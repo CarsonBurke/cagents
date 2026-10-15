@@ -9,6 +9,7 @@
 //! derives nothing that an entity already determines: folded filter keys,
 //! widget identities, and accessible names are built once per entity.
 
+pub use crate::repository::GitOperation;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
@@ -1411,6 +1412,7 @@ pub enum MutationKind {
     Discard,
     Commit,
     Push,
+    Other,
 }
 
 impl MutationKind {
@@ -1421,6 +1423,7 @@ impl MutationKind {
             Self::Discard => "Discarding…",
             Self::Commit => "Committing…",
             Self::Push => "Pushing…",
+            Self::Other => "Updating Git…",
         }
     }
 }
@@ -1729,6 +1732,8 @@ struct ChangeGroupChrome {
 pub struct CommitRow {
     pub oid: Oid,
     pub parent: Option<Oid>,
+    pub message: Arc<str>,
+    pub mainline: Option<u32>,
     chrome: CommitRowChrome,
 }
 
@@ -1757,6 +1762,8 @@ impl CommitRow {
         Self {
             oid: commit.oid.clone(),
             parent: commit.parents.first().cloned(),
+            message: compose_commit_message(&commit.subject, &commit.body).into(),
+            mainline: merge.then_some(1),
             chrome,
         }
     }
@@ -1906,6 +1913,14 @@ pub struct SourceControlModel {
     pub mutation: Option<MutationKind>,
     /// The most recent mutation failure, retained until the next attempt.
     pub error: Option<String>,
+    pub output_expanded: bool,
+    pub operation: Option<crate::repository::GitOperationState>,
+    pub stashes: Vec<crate::repository::StashEntry>,
+    pub last_fetch_unix_ms: Option<u64>,
+    pub stashes_expanded: bool,
+    pub pending_stash_drop: Option<crate::repository::StashEntry>,
+    pub pending_marker_stage: Option<Vec<PathSelection>>,
+    pub pending_marker_approval: BTreeMap<RepoPath, crate::repository::ConflictMarkerVersion>,
     pub staged_count: usize,
     pub files: Vec<FileRow>,
     pub ignored_directory_errors: BTreeMap<RepoPath, String>,
@@ -1916,6 +1931,7 @@ pub struct SourceControlModel {
     change_count_label: Option<Box<str>>,
     pub branch_changes: BranchChanges,
     pub history: Vec<CommitRow>,
+    pub history_query: String,
     pub commit_changes: Option<CommitChanges>,
     /// False until a page has landed. Without it an empty `history` is
     /// indistinguishable from a branch that has no commits.
@@ -2052,6 +2068,14 @@ impl SourceControlModel {
             remotes: Vec::new(),
             mutation: None,
             error: None,
+            output_expanded: false,
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
+            stashes_expanded: false,
+            pending_stash_drop: None,
+            pending_marker_stage: None,
+            pending_marker_approval: BTreeMap::new(),
             staged_count: 0,
             files: Vec::new(),
             ignored_directory_errors: BTreeMap::new(),
@@ -2059,6 +2083,7 @@ impl SourceControlModel {
             change_count_label: None,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
+            history_query: String::new(),
             commit_changes: None,
             history_loaded: false,
             history_requested: false,
@@ -2074,6 +2099,14 @@ impl SourceControlModel {
 
     /// Builds the panel from a loaded snapshot.
     pub fn ready(key: ActiveWorktreeKey, snapshot: &RepositorySnapshot) -> Self {
+        Self::ready_for_tab(key, snapshot, true)
+    }
+
+    pub fn ready_for_tab(
+        key: ActiveWorktreeKey,
+        snapshot: &RepositorySnapshot,
+        browse_files: bool,
+    ) -> Self {
         let worktree_id = key.worktree_id;
         // The header's label and the branch a push names come from the same
         // `HEAD` and are not the same value: the label is a lossy decoding of
@@ -2121,10 +2154,14 @@ impl SourceControlModel {
             paths.extend(snapshot.files.ignored.iter().cloned());
             &paths
         };
-        let mut files = file_rows_from_tree(build_file_tree_with_directories(
-            paths,
-            &snapshot.files.ignored_directories,
-        ));
+        let mut files = if browse_files {
+            file_rows_from_tree(build_file_tree_with_directories(
+                paths,
+                &snapshot.files.ignored_directories,
+            ))
+        } else {
+            Vec::new()
+        };
         let ignored: BTreeSet<_> = snapshot.files.ignored.iter().collect();
         let ignored_directories: BTreeSet<_> = snapshot
             .files
@@ -2172,6 +2209,14 @@ impl SourceControlModel {
             remotes,
             mutation: None,
             error: None,
+            output_expanded: false,
+            operation: snapshot.operation.clone(),
+            stashes: snapshot.stashes.clone(),
+            last_fetch_unix_ms: snapshot.last_fetch_unix_ms,
+            stashes_expanded: false,
+            pending_stash_drop: None,
+            pending_marker_stage: None,
+            pending_marker_approval: BTreeMap::new(),
             staged_count,
             files,
             ignored_directory_errors: snapshot.files.ignored_directory_errors.clone(),
@@ -2179,6 +2224,7 @@ impl SourceControlModel {
             change_count_label,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
+            history_query: String::new(),
             commit_changes: None,
             history_loaded: false,
             history_requested: false,
@@ -2192,6 +2238,16 @@ impl SourceControlModel {
             chrome,
             file_search: FileSearch::Inactive,
         }
+    }
+
+    pub fn search_history(&mut self, query: String) {
+        self.history_query = query;
+        self.history.clear();
+        self.commit_changes = None;
+        self.history_loaded = false;
+        self.history_complete = false;
+        self.next_history_page = 0;
+        self.mark_history_requested();
     }
 
     /// Appends one loaded history page. A short page is the last one.
@@ -2242,7 +2298,7 @@ impl SourceControlModel {
     /// True while a further page can exist. An unborn `HEAD` has no walk to
     /// page through, so it is offered no pager.
     fn can_load_history(&self) -> bool {
-        !self.history_loading && !self.history_complete && !self.unborn
+        !self.history_loading && !self.history_complete && !self.unborn && self.head_oid.is_some()
     }
 
     /// Records that the first page has been asked for, so expanding, closing,
@@ -2265,11 +2321,83 @@ impl SourceControlModel {
         self.reloading = reloading;
     }
 
+    /// Move the intended rows immediately. The authoritative snapshot replaces
+    /// these pending rows once the worktree queue drains.
+    pub fn optimistic_mutation(&mut self, kind: MutationKind, selection: &[PathSelection]) {
+        let target = match kind {
+            MutationKind::Stage => ChangeArea::Staged,
+            MutationKind::Unstage => ChangeArea::Unstaged,
+            _ => return,
+        };
+        let selected = selection
+            .iter()
+            .map(|entry| &entry.path)
+            .collect::<BTreeSet<_>>();
+        let mut moved = Vec::new();
+        for group in &mut self.groups {
+            if group.area == target {
+                continue;
+            }
+            if !group
+                .rows
+                .iter()
+                .any(|row| selected.contains(&row.entry.path))
+            {
+                continue;
+            }
+            let mut kept = Vec::new();
+            for mut row in std::mem::take(&mut group.rows) {
+                if selected.contains(&row.entry.path) {
+                    row.entry.area = if kind == MutationKind::Unstage
+                        && matches!(row.entry.kind, ChangeKind::Added | ChangeKind::Untracked)
+                    {
+                        row.entry.kind = ChangeKind::Untracked;
+                        ChangeArea::Untracked
+                    } else {
+                        if kind == MutationKind::Stage && row.entry.kind == ChangeKind::Untracked {
+                            row.entry.kind = ChangeKind::Added;
+                        }
+                        target
+                    };
+                    row.entry.conflict = None;
+                    let mut pending = ChangeRow::new(self.key.worktree_id, &row.entry);
+                    pending.chrome.status = "Pending…".into();
+                    moved.push(pending);
+                } else {
+                    kept.push(row);
+                }
+            }
+            *group = ChangeGroup::new(self.key.worktree_id, group.area, kept);
+        }
+        for group in &mut self.groups {
+            let additions = moved
+                .iter()
+                .filter(|row| row.entry.area == group.area)
+                .cloned()
+                .collect::<Vec<_>>();
+            if additions.is_empty() {
+                continue;
+            }
+            let moved_paths = additions
+                .iter()
+                .map(|row| row.entry.path.clone())
+                .collect::<BTreeSet<_>>();
+            let mut rows = std::mem::take(&mut group.rows);
+            rows.retain(|row| !moved_paths.contains(&row.entry.path));
+            rows.extend(additions);
+            *group = ChangeGroup::new(self.key.worktree_id, group.area, rows);
+        }
+        self.staged_count = self
+            .group(ChangeArea::Staged)
+            .map_or(0, |group| group.rows.len());
+    }
+
     pub fn set_mutation(&mut self, mutation: Option<MutationKind>) {
         self.mutation = mutation;
     }
 
     pub fn set_error(&mut self, error: Option<String>) {
+        self.output_expanded = false;
         self.error = error;
     }
 
@@ -2308,8 +2436,21 @@ impl SourceControlModel {
             return;
         }
         next.mutation = self.mutation;
+        if self.mutation.is_some() {
+            // A read started before the queue cannot overwrite newer user
+            // intent. The single read after drain supplies authoritative rows.
+            next.groups = self.groups.clone();
+            next.staged_count = self.staged_count;
+            next.change_count_label = self.change_count_label.clone();
+        }
         next.error = self.error.clone();
+        next.output_expanded = self.output_expanded;
+        next.stashes_expanded = self.stashes_expanded;
+        next.pending_stash_drop = self.pending_stash_drop.clone();
+        next.pending_marker_stage = self.pending_marker_stage.clone();
+        next.pending_marker_approval = self.pending_marker_approval.clone();
         next.commit_changes = self.commit_changes.clone();
+        next.history_query.clone_from(&self.history_query);
         // The loading placeholder between two snapshots has not read `HEAD`
         // yet, and that gap must not look like a `HEAD` that moved.
         if next.head_oid.is_none() && !next.unborn {
@@ -2360,7 +2501,15 @@ impl SourceControlModel {
 
     /// Commit needs a message, something staged, and no mutation in flight.
     pub fn can_commit(&self, message: &str) -> bool {
-        !message.trim().is_empty() && self.staged_count > 0 && !self.busy()
+        !message.trim().is_empty()
+            && (self.staged_count > 0
+                || self.operation.as_ref().is_some_and(|operation| {
+                    operation.kind == crate::repository::GitOperationKind::Merge
+                }))
+            && self
+                .group(ChangeArea::Conflict)
+                .is_none_or(ChangeGroup::is_empty)
+            && !self.busy()
     }
 
     /// Push needs a non-detached branch that is actually ahead of an upstream.
@@ -2740,6 +2889,8 @@ pub struct SidebarState {
     /// Compact mode only: whether the source-control popover is showing.
     panel_open: bool,
     files_query: String,
+    history_query: String,
+    history_branch: Option<(Oid, String)>,
     files_filter_open: bool,
     change_list_mode: FileListMode,
     /// Which view of the Git panel is showing. Local to the surface, like
@@ -2781,6 +2932,33 @@ impl SidebarState {
         visible: &[SelectionRow],
     ) {
         self.rows.select(row, intent, visible);
+    }
+
+    /// Navigation can point at another project while an editor remains active.
+    /// Keep those explicit targets live alongside the active workspace.
+    pub fn git_watch_targets(&self) -> Vec<(ProjectId, Option<WorktreeId>)> {
+        let mut targets = Vec::new();
+        if let Some(selection) = self.selection {
+            targets.push(match selection {
+                SidebarSelection::Project(project_id)
+                | SidebarSelection::PullRequest { project_id, .. } => (project_id, None),
+                SidebarSelection::Worktree {
+                    project_id,
+                    worktree_id,
+                } => (project_id, Some(worktree_id)),
+            });
+        }
+        for row in self.rows.iter() {
+            let target = match row {
+                SelectionRow::Project(project_id) => (project_id, None),
+                SelectionRow::Worktree(project_id, worktree_id) => (project_id, Some(worktree_id)),
+                SelectionRow::Channel(_) => continue,
+            };
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        targets
     }
 
     pub fn selected_rows(&self, visible: &[SelectionRow]) -> Vec<SelectionRow> {
@@ -3026,6 +3204,18 @@ impl SidebarState {
         &self.commit_draft.message
     }
 
+    pub fn prefill_operation_message(&mut self, key: &ActiveWorktreeKey, message: Option<&str>) {
+        if self.active_worktree() == Some(key)
+            && self.commit_message().trim().is_empty()
+            && let Some(message) = message.filter(|message| !message.trim().is_empty())
+        {
+            self.apply(&SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: message.to_owned(),
+            });
+        }
+    }
+
     /// The discard awaiting confirmation, which the application mounts with
     /// [`discard_confirmation_dialog`].
     pub fn pending_discard(&self) -> Option<&DiscardConfirmation> {
@@ -3129,6 +3319,8 @@ impl SidebarState {
         self.active_worktree = next;
         // Every panel-local draft belongs to the worktree it was typed for.
         self.files_query.clear();
+        self.history_query.clear();
+        self.history_branch = None;
         self.files_filter_open = false;
         self.expanded_directories.clear();
         self.collapsed_change_directories.clear();
@@ -3301,6 +3493,13 @@ impl SidebarState {
                     );
                 }
             }
+            SidebarAction::HistoryQueryChanged { query, .. } => self.history_query.clone_from(query),
+            SidebarAction::HistoryBranchChanged { name, .. } => {
+                if let Some((_, draft)) = self.history_branch.as_mut() { draft.clone_from(name); }
+            }
+            SidebarAction::CancelHistoryBranch => self.history_branch = None,
+            SidebarAction::CreateHistoryBranch { .. } => {},
+            SidebarAction::HistoryCommand { oid, command: HistoryCommand::CreateBranch, .. } => self.history_branch = Some((oid.clone(), String::new())),
             SidebarAction::AmendChanged { amend, .. } => {
                 if self.commit_draft.amend != *amend {
                     self.revise_commit_draft();
@@ -3362,6 +3561,12 @@ impl SidebarState {
             | SidebarAction::CreatePullRequest { .. }
             | SidebarAction::OpenSettings
             | SidebarAction::OpenAutomations
+            | SidebarAction::GitOperation { .. }
+            | SidebarAction::ToggleStashes { .. }
+            | SidebarAction::RequestStashDrop { .. }
+            | SidebarAction::ConfirmStageMarkers { .. }
+            | SidebarAction::CancelGitMutation { .. }
+            | SidebarAction::ToggleGitOutput { .. }
             | SidebarAction::Stage { .. }
             | SidebarAction::ChangeGroup { .. }
             | SidebarAction::Unstage { .. }
@@ -3370,6 +3575,8 @@ impl SidebarState {
             | SidebarAction::CloseCommit { .. }
             | SidebarAction::ShowMoreCommitFiles { .. }
             | SidebarAction::LoadMoreHistory { .. }
+            | SidebarAction::SearchHistory { .. }
+            | SidebarAction::HistoryCommand { .. }
             | SidebarAction::Resize { .. }
             | SidebarAction::ResizeFinished
             | SidebarAction::SelectRows { .. }
@@ -3621,6 +3828,27 @@ pub enum SidebarAction {
         head: Oid,
         merge_base: Oid,
     },
+    GitOperation {
+        key: ActiveWorktreeKey,
+        operation: GitOperation,
+    },
+    ToggleStashes {
+        key: ActiveWorktreeKey,
+    },
+    RequestStashDrop {
+        key: ActiveWorktreeKey,
+        entry: Option<crate::repository::StashEntry>,
+    },
+    ConfirmStageMarkers {
+        key: ActiveWorktreeKey,
+        confirmed: bool,
+    },
+    CancelGitMutation {
+        key: ActiveWorktreeKey,
+    },
+    ToggleGitOutput {
+        key: ActiveWorktreeKey,
+    },
     Stage {
         key: ActiveWorktreeKey,
         selection: Vec<PathSelection>,
@@ -3662,6 +3890,12 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         action: cosmic::iced::widget::text_editor::Action,
     },
+    HistoryQueryChanged { key: ActiveWorktreeKey, query: String },
+    SearchHistory { key: ActiveWorktreeKey, query: String },
+    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand, mainline: Option<u32>, message: Arc<str> },
+    HistoryBranchChanged { key: ActiveWorktreeKey, name: String },
+    CancelHistoryBranch,
+    CreateHistoryBranch { key: ActiveWorktreeKey, oid: Oid, name: ValidatedBranchName },
     AmendChanged {
         key: ActiveWorktreeKey,
         amend: bool,
@@ -4700,8 +4934,13 @@ fn project_identity_row<'a>(
         .on_press_maybe(
             project_primary_action(
                 project,
-                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
-            ).and_then(|action| gated(action, modal_open)),
+                if review_mode {
+                    SidebarFilter::PullRequests
+                } else {
+                    SidebarFilter::All
+                },
+            )
+            .and_then(|action| gated(action, modal_open)),
         );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
@@ -4725,16 +4964,20 @@ pub(crate) fn project_primary_action(
             repository: project.repository.clone(),
         });
     }
-    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
-        SidebarAction::BrowsePullRequests { project_id: project.id }
-    } else if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(
+        if filter == SidebarFilter::PullRequests && project.github_ready {
+            SidebarAction::BrowsePullRequests {
+                project_id: project.id,
+            }
+        } else if project.kind == ProjectKind::Folder {
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }
+        } else {
+            SidebarAction::ToggleProject(project.id)
+        },
+    )
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -4949,8 +5192,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = project_primary_action(project, state.filter)
-        .and_then(|action| gated(action, modal_open));
+    let reload =
+        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -6269,6 +6512,32 @@ fn context_controls<'a>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryCommand { CopySha, CopyMessage, NewWorktree, CreateBranch, Revert, CherryPick }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand }
+
+impl widget::menu::Action for HistoryContextCommand<'_> {
+    type Message = SidebarAction;
+    fn message(&self) -> SidebarAction {
+        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) }
+    }
+}
+
+fn history_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a CommitRow, blocked: bool) -> Element<'a, SidebarAction> {
+    if blocked { return content; }
+    let entries = [
+        ("Copy SHA", HistoryCommand::CopySha),
+        ("Copy message", HistoryCommand::CopyMessage),
+        ("New worktree from this commit…", HistoryCommand::NewWorktree),
+        ("Create branch here…", HistoryCommand::CreateBranch),
+        (if row.mainline.is_some() { "Revert commit (first parent)" } else { "Revert commit" }, HistoryCommand::Revert),
+        (if row.mainline.is_some() { "Cherry-pick into this worktree (first parent)" } else { "Cherry-pick into this worktree" }, HistoryCommand::CherryPick),
+    ].into_iter().map(|(label, command)| widget::menu::Item::Button(label.to_owned(), None, HistoryContextCommand { key, row, command })).collect();
+    crate::interaction::context_menu(content, widget::menu::items(&std::collections::HashMap::new(), entries))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileContextCommand<'a> {
     Manage {
         key: &'a ActiveWorktreeKey,
@@ -6565,7 +6834,7 @@ pub fn worktree_sidebar_with_body<'a, M: 'a>(
         navigation,
         sidebar_pane_width(width),
     );
-    let notices: Element<'a, SidebarAction> = source_control_notices(source).into();
+    let notices: Element<'a, SidebarAction> = source_control_notices(source, false).into();
     // The body sits between the sidebar's own header and footer, so each of
     // those maps on its own; the mapper is shared rather than cloned.
     let map = std::rc::Rc::new(map);
@@ -6850,6 +7119,12 @@ fn source_control_header<'a>(
         .width(Length::Fill)
         .into(),
     ]);
+    if source.mutation.is_some() {
+        header = header.push(
+            widget::button::text("Cancel")
+                .on_press(SidebarAction::CancelGitMutation { key: key.clone() }),
+        );
+    }
     match view {
         PanelView::Files => {
             header = header.push(
@@ -6894,14 +7169,247 @@ fn source_control_header<'a>(
 /// icon slot so a background read or mutation cannot move the body.
 fn source_control_notices<'a>(
     source: &'a SourceControlModel,
+    git_controls: bool,
 ) -> cosmic::iced::widget::Column<'a, SidebarAction, cosmic::Theme, cosmic::Renderer> {
-    widget::column::with_capacity(3)
-        .spacing(space::XS)
-        .push(slot(source.error.as_deref().map(|error| {
-            design::caption(error)
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                .into()
-        })))
+    let mut notices = widget::column::with_capacity(3).spacing(space::XS);
+    if let Some(error) = source.error.as_deref() {
+        let (summary, output) = error.split_once("\n\nGit output:\n").unwrap_or((error, ""));
+        notices = notices
+            .push(design::caption(summary).wrapping(cosmic::iced::widget::text::Wrapping::Word));
+        if !output.is_empty() {
+            notices = notices.push(
+                widget::button::text(if source.output_expanded {
+                    "Hide Git output"
+                } else {
+                    "Show Git output"
+                })
+                .on_press(SidebarAction::ToggleGitOutput {
+                    key: source.key.clone(),
+                }),
+            );
+            if source.output_expanded {
+                notices = notices.push(
+                    widget::scrollable(
+                        design::caption(output)
+                            .wrapping(cosmic::iced::widget::text::Wrapping::Word),
+                    )
+                    .height(Length::Fixed(220.0)),
+                );
+            }
+        }
+    }
+    if let Some(operation) = &source.operation {
+        notices = notices.push(design::caption(format!(
+            "{} in progress{}",
+            operation.kind.label(),
+            operation
+                .incoming_ref
+                .as_deref()
+                .map(|reference| format!(" · {}", reference.chars().take(12).collect::<String>()))
+                .unwrap_or_default()
+        )));
+        notices = notices.push(
+            widget::row::with_children(vec![
+                widget::button::text("Abort")
+                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                        key: source.key.clone(),
+                        operation: GitOperation::Abort {
+                            kind: operation.kind,
+                        },
+                    }))
+                    .into(),
+                widget::button::text("Continue")
+                    .on_press_maybe(
+                        (!source.busy()
+                            && source
+                                .group(ChangeArea::Conflict)
+                                .is_none_or(ChangeGroup::is_empty))
+                        .then(|| SidebarAction::GitOperation {
+                            key: source.key.clone(),
+                            operation: GitOperation::Continue {
+                                kind: operation.kind,
+                            },
+                        }),
+                    )
+                    .into(),
+            ])
+            .spacing(space::XS),
+        );
+    }
+    if source.pending_marker_stage.is_some() {
+        let names = source
+            .pending_marker_approval
+            .keys()
+            .take(3)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        notices = notices.push(design::caption(format!(
+            "Conflict markers remain in {} selected file(s): {}{}. Stage anyway?",
+            source.pending_marker_approval.len(),
+            names,
+            if source.pending_marker_approval.len() > 3 {
+                ", …"
+            } else {
+                ""
+            }
+        )));
+
+        notices = notices.push(widget::row::with_children(vec![
+            widget::button::text("Stage anyway")
+                .on_press(SidebarAction::ConfirmStageMarkers {
+                    key: source.key.clone(),
+                    confirmed: true,
+                })
+                .into(),
+            widget::button::text("Cancel")
+                .on_press(SidebarAction::ConfirmStageMarkers {
+                    key: source.key.clone(),
+                    confirmed: false,
+                })
+                .into(),
+        ]));
+    }
+    if git_controls && source.offers_changes() {
+        let key = &source.key;
+        let mut actions = widget::row::with_capacity(4).spacing(space::XS);
+        if let Some(remote) = source
+            .upstream
+            .as_ref()
+            .map(|target| target.remote())
+            .or_else(|| source.remotes.first().map(String::as_str))
+        {
+            actions = actions.push(widget::button::text("Fetch").on_press_maybe(
+                (!source.busy()).then(|| SidebarAction::GitOperation {
+                    key: key.clone(),
+                    operation: GitOperation::Fetch {
+                        remote: remote.to_owned(),
+                        prune: true,
+                    },
+                }),
+            ));
+        }
+        if source.upstream.is_some() {
+            actions = actions.push(widget::button::text("Sync").on_press_maybe(
+                (!source.busy()).then(|| SidebarAction::GitOperation {
+                    key: key.clone(),
+                    operation: GitOperation::Sync { rebase: false },
+                }),
+            ));
+            actions = actions.push(widget::button::text("Sync (rebase)").on_press_maybe(
+                (!source.busy()).then(|| SidebarAction::GitOperation {
+                    key: key.clone(),
+                    operation: GitOperation::Sync { rebase: true },
+                }),
+            ));
+        }
+        notices = notices.push(actions);
+        if let Some(time) = source.last_fetch_unix_ms {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            notices = notices.push(design::caption(format!(
+                "Fetched {} min ago",
+                now.saturating_sub(time) / 60_000
+            )));
+        }
+        notices = notices.push(
+            widget::row::with_children(vec![
+                widget::button::text(format!("Stashes ({})", source.stashes.len()))
+                    .on_press(SidebarAction::ToggleStashes { key: key.clone() })
+                    .into(),
+                widget::button::text("Stash changes")
+                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                        key: key.clone(),
+                        operation: GitOperation::StashPush {
+                            message: None,
+                            include_untracked: false,
+                        },
+                    }))
+                    .into(),
+            ])
+            .spacing(space::XS),
+        );
+        if source.stashes_expanded {
+            notices = notices.push(
+                widget::button::text("Stash including new files").on_press_maybe(
+                    (!source.busy()).then(|| SidebarAction::GitOperation {
+                        key: key.clone(),
+                        operation: GitOperation::StashPush {
+                            message: None,
+                            include_untracked: true,
+                        },
+                    }),
+                ),
+            );
+            let mut rows = widget::column::with_capacity(source.stashes.len()).spacing(space::XS);
+            for stash in &source.stashes {
+                rows = rows.push(design::caption(format!(
+                    "{} · {}",
+                    stash.reference, stash.message
+                )));
+                rows = rows.push(
+                    widget::row::with_children(vec![
+                        widget::button::text("Apply")
+                            .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                                key: key.clone(),
+                                operation: GitOperation::StashApply {
+                                    reference: stash.reference.clone(),
+                                    expected_oid: stash.oid.clone(),
+                                    pop: false,
+                                },
+                            }))
+                            .into(),
+                        widget::button::text("Pop")
+                            .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                                key: key.clone(),
+                                operation: GitOperation::StashApply {
+                                    reference: stash.reference.clone(),
+                                    expected_oid: stash.oid.clone(),
+                                    pop: true,
+                                },
+                            }))
+                            .into(),
+                        widget::button::text("Drop…")
+                            .on_press_maybe((!source.busy()).then(|| {
+                                SidebarAction::RequestStashDrop {
+                                    key: key.clone(),
+                                    entry: Some(stash.clone()),
+                                }
+                            }))
+                            .into(),
+                    ])
+                    .spacing(space::XS),
+                );
+            }
+            notices = notices.push(widget::scrollable(rows).height(Length::Fixed(180.0)));
+        }
+        if let Some(stash) = &source.pending_stash_drop {
+            notices = notices.push(design::caption(format!(
+                "Permanently drop {}?",
+                stash.reference
+            )));
+            notices = notices.push(widget::row::with_children(vec![
+                widget::button::text("Drop stash")
+                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                        key: key.clone(),
+                        operation: GitOperation::StashDrop {
+                            reference: stash.reference.clone(),
+                            expected_oid: stash.oid.clone(),
+                        },
+                    }))
+                    .into(),
+                widget::button::text("Cancel")
+                    .on_press(SidebarAction::RequestStashDrop {
+                        key: key.clone(),
+                        entry: None,
+                    })
+                    .into(),
+            ]));
+        }
+    }
+    notices
 }
 
 /// Shared worktree identity and loading slots around file or Git navigation.
@@ -6921,7 +7429,8 @@ fn source_control_panel<'a>(
     let view = PanelView::new(panel, navigation, state);
     let header = source_control_header(state, source, worktree, modal_open, view);
     let tabs = panel_navigation(source, modal_open, view, navigation, width);
-    let mut notices = source_control_notices(source);
+    let mut notices =
+        source_control_notices(source, matches!(view, PanelView::Git(ChangesTab::Changes)));
 
     match &source.data_state {
         SidebarDataState::Loading => {
@@ -8171,8 +8680,8 @@ impl<'a> IconCommand<'a> {
 ///
 /// Which commands exist is a fact about the area: conflicts are staged to mark
 /// them resolved, there is no unstage for an unmerged path, and untracked paths
-/// have nothing to unstage from. An in-flight Git command disables the actions
-/// in place, because a second mutation against the same index would race the first.
+/// have nothing to unstage from. Stage and unstage remain available for the
+/// serialized queue; destructive actions wait for the current mutation.
 fn group_commands<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
@@ -8194,7 +8703,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Unstage,
                 },
-                modal_open || source.busy(),
+                modal_open,
             ),
             id: chrome.unstage_all_id.clone(),
         });
@@ -8208,7 +8717,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Stage,
                 },
-                modal_open || source.busy(),
+                modal_open,
             ),
             id: chrome.stage_all_id.clone(),
         });
@@ -8240,7 +8749,7 @@ pub fn resolve_group_command(
     let SidebarAction::ChangeGroup { key, area, command } = action else {
         return None;
     };
-    if key != &source.key || source.busy() {
+    if key != &source.key || (source.busy() && matches!(command, ChangeGroupCommand::Discard)) {
         return None;
     }
     let group = source.group(*area)?;
@@ -8290,7 +8799,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     selection: vec![row.selection()],
                 },
-                modal_open || source.busy(),
+                modal_open,
             ),
             id: chrome.unstage_id.clone(),
         });
@@ -8303,10 +8812,32 @@ fn row_commands<'a>(
                     key: key.clone(),
                     selection: vec![row.selection()],
                 },
-                modal_open || source.busy(),
+                modal_open,
             ),
             id: chrome.stage_id.clone(),
         });
+    }
+    if area == ChangeArea::Conflict {
+        for (ours, name, icon) in [
+            (true, "Accept ours and stage", Icon::Undo),
+            (false, "Accept theirs and stage", Icon::Select),
+        ] {
+            commands.push(IconCommand {
+                icon,
+                name,
+                action: gated(
+                    SidebarAction::GitOperation {
+                        key: key.clone(),
+                        operation: GitOperation::ResolveConflict {
+                            path: row.entry.path.clone(),
+                            ours,
+                        },
+                    },
+                    modal_open || source.busy(),
+                ),
+                id: stable_id(format!("resolve.{ours}.{}", path_key(&row.entry.path))),
+            });
+        }
     }
     if matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked) {
         commands.push(IconCommand {
@@ -8425,7 +8956,14 @@ fn changes_footer<'a>(
     let can_commit = !modal_open
         && !source.busy()
         && !state.commit_draft.subject.trim().is_empty()
-        && (source.staged_count > 0 || (state.commit_draft.amend && source.head_oid.is_some()));
+        && (source.staged_count > 0
+            || (state.commit_draft.amend && source.head_oid.is_some())
+            || source.operation.as_ref().is_some_and(|operation| {
+                operation.kind == crate::repository::GitOperationKind::Merge
+            }))
+        && source
+            .group(ChangeArea::Conflict)
+            .is_none_or(ChangeGroup::is_empty);
     let commit_action = SidebarAction::Commit {
         key: key.clone(),
         message: message.to_owned(),
@@ -8881,10 +9419,32 @@ fn history_section<'a>(
                     .into()
             }),
     ));
+    let search_key = key.clone();
+    let submit_key = key.clone();
+    let mut search = crate::ui_controls::field::search("Message, author or SHA — Enter to search", &state.history_query);
+    if !modal_open {
+        search = search.on_input(move |query| SidebarAction::HistoryQueryChanged { key: search_key.clone(), query });
+        if source.head_oid.is_some() {
+            search = search.on_submit(move |query| SidebarAction::SearchHistory { key: submit_key.clone(), query });
+        }
+    }
+    column = column.push(search);
+    column = column.push(design::caption("Paste a commit SHA from another branch to find it here."));
+    if let Some((oid, name)) = &state.history_branch {
+        let branch_key = key.clone();
+        let create = ValidatedBranchName::parse(name.clone()).ok().map(|name| SidebarAction::CreateHistoryBranch { key: key.clone(), oid: oid.clone(), name });
+        let mut input = crate::ui_controls::field::text("New branch name", name);
+        if !modal_open { input = input.on_input(move |name| SidebarAction::HistoryBranchChanged { key: branch_key.clone(), name }); }
+        column = column.push(input);
+        column = column.push(widget::row::with_children(vec![
+            crate::ui_controls::button::secondary("Cancel").on_press_maybe((!modal_open).then_some(SidebarAction::CancelHistoryBranch)).into(),
+            crate::ui_controls::button::primary("Create branch").on_press_maybe(create.filter(|_| !modal_open)).into(),
+        ]).spacing(space::XS));
+    }
     let mut rows = widget::column::with_capacity(source.history.len());
     for row in &source.history {
         let chrome = &row.chrome;
-        rows = rows.push(crate::interaction::keyboard_list_row(
+        rows = rows.push(history_context_controls(crate::interaction::keyboard_list_row(
             button::custom(
                 widget::row::with_children(vec![
                     widget::container(Icon::Commit.handle().icon().size(ROW_ICON_SIZE))
@@ -8922,7 +9482,7 @@ fn history_section<'a>(
                 modal_open,
             ))
             .width(Length::Fill),
-        ));
+        ), key, row, modal_open));
     }
     column = column.push(rows);
     column = column.push(slot((!source.history_complete && !source.unborn).then(
@@ -8969,7 +9529,11 @@ fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
         return Some("This branch’s commits have not been loaded yet.");
     }
     if source.history.is_empty() {
-        return Some("HEAD names a commit, but the page of history that loaded held none.");
+        return Some(if source.history_query.is_empty() {
+            "HEAD names a commit, but the page of history that loaded held none."
+        } else {
+            "No commits match this message, author or SHA."
+        });
     }
     None
 }
@@ -10469,7 +11033,9 @@ mod row_interaction {
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
                 && let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key), modifiers, ..
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
                 }) = event
                 && modifiers.is_empty()
             {
@@ -11065,6 +11631,71 @@ mod row_interaction {
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
+    fn optimistic_rows_move_to_pending_target_group() {
+        let mut source = SourceControlModel::ready(main_key(), &snapshot());
+        let selected = source.group(ChangeArea::Untracked).unwrap().rows()[0].selection();
+        source.optimistic_mutation(MutationKind::Stage, &[selected.clone()]);
+        assert!(source.group(ChangeArea::Untracked).unwrap().is_empty());
+        assert!(
+            source
+                .group(ChangeArea::Staged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == selected.path && row.status_label() == "Pending…")
+        );
+    }
+
+    #[test]
+    fn optimistically_unstaging_a_new_file_returns_it_to_untracked() {
+        let mut source = SourceControlModel::ready(main_key(), &snapshot());
+        let selected = source.group(ChangeArea::Untracked).unwrap().rows()[0].selection();
+        source.optimistic_mutation(MutationKind::Stage, &[selected.clone()]);
+        assert!(
+            source
+                .group(ChangeArea::Staged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == selected.path && row.entry.kind == ChangeKind::Added)
+        );
+        source.optimistic_mutation(MutationKind::Unstage, &[selected.clone()]);
+        assert!(
+            !source
+                .group(ChangeArea::Staged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == selected.path)
+        );
+        assert!(
+            source
+                .group(ChangeArea::Untracked)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == selected.path && row.status_label() == "Pending…")
+        );
+    }
+
+    #[test]
+    fn all_ours_merge_can_commit_after_conflicts_are_resolved() {
+        let mut source = SourceControlModel::ready(main_key(), &snapshot());
+        source.staged_count = 0;
+        source
+            .groups
+            .retain(|group| group.area != ChangeArea::Conflict);
+        source.operation = Some(crate::repository::GitOperationState {
+            kind: crate::repository::GitOperationKind::Merge,
+            incoming_ref: None,
+            message: Some("Merge fixture".into()),
+        });
+        assert!(source.can_commit("Merge fixture"));
+        source.operation = None;
+        assert!(!source.can_commit("Merge fixture"));
+    }
+
+    #[test]
     fn required_review_policy_does_not_claim_the_viewer_was_requested() {
         let mut pull_request = crate::pull_request_review::tests::pull_request(51);
         for decision in ["REVIEW_REQUIRED", "CHANGES_REQUESTED"] {
@@ -11258,58 +11889,61 @@ pub(crate) mod tests {
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
-        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
-        for (focused, modal) in [(false, false), (true, false), (true, true)] {
-            let state = SidebarState::default();
-            let renderer = headless_renderer();
-            let mut element = search(&state, modal);
-            let mut tree = Tree::new(&element);
-            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            );
-            if focused {
-                element.as_widget_mut().operate(
+        for key in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            for (focused, modal) in [(false, false), (true, false), (true, true)] {
+                let state = SidebarState::default();
+                let renderer = headless_renderer();
+                let mut element = search(&state, modal);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+                let node = element.as_widget_mut().layout(
                     &mut tree,
-                    Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if focused {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(search_focus_id()),
+                    );
+                }
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if focused && !modal {
+                        vec![if key == keyboard::key::Named::Escape {
+                            SidebarAction::ToggleControls
+                        } else {
+                            SidebarAction::FocusFirstSearchResult
+                        }]
+                    } else {
+                        vec![]
+                    }
                 );
             }
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
-                    text: None,
-                    repeat: false,
-                }),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                messages,
-                if focused && !modal {
-                    vec![if key == keyboard::key::Named::Escape {
-                        SidebarAction::ToggleControls
-                    } else {
-                        SidebarAction::FocusFirstSearchResult
-                    }]
-                } else {
-                    vec![]
-                }
-            );
-        }
         }
     }
 
@@ -15495,6 +16129,9 @@ pub(crate) mod tests {
     /// the four change areas and one unmeasured (binary) count.
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: StatusSnapshot {
                 untracked_omitted: false,
                 head: HeadState::Branch {
@@ -15572,6 +16209,16 @@ pub(crate) mod tests {
 
     fn source_control() -> SourceControlModel {
         SourceControlModel::ready(main_key(), &snapshot())
+    }
+
+    #[test]
+    fn changes_tab_does_not_build_the_files_tree() {
+        let snapshot = snapshot();
+        let changes = SourceControlModel::ready_for_tab(main_key(), &snapshot, false);
+        assert!(changes.files.is_empty());
+        let files = SourceControlModel::ready_for_tab(main_key(), &snapshot, true);
+        assert!(!files.files.is_empty());
+        assert_eq!(changes.groups, files.groups);
     }
 
     #[test]
@@ -15725,6 +16372,9 @@ pub(crate) mod tests {
         let mut source = SourceControlModel::ready(
             main_key(),
             &RepositorySnapshot {
+                operation: None,
+                stashes: Vec::new(),
+                last_fetch_unix_ms: None,
                 status: StatusSnapshot::default(),
                 files: WorkingFiles::default(),
                 remotes: Vec::new(),
@@ -16464,22 +17114,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_running_mutation_withholds_every_further_command_against_the_same_index() {
+    fn a_running_mutation_keeps_stage_and_unstage_available_but_withholds_discard() {
         let mut source = source_control();
         source.set_mutation(Some(MutationKind::Stage));
-        let group = source
-            .group(ChangeArea::Unstaged)
-            .expect("an unstaged group exists");
-        assert!(
-            group_commands(&source, group, false)
-                .iter()
-                .all(|command| command.action.is_none())
-                && row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false)
-                    .iter()
-                    .all(|command| command.action.is_none()),
-            "two `git add` runs against one index corrupt each other's lock, so the second is not \
-             enabled"
-        );
+        for area in [ChangeArea::Staged, ChangeArea::Unstaged] {
+            let group = source.group(area).expect("the fixture has both areas");
+            let group_actions = group_commands(&source, group, false)
+                .into_iter()
+                .filter_map(|command| command.action)
+                .filter_map(|action| resolve_group_command(&source, &action))
+                .collect::<Vec<_>>();
+            let row_actions = row_commands(&source, area, &group.rows()[0], false)
+                .into_iter()
+                .filter_map(|command| command.action)
+                .collect::<Vec<_>>();
+            for actions in [&group_actions, &row_actions] {
+                assert!(actions.iter().any(|action| match area {
+                    ChangeArea::Staged => matches!(action, SidebarAction::Unstage { .. }),
+                    _ => matches!(action, SidebarAction::Stage { .. }),
+                }), "stage and unstage intentions must reach the serialized queue");
+                assert!(!actions.iter().any(|action| matches!(
+                    action, SidebarAction::RequestDiscard { .. }
+                )), "discard remains unavailable while a mutation runs");
+            }
+            for commands in [
+                group_commands(&source, group, true),
+                row_commands(&source, area, &group.rows()[0], true),
+            ] {
+                assert!(commands.iter().all(|command| command.action.is_none()),
+                    "an open dialog still withholds every command");
+            }
+        }
     }
 
     #[test]
@@ -17072,6 +17737,21 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn history_actions_pin_the_message_and_merge_parent_from_the_rendered_commit() {
+        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
+        let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![oid_of(1), oid_of(2)], author: identity.clone(), committer: identity, subject: "Merge subject".into(), body: "Body line\n".into() });
+        let key = main_key();
+        let action = widget::menu::Action::message(&HistoryContextCommand { key: &key, row: &row, command: HistoryCommand::Revert });
+        let message = Arc::clone(&row.message);
+        drop(row);
+        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = action else { panic!("expected a history command"); };
+        assert_eq!(oid, oid_of(3));
+        assert_eq!(mainline, Some(1));
+        assert_eq!(captured.as_ref(), "Merge subject\n\nBody line\n");
+        assert!(Arc::ptr_eq(&captured, &message));
     }
 
     #[test]
