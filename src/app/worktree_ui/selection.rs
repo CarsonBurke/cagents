@@ -35,7 +35,7 @@ struct Prepared {
 }
 
 #[derive(Clone)]
-pub(in crate::app) struct Receipt(Arc<Mutex<Option<(PathBuf, u64, Intent, Result<Prepared, String>)>>>);
+pub(in crate::app) struct Receipt(Arc<Mutex<Option<(PathBuf, u64, HashSet<PathBuf>, Intent, Result<Prepared, String>)>>>);
 impl std::fmt::Debug for Receipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PreparedWorktreeSelection")
@@ -112,34 +112,41 @@ impl Cagents {
         &self, generation: u64, path: PathBuf, create: bool, intent: Intent, epoch: u64,
         prepare: impl FnOnce(PathBuf) -> Result<(PathBuf, Vec<(PathBuf,PathBuf)>, Option<crate::worktree_cleanup::Protection>),String> + Send + 'static,
     ) -> Task<Message> {
+        let roots = self.known_worktree_roots.clone();
         cosmic::task::future(async move {
             let requested = path.clone();
             let result = tokio::task::spawn_blocking(move || prepare(path)).await
                 .map_err(|error| error.to_string()).and_then(|value| value)
                 .map(|(path,canonical,guard)| Prepared {path,canonical,guard});
             Message::WorktreeSelectionPrepared { generation, create,
-                receipt: Receipt(Arc::new(Mutex::new(Some((requested,epoch,intent,result))))) }
+                receipt: Receipt(Arc::new(Mutex::new(Some((requested,epoch,roots,intent,result))))) }
         })
     }
 
     pub(in crate::app) fn worktree_selection_prepared(&mut self, generation: u64, create: bool, receipt: Receipt) -> Task<Message> {
-        let Some((requested,epoch,intent,result)) = receipt.0.lock().unwrap().take() else { return Task::none(); };
+        let Some((requested,epoch,roots,intent,result)) = receipt.0.lock().unwrap().take() else { return Task::none(); };
         if generation != self.worktree_selection.generation || !self.worktree_selection.pending {
             // Dropping an obsolete receipt releases its unexposed lease.
+            self.abandon_worktree_selection(intent);
             return Task::none();
         }
         self.worktree_selection.pending = false;
-        if epoch != self.worktree_owner_paths.watch.epoch() {
+        self.refresh_worktree_owners(Some(&requested));
+        if roots != self.known_worktree_roots || epoch != self.worktree_owner_paths.watch.epoch() {
             return self.select_worktree_then(requested,create,intent);
         }
         let prepared = match result {
             Ok(prepared) => prepared,
             Err(error) => {
+                self.abandon_worktree_selection(intent);
                 self.status = Some(TransientNotice::warning(format!("Cannot open this worktree yet: {error}")));
                 return Task::none();
             }
         };
-        if self.refuse_in_deleting_worktree(&prepared.path) { return Task::none(); }
+        if self.refuse_in_deleting_worktree(&prepared.path) {
+            self.abandon_worktree_selection(intent);
+            return Task::none();
+        }
         self.worktree_protections.install_prepared(prepared.guard);
         self.worktree_protection_sync.invalidate();
         self.worktree_owner_paths.cached.extend(prepared.canonical);
@@ -154,6 +161,10 @@ impl Cagents {
         self.worktree_selection.initialize_runtimes = false;
         let initialize = self.initialize_runtimes();
         Task::batch([initialize,self.ensure_default_pane()])
+    }
+
+    fn abandon_worktree_selection(&mut self, intent: Intent) {
+        if let Intent::Delete(target) = intent { self.cancel_prepared_worktree_deletion(target); }
     }
 
     fn finish_worktree_selection(&mut self, intent: Intent) -> Task<Message> {

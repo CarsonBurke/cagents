@@ -13,6 +13,7 @@ pub(super) struct OwnerPaths {
     queued: HashSet<PathBuf>,
     inflight: HashSet<PathBuf>,
     inflight_generation: Option<u64>,
+    inflight_epoch: Option<u64>,
     active: HashSet<PathBuf>,
     watch_dirty: bool,
     generation: u64,
@@ -33,6 +34,7 @@ impl OwnerPaths {
     fn take_batch(&mut self) -> Option<(u64, Vec<PathBuf>)> {
         if self.inflight_generation.is_some() || (self.queued.is_empty() && !self.watch_dirty) { return None; }
         self.generation = self.generation.wrapping_add(1);
+        self.inflight_epoch = Some(self.watch.epoch());
         self.inflight_generation = Some(self.generation);
         self.watch_dirty = false;
         self.inflight = std::mem::take(&mut self.queued);
@@ -41,6 +43,14 @@ impl OwnerPaths {
 
     fn finish(&mut self, generation: u64, paths: Vec<(PathBuf, PathBuf)>) -> bool {
         if self.inflight_generation != Some(generation) { return false; }
+        if self.inflight_epoch != Some(self.watch.epoch()) {
+            self.invalidate_watched();
+            self.queued.extend(self.inflight.drain().filter(|path|self.active.contains(path)));
+            self.queued.extend(self.invalidated.drain());
+            self.inflight_generation = None;
+            self.inflight_epoch = None;
+            return false;
+        }
         for (path, resolved) in paths {
             if self.inflight.contains(&path) && self.active.contains(&path) && !self.invalidated.contains(&path) {
                 self.cached.insert(path, resolved);
@@ -49,6 +59,7 @@ impl OwnerPaths {
         self.queued.extend(self.invalidated.drain());
         self.inflight.clear();
         self.inflight_generation = None;
+        self.inflight_epoch = None;
         true
     }
 
@@ -2621,6 +2632,50 @@ mod owner_path_cache_tests {
             }
         }
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn repository_loaded_with_unchanged_roots_schedules_no_canonicalization() {
+        use cosmic::Application as _;
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let project = ProjectId::new();
+        let repository_id = RepositoryId::new();
+        let records = (0..12).map(|index| {
+            let path = root.join(format!("worktree-{index}"));
+            std::fs::create_dir(&path).unwrap();
+            WorktreeRecord {id:crate::model::WorktreeId::new(),path,created_at_unix_ms:None,
+                head_oid:None,branch:None,detached:false,bare:false,lock:Default::default(),prunable_reason:None}
+        }).collect::<Vec<_>>();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects = vec![SidebarProject::new(project,repository_id,"fixture".into(),root.clone(),
+            records.iter().map(|record|SidebarWorktree::from_repository(record,None)).collect(),Vec::new())];
+        app.refresh_worktree_owners(None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let task = app.resolve_worktree_owner_paths_with(move |path| {
+            counted.fetch_add(1,Ordering::Relaxed); path.canonicalize()
+        });
+        let Message::WorktreeOwnerPathsResolved {generation,paths} = super::super::tests::task_app_message(task) else {panic!("unexpected owner result")};
+        assert!(app.worktree_owner_paths.finish(generation,paths));
+        let initial = calls.load(Ordering::Relaxed);
+        assert!(initial >= 12);
+        let loaded = LoadedRepository {
+            project: ProjectState {id:project,generation:0,name:"fixture".into(),repository:root.clone(),
+                kind:crate::model::ProjectKind::Git,existence:Existence::Open},
+            repository:Some(RepositoryInfo {id:repository_id,selected_path:root.clone(),common_dir:root.join(".git"),
+                git_dir:root.join(".git"),worktree_root:Some(root),is_bare:false}),
+            worktrees:records.into_iter().map(|record|(record,None)).collect(),github:GitHubAvailability::NotAssociated,
+            review_repository:None,head_repositories:HashMap::new(),
+        };
+        for generation in 1..=3 {
+            app.repository_generations.insert(project,generation);
+            drop(app.update(Message::RepositoryLoaded {open_cards:false,project_id:project,generation,result:Ok(Box::new(loaded.clone()))}));
+            assert!(app.worktree_owner_paths.inflight_generation.is_none(),"unchanged reload scheduled owner I/O");
+            assert!(app.worktree_owner_paths.take_batch().is_none());
+            assert_eq!(calls.load(Ordering::Relaxed),initial);
+        }
     }
 
     #[test]

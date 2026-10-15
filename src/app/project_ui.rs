@@ -1483,6 +1483,15 @@ impl Cagents {
         Task::batch([leave, self.run_worktree_deletion(target)])
     }
 
+    /// A newer navigation or failed preflight did not authorize exposing an
+    /// unprotected destination. No deletion has started, so release its row.
+    pub(super) fn cancel_prepared_worktree_deletion(&mut self, target: Target) {
+        if let Some(id) = target.worktree {
+            self.project_ui.deletions.remove(&id);
+            self.sync_worktree_operation_rows();
+        }
+    }
+
     /// Runs the deletion once no session in the worktree is still starting:
     /// one that is would come up after its directory had been emptied.
     pub(super) fn run_worktree_deletion(&mut self, target: Target) -> Task<Message> {
