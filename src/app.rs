@@ -23153,14 +23153,15 @@ fn read_loaded_repository<E: crate::repository::ProcessExecutor>(
         .map(|worktree| {
             let status = (!worktree.bare)
                 .then(|| {
-                    display_service
-                        .status_projection(
-                            &worktree.path,
-                            true,
-                            git_ui::SIDEBAR_STATUS_LIMIT,
-                            &cancellation,
-                        )
-                        .ok()
+                    if worktree.path == repository.selected_path {
+                        service.status_projection(&worktree.path, true,
+                            git_ui::SIDEBAR_STATUS_LIMIT, cancellation).ok()
+                    } else {
+                        // Other rows are display projections only; the retained
+                        // creation source never authorizes a sibling worktree.
+                        display_service.status_projection(&worktree.path, true,
+                            git_ui::SIDEBAR_STATUS_LIMIT, cancellation).ok()
+                    }
                 })
                 .flatten();
             (worktree, status)
@@ -23170,7 +23171,14 @@ fn read_loaded_repository<E: crate::repository::ProcessExecutor>(
         .iter()
         .filter_map(|(record, _)| {
             let branch = record.branch.as_deref()?.strip_prefix("refs/heads/")?;
-            let key = crate::github::worktree_head_repository(&record.path, branch, &cancellation)?;
+            let key = if record.path == repository.selected_path {
+                let branch = crate::repository::ValidatedBranchName::parse(branch).ok()?;
+                let remote = service.branch_remote(&record.path, &branch, cancellation).ok()??;
+                remote.push_url.as_deref().or(remote.fetch_url.as_deref())
+                    .and_then(crate::github::remote_repository_key)?
+            } else {
+                crate::github::worktree_head_repository(&record.path, branch, cancellation)?
+            };
             Some((record.id, key))
         })
         .collect();
