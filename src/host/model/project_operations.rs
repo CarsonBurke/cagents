@@ -90,7 +90,8 @@ pub(crate) struct Obligation {
 }
 
 // EXACT future-controller DDL leaf; no user_version or selected18 mutation.
-// The controller invokes this inside its own crash-safe migration transaction.
+// The sole outer controller installs these exact objects in its crash-safe
+// migration transaction. This runtime module exposes no migration entry point.
 pub(crate) const CREATE_TABLE: &str = "CREATE TABLE project_operation_obligations (
  operation TEXT PRIMARY KEY CHECK(length(operation)=36),
  registry TEXT NOT NULL CHECK(length(registry)=36),
@@ -107,10 +108,6 @@ pub(crate) const CREATE_TABLE: &str = "CREATE TABLE project_operation_obligation
 CREATE INDEX project_operation_obligations_pending_project
  ON project_operation_obligations(registry,repository,project_ordinal)
  WHERE phase NOT IN ('resolved','aborted');";
-
-pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
-    tx.execute_batch(CREATE_TABLE).map_err(|error| error.to_string())
-}
 
 struct BoundedWriter<W> {inner:W,remaining:usize}
 impl<W:io::Write> io::Write for BoundedWriter<W> {
