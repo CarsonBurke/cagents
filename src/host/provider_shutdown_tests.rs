@@ -1,6 +1,7 @@
 //! Actual private holder/receipt failure through the provider shutdown caller.
 //! This exercises local lifecycle ownership, not a real provider conversation.
 use super::*;
+use std::os::unix::fs::OpenOptionsExt;
 use crate::{
     model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
     terminal::{TerminalConfig, TerminalHandle},
@@ -15,15 +16,105 @@ use std::{
 
 const ROOT: &str = "CAGENTS_PROVIDER_SHUTDOWN_ROOT";
 
-struct TestChild(Child);
-
+struct TestChild {
+    child: Option<Child>,
+    pin: Option<File>,
+    reservation: Option<crate::daemon::child_reaper::Reservation>,
+    signal_allowed: bool,
+}
+impl TestChild {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        let reservation = crate::daemon::child_reaper::reserve()?;
+        let child = command.spawn()?;
+        let mut owner = Self { child: Some(child), pin: None, reservation: Some(reservation), signal_allowed: false };
+        let pid = owner.child.as_ref().unwrap().id() as i32;
+        let before = crate::daemon::holder_registry::Process::read(pid)?;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 { return Err(io::Error::last_os_error()); }
+        owner.pin = Some(unsafe { File::from_raw_fd(fd as i32) });
+        if crate::daemon::holder_registry::Process::read(pid)? != before { return Err(io::Error::other("fixture child changed before pidfd capture")); }
+        // A retained original Child plus a live kernel-child pidfd establishes
+        // authority; no late numeric PID is used for cancellation or waiting.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::waitid(libc::P_PIDFD, fd as libc::id_t, &raw mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        owner.signal_allowed = true;
+        Ok(owner)
+    }
+    fn status(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.as_mut().expect("original fixture child is owned").try_wait()?;
+        if status.is_some() {
+            self.child.take(); self.pin.take(); self.reservation.take();
+        }
+        Ok(status)
+    }
+}
 impl Drop for TestChild {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        let Some(mut child) = self.child.take() else { return; };
+        if matches!(child.try_wait(), Ok(Some(_))) { return; }
+        let reservation = self.reservation.take().expect("reserved before spawn");
+        reservation.quarantine();
+        let Some(pin) = self.pin.take() else {
+            reservation.preserve_suspended(child, None, "fixture pidfd capture failed");
+            return;
+        };
+        if !self.signal_allowed {
+            reservation.preserve_suspended(child, Some(pin), "fixture pidfd kernel-child verification failed");
+            return;
+        }
+        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pin.as_raw_fd(), libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(), 0); }
+        // Never block the test thread in wait(). Failed transfer retains every
+        // original object in its preallocated suspended slot.
+        if let Err((error, child, pin, reservation)) = reservation.retain(child, pin) {
+            reservation.preserve_suspended(child, Some(pin), &error.to_string());
         }
     }
+}
+
+struct FixtureDirectory(Option<tempfile::TempDir>);
+impl Drop for FixtureDirectory {
+    fn drop(&mut self) {
+        if let Some(directory) = self.0.take() { directory.keep(); }
+    }
+}
+const LOG_LIMIT: usize = 1024 * 1024;
+struct Captured<R> { pipe: R, log: File, bytes: Vec<u8>, truncated: bool }
+impl<R: io::Read + AsRawFd> Captured<R> {
+    fn new(pipe: R, path: &Path) -> io::Result<Self> {
+        let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let log = fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path)?;
+        Ok(Self { pipe, log, bytes: Vec::new(), truncated: false })
+    }
+    fn drain(&mut self) -> io::Result<()> {
+        use io::{Read, Write};
+        let mut chunk = [0u8; 8192];
+        // Output cannot monopolize the parent deadline. Excess is consumed and
+        // discarded without increasing disk or memory residency.
+        for _ in 0..16 {
+            match self.pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let kept = count.min(LOG_LIMIT - self.bytes.len());
+                    self.log.write_all(&chunk[..kept])?;
+                    self.bytes.extend_from_slice(&chunk[..kept]);
+                    self.truncated |= kept != count;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+    fn text(&self) -> std::borrow::Cow<'_, str> { String::from_utf8_lossy(&self.bytes) }
 }
 
 fn session(id: u128, root: &Path) -> TerminalSession {
@@ -82,59 +173,59 @@ fn start_time(pid: u32) -> io::Result<String> {
         .into())
 }
 
+// A failed procfs inspection cannot count as original-process reaping.
+fn original_is_current(expected: &crate::daemon::holder_registry::Process) -> bool {
+    match crate::daemon::holder_registry::Process::read(expected.pid) {
+        Ok(actual) => actual == *expected,
+        Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => false,
+        Err(error) => panic!("inspect the pinned original fixture process: {error}"),
+    }
+}
+
 fn private_runtime(test: &str) -> Option<std::path::PathBuf> {
     let Some(root) = std::env::var_os(ROOT) else {
-        // Do not mutate process-wide XDG variables in a parallel test runner.
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let root = directory.path().canonicalize().unwrap();
+        let directory = FixtureDirectory(Some(tempfile::tempdir_in("/var/tmp").unwrap()));
+        let root = directory.0.as_ref().unwrap().path().canonicalize().unwrap();
         for name in ["home", "run", "data", "config", "cache"] {
             fs::create_dir(root.join(name)).unwrap();
             fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let stdout = root.join("test.stdout");
-        let stderr = root.join("test.stderr");
-        let mut child = TestChild(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", test, "--nocapture"])
-                .env_clear()
-                .env(ROOT, &root)
-                .env("HOME", root.join("home"))
-                .env("XDG_RUNTIME_DIR", root.join("run"))
-                .env("XDG_DATA_HOME", root.join("data"))
-                .env("XDG_CONFIG_HOME", root.join("config"))
-                .env("XDG_CACHE_HOME", root.join("cache"))
-                .env("PATH", "/usr/bin:/bin")
-                .stdout(Stdio::from(File::create(&stdout).unwrap()))
-                .stderr(Stdio::from(File::create(&stderr).unwrap()))
-                .spawn()
-                .unwrap(),
-        );
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut child = TestChild::spawn(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1", "--color=never"])
+            .env_clear().env(ROOT, &root)
+            .env("HOME", root.join("home"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("PATH", "/usr/bin:/bin")
+            .stdout(Stdio::piped()).stderr(Stdio::piped())).unwrap();
+        let mut stdout = Captured::new(child.child.as_mut().unwrap().stdout.take().unwrap(), &root.join("test.stdout")).unwrap();
+        let mut stderr = Captured::new(child.child.as_mut().unwrap().stderr.take().unwrap(), &root.join("test.stderr")).unwrap();
         let status = loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                break Some(status);
-            }
-            if Instant::now() >= deadline {
-                child.0.kill().unwrap();
-                child.0.wait().unwrap();
-                break None;
-            }
-            thread::sleep(Duration::from_millis(10));
+            stdout.drain().unwrap(); stderr.drain().unwrap();
+            if let Some(status) = child.status().unwrap() { break Some(status); }
+            if Instant::now() >= deadline { break None; }
+            thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(5)));
         };
-        let stdout = fs::read_to_string(stdout).unwrap();
-        let stderr = fs::read_to_string(stderr).unwrap();
-        let failure_root = if status.is_some_and(|status| status.success()) {
-            None
-        } else {
-            // A timed-out child may still have discoverable private holders;
-            // keep their evidence rather than unlinking their private runtime.
-            Some(directory.keep())
-        };
-        assert!(
-            status.is_some_and(|status| status.success()),
-            "isolated provider shutdown failed or exceeded 30s; retained {failure_root:?}:\n{stdout}\n{stderr}"
-        );
-        assert!(stdout.contains("1 passed"));
+        // If timed out, Drop signals only the prevalidated original pidfd and
+        // transfers the original Child into its already-reserved reaper slot.
+        // No blocking wait or unbounded reader-thread join follows a deadline.
+        drop(child);
+        stdout.drain().unwrap(); stderr.drain().unwrap();
+        let output = stdout.text();
+        assert!(status.is_some_and(|status| status.success()),
+            "private provider shutdown failed or exceeded30s; retained {}:\n{}\n{}", root.display(), output, stderr.text());
+        assert!(!stdout.truncated && !stderr.truncated, "fixture output exceeded bounded logs at {}", root.display());
+        assert_eq!(output.lines().filter(|line| *line == "running 1 test").count(), 1, "{output}");
+        let passed = format!("test {test} ... ok");
+        assert_eq!(output.lines().filter(|line| *line == passed).count(), 1, "{output}");
+        assert_eq!(output.lines().filter(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")).count(), 1, "{output}");
+        // Keep the bounded private artifacts until the external strict wrapper
+        // independently proves whole-family settlement; Child exit alone does
+        // not establish that every fixture descendant has finished.
+        drop(directory);
         return None;
     };
     Some(std::path::PathBuf::from(root).canonicalize().unwrap())
@@ -250,7 +341,7 @@ fn provider_shutdown_failure_is_reported_while_healthy_owners_are_reaped() {
     let record = registry::evidence(&registry::socket(&directory, id), Kind::Native)
         .unwrap()
         .unwrap();
-    assert!(record.root.is_current());
+    assert!(original_is_current(&record.root));
     let receipt = directory.join(format!(
         "{id}-{}-{}.closed",
         record.holder.pid, record.holder.start
@@ -326,7 +417,7 @@ fn provider_shutdown_failure_is_reported_while_healthy_owners_are_reaped() {
     );
     assert!(!failed.is_completed());
     assert!(
-        record.root.is_current(),
+        original_is_current(&record.root),
         "failed proof must retain the exact actual provider owner"
     );
     assert!(
@@ -347,7 +438,7 @@ fn provider_shutdown_failure_is_reported_while_healthy_owners_are_reaped() {
     }
     assert!(started.elapsed() < Duration::from_secs(12));
     assert!(
-        record.root.is_current(),
+        original_is_current(&record.root),
         "unrelated healthy cleanup must not terminate the retained provider"
     );
     // The same owned capability can make progress after its exact transient
@@ -355,7 +446,7 @@ fn provider_shutdown_failure_is_reported_while_healthy_owners_are_reaped() {
     fs::remove_file(&receipt).unwrap();
     failed.close().unwrap();
     assert!(failed.is_completed());
-    assert!(!record.root.is_current());
+    assert!(!original_is_current(&record.root));
     drop(cleanup);
 }
 
@@ -416,7 +507,7 @@ fn retained_chat(
     let record = registry::evidence(&registry::socket(&directory, id), Kind::Native)
         .unwrap()
         .unwrap();
-    assert!(record.root.is_current());
+    assert!(original_is_current(&record.root));
     let handle = quiet_chat(root);
     handle.close().unwrap();
     handle.fixture_retained_native_holder(holder, "Native teardown remains unconfirmed".into());
@@ -462,7 +553,7 @@ fn two_contended_provider_owners_do_not_starve_a_healthy_chat_or_terminal() {
     let healthy_descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, healthy_process.pid, 0) };
     assert!(healthy_descriptor >= 0);
     let _healthy_pin = RootPin(unsafe { File::from_raw_fd(healthy_descriptor as i32) });
-    assert!(healthy_process.is_current());
+    assert!(original_is_current(&healthy_process));
     let mut healthy_source = first_source.clone();
     healthy_source.id = TerminalId::from_uuid(Uuid::from_u128(3));
     healthy_source.owned_codex_listener = None;
@@ -536,7 +627,7 @@ fn two_contended_provider_owners_do_not_starve_a_healthy_chat_or_terminal() {
         assert!(started.elapsed() < Duration::from_secs(3), "{error}");
         for record in [&first_record, &second_record] {
             assert!(
-                record.root.is_current(),
+                original_is_current(&record.root),
                 "uncertainty must preserve this exact retained child"
             );
             assert!(error.contains(&record.terminal.to_string()), "{error}");
@@ -548,7 +639,7 @@ fn two_contended_provider_owners_do_not_starve_a_healthy_chat_or_terminal() {
             "two contended owners prevented the third provider's close"
         );
         assert!(
-            !healthy_process.is_current(),
+            !original_is_current(&healthy_process),
             "the exact healthy provider child was not reaped"
         );
         assert_eq!(finish_terminal_shutdown(&terminals), vec![Ok(())]);
@@ -563,7 +654,7 @@ fn two_contended_provider_owners_do_not_starve_a_healthy_chat_or_terminal() {
                     || error.raw_os_error() == Some(libc::ESRCH) => {}
             Err(error) => panic!("inspect the healthy terminal root: {error}"),
         }
-        assert!(first_record.root.is_current() && second_record.root.is_current());
+        assert!(original_is_current(&first_record.root) && original_is_current(&second_record.root));
         drop(release_first);
         drop(release_second);
     });
@@ -572,7 +663,7 @@ fn two_contended_provider_owners_do_not_starve_a_healthy_chat_or_terminal() {
     first.close().unwrap();
     second.close().unwrap();
     assert!(first.is_completed() && second.is_completed());
-    assert!(!first_record.root.is_current() && !second_record.root.is_current());
+    assert!(!original_is_current(&first_record.root) && !original_is_current(&second_record.root));
 }
 
 #[test]
@@ -619,4 +710,63 @@ fn semantic_batch_keeps_more_sources_than_its_ticket_capacity() {
             .values()
             .all(|record| record.handle.is_completed())
     );
+}
+
+
+#[test]
+fn fixture_child_drop_reaps_only_the_original_and_preserves_its_neighbor() {
+    const TEST: &str = "host::provider_shutdown_tests::fixture_child_drop_reaps_only_the_original_and_preserves_its_neighbor";
+    let Some(root) = private_runtime(TEST) else { return; };
+    assert!(!crate::daemon::child_reaper::has_outstanding_ownership());
+    let spawn = || TestChild::spawn(Command::new("/bin/sleep").arg("60")
+        .env_clear().current_dir(&root).stdin(Stdio::null())
+        .stdout(Stdio::null()).stderr(Stdio::null())).unwrap();
+    let original = spawn();
+    let neighbor = spawn();
+    let first = crate::daemon::holder_registry::Process::read(original.child.as_ref().unwrap().id() as i32).unwrap();
+    let other = crate::daemon::holder_registry::Process::read(neighbor.child.as_ref().unwrap().id() as i32).unwrap();
+    assert!(original_is_current(&first) && original_is_current(&other));
+    drop(original);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while original_is_current(&first) {
+        assert!(Instant::now() < deadline, "the exact original Child was not reaped");
+        assert!(original_is_current(&other), "fixture cleanup touched its neighboring owner");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(original_is_current(&other));
+    drop(neighbor);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while original_is_current(&other) || crate::daemon::child_reaper::has_outstanding_ownership() {
+        assert!(Instant::now() < deadline, "fixture cleanup still owns an original child or reservation");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn fixture_output_overflow_is_bounded_and_cannot_count_as_a_passing_oracle() {
+    use io::Write;
+    use std::os::unix::net::UnixStream;
+    const TEST: &str = "host::provider_shutdown_tests::fixture_output_overflow_is_bounded_and_cannot_count_as_a_passing_oracle";
+    let Some(root) = private_runtime(TEST) else { return; };
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let path = root.join("overflow.log");
+    let mut capture = Captured::new(reader, &path).unwrap();
+    let bytes = [b'x'; 8192];
+    let mut sent = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sent < LOG_LIMIT + bytes.len() {
+        assert!(Instant::now() < deadline, "bounded fixture capture made no progress");
+        match writer.write(&bytes) {
+            Ok(count) => sent += count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error) => panic!("write fixture overflow: {error}"),
+        }
+        capture.drain().unwrap();
+    }
+    drop(writer);
+    capture.drain().unwrap();
+    assert!(capture.truncated, "excess output must refuse fixture success");
+    assert_eq!(capture.bytes.len(), LOG_LIMIT);
+    assert_eq!(fs::metadata(path).unwrap().len(), LOG_LIMIT as u64);
 }
