@@ -40,7 +40,7 @@ clean_env() {
 clean_env /bin/sh "$source_dir/configure" --disable-shared --disable-tcl
 clean_env make -j2 B.tclsh=tclsh sqlite3.c sqlite3.h
 grep -Eq '^#define SQLITE_VERSION +"3\.50\.7"$' sqlite3.h
-grep -F "$expected_source" sqlite3.h >/dev/null
+grep -Eq "^#define SQLITE_SOURCE_ID +\"2026-03-05 01:44:06 $expected_source\"$" sqlite3.h
 cp sqlite3.c sqlite3.h sqlite3ext.h "$output/"
 cd "$output"
 sha256sum sqlite3.c sqlite3.h sqlite3ext.h > generated.sha256
