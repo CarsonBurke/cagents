@@ -19,6 +19,21 @@ pub(super) fn transcript<'a>(
     follow_end: bool,
     items: Vec<(Id, &'a str)>,
 ) -> Element<'a, Message> {
+    transcript_impl(content.into(), target, subagent, anchors, follow_end, items, None)
+}
+
+pub(super) type Observations = Rc<std::cell::RefCell<HashMap<Option<String>, Scroll>>>;
+
+pub(super) fn transcript_observed<'a>(
+    content: impl Into<Element<'a, Message>>, target: Target, subagent: Option<&'a str>,
+    anchors: Vec<(usize, &'a str)>, follow_end: bool, items: Vec<(Id, &'a str)>, observations: Observations,
+) -> Element<'a, Message> {
+    transcript_impl(content.into(), target, subagent, anchors, follow_end, items, Some(observations))
+}
+
+fn transcript_impl<'a>(content: Element<'a, Message>, target: Target, subagent: Option<&'a str>,
+    anchors: Vec<(usize, &'a str)>, follow_end: bool, items: Vec<(Id, &'a str)>, observations: Option<Observations>,
+) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
         content: content.into(),
@@ -39,6 +54,7 @@ pub(super) fn transcript<'a>(
         anchors,
         follow_end,
         items,
+        observations,
     })
 }
 
@@ -53,6 +69,7 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         anchors: Vec::new(),
         follow_end: true,
         items: Vec::new(),
+        observations: None,
     })
 }
 
@@ -155,6 +172,7 @@ struct Anchored<'a> {
     anchors: Vec<(usize, &'a str)>,
     follow_end: bool,
     items: Vec<(Id, &'a str)>,
+    observations: Option<Observations>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -785,7 +803,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     top,
                     geometry,
                 });
-                if let Some(target) = self.target {
+                if let Some(observations) = &self.observations {
+                    observations.borrow_mut().insert(self.subagent.map(str::to_owned), scroll);
+                }
+                // Native geometry is shared directly with the Runtime. Only
+                // navigation needs a model message; a streamed height change
+                // must not cause another complete update/view/layout cycle.
+                if let Some(target) = self.target.filter(|_| self.observations.is_none() || user_input) {
                     shell.publish(action(Action::Scrolled(
                         target,
                         self.subagent.map(str::to_owned),
@@ -913,6 +937,40 @@ mod tests {
             Some(0.0)
         );
         anchor
+    }
+
+    #[test]
+    fn native_geometry_updates_the_reader_without_echoing_a_model_message() {
+        let renderer = crate::app::tests::headless_renderer();
+        let observations: Observations = Default::default();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let make = |height| transcript_observed(widget::Space::new().height(height).width(Length::Fill),
+            target, None, vec![], true, vec![], observations.clone());
+        let bounds = Rectangle::with_size(Size::new(400.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, bounds.size());
+        let mut element = make(100.0);
+        let mut tree = Tree::new(&element);
+        let mut messages = Vec::new();
+        for height in [100.0, 2000.0, 4000.0] {
+            element = make(height);
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().update(&mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), Layout::new(&node),
+                mouse::Cursor::Unavailable, &renderer, &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages), &bounds);
+            assert!(messages.is_empty(), "streamed geometry does not enqueue another model/view cycle");
+            let scroll = observations.borrow()[&None];
+            assert_eq!(scroll.content(), height);
+            assert!(scroll.at_bottom(), "the direct observation keeps authoritative native geometry");
+        }
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 } }), Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)), &renderer,
+            &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::Scrolled(_, None, _, true)))), "user navigation still drives paging");
     }
 
     #[test]

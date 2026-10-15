@@ -1509,6 +1509,7 @@ pub(super) struct Runtime {
     /// the snapshot changes rather than once per frame.
     turns: Vec<turn::Turn>,
     selected_subagent: Option<String>,
+    observed_scroll: scroll::Observations,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -2099,6 +2100,7 @@ impl Runtime {
             syntax_theme,
             turns: Vec::new(),
             selected_subagent: None,
+            observed_scroll: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -2156,6 +2158,7 @@ impl Runtime {
         self.page_request = None;
         self.deferred_page = None;
         self.scroll = view::Scroll::default();
+        self.observed_scroll.borrow_mut().clear();
         self.asked_after.clear();
         self.asked.clear();
         self.find_disclosure = find::Disclosure::default();
@@ -2253,11 +2256,16 @@ impl Runtime {
             .or_else(chat::now_ms)
     }
 
+    fn parent_scroll(&self) -> view::Scroll {
+        self.observed_scroll.borrow().get(&None).copied().unwrap_or(self.scroll)
+    }
     fn active_scroll(&self) -> view::Scroll {
-        match self.selected_subagent.as_ref() {
-            Some(id) => self.subagent_scroll.get(id).copied().unwrap_or_default(),
-            None => self.scroll,
-        }
+        self.observed_scroll.borrow().get(&self.selected_subagent).copied().unwrap_or_else(|| {
+            match self.selected_subagent.as_ref() {
+                Some(id) => self.subagent_scroll.get(id).copied().unwrap_or_default(),
+                None => self.scroll,
+            }
+        })
     }
     fn refresh(&mut self) {
         self.refresh_session();
@@ -2298,6 +2306,7 @@ impl Runtime {
         }
         self.subagent_scroll
             .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
+        self.observed_scroll.borrow_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
         self.settle_recalls(&snapshot);
         self.taken_back.retain(|id| {
             snapshot
@@ -2311,7 +2320,7 @@ impl Runtime {
                     draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
                 });
         }
-        if !self.scroll.at_bottom()
+        if !self.parent_scroll().at_bottom()
             && !snapshot.has_later
             && self.page_request.is_none()
             && !snapshot.history_loading
@@ -5601,8 +5610,8 @@ impl Cagents {
         match page {
             HistoryNavigation::Latest => self.handle_chat_action(Action::Latest(target)),
             HistoryNavigation::NewerEdge
-                if runtime.scroll.at_bottom()
-                    && !runtime.scroll.at_top()
+                if runtime.parent_scroll().at_bottom()
+                    && !runtime.parent_scroll().at_top()
                     && runtime.snapshot.has_later =>
             {
                 self.chat_send(target, Command::LoadLater, false)
@@ -5611,8 +5620,8 @@ impl Cagents {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
             HistoryNavigation::EarlierEdge
-                if runtime.scroll.at_top()
-                    && !runtime.scroll.at_bottom()
+                if runtime.parent_scroll().at_top()
+                    && !runtime.parent_scroll().at_bottom()
                     && runtime.snapshot.has_earlier =>
             {
                 self.chat_send(target, Command::LoadEarlier, false)
@@ -5700,9 +5709,9 @@ impl Cagents {
         if let Some(page) = page {
             runtime.page_request = Some((page, runtime.snapshot.generation));
             match page {
-                view::Page::Earlier => runtime.earlier_asked = Some(runtime.scroll.content()),
+                view::Page::Earlier => runtime.earlier_asked = Some(runtime.parent_scroll().content()),
                 view::Page::Newer | view::Page::Latest => {
-                    runtime.later_asked = Some(runtime.scroll.content())
+                    runtime.later_asked = Some(runtime.parent_scroll().content())
                 }
             }
         }
