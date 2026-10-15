@@ -7998,6 +7998,25 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_cache_notices_truncation_even_when_the_retained_prefix_is_identical() {
+        let mut outputs = vec![success(b""), success(b"? first.txt\0")];
+        outputs.extend((0..6).map(|_| success(b"")));
+        outputs.extend([success(b"? first.txt\0? second.txt\0"), success(b""), success(b"")]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor);
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::new();
+        let options = SnapshotOptions { status_limit: Some(1), untracked_changes: true, untracked_files: false };
+        let first = git.snapshot_cached(Path::new("/snapshot-limit-test"), options, &cancel, &mut cache).unwrap().unwrap();
+        assert_eq!(first.status.entries.len(), 1);
+        assert!(!first.status.listing_truncated);
+        let next = git.snapshot_cached(Path::new("/snapshot-limit-test"), options, &cancel, &mut cache).unwrap()
+            .expect("a newly truncated snapshot must update its lower-bound notice");
+        assert_eq!(next.status.entries, first.status.entries);
+        assert!(next.status.listing_truncated);
+    }
+
+    #[test]
     fn snapshot_cache_status_or_content_change_reuses_metadata() {
         let mut outputs = (0..8).map(|_| success(b"")).collect::<Vec<_>>();
         outputs.extend([success(b"? new.txt\0"), success(b""), success(b"")]);
