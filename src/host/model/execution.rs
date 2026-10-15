@@ -1694,15 +1694,25 @@ mod tests {
                 repository: directory.path().into(),
                 path: directory.path().into(),
             };
-            registry.apply(&ModelEdit::SeedView {
-                scope: initial.clone(), panes: vec![pane.clone()], closed: vec![],
-            }).unwrap();
-            registry.apply(&ModelEdit::ChangeView {
-                scope: initial.clone(),
-                expected_revision: registry.view_revision(&initial).unwrap(),
-                operation: uuid::Uuid::new_v4(),
-                change: Change::Transfer { id: pane.id, destination: moved.clone(), before: None },
-            }).unwrap();
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: initial.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: initial.clone(),
+                    expected_revision: registry.view_revision(&initial).unwrap(),
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Transfer {
+                        id: pane.id,
+                        destination: moved.clone(),
+                        before: None,
+                    },
+                })
+                .unwrap();
             let before = registry.model().unwrap();
             let run = registry.agent_run(accepted.run.id).unwrap();
             let retained = registry.agent(accepted.agent.id).unwrap().session.unwrap();
@@ -1719,7 +1729,10 @@ mod tests {
                 assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
                 drop(registry);
                 let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-                assert_eq!(super::super::views::read(&registry.db, &moved).unwrap(), view);
+                assert_eq!(
+                    super::super::views::read(&registry.db, &moved).unwrap(),
+                    view
+                );
                 assert!(registry.agent(accepted.agent.id).unwrap().closed);
                 assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
             }

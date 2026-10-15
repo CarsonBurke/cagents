@@ -944,16 +944,30 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     let HostedSession::Chat(parent_chat) = parent.session.as_ref().unwrap() else {
         unreachable!()
     };
-    registry(&host).unwrap().lock().unwrap().apply(&ModelEdit::SeedView {
-        scope: scope.clone(),
-        panes: vec![crate::workspace_model::views::Pane {
-            id: pane_id, title: "Review".into(), user_title: None,
-            pending_terminal_start: false, width_fraction: 0.5,
-            kind: crate::model::CardKind::Chat(parent_chat.clone()), scope: None,
-        }],
-        closed: vec![],
-    }).unwrap();
-    let retained_run = registry(&host).unwrap().lock().unwrap().agent_run(accepted.run.id).unwrap();
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![crate::workspace_model::views::Pane {
+                id: pane_id,
+                title: "Review".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(parent_chat.clone()),
+                scope: None,
+            }],
+            closed: vec![],
+        })
+        .unwrap();
+    let retained_run = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent_run(accepted.run.id)
+        .unwrap();
     let parent_session = parent.session.as_ref().unwrap().id();
     super::super::chat::process(
         &host,
