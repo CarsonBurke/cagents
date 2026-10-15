@@ -535,6 +535,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if holding.identity() != (metadata.dev(), metadata.ino())
             || metadata.mode() & 0o7777 != 0o700
             || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != holding.initial_metadata().uid()
+            || metadata.gid() != holding.initial_metadata().gid()
         {
             return Err(ValidationError::Io(
                 "Recovery materialization requires the exact published private holding directory"

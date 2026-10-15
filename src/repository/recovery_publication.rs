@@ -40,6 +40,7 @@ struct Holding {
     publication: fs_safety::DirectoryPublication,
     parent: fs_safety::Root,
     files: Vec<Arc<fs::File>>,
+    private_metadata: fs::Metadata,
     context: FilesystemRecoveryContext,
     // Native owners above close before their creation/private charge releases.
     slot: Option<RecoverySlot>,
@@ -77,12 +78,13 @@ impl Holding {
             original_parent,
         )
         .map_err(|error| remember_directory_error(recovery, error))?;
-        let (publication, parent, _private_metadata, context, slot) = directory.into_parts();
+        let (publication, parent, private_metadata, context, slot) = directory.into_parts();
         // SAME pre-effect admission and parent survive factory errors; success
         // uses its already enrolled original700 inode without cloning/reopening.
         Ok(Self {
             publication,
             parent,
+            private_metadata,
             slot: Some(slot),
             files: vec![],
             context,
@@ -92,10 +94,12 @@ impl Holding {
         self.publication.directory()
     }
     fn create_private_blob(&mut self) -> Result<Arc<fs::File>, String> {
+        self.validate()?;
         let file = create_blob_file(self.root())?;
         // Preserve the actual creator before chmod or metadata observation can
         // fail. mkdir/open mode arguments alone do not override a strict umask.
         self.files.push(file.clone());
+        self.validate()?;
         let created = file.metadata().map_err(|error| error.to_string())?;
         if !created.is_file() || created.uid() != unsafe { libc::geteuid() } {
             return Err("The recovery blob creator is not an owned regular file".into());
@@ -128,12 +132,20 @@ impl Holding {
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.verify_private()?;
         self.context
             .validate_payload_root(self.root())
+            .map_err(|error| error.to_string())?;
+        self.verify_private()
+    }
+
+    fn verify_private(&self) -> Result<(), String> {
+        fs_safety::verify_recovery_directory_private(self.root(), &self.private_metadata)
             .map_err(|error| error.to_string())
     }
 
     fn open(&mut self, name: &Path) -> Result<Arc<fs::File>, String> {
+        self.validate()?;
         let file = Arc::new(
             fs_safety::open_beneath(self.root(), name).map_err(|error| error.to_string())?,
         );
@@ -264,6 +276,7 @@ impl Proof {
         name: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Self, String> {
+        holding.verify_private()?;
         let metadata =
             fs_safety::metadata_beneath(holding.root(), name).map_err(|error| error.to_string())?;
         let (file, digest, target, identity_pin) = if metadata.is_file() {
@@ -316,6 +329,7 @@ impl Proof {
         cancellation: &CancellationToken,
         after_mode: impl FnOnce(&Arc<fs::File>) -> Result<(), String>,
     ) -> Result<Self, String> {
+        holding.validate()?;
         if full_version(&authenticated)
             != full_version(&file.metadata().map_err(|error| error.to_string())?)
         {
@@ -390,6 +404,7 @@ impl Proof {
         name: &Path,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
+        holding.verify_private()?;
         self.same_identity(holding, name)?;
         let named =
             fs_safety::metadata_beneath(holding.root(), name).map_err(|error| error.to_string())?;
@@ -418,7 +433,7 @@ impl Proof {
                 return Err("Undo symlink changed after verification".into());
             }
         }
-        Ok(())
+        holding.verify_private()
     }
 }
 
@@ -692,6 +707,26 @@ mod tests {
         )
         .unwrap();
         (directory, recovery, holding)
+    }
+
+    #[test]
+    fn undo_refuses_changed_private_permissions_before_payload_and_during_live_retry() {
+        let (directory, recovery, mut holding) = fixture();
+        fs::write(directory.path().join("original"), b"preserved").unwrap();
+        let private = holding.root().path().to_owned();
+        fs_safety::set_directory_permissions(holding.root(), 0o711).unwrap();
+        assert!(holding.create_private_blob().is_err());
+        assert_eq!(holding.root().read_dir().unwrap().count(), 0, "no payload is created under a changed boundary");
+        assert_eq!(holding.root().metadata().unwrap().mode() & 0o7777, 0o711);
+        holding.retain(&recovery);
+        let authority = recovery.live_recovery.authority().unwrap();
+        assert!(authority.retry().is_err());
+        assert_eq!(fs::metadata(&private).unwrap().mode() & 0o7777, 0o711, "retry never repairs newer permissions implicitly");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert!(!private.exists());
+        assert_eq!(fs::read(directory.path().join("original")).unwrap(), b"preserved");
     }
 
     #[test]
