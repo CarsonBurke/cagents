@@ -158,9 +158,9 @@ struct Entry {
     /// rather than from any read, since the edits a partial watch still
     /// reports would otherwise postpone the scan it stands in for.
     last_full_scan: Instant,
-    /// Separate pacing for known failed rows; healthy sibling reads cannot
-    /// postpone recovery or turn a targeted retry into a topology rescan.
-    last_failed_status_attempt: Option<Instant>,
+    /// Failed siblings have independent retry pacing; attempts for one row
+    /// cannot postpone another row's recovery or force a topology rescan.
+    failed_status_attempts: HashMap<WorktreeId, Instant>,
 }
 
 #[derive(Default)]
@@ -229,7 +229,7 @@ impl State {
             entry.plan = Some(Arc::new(plan));
         }
         entry.snapshot.status_errors.remove(&key.worktree_id);
-        if entry.snapshot.status_errors.is_empty() { entry.last_failed_status_attempt = None; }
+        entry.failed_status_attempts.remove(&key.worktree_id);
         if let Some(operation) = operation {
             entry.snapshot.operations.insert(key.worktree_id, operation);
         } else {
@@ -261,7 +261,7 @@ impl State {
                 .worktrees
                 .retain(|(record, _)| record.id != worktree);
             entry.snapshot.status_errors.remove(&worktree);
-            if entry.snapshot.status_errors.is_empty() { entry.last_failed_status_attempt = None; }
+            entry.failed_status_attempts.remove(&worktree);
             entry.snapshot.status_updates.remove(&worktree);
             entry
                 .snapshot
@@ -411,7 +411,7 @@ impl Cagents {
                 pending: git_watch::Change::default(),
                 fallback: failure,
                 last_full_scan: Instant::now(),
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
             },
         );
         state.changed(
@@ -474,11 +474,12 @@ impl Cagents {
                     topology: true, membership: true, ..Default::default()
                 }));
             }
-            if !entry.snapshot.status_errors.is_empty()
-                && entry.last_failed_status_attempt.is_some_and(|last| last.elapsed() >= FALLBACK_INTERVAL) {
+            let failed = entry.snapshot.status_errors.keys().copied().filter(|id|
+                entry.failed_status_attempts.get(id).is_none_or(|last| last.elapsed() >= FALLBACK_INTERVAL)
+            ).collect::<BTreeSet<_>>();
+            if !failed.is_empty() {
                 return Some((project, git_watch::Change {
-                    worktrees: entry.snapshot.status_errors.keys().copied().collect(),
-                    untracked: true, ..Default::default()
+                    worktrees: failed, untracked: true, ..Default::default()
                 }));
             }
             None
@@ -657,10 +658,9 @@ impl Cagents {
                         if entry.read_full_scan {
                             entry.read_failure = None;
                         }
-                        if snapshot.status_errors.is_empty() {
-                            entry.last_failed_status_attempt = None;
-                        } else if entry.last_failed_status_attempt.is_none() {
-                            entry.last_failed_status_attempt = Some(Instant::now());
+                        entry.failed_status_attempts.retain(|id, _| snapshot.status_errors.contains_key(id));
+                        for id in snapshot.status_errors.keys() {
+                            entry.failed_status_attempts.entry(*id).or_insert_with(Instant::now);
                         }
                         let previous = std::mem::replace(&mut entry.snapshot, snapshot.clone());
                         let removed =
@@ -805,9 +805,8 @@ impl Cagents {
                 continue;
             }
             let change = std::mem::take(&mut entry.pending);
-            if !entry.snapshot.status_errors.is_empty()
-                && (change.topology || change.worktrees.iter().any(|id| entry.snapshot.status_errors.contains_key(id))) {
-                entry.last_failed_status_attempt = Some(Instant::now());
+            for id in entry.snapshot.status_errors.keys().filter(|id| change.topology || change.worktrees.contains(*id)) {
+                entry.failed_status_attempts.insert(*id, Instant::now());
             }
             entry.read_full_scan = change.topology;
             let snapshot = entry.snapshot.clone();
@@ -1296,7 +1295,7 @@ mod tests {
                 read_failure: None,
                 read_full_scan: false,
                 last_full_scan: Instant::now(),
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
             },
         );
         app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
@@ -1569,7 +1568,7 @@ mod tests {
                     read_failure: None,
                     read_full_scan: false,
                     last_full_scan: Instant::now(),
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
                 },
             );
             app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
@@ -2507,7 +2506,7 @@ mod tests {
                 pending: Default::default(),
                 fallback: None,
                 last_full_scan: Instant::now(),
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
             },
         );
         for name in ["outside", "inside"] {
@@ -2544,7 +2543,7 @@ mod tests {
                 pending: Default::default(),
                 fallback: None,
                 last_full_scan: Instant::now(),
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
             },
         );
         app.repository_generations.insert(project, 2);
@@ -2558,7 +2557,7 @@ mod tests {
         assert!(app.sidebar_model.project(project).is_none());
     }
     #[test]
-    fn failed_row_recovery_is_targeted_paced_and_not_postponed_by_healthy_siblings() {
+    fn failed_row_recovery_is_paced_per_row_and_not_postponed_by_failed_siblings() {
         fn run(task: Task<Message>) -> Message {
             use cosmic::iced::futures::StreamExt;
             let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("retry worker task");
@@ -2572,45 +2571,65 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let primary = directory.path().join("primary");
         let initial = fixture(&primary);
-        let linked = directory.path().join("linked");
-        git(&primary, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+        let linked_b = directory.path().join("linked-b");
+        let linked_c = directory.path().join("linked-c");
+        for (name, path) in [("b", &linked_b), ("c", &linked_c)] {
+            git(&primary, &["worktree", "add", "-b", name, path.to_str().unwrap()]);
+        }
         let project = ProjectId::new();
         let cancel = CancellationToken::default();
         let (baseline, _) = read_local(project, initial, git_watch::Change { topology: true, ..Default::default() }, cancel.clone()).unwrap();
-        let a = baseline.worktrees.iter().find(|(record, _)| record.path == primary).unwrap().0.id;
-        let b = baseline.worktrees.iter().find(|(record, _)| record.path == linked).unwrap().0.id;
-        let private = RepositoryService::system("git").git_dir(&linked, &cancel).unwrap();
-        let index = fs::read(private.join("index")).unwrap();
-        fs::write(private.join("index"), "broken index").unwrap();
-        let (failed, _) = read_local(project, baseline.clone(), git_watch::Change { worktrees: [b].into(), ..Default::default() }, cancel.clone()).unwrap();
+        let id = |path: &Path| baseline.worktrees.iter().find(|(record, _)| record.path == path).unwrap().0.id;
+        let (a, b, c) = (id(&primary), id(&linked_b), id(&linked_c));
+        let git = RepositoryService::system("git");
+        let private_b = git.git_dir(&linked_b, &cancel).unwrap();
+        let private_c = git.git_dir(&linked_c, &cancel).unwrap();
+        let index_c = fs::read(private_c.join("index")).unwrap();
+        for private in [&private_b, &private_c] { fs::write(private.join("index"), "broken index").unwrap(); }
+        let (failed, _) = read_local(project, baseline.clone(), git_watch::Change { worktrees: [b, c].into(), ..Default::default() }, cancel.clone()).unwrap();
         let key = ActiveWorktreeKey { project_id: project, worktree_id: a, canonical_path: primary };
         let mut app = app_with_status_snapshot(baseline, &key);
         drop(app.update(Message::GitUi(Action::Read { project, generation: 9, result: Ok((failed, None)) })));
-        assert!(app.refresh_ui.git.entries[&project].last_failed_status_attempt.is_some());
+        assert_eq!(app.refresh_ui.git.entries[&project].failed_status_attempts.len(), 2);
         let due = Instant::now() - FALLBACK_INTERVAL;
-        app.refresh_ui.git.entries.get_mut(&project).unwrap().last_failed_status_attempt = Some(due);
+        app.refresh_ui.git.entries.get_mut(&project).unwrap().failed_status_attempts.insert(c, due);
         let (healthy, _) = read_local(project, app.refresh_ui.git.entries[&project].snapshot.clone(),
             git_watch::Change { worktrees: [a].into(), ..Default::default() }, cancel.clone()).unwrap();
         drop(app.update(Message::GitUi(Action::Read { project, generation: 9, result: Ok((healthy, None)) })));
-        assert_eq!(app.refresh_ui.git.entries[&project].last_failed_status_attempt, Some(due), "A cannot postpone B's retry");
+        assert_eq!(app.refresh_ui.git.entries[&project].failed_status_attempts[&c], due, "healthy A cannot postpone C");
+        // Continuing failed B traffic must not move C's independent deadline.
+        for _ in 0..3 {
+            app.refresh_ui.git.changed(project, git_watch::Change { worktrees: [b].into(), ..Default::default() });
+            let message = run(app.start_git_reads());
+            drop(app.update(message));
+            assert_eq!(app.refresh_ui.git.entries[&project].failed_status_attempts[&c], due, "failed B cannot postpone C");
+        }
         let message = run(app.git_fallback_tick());
         let Message::GitUi(Action::Read { result: Ok((snapshot, _)), .. }) = &message else { panic!("wrong retry result"); };
-        assert_eq!(snapshot.status_updates, HashSet::from([b]), "no healthy sibling status process");
-        assert!(snapshot.status_errors.contains_key(&b));
+        assert_eq!(snapshot.status_updates, HashSet::from([c]), "only C is due; no B or healthy A process");
+        assert!(snapshot.status_errors.contains_key(&c));
         assert!(!app.refresh_ui.git.entries[&project].read_full_scan);
         drop(app.update(message));
-        assert!(cosmic::iced::runtime::task::into_stream(app.git_fallback_tick()).is_none(), "known failure must not retry again before interval");
-        fs::write(private.join("index"), index).unwrap();
-        fs::write(linked.join("new.txt"), "repaired without delivering its event\n").unwrap();
-        app.refresh_ui.git.entries.get_mut(&project).unwrap().last_failed_status_attempt = Some(Instant::now() - FALLBACK_INTERVAL);
+        assert!(cosmic::iced::runtime::task::into_stream(app.git_fallback_tick()).is_none(), "failure cannot retry before its interval");
+        fs::write(private_c.join("index"), index_c).unwrap();
+        fs::write(linked_c.join("new.txt"), "repaired without delivering its event\n").unwrap();
+        app.refresh_ui.git.entries.get_mut(&project).unwrap().failed_status_attempts.insert(c, due);
+        for _ in 0..3 {
+            app.refresh_ui.git.changed(project, git_watch::Change { worktrees: [b].into(), ..Default::default() });
+            let message = run(app.start_git_reads());
+            drop(app.update(message));
+            assert_eq!(app.refresh_ui.git.entries[&project].failed_status_attempts[&c], due);
+        }
         let message = run(app.git_fallback_tick());
         let Message::GitUi(Action::Read { result: Ok((snapshot, _)), .. }) = &message else { panic!("wrong repaired retry result"); };
-        assert_eq!(snapshot.status_updates, HashSet::from([b]));
-        assert!(snapshot.status_errors.is_empty());
+        assert_eq!(snapshot.status_updates, HashSet::from([c]));
+        assert!(!snapshot.status_errors.contains_key(&c));
+        assert!(snapshot.status_errors.contains_key(&b));
         drop(app.update(message));
         let entry = &app.refresh_ui.git.entries[&project];
-        assert!(entry.last_failed_status_attempt.is_none());
-        assert_eq!(app.sidebar_model.projects[0].worktrees.iter().find(|row| row.id == b).unwrap().dirty.as_ref().unwrap().untracked, 1);
+        assert!(!entry.failed_status_attempts.contains_key(&c));
+        assert!(entry.failed_status_attempts.contains_key(&b));
+        assert_eq!(app.sidebar_model.projects[0].worktrees.iter().find(|row| row.id == c).unwrap().dirty.as_ref().unwrap().untracked, 1);
         assert!(app.refresh_ui.projects.is_empty(), "row recovery never schedules GitHub");
     }
 
@@ -2645,7 +2664,7 @@ mod tests {
                     pending: Default::default(),
                     fallback: Some("watch limit".into()),
                     last_full_scan: Instant::now() - FALLBACK_INTERVAL,
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
                 },
             );
         }
@@ -2700,7 +2719,7 @@ mod tests {
                 pending: Default::default(),
                 fallback: Some("directory watch limit reached".into()),
                 last_full_scan: Instant::now() - FALLBACK_INTERVAL,
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
             },
         );
         // An edit in a directory that is still watched is read on its own.
@@ -2856,7 +2875,7 @@ mod tests {
                 pending: Default::default(),
                 fallback: None,
                 last_full_scan: Instant::now(),
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
             },
         );
         snapshot.worktrees[0].1.as_mut().unwrap().dirty.unstaged = 1;
@@ -2907,7 +2926,7 @@ mod tests {
                 pending: Default::default(),
                 fallback: Some("watch limit".into()),
                 last_full_scan: Instant::now(),
-                last_failed_status_attempt: None,
+                failed_status_attempts: HashMap::new(),
             },
         );
         state.changed(
