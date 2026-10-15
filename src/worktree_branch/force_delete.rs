@@ -8,7 +8,7 @@ const GUARD: &str = r##"#!/bin/sh
 set -eu
 input=$(/bin/cat)
 if [ -n "$CAGENTS_DELETE_PREVIOUS_HOOK" ] && [ -x "$CAGENTS_DELETE_PREVIOUS_HOOK" ]; then
-    printf '%s\n' "$input" | "$CAGENTS_DELETE_PREVIOUS_HOOK" "$@"
+    printf '%s\n' "$input" | GIT_CONFIG_PARAMETERS="$CAGENTS_DELETE_PREVIOUS_CONFIG" "$CAGENTS_DELETE_PREVIOUS_HOOK" "$@"
 fi
 if [ "$1" = prepared ]; then
     while IFS=' ' read -r old new ref; do
@@ -97,6 +97,16 @@ pub(super) fn delete(
         .and_then(|()| file.sync_all())
         .map_err(|error| error.to_string())?;
     drop(file);
+    // Git propagates this command's -c hooksPath through its environment.
+    // Restore the original command configuration only for the chained hook,
+    // so policy hooks can delegate to sibling hooks and child Git commands.
+    // Preserve opaque inherited parameters and COUNT entries; add only the
+    // same fsmonitor safeguard that ordinary repository commands receive.
+    let mut previous_config = std::env::var_os("GIT_CONFIG_PARAMETERS").unwrap_or_default();
+    if !previous_config.is_empty() {
+        previous_config.push(" ");
+    }
+    previous_config.push("'core.fsmonitor=false'");
     let command = git_command(repository)
         .args([
             std::ffi::OsString::from("-c"),
@@ -108,6 +118,7 @@ pub(super) fn delete(
         ])
         .env("CAGENTS_DELETE_PROOF", &proof)
         .env("CAGENTS_DELETE_PREVIOUS_HOOK", previous)
+        .env("CAGENTS_DELETE_PREVIOUS_CONFIG", previous_config)
         .env("CAGENTS_DELETE_REF", full_ref)
         .env("CAGENTS_DELETE_OID", oid)
         .env("CAGENTS_DELETE_GIT", "git");
