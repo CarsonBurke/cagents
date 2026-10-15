@@ -1767,6 +1767,7 @@ pub struct LoadedRepository {
     github: GitHubAvailability,
     review_repository: Option<GitHubRepoKey>,
     head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
+    status_order: git_ui::LoadedStatusOrder,
 }
 
 type WorktreePrCacheKey = (GitHubRepoKey, GitHubRepoKey, String, String);
@@ -13642,11 +13643,13 @@ impl Application for Cagents {
                 );
                 let mut task = Task::none();
                 match result {
-                    Ok(loaded) => {
+                    Ok(mut loaded) => {
                         if self.project_ui.closed.contains(&loaded.project.repository) {
+                            self.refresh_ui.git.forget(project_id);
                             self.repository_generations.remove(&project_id);
                             return Task::none();
                         }
+                        self.refresh_ui.git.reconcile_repository_load(&mut loaded);
                         let pr_request = if let GitHubAvailability::Ready {
                             repository_key,
                             pull_requests,
@@ -13746,6 +13749,7 @@ impl Application for Cagents {
                                 ));
                             }
                             let existing_id = existing.id;
+                            self.refresh_ui.git.forget(project_id);
                             self.repository_generations.remove(&project_id);
                             if let Some(previous) =
                                 self.repository_pr_cancellations.remove(&project_id)
@@ -13797,6 +13801,7 @@ impl Application for Cagents {
                                     SidebarWorktree::from_repository(record, status.as_ref());
                                 row.head_repository =
                                     loaded.head_repositories.get(&record.id).cloned();
+                                row.apply_status_error(loaded.status_order.errors.get(&record.id).map(String::as_str));
                                 row
                             })
                             .collect();
@@ -13978,6 +13983,7 @@ impl Application for Cagents {
                         self.github_availability.insert(project_id, unavailable);
                         self.review_repositories.remove(&project_id);
                         self.status = Some(TransientNotice::error(error.clone()));
+                        self.refresh_ui.git.forget(project_id);
                         finish_repository_load_failure(&mut self.sidebar_model, project_id, error);
                         task = self.apply_closed_project_tombstones();
                     }
@@ -17755,6 +17761,7 @@ fn load_project(
         github: GitHubAvailability::NotAssociated,
         review_repository: None,
         head_repositories: HashMap::new(),
+        status_order: Default::default(),
     })
 }
 
@@ -17775,25 +17782,28 @@ fn load_repository(
     let repository = service
         .discover(&path, &cancellation)
         .map_err(|error| error.to_string())?;
+    let mut status_order = git_ui::LoadedStatusOrder::new();
     let worktrees = service
         .list_worktrees(&repository.common_dir, &cancellation)
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))
-        .map(|worktree| {
-            let status = (!worktree.bare)
-                .then(|| {
-                    service
-                        .status_projection(
-                            &worktree.path,
-                            true,
-                            sidebar::STATUS_DISPLAY_LIMIT,
-                            &cancellation,
-                        )
-                        .ok()
-                        .map(|status| status.display_summary())
-                })
-                .flatten();
+        .map(|mut worktree| {
+            let status = if worktree.bare {
+                None
+            } else {
+                status_order.reads.insert(worktree.id, git_ui::next_status_read());
+                match service.status_projection(
+                    &worktree.path, true, sidebar::STATUS_DISPLAY_LIMIT, &cancellation,
+                ) {
+                    Ok(status) => Some(status.display_summary()),
+                    Err(error) => {
+                        status_order.errors.insert(worktree.id, error.to_string());
+                        None
+                    }
+                }
+            };
+            if let Some(status) = &status { git_ui::apply_status_head(&mut worktree, status); }
             (worktree, status)
         })
         .collect::<Vec<_>>();
@@ -17832,6 +17842,7 @@ fn load_repository(
         github: github_availability,
         review_repository,
         head_repositories,
+        status_order,
     })
 }
 
@@ -23729,6 +23740,7 @@ mod tests {
             github: GitHubAvailability::NotAssociated,
             review_repository: None,
             head_repositories: HashMap::new(),
+            status_order: Default::default(),
         };
 
         // The failure lands last on purpose. A failure followed by a success

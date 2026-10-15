@@ -341,7 +341,7 @@ impl Cagents {
             return self.device_project_read_task(path, project_id, generation, kind);
         }
         self.refresh_ui.schedule.started(project_id, Instant::now());
-        self.refresh_ui.git.forget(project_id);
+        self.refresh_ui.git.begin_repository_load(project_id);
         let cancellation = CancellationToken::default();
         if let Some(previous) = self
             .refresh_ui

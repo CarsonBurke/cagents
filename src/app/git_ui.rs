@@ -29,6 +29,36 @@ pub struct Snapshot {
     status_reads: HashMap<WorktreeId, u64>,
 }
 
+/// Initial/reload reads participate in the same per-row order as both live
+/// streams. The listing timestamp is only authority for omitted rows.
+#[derive(Debug, Clone, Default)]
+pub(super) struct LoadedStatusOrder {
+    listing: u64,
+    pub(super) reads: HashMap<WorktreeId, u64>,
+    pub(super) errors: HashMap<WorktreeId, String>,
+}
+impl LoadedStatusOrder {
+    pub(super) fn new() -> Self {
+        Self { listing: next_status_read(), ..Self::default() }
+    }
+}
+
+#[derive(Clone)]
+struct BoundLoadUpdate {
+    path: PathBuf,
+    status: Option<StatusSnapshot>,
+    head: Option<GitHubRepoKey>,
+    error: Option<String>,
+    read: u64,
+}
+#[derive(Default)]
+struct ReloadStatus {
+    previous: Option<Snapshot>,
+    // Only an already-bound row can supply these proofs; at most one scalar
+    // update per worktree in this live project load. No path listings retained.
+    bound: HashMap<WorktreeId, BoundLoadUpdate>,
+}
+
 /// Sidebar snapshots retain scalar row facts, never the Changes panel's file
 /// listing. Build the projection directly so the UI does not first clone a
 /// potentially large entries vector merely to discard it.
@@ -186,9 +216,100 @@ pub(super) struct State {
     entries: HashMap<ProjectId, Entry>,
     queue: VecDeque<ProjectId>,
     activity: Vec<ProjectId>,
+    reloads: HashMap<ProjectId, ReloadStatus>,
 }
 
 impl State {
+    /// Stop the old watcher worker, retaining its row frontier until this
+    /// project's generation-checked loader publishes or the project closes.
+    pub(super) fn begin_repository_load(&mut self, project: ProjectId) {
+        let retained = self.reloads.remove(&project).unwrap_or_default();
+        let previous = self.entries.get(&project).map(|entry| entry.snapshot.clone())
+            .or(retained.previous);
+        self.forget(project);
+        self.reloads.insert(project, ReloadStatus { previous, bound: retained.bound });
+    }
+
+    fn accept_during_load(&mut self, key: &ActiveWorktreeKey, update: BoundLoadUpdate) -> bool {
+        let Some(reload) = self.reloads.get_mut(&key.project_id) else { return true; };
+        if let Some(previous) = &reload.previous {
+            if !previous.worktrees.iter().any(|(record, _)| record.id == key.worktree_id && record.path == key.canonical_path)
+                || previous.status_reads.get(&key.worktree_id).is_some_and(|current| *current > update.read)
+            { return false; }
+        }
+        if reload.bound.get(&key.worktree_id).is_some_and(|current| current.read > update.read) {
+            return false;
+        }
+        // A failure retains the preceding last-known values; its read order
+        // still supersedes an older loader success.
+        let mut update = update;
+        if update.error.is_some() {
+            if let Some(previous) = reload.bound.get(&key.worktree_id) {
+                update.status = previous.status.clone();
+                update.head = previous.head.clone();
+            } else if let Some(previous) = &reload.previous {
+                update.status = previous.worktrees.iter().find(|(record, _)| record.id == key.worktree_id)
+                    .and_then(|(_, status)| status.clone());
+                update.head = previous.heads.get(&key.worktree_id).cloned();
+            }
+        }
+        reload.bound.insert(key.worktree_id, update);
+        true
+    }
+
+    /// Reconcile before the App creates visible rows, persists records or
+    /// installs the new watcher entry. All three see exactly the same facts.
+    pub(super) fn reconcile_repository_load(&mut self, loaded: &mut LoadedRepository) {
+        let Some(repository) = &loaded.repository else {
+            self.reloads.remove(&loaded.project.id);
+            return;
+        };
+        let mut snapshot = Snapshot {
+            repository: repository.clone(), worktrees: display_worktrees(&loaded.worktrees),
+            heads: loaded.head_repositories.clone(), status_errors: loaded.status_order.errors.clone(),
+            status_reads: loaded.status_order.reads.clone(),
+            status_updates: loaded.worktrees.iter().map(|(record, _)| record.id).collect(),
+        };
+        if let Some(reload) = self.reloads.remove(&loaded.project.id).or_else(|| self.entries.get(&loaded.project.id)
+            .map(|entry| ReloadStatus { previous: Some(entry.snapshot.clone()), bound: HashMap::new() })) {
+            if reload.previous.as_ref().is_some_and(|previous| previous.repository.id != repository.id
+                || previous.repository.common_dir != repository.common_dir) {
+                return;
+            }
+            let previous = reload.previous;
+            if let Some(previous) = &previous {
+                for (record, _) in &previous.worktrees {
+                    snapshot.status_reads.entry(record.id).or_insert(loaded.status_order.listing);
+                }
+                snapshot.preserve_newer_status(previous);
+            }
+            for (id, update) in reload.bound {
+                if snapshot.status_reads.get(&id).is_some_and(|read| *read > update.read) { continue; }
+                // A successful bound read also proves a previously listed row
+                // survived an older omission. Preserve its original record.
+                if !snapshot.worktrees.iter().any(|(record, _)| record.id == id)
+                    && let Some(row) = previous.as_ref().and_then(|previous| previous.worktrees.iter()
+                        .find(|(record, _)| record.id == id && record.path == update.path))
+                { snapshot.worktrees.push(row.clone()); }
+                let Some((record, status)) = snapshot.worktrees.iter_mut()
+                    .find(|(record, _)| record.id == id && record.path == update.path) else { continue; };
+                if let Some(current) = &update.status {
+                    *status = Some(current.clone());
+                    apply_status_head(record, current);
+                }
+                if let Some(error) = update.error { snapshot.status_errors.insert(id, error); }
+                else { snapshot.status_errors.remove(&id); }
+                if let Some(head) = update.head { snapshot.heads.insert(id, head); }
+                else { snapshot.heads.remove(&id); }
+                snapshot.status_reads.insert(id, update.read);
+            }
+        }
+        loaded.worktrees = snapshot.worktrees;
+        loaded.head_repositories = snapshot.heads;
+        loaded.status_order.reads = snapshot.status_reads;
+        loaded.status_order.errors = snapshot.status_errors;
+    }
+
     pub(super) fn remember_archived(
         &mut self,
         project: ProjectId,
@@ -213,7 +334,10 @@ impl State {
         read: u64,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(&key.project_id) else {
-            return true;
+            return self.accept_during_load(key, BoundLoadUpdate {
+                path: key.canonical_path.clone(), status: Some(status.display_summary()),
+                head: head_repository.cloned(), error: None, read,
+            });
         };
         if entry
             .snapshot
@@ -273,7 +397,10 @@ impl State {
         read: u64,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(&key.project_id) else {
-            return true;
+            return self.accept_during_load(key, BoundLoadUpdate {
+                path: key.canonical_path.clone(), status: None, head: None,
+                error: Some(error.to_owned()), read,
+            });
         };
         if entry
             .snapshot
@@ -307,6 +434,7 @@ impl State {
     }
 
     pub fn forget(&mut self, project: ProjectId) {
+        self.reloads.remove(&project);
         if let Some(entry) = self.entries.remove(&project)
             && let Some(cancel) = entry.cancellation
         {
@@ -461,9 +589,9 @@ impl Cagents {
                     worktrees: display_worktrees(&loaded.worktrees),
                     heads: loaded.head_repositories.clone(),
 
-                    status_errors: HashMap::new(),
+                    status_errors: loaded.status_order.errors.clone(),
                     status_updates: HashSet::new(),
-                    status_reads: HashMap::new(),
+                    status_reads: loaded.status_order.reads.clone(),
                 },
                 generation,
                 plan: reusable_plan.clone(),
@@ -475,7 +603,7 @@ impl Cagents {
                 pending: git_watch::Change::default(),
                 fallback: failure,
                 last_full_scan: Instant::now(),
-                failed_status_attempts: HashMap::new(),
+                failed_status_attempts: loaded.status_order.errors.keys().map(|id| (*id, Instant::now())).collect(),
             },
         );
         state.changed(
@@ -1092,7 +1220,7 @@ fn read_local_with_plan(
     Ok((snapshot, plan))
 }
 
-fn apply_status_head(record: &mut WorktreeRecord, status: &StatusSnapshot) {
+pub(super) fn apply_status_head(record: &mut WorktreeRecord, status: &StatusSnapshot) {
     match &status.head {
         HeadState::Branch { name, oid } => {
             record.branch = Some(format!("refs/heads/{name}"));
@@ -3046,6 +3174,95 @@ mod tests {
             "watcher publication drops file paths on its worker"
         );
         assert_eq!(full.entries.len(), 200);
+    }
+
+    #[test]
+    fn repository_reload_and_bound_tasks_publish_the_newest_sample_in_either_delivery_order() {
+        const TEST: &str = "app::git_ui::tests::repository_reload_and_bound_tasks_publish_the_newest_sample_in_either_delivery_order";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for no_entry in [false, true] {
+            for bound_sample_first in [false, true] {
+                for bound_delivered_first in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let root = directory.path().join("repository");
+                    let baseline = fixture(&root);
+                    let key = ActiveWorktreeKey { project_id: ProjectId::new(),
+                        worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+                    let mut app = app_with_status_snapshot(baseline, &key);
+                    app.active_workspace = Some(root.clone());
+                    app.sidebar_state.sync_active_worktree(&app.sidebar_model,
+                        &SidebarFocus::Repository { worktree: root.clone() });
+                    if no_entry { app.refresh_ui.git.forget(key.project_id); }
+                    app.repository_generations.insert(key.project_id, 10);
+                    // This is the production task, including its read-start
+                    // cache retirement. Hold its actual callback during the
+                    // other worker and then exercise both delivery orders.
+                    let load = app.repository_read_task(root.clone(), key.project_id, 10, false, Some(ProjectKind::Git));
+                    assert!(!app.refresh_ui.git.entries.contains_key(&key.project_id));
+                    let mut load = Some(load);
+                    let first = if bound_sample_first {
+                        super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()))
+                    } else { super::super::tests::task_app_message(load.take().unwrap()) };
+                    git(&root, &["checkout", "-b", "learned"]);
+                    fs::write(root.join("new.txt"), "new\n").unwrap();
+                    let second = if bound_sample_first { super::super::tests::task_app_message(load.take().unwrap()) }
+                        else { super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone())) };
+                    let (bound, loaded) = if bound_sample_first { (first, second) } else { (second, first) };
+                    assert!(matches!(&bound, Message::SourceControlLoaded { result: Ok(_), .. }));
+                    assert!(matches!(&loaded, Message::RepositoryLoaded { result: Ok(_), .. }));
+                    for message in if bound_delivered_first { [bound, loaded] } else { [loaded, bound] } {
+                        drop(app.update(message));
+                    }
+                    let row = &app.sidebar_model.projects[0].worktrees[0];
+                    assert_eq!(row.branch.as_deref(), Some("learned"));
+                    assert_eq!(row.dirty.as_ref().unwrap().untracked, 1);
+                    assert!(row.status_error.is_none());
+                    let entry = &app.refresh_ui.git.entries[&key.project_id];
+                    assert_eq!(entry.snapshot.worktrees[0].0.branch.as_deref(), Some("refs/heads/learned"));
+                    assert_eq!(entry.snapshot.worktrees[0].1.as_ref().unwrap().dirty.untracked, 1);
+                    assert!(entry.snapshot.status_reads[&key.worktree_id] > 0);
+                    assert!(!app.refresh_ui.git.reloads.contains_key(&key.project_id));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repository_reload_preserves_newer_status_failures_and_clears_older_failures() {
+        const TEST: &str = "app::git_ui::tests::repository_reload_preserves_newer_status_failures_and_clears_older_failures";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for newer_failure in [false, true] {
+            for bound_first in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path().join("repository");
+                let baseline = fixture(&root);
+                let key = ActiveWorktreeKey { project_id: ProjectId::new(),
+                    worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+                let mut app = app_with_status_snapshot(baseline, &key);
+                app.active_workspace = Some(root.clone());
+                app.sidebar_state.sync_active_worktree(&app.sidebar_model,
+                    &SidebarFocus::Repository { worktree: root.clone() });
+                let index = root.join(".git/index");
+                let original = fs::read(&index).unwrap();
+                if !newer_failure { fs::write(&index, "broken index").unwrap(); }
+                app.repository_generations.insert(key.project_id, 10);
+                let loaded = super::super::tests::task_app_message(app.repository_read_task(
+                    root.clone(), key.project_id, 10, false, Some(ProjectKind::Git)));
+                if newer_failure { fs::write(&index, "broken index").unwrap(); }
+                else { fs::write(&index, original).unwrap(); fs::write(root.join("new.txt"), "new\n").unwrap(); }
+                let bound = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+                if newer_failure {
+                    assert!(matches!(&bound, Message::SourceControlLoaded { result: Err(failure), .. } if failure.status_read.is_some()));
+                } else { assert!(matches!(&bound, Message::SourceControlLoaded { result: Ok(_), .. })); }
+                for message in if bound_first { [bound, loaded] } else { [loaded, bound] } { drop(app.update(message)); }
+                let row = &app.sidebar_model.projects[0].worktrees[0];
+                assert_eq!(row.status_error.is_some(), newer_failure);
+                let entry = &app.refresh_ui.git.entries[&key.project_id];
+                assert_eq!(entry.snapshot.status_errors.contains_key(&key.worktree_id), newer_failure);
+                assert_eq!(entry.failed_status_attempts.contains_key(&key.worktree_id), newer_failure);
+                if !newer_failure { assert_eq!(row.dirty.as_ref().unwrap().untracked, 1); }
+            }
+        }
     }
 
     #[test]
