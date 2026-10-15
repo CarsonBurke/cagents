@@ -154,6 +154,9 @@ impl Cagents {
         }
         let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64).unwrap_or_default();
+        // Keep the existing window lease through guarded scope selection and
+        // pane publication. The selection lifecycle callback retires this entry.
+        self.setup_ui.pending.insert(worktree.clone(), (operation, CancellationToken::new()));
         self.setup_ui.authorized_runs.lock().expect("setup launch authorization lock").insert(operation);
         let launch = LaunchRecipe {
             program: "/bin/sh".into(), arguments: vec!["-c".into(), command], working_directory: worktree.clone(),
@@ -166,10 +169,22 @@ impl Cagents {
         self.setup_ui.statuses.insert(worktree.clone(), WorktreeSetupStatus::Running);
         // The new worktree owns this card even if another channel was selected
         // while the bounded copy operation completed.
-        let select = self.select_worktree(worktree, false);
+        let select = self.select_worktree(worktree.clone(), false);
         let start = self.insert_terminal_card(session, None);
+        let _ = self.worktree_setup_selection_finished(operation, worktree, true);
         self.refresh_worktree_setup_rows();
         Task::batch([select, start])
+    }
+
+    pub(super) fn worktree_setup_selection_finished(&mut self, operation: OperationId, worktree: PathBuf, committed: bool) -> Task<Message> {
+        if !self.setup_ui.pending.get(&worktree).is_some_and(|(run, _)| *run == operation) { return Task::none(); }
+        self.setup_ui.pending.remove(&worktree);
+        if !committed {
+            self.setup_ui.authorized_runs.lock().expect("setup launch authorization lock").remove(&operation);
+            self.setup_ui.statuses.insert(worktree, WorktreeSetupStatus::Interrupted("Setup was not opened because its destination selection changed or could not be protected. Review setup to resume.".into()));
+        }
+        self.refresh_worktree_setup_rows();
+        Task::none()
     }
 
     pub(super) fn refresh_worktree_setup_rows(&mut self) {
@@ -577,6 +592,23 @@ mod tests {
         let session = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
         assert!(matches!(terminal_status(&session, true, false), WorktreeSetupStatus::Interrupted(_)));
         assert_eq!(terminal_status(&session, true, true), WorktreeSetupStatus::Running);
+    }
+
+    #[test]
+    fn stale_selection_callbacks_cannot_retire_a_newer_setup_path_guard() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let path = PathBuf::from("/repo/setup");
+        let old = OperationId::new(); let current = OperationId::new();
+        app.setup_ui.pending.insert(path.clone(), (current, CancellationToken::new()));
+        app.setup_ui.recovered.insert(path.clone(), (current, SetupIntent { run_id: Some(current), ..Default::default() }));
+        app.setup_ui.authorized_runs.lock().unwrap().insert(current);
+        drop(app.worktree_setup_selection_finished(old, path.clone(), false));
+        assert!(app.setup_ui.preparing(&path));
+        drop(app.worktree_setup_selection_finished(current, path.clone(), false));
+        assert!(!app.setup_ui.preparing(&path));
+        assert!(!app.setup_ui.active());
+        assert!(app.setup_ui.authorized_runs.lock().unwrap().is_empty());
+        assert!(matches!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Interrupted(_)));
     }
 
     #[test]

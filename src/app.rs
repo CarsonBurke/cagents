@@ -4252,6 +4252,8 @@ pub enum Message {
     WorktreeSetupSkipChanged(bool),
     WorktreeSetupTrustChanged(bool),
     WorktreeSetupPrepared { operation: crate::model::OperationId, worktree: PathBuf, result: Result<crate::worktree_setup::SetupPreparation, String> },
+    WorktreeSetupSelectionCommitted { operation: crate::model::OperationId, worktree: PathBuf },
+    WorktreeSetupSelectionRejected { operation: crate::model::OperationId, worktree: PathBuf },
     WorktreeChoicesResolved { id: crate::model::OperationId, result: Result<worktree_choices::Choices, String> },
     WorktreeFieldFocused(WorktreeField),
     WorktreeChoiceSelected { field: WorktreeField, reference: String },
@@ -15468,6 +15470,8 @@ impl Application for Cagents {
             Message::WorktreeLinearResolved { id, result } => self.finish_worktree_linear(id, result),
             Message::WorktreeChoicesResolved { id, result } => self.finish_worktree_choices(id, result),
             Message::WorktreeSetupPrepared { operation, worktree, result } => self.finish_worktree_setup(operation, worktree, result),
+            Message::WorktreeSetupSelectionCommitted { operation, worktree } => self.worktree_setup_selection_finished(operation, worktree, true),
+            Message::WorktreeSetupSelectionRejected { operation, worktree } => self.worktree_setup_selection_finished(operation, worktree, false),
             Message::WorktreeSetupSkipChanged(skip) => {
                 if let Some(dialog) = &mut self.worktree_dialog { dialog.edit_setup_skip(skip); }
                 Task::none()
