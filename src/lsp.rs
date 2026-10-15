@@ -4615,7 +4615,11 @@ impl LspManager {
                     .await
                     .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
                 {
+                    let doc=watched.activity.lock().unwrap_or_else(|error|error.into_inner()).documents.iter().copied().next();
                     retire_from_watchdog(watched).await;
+                    // Refresh cached inspector metrics even when this was the
+                    // final server, so no other watchdog remains to refresh it.
+                    if let Some(doc)=doc {events.emit_now(LspEvent::Resources{doc});}
                     break;
                 }
                 let pid = {
@@ -8916,4 +8920,15 @@ mod tests {
             assert!(barrier.ready.load(Ordering::Acquire));
         });
     }
+
+    #[test]
+    fn externally_removed_root_retires_and_refreshes_last_server_metrics(){block_on(async{
+        let (_guard,worktree,file)=workspace();let mut manager=rust_manager().with_lifecycle(1,1);
+        let slot=install_fake(&mut manager,incremental_capabilities(), |_|Vec::new());let events=manager.events();let doc=LspDocumentId(1);
+        manager.open_for_test(doc,&file,&worktree,rust_language(),1,"fn f() {}\n");let handle=handle_of(&slot).await;await_ready(&events,doc).await;assert_eq!(manager.live_servers().len(),1);
+        std::fs::remove_dir_all(&worktree).unwrap();
+        next_matching(&events,|event|match event{LspEvent::Resources{doc:at}if *at==doc=>Some(()),_=>None}).await;
+        assert!(manager.live_servers().is_empty());assert!(handle.methods().iter().any(|method|method=="shutdown"));assert!(handle.methods().iter().any(|method|method=="exit"));
+        manager.begin_shutdown().await;
+    });}
 }
