@@ -143,8 +143,9 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-/// Version 78 adds daemon worktree control and immediate sidebar refresh edges.
-pub const PROTOCOL_VERSION: u16 = 78;
+/// Version 78 carries typed refusal reasons for automatic worktree cleanup.
+/// Version 79 adds daemon worktree control and immediate sidebar refresh edges.
+pub const PROTOCOL_VERSION: u16 = 79;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
