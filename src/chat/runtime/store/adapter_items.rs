@@ -14,6 +14,23 @@ impl CanonicalItemReader for Reader {
 }
 pub(in crate::chat::runtime) fn reader(store:&Arc<Mutex<Store>>)->Arc<dyn CanonicalItemReader> {Arc::new(Reader {store:Arc::downgrade(store)})}
 impl Store {
+    fn strict_adapter_field(&self,id:&str,field:i64,expected:usize)->Result<Vec<u8>,String> {
+        if expected>MAX_REHYDRATION {return Err("Original tool source exceeds the bounded adapter read limit".into());}
+        let mut query=self.db.prepare_cached("SELECT position,length(data),CASE WHEN length(data)<=?3 THEN data ELSE NULL END FROM chunks WHERE id=?1 AND field=?2 ORDER BY position").map_err(|error|error.to_string())?;
+        let rows=query.query_map(params![id,field,PART_BYTES],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<Vec<u8>>>(2)?))).map_err(|error|error.to_string())?;
+        let mut result=Vec::with_capacity(expected);
+        for row in rows {
+            let (position,len,data)=row.map_err(|error|error.to_string())?;
+            let position=usize::try_from(position).map_err(|_|"Original tool source has a negative chunk offset")?;
+            let data=data.ok_or("Original tool source has an oversized chunk")?;
+            if position!=result.len() || data.is_empty() || len!=data.len() as i64 || data.len()>expected.saturating_sub(result.len()) {
+                return Err("Original tool source has a missing, overlapping or invalid chunk".into());
+            }
+            result.extend(data);
+        }
+        if result.len()!=expected {return Err("Original tool source is incomplete; its stored call was preserved".into());}
+        Ok(result)
+    }
     fn adapter_item(&mut self,key:&CanonicalItemKey)->Result<Option<Item>,String> {
         self.flush_input()?;self.flush_text()?;
         if key.agent_id.is_some() {
@@ -28,8 +45,8 @@ impl Store {
         if len0.checked_add(len1).and_then(|bytes|bytes.checked_add(len2)).is_none_or(|bytes|bytes>MAX_REHYDRATION) {return Err("Original tool source exceeds the bounded adapter read limit".into());}
         let mut item:Item=postcard::from_bytes(&metadata).map_err(|error|error.to_string())?;
         if item.id!=key.item_id || len2!=0 {return Err("Original tool source identity or layout changed".into());}
-        let body0=String::from_utf8(self.field(&key.item_id,0,0,len0)?).map_err(|error|error.to_string())?;
-        let body1=String::from_utf8(self.field(&key.item_id,1,0,len1)?).map_err(|error|error.to_string())?;
+        let body0=String::from_utf8(self.strict_adapter_field(&key.item_id,0,len0)?).map_err(|error|error.to_string())?;
+        let body1=String::from_utf8(self.strict_adapter_field(&key.item_id,1,len1)?).map_err(|error|error.to_string())?;
         match &mut item.content {
             ItemContent::Tool {input,output,..}=> {*input=body0;*output=body1;}
             ItemContent::Command {output,..} if body1.is_empty()=> {*output=body0;}
@@ -91,6 +108,24 @@ mod tests {
         assert!(missing.events.iter().any(|event|matches!(event,Event::Error {fatal:false,..})),"unavailable canonical source is explicit");
         assert!(!missing.events.iter().any(|event|matches!(event,Event::Item(_))),"source failure cannot invent a replacement tool");
     }
+    #[test]
+    fn missing_canonical_chunks_never_replace_an_evicted_tool_with_partial_source() {
+        use serde_json::json;
+        for position in [0,PART_BYTES] {
+            let store=Arc::new(Mutex::new(Store::new().unwrap()));
+            let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(reader(&store));
+            let step=adapter.receive(json!({"type":"assistant","uuid":"corrupt-call","message":{"content":[{"type":"tool_use","id":"corrupt","name":"Opaque","input":{"content":"x".repeat(3*1024*1024)}}]}})).unwrap();
+            commit(&store,adapter.as_mut(),step);
+            let before={let store=store.lock().unwrap();store.db.execute("DELETE FROM chunks WHERE id='corrupt' AND field=0 AND position=?1",[position]).unwrap();store.db.query_row("SELECT SUM(length(data)) FROM chunks WHERE id='corrupt'",[],|row|row.get::<_,i64>(0)).unwrap()};
+            assert!(reader(&store).read(&CanonicalItemKey::new(None,"corrupt")).is_err());
+            let step=adapter.receive(json!({"type":"user","uuid":"corrupt-result","message":{"content":[{"type":"tool_result","tool_use_id":"corrupt","content":"finished","is_error":false}]}})).unwrap();
+            assert!(step.events.iter().any(|event|matches!(event,Event::Error {fatal:false,..})));
+            assert!(!step.events.iter().any(|event|matches!(event,Event::Item(_))),"partial UTF8-valid input must not be promoted to an authoritative replacement");
+            commit(&store,adapter.as_mut(),step);
+            assert_eq!(store.lock().unwrap().db.query_row("SELECT SUM(length(data)) FROM chunks WHERE id='corrupt'",[],|row|row.get::<_,i64>(0)).unwrap(),before);
+        }
+    }
+
     #[test]
     fn byte_evicted_large_agent_call_does_not_reappear_as_a_duplicate_task_row() {
         use serde_json::json;
