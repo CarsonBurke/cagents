@@ -231,11 +231,22 @@ impl Registry {
                 primary_checkout,
                 name,
                 kind,
+            }
+            | ModelEdit::VisitProject {
+                repository,
+                checkout,
+                primary_checkout,
+                name,
+                kind,
+                ..
             } => {
                 let key = repository_key(repository)?;
                 let checkout = checkout.as_deref().map(repository_key).transpose()?;
                 let primary_checkout = primary_checkout.as_deref().map(repository_key).transpose()?;
-                let explicit = matches!(edit, ModelEdit::ReopenProject { .. });
+                let explicit = matches!(edit,
+                    ModelEdit::ReopenProject { .. }
+                    | ModelEdit::VisitProject { reopen: true, .. });
+                let visiting = matches!(edit, ModelEdit::VisitProject { .. });
                 let tombstoned: bool = transaction
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM closed_projects WHERE repository = ?1)",
@@ -266,10 +277,11 @@ impl Registry {
                         .optional()
                         .map_err(|error| error.to_string())?;
                     match existing {
-                        Some((current, current_checkout, current_primary)) if current == *name
+                        Some((current, current_checkout, current_primary)) if (visiting || current == *name)
                             && checkout.is_none_or(|checkout| Some(checkout) == current_checkout.as_deref())
                             && primary_checkout.is_none_or(|primary| Some(primary) == current_primary.as_deref()) => reopened,
-                        Some(_) => {
+                        Some((current, _, _)) => {
+                            let name = if visiting { &current } else { name };
                             transaction
                                 .execute(
                                     "UPDATE projects SET name = ?2, checkout = COALESCE(?3, checkout), primary_checkout = COALESCE(?4, primary_checkout) WHERE repository = ?1",
