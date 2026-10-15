@@ -62,6 +62,12 @@ impl WorktreeAuthority {
         self.root.path()
     }
 
+    /// Pure clone of the original held worktree for negative root enrollment.
+    /// This performs no IO and grants no new source/adoption/effect authority.
+    pub fn retained_worktree_root(&self) -> Arc<fs_safety::Root> {
+        Arc::clone(&self.root)
+    }
+
     /// Compare the originally held scopes without touching the filesystem.
     /// Workers must still call `validate` before performing IO.
     pub fn same_scope(&self, other: &Self) -> bool {
