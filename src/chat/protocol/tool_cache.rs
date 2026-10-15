@@ -54,8 +54,10 @@ impl ToolCache {
         let key = ItemKey::new(agent, &item.id);
         if let Some(old) = self.items.remove(&key) {
             self.bytes = self.bytes.saturating_sub(cost(&key, &old));
+            self.order.retain(|old| old != &key);
         }
-        self.order.retain(|old| old != &key);
+        // A new key cannot already be in the order. Scanning the growing
+        // same-frame order here makes a many-call native frame quadratic.
         self.bytes = self.bytes.saturating_add(cost(&key, &item));
         self.order.push_back(key.clone());
         self.items.insert(key, item);
