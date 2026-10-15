@@ -1064,6 +1064,11 @@ pub enum DiffContent {
         /// Human-readable side labels, e.g. `HEAD` and `Index`.
         old_label: String,
         new_label: String,
+        /// HEAD used by this comparison, including an explicitly unborn HEAD.
+        /// Index/worktree and immutable commit comparisons need no HEAD guard.
+        source_head: Option<GitHeadGuard>,
+        /// Git modes read alongside each side, not inferred from text presence.
+        modes: [Option<u32>; 2],
     },
     /// An unmerged path, read from index stages 1, 2 and 3 plus the worktree.
     /// A missing stage-0 blob is never reported as an empty added side.
@@ -2689,10 +2694,11 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
 /// size comes from the same descriptor the bytes come from, and the read is
 /// bounded — so a classification and the read that acts on it cannot describe
 /// different objects.
-fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
-    let unreadable = |error: &dyn fmt::Display| DiffSide::Unreadable {
+fn read_worktree_side(worktree: &Path, path: &RepoPath) -> (DiffSide, Option<u32>) {
+    use std::os::unix::fs::PermissionsExt;
+    let unreadable = |error: &dyn fmt::Display| (DiffSide::Unreadable {
         reason: error.to_string(),
-    };
+    }, None);
     let root = match fs_safety::Root::open(worktree) {
         Ok(root) => root,
         Err(error) => return unreadable(&error),
@@ -2700,22 +2706,22 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
     let relative = path.as_path();
     let metadata = match fs_safety::metadata_beneath(&root, relative) {
         Ok(metadata) => metadata,
-        Err(error) if error.is_not_found() => return DiffSide::Absent,
+        Err(error) if error.is_not_found() => return (DiffSide::Absent, None),
         Err(error) => return unreadable(&error),
     };
     if metadata.file_type().is_symlink() {
         return match fs_safety::read_link_beneath(&root, relative) {
-            Ok(target) => DiffSide::Symlink { target },
+            Ok(target) => (DiffSide::Symlink { target }, Some(0o120000)),
             Err(error) => unreadable(&error),
         };
     }
     if !metadata.is_file() {
-        return DiffSide::NotRegularFile;
+        return (DiffSide::NotRegularFile, None);
     }
 
     let mut file = match fs_safety::open_beneath(&root, relative) {
         Ok(file) => file,
-        Err(error) if error.is_not_found() => return DiffSide::Absent,
+        Err(error) if error.is_not_found() => return (DiffSide::Absent, None),
         Err(error) => return unreadable(&error),
     };
     let opened = match fs_safety::metadata_of(&file) {
@@ -2723,14 +2729,13 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
         Err(error) => return unreadable(&error),
     };
     if !opened.is_file() {
-        return DiffSide::NotRegularFile;
+        return (DiffSide::NotRegularFile, None);
     }
+    let mode = Some(if opened.permissions().mode() & 0o100 != 0 { 0o100755 } else { 0o100644 });
     if opened.len() > MAX_DIFF_SIDE_BYTES {
-        return DiffSide::Oversize {
-            bytes: opened.len(),
-        };
+        return (DiffSide::Oversize { bytes: opened.len() }, mode);
     }
-    match fs_safety::read_bounded(&mut file, MAX_DIFF_SIDE_BYTES) {
+    let side = match fs_safety::read_bounded(&mut file, MAX_DIFF_SIDE_BYTES) {
         // `read_bounded` reads one byte past the limit precisely so that "at the
         // limit" and "over it" stay distinguishable. A file that grew after its
         // size was taken from the descriptor lands here.
@@ -2738,8 +2743,9 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
             bytes: bytes.len() as u64,
         },
         Ok(bytes) => classify_bytes(bytes),
-        Err(error) => unreadable(&error),
-    }
+        Err(error) => unreadable(&error).0,
+    };
+    (side, mode)
 }
 
 /// Measures untracked text without one Git process (or allocation) per file.
@@ -4231,15 +4237,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<DiffContent, RepositoryError> {
         let worktree = request.worktree.as_path();
         let old_path = request.old_path.as_ref().unwrap_or(&request.path);
+        let comparison = |old, new, old_label, new_label, source_head, modes| DiffContent::Comparison {
+            old, new, old_label, new_label, source_head, modes,
+        };
         match &request.basis {
             DiffBasis::IndexToWorktree => {
                 let stages = self.index_entries(worktree, old_path, cancellation)?;
-                let worktree_side = read_worktree_side(worktree, &request.path);
+                let (worktree_side, worktree_mode) = read_worktree_side(worktree, &request.path);
                 let stage = |number: u8| stages.iter().find(|entry| entry.stage == number);
                 if stage(0).is_none() && (1..=3).any(|number| stage(number).is_some()) {
-                    // An unmerged path has no stage 0. Treating that absence as
-                    // an empty old side would claim the file was added, so the
-                    // three conflict stages are reported instead.
                     return Ok(DiffContent::Unmerged {
                         base: self.entry_side(worktree, stage(1), cancellation)?,
                         ours: self.entry_side(worktree, stage(2), cancellation)?,
@@ -4247,63 +4253,48 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         worktree: worktree_side,
                     });
                 }
-                Ok(DiffContent::Comparison {
-                    old: self.entry_side(worktree, stage(0), cancellation)?,
-                    new: worktree_side,
-                    old_label: "Index".into(),
-                    new_label: "Working tree".into(),
-                })
+                Ok(comparison(
+                    self.entry_side(worktree, stage(0), cancellation)?, worktree_side,
+                    "Index".into(), "Working tree".into(), None,
+                    [stage(0).map(|entry| entry.mode), worktree_mode],
+                ))
             }
             DiffBasis::HeadToIndex => {
-                let old = match self.resolve_head(worktree, cancellation)? {
-                    Some(head) => self.tree_side(worktree, &head, old_path, cancellation)?,
-                    None => DiffSide::Absent,
+                // Resolve once: metadata and bytes must refer to the same HEAD,
+                // even if another process commits while the blobs are read.
+                let head = self.resolve_head(worktree, cancellation)?;
+                let (old, old_mode) = match head.as_ref() {
+                    Some(head) => self.tree_side(worktree, head, old_path, cancellation)?,
+                    None => (DiffSide::Absent, None),
                 };
+                let source_head = Some(match head { Some(head) => GitHeadGuard::Commit(head), None => GitHeadGuard::Unborn });
                 let stages = self.index_entries(worktree, &request.path, cancellation)?;
                 let staged = stages.iter().find(|entry| entry.stage == 0);
-                Ok(DiffContent::Comparison {
-                    old,
-                    new: self.entry_side(worktree, staged, cancellation)?,
-                    old_label: "HEAD".into(),
-                    new_label: "Index".into(),
-                })
+                Ok(comparison(old, self.entry_side(worktree, staged, cancellation)?,
+                    "HEAD".into(), "Index".into(), source_head,
+                    [old_mode, staged.map(|entry| entry.mode)]))
             }
-            DiffBasis::MergeBaseToHead {
-                base_ref,
-                head,
-                merge_base,
-            } => Ok(DiffContent::Comparison {
-                old: self.tree_side(worktree, merge_base, old_path, cancellation)?,
-                new: self.tree_side(worktree, head, &request.path, cancellation)?,
-                old_label: format!("{} ({})", base_ref.short_name(), merge_base.short()),
-                new_label: format!("HEAD ({})", head.short()),
-            }),
+            DiffBasis::MergeBaseToHead { base_ref, head, merge_base } => {
+                let (old, old_mode) = self.tree_side(worktree, merge_base, old_path, cancellation)?;
+                let (new, new_mode) = self.tree_side(worktree, head, &request.path, cancellation)?;
+                Ok(comparison(old, new, format!("{} ({})", base_ref.short_name(), merge_base.short()),
+                    format!("HEAD ({})", head.short()), None, [old_mode, new_mode]))
+            }
             DiffBasis::CommitToParent { oid, parent } => {
-                let old = match parent {
+                let (old, old_mode) = match parent {
                     Some(parent) => self.tree_side(worktree, parent, old_path, cancellation)?,
-                    None => DiffSide::Absent,
+                    None => (DiffSide::Absent, None),
                 };
-                Ok(DiffContent::Comparison {
-                    old,
-                    new: self.tree_side(worktree, oid, &request.path, cancellation)?,
-                    old_label: match parent {
-                        Some(parent) => parent.short().to_owned(),
-                        None => "root commit".into(),
-                    },
-                    new_label: oid.short().to_owned(),
-                })
+                let (new, new_mode) = self.tree_side(worktree, oid, &request.path, cancellation)?;
+                Ok(comparison(old, new, match parent { Some(parent) => parent.short().to_owned(), None => "root commit".into() },
+                    oid.short().to_owned(), None, [old_mode, new_mode]))
             }
-            DiffBasis::PullRequest {
-                number,
-                base_ref,
-                head,
-                merge_base,
-            } => Ok(DiffContent::Comparison {
-                old: self.tree_side(worktree, merge_base, old_path, cancellation)?,
-                new: self.tree_side(worktree, head, &request.path, cancellation)?,
-                old_label: format!("{} ({})", base_ref.short_name(), merge_base.short()),
-                new_label: format!("#{number} ({})", head.short()),
-            }),
+            DiffBasis::PullRequest { number, base_ref, head, merge_base } => {
+                let (old, old_mode) = self.tree_side(worktree, merge_base, old_path, cancellation)?;
+                let (new, new_mode) = self.tree_side(worktree, head, &request.path, cancellation)?;
+                Ok(comparison(old, new, format!("{} ({})", base_ref.short_name(), merge_base.short()),
+                    format!("#{number} ({})", head.short()), None, [old_mode, new_mode]))
+            }
         }
     }
 
@@ -4353,7 +4344,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         revision: &Oid,
         path: &RepoPath,
         cancellation: &CancellationToken,
-    ) -> Result<DiffSide, RepositoryError> {
+    ) -> Result<(DiffSide, Option<u32>), RepositoryError> {
         let command = self.git_literal_read(
             worktree,
             [
@@ -4368,8 +4359,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let parsed = parse_tree_entries(&output.stdout);
         let entries = invalid_output(parsed, output)?;
         match entries.into_iter().find(|entry| entry.path == *path) {
-            Some(entry) => self.object_side(worktree, entry.mode, &entry.oid, cancellation),
-            None => Ok(DiffSide::Absent),
+            Some(entry) => self.object_side(worktree, entry.mode, &entry.oid, cancellation).map(|side| (side, Some(entry.mode))),
+            None => Ok((DiffSide::Absent, None)),
         }
     }
 
@@ -9840,6 +9831,8 @@ mod tests {
                 },
                 old_label: "Index".into(),
                 new_label: "Working tree".into(),
+                source_head: None,
+                modes: [None, Some(0o100644)],
             }
         );
     }
@@ -9904,7 +9897,7 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         let service = fake_service(vec![
             success(format!("{}\n", oid(9)).as_bytes()),
-            success(format!("100644 blob {}\told.txt\0", oid(1)).as_bytes()),
+            success(format!("100755 blob {}\told.txt\0", oid(1)).as_bytes()),
             success(format!("{} blob 4\nold\n\n", oid(1)).as_bytes()),
             success(format!("100644 {} 0\tnew.txt\0", oid(2)).as_bytes()),
             success(format!("{} blob 4\nnew\n\n", oid(2)).as_bytes()),
@@ -9944,13 +9937,54 @@ mod tests {
             DiffContent::Comparison {
                 old_label,
                 new_label,
+                source_head,
+                modes,
                 ..
             } => {
                 assert_eq!(old_label, "HEAD");
                 assert_eq!(new_label, "Index");
+                assert_eq!(source_head, Some(GitHeadGuard::Commit(oid(9))));
+                assert_eq!(modes, [Some(0o100755), Some(0o100644)]);
             }
             other => panic!("expected a comparison, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unborn_diff_metadata_keeps_an_explicit_head_guard() {
+        let mut unborn = success(b"").unwrap();
+        unborn.success = false;
+        unborn.exit_code = Some(1);
+        let service = fake_service(vec![
+            Ok(unborn),
+            success(format!("100755 {} 0\tnew.sh\0", oid(2)).as_bytes()),
+            success(format!("{} blob 4\nnew\n\n", oid(2)).as_bytes()),
+        ]);
+        let DiffContent::Comparison { source_head, modes, old, .. } = service.diff(
+            &DiffRequest { worktree: PathBuf::from("/repo"), basis: DiffBasis::HeadToIndex,
+                path: path("new.sh"), old_path: None }, &CancellationToken::new()).unwrap()
+        else { panic!("expected a text comparison"); };
+        assert_eq!(source_head, Some(GitHeadGuard::Unborn));
+        assert_eq!(modes, [None, Some(0o100755)]);
+        assert_eq!(old, DiffSide::Absent);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn worktree_diff_mode_comes_from_the_opened_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("new.sh");
+        fs::write(&target, "script\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let service = fake_service(vec![success(b"")]);
+        let DiffContent::Comparison { modes, source_head, new, .. } = service.diff(
+            &DiffRequest { worktree: root.path().into(), basis: DiffBasis::IndexToWorktree,
+                path: path("new.sh"), old_path: None }, &CancellationToken::new()).unwrap()
+        else { panic!("expected a text comparison"); };
+        assert_eq!(modes, [None, Some(0o100755)]);
+        assert_eq!(source_head, None);
+        assert_eq!(new.text(), Some("script\n"));
     }
 
     #[test]
