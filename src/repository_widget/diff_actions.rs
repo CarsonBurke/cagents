@@ -105,7 +105,9 @@ impl RepositoryRuntime {
         }
         let selection = &mut self.diff_interaction.selection;
         if (extend || drag)
-            && selection.is_some_and(|selection| selection.mode == mode && (mode == DiffMode::Inline || selection.side == side))
+            && selection.is_some_and(|selection| {
+                selection.mode == mode && (mode == DiffMode::Inline || selection.side == side)
+            })
         {
             selection.as_mut().unwrap().head = row;
         } else {
@@ -231,7 +233,9 @@ impl RepositoryRuntime {
                 })
             }
             DiffCommand::OpenInEditor { row, side } => {
-                if self.is_saving() { return Task::none(); }
+                if self.is_saving() {
+                    return Task::none();
+                }
                 let Some(line) = model
                     .new_line_at_row(self.diff_mode, row)
                     .or_else(|| Selection::new(self.diff_mode, side, row).line_reference(model))
@@ -509,8 +513,11 @@ impl<'a> RowContext<'a> {
         let unified = runtime.diff_mode == DiffMode::Inline;
         let editable = matches!(runtime.document, DocumentState::Editable(_));
         let can_open = !runtime.is_saving() && (editable || !runtime.blocks_navigation());
-        let changed = runtime.diff_interaction.selection.zip(runtime.diff_model())
-            .is_some_and(|(selection,model)| selection.has_changes(model));
+        let changed = runtime
+            .diff_interaction
+            .selection
+            .zip(runtime.diff_model())
+            .is_some_and(|(selection, model)| selection.has_changes(model));
         let Some(source) = runtime.diff_source_key() else {
             return content;
         };
@@ -706,17 +713,44 @@ mod tests {
 
     #[test]
     fn unified_selection_extends_across_old_and_new_rows_but_split_stays_per_side() {
-        for mode in [DiffMode::Inline,DiffMode::Split] {
-            let (mut runtime,card,identity) = fixture(mode);
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let (mut runtime, card, identity) = fixture(mode);
             let model = runtime.diff_model().unwrap();
             let start = model.change_starts(mode)[0];
-            let end = start+1;
+            let end = start + 1;
             let revision = runtime.diff_layout_revision;
             let basis = runtime.diff_basis.clone();
-            runtime.select_diff_row(identity.clone(),basis.clone(),mode,revision,start,Side::Old,false,false,false);
-            runtime.select_diff_row(identity,basis,mode,revision,end,Side::New,true,false,false);
+            runtime.select_diff_row(
+                identity.clone(),
+                basis.clone(),
+                mode,
+                revision,
+                start,
+                Side::Old,
+                false,
+                false,
+                false,
+            );
+            runtime.select_diff_row(
+                identity,
+                basis,
+                mode,
+                revision,
+                end,
+                Side::New,
+                true,
+                false,
+                false,
+            );
             let selection = runtime.diff_interaction.selection.unwrap();
-            assert_eq!(selection.rows(),if mode == DiffMode::Inline { start..end+1 } else { end..end+1 });
+            assert_eq!(
+                selection.rows(),
+                if mode == DiffMode::Inline {
+                    start..end + 1
+                } else {
+                    end..end + 1
+                }
+            );
             drop(runtime.update(RepositoryAction::EndDiffSelection { card }));
             assert!(!runtime.diff_interaction.dragging);
         }

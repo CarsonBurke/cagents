@@ -52,15 +52,19 @@ impl Selection {
     /// Hunk starts are sorted model coordinates. Inspect the first row and
     /// binary-search the next start, instead of rescanning the full file for
     /// every mounted row's context menu.
-    pub fn has_changes(self, model:&DiffModel)->bool {
+    pub fn has_changes(self, model: &DiffModel) -> bool {
         let rows = self.rows();
         let kind = match self.mode {
             DiffMode::Inline => model.inline_rows.get(rows.start).map(|row| row.kind),
             DiffMode::Split => model.split_rows.get(rows.start).map(|row| row.kind),
         };
-        if kind.is_some_and(|kind| kind != DiffRowKind::Context) { return true; }
+        if kind.is_some_and(|kind| kind != DiffRowKind::Context) {
+            return true;
+        }
         let starts = model.change_starts(self.mode);
-        starts.get(starts.partition_point(|start| *start < rows.start)).is_some_and(|start| *start < rows.end)
+        starts
+            .get(starts.partition_point(|start| *start < rows.start))
+            .is_some_and(|start| *start < rows.end)
     }
 
     /// Copy original source bytes, including CRLF and final-newline identity.
@@ -206,13 +210,23 @@ mod tests {
 
     #[test]
     fn changed_selection_detects_hunk_interiors_and_context_boundaries() {
-        let model = build_diff("a\nb\nc\nd\n","a\nB\nC\nd\n");
-        for mode in [DiffMode::Inline,DiffMode::Split] {
+        let model = build_diff("a\nb\nc\nd\n", "a\nB\nC\nd\n");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
             let first = model.change_starts(mode)[0];
-            assert!(!Selection::new(mode,Side::New,0).has_changes(&model));
-            assert!(Selection::new(mode,Side::New,first+1).has_changes(&model));
-            assert!(!Selection::new(mode,Side::New,model.row_count(mode)-1).has_changes(&model));
-            assert!(Selection { mode,side:Side::New,anchor:0,head:first }.has_changes(&model));
+            assert!(!Selection::new(mode, Side::New, 0).has_changes(&model));
+            assert!(Selection::new(mode, Side::New, first + 1).has_changes(&model));
+            assert!(
+                !Selection::new(mode, Side::New, model.row_count(mode) - 1).has_changes(&model)
+            );
+            assert!(
+                Selection {
+                    mode,
+                    side: Side::New,
+                    anchor: 0,
+                    head: first
+                }
+                .has_changes(&model)
+            );
         }
     }
 
@@ -554,7 +568,10 @@ pub fn highlight_matches<'a>(
     let mut start = 0;
     for span in spans {
         let end = start + span.text.as_ref().len();
-        if end == start { result.push(span); continue; }
+        if end == start {
+            result.push(span);
+            continue;
+        }
         // Search results are source-ordered, including Unicode folds that map
         // multiple hits to the same source range. Partition monotonic bounds
         // instead of scanning every match for each syntax fragment.
@@ -576,7 +593,10 @@ pub fn highlight_matches<'a>(
             let mut part = span.clone();
             part.text = (&text[a..b]).into();
             let candidate = matches.partition_point(|found| found.end <= a);
-            if matches.get(candidate).is_some_and(|found| found.contains(&a)) {
+            if matches
+                .get(candidate)
+                .is_some_and(|found| found.contains(&a))
+            {
                 let mut color = crate::design::warning_color(theme);
                 color.a = if active.is_some_and(|found| found.contains(&a)) {
                     0.65
@@ -599,13 +619,25 @@ mod highlight_tests {
     fn empty_and_dense_search_emphasis_preserve_exact_source_text() {
         use cosmic::iced::widget::text::Span;
         let theme = cosmic::theme::active();
-        let empty = highlight_matches("",vec![Span::new("")],&[0..0],None,&theme);
-        assert_eq!(empty.len(),1);
+        let empty = highlight_matches("", vec![Span::new("")], &[0..0], None, &theme);
+        assert_eq!(empty.len(), 1);
         assert!(empty[0].highlight.is_none());
         let text = "a".repeat(5000);
-        let matches = (0..text.len()).map(|at| at..at+1).collect::<Vec<_>>();
-        let result = highlight_matches(&text,vec![Span::new(text.as_str())],&matches,Some(&(2500..2501)),&theme);
-        assert_eq!(result.iter().map(|span| span.text.as_ref()).collect::<String>(),text);
+        let matches = (0..text.len()).map(|at| at..at + 1).collect::<Vec<_>>();
+        let result = highlight_matches(
+            &text,
+            vec![Span::new(text.as_str())],
+            &matches,
+            Some(&(2500..2501)),
+            &theme,
+        );
+        assert_eq!(
+            result
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            text
+        );
         assert!(result.iter().all(|span| span.highlight.is_some()));
     }
 
