@@ -18970,21 +18970,20 @@ mod tests {
                 }
             )))
         ));
-        for key in [Key::Named(Named::Space), Key::Character(" ".into())] {
-            assert!(matches!(
-                registered_editor_binding(
-                    card,
-                    &runtime,
-                    &press(key, iced::keyboard::Modifiers::CTRL)
-                ),
-                Some(Some(text_editor::Binding::Custom(
-                    RepositoryAction::Language {
-                        action: EditorLspAction::Complete,
-                        ..
-                    }
-                )))
-            ));
-        }
+        let key = Key::Character(" ".into());
+        assert!(matches!(
+            registered_editor_binding(
+                card,
+                &runtime,
+                &press(key, iced::keyboard::Modifiers::CTRL)
+            ),
+            Some(Some(text_editor::Binding::Custom(
+                RepositoryAction::Language {
+                    action: EditorLspAction::Complete,
+                    ..
+                }
+            )))
+        ));
         assert!(
             matches!(runtime.editor_language_command_action(card, Command::ShowHover), Some(RepositoryAction::Language { action: EditorLspAction::Hover(Some(at)), .. }) if at == runtime.cursor_position().unwrap()),
             "explicit hover uses the caret rather than the mouse-leave dismiss action"
@@ -19014,7 +19013,7 @@ mod tests {
             registered_editor_binding(
                 card,
                 &runtime,
-                &press(Key::Named(Named::Space), iced::keyboard::Modifiers::CTRL)
+                &press(Key::Character(" ".into()), iced::keyboard::Modifiers::CTRL)
             )
             .is_none()
         );

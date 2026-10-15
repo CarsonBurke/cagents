@@ -7990,7 +7990,7 @@ fn change_context_controls<'a>(
     } else {
         widget::menu::Item::ButtonDisabled
     };
-    let mut entries = vec![mutation(
+    let mut entries: Vec<widget::menu::Item<ChangeContextCommand<'_>, String>> = vec![mutation(
         commands::label(commands::change_command_id(command)).into(),
         None,
         ChangeContextCommand {
@@ -13378,9 +13378,7 @@ mod row_interaction {
                         ..
                     }) if state.focused => {
                         let action = match named {
-                            keyboard::key::Named::Space | keyboard::key::Named::Enter
-                                if modifiers.is_empty() =>
-                            {
+                            keyboard::key::Named::Enter if modifiers.is_empty() => {
                                 Some(SidebarAction::InvokeChangeRows {
                                     key: key.clone(),
                                     row: row.clone(),

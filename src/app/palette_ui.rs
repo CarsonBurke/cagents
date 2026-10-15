@@ -906,7 +906,6 @@ impl Cagents {
                         Some(value.to_uppercase())
                     }
                     keyboard::Key::Named(name) => match name {
-                        keyboard::key::Named::Space => Some("Space".into()),
                         keyboard::key::Named::ArrowLeft => Some("Left".into()),
                         keyboard::key::Named::ArrowRight => Some("Right".into()),
                         keyboard::key::Named::ArrowUp => Some("Up".into()),
@@ -2159,7 +2158,7 @@ impl Cagents {
                 && self.sidebar_state.active_worktree() == Some(&source.key)
                 && self.sidebar_model.contains_worktree(&source.key)
                 && matches!(source.data_state, sidebar::SidebarDataState::Ready)
-                && !source.reloading
+                && !source.is_reloading()
                 && !source.busy()
         })
     }
