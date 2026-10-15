@@ -51,6 +51,9 @@ struct ReturnTarget {
     published: Option<(crate::terminal_ipc::TerminalDescriptor, crate::terminal::TerminalHandle)>,
 }
 impl History {
+    pub(in crate::host) fn has_pending_handoff(&self, id: TerminalId) -> bool {
+        self.entries.get(&id).is_some_and(|entry|entry.pending_handoff.is_some())
+    }
     fn ensure(&mut self, id: TerminalId) -> Result<(), ProtocolError> {
         if self.entries.contains_key(&id) { return Ok(()); }
         if self.entries.len() >= CAPACITY {

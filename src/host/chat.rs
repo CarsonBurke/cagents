@@ -3710,6 +3710,7 @@ fn process_inner_claimed(
             Ok(response)
         }
         ClientRequest::ChatReturnTerminal { chat_id, expected } => {
+            local_retirement::require_open(&host.lock().unwrap_or_else(|p|p.into_inner()),chat_id).map_err(unavailable)?;
             if expected.source.id != chat_id {
                 return Err(error("Captured backend belongs to another conversation"));
             }
@@ -4164,14 +4165,6 @@ fn close_chat_source(
         (handle, source)
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
-    let local_custody = (handle.actor_identity().is_none()
-        && !source.native_continuity.retains_provider() && !source.owns_codex_listener())
-        .then(|| local_retirement::begin(host,chat_id,&handle)).transpose()?;
-    if let Some(pending)=&local_custody && pending.chat_sealed() {
-        let snapshot=pending.snapshot().ok_or_else(|| unavailable("The exact closed owner has no final transcript; retry its original terminal close"))?;
-        local_retirement::commit(host,pending)?;
-        return Ok(ServerResponse::ChatClosed {chat_id,snapshot});
-    }
     if bound_close::close_unattempted(host, &source)
         .map_err(unavailable)?
         .is_some()
@@ -4179,8 +4172,15 @@ fn close_chat_source(
         let snapshot = handle.snapshot(None).ok_or_else(|| {
             unavailable("The exact original owner closed, but its final transcript is unavailable")
         })?;
-        if let Some(pending)=&local_custody {local_retirement::finished_elsewhere(host,pending);}
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
+    }
+    let local_custody = (handle.actor_identity().is_none()
+        && !source.native_continuity.retains_provider() && !source.owns_codex_listener())
+        .then(|| local_retirement::begin(host,chat_id,&handle)).transpose()?;
+    if let Some(pending)=&local_custody && pending.chat_sealed() {
+        let snapshot=pending.snapshot().ok_or_else(|| unavailable("The exact closed owner has no final transcript; retry its original terminal close"))?;
+        local_retirement::commit(host,pending)?;
+        return Ok(ServerResponse::ChatClosed {chat_id,snapshot});
     }
     let snapshot = if let Some(pending)=&local_custody && pending.sealed() {
         // A successful terminal-actor close may have failed its SQL commit.
@@ -4280,7 +4280,7 @@ fn close_chat_source(
         Some(pending)=>pending,
         None=>local_retirement::begin(host,chat_id,&handle)?,
     };
-    pending.seal(Some(snapshot.clone()),terminal,true);
+    pending.seal(snapshot.clone(),terminal,true)?;
     local_retirement::commit(host,&pending)?;
     Ok(ServerResponse::ChatClosed { chat_id, snapshot })
 }
@@ -4765,14 +4765,18 @@ pub(super) fn close_terminal_actor_under_transition(
     if let Some(source) = &source {
         super::agent_execution::preflight_retirement(host, source).map_err(unavailable)?;
     }
-    let custody=source.as_ref().filter(|_|handle.actor_identity().is_none())
+    let custody=source.as_ref().filter(|source|handle.actor_identity().is_none()
+        && !source.native_continuity.retains_provider() && !source.owns_codex_listener())
         .map(|_|local_retirement::begin(host,terminal_id,handle)).transpose()?;
     if custody.as_ref().is_none_or(|pending|!pending.sealed()) {
         match deadline {
             Some(deadline) => handle.close_until(deadline).map_err(unavailable)?,
             None => handle.close().map_err(unavailable)?,
         }
-        if let Some(pending)=&custody {pending.seal(handle.snapshot(None),None,false);}
+        if let Some(pending)=&custody {
+            let snapshot=handle.snapshot(None).ok_or_else(||unavailable("The exact closed owner has no final snapshot; its custody was retained"))?;
+            pending.seal(snapshot,None,false)?;
+        }
     }
     retire_terminal_actor(host, terminal_id, handle)
 }
@@ -4793,8 +4797,8 @@ fn retire_terminal_actor(
     if let Some(source) = &source {
         retained_actor::finish_close(host, handle, source).map_err(unavailable)?;
     }
-    if handle.actor_identity().is_none() && source.is_some() {
-        let pending=local_retirement::begin(host,terminal_id,handle)?;
+    let pending=host.lock().unwrap_or_else(|p|p.into_inner()).local_chat_retirements.get(&terminal_id).cloned();
+    if let Some(pending)=pending {
         return local_retirement::commit(host,&pending);
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());

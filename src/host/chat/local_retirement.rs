@@ -15,6 +15,7 @@ pub(in crate::host) struct Pending {
 #[derive(Default)]
 struct Final {
     snapshot: Option<chat::Snapshot>,
+    retirement_source: Option<Session>,
     pair: Option<(crate::model::TerminalSession, crate::terminal::TerminalHandle)>,
     chat_close: bool,
 }
@@ -25,10 +26,10 @@ pub(in crate::host) fn require_open(state: &HostState, id: TerminalId) -> Result
     }
     Ok(())
 }
-fn matches(state: &HostState, pending: &Pending) -> bool {
+fn matches_owner(state: &HostState, pending: &Pending) -> bool {
     state.chats.get(&pending.source.id).is_some_and(|record| {
         record.execution_instance == pending.instance && record.handle.same_actor(&pending.actor)
-            && record.session == pending.source
+
             && match (&record.paired_terminal, &pending.pair_at_capture) {
                 (None, None) => true,
                 (Some(actual), Some(expected)) => actual.same_worker(expected),
@@ -36,15 +37,22 @@ fn matches(state: &HostState, pending: &Pending) -> bool {
             }
     })
 }
+fn matches(state: &HostState, pending: &Pending, sealed_source: &Session) -> bool {
+    matches_owner(state, pending) && state.chats.get(&pending.source.id).is_some_and(|record|
+        record.session == pending.source || record.session == *sealed_source)
+}
 /// Reserve BEFORE close effects. An uncertain close retains the original
 /// owner; it must not be confused with a sealed successful teardown.
 pub(super) fn begin(host: &SharedHost, id: TerminalId, actor: &Handle) -> Result<Arc<Pending>, ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(pending) = state.local_chat_retirements.get(&id) {
-        if !pending.actor.same_actor(actor) || !matches(&state, pending) {
+        if !pending.actor.same_actor(actor) || !matches_owner(&state, pending) {
             return Err(unavailable("The pending closed owner differs from the current actor; neither owner was discarded"));
         }
         return Ok(pending.clone());
+    }
+    if state.native_sources.has_pending_handoff(id) {
+        return Err(unavailable("The exact Return operation retains this owner; finish that original operation before a separate Local close"));
     }
     let record = state.chats.get(&id).filter(|record| record.handle.same_actor(actor))
         .ok_or_else(|| unavailable("The exact actor changed before close custody was reserved"))?;
@@ -69,13 +77,20 @@ impl Pending {
     }
     /// Only after the ACTUAL actor close and, for ordinary chat close, exact
     /// paired shutdown succeeded. A completed flag or cache read cannot seal.
-    pub(super) fn seal(&self, snapshot:Option<chat::Snapshot>,
-        pair:Option<(crate::model::TerminalSession,crate::terminal::TerminalHandle)>, chat_close:bool) {
+    pub(super) fn seal(&self, snapshot:chat::Snapshot,
+        pair:Option<(crate::model::TerminalSession,crate::terminal::TerminalHandle)>, chat_close:bool) -> Result<(),ProtocolError> {
+        if self.source.launch.session_id.as_ref().is_some_and(|known| snapshot.session_id.as_ref()!=Some(known))
+            || snapshot.native_continuity != self.source.native_continuity {
+            return Err(unavailable("The actual closed provider changed its known thread or native ownership; its original custody was retained"));
+        }
+        let mut retirement_source=self.source.clone();
+        retirement_source.launch.session_id=snapshot.session_id.clone();
         let mut final_state=self.final_state.lock().unwrap_or_else(|p|p.into_inner());
         if !self.closed.load(Ordering::Acquire) || (chat_close && !final_state.chat_close) {
-            *final_state=Final {snapshot,pair,chat_close};
+            *final_state=Final {snapshot:Some(snapshot),retirement_source:Some(retirement_source),pair,chat_close};
             self.closed.store(true,Ordering::Release);
         }
+        Ok(())
     }
 }
 /// Native cleanup has its own stronger custody/commit sequence. Release this
@@ -91,9 +106,10 @@ pub(super) fn finished_elsewhere(host:&SharedHost,pending:&Arc<Pending>) {
 pub(super) fn commit(host:&SharedHost,pending:&Arc<Pending>)->Result<(),ProtocolError> {
     if !pending.sealed() {return Err(unavailable("The original close has not proved teardown; its owner remains retained"));}
     let final_state=pending.final_state.lock().unwrap_or_else(|p|p.into_inner());
+    let retirement_source=final_state.retirement_source.as_ref().ok_or_else(||unavailable("The exact close has no sealed final source"))?;
     {
         let state=host.lock().unwrap_or_else(|p|p.into_inner());
-        if !matches(&state,pending) {return Err(unavailable("The exact closed actor changed before durable retirement; its replacement was preserved"));}
+        if !matches(&state,pending,retirement_source) {return Err(unavailable("The exact closed actor changed before durable retirement; its replacement was preserved"));}
         if let Some((source,worker))=&final_state.pair
             && state.terminals.get(&source.id).is_none_or(|record|
                 !matches_paired_terminal(&record.session,source,state.proof()) || !record.handle.same_worker(worker)) {
@@ -103,12 +119,12 @@ pub(super) fn commit(host:&SharedHost,pending:&Arc<Pending>)->Result<(),Protocol
     if !pending.committed.load(Ordering::Acquire) {
         // SQL and model notification are outside HostState. A failure leaves
         // Record, actual Handle, final snapshot and exact pair in custody.
-        super::super::agent_execution::retired(host,&pending.source).map_err(unavailable)?;
+        super::super::agent_execution::retired(host,retirement_source).map_err(unavailable)?;
         pending.committed.store(true,Ordering::Release);
     }
     let (record,pair,removed_pending)={
         let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
-        if !matches(&state,pending) {return Err(unavailable("The actor changed after retirement committed; its replacement was preserved"));}
+        if !matches(&state,pending,retirement_source) {return Err(unavailable("The actor changed after retirement committed; its replacement was preserved"));}
         if let Some((source,worker))=&final_state.pair
             && state.terminals.get(&source.id).is_none_or(|record|
                 !matches_paired_terminal(&record.session,source,state.proof()) || !record.handle.same_worker(worker)) {

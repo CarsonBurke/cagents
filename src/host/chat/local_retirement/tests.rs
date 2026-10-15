@@ -3,11 +3,17 @@ use super::*;
 use crate::{agent_execution::{Destination,HostedSession,Origin,Spec,Submit,Surface,Target},
     chat::{Command,Event,protocol::{Adapter,ProcessSpec,Step}},
     model::{LaunchRecipe,ProjectKind},workspace_model::ModelEdit};
-struct NoPrompt;
+struct NoPrompt { confirm:bool }
 impl Adapter for NoPrompt {
     fn initialize(&mut self)->Result<Step,String>{Ok(Step::default())}
-    fn command(&mut self,_:Command)->Result<Step,String>{Err("No prompt/control is authorized by this close fixture".into())}
-    fn receive(&mut self,_:serde_json::Value)->Result<Step,String>{Ok(Step::default())}
+    fn command(&mut self,command:Command)->Result<Step,String>{
+        if self.confirm && matches!(command,Command::Refresh) {
+            Ok(Step{writes:vec![serde_json::json!({"confirm":true})],events:Vec::new()})
+        } else { Err("No prompt/control is authorized by this close fixture".into()) }
+    }
+    fn receive(&mut self,_:serde_json::Value)->Result<Step,String>{Ok(Step{writes:Vec::new(),events:if self.confirm {
+        vec![Event::Session{id:"confirmed-by-original-cat-frame".into(),title:None}]
+    } else {Vec::new()}})}
 }
 struct Fixture {
     _directory:tempfile::TempDir, host:SharedHost, source:Session, actor:Handle,
@@ -18,7 +24,7 @@ fn actor(recipe:&LaunchRecipe)->Handle {
     let spec=ProcessSpec::from(recipe);
     let mut initial=Step{writes:Vec::new(),events:vec![Event::Ready(true)]};
     let store=chat::runtime::preflight(&spec,&mut initial).unwrap();
-    Handle::start(spec,Box::new(NoPrompt),initial,store,None,|_|{}).unwrap()
+    Handle::start(spec,Box::new(NoPrompt{confirm:false}),initial,store,None,|_|{}).unwrap()
 }
 fn record(source:Session,actor:Handle)->Record {
     Record{execution_instance:uuid::Uuid::new_v4(),console_recipe:None,paired_terminal:None,
@@ -27,7 +33,8 @@ fn record(source:Session,actor:Handle)->Record {
         completion_observed:false,returning_terminal:false}
 }
 impl Fixture {
-    fn new()->Self {
+    fn new()->Self {Self::observed(None)}
+    fn observed(barrier:Option<(std::sync::mpsc::Sender<()>,std::sync::mpsc::Receiver<()>)>)->Self {
         let directory=tempfile::tempdir().unwrap();
         let db=directory.path().join("registry.sqlite3");
         let mut registry=crate::host::model::Registry::at(&db).unwrap();
@@ -45,9 +52,24 @@ impl Fixture {
             proof:Some(host.lock().unwrap().proof().clone()),terminal:None,owned_codex_listener:None,
             native_continuity:Default::default(),archive_report:None};
         registry.bind_agent(accepted.agent.id,None,HostedSession::Chat(source.clone())).unwrap();
-        let actor=actor(&source.launch.recipe);
+        let instance=uuid::Uuid::new_v4();
+        let confirm=barrier.is_some();let barrier=std::sync::Mutex::new(barrier);
+        let weak=Arc::downgrade(&host);let id=source.id;
+        let spec=ProcessSpec::from(&source.launch.recipe);
+        let mut initial=Step{writes:Vec::new(),events:vec![Event::Ready(true)]};
+        let store=chat::runtime::preflight(&spec,&mut initial).unwrap();
+        let actor=Handle::start(spec,Box::new(NoPrompt{confirm}),initial,store,None,move|update|{
+            if matches!(&update,Update::Identity) {
+                let wait=barrier.lock().unwrap().take();
+                if let Some((entered,release))=wait {entered.send(()).unwrap();release.recv_timeout(Duration::from_secs(5)).unwrap();}
+            }
+            super::super::changed_from(&weak,id,Some(instance),update);
+        }).unwrap();
+        let registration=registry.install_session_observer(&HostedSession::Chat(source.clone()),instance,None,None,None).unwrap();
         {let mut state=host.lock().unwrap();state.install_model(registry);state.register_client(1);
-            state.chats.insert(source.id,record(source.clone(),actor.clone()));}
+            state.publish_chat_observer(source.id,instance,registration.stamp());
+            let mut issued=record(source.clone(),actor.clone());issued.execution_instance=instance;
+            state.chats.insert(source.id,issued);}
         let registry=crate::host::agent_execution::registry(&host).unwrap();
         let fault=rusqlite::Connection::open(&db).unwrap();
         fault.execute_batch("CREATE TRIGGER fail_local_retirement BEFORE UPDATE OF closed ON agents WHEN NEW.closed=1 BEGIN SELECT RAISE(ABORT,'local retirement write denied'); END;").unwrap();
@@ -57,7 +79,7 @@ impl Fixture {
     fn assert_retained(&self){
         assert!(self.actor.is_completed(),"actual Local close must complete before the SQL fault");
         let pending=self.pending();assert!(pending.sealed());assert!(pending.snapshot().is_some());
-        assert!(matches(&self.host.lock().unwrap(),&pending));
+        assert!(matches_owner(&self.host.lock().unwrap(),&pending));
         assert!(!self.registry.lock().unwrap().agent(self.agent).unwrap().closed);
     }
     fn allow_commit(&self){self.fault.execute_batch("DROP TRIGGER fail_local_retirement").unwrap();}
@@ -102,4 +124,29 @@ fn sealed_local_retirement_preserves_newer_actor_and_enriched_source(){
     let displaced={let mut state=f.host.lock().unwrap();let mut original=original;original.session=f.source.clone();state.chats.insert(f.source.id,original)};
     drop(displaced);successor.close().unwrap();
     commit(&f.host,&pending).unwrap();f.assert_retired();
+}
+
+#[test]
+fn original_local_late_thread_callback_survives_failed_retirement_and_exact_retry(){
+    if chat::runtime::isolated_backend_contract("host::chat::local_retirement::tests::original_local_late_thread_callback_survives_failed_retirement_and_exact_retry"){return;}
+    let (entered,waiting)=std::sync::mpsc::channel();let (release,released)=std::sync::mpsc::channel();
+    let f=Fixture::observed(Some((entered,released)));
+    f.actor.command(Command::Refresh).unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let closing_host=f.host.clone();let id=f.source.id;
+    let closing=thread::spawn(move||super::super::process(&closing_host,1,ClientRequest::ChatClose{chat_id:id}));
+    let deadline=Instant::now()+Duration::from_secs(5);
+    loop {
+        if f.host.lock().unwrap().local_chat_retirements.contains_key(&id){break;}
+        assert!(Instant::now()<deadline,"actual close did not reserve before original callback release");
+        thread::sleep(Duration::from_millis(5));
+    }
+    release.send(()).unwrap();
+    let refused=closing.join().unwrap().unwrap_err();
+    assert!(refused.message.contains("local retirement write denied"),"{refused:?}");f.assert_retained();
+    assert_eq!(f.host.lock().unwrap().chats[&id].session.launch.session_id.as_deref(),Some("confirmed-by-original-cat-frame"));
+    assert_eq!(f.pending().snapshot().unwrap().session_id.as_deref(),Some("confirmed-by-original-cat-frame"));
+    f.allow_commit();
+    assert!(matches!(super::super::process(&f.host,1,ClientRequest::ChatClose{chat_id:id}).unwrap(),ServerResponse::ChatClosed{..}));
+    f.assert_retired();
 }
