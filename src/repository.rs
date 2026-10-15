@@ -4668,7 +4668,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         let path = bytes_to_path(trim_one_line_ending(&output.stdout));
                         if !path.as_os_str().is_empty() { policy.attributes.push(path); }
                     } else if output.exit_code == Some(1) {
-                        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+                        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
                             policy.attributes.push(PathBuf::from(xdg).join("git/attributes"));
                         } else if let Some(home) = std::env::var_os("HOME") {
                             policy.attributes.push(PathBuf::from(home).join(".config/git/attributes"));
@@ -4726,7 +4726,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             policy.attributes.push(PathBuf::from(path));
         } else if let Some(home) = std::env::var_os("HOME") {
             policy.attributes.push(PathBuf::from(&home).join(".gitconfig"));
-            let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(home).join(".config"));
+            let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(home).join(".config"));
             policy.attributes.push(xdg.join("git/config"));
         }
         for dependency in &mut policy.attributes {
