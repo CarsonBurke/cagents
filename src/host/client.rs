@@ -355,24 +355,56 @@ pub(super) fn process_request(
         operation: crate::device_service::Operation::RemoveMergedWorktree { request },
     } = &request
     {
+        use crate::device_service::{CleanupRefusal, CleanupRefusalKind};
+        let path = request.path.clone();
         let prepared = {
             let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
-            ensure_control_open(host)?;
-            crate::worktree_cleanup::PreparedRemoval::prepare(request.clone())
+            ensure_control_open(host)
+                .map_err(|error| {
+                    CleanupRefusal::new(CleanupRefusalKind::ShutdownOrUpgrade, error.message)
+                })
+                .and_then(|()| {
+                    crate::worktree_cleanup::PreparedRemoval::prepare(request.clone()).map_err(
+                        |detail| CleanupRefusal::new(CleanupRefusalKind::SafetyCheckFailed, detail),
+                    )
+                })
         };
         let removed = match prepared {
             Ok(prepared) => {
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
-                ensure_control_open(host)?;
-                prepared
-                    .remove(|windows| {
-                        host.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .allow_automatic_worktree_cleanup(client_id, windows)
+                ensure_control_open(host)
+                    .map_err(|error| {
+                        CleanupRefusal::new(CleanupRefusalKind::ShutdownOrUpgrade, error.message)
                     })
-                    .ok()
+                    .and_then(|()| {
+                        let mut refusal = None;
+                        prepared
+                            .remove(|windows| {
+                                // Only capture daemon ownership under the host lock. The
+                                // process/holder census must not stall terminal delivery.
+                                let scope = host
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .automatic_worktree_cleanup_scope(client_id, windows);
+                                scope
+                                    .and_then(|scope| scope.check(&path))
+                                    .map_err(|reason| {
+                                        let detail = reason.to_string();
+                                        refusal = Some(reason);
+                                        detail
+                                    })
+                            })
+                            .map_err(|detail| {
+                                refusal.unwrap_or_else(|| {
+                                    CleanupRefusal::new(
+                                        CleanupRefusalKind::SafetyCheckFailed,
+                                        detail,
+                                    )
+                                })
+                            })
+                    })
             }
-            Err(_) => None,
+            Err(refusal) => Err(refusal),
         };
         return Ok((
             ServerResponse::DeviceOperation {
@@ -1386,6 +1418,48 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn automatic_cleanup_shutdown_refusal_keeps_typed_reason() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+        let mut state = super::super::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("cleanup"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        });
+        state.shutting_down = true;
+        let host = Arc::new(crate::host::state::HostLock::new(state));
+        let repository =
+            crate::github_identity::GitHubRepoKey::new("github.com", None, "fixture", "repo")
+                .unwrap();
+        let request = ClientRequest::DeviceOperation {
+            operation: crate::device_service::Operation::RemoveMergedWorktree {
+                request: crate::worktree_cleanup::RemovalRequest {
+                    repository: "/does-not-exist".into(),
+                    path: "/does-not-exist/wt".into(),
+                    branch: "feature".into(),
+                    head_oid: "a".repeat(40),
+                    source_repository: repository.clone(),
+                    pull_request: crate::github_identity::PullRequestKey::new(repository, 1)
+                        .unwrap(),
+                },
+            },
+        };
+        let (response, extras, shutdown) = process_request(&host, 1, request).unwrap();
+        let ServerResponse::DeviceOperation {
+            reply: crate::device_service::Reply::MergedWorktreeRemoved(Err(reason)),
+        } = response
+        else {
+            panic!("cleanup refusal lost its typed reply");
+        };
+        assert_eq!(
+            reason.kind,
+            crate::device_service::CleanupRefusalKind::ShutdownOrUpgrade
+        );
+        assert!(!reason.detail.is_empty());
+        assert!(extras.is_empty());
+        assert!(!shutdown);
+    }
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {
