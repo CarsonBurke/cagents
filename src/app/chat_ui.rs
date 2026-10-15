@@ -213,7 +213,11 @@ pub enum Action {
         provider_exit::Request,
         chat::client::DiagnosticCompletion,
     ),
-    ProviderExitCopyReady(Target, provider_exit::Request, chat::client::DiagnosticCopyCompletion),
+    ProviderExitCopyReady(
+        Target,
+        provider_exit::Request,
+        chat::client::DiagnosticCopyCompletion,
+    ),
     ProviderExitClipboardIssued(chat::client::DiagnosticCopyReceipt),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
@@ -506,7 +510,10 @@ pub(super) struct State {
     last_models: HashMap<Provider, (String, Option<String>)>,
 }
 impl State {
-    pub(super) fn clipboard_surface<'a, M: 'a>(&self, content: cosmic::Element<'a, M>) -> cosmic::Element<'a, M> {
+    pub(super) fn clipboard_surface<'a, M: 'a>(
+        &self,
+        content: cosmic::Element<'a, M>,
+    ) -> cosmic::Element<'a, M> {
         clipboard_surface::surface(content, self.copy_intents.clone())
     }
 }
@@ -2570,8 +2577,8 @@ impl Runtime {
         {
             self.provider_exit_expanded = false;
         }
-        let actor=self.handle().map(Arc::downgrade);
-        self.provider_exit_output.reconcile(&snapshot,actor);
+        let actor = self.handle().map(Arc::downgrade);
+        self.provider_exit_output.reconcile(&snapshot, actor);
         self.snapshot = snapshot;
         images::sync(self);
         self.refresh_find();
@@ -7590,7 +7597,9 @@ impl Cagents {
             Action::ProviderExitCopyReady(target, request, result) => {
                 return self.provider_exit_copy_ready(target, request, result);
             }
-            Action::ProviderExitClipboardIssued(receipt) => {drop(receipt);}
+            Action::ProviderExitClipboardIssued(receipt) => {
+                drop(receipt);
+            }
             Action::ProviderExitPage(target, forward) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.provider_exit_page(forward);
