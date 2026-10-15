@@ -61,54 +61,8 @@ pub struct ModelChannel {
     pub ordinal: u32,
 }
 
-/// A prompt fallback labels its first substantive line, rather than flattening
-/// attached context into the sidebar. Provider titles use `channel_title`.
-pub fn channel_title_from_prompt(prompt: &str) -> Option<String> {
-    let mut fence = false;
-    let mut context = false;
-    prompt.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with("```") || line.starts_with("~~~") {
-            fence = !fence;
-            return None;
-        }
-        if matches!(
-            line,
-            "<INSTRUCTIONS>" | "<environment_context>" | "<system-reminder>"
-        ) {
-            context = true;
-            return None;
-        }
-        if matches!(
-            line,
-            "</INSTRUCTIONS>" | "</environment_context>" | "</system-reminder>"
-        ) {
-            context = false;
-            return None;
-        }
-        if fence || context || line.starts_with("# AGENTS.md") || line.starts_with("<image ") {
-            return None;
-        }
-        let line = line.trim_start_matches(['#', '*', '-', '>', ' ']);
-        channel_title(line)
-    })
-}
-
-pub fn channel_title(text: &str) -> Option<String> {
-    let title = crate::names::normalize_card_name(text)?;
-    if title.chars().count() <= 80 {
-        return Some(title);
-    }
-    let shortened: String = title.chars().take(79).collect();
-    let end = shortened
-        .rfind(' ')
-        .filter(|end| *end > shortened.len() / 2);
-    Some(format!(
-        "{}…",
-        end.map_or(shortened.as_str(), |end| &shortened[..end])
-            .trim_end()
-    ))
-}
+mod conversation_titles;
+pub use conversation_titles::{channel_title, channel_title_from_prompt};
 
 /// The identity of a registry that has never been created.
 ///
@@ -306,6 +260,17 @@ impl WorkspaceModel {
                     channel.title_source = *source;
                 }
             }
+            ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } => {
+                let current = self.views.iter().any(|view| view.scope == views::Scope::Channel(*id)
+                    && view.revision == *expected_revision && view.primary_chat() == Some(*card));
+                if current && !title.is_empty()
+                    && let Some(channel) = self.channels.iter_mut().find(|channel| channel.id == *id)
+                    && channel.title_source.accepts_refresh(&channel.title, *source)
+                {
+                    channel.title = title.clone();
+                    channel.title_source = *source;
+                }
+            }
             ModelEdit::DeleteChannel { id } => {
                 self.channels.retain(|channel| channel.id != *id);
             }
@@ -381,6 +346,15 @@ pub enum ModelEdit {
         expected_revision: u64,
         operation: Uuid,
         change: views::Change,
+    },
+    /// A refresh from the current primary conversation. The daemon checks the
+    /// original view revision and primary card in the title-update transaction.
+    SuggestConversationTitle {
+        id: ChannelId,
+        card: crate::model::CardId,
+        expected_revision: u64,
+        title: String,
+        source: crate::model::ChannelTitleSource,
     },
 }
 
@@ -465,6 +439,7 @@ impl ModelEdit {
             }
             edit @ (Self::RetitleChannel { .. }
             | Self::SuggestChannelTitle { .. }
+            | Self::SuggestConversationTitle { .. }
             | Self::DeleteChannel { .. }
             | Self::AgentsChanged) => edit,
         })
@@ -524,6 +499,19 @@ pub fn repository_display_name(repository: &Path) -> String {
 mod tests {
     use super::*;
     use crate::model::ChannelTitleSource;
+
+    #[test]
+    fn conversation_title_proof_roundtrips_without_changing_existing_edit_prefix() {
+        let old = ModelEdit::SuggestChannelTitle { id: ChannelId::new(), title: "old".into(),
+            source: ChannelTitleSource::Provider };
+        assert_eq!(postcard::to_allocvec(&old).unwrap()[0], 7);
+        let edit = ModelEdit::SuggestConversationTitle { id: ChannelId::new(),
+            card: crate::model::CardId::new(), expected_revision: 23, title: "Bundle encryption".into(),
+            source: ChannelTitleSource::Provider };
+        let bytes = postcard::to_allocvec(&edit).unwrap();
+        assert_eq!(bytes[0], 12);
+        assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
+    }
 
     #[test]
     fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {

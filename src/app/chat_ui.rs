@@ -449,6 +449,7 @@ impl Phase {
 }
 
 pub(super) struct State {
+    channel_names: HashMap<Target, ChannelNameObservation>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -491,6 +492,7 @@ impl Default for State {
         let (sender, receiver) = async_channel::unbounded();
         Self {
             image_viewer: None,
+            channel_names: HashMap::new(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -1328,6 +1330,7 @@ fn snapshot_channel_name(
             snapshot
                 .items
                 .iter()
+                .take(128)
                 .find_map(|item| match (&item.role, &item.content) {
                     (chat::Role::User, ItemContent::Text { text, .. }) => {
                         crate::workspace_model::channel_title_from_prompt(text)
@@ -1336,6 +1339,36 @@ fn snapshot_channel_name(
                     _ => None,
                 })
         })
+}
+
+/// Prompt discovery is bounded and runs once per turn/history edge, rather
+/// than scanning retained history for every streamed token. Provider names
+/// remain cheap to observe and may improve throughout the same session.
+#[derive(Default)]
+struct ChannelNameObservation {
+    session: Option<String>,
+    scanned: Option<(u64, usize, Option<String>)>,
+    title: Option<(String, crate::model::ChannelTitleSource)>,
+    pending: bool,
+}
+impl ChannelNameObservation {
+    fn observe(&mut self, snapshot: &Snapshot) -> Option<(String, crate::model::ChannelTitleSource)> {
+        if self.session != snapshot.session_id {
+            *self = Self { session: snapshot.session_id.clone(), ..Self::default() };
+        }
+        let previous = self.title.clone();
+        if let Some(title) = snapshot.title.as_deref().and_then(crate::workspace_model::channel_title) {
+            self.title = Some((title, crate::model::ChannelTitleSource::Provider));
+        } else if self.title.is_none() {
+            let stamp = (snapshot.turn_generation, snapshot.items.len(), snapshot.items.first().map(|item| item.id.clone()));
+            if self.scanned.as_ref() != Some(&stamp) {
+                self.scanned = Some(stamp);
+                self.title = snapshot_channel_name(snapshot);
+            }
+        }
+        self.pending |= self.title != previous;
+        self.pending.then(|| self.title.clone()).flatten()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5255,6 +5288,43 @@ impl Cagents {
             _ => None,
         }
     }
+    fn observe_channel_name(&mut self, target: Target, snapshot: &Snapshot)
+        -> Option<(String, crate::model::ChannelTitleSource)> {
+        if !self.chat_ui.channel_names.contains_key(&target) {
+            self.chat_ui.channel_names.retain(|previous, _| previous.card != target.card);
+        }
+        self.chat_ui.channel_names.entry(target).or_default().observe(snapshot)
+    }
+
+    fn publish_observed_channel_name(&mut self, target: Target, title: String, source: crate::model::ChannelTitleSource) {
+        let settled = self.durable.channels.iter().any(|channel| channel.cards.contains(&target.card)
+            && (channel.title_source == crate::model::ChannelTitleSource::Manual && !channel.title.is_empty()
+                || channel.title == title && channel.title_source == source));
+        if (settled || self.suggest_channel_title(target.card, title, source))
+            && let Some(observation) = self.chat_ui.channel_names.get_mut(&target) {
+            observation.pending = false;
+        }
+    }
+
+    /// A title may precede its pane's first shared-view acknowledgement. Retry
+    /// the retained candidate after projection, with the newly accepted proof.
+    pub(super) fn refresh_channel_title_suggestions(&mut self) {
+        for target in self.chat_ui.channel_names.keys().copied().collect::<Vec<_>>() {
+            if self.chat_runtime_mut(target).is_none() {
+                self.chat_ui.channel_names.remove(&target);
+            }
+        }
+        let candidates = self.chat_ui.channel_names.iter().filter_map(|(target, observation)|
+            observation.pending.then(|| observation.title.clone()).flatten().map(|(title, source)| (*target, title, source))).collect::<Vec<_>>();
+        for (target, title, source) in candidates {
+            if self.chat_runtime_mut(target).is_some() {
+                self.publish_observed_channel_name(target, title, source);
+            } else {
+                self.chat_ui.channel_names.remove(&target);
+            }
+        }
+    }
+
     fn chat_runtime_mut(&mut self, target: Target) -> Option<&mut Runtime> {
         match self.cards.get_mut(&target.card) {
             Some(CardRuntime::Chat(runtime)) if runtime.target == target => Some(runtime),
@@ -6213,7 +6283,7 @@ impl Cagents {
                         let mut session = handle.session();
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
-                        let channel_name = snapshot_channel_name(&snapshot);
+                        let channel_name = self.observe_channel_name(target, &snapshot);
                         let title = snapshot.title.clone();
                         let activity = Activity {
                             provider: session.launch.provider,
@@ -6278,7 +6348,7 @@ impl Cagents {
                             self.persist();
                         }
                         if let Some((name, source)) = channel_name {
-                            self.suggest_channel_title(target.card, name, source);
+                            self.publish_observed_channel_name(target, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         // Reports that raced the attachment woke nothing.
@@ -6536,18 +6606,16 @@ impl Cagents {
                 if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
                     && runtime.target == target
                 {
-                    let name = match runtime.handle() {
-                        Some(handle) if needs_name && matches!(wake, Wake::Changed) => {
-                            snapshot_channel_name(&handle.snapshot())
-                        }
+                    let snapshot = match runtime.handle() {
+                        Some(handle) if needs_name && matches!(wake, Wake::Changed) => Some(handle.snapshot()),
                         _ => None,
                     };
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
-                    if let Some((name, source)) = name {
-                        self.suggest_channel_title(target.card, name, source);
+                    if let Some((name, source)) = snapshot.and_then(|snapshot| self.observe_channel_name(target, &snapshot)) {
+                        self.publish_observed_channel_name(target, name, source);
                     }
                     return Task::none();
                 }
@@ -6587,11 +6655,11 @@ impl Cagents {
                         let session = runtime.session.clone();
                         let snapshot = handle.snapshot();
                         let channel_name = needs_name
-                            .then(|| snapshot_channel_name(&snapshot))
+                            .then(|| self.observe_channel_name(target, &snapshot))
                             .flatten();
                         let title = snapshot.title.clone();
                         if let Some((name, source)) = channel_name {
-                            self.suggest_channel_title(target.card, name, source);
+                            self.publish_observed_channel_name(target, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         self.commit_chat_session(target.card, session);
@@ -9815,6 +9883,30 @@ mod tests {
             snapshot_channel_name(&snapshot).unwrap().0,
             "Implement the requested feature"
         );
+    }
+
+    #[test]
+    fn automatic_channel_names_observe_metadata_without_replaying_old_snapshots() {
+        let mut observation = ChannelNameObservation::default();
+        let mut snapshot = Snapshot { session_id: Some("session-a".into()), ..Default::default() };
+        assert!(observation.observe(&snapshot).is_none());
+        snapshot.items.push(Arc::new(chat::Item { id: "first-task".into(), role: chat::Role::User,
+            content: text("Review bundle encryption and performance"), started_at: None, at: None }));
+        assert_eq!(observation.observe(&snapshot).unwrap().0, "Review bundle encryption and performance");
+        observation.pending = false;
+        // Streaming assistant changes and newer shared-model reads must not
+        // re-publish an older name over a newer name from another window.
+        snapshot.generation += 1;
+        assert!(observation.observe(&snapshot).is_none());
+        snapshot.title = Some("Bundle encryption audit".into());
+        assert_eq!(observation.observe(&snapshot).unwrap().1, crate::model::ChannelTitleSource::Provider);
+        observation.pending = false;
+        assert!(observation.observe(&snapshot).is_none());
+        snapshot.title = Some("Encryption and throughput".into());
+        assert_eq!(observation.observe(&snapshot).unwrap().0, "Encryption and throughput");
+        snapshot.session_id = Some("successor-session".into()); snapshot.title = None; snapshot.items.clear();
+        assert!(observation.observe(&snapshot).is_none());
+        assert!(observation.title.is_none());
     }
 
     fn text(body: &str) -> ItemContent {

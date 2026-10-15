@@ -207,6 +207,12 @@ fn publish(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
+                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. })
+                        && let Ok(model) = client.read_workspace_model() {
+                        // A refused suggestion is not replayed against a newer
+                        // owner. Restore the authoritative name after optimism.
+                        let _ = updates.send_blocking(ModelUpdate::Read(model));
+                    }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
@@ -296,7 +302,7 @@ fn send(
             ordinal: channel.ordinal,
         });
     }
-    if reordered {
+    if reordered || matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
@@ -718,6 +724,7 @@ impl Cagents {
             tasks.push(self.sync_chrome());
         }
         tasks.push(self.reconcile_shared_views());
+        self.refresh_channel_title_suggestions();
         Task::batch(tasks)
     }
 

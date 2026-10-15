@@ -448,21 +448,28 @@ fn prompt_of(provider: Provider, value: &Value) -> Option<String> {
         {
             return value["payload"]["message"]
                 .as_str()
-                .and_then(crate::account::clean_label);
+                .and_then(crate::workspace_model::channel_title_from_prompt);
         }
         _ => return None,
     };
     let content = &message["content"];
-    let text = content.as_str().or_else(|| {
-        content
-            .as_array()?
-            .iter()
-            .find_map(|part| part["text"].as_str())
-    })?;
+    let combined;
+    let text = if let Some(text) = content.as_str() { text } else {
+        combined = content.as_array()?.iter().take(32)
+            .filter_map(|part| part["text"].as_str()).fold(String::new(), |mut text, part| {
+                let remaining = (32 * 1024usize).saturating_sub(text.len() + 1);
+                if remaining > 0 {
+                    text.push('\n');
+                    text.push_str(&part[..part.floor_char_boundary(remaining.min(part.len()))]);
+                }
+                text
+            });
+        &combined
+    };
     if provider == Provider::Claude {
         return claude_prompt(text);
     }
-    crate::account::clean_label(text)
+    crate::workspace_model::channel_title_from_prompt(text)
 }
 
 /// What a Claude user record asked, as a title: a command with what it was
@@ -475,11 +482,9 @@ fn claude_prompt(text: &str) -> Option<String> {
         let end = start + text[start..].find(&format!("</{name}>"))?;
         Some(text[start..end].trim())
     };
-    if let Some(command) = element("command-name") {
+    if element("command-name").is_some() {
         let args = element("command-args").unwrap_or_default();
-        return (!args.is_empty())
-            .then(|| crate::account::clean_label(&format!("{command} {args}")))
-            .flatten();
+        return crate::workspace_model::channel_title_from_prompt(args);
     }
     let trimmed = text.trim_start();
     if ["<local-command-", "<bash-", "<command-"]
@@ -488,7 +493,7 @@ fn claude_prompt(text: &str) -> Option<String> {
     {
         return None;
     }
-    crate::account::clean_label(text)
+    crate::workspace_model::channel_title_from_prompt(text)
 }
 
 /// The session `found` resumes as: `seed`'s account and launch, with the
@@ -691,7 +696,7 @@ mod tests {
         assert_eq!(claude_prompt(&command("/exit", "")), None);
         assert_eq!(
             claude_prompt(&command("/solve-task", "fix resume")).as_deref(),
-            Some("/solve-task fix resume")
+            Some("fix resume")
         );
         assert_eq!(
             claude_prompt("<local-command-stdout>Bye!</local-command-stdout>"),
