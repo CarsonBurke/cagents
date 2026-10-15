@@ -55,6 +55,13 @@ pub(super) struct Journal {
     outcome_ack: u64,
     outcome_latest: u64,
 }
+/// Context is optional enrichment. Invalid enrichment must not erase the
+/// independently authoritative evidence or block later execution settlements.
+fn valid_attention_context(evidence:&crate::notifications::Evidence,content:&crate::notifications::Content)->bool {
+    let bounded=|text:&str,limit| text.chars().take(limit+1).count()<=limit && !text.chars().any(char::is_control);
+    bounded(&content.conversation,80) && bounded(&content.preview,240)
+        && (content.request.is_none() || evidence.kind==crate::notifications::Kind::Waiting)
+}
 impl Journal {
     pub fn open(directory: &Path) -> Result<Self, String> {
         Self::with_budget(directory, DEFAULT_BUDGET)
@@ -154,9 +161,16 @@ impl Journal {
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
-        if !matches!(update, Update::Execution { .. } | Update::Attention(_)) {
+        if !matches!(update, Update::Execution { .. } | Update::Attention(_) | Update::AttentionContext {..}) {
             return Ok(());
         }
+        // Keep bounded supplied context byte-for-byte. Never consult a later
+        // snapshot or modify evidence to repair malformed optional display data.
+        let metadata_only=match update {
+            Update::AttentionContext {evidence,content:Some(content)} if !valid_attention_context(evidence,content)=>Some(Update::AttentionContext {evidence:evidence.clone(),content:None}),
+            _=>None,
+        };
+        let update=metadata_only.as_ref().unwrap_or(update);
         if self.loss()?.is_some() {
             return Err("Actor outcome journal already has a recorded loss".into());
         }
@@ -577,6 +591,48 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn immutable_attention_context_repeats_verbatim_until_full_ack() {
+        let dir=tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal=Journal::with_budget(dir.path(),16*1024).unwrap();
+        let evidence=crate::notifications::Evidence {key:"exact-provider-turn".into(),kind:crate::notifications::Kind::Waiting};
+        let content=crate::notifications::Content {conversation:"名".repeat(80),preview:"😀".repeat(240),request:Some(crate::notifications::RequestType::Question)};
+        let update=Update::AttentionContext {evidence:evidence.clone(),content:Some(content.clone())};
+        journal.append(&update).unwrap();
+        let first=journal.page(0).unwrap();let second=journal.page(0).unwrap();
+        assert_eq!(serde_json::to_value(&first).unwrap(),serde_json::to_value(&second).unwrap());
+        assert!(matches!(&first[0].update,Update::AttentionContext {evidence:at,content:Some(at_content)} if at==&evidence && at_content==&content));
+        // The committed bytes themselves retain the immutable payload; this
+        // helper never reconstructs its Store or journal during daemon adoption.
+        let bytes:Vec<u8>=journal.db.query_row("SELECT payload FROM outcomes WHERE sequence=1",[],|row|row.get(0)).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),serde_json::to_value(&update).unwrap());
+        journal.append(&Update::PastAttention(evidence.clone())).unwrap();
+        journal.append(&Update::Presentation).unwrap();
+        assert_eq!(journal.latest().unwrap(),1,"old-turn evidence/stream wakes never become current attention");
+        journal.ack(1).unwrap();assert!(journal.page(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_optional_context_keeps_exact_semantic_evidence_without_later_enrichment() {
+        use crate::notifications::{Content,Evidence,Kind,RequestType};
+        for content in [
+            Content {conversation:"x".repeat(81),..Default::default()},
+            Content {preview:"x".repeat(241),..Default::default()},
+            Content {preview:"line\ncontrol".into(),..Default::default()},
+            Content {conversation:"\u{1b}title".into(),..Default::default()},
+            Content {request:Some(RequestType::Approval),..Default::default()},
+        ] {
+            let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),4096).unwrap();
+            let evidence=Evidence {key:"known-final-turn".into(),kind:Kind::Succeeded};
+            journal.append(&Update::AttentionContext {evidence:evidence.clone(),content:Some(content)}).unwrap();
+            let page=journal.page(0).unwrap();
+            assert!(matches!(&page[0].update,Update::AttentionContext {evidence:at,content:None} if at==&evidence));
+            assert!(journal.continuity_loss().unwrap().is_none(),"invalid optional display data does not make known execution uncertain");
+            journal.append(&Update::Attention(Evidence {key:"legacy-turn".into(),kind:Kind::Cancelled})).unwrap();
+            assert_eq!(journal.latest().unwrap(),2,"legacy/new metadata evidence coexist without later Snapshot reads");
+        }
+    }
+
     #[test]
     fn restart_identity_is_deduplicated_before_any_replacement_effects() {
         let dir = tempfile::tempdir_in("/var/tmp").unwrap();
