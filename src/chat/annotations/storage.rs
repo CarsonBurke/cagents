@@ -936,7 +936,14 @@ impl Store {
     pub(crate) fn denied(&self, key: &ApprovalKey) -> Result<bool, String> {
         self.revalidate()?;
         let session = self.confirmed()?;
-        self.db.query_row("SELECT EXISTS(SELECT 1 FROM current_approval c JOIN approvals a USING(session,agent,item,request) WHERE c.session=?1 AND c.agent=?2 AND c.item=?3 AND a.decision=2)",params![session,key.agent_id.as_deref().unwrap_or(""),key.item_id],|r|r.get(0)).map_err(|e|e.to_string())
+        let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Deferred).map_err(|error|error.to_string())?;
+        turns::require_schema(&transaction)?;
+        turns::reject_revoked_session(&transaction,session)?;
+        let denied=transaction.query_row("SELECT EXISTS(SELECT 1 FROM current_approval c JOIN approvals a USING(session,agent,item,request) WHERE c.session=?1 AND c.agent=?2 AND c.item=?3 AND a.decision=2)",params![session,key.agent_id.as_deref().unwrap_or(""),key.item_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+        transaction.commit().map_err(|error|error.to_string())?;
+        self.revalidate()?;
+        self.confirmed()?;
+        Ok(denied)
     }
 }
 fn storage_error(error: rusqlite::Error) -> OriginalError {

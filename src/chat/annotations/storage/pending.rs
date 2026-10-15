@@ -72,8 +72,18 @@ impl Store {
         if !valid_id(id) {
             return Err(OriginalError::TooLarge);
         }
-        let metadata: Option<Vec<u8>> = self
-            .db
+        let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Deferred).map_err(storage_error)?;
+        super::turns::require_schema(&transaction).map_err(OriginalError::Unavailable)?;
+        let command=Self::prepared_from(&transaction,id)?;
+        if let Some(session)=command.expected_session.as_deref() {
+            super::turns::reject_revoked_session(&transaction,session).map_err(OriginalError::Unavailable)?;
+        }
+        transaction.commit().map_err(storage_error)?;
+        self.revalidate().map_err(OriginalError::Unavailable)?;
+        Ok(command)
+    }
+    fn prepared_from(db: &Connection,id: &str) -> Result<PreparedCommand,OriginalError> {
+        let metadata: Option<Vec<u8>> = db
             .query_row(
                 "SELECT metadata FROM pending_commands WHERE command_id=?1",
                 [id],
@@ -215,7 +225,7 @@ impl Store {
         let transaction=self.begin_write(Some(session)).map_err(OriginalError::Unavailable)?;
         // Read under the same reservation, so a concurrent settings update
         // cannot be overwritten by a stale pre-transaction metadata copy.
-        let mut command = self.prepared(id)?;
+        let mut command = Self::prepared_from(&transaction,id)?;
         if command
             .expected_session
             .as_deref()
