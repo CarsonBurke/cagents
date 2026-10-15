@@ -2152,7 +2152,7 @@ pub enum Event {
     Forked(String),
     /// Parent history item aliases whose actual source records explicitly
     /// name this native session. Missing source IDs remain unqualified.
-    HistoryOrigins { session_id: String, item_ids: Vec<String> },
+    HistoryOrigins { account:turn_outcomes::HistoryAccountOrigin, session_id: String, item_ids: Vec<String> },
 }
 
 #[cfg(test)]
