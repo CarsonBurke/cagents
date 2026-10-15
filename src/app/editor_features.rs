@@ -67,7 +67,7 @@ mod tests {
     }
 
     fn operation(app: &Cagents, card: CardId) -> Operation {
-        Operation { card, doc: LspDocumentId(44), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: app.editor_open_files() }
+        Operation { card, doc: LspDocumentId(44), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: app.editor_open_files() }
     }
 
     fn plan(app: &Cagents, root: &Path, names: &[&str]) -> Arc<workspace::Plan> {
@@ -582,7 +582,7 @@ mod tests {
     fn retired_manager_response_cannot_consume_a_new_documents_reused_request_id() {
         let mut app = app();
         let request = LspRequestId(7);
-        let current = Operation { card: CardId::new(), doc: LspDocumentId(2), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
+        let current = Operation { card: CardId::new(), doc: LspDocumentId(2), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
         app.editor_features.requests.insert(request, current);
         drop(app.editor_feature_event(&LspEvent::WorkspaceEdit { request, doc: LspDocumentId(1), kind: LspEditKind::Rename, edit: LspWorkspaceEdit::default() }));
         assert_eq!(app.editor_features.requests.get(&request).unwrap().doc, LspDocumentId(2));
@@ -818,6 +818,7 @@ struct Operation {
     kind: LspEditKind,
     save_after: bool,
     command: Option<LspCommand>,
+    command_context: Option<LspCodeAction>,
     server_request: Option<LspServerEditId>,
     annotations: Vec<LspChangeAnnotation>,
     open_files: Vec<(CardId, PathBuf)>,
@@ -1031,13 +1032,32 @@ impl Cagents {
             if runtime.cursor_position() == Some(at) && runtime.editor_selection_range() == selection)
     }
 
+    fn validate_editor_feature_command(&self, operation: &Operation) -> Result<(), LspError> {
+        if operation.command.is_none() { return Ok(()); }
+        if let Some(context) = &operation.command_context {
+            self.lsp.validate_code_action_context(context)?;
+        }
+        Ok(())
+    }
+
     fn execute_editor_feature_command(&mut self, operation: &Operation, command: LspCommand) {
+        if let Err(error) = self.validate_editor_feature_command(operation) {
+            self.feature_failure(operation.card, format!("Code action command was not run: {error}"));
+            return;
+        }
+        self.send_admitted_editor_feature_command(operation, command);
+    }
+
+    // The caller may validate immediately before applying this action's own
+    // edits. Their LSP version updates must not invalidate that admission.
+    fn send_admitted_editor_feature_command(&mut self, operation: &Operation, command: LspCommand) {
         let request = self.lsp.execute_command(operation.doc, command);
         let mut completion = operation.clone();
         // An executeCommand result has no edit coordinates. Its failure still
         // belongs to this invocation even if workspace/applyEdit advanced the
         // buffer version before the command acknowledged completion.
         completion.command = None;
+        completion.command_context = None;
         completion.server_request = None;
         completion.save_after = false;
         self.editor_features.requests.insert(request, completion);
@@ -1072,6 +1092,7 @@ impl Cagents {
                 let Some(mut operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 if !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 if let Some(reason) = &item.disabled { self.feature_failure(operation.card, reason.clone()); return Some(Task::none()); }
+                operation.command_context = Some(item.clone());
                 operation.command = item.command.clone();
                 if let Some(edit) = &item.edit { Some(self.prepare_editor_workspace_edit(operation, edit.clone())) }
                 else {
@@ -1129,13 +1150,13 @@ impl Cagents {
         // can be a read-only std tab; writability is checked independently for
         // every actual target by the workspace planner and publication fence.
         Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind: LspEditKind::CodeAction,
-            save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
+            save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
     }
 
     fn editor_operation(&self, card: CardId, kind: LspEditKind) -> Option<Operation> {
         if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() || !runtime.desired_file_present()) { return None; }
         let doc = self.lsp_document(card)?;
-        Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
+        Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind, save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
     }
 
     fn editor_operation_current(&self, operation: &Operation) -> bool {
@@ -1274,6 +1295,7 @@ impl Cagents {
                     self.editor_features.requests.insert(request, operation);
                     return Task::none();
                 }
+                operation.command_context = Some(item.clone());
                 operation.command = item.command;
                 if let Some(edit) = item.edit { self.prepare_editor_workspace_edit(operation, edit) }
                 else if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); Task::none() }
@@ -1282,7 +1304,7 @@ impl Cagents {
             Action::Signature(card, trigger) => {
                 let Some(doc) = self.lsp_document(card) else { return Task::none(); };
                 let Some(version) = self.lsp.document_version(doc) else { return Task::none(); };
-                let operation = Operation { card, doc, version, kind: LspEditKind::CodeAction, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
+                let operation = Operation { card, doc, version, kind: LspEditKind::CodeAction, save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
                 let Some(at) = runtime.cursor_position() else { return Task::none(); };
                 let active = runtime.editor_signature_help().cloned();
@@ -1405,6 +1427,10 @@ impl Cagents {
                 };
                 let has_warnings = !report.durability_warnings.is_empty();
                 if has_warnings { self.feature_failure(publication.operation.card, report.durability_warnings.join("\n")); }
+                // Validate the captured command context before these native
+                // edits advance the same URI versions. This reducer sends the
+                // admitted command without yielding to another user message.
+                let command_admission = self.validate_editor_feature_command(&publication.operation);
                 let mut tasks = Vec::new();
                 let mut failure = None;
                 for card in publication.cards {
@@ -1421,7 +1447,12 @@ impl Cagents {
                     self.feature_failure(publication.operation.card, error);
                 } else {
                     if let Some(lease) = publication.server_lease.take() { lease.respond(true, None); }
-                    if let Some(command) = publication.operation.command.clone() { self.execute_editor_feature_command(&publication.operation, command); }
+                    if let Some(command) = publication.operation.command.clone() {
+                        match command_admission {
+                            Ok(()) => self.send_admitted_editor_feature_command(&publication.operation, command),
+                            Err(error) => self.feature_failure(publication.operation.card, format!("Workspace edits were applied, but the code action command was not run: {error}")),
+                        }
+                    }
                     tasks.push(self.save_after_feature(&publication.operation));
                     if publication.hidden && !has_warnings {
                         self.notices.record(TransientNotice::success("Workspace edit applied"));
@@ -1511,6 +1542,11 @@ impl Cagents {
 
     fn publish_editor_workspace_edit(&mut self, ticket: u64, operation: Operation, plan: Arc<workspace::Plan>) -> Task<Message> {
         if self.editor_features.publication.is_some() { self.reject_server_edit(&operation, "Another edit is being applied"); return Task::none(); }
+        if let Err(error) = self.validate_editor_feature_command(&operation) {
+            self.reject_server_edit(&operation, &error.to_string());
+            self.feature_failure(operation.card, format!("Code action is no longer current: {error}"));
+            return Task::none();
+        }
         if operation.open_files != self.editor_open_files() {
             self.reject_server_edit(&operation, "The open file tabs changed; prepare the edit again");
             self.feature_failure(operation.card, "The open file tabs changed; prepare the edit again");
