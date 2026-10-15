@@ -257,7 +257,13 @@ impl CommandMailbox {
         let Some(index) = keyboard.held.iter().position(|(key, _)| *key == physical) else {
             return Ok(false);
         };
-        self.send(Command::Input(release))?;
+        self.check_live()?;
+        // A native keyup must survive queue pressure just like blur cleanup.
+        // Keep it behind its admitted press and ahead of any later input.
+        let mut pending = self.deferred_releases.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.push_back(release);
+        self.refill_releases(&mut pending);
         keyboard.held.swap_remove(index);
         Ok(true)
     }
@@ -987,6 +993,33 @@ mod tests {
             mailbox.receiver().try_recv().is_err(),
             "physical release was already paired"
         );
+    }
+
+    #[test]
+    fn native_release_survives_a_full_queue_without_needing_blur() {
+        use super::super::{ButtonState, input::iced_key};
+        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        let mailbox = CommandMailbox::new();
+        let physical = Physical::Code(Code::KeyA);
+        let key = keyboard::Key::Character("a".into());
+        let input = |state| iced_key(state, &key, physical,
+            keyboard::Location::Standard, keyboard::Modifiers::empty(), false, false);
+        mailbox.press_key(physical, input(ButtonState::Pressed), input(ButtonState::Released)).unwrap();
+        for _ in 1..COMMAND_CAPACITY { mailbox.send(Command::Reload).unwrap(); }
+        assert!(mailbox.release_key(physical, input(ButtonState::Released)).unwrap());
+        assert!(!mailbox.release_key(physical, input(ButtonState::Released)).unwrap());
+        assert!(matches!(mailbox.press_key(physical,
+            input(ButtonState::Pressed), input(ButtonState::Released)),
+            Err(BrowserError::CommandQueueFull)));
+        let mut observed = Vec::new();
+        while let Ok(command) = mailbox.receiver().try_recv() {
+            mailbox.refill_after_receive();
+            if let Command::Input(input) = command { observed.push(input); }
+        }
+        assert_eq!(observed, vec![input(ButtonState::Pressed), input(ButtonState::Released)]);
+        assert!(mailbox.keyboard.lock().unwrap().held.is_empty());
+        mailbox.press_key(physical, input(ButtonState::Pressed), input(ButtonState::Released)).unwrap();
+        assert!(matches!(mailbox.receiver().try_recv(), Ok(Command::Input(BrowserInput::Key { state: ButtonState::Pressed, .. }))));
     }
 
     #[test]
