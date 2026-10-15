@@ -196,6 +196,7 @@ struct Dialog {
     /// dialog is opened again from its row. Confirming retries it.
     failure: Option<String>,
     safety: Option<WorktreeSafetySnapshot>,
+    expected_head: Option<DeletionHead>,
     loading: bool,
     request: u64,
     options_loading: bool,
@@ -208,6 +209,16 @@ struct Dialog {
     /// sessions and all work they may admit before the guarded stop takes it.
     busy_confirmed: Option<Vec<BusyAgent>>,
     stale_lock: bool,
+}
+
+/// A post-merge cleanup offer is bound to the exact reviewed source and
+/// head, never only to a path-derived worktree ID or a generic merged badge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DeletionHead {
+    pub head_repository: GitHubRepoKey,
+    /// Exact local branch name, without adding/removing a refs prefix.
+    pub branch: String,
+    pub head_oid: String,
 }
 
 #[derive(Debug, Clone)]
@@ -668,6 +679,37 @@ impl Cagents {
         }
     }
 
+    pub(super) fn open_worktree_delete_dialog_for_head(
+        &mut self,
+        project: ProjectId,
+        worktree: WorktreeId,
+        expected: DeletionHead,
+    ) -> Task<Message> {
+        if self.modal_is_open() || self.update_prepared {
+            return Task::none();
+        }
+        let target = self.project_target(project, Some(worktree));
+        if crate::repository::ValidatedBranchName::parse(expected.branch.clone()).is_err()
+            || crate::repository::BaseRevision::object_id(expected.head_oid.clone()).is_err()
+            || target.as_ref().is_none_or(|target| !self.deletion_head_matches_row(target, &expected))
+        {
+            self.status = Some(TransientNotice::warning("The merged pull request no longer matches this worktree. Refresh its current branch before offering cleanup."));
+            return Task::none();
+        }
+        let task = self.open_worktree_delete_dialog(target.expect("target checked"));
+        if let Some(dialog) = &mut self.project_ui.dialog {
+            dialog.expected_head = Some(expected);
+        }
+        task
+    }
+
+    fn deletion_head_matches_row(&self, target: &Target, expected: &DeletionHead) -> bool {
+        self.sidebar_model.project(target.project)
+            .and_then(|project| project.worktrees.iter().find(|row| Some(row.id) == target.worktree && row.path == target.path))
+            .is_some_and(|row| row.branch.as_deref() == Some(expected.branch.as_str())
+                && row.head_repository.as_ref() == Some(&expected.head_repository))
+    }
+
     fn open_worktree_delete_dialog(&mut self, target: Target) -> Task<Message> {
         self.project_ui.cleanup_dialog = None;
         self.project_ui.remove_dialog = None;
@@ -684,6 +726,7 @@ impl Cagents {
             blocker,
             failure,
             safety: None,
+            expected_head: None,
             loading,
             request,
             options_loading: loading,
@@ -1952,6 +1995,10 @@ impl Cagents {
                         })
                     })
                     .unwrap_or(false);
+                let expected_source_matches = self.project_ui.dialog.as_ref()
+                    .filter(|dialog| dialog.request == request)
+                    .is_none_or(|dialog| dialog.expected_head.as_ref().is_none_or(|expected|
+                        self.deletion_head_matches_row(&dialog.target, expected)));
                 let Some(dialog) = self
                     .project_ui
                     .dialog
@@ -1969,6 +2016,15 @@ impl Cagents {
                         ));
                     }
                     Ok((snapshot, agents)) => {
+                        if !expected_source_matches || dialog.expected_head.as_ref().is_some_and(|expected|
+                            snapshot.branch.as_deref() != Some(expected.branch.as_str())
+                                || snapshot.head_oid.as_deref() != Some(expected.head_oid.as_str()))
+                        {
+                            dialog.safety = None;
+                            dialog.busy_confirmed = None;
+                            dialog.blocker = Some("The merged pull request's exact branch, source or head changed. Cancel and refresh before offering cleanup.".into());
+                            return Task::none();
+                        }
                         let agents_changed = dialog.busy_agents != agents.agents
                             || dialog.session_census != agents.census;
                         dialog.busy_agents = agents.agents;
@@ -4307,6 +4363,44 @@ mod tests {
                 .unwrap()
                 .contains("changed")
         );
+    }
+
+    #[test]
+    fn post_merge_cleanup_refuses_a_replaced_branch_source_or_head_before_stopping_sessions() {
+        for changed in 0..3 {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+            let source = GitHubRepoKey::new("github.com", None, "example", "repo").unwrap();
+            let mut linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+            linked.head_repository = Some(source.clone());
+            let (mut app, _state, project) = deletable_app(&repository, &linked, &primary);
+            let oid = "a".repeat(40);
+            drop(app.open_worktree_delete_dialog_for_head(project, linked.id, DeletionHead {
+                head_repository: source, branch: "feature".into(), head_oid: oid.clone(),
+            }));
+            let request = app.project_ui.dialog.as_ref().unwrap().request;
+            drop(app.handle_project_action(Action::DeleteOptionsRead {request, result: Ok(DeleteOptions {
+                branch_elsewhere: false, stale_lock: false, lock_error: None,
+            })}));
+            let mut snapshot = clean_snapshot(); snapshot.head_oid = Some(oid);
+            drop(app.handle_project_action(Action::SafetyRead {request, confirming: false,
+                result: Ok((snapshot.clone(), AgentCensus::default()))}));
+            assert!(app.project_ui.dialog.as_ref().unwrap().safety.is_some());
+            drop(app.handle_project_action(Action::ConfirmDelete(request)));
+            match changed {
+                0 => snapshot.branch = Some("replacement".into()),
+                1 => snapshot.head_oid = Some("b".repeat(40)),
+                _ => app.sidebar_model.projects[0].worktrees.iter_mut().find(|row| row.id == linked.id).unwrap().head_repository =
+                    Some(GitHubRepoKey::new("github.com", None, "different", "repo").unwrap()),
+            }
+            drop(app.handle_project_action(Action::SafetyRead {request, confirming: true,
+                result: Ok((snapshot, AgentCensus::default()))}));
+            let dialog = app.project_ui.dialog.as_ref().unwrap();
+            assert!(dialog.safety.is_none());
+            assert!(dialog.blocker.as_deref().is_some_and(|message| message.contains("head changed")));
+            assert!(!app.project_ui.is_deleting(linked.id));
+            assert!(!app.project_ui.deletion_authorizations.contains_key(&linked.id));
+        }
     }
 
     #[test]
