@@ -142,11 +142,15 @@ fn combined_close_retained_lifecycle_refuses_while_real_restart_owns_claim_and_p
     let deadline = Instant::now() + Duration::from_secs(5);
     while !marker.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(5)); }
     let reached = marker.exists();
-    let refused = crate::host::chat::close_retained_native(&fixture.host, &fixture.source);
+    let (closed, completion) = std::sync::mpsc::channel();
+    let host = fixture.host.clone(); let source = fixture.source.clone();
+    let closing = std::thread::spawn(move || {closed.send(crate::host::chat::close_retained_native(&host, &source)).unwrap();});
+    let refused = completion.recv_timeout(Duration::from_secs(2));
     fixture.release_restart();
+    closing.join().unwrap();
     let restarted = attaching.join().unwrap();
     assert!(reached, "actual second backend must be held before its initialization reply");
-    assert!(refused.unwrap_err().contains("lifecycle transition"));
+    assert!(refused.expect("close must promptly defer while B is initializing").unwrap_err().contains("lifecycle transition"));
     let (response, _, _) = restarted.unwrap();
     assert!(matches!(response, ServerResponse::ChatAttached {..}));
     fixture.handle.refresh_retained_state().unwrap();
@@ -214,7 +218,8 @@ fn combined_close_retained_lifecycle_reconciliation_defers_to_initializing_resta
         released.recv_timeout(Duration::from_secs(10)).unwrap();
     });
     let host = fixture.host.clone(); let run = fixture.run.clone();
-    let reconciling = std::thread::spawn(move || reconcile_agent_run(&host, &run, true));
+    let (reconciled, completion) = std::sync::mpsc::channel();
+    let reconciling = std::thread::spawn(move || {reconciled.send(reconcile_agent_run(&host, &run, true)).unwrap();});
     let reached = entering.recv_timeout(Duration::from_secs(2));
     // Actual public ChatAttach creates B in the same helper. Its private
     // protocol initialization is held before readiness, with the production
@@ -228,12 +233,13 @@ fn combined_close_retained_lifecycle_reconciliation_defers_to_initializing_resta
     let initializing = marker.exists();
     let before_refusal = store.lock().unwrap().agent(fixture.agent.id).unwrap();
     let _ = release.send(());
-    let result = reconciling.join().unwrap();
+    let result = completion.recv_timeout(Duration::from_secs(2));
     let after_refusal = store.lock().unwrap().agent(fixture.agent.id).unwrap();
     fixture.release_restart();
+    reconciling.join().unwrap();
     let restarted = attaching.join().unwrap();
     assert!(reached.is_ok()); assert!(initializing, "real restarted B must be held before readiness");
-    let error = result.unwrap_err();
+    let error = result.expect("reconciliation must promptly defer before B initialization is released").unwrap_err();
     assert!(error.contains("lifecycle transition"), "automatic cleanup must defer to initializing B: {error}");
     assert_eq!(before_refusal, after_refusal);
     let (response, _, _) = restarted.unwrap();
