@@ -46,6 +46,8 @@ pub struct Content {
     state: State,
     open_fence: Option<OpenFence>,
     open_plain: bool,
+    /// Raw EOF spaces become rendered only when later nonspace arrives.
+    pending_spaces: usize,
     #[cfg(test)]
     parsed_bytes: usize,
 }
@@ -90,8 +92,9 @@ impl Content {
             && markdown.chars().all(plain_character)
             && let Some(Item::Paragraph(text)) = self.items.last_mut()
         {
+            let suffix = visible_suffix(markdown, &mut self.pending_spaces);
             self.state.leftover.push_str(markdown);
-            text.append_plain(markdown);
+            if !suffix.is_empty() { text.append_plain(&suffix); }
             return;
         }
         self.open_plain = false;
@@ -162,6 +165,8 @@ impl Content {
             OpenFence::detect(&self.state.leftover, code)
         });
 
+        let rendered_source = self.state.leftover.trim_end_matches(' ');
+        self.pending_spaces = self.state.leftover.len() - rendered_source.len();
         self.open_plain = self
             .state
             .leftover
@@ -169,7 +174,7 @@ impl Content {
             .next()
             .is_some_and(char::is_alphabetic)
             && self.state.leftover.chars().all(plain_character)
-            && matches!(self.items.last(), Some(Item::Paragraph(text)) if text.is_plain_source(&self.state.leftover));
+            && matches!(self.items.last(), Some(Item::Paragraph(text)) if text.is_plain_source(rendered_source));
 
         // Re-parse incomplete sections if new references are available
         if !self.incomplete.is_empty() {
@@ -248,6 +253,21 @@ impl Content {
     pub fn images(&self) -> &HashSet<Uri> {
         &self.state.images
     }
+}
+
+/// CommonMark discards ASCII spaces at paragraph EOF. Keep them in raw source
+/// and publish them only when a subsequent nonspace makes them interior text.
+fn visible_suffix(suffix: &str, pending: &mut usize) -> String {
+    let visible = suffix.trim_end_matches(' ');
+    if visible.is_empty() {
+        *pending += suffix.len();
+        return String::new();
+    }
+    let mut result = String::with_capacity(*pending + visible.len());
+    result.extend(std::iter::repeat_n(' ', *pending));
+    result.push_str(visible);
+    *pending = suffix.len() - visible.len();
+    result
 }
 
 fn plain_character(ch: char) -> bool {
@@ -1416,6 +1436,18 @@ mod tests {
                     "prefix {:?}",
                     &source[..end]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_eof_spaces_remain_pending_until_the_next_visible_character() {
+        for initial in ["Answer", "Answer **bold** tail"] {
+            let mut source = initial.to_owned();
+            let mut content = Content::parse(initial);
+            for suffix in [" ", " ", "α", " ", "new ", " ", "words", "  ", "**markup** ", " ", "after"] {
+                source.push_str(suffix); content.push_str(suffix);
+                assert_eq!(native_outline(content.items()), original_outline(original::Content::parse(&source).items()), "{source:?}");
             }
         }
     }
