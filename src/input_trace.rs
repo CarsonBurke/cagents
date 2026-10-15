@@ -10,7 +10,10 @@
 //! both whichever way they went: ahead of the content when they reach it, and
 //! from within the overlays when those take them first.
 
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use crate::{model::CardId, workspace_widget::FocusedPane};
 use cosmic::iced::advanced::{
@@ -25,7 +28,11 @@ use cosmic::{Element, Renderer, Theme};
 /// Cloning shares the record. It is cheap to hand to every widget that reads
 /// it, and costs one copy of a few words per recorded event.
 #[derive(Clone, Default)]
-pub struct InputTrace(Rc<Cell<Sample>>, Rc<Cell<Option<KeyboardRegion>>>);
+pub struct InputTrace(
+    Rc<Cell<Sample>>,
+    Rc<Cell<Option<KeyboardRegion>>>,
+    Rc<RefCell<Option<cosmic::iced::widget::Id>>>,
+);
 
 #[derive(Clone, Copy, Default)]
 struct Sample {
@@ -40,6 +47,11 @@ impl InputTrace {
     /// Actual widget focus sampled immediately before this keyboard event.
     pub fn keyboard_focus(&self) -> Option<FocusedPane> {
         self.1.get().map(|region| region.pane)
+    }
+
+    /// Exact native focused control sampled with the current keyboard region.
+    pub fn keyboard_widget_id(&self) -> Option<cosmic::iced::widget::Id> {
+        self.2.borrow().clone()
     }
 
     pub fn keyboard_card(&self) -> Option<CardId> {
@@ -146,7 +158,8 @@ pub fn observe_keyboard_focus<'a, Message: 'a>(
     })
 }
 
-type KeyboardCallback<Message> = fn(keyboard::Event, bool, KeyboardRegion) -> Message;
+type KeyboardCallback<Message> =
+    fn(keyboard::Event, bool, KeyboardRegion, Option<cosmic::iced::widget::Id>) -> Message;
 
 /// Publish each keyboard event with its own native focus snapshot. Iced
 /// batches widget events before subscription messages, so reading a shared
@@ -168,15 +181,28 @@ pub fn observe_keyboard_events<'a, Message: 'a>(
 pub(crate) struct ScopedKeyboardRegion {
     focus: Rc<Cell<Option<KeyboardRegion>>>,
     previous: Option<KeyboardRegion>,
+    widget: Rc<RefCell<Option<cosmic::iced::widget::Id>>>,
+    previous_widget: Option<cosmic::iced::widget::Id>,
 }
 impl Drop for ScopedKeyboardRegion {
     fn drop(&mut self) {
         self.focus.set(self.previous);
+        *self.widget.borrow_mut() = self.previous_widget.take();
     }
 }
 impl InputTrace {
     pub(crate) fn scoped_keyboard_region(&self, region: KeyboardRegion) -> ScopedKeyboardRegion {
+        self.scoped_keyboard_focus(region, self.keyboard_widget_id())
+    }
+
+    pub(crate) fn scoped_keyboard_focus(
+        &self,
+        region: KeyboardRegion,
+        widget: Option<cosmic::iced::widget::Id>,
+    ) -> ScopedKeyboardRegion {
         ScopedKeyboardRegion {
+            widget: Rc::clone(&self.2),
+            previous_widget: self.2.replace(widget),
             focus: Rc::clone(&self.1),
             previous: self.1.replace(Some(region)),
         }
@@ -350,16 +376,19 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
                 &mut focus,
             );
             self.trace.1.set(Some(focus.region(regions)));
+            *self.trace.2.borrow_mut() = focus.focused.as_ref().and_then(|(id, _)| id.clone());
         } else if matches!(event, Event::Keyboard(_)) && self.focus_regions.is_some() {
             // An ordinary key or modifier update must not reuse a previous
             // chord's pane after the user moves focus with the pointer.
             self.trace.1.set(None);
+            self.trace.2.borrow_mut().take();
         }
         let region = self
             .trace
             .1
             .get()
             .unwrap_or_else(|| FocusedPane::Other.into());
+        let widget = self.trace.keyboard_widget_id();
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -373,7 +402,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
         if let Event::Keyboard(event) = event
             && let Some(callback) = &self.keyboard_callback
         {
-            shell.publish(callback(event.clone(), shell.is_event_captured(), region));
+            shell.publish(callback(event.clone(), shell.is_event_captured(), region, widget));
         }
     }
 
@@ -542,12 +571,14 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
                 .operate(layout, renderer, &mut focus);
             owns_keyboard = focus.focused.is_some();
             self.trace.1.set(Some(focus.region(regions)));
+            *self.trace.2.borrow_mut() = focus.focused.as_ref().and_then(|(id, _)| id.clone());
         }
         let region = self
             .trace
             .1
             .get()
             .unwrap_or_else(|| FocusedPane::OutsideWorkspace.into());
+        let widget = self.trace.keyboard_widget_id();
         self.content
             .as_overlay_mut()
             .update(event, layout, cursor, renderer, clipboard, shell);
@@ -560,7 +591,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
                 shell.capture_event();
             }
             if shell.is_event_captured() {
-                shell.publish(callback(event.clone(), true, region));
+                shell.publish(callback(event.clone(), true, region, widget));
             }
         }
     }
@@ -649,13 +680,18 @@ mod tests {
         };
         let sidebar = KeyboardRegion::from(FocusedPane::TextInput);
         trace.1.set(Some(sidebar));
+        let later = cosmic::iced::widget::Id::new("later-widget");
+        let original = cosmic::iced::widget::Id::new("original-widget");
+        *trace.2.borrow_mut() = Some(later.clone());
         {
-            let _event = trace.scoped_keyboard_region(editor);
+            let _event = trace.scoped_keyboard_focus(editor, Some(original.clone()));
+            assert_eq!(trace.keyboard_widget_id(), Some(original));
             assert_eq!(trace.keyboard_focus(), Some(FocusedPane::Editor));
             assert_eq!(trace.keyboard_card(), editor.card);
         }
         assert_eq!(trace.keyboard_focus(), Some(FocusedPane::TextInput));
         assert_eq!(trace.keyboard_card(), None);
+        assert_eq!(trace.keyboard_widget_id(), Some(later));
     }
 
     #[test]

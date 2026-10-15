@@ -568,7 +568,7 @@ mod tests {
                             card: Some(owning_card),
                         },
                     )],
-                    Message::Keyboard,
+                    |event, captured, region, _widget| Message::Keyboard(event, captured, region),
                 );
                 tree.diff(element.as_widget_mut());
                 let node = element.as_widget_mut().layout(

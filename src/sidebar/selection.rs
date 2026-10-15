@@ -6,7 +6,7 @@
 //! therefore empty almost all of the time. Shared context-menu actions and
 //! keyboard deletion target the group only when the user explicitly selects it.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::{Arc, OnceLock}};
 
 use crate::model::{ChannelId, ProjectId, WorktreeId};
 
@@ -57,16 +57,33 @@ pub enum Intent {
     Range { extend: bool },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct Selection {
     rows: BTreeSet<Row>,
     anchor: Option<Row>,
+    context_snapshot: OnceLock<Arc<[Row]>>,
 }
+
+impl PartialEq for Selection {
+    fn eq(&self, other: &Self) -> bool { self.rows == other.rows && self.anchor == other.anchor }
+}
+impl Eq for Selection {}
 
 impl Selection {
     pub(super) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+    pub(super) fn context_rows(&self, row: Row) -> Option<Arc<[Row]>> {
+        // Single-row menus already carry the row ID. Share the empty marker
+        // instead of allocating for every visible row, and share group intent
+        // across all of its menus until the explicit selection changes.
+        static SINGLE: OnceLock<Arc<[Row]>> = OnceLock::new();
+        if !self.contains(row) || self.rows.len() == 1 {
+            return Some(Arc::clone(SINGLE.get_or_init(Arc::default)));
+        }
+        self.group_size(row).map(|_| Arc::clone(self.context_snapshot.get_or_init(|| self.rows.iter().copied().collect())))
+    }
+
     pub(super) fn group_size(&self, row: Row) -> Option<usize> {
         if !self.contains(row) {
             return Some(1);
@@ -81,11 +98,13 @@ impl Selection {
     }
 
     pub(super) fn clear(&mut self) {
+        self.context_snapshot.take();
         self.rows.clear();
         self.anchor = None;
     }
 
     pub(super) fn retain_visible(&mut self, visible: &[Row]) {
+        self.context_snapshot.take();
         let visible = visible.iter().copied().collect::<BTreeSet<_>>();
         self.rows.retain(|row| visible.contains(row));
         self.anchor = self.anchor.filter(|row| visible.contains(row));

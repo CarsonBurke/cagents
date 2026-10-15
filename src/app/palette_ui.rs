@@ -10,6 +10,7 @@ pub(super) struct State {
     query: Option<String>,
     selected: usize,
     panes_only: bool,
+    sidebar_target: Option<sidebar::commands::CommandTarget>,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
@@ -255,6 +256,7 @@ impl Cagents {
                 self.palette.filtering_key = true;
                 self.palette.recording = None;
                 self.palette.query = None;
+                self.palette.sidebar_target = None;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
                 Task::none()
@@ -343,6 +345,7 @@ impl Cagents {
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
+                self.palette.sidebar_target = self.capture_sidebar_command_target();
                 self.palette.panes_only = matches!(action, Action::OpenPanes);
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
@@ -355,6 +358,7 @@ impl Cagents {
                 self.palette.recording = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
+                self.palette.sidebar_target = None;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
                 self.workspace.focused().map_or_else(Task::none, |card| {
@@ -433,6 +437,7 @@ impl Cagents {
         self.settings.palette_recents.truncate(24);
         self.palette.query = None;
         let command = self.update(message);
+        self.palette.sidebar_target = None;
         let save = if self.settings_path.is_some() {
             self.save_settings_task(false)
         } else {
@@ -975,6 +980,49 @@ impl Cagents {
         })
     }
 
+    fn capture_sidebar_command_target(&self) -> Option<sidebar::commands::CommandTarget> {
+        let pane = self.input_trace.keyboard_focus()?;
+        let Some(widget) = self.input_trace.keyboard_widget_id() else {
+            return matches!(pane, workspace_widget::FocusedPane::SidebarRows | workspace_widget::FocusedPane::SidebarFiles).then_some(sidebar::commands::CommandTarget::Unavailable);
+        };
+        match pane {
+            workspace_widget::FocusedPane::SidebarRows => {
+                let visible = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, self.projects_sidebar_mode() == SidebarMode::Compact);
+                let Some(row) = visible.iter().copied().find(|row| sidebar::selection_row_focus_id(*row) == widget) else { return Some(sidebar::commands::CommandTarget::Unavailable); };
+                let selected = self.sidebar_state.selected_rows(&visible);
+                Some(sidebar::commands::CommandTarget::Rows(if selected.contains(&row) { selected } else { vec![row] }))
+            }
+            workspace_widget::FocusedPane::SidebarFiles => {
+                let Some(source) = self.sidebar_model.source_control.as_ref() else { return Some(sidebar::commands::CommandTarget::Unavailable); };
+                let Some(row) = sidebar::commands::file_rows(source).find(|row| sidebar::file_row_focus_id(&source.key, &row.path) == widget) else { return Some(sidebar::commands::CommandTarget::Unavailable); };
+                Some(sidebar::commands::CommandTarget::File { key: source.key.clone(), path: row.path.clone() })
+            }
+            _ => None,
+        }
+    }
+
+    fn sidebar_command_target(&self) -> Option<sidebar::commands::CommandTarget> {
+        self.palette.sidebar_target.clone().or_else(|| self.capture_sidebar_command_target())
+    }
+
+    fn sidebar_command_mask(&self, target: &sidebar::commands::CommandTarget) -> u64 {
+        workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| {
+            let bit = descriptor.action.sidebar_command_bit()?;
+            let action = target.resolve(&self.sidebar_model, descriptor.action)?;
+            (!crate::device::is_remote() || device_ui::supports_sidebar_action(&action)).then_some(bit)
+        }).fold(0, |mask, bit| mask | bit)
+    }
+
+    pub(super) fn run_sidebar_registered_command(&mut self, command: Command, action: SidebarAction) -> Task<Message> {
+        let valid = sidebar::commands::CommandTarget::from_action(&action)
+            .is_some_and(|target| target.accepts(&self.sidebar_model, command, &action));
+        if !valid || (crate::device::is_remote() && !device_ui::supports_sidebar_action(&action)) {
+            self.status = Some(TransientNotice::warning("The original sidebar target is no longer available"));
+            return Task::none();
+        }
+        self.update(Message::Sidebar(action))
+    }
+
     /// Availability is shared by palette listing and execution. A stale menu
     /// or shortcut cannot turn an unavailable command into a silent no-op.
     fn command_context(&self, card: Option<CardId>) -> workspace_widget::CommandContext {
@@ -982,6 +1030,7 @@ impl Cagents {
             card.and_then(|id| self.workspace.order().position(|candidate| candidate == id));
         let state = card.and_then(|id| self.card_state(id));
         workspace_widget::CommandContext {
+            sidebar_commands: self.sidebar_command_target().as_ref().map(|target| self.sidebar_command_mask(target)),
             // The palette's search field owns native keyboard focus. Command
             // availability instead describes the originating pane's content.
             focused: match card.and_then(|id| self.cards.get(&id)) {
@@ -1049,7 +1098,9 @@ impl Cagents {
     }
 
     pub(super) fn pane_command_available(&self, card: CardId, command: Command) -> bool {
-        workspace_widget::shortcut_descriptor(command).available(&self.command_context(Some(card)))
+        let mut context = self.command_context(Some(card));
+        context.sidebar_commands = None;
+        workspace_widget::shortcut_descriptor(command).available(&context)
     }
 
     /// Pane menus carry their original target, independently of current focus.
@@ -1080,6 +1131,17 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if command.sidebar_command_bit().is_some()
+            && let Some(target) = self.sidebar_command_target()
+        {
+            return match target.resolve(&self.sidebar_model, command) {
+                Some(action) => self.run_sidebar_registered_command(command, action),
+                None => {
+                    self.status = Some(TransientNotice::warning("The original sidebar target is no longer available"));
+                    Task::none()
+                }
+            };
+        }
         if let Some(index) = project_command_index(command) {
             let Some(project) = self.sidebar_model.projects.get(index) else {
                 return Task::none();
@@ -1181,6 +1243,9 @@ impl Cagents {
             )));
             return Task::none();
         }
+        if command.sidebar_command_bit().is_some() && self.sidebar_command_target().is_some() {
+            return self.run_registered_command(command);
+        }
         match command {
             Command::NewBrowser
             | Command::OpenFolder
@@ -1224,7 +1289,27 @@ impl Cagents {
             | Command::EditorCopy
             | Command::EditorPaste
             | Command::EditorSelectAll
-            | Command::EndConversation => self.run_registered_command(command),
+            | Command::EndConversation
+            | Command::CopyBranch
+            | Command::OpenOrCreatePullRequest
+            | Command::NewWorktreeFromBranch
+            | Command::MoveProjectUp
+            | Command::MoveProjectDown
+            | Command::ResetSidebarOrder
+            | Command::RevealInFileManager
+            | Command::OpenRepositoryUrl
+            | Command::OpenInExternalEditor
+            | Command::DeleteWorktree
+            | Command::RemoveProject
+            | Command::DeleteSelectedRows
+            | Command::RenameChannel
+            | Command::MarkChannelRead
+            | Command::DeleteChannel
+            | Command::MarkWorktreeRead
+            | Command::RenameFile
+            | Command::DuplicateFile
+            | Command::CopyRelativePath
+            => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -1441,6 +1526,25 @@ impl SettingsField {
             Self::ShortcutMarkAllRead => Some(Command::MarkAllRead),
             Self::ShortcutSearchInProject => Some(Command::SearchInProject),
             Self::ShortcutCloneRepository => Some(Command::CloneRepository),
+            Self::ShortcutCopyBranch => Some(Command::CopyBranch),
+            Self::ShortcutOpenOrCreatePullRequest => Some(Command::OpenOrCreatePullRequest),
+            Self::ShortcutNewWorktreeFromBranch => Some(Command::NewWorktreeFromBranch),
+            Self::ShortcutMoveProjectUp => Some(Command::MoveProjectUp),
+            Self::ShortcutMoveProjectDown => Some(Command::MoveProjectDown),
+            Self::ShortcutResetSidebarOrder => Some(Command::ResetSidebarOrder),
+            Self::ShortcutRevealInFileManager => Some(Command::RevealInFileManager),
+            Self::ShortcutOpenRepositoryUrl => Some(Command::OpenRepositoryUrl),
+            Self::ShortcutOpenInExternalEditor => Some(Command::OpenInExternalEditor),
+            Self::ShortcutDeleteWorktree => Some(Command::DeleteWorktree),
+            Self::ShortcutRemoveProject => Some(Command::RemoveProject),
+            Self::ShortcutDeleteSelectedRows => Some(Command::DeleteSelectedRows),
+            Self::ShortcutRenameChannel => Some(Command::RenameChannel),
+            Self::ShortcutMarkChannelRead => Some(Command::MarkChannelRead),
+            Self::ShortcutDeleteChannel => Some(Command::DeleteChannel),
+            Self::ShortcutMarkWorktreeRead => Some(Command::MarkWorktreeRead),
+            Self::ShortcutRenameFile => Some(Command::RenameFile),
+            Self::ShortcutDuplicateFile => Some(Command::DuplicateFile),
+            Self::ShortcutCopyRelativePath => Some(Command::CopyRelativePath),
 
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
@@ -1562,6 +1666,25 @@ impl ShortcutDraft {
             (Command::MarkAllRead, self.mark_all_read.as_str()),
             (Command::SearchInProject, self.search_in_project.as_str()),
             (Command::CloneRepository, self.clone_repository.as_str()),
+            (Command::CopyBranch, self.copy_branch.as_str()),
+            (Command::OpenOrCreatePullRequest, self.open_or_create_pull_request.as_str()),
+            (Command::NewWorktreeFromBranch, self.new_worktree_from_branch.as_str()),
+            (Command::MoveProjectUp, self.move_project_up.as_str()),
+            (Command::MoveProjectDown, self.move_project_down.as_str()),
+            (Command::ResetSidebarOrder, self.reset_sidebar_order.as_str()),
+            (Command::RevealInFileManager, self.reveal_in_file_manager.as_str()),
+            (Command::OpenRepositoryUrl, self.open_repository_url.as_str()),
+            (Command::OpenInExternalEditor, self.open_in_external_editor.as_str()),
+            (Command::DeleteWorktree, self.delete_worktree.as_str()),
+            (Command::RemoveProject, self.remove_project.as_str()),
+            (Command::DeleteSelectedRows, self.delete_selected_rows.as_str()),
+            (Command::RenameChannel, self.rename_channel.as_str()),
+            (Command::MarkChannelRead, self.mark_channel_read.as_str()),
+            (Command::DeleteChannel, self.delete_channel.as_str()),
+            (Command::MarkWorktreeRead, self.mark_worktree_read.as_str()),
+            (Command::RenameFile, self.rename_file.as_str()),
+            (Command::DuplicateFile, self.duplicate_file.as_str()),
+            (Command::CopyRelativePath, self.copy_relative_path.as_str()),
 
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
@@ -1942,7 +2065,7 @@ mod tests {
     fn palette_end_conversation_keeps_recovery_available_without_a_ready_runtime() {
         let mut app = settings_focus_fixture();
         let directory = tempfile::tempdir().unwrap();
-        drop(app.new_native_chat(crate::chat::Provider::Codex, Some(directory.path().into())));
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some(directory.path().into())));
         let card = app.workspace.focused().unwrap();
         for runtime in [CardRuntime::Loading, CardRuntime::Failed("fixture startup failure".into())] {
             app.cards.insert(card, runtime);
@@ -2641,4 +2764,33 @@ mod settings_recorder_tests {
         assert!(app.settings_invalid.is_empty());
         assert!(app.settings.clone().validate().is_ok());
     }
+    #[test]
+    fn sidebar_palette_keeps_original_row_after_focus_and_selection_change() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.sidebar_model = sidebar::tests::panel_model();
+        let project = app.sidebar_model.projects[0].id;
+        let row = sidebar::SelectionRow::Worktree(project, app.sidebar_model.projects[0].worktrees[0].id);
+        let region = crate::input_trace::KeyboardRegion::from(workspace_widget::FocusedPane::SidebarRows);
+        let _event = app.input_trace.scoped_keyboard_focus(region, Some(sidebar::selection_row_focus_id(row)));
+        drop(app.update_palette(Action::Open));
+        assert_eq!(app.palette.sidebar_target, Some(sidebar::commands::CommandTarget::Rows(vec![row])));
+        let replacement = app.sidebar_model.projects[0].worktrees[1].id;
+        app.sidebar_state.select_rows(sidebar::SelectionRow::Worktree(project, replacement), sidebar::SelectionIntent::Toggle, &[row, sidebar::SelectionRow::Worktree(project, replacement)]);
+        assert_eq!(app.sidebar_command_target(), Some(sidebar::commands::CommandTarget::Rows(vec![row])));
+        app.sidebar_model.projects[0].worktrees.remove(0);
+        assert!(!app.command_available(Command::NewTerminal));
+        assert!(!app.command_available(Command::CopyPath));
+        drop(app.run_registered_command(Command::CopyPath));
+        assert!(app.status.is_some());
+    }
+
+    #[test]
+    fn stale_native_sidebar_identity_does_not_fall_back_to_focused_pane() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let region = crate::input_trace::KeyboardRegion::from(workspace_widget::FocusedPane::SidebarRows);
+        let _event = app.input_trace.scoped_keyboard_focus(region, Some(widget::Id::new("removed-sidebar-row")));
+        assert_eq!(app.sidebar_command_target(), Some(sidebar::commands::CommandTarget::Unavailable));
+        assert!(!app.command_available(Command::CopyPath));
+    }
+
 }
