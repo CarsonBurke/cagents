@@ -274,6 +274,20 @@ impl Project {
             .collect()
     }
 
+    /// A successful bound read can repair missed HEAD/upstream events without
+    /// another census. Keep the existing Arc/coverage on unchanged reads.
+    pub(crate) fn refresh_worktree_routing(
+        &self, record: &WorktreeRecord, upstream: Option<&str>,
+    ) -> Option<Self> {
+        let index = self.worktrees.iter().position(|worktree| worktree.id == record.id && worktree.root == record.path)?;
+        let current = &self.worktrees[index];
+        if current.branch == record.branch && current.upstream.as_deref() == upstream { return None; }
+        let mut next = self.clone();
+        next.worktrees[index].branch = record.branch.clone();
+        next.worktrees[index].upstream = upstream.map(str::to_owned);
+        Some(next)
+    }
+
     fn polling_reason(&self) -> Option<&str> {
         self.polling.as_deref().or_else(|| {
             self.worktrees

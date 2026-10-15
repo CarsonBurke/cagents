@@ -212,6 +212,14 @@ impl State {
         };
         *cached = Some(status.display_summary());
         apply_status_head(record, status);
+        let upstream = match &status.tracking {
+            crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream.as_str()),
+            crate::repository::TrackingState::Unknown { upstream } => upstream.as_deref(),
+            crate::repository::TrackingState::NoUpstream => None,
+        };
+        let routed = entry.plan.as_ref().and_then(|plan| plan.refresh_worktree_routing(record, upstream));
+        let reconfigure = routed.is_some();
+        if let Some(plan) = routed { entry.plan = Some(Arc::new(plan)); }
         entry.snapshot.status_errors.remove(&key.worktree_id);
         if let Some(operation) = operation {
             entry.snapshot.operations.insert(key.worktree_id, operation);
@@ -219,6 +227,7 @@ impl State {
             entry.snapshot.operations.remove(&key.worktree_id);
         }
         entry.snapshot.status_reads.insert(key.worktree_id, read);
+        if reconfigure { self.configure(); }
         true
     }
 
@@ -1779,6 +1788,59 @@ mod tests {
                     Instant::now() < deadline,
                     "recovered worktree lost subsequent native events"
                 );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn bound_success_repairs_missed_branch_and_upstream_watch_routing_without_a_census() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let initial = fixture(&root);
+        let project = ProjectId::new();
+        let cancel = CancellationToken::default();
+        let (baseline, plan) = read_local(project, initial,
+            git_watch::Change { topology: true, ..Default::default() }, cancel.clone()).unwrap();
+        let key = ActiveWorktreeKey { project_id: project, worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let old = Arc::new(plan.unwrap());
+        git(&root, &["checkout", "-b", "learned"]);
+        git(&root, &["remote", "add", "origin", root.to_str().unwrap()]);
+        git(&root, &["update-ref", "refs/remotes/origin/learned", "HEAD"]);
+        git(&root, &["config", "branch.learned.remote", "origin"]);
+        git(&root, &["config", "branch.learned.merge", "refs/heads/learned"]);
+        let read = next_status_read();
+        let full = RepositoryService::system("git").snapshot(&root, &cancel).unwrap();
+        let mut app = app_with_status_snapshot(baseline, &key);
+        app.refresh_ui.git.entries.get_mut(&project).unwrap().plan = Some(old.clone());
+        app.refresh_ui.git.monitor = Some(git_watch::Monitor::start().unwrap());
+        drop(app.update(bound_status_message(&key, 7, full, read)));
+        let entry = &app.refresh_ui.git.entries[&project];
+        let current = entry.plan.as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(&old, &current), "changed routing must replace the plan");
+        assert!(current.matches(&entry.snapshot.repository.common_dir,
+            &entry.snapshot.worktrees.iter().map(|(record, _)| record.clone()).collect::<Vec<_>>()));
+        let status = entry.snapshot.worktrees[0].1.as_ref().unwrap().display_summary();
+        drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: 7,
+            result: Ok(SourceControlRead { prepared: None, status, operation: None, read: next_status_read() }) }));
+        assert!(Arc::ptr_eq(&current, app.refresh_ui.git.entries[&project].plan.as_ref().unwrap()),
+            "unchanged proof must not clone/rebuild coverage");
+        let monitor = app.refresh_ui.git.monitor.as_ref().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if monitor.drain().get(&project).is_some_and(|change| change.coverage == Some(true)) { break; }
+            assert!(Instant::now() < deadline, "bound routing configuration not acknowledged");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for name in ["refs/heads/learned", "refs/remotes/origin/learned"] {
+            monitor.drain();
+            let path = root.join(".git").join(name);
+            let bytes = fs::read(&path).unwrap();
+            fs::write(&path, bytes).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if monitor.drain().get(&project).is_some_and(|change| change.worktrees.contains(&key.worktree_id)) { break; }
+                assert!(Instant::now() < deadline, "bound-only new ref routing omitted {name}");
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
