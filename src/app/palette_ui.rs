@@ -53,41 +53,77 @@ impl Cagents {
                 Task::none()
             }
             Action::Reassign => {
-                let Some((field, chord, owner)) = self.palette.reassign.take() else { return Task::none(); };
-                if self.palette.recording != Some(field) { return Task::none(); }
+                let Some((field, chord, owner)) = self.palette.reassign.take() else {
+                    return Task::none();
+                };
+                if self.palette.recording != Some(field) {
+                    return Task::none();
+                }
                 let binding = settings::parse_shortcut(&chord).expect("recorded chord");
                 let mut next = self.settings.clone();
                 let drafts = self.settings_draft.keyboard_shortcuts.shortcut_values();
-                let owner_action = SettingsField::SHORTCUTS[owner].shortcut_action().expect("shortcut action");
-                let remaining = drafts.iter().find(|(action, _)| *action == owner_action).expect("owner draft").1;
+                let owner_action = SettingsField::SHORTCUTS[owner]
+                    .shortcut_action()
+                    .expect("shortcut action");
+                let remaining = drafts
+                    .iter()
+                    .find(|(action, _)| *action == owner_action)
+                    .expect("owner draft")
+                    .1;
                 let mut remaining = settings::parse_chords(remaining);
                 remaining.retain(|chord| settings::parse_shortcut(chord).ok() != Some(binding));
                 next.keyboard_shortcuts.set_action(owner, remaining.clone());
-                let index = SettingsField::SHORTCUTS.iter().position(|candidate| *candidate == field).expect("shortcut");
+                let index = SettingsField::SHORTCUTS
+                    .iter()
+                    .position(|candidate| *candidate == field)
+                    .expect("shortcut");
                 let action = field.shortcut_action().expect("shortcut action");
-                let mine = drafts.iter().find(|(candidate, _)| *candidate == action).expect("edited draft").1;
+                let mine = drafts
+                    .iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("edited draft")
+                    .1;
                 let mut mine = settings::parse_chords(mine);
-                if !mine.iter().any(|chord| settings::parse_shortcut(chord).ok() == Some(binding)) { mine.push(chord); }
+                if !mine
+                    .iter()
+                    .any(|chord| settings::parse_shortcut(chord).ok() == Some(binding))
+                {
+                    mine.push(chord);
+                }
                 next.keyboard_shortcuts.set_action(index, mine.clone());
                 let attempted = next.clone();
                 match next.validate() {
                     Ok(next) => {
                         let previous = std::mem::replace(&mut self.settings, next);
-                        self.settings_draft.set(SettingsField::SHORTCUTS[owner], settings::format_chords(&remaining));
-                        self.settings_draft.set(field, settings::format_chords(&mine));
+                        self.settings_draft.set(
+                            SettingsField::SHORTCUTS[owner],
+                            settings::format_chords(&remaining),
+                        );
+                        self.settings_draft
+                            .set(field, settings::format_chords(&mine));
                         self.settings_pending.remove(&field);
-                        self.settings_pending.remove(&SettingsField::SHORTCUTS[owner]);
+                        self.settings_pending
+                            .remove(&SettingsField::SHORTCUTS[owner]);
                         self.settings_invalid.remove(&field);
-                        self.settings_invalid.remove(&SettingsField::SHORTCUTS[owner]);
+                        self.settings_invalid
+                            .remove(&SettingsField::SHORTCUTS[owner]);
                         self.retry_shortcut_drafts();
                         self.palette.recording = None;
                         self.palette.recording_error = None;
                         self.refresh_settings_feedback();
-                        Task::batch([self.save_settings_task(false), self.synchronize_settings(&previous)])
+                        Task::batch([
+                            self.save_settings_task(false),
+                            self.synchronize_settings(&previous),
+                        ])
                     }
                     Err(_) => {
-                        self.palette.recording_error = if remaining.is_empty() && settings::shortcut_required(owner) {
-                            Some(format!("{} requires at least one shortcut. Record another shortcut there before reassigning this one.", SettingsField::SHORTCUTS[owner].label()))
+                        self.palette.recording_error = if remaining.is_empty()
+                            && settings::shortcut_required(owner)
+                        {
+                            Some(format!(
+                                "{} requires at least one shortcut. Record another shortcut there before reassigning this one.",
+                                SettingsField::SHORTCUTS[owner].label()
+                            ))
                         } else {
                             refusal(field, &attempted).or_else(|| refusal(SettingsField::SHORTCUTS[owner], &attempted)).or_else(|| Some("Reassignment could not be saved. Check the other settings.".into()))
                         };
@@ -209,7 +245,12 @@ impl Cagents {
                         self.palette.filtering_key = false;
                         return Some(self.update(Message::SettingsSearchChanged(chord)));
                     }
-                    return Some(self.record_shortcut(self.palette.recording.expect("recording field"), chord));
+                    return Some(
+                        self.record_shortcut(
+                            self.palette.recording.expect("recording field"),
+                            chord,
+                        ),
+                    );
                 }
             }
             return Some(Task::none());
@@ -245,9 +286,18 @@ impl Cagents {
     fn record_shortcut(&mut self, field: SettingsField, chord: String) -> Task<Message> {
         self.palette.reassign = None;
         let action = field.shortcut_action().expect("shortcut field");
-        let value = self.settings_draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).expect("shortcut draft").1;
+        let value = self
+            .settings_draft
+            .keyboard_shortcuts
+            .shortcut_values()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == action)
+            .expect("shortcut draft")
+            .1;
         let mut chords = settings::parse_chords(value);
-        if !chords.iter().any(|existing| settings::parse_shortcut(existing).ok() == settings::parse_shortcut(&chord).ok()) {
+        if !chords.iter().any(|existing| {
+            settings::parse_shortcut(existing).ok() == settings::parse_shortcut(&chord).ok()
+        }) {
             chords.push(chord.clone());
         }
         let value = settings::format_chords(&chords);
@@ -256,7 +306,16 @@ impl Cagents {
                 self.palette.recording_error = Some(reason);
                 if let Ok(binding) = settings::parse_shortcut(&chord)
                     && settings::shortcut_chord_refusal(binding).is_none()
-                    && let Some(owner) = self.settings.keyboard_shortcuts.actions().iter().position(|chords| chords.iter().any(|candidate| settings::parse_shortcut(candidate).ok() == Some(binding)))
+                    && let Some(owner) =
+                        self.settings
+                            .keyboard_shortcuts
+                            .actions()
+                            .iter()
+                            .position(|chords| {
+                                chords.iter().any(|candidate| {
+                                    settings::parse_shortcut(candidate).ok() == Some(binding)
+                                })
+                            })
                     && SettingsField::SHORTCUTS[owner] != field
                 {
                     self.palette.reassign = Some((field, chord, owner));
@@ -352,14 +411,32 @@ impl Cagents {
 
     pub(super) fn palette_surface(&self) -> Option<Element<'_, Message>> {
         if self.palette.recording.is_some() || self.palette.filtering_key {
-            let mut children: Vec<Element<'_, Message>> = vec![design::body("Press a shortcut · Escape cancels").into()];
+            let mut children: Vec<Element<'_, Message>> =
+                vec![design::body("Press a shortcut · Escape cancels").into()];
             if let Some(reason) = &self.palette.recording_error {
-                children.push(design::body(reason).class(cosmic::theme::Text::Custom(design::destructive_text)).into());
+                children.push(
+                    design::body(reason)
+                        .class(cosmic::theme::Text::Custom(design::destructive_text))
+                        .into(),
+                );
             }
             if let Some((_, _, owner)) = &self.palette.reassign {
-                children.push(widget::button::text(format!("Reassign from {}", SettingsField::SHORTCUTS[*owner].label())).on_press(Message::Palette(Action::Reassign)).into());
+                children.push(
+                    widget::button::text(format!(
+                        "Reassign from {}",
+                        SettingsField::SHORTCUTS[*owner].label()
+                    ))
+                    .on_press(Message::Palette(Action::Reassign))
+                    .into(),
+                );
             }
-            return Some(widget::container(widget::column::with_children(children).spacing(space::S)).class(cosmic::theme::Container::Card).padding(20).width(480).into());
+            return Some(
+                widget::container(widget::column::with_children(children).spacing(space::S))
+                    .class(cosmic::theme::Container::Card)
+                    .padding(20)
+                    .width(480)
+                    .into(),
+            );
         }
         let query = self.palette.query.as_ref()?;
         let input =
@@ -987,17 +1064,44 @@ mod tests {
     fn send_to_terminal_setting_updates_live_policy_and_retained_controls() {
         let mut app = settings_focus_fixture();
         let action = "rename_pane";
-        assert!(app.settings.keyboard_shortcuts.terminal_passthrough_actions.iter().any(|name| name == action));
+        assert!(
+            app.settings
+                .keyboard_shortcuts
+                .terminal_passthrough_actions
+                .iter()
+                .any(|name| name == action)
+        );
         for enabled in [false, true] {
-            drop(app.update(Message::ShortcutTerminalPassthrough { action: action.into(), enabled }));
-            assert_eq!(app.settings.keyboard_shortcuts.terminal_passthrough_actions.iter().any(|name| name == action), enabled);
-            assert_eq!(app.settings_draft.keyboard_shortcuts.terminal_passthrough_actions, app.settings.keyboard_shortcuts.terminal_passthrough_actions);
+            drop(app.update(Message::ShortcutTerminalPassthrough {
+                action: action.into(),
+                enabled,
+            }));
+            assert_eq!(
+                app.settings
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions
+                    .iter()
+                    .any(|name| name == action),
+                enabled
+            );
+            assert_eq!(
+                app.settings_draft
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions,
+                app.settings.keyboard_shortcuts.terminal_passthrough_actions
+            );
             let encoded = toml::to_string(&app.settings.keyboard_shortcuts).unwrap();
             let restored: KeyboardShortcuts = toml::from_str(&encoded).unwrap();
-            assert_eq!(restored.terminal_passthrough_actions, app.settings.keyboard_shortcuts.terminal_passthrough_actions);
+            assert_eq!(
+                restored.terminal_passthrough_actions,
+                app.settings.keyboard_shortcuts.terminal_passthrough_actions
+            );
         }
         let previous = app.settings.keyboard_shortcuts.clone();
-        drop(app.update(Message::ShortcutTerminalPassthrough { action: "unknown-command".into(), enabled: true }));
+        drop(app.update(Message::ShortcutTerminalPassthrough {
+            action: "unknown-command".into(),
+            enabled: true,
+        }));
         assert_eq!(app.settings.keyboard_shortcuts, previous);
     }
 
@@ -1012,13 +1116,32 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.push(second);
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.cards.insert(target, CardRuntime::Loading);
-        app.input_trace = crate::input_trace::InputTrace::with_keyboard_region(crate::input_trace::KeyboardRegion { pane: workspace_widget::FocusedPane::Other, card: Some(target) });
-        app.sidebar_model.projects.push(SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Project".into(), std::env::temp_dir(), Vec::new(), Vec::new()));
+        app.input_trace = crate::input_trace::InputTrace::with_keyboard_region(
+            crate::input_trace::KeyboardRegion {
+                pane: workspace_widget::FocusedPane::Other,
+                card: Some(target),
+            },
+        );
+        app.sidebar_model.projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Project".into(),
+            std::env::temp_dir(),
+            Vec::new(),
+            Vec::new(),
+        ));
         assert_eq!(app.workspace.focused(), Some(first));
         drop(app.update(Message::KeyEvent {
             event: keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character("f".into()), modified_key: keyboard::Key::Character("f".into()), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyF), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false,
-            }, captured: true,
+                key: keyboard::Key::Character("f".into()),
+                modified_key: keyboard::Key::Character("f".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyF),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            },
+            captured: true,
         }));
         assert_eq!(app.workspace.focused(), Some(target));
         assert!(app.sidebar_state.controls_expanded());
@@ -1230,13 +1353,30 @@ mod settings_recorder_tests {
     fn recorder_refuses_shell_controls_and_fixed_chords_before_editing_the_draft() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let field = SettingsField::ShortcutToggleProjects;
-        let original = app.settings_draft.keyboard_shortcuts.toggle_projects.clone();
-        for (chord, reason) in [("Ctrl+C", "interrupts"), ("Ctrl+Tab", "Cycle recent panes"), ("Ctrl+=", "Increase font size")] {
+        let original = app
+            .settings_draft
+            .keyboard_shortcuts
+            .toggle_projects
+            .clone();
+        for (chord, reason) in [
+            ("Ctrl+C", "interrupts"),
+            ("Ctrl+Tab", "Cycle recent panes"),
+            ("Ctrl+=", "Increase font size"),
+        ] {
             drop(app.update_palette(Action::Record(field)));
             drop(app.record_shortcut(field, chord.into()));
-            assert!(app.palette.recording_error.as_ref().is_some_and(|error| error.contains(reason)), "{chord}");
+            assert!(
+                app.palette
+                    .recording_error
+                    .as_ref()
+                    .is_some_and(|error| error.contains(reason)),
+                "{chord}"
+            );
             assert_eq!(app.palette.recording, Some(field));
-            assert_eq!(app.settings_draft.keyboard_shortcuts.toggle_projects, original);
+            assert_eq!(
+                app.settings_draft.keyboard_shortcuts.toggle_projects,
+                original
+            );
         }
     }
 
@@ -1253,7 +1393,10 @@ mod settings_recorder_tests {
             key: keyboard::Key::Named(keyboard::key::Named::Escape),
             modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
         };
         drop(app.palette_key_event(&escape));
         assert!(app.palette.reassign.is_none());
@@ -1270,12 +1413,18 @@ mod settings_recorder_tests {
         let field = SettingsField::ShortcutToggleProjects;
         let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
         drop(app.queue_setting_input(field, String::new()));
-        drop(app.queue_setting_input(SettingsField::ShortcutCommandPalette, format!("{chord}, Ctrl+Alt+Shift+P")));
+        drop(app.queue_setting_input(
+            SettingsField::ShortcutCommandPalette,
+            format!("{chord}, Ctrl+Alt+Shift+P"),
+        ));
         drop(app.update_palette(Action::Record(field)));
         drop(app.record_shortcut(field, chord.clone()));
         drop(app.update_palette(Action::Reassign));
         assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
-        assert_eq!(app.settings.keyboard_shortcuts.command_palette, ["Ctrl+Alt+Shift+P"]);
+        assert_eq!(
+            app.settings.keyboard_shortcuts.command_palette,
+            ["Ctrl+Alt+Shift+P"]
+        );
         assert!(app.settings_pending.is_empty());
         assert!(app.settings_invalid.is_empty());
     }
@@ -1291,7 +1440,12 @@ mod settings_recorder_tests {
         drop(app.update_palette(Action::Reassign));
         assert!(app.palette.recording.is_none());
         assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
-        assert!(app.settings.keyboard_shortcuts.toggle_projects.contains(&chord));
+        assert!(
+            app.settings
+                .keyboard_shortcuts
+                .toggle_projects
+                .contains(&chord)
+        );
         assert!(app.settings_invalid.is_empty());
         assert!(app.settings.clone().validate().is_ok());
     }

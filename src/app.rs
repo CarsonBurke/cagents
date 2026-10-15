@@ -3865,7 +3865,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
 fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
     let fault = shortcuts.fault()?;
     let Some(owner) = fault.conflicts_with else {
-        if fault.action != action { return None; }
+        if fault.action != action {
+            return None;
+        }
         let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
             return None;
         };
@@ -4283,7 +4285,11 @@ pub enum Message {
         action: String,
         enabled: bool,
     },
-    RoutedKeyEvent { event: keyboard::Event, captured: bool, region: crate::input_trace::KeyboardRegion },
+    RoutedKeyEvent {
+        event: keyboard::Event,
+        captured: bool,
+        region: crate::input_trace::KeyboardRegion,
+    },
     KeyEvent {
         event: keyboard::Event,
         /// Whether a widget already consumed this keystroke. The shell's
@@ -6464,7 +6470,12 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
-            _ if self.card_state(card).is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) => workspace_widget::FocusedPane::ChatPane,
+            _ if self
+                .card_state(card)
+                .is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) =>
+            {
+                workspace_widget::FocusedPane::ChatPane
+            }
             _ => workspace_widget::FocusedPane::Other,
         }
     }
@@ -12496,21 +12507,39 @@ impl Cagents {
     fn retry_shortcut_drafts(&mut self) {
         loop {
             let mut progressed = false;
-            let fields: Vec<_> = SettingsField::SHORTCUTS.into_iter().filter(|field| self.settings_invalid.contains_key(field)).collect();
+            let fields: Vec<_> = SettingsField::SHORTCUTS
+                .into_iter()
+                .filter(|field| self.settings_invalid.contains_key(field))
+                .collect();
             for field in fields {
                 let action = field.shortcut_action().expect("shortcut field");
-                let value = self.settings_draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).expect("registered shortcut").1.to_owned();
+                let value = self
+                    .settings_draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered shortcut")
+                    .1
+                    .to_owned();
                 match settings_update(&self.settings, field, &value) {
                     SettingsDecision::Persist(settings) => {
                         self.settings = settings;
                         self.settings_invalid.remove(&field);
                         progressed = true;
                     }
-                    SettingsDecision::Unchanged => { self.settings_invalid.remove(&field); progressed = true; }
-                    SettingsDecision::Invalid(reason) => { self.settings_invalid.insert(field, reason); }
+                    SettingsDecision::Unchanged => {
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Invalid(reason) => {
+                        self.settings_invalid.insert(field, reason);
+                    }
                 }
             }
-            if !progressed { break; }
+            if !progressed {
+                break;
+            }
         }
     }
 
@@ -12528,9 +12557,17 @@ impl Cagents {
                 let previous = self.settings.clone();
                 self.retry_shortcut_drafts();
                 let changed = previous != self.settings;
-                let save = if changed || self.settings_save_error.is_some() { self.save_settings_task(false) } else { Task::none() };
+                let save = if changed || self.settings_save_error.is_some() {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
                 self.refresh_settings_feedback();
-                let effect = if changed { self.synchronize_settings(&previous) } else { Task::none() };
+                let effect = if changed {
+                    self.synchronize_settings(&previous)
+                } else {
+                    Task::none()
+                };
                 Task::batch([save, effect])
             }
             SettingsDecision::Persist(settings) => {
@@ -13175,7 +13212,11 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let (message, _keyboard_region) = match message {
-            Message::RoutedKeyEvent { event, captured, region } => (
+            Message::RoutedKeyEvent {
+                event,
+                captured,
+                region,
+            } => (
                 Message::KeyEvent { event, captured },
                 Some(self.input_trace.scoped_keyboard_region(region)),
             ),
@@ -15742,15 +15783,21 @@ impl Application for Cagents {
                 if enabled {
                     actions.push(action);
                 }
-                self.settings_draft.keyboard_shortcuts.terminal_passthrough_actions = actions.clone();
+                self.settings_draft
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions = actions.clone();
                 self.save_settings_task(false)
             }
-            Message::RoutedKeyEvent { .. } => unreachable!("native keyboard events are normalized before dispatch"),
+            Message::RoutedKeyEvent { .. } => {
+                unreachable!("native keyboard events are normalized before dispatch")
+            }
             Message::KeyEvent { event, captured } => {
                 if !self.workspace_inputs_blocked()
                     && let Some(card) = self.input_trace.keyboard_card()
                     && !self.workspace.order().any(|candidate| candidate == card)
-                { return Task::none(); }
+                {
+                    return Task::none();
+                }
                 let focus_task = if !self.workspace_inputs_blocked()
                     && let Some(card) = self.input_trace.keyboard_card()
                     && self.workspace.focused() != Some(card)
@@ -15759,315 +15806,331 @@ impl Application for Cagents {
                     // Synchronize the action target without moving native
                     // focus or delivering the widget's input a second time.
                     self.apply_viewport(update, false, false)
-                } else { Task::none() };
+                } else {
+                    Task::none()
+                };
                 let route_task = (|| {
-                if let Some(task) = self.automation_approval_key(&event, captured) {
-                    return task;
-                }
-                if let Some(task) = self.session_recovery_key_event(&event, captured) {
-                    return task;
-                }
-                if let Some(task) = self.daemon_health_key_event(&event, captured) {
-                    return task;
-                }
-                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                    self.keyboard_modifiers = *modifiers;
-                }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
-                        match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
+                    if let Some(task) = self.automation_approval_key(&event, captured) {
+                        return task;
+                    }
+                    if let Some(task) = self.session_recovery_key_event(&event, captured) {
+                        return task;
+                    }
+                    if let Some(task) = self.daemon_health_key_event(&event, captured) {
+                        return task;
+                    }
+                    if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                        self.keyboard_modifiers = *modifiers;
+                    }
+                    if self.chat_ui.image_viewer.is_some() {
+                        if let keyboard::Event::KeyPressed { key, .. } = &event {
+                            match key {
+                                keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                                    self.chat_ui.image_viewer = None
+                                }
+                                keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                                    self.chat_ui.image_viewer.as_mut().unwrap().next(false);
+                                }
+                                keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                                    self.chat_ui.image_viewer.as_mut().unwrap().next(true);
+                                }
+                                _ => {}
                             }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                            }
-                            _ => {}
+                        }
+                        return Task::none();
+                    }
+                    if !captured
+                        && !self.workspace_inputs_blocked()
+                        && !matches!(
+                            self.focused_pane(),
+                            workspace_widget::FocusedPane::TextInput
+                                | workspace_widget::FocusedPane::OutsideWorkspace
+                        )
+                        && workspace_widget::global_shortcut(
+                            &event,
+                            &self.settings.keyboard_shortcuts,
+                            self.focused_pane(),
+                        )
+                        .is_none()
+                        && let keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Character(key),
+                            modifiers,
+                            ..
+                        } = &event
+                        && modifiers.control()
+                        && modifiers.shift()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && key.eq_ignore_ascii_case("s")
+                        && let Some(card) = self.workspace.focused()
+                        && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                    {
+                        let stage = runtime.selected_staging_selection(true).is_some();
+                        if stage || runtime.selected_staging_selection(false).is_some() {
+                            return cosmic::task::message(Message::Repository(
+                                RepositoryAction::StageSelected { card, stage },
+                            ));
                         }
                     }
-                    return Task::none();
-                }
-                if !captured
-                    && !self.workspace_inputs_blocked()
-                    && !matches!(self.focused_pane(), workspace_widget::FocusedPane::TextInput | workspace_widget::FocusedPane::OutsideWorkspace)
-                    && workspace_widget::global_shortcut(
+                    if let Some(task) = self.palette_key_event(&event) {
+                        return task;
+                    }
+                    if crate::tab_history::released(&event) {
+                        self.tab_history.finish(self.workspace.focused());
+                    }
+                    if crate::tab_history::modifiers_released(
                         &event,
-                        &self.settings.keyboard_shortcuts,
-                        self.focused_pane(),
-                    )
-                    .is_none()
-                    && let keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Character(key),
-                        modifiers,
-                        ..
-                    } = &event
-                    && modifiers.control()
-                    && modifiers.shift()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
-                    && key.eq_ignore_ascii_case("s")
-                    && let Some(card) = self.workspace.focused()
-                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
-                {
-                    let stage = runtime.selected_staging_selection(true).is_some();
-                    if stage || runtime.selected_staging_selection(false).is_some() {
-                        return cosmic::task::message(Message::Repository(
-                            RepositoryAction::StageSelected { card, stage },
-                        ));
-                    }
-                }
-                if let Some(task) = self.palette_key_event(&event) {
-                    return task;
-                }
-                if crate::tab_history::released(&event) {
-                    self.tab_history.finish(self.workspace.focused());
-                }
-                if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers)
-                    && let Some(since) = self.chrome_ui.workspace_preview_since
-                {
-                    // A window losing focus is told its modifiers are released
-                    // just before it is told about the focus. Deciding one
-                    // message later lets that cancel instead of commit.
-                    self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
-                    return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
-                }
-                if self.chrome_ui.workspace_preview.is_some() {
-                    return self.workspace_switcher_key(&event);
-                }
-                if !self.workspace_inputs_blocked()
-                    && !self.focused_repository_is_saving()
-                    && let Some(backwards) = crate::tab_history::step_direction(&event)
-                {
-                    let available: Vec<_> = self.workspace.order().collect();
-                    self.tab_history.retain(|id| {
-                        self.durable
-                            .cards
-                            .iter()
-                            .any(|card| card.id == id && card.existence.is_open())
-                    });
-                    if let Some(id) =
-                        self.tab_history
-                            .step(&available, self.workspace.focused(), backwards)
-                        && let Ok(update) = self.workspace.focus(id)
+                        self.workspace_cycle_modifiers,
+                    ) && let Some(since) = self.chrome_ui.workspace_preview_since
                     {
-                        return self.apply_viewport(update, true, false);
+                        // A window losing focus is told its modifiers are released
+                        // just before it is told about the focus. Deciding one
+                        // message later lets that cancel instead of commit.
+                        self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+                        return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
                     }
-                    return Task::none();
-                }
-                if let Some(task) = self.chrome_key_event(&event) {
-                    return task;
-                }
-                if let Some(task) = self.account_key_event(&event) {
-                    return task;
-                }
-                if !self.workspace_inputs_blocked()
-                    && let Some(task) = self.chat_find_key(&event)
-                {
-                    return task;
-                }
-                // A widget that consumed Escape has already answered it - a
-                // focused terminal clearing its selection, for one. Running the
-                // chain anyway would close the inspector behind it in the same
-                // keystroke. Global shortcuts below are deliberately exempt:
-                // `WorkspaceSurface` captures those chords itself, before any
-                // child sees them, and relies on this message to act on them.
-                // A form dialog on top answers Escape before anything under
-                // it, such as a find bar or picker, and even when its focused
-                // field captured the key to blur itself: otherwise closing it
-                // would take a second press.
-                if is_escape_press(&event) && self.form_dialog_on_top() {
-                    return self.cancel_form_dialog();
-                }
-                if self.form_dialog_on_top()
-                    && let Some(task) = self.resume_key_event(&event)
-                {
-                    return task;
-                }
-                if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
-                    return self.update_device(device_ui::Action::Menu(false));
-                }
-                // The model search field captures Escape to blur itself. Close
-                // its picker in the same press, while dialogs retain priority.
-                if is_escape_press(&event)
-                    && !self.workspace_inputs_blocked()
-                    && self.dismiss_chat_picker()
-                {
-                    return self.workspace.focused().map_or_else(Task::none, |card| {
-                        iced::widget::operation::focus(card_control_id(card, "chat-composer"))
-                            .map(cosmic::Action::App)
-                    });
-                }
-                if self.settings_reset_on_top() {
-                    if is_escape_press(&event) {
-                        return self.close_settings_reset();
+                    if self.chrome_ui.workspace_preview.is_some() {
+                        return self.workspace_switcher_key(&event);
                     }
-                    if is_tab_press(&event).is_some() {
-                        self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
-                        let target = if self.settings_reset_focus_confirm {
-                            "dialog.reset-settings.confirm"
-                        } else {
-                            "dialog.reset-settings.cancel"
-                        };
-                        return iced::widget::operation::focus(widget::Id::new(target))
-                            .map(cosmic::Action::App);
+                    if !self.workspace_inputs_blocked()
+                        && !self.focused_repository_is_saving()
+                        && let Some(backwards) = crate::tab_history::step_direction(&event)
+                    {
+                        let available: Vec<_> = self.workspace.order().collect();
+                        self.tab_history.retain(|id| {
+                            self.durable
+                                .cards
+                                .iter()
+                                .any(|card| card.id == id && card.existence.is_open())
+                        });
+                        if let Some(id) =
+                            self.tab_history
+                                .step(&available, self.workspace.focused(), backwards)
+                            && let Ok(update) = self.workspace.focus(id)
+                        {
+                            return self.apply_viewport(update, true, false);
+                        }
+                        return Task::none();
                     }
-                }
-                if is_escape_press(&event) && !captured {
-                    if self.transient_work_close.is_some() {
-                        return cosmic::task::message(Message::CancelTransientWorkClose);
+                    if let Some(task) = self.chrome_key_event(&event) {
+                        return task;
                     }
-                    if let Some(action) = self.automation_ui.keep_draft_action() {
-                        return self.update_automation_ui(action);
+                    if let Some(task) = self.account_key_event(&event) {
+                        return task;
                     }
-                    if let Some((card, _)) = &self.terminal_paste {
-                        return self
-                            .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
+                    if !self.workspace_inputs_blocked()
+                        && let Some(task) = self.chat_find_key(&event)
+                    {
+                        return task;
                     }
-                    if self.update_ui.confirmation.is_some() {
-                        return self.update_update_ui(update_ui::Action::CancelApply);
+                    // A widget that consumed Escape has already answered it - a
+                    // focused terminal clearing its selection, for one. Running the
+                    // chain anyway would close the inspector behind it in the same
+                    // keystroke. Global shortcuts below are deliberately exempt:
+                    // `WorkspaceSurface` captures those chords itself, before any
+                    // child sees them, and relies on this message to act on them.
+                    // A form dialog on top answers Escape before anything under
+                    // it, such as a find bar or picker, and even when its focused
+                    // field captured the key to blur itself: otherwise closing it
+                    // would take a second press.
+                    if is_escape_press(&event) && self.form_dialog_on_top() {
+                        return self.cancel_form_dialog();
                     }
-                    if self.terminal_close_dialog_visible() {
-                        return self.cancel_terminal_close();
+                    if self.form_dialog_on_top()
+                        && let Some(task) = self.resume_key_event(&event)
+                    {
+                        return task;
                     }
-                    if self.sidebar_state.pending_discard().is_some() {
-                        return cosmic::task::message(Message::Sidebar(
-                            SidebarAction::CancelDiscard,
-                        ));
+                    if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open()
+                    {
+                        return self.update_device(device_ui::Action::Menu(false));
                     }
-                    if self.project_ui.modal_open() {
-                        return self.handle_project_action(project_ui::Action::Dismiss);
+                    // The model search field captures Escape to blur itself. Close
+                    // its picker in the same press, while dialogs retain priority.
+                    if is_escape_press(&event)
+                        && !self.workspace_inputs_blocked()
+                        && self.dismiss_chat_picker()
+                    {
+                        return self.workspace.focused().map_or_else(Task::none, |card| {
+                            iced::widget::operation::focus(card_control_id(card, "chat-composer"))
+                                .map(cosmic::Action::App)
+                        });
                     }
-                    if self.sidebar_selection_ui.dialog.is_some() {
-                        return self
-                            .update_sidebar_selection(sidebar_selection_ui::Action::Dismiss);
+                    if self.settings_reset_on_top() {
+                        if is_escape_press(&event) {
+                            return self.close_settings_reset();
+                        }
+                        if is_tab_press(&event).is_some() {
+                            self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
+                            let target = if self.settings_reset_focus_confirm {
+                                "dialog.reset-settings.confirm"
+                            } else {
+                                "dialog.reset-settings.cancel"
+                            };
+                            return iced::widget::operation::focus(widget::Id::new(target))
+                                .map(cosmic::Action::App);
+                        }
                     }
-                    if self.dirty_repository_close.is_some() {
-                        if self.dirty_repository_close.as_ref().is_some_and(|close| {
+                    if is_escape_press(&event) && !captured {
+                        if self.transient_work_close.is_some() {
+                            return cosmic::task::message(Message::CancelTransientWorkClose);
+                        }
+                        if let Some(action) = self.automation_ui.keep_draft_action() {
+                            return self.update_automation_ui(action);
+                        }
+                        if let Some((card, _)) = &self.terminal_paste {
+                            return self.handle_terminal_find(terminal_ui::Action::ConfirmPaste(
+                                *card, false,
+                            ));
+                        }
+                        if self.update_ui.confirmation.is_some() {
+                            return self.update_update_ui(update_ui::Action::CancelApply);
+                        }
+                        if self.terminal_close_dialog_visible() {
+                            return self.cancel_terminal_close();
+                        }
+                        if self.sidebar_state.pending_discard().is_some() {
+                            return cosmic::task::message(Message::Sidebar(
+                                SidebarAction::CancelDiscard,
+                            ));
+                        }
+                        if self.project_ui.modal_open() {
+                            return self.handle_project_action(project_ui::Action::Dismiss);
+                        }
+                        if self.sidebar_selection_ui.dialog.is_some() {
+                            return self
+                                .update_sidebar_selection(sidebar_selection_ui::Action::Dismiss);
+                        }
+                        if self.dirty_repository_close.is_some() {
+                            if self.dirty_repository_close.as_ref().is_some_and(|close| {
                             matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
                         }) {
                             return Task::none();
                         }
-                        return cosmic::task::message(Message::CancelRepositoryClose);
+                            return cosmic::task::message(Message::CancelRepositoryClose);
+                        }
+                        // Ahead of the inspector and the sidebar because the find
+                        // bar is the innermost thing the user is looking at, and
+                        // behind the confirmations above because those are modal.
+                        if let Some(card) = self.focused_repository_card_with_find() {
+                            return cosmic::task::message(Message::Repository(
+                                RepositoryAction::CloseFind { card },
+                            ));
+                        }
+                        if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
+                            return cosmic::task::message(Message::CancelDialog);
+                        }
+                        if self.sidebar_state.controls_expanded() {
+                            return self.update(Message::Sidebar(SidebarAction::ToggleControls));
+                        }
+                        if self.context_inspector_is_overlay() {
+                            return cosmic::task::message(Message::ContextInspector(
+                                InspectorAction::Close,
+                            ));
+                        }
                     }
-                    // Ahead of the inspector and the sidebar because the find
-                    // bar is the innermost thing the user is looking at, and
-                    // behind the confirmations above because those are modal.
-                    if let Some(card) = self.focused_repository_card_with_find() {
-                        return cosmic::task::message(Message::Repository(
-                            RepositoryAction::CloseFind { card },
-                        ));
+                    if let Some(backwards) = is_tab_press(&event)
+                        && self.terminal_close_dialog_visible()
+                    {
+                        return self.cycle_terminal_close_focus(backwards);
                     }
-                    if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
-                        return cosmic::task::message(Message::CancelDialog);
+                    if let Some(backwards) = is_tab_press(&event)
+                        && self.dirty_repository_close.is_some()
+                    {
+                        return self.cycle_dirty_close_focus(backwards);
                     }
-                    if self.sidebar_state.controls_expanded() {
-                        return self.update(Message::Sidebar(SidebarAction::ToggleControls));
+                    // A chord typed at a dialog is not the workspace's to act on:
+                    // the close chord must not close the card behind the dialog.
+                    // The dialog is an overlay, so it has already seen the
+                    // keystroke by the time this runs, and what it does with one
+                    // is its own affair.
+                    if self.workspace_inputs_blocked() {
+                        return Task::none();
                     }
-                    if self.context_inspector_is_overlay() {
-                        return cosmic::task::message(Message::ContextInspector(
-                            InspectorAction::Close,
-                        ));
+                    if let Some(task) = self.chat_picker_key(&event) {
+                        return task;
                     }
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.terminal_close_dialog_visible()
-                {
-                    return self.cycle_terminal_close_focus(backwards);
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.dirty_repository_close.is_some()
-                {
-                    return self.cycle_dirty_close_focus(backwards);
-                }
-                // A chord typed at a dialog is not the workspace's to act on:
-                // the close chord must not close the card behind the dialog.
-                // The dialog is an overlay, so it has already seen the
-                // keystroke by the time this runs, and what it does with one
-                // is its own affair.
-                if self.workspace_inputs_blocked() {
-                    return Task::none();
-                }
-                if let Some(task) = self.chat_picker_key(&event) {
-                    return task;
-                }
-                if let Some(card) = self.workspace.focused()
-                    && self.terminal_find.get(&card).is_some_and(|find| find.open)
-                    && let keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Named(key),
+                    if let Some(card) = self.workspace.focused()
+                        && self.terminal_find.get(&card).is_some_and(|find| find.open)
+                        && let keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(key),
+                            modifiers,
+                            ..
+                        } = &event
+                    {
+                        if *key == keyboard::key::Named::Escape && !captured {
+                            return self.handle_terminal_find(terminal_ui::Action::Close(card));
+                        }
+                        if *key == keyboard::key::Named::Enter
+                            && self
+                                .terminal_find
+                                .get(&card)
+                                .is_some_and(|find| find.focused)
+                        {
+                            return self.handle_terminal_find(terminal_ui::Action::Next(
+                                card,
+                                modifiers.shift(),
+                            ));
+                        }
+                    }
+                    if let keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Enter),
                         modifiers,
                         ..
                     } = &event
-                {
-                    if *key == keyboard::key::Named::Escape && !captured {
-                        return self.handle_terminal_find(terminal_ui::Action::Close(card));
-                    }
-                    if *key == keyboard::key::Named::Enter
-                        && self
-                            .terminal_find
-                            .get(&card)
-                            .is_some_and(|find| find.focused)
+                        && !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && let Some(card) = self.workspace.focused()
+                        && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
                     {
-                        return self.handle_terminal_find(terminal_ui::Action::Next(
-                            card,
-                            modifiers.shift(),
+                        return cosmic::task::message(Message::Repository(if modifiers.shift() {
+                            RepositoryAction::FindPrevious { card }
+                        } else {
+                            RepositoryAction::FindNext { card }
+                        }));
+                    }
+                    #[cfg(feature = "integrated-browser")]
+                    if !captured
+                        && let Some(card) = self.workspace.focused()
+                        && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
+                        && let Some(message) = browser_shortcut(card, &event)
+                    {
+                        return cosmic::task::message(message);
+                    }
+                    if !captured && let Some(task) = self.chat_scroll_key(&event) {
+                        return task;
+                    }
+                    if is_save_press(&event)
+                        && !matches!(
+                            self.focused_pane(),
+                            workspace_widget::FocusedPane::TextInput
+                                | workspace_widget::FocusedPane::OutsideWorkspace
+                        )
+                        && let Some(card) = self.workspace.focused()
+                        && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
+                    {
+                        return cosmic::task::message(Message::Repository(
+                            RepositoryAction::Save {
+                                card,
+                                overwrite: false,
+                            },
                         ));
                     }
-                }
-                if let keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                    modifiers,
-                    ..
-                } = &event
-                    && !modifiers.control()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
-                    && let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
-                {
-                    return cosmic::task::message(Message::Repository(if modifiers.shift() {
-                        RepositoryAction::FindPrevious { card }
-                    } else {
-                        RepositoryAction::FindNext { card }
-                    }));
-                }
-                #[cfg(feature = "integrated-browser")]
-                if !captured
-                    && let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
-                    && let Some(message) = browser_shortcut(card, &event)
-                {
-                    return cosmic::task::message(message);
-                }
-                if !captured && let Some(task) = self.chat_scroll_key(&event) {
-                    return task;
-                }
-                if is_save_press(&event)
-                    && !matches!(self.focused_pane(), workspace_widget::FocusedPane::TextInput | workspace_widget::FocusedPane::OutsideWorkspace)
-                    && let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
-                {
-                    return cosmic::task::message(Message::Repository(RepositoryAction::Save {
-                        card,
-                        overwrite: false,
-                    }));
-                }
-                match workspace_widget::global_shortcut(
-                    &event,
-                    &self.settings.keyboard_shortcuts,
-                    self.focused_pane(),
-                ) {
-                    Some(command) => {
-                        let modifiers = match event {
-                            keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
-                            _ => keyboard::Modifiers::empty(),
-                        };
-                        self.run_workspace_command(command, modifiers)
+                    match workspace_widget::global_shortcut(
+                        &event,
+                        &self.settings.keyboard_shortcuts,
+                        self.focused_pane(),
+                    ) {
+                        Some(command) => {
+                            let modifiers = match event {
+                                keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
+                                _ => keyboard::Modifiers::empty(),
+                            };
+                            self.run_workspace_command(command, modifiers)
+                        }
+                        None => Task::none(),
                     }
-                    None => Task::none(),
-                }
                 })();
                 Task::batch([focus_task, route_task])
             }
@@ -17436,9 +17499,22 @@ impl Application for Cagents {
         for mounted in &projection.mounted {
             let card = mounted.id;
             let kind = self.pane_kind(card);
-            let container_kind = if matches!(kind, workspace_widget::FocusedPane::Review | workspace_widget::FocusedPane::ChatPane) { kind } else { workspace_widget::FocusedPane::Other };
-            let region = |pane| crate::input_trace::KeyboardRegion { pane, card: Some(card) };
-            focus_regions.push((workspace_widget::card_widget_id(card), region(container_kind)));
+            let container_kind = if matches!(
+                kind,
+                workspace_widget::FocusedPane::Review | workspace_widget::FocusedPane::ChatPane
+            ) {
+                kind
+            } else {
+                workspace_widget::FocusedPane::Other
+            };
+            let region = |pane| crate::input_trace::KeyboardRegion {
+                pane,
+                card: Some(card),
+            };
+            focus_regions.push((
+                workspace_widget::card_widget_id(card),
+                region(container_kind),
+            ));
             if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_))) {
                 focus_regions.push((self.card_keyboard_focus(card), region(kind)));
             }
@@ -17446,18 +17522,34 @@ impl Application for Cagents {
             if let Some(chrome) = self.card_chrome.get(&card) {
                 focus_regions.push((chrome.close_id.clone(), region(container_kind)));
                 focus_regions.push((chrome.resize_id.clone(), region(container_kind)));
-                focus_regions.push((chrome.browser_address_id.clone(), region(workspace_widget::FocusedPane::TextInput)));
+                focus_regions.push((
+                    chrome.browser_address_id.clone(),
+                    region(workspace_widget::FocusedPane::TextInput),
+                ));
             }
             if matches!(self.cards.get(&card), Some(CardRuntime::Repository(_))) {
-                focus_regions.push((repository_widget::editor_focus_id(card), region(workspace_widget::FocusedPane::Editor)));
+                focus_regions.push((
+                    repository_widget::editor_focus_id(card),
+                    region(workspace_widget::FocusedPane::Editor),
+                ));
             }
             if matches!(self.cards.get(&card), Some(CardRuntime::Chat(_))) {
-                focus_regions.push((card_control_id(card, "chat-composer"), region(workspace_widget::FocusedPane::Chat)));
+                focus_regions.push((
+                    card_control_id(card, "chat-composer"),
+                    region(workspace_widget::FocusedPane::Chat),
+                ));
             }
         }
-        let surface =
-            crate::input_trace::observe_keyboard_events(surface, &self.input_trace, focus_regions,
-                |event, captured, region| Message::RoutedKeyEvent { event, captured, region });
+        let surface = crate::input_trace::observe_keyboard_events(
+            surface,
+            &self.input_trace,
+            focus_regions,
+            |event, captured, region| Message::RoutedKeyEvent {
+                event,
+                captured,
+                region,
+            },
+        );
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(

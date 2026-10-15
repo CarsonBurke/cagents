@@ -504,7 +504,11 @@ mod tests {
     enum Message {
         Edit(text_editor::Action),
         Cursor(text_editor::Cursor),
-        Keyboard(cosmic::iced::keyboard::Event, bool, crate::input_trace::KeyboardRegion),
+        Keyboard(
+            cosmic::iced::keyboard::Event,
+            bool,
+            crate::input_trace::KeyboardRegion,
+        ),
     }
     #[test]
     fn native_composer_keys_undo_and_redo_without_a_workspace_action() {
@@ -557,7 +561,13 @@ mod tests {
                 let mut element = input_trace::observe_keyboard_events(
                     editor,
                     &trace,
-                    vec![(id.clone(), input_trace::KeyboardRegion { pane: FocusedPane::Chat, card: Some(owning_card) })],
+                    vec![(
+                        id.clone(),
+                        input_trace::KeyboardRegion {
+                            pane: FocusedPane::Chat,
+                            card: Some(owning_card),
+                        },
+                    )],
                     Message::Keyboard,
                 );
                 tree.diff(element.as_widget_mut());
@@ -593,7 +603,10 @@ mod tests {
                     Message::Keyboard(delivered, captured, region) => {
                         assert_eq!(delivered, event);
                         assert!(captured, "the text widget handles each tested edit chord");
-                        if modifiers.control() { assert_eq!(region.card, Some(owning_card)); assert_eq!(region.pane, FocusedPane::Chat); }
+                        if modifiers.control() {
+                            assert_eq!(region.card, Some(owning_card));
+                            assert_eq!(region.pane, FocusedPane::Chat);
+                        }
                     }
                 }
             }

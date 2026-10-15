@@ -1222,30 +1222,81 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
 fn shortcut_group(field: SettingsField) -> &'static str {
     use workspace_widget::GlobalShortcut as Action;
     match field.shortcut_action().expect("shortcut field") {
-        Action::ChatPermissions | Action::ChatModel | Action::ChatAccount | Action::NewThread => "Chat",
-        Action::ReviewToggleViewed | Action::ReviewNextFile | Action::ReviewPreviousFile | Action::ReviewNextUnviewed | Action::ReviewNextChange | Action::ReviewPreviousChange => "Review",
-        Action::CycleWorkspace(_) | Action::CommandPalette | Action::FocusProjectSearch | Action::ToggleProjects | Action::OpenSettings => "Navigation",
+        Action::ChatPermissions | Action::ChatModel | Action::ChatAccount | Action::NewThread => {
+            "Chat"
+        }
+        Action::ReviewToggleViewed
+        | Action::ReviewNextFile
+        | Action::ReviewPreviousFile
+        | Action::ReviewNextUnviewed
+        | Action::ReviewNextChange
+        | Action::ReviewPreviousChange => "Review",
+        Action::CycleWorkspace(_)
+        | Action::CommandPalette
+        | Action::FocusProjectSearch
+        | Action::ToggleProjects
+        | Action::OpenSettings => "Navigation",
         _ => "Panes",
     }
 }
 
-fn keyboard_groups<'a>(draft: &'a SettingsDraft, invalid: &'a HashMap<SettingsField, String>) -> Vec<Group<'a, Message>> {
+fn keyboard_groups<'a>(
+    draft: &'a SettingsDraft,
+    invalid: &'a HashMap<SettingsField, String>,
+) -> Vec<Group<'a, Message>> {
     let mut groups = vec![settings_group("Keyboard shortcuts", "Leave blank to unbind optional actions. Required actions need at least one chord. Fixed chords belong to native surfaces.", vec![setting_field("Filter shortcuts", "", widget::row::with_children(vec![
         widget::button::text("Filter by pressed key").on_press(Message::Palette(palette_ui::Action::FilterKey)).into(),
         widget::button::text("Conflicts").on_press(Message::SettingsSearchChanged("conflicts".into())).into(),
     ]).spacing(space::S).into()).label_in_control()]).compact()];
     for group in ["Panes", "Navigation", "Chat", "Review", "Editor"] {
-        let mut rows: Vec<_> = SettingsField::SHORTCUTS.into_iter().filter(|field| shortcut_group(*field) == group).map(|field| {
-            let action = field.shortcut_action().expect("shortcut field");
-            let value = draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).expect("registered draft").1;
-            shortcut_input(field.label(), value, field, &draft.keyboard_shortcuts, invalid)
-        }).collect();
-        for fixed in settings::FIXED_SHORTCUTS.iter().chain(settings::TEXT_EDITING_SHORTCUTS).filter(|fixed| fixed.scope == group) {
+        let mut rows: Vec<_> = SettingsField::SHORTCUTS
+            .into_iter()
+            .filter(|field| shortcut_group(*field) == group)
+            .map(|field| {
+                let action = field.shortcut_action().expect("shortcut field");
+                let value = draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered draft")
+                    .1;
+                shortcut_input(
+                    field.label(),
+                    value,
+                    field,
+                    &draft.keyboard_shortcuts,
+                    invalid,
+                )
+            })
+            .collect();
+        for fixed in settings::FIXED_SHORTCUTS
+            .iter()
+            .chain(settings::TEXT_EDITING_SHORTCUTS)
+            .filter(|fixed| fixed.scope == group)
+        {
             let keys = fixed.chords.join(", ");
-            let row = widget::row::with_children(vec![design::body(fixed.label).width(Length::FillPortion(3)).into(), design::caption(keys.clone()).width(Length::FillPortion(4)).into(), design::caption("Fixed").width(64).into()]).spacing(space::S).align_y(Alignment::Center);
-            rows.push(setting_field(fixed.label, "", row.into()).label_in_control().keywords(&keys).keywords("fixed"));
+            let row = widget::row::with_children(vec![
+                design::body(fixed.label)
+                    .width(Length::FillPortion(3))
+                    .into(),
+                design::caption(keys.clone())
+                    .width(Length::FillPortion(4))
+                    .into(),
+                design::caption("Fixed").width(64).into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center);
+            rows.push(
+                setting_field(fixed.label, "", row.into())
+                    .label_in_control()
+                    .keywords(&keys)
+                    .keywords("fixed"),
+            );
         }
-        if !rows.is_empty() { groups.push(settings_group(group, "Action · Keys · Source · Terminal", rows).compact()); }
+        if !rows.is_empty() {
+            groups.push(settings_group(group, "Action · Keys · Source · Terminal", rows).compact());
+        }
     }
     groups
 }
@@ -1257,52 +1308,141 @@ fn shortcut_input<'a>(
     draft: &ShortcutDraft,
     invalid: &'a HashMap<SettingsField, String>,
 ) -> Setting<'a, Message> {
-    let action = field.shortcut_action().expect("shortcut setting has command");
-    let index = SettingsField::SHORTCUTS.iter().position(|candidate| *candidate == field).expect("shortcut index");
+    let action = field
+        .shortcut_action()
+        .expect("shortcut setting has command");
+    let index = SettingsField::SHORTCUTS
+        .iter()
+        .position(|candidate| *candidate == field)
+        .expect("shortcut index");
     let chords = settings::parse_chords(value);
     let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
     let source = if value == default { "Default" } else { "User" };
-    let mut controls: Vec<Element<'a, Message>> = chords.iter().enumerate().map(|(index, chord)| {
-        let mut remaining = chords.clone(); remaining.remove(index);
-        crate::ui_controls::button::quiet(format!("{chord} ×"))
-            .on_press(Message::SettingsDraftChanged { field, value: settings::format_chords(&remaining) }).into()
-    }).collect();
-    controls.push(crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}")).compact().on_press(Message::Palette(palette_ui::Action::Record(field))).into());
-    controls.push(crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut")).compact().on_press_maybe((value != default).then(|| Message::SettingsDraftChanged { field, value: default })).into());
-    let required = if settings::shortcut_required(index) { " · required" } else { "" };
+    let mut controls: Vec<Element<'a, Message>> = chords
+        .iter()
+        .enumerate()
+        .map(|(index, chord)| {
+            let mut remaining = chords.clone();
+            remaining.remove(index);
+            crate::ui_controls::button::quiet(format!("{chord} ×"))
+                .on_press(Message::SettingsDraftChanged {
+                    field,
+                    value: settings::format_chords(&remaining),
+                })
+                .into()
+        })
+        .collect();
+    controls.push(
+        crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
+            .compact()
+            .on_press(Message::Palette(palette_ui::Action::Record(field)))
+            .into(),
+    );
+    controls.push(
+        crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
+            .compact()
+            .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
+                field,
+                value: default,
+            }))
+            .into(),
+    );
+    let required = if settings::shortcut_required(index) {
+        " · required"
+    } else {
+        ""
+    };
     let mut error = invalid.get(&field).cloned();
     if error.is_none() {
         for chord in &chords {
             match settings::parse_shortcut(chord) {
-                Err(reason) => { error = Some(sentence(reason)); break; }
+                Err(reason) => {
+                    error = Some(sentence(reason));
+                    break;
+                }
                 Ok(binding) => {
-                    if let Some(reason) = settings::shortcut_chord_refusal(binding) { error = Some(sentence(reason)); break; }
-                    if let Some((other, _)) = draft.shortcut_values().into_iter().find(|(other, value)| *other != action && settings::parse_chords(value).iter().any(|chord| settings::parse_shortcut(chord).is_ok_and(|candidate| candidate == binding))) {
-                        error = Some(format!("Conflicts with {}", workspace_widget::shortcut_descriptor(other).label)); break;
+                    if let Some(reason) = settings::shortcut_chord_refusal(binding) {
+                        error = Some(sentence(reason));
+                        break;
+                    }
+                    if let Some((other, _)) =
+                        draft.shortcut_values().into_iter().find(|(other, value)| {
+                            *other != action
+                                && settings::parse_chords(value).iter().any(|chord| {
+                                    settings::parse_shortcut(chord)
+                                        .is_ok_and(|candidate| candidate == binding)
+                                })
+                        })
+                    {
+                        error = Some(format!(
+                            "Conflicts with {}",
+                            workspace_widget::shortcut_descriptor(other).label
+                        ));
+                        break;
                     }
                 }
             }
         }
     }
     let row = widget::row::with_children(vec![
-        design::body(format!("{label}{required}")).width(Length::FillPortion(3)).into(),
-        widget::flex_row(controls).spacing(2).align_items(Alignment::Center).width(Length::FillPortion(4)).into(),
+        design::body(format!("{label}{required}"))
+            .width(Length::FillPortion(3))
+            .into(),
+        widget::flex_row(controls)
+            .spacing(2)
+            .align_items(Alignment::Center)
+            .width(Length::FillPortion(4))
+            .into(),
         design::caption(source).width(64).into(),
         {
             let action_key = KeyboardShortcuts::action_names()[index];
-            crate::ui_controls::field::checkbox(draft.terminal_passthrough_actions.iter().any(|name| name == action_key))
-                .label("Send to terminal")
-                .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough { action: action_key.to_owned(), enabled })
-                .into()
+            crate::ui_controls::field::checkbox(
+                draft
+                    .terminal_passthrough_actions
+                    .iter()
+                    .any(|name| name == action_key),
+            )
+            .label("Send to terminal")
+            .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough {
+                action: action_key.to_owned(),
+                enabled,
+            })
+            .into()
         },
-    ]).spacing(space::S).align_y(Alignment::Center);
+    ])
+    .spacing(space::S)
+    .align_y(Alignment::Center);
     let mut children = vec![row.into()];
-    if let Some(reason) = chords.iter().filter_map(|chord| settings::parse_shortcut(chord).ok()).find_map(settings::text_editing_shortcut_conflict) {
+    if let Some(reason) = chords
+        .iter()
+        .filter_map(|chord| settings::parse_shortcut(chord).ok())
+        .find_map(settings::text_editing_shortcut_conflict)
+    {
         children.push(design::caption(format!("Scoped conflict: {reason}")).into());
     }
-    if let Some(reason) = &error { children.push(design::caption(reason.clone()).class(cosmic::theme::Text::Custom(design::destructive_text)).into()); }
-    let conflict = if error.is_some() { "conflicts unsaved" } else { "" };
-    setting_field(label, "", widget::column::with_children(children).spacing(2).into()).label_in_control().keywords(value).keywords(settings::shortcut_search_keywords(value)).keywords(format!("keyboard_shortcuts send to terminal {source} {conflict}"))
+    if let Some(reason) = &error {
+        children.push(
+            design::caption(reason.clone())
+                .class(cosmic::theme::Text::Custom(design::destructive_text))
+                .into(),
+        );
+    }
+    let conflict = if error.is_some() {
+        "conflicts unsaved"
+    } else {
+        ""
+    };
+    setting_field(
+        label,
+        "",
+        widget::column::with_children(children).spacing(2).into(),
+    )
+    .label_in_control()
+    .keywords(value)
+    .keywords(settings::shortcut_search_keywords(value))
+    .keywords(format!(
+        "keyboard_shortcuts send to terminal {source} {conflict}"
+    ))
 }
 
 #[cfg(test)]
@@ -1312,9 +1452,15 @@ mod keyboard_table_tests {
     #[test]
     fn shortcut_rows_match_the_persisted_policy_registry() {
         let settings = KeyboardShortcuts::default();
-        assert_eq!(SettingsField::SHORTCUTS.len(), KeyboardShortcuts::action_names().len());
+        assert_eq!(
+            SettingsField::SHORTCUTS.len(),
+            KeyboardShortcuts::action_names().len()
+        );
         for (field, values) in SettingsField::SHORTCUTS.into_iter().zip(settings.actions()) {
-            assert_eq!(workspace_widget::shortcut_keys(field.shortcut_action().unwrap(), &settings), values);
+            assert_eq!(
+                workspace_widget::shortcut_keys(field.shortcut_action().unwrap(), &settings),
+                values
+            );
         }
     }
 
@@ -1325,11 +1471,30 @@ mod keyboard_table_tests {
         draft.keyboard_shortcuts.chat_model = "Ctrl+Tab".into();
         let invalid = HashMap::new();
         let groups = keyboard_groups(&draft, &invalid);
-        let matches = groups.into_iter().filter_map(|group| group.view("Keyboard", "Ctrl+Tab")).count();
-        assert_eq!(matches, 3, "the pane action, chat action and fixed navigation row all match");
-        assert_eq!(keyboard_groups(&draft, &invalid).into_iter().filter_map(|group| group.view("Keyboard", "Ctrl+=")).count(), 1);
+        let matches = groups
+            .into_iter()
+            .filter_map(|group| group.view("Keyboard", "Ctrl+Tab"))
+            .count();
+        assert_eq!(
+            matches, 3,
+            "the pane action, chat action and fixed navigation row all match"
+        );
+        assert_eq!(
+            keyboard_groups(&draft, &invalid)
+                .into_iter()
+                .filter_map(|group| group.view("Keyboard", "Ctrl+="))
+                .count(),
+            1
+        );
         draft.keyboard_shortcuts.rename_pane = "Control + F8".into();
         draft.keyboard_shortcuts.chat_model = "F8 + Control".into();
-        assert_eq!(keyboard_groups(&draft, &invalid).into_iter().filter_map(|group| group.view("Keyboard", "Ctrl+F8")).count(), 2, "pressed keys find accepted aliases and modifier order");
+        assert_eq!(
+            keyboard_groups(&draft, &invalid)
+                .into_iter()
+                .filter_map(|group| group.view("Keyboard", "Ctrl+F8"))
+                .count(),
+            2,
+            "pressed keys find accepted aliases and modifier order"
+        );
     }
 }

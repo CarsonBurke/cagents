@@ -9,7 +9,9 @@ use libghostty_vt::{
 /// Query the active screen, independently of the user's scrollback position.
 /// A primary prompt anchors the current command; continuations and cells to
 /// the right of a cursor moved back into the line must also be inspected.
-pub(super) fn has_prompt_input(terminal: &Terminal<'_, '_>) -> Result<Option<bool>, libghostty_vt::Error> {
+pub(super) fn has_prompt_input(
+    terminal: &Terminal<'_, '_>,
+) -> Result<Option<bool>, libghostty_vt::Error> {
     if terminal.active_screen()? == Screen::Alternate {
         return Ok(None);
     }
@@ -62,7 +64,12 @@ mod tests {
 
     #[test]
     fn a_screen_without_prompt_markers_does_not_prove_empty_input() {
-        let mut terminal = Terminal::new(TerminalOptions { cols: 40, rows: 6, max_scrollback: 100 }).unwrap();
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 6,
+            max_scrollback: 100,
+        })
+        .unwrap();
         terminal.vt_write(b"prompt> ");
         assert_eq!(has_prompt_input(&terminal).unwrap(), None);
         terminal.vt_write(b"unfinished");
@@ -71,7 +78,12 @@ mod tests {
 
     #[test]
     fn a_command_taller_than_the_screen_keeps_input_protection() {
-        let mut terminal = Terminal::new(TerminalOptions { cols: 8, rows: 3, max_scrollback: 100 }).unwrap();
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 3,
+            max_scrollback: 100,
+        })
+        .unwrap();
         terminal.vt_write(b"\x1b]133;A\x07> \x1b]133;B\x07a long wrapped unsent command that scrolls the prompt away");
         assert_eq!(has_prompt_input(&terminal).unwrap(), Some(true));
     }
