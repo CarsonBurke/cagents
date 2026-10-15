@@ -212,3 +212,23 @@ If the deadline expires before a run’s first status arrives, `agent wait` keep
 any statuses already received and reports the unread IDs in `data.unresolved_runs`.
 Spawn/send retain their durable acceptance when that first status is unavailable.
 No run outcome is invented from missing status evidence.
+
+## Shell completions
+
+Generate completions from the installed command grammar. This does not contact
+or start a daemon:
+
+```sh
+cagents completions bash > ~/.local/share/bash-completion/completions/cagents
+cagents completions zsh > ~/.zfunc/_cagents
+cagents completions fish > ~/.config/fish/completions/cagents.fish
+```
+
+Create the destination directory first. Bash and fish load their completion files
+through the usual shell setup; add `~/.zfunc` to zsh's `fpath` before `compinit`.
+Elvish and PowerShell scripts are available with `completions elvish` and
+`completions powershell`. Regenerate after upgrading the CLI.
+
+Automation definition and history pages accept `--limit` from 1 through 100;
+values outside that range are refused. For definitions, pass the last returned
+UUID as `--after` to request the next page.
