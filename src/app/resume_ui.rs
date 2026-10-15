@@ -613,6 +613,12 @@ impl Cagents {
                 self.resume_ui.loading = false;
                 match result {
                     Ok(session) => {
+                        if self.saved_conversation_is_automation_report(&entry)
+                            && self.existing_conversation_card(&entry.session).is_none()
+                        {
+                            self.resume_error("This is a saved automation run report. Open Automations and its run history to view the result; it cannot resume a provider conversation.");
+                            return Task::none();
+                        }
                         entry.session = session;
                         if self.existing_conversation_card(&entry.session).is_some() {
                             return self.resume_saved_conversation(entry);
@@ -768,6 +774,13 @@ impl Cagents {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }
+        // A saved run report is not a provider resume recipe. In particular,
+        // assigning a new native ID below would evade the retired owner's
+        // no-execution fence. Presentation restoration has its own typed path.
+        if self.saved_conversation_is_automation_report(&entry) {
+            self.resume_error("This is a saved automation run report. Open Automations and its run history to view the result; it cannot resume a provider conversation.");
+            return Task::none();
+        }
         let session = &entry.session;
         if matches!(
             session.native_continuity,
@@ -793,7 +806,25 @@ impl Cagents {
         self.insert_resumed_conversation(entry)
     }
 
+    fn saved_conversation_is_automation_report(&self, entry: &SavedConversation) -> bool {
+        self.durable.automation_archives.contains_key(&entry.card)
+            || self.workspace_model.archived_automation_agents.iter().any(|agent| {
+                agent.closed
+                    && matches!(agent.origin, crate::agent_execution::Origin::Automation { .. })
+                    && agent.id.as_uuid() == entry.card.as_uuid()
+                    && matches!(&agent.session,
+                        Some(crate::agent_execution::HostedSession::Chat(saved))
+                            if saved.id == entry.session.id)
+            })
+    }
+
     fn insert_resumed_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
+        // Preparation is asynchronous. A closed owner/map may have arrived
+        // while the backend was qualifying the original provider source.
+        if self.saved_conversation_is_automation_report(&entry) {
+            self.resume_error("This is a saved automation run report. Open Automations and its run history to view the result; it cannot resume a provider conversation.");
+            return Task::none();
+        }
         let mut session = entry.session;
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
@@ -1058,6 +1089,51 @@ mod tests {
             },
         ));
         let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
+    }
+
+    #[test]
+    fn a_known_closed_automation_report_cannot_become_a_new_provider_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = saved(directory.path());
+        let original = entry.session.clone();
+        let id = crate::model::AgentId::from_uuid(entry.card.as_uuid());
+        Arc::make_mut(&mut app.durable).automation_archives.insert(entry.card, id);
+        let cards = app.durable.cards.clone();
+        let order = app.workspace.order().collect::<Vec<_>>();
+        let task = app.resume_saved_conversation(entry);
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        assert!(app.resume_ui.error.as_deref().unwrap().contains("run history"));
+        assert!(app.cards.values().all(|runtime| !matches!(runtime,
+            CardRuntime::Chat(chat) if chat.session.id == original.id)));
+    }
+
+    #[test]
+    fn late_archive_classification_fences_the_actual_prepared_resume_callback() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut entry = saved(directory.path());
+        entry.session.native_continuity = chat::NativeContinuity::Durable {
+            provider_version: "0.162.0".into(),
+        };
+        let id = crate::model::AgentId::from_uuid(entry.card.as_uuid());
+        app.resume_ui.open = true;
+        app.resume_ui.loading = true;
+        app.resume_ui.generation = 7;
+        // This model edge arrives while a previous prepare RPC is held.
+        Arc::make_mut(&mut app.durable).automation_archives.insert(entry.card, id);
+        let returned = entry.session.clone();
+        let task = app.update_resume(Action::Prepared(7, entry, Ok(returned)));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(!app.resume_ui.loading);
+        assert!(app.durable.cards.is_empty());
+        assert!(app.workspace.order().next().is_none());
+        assert!(app.cards.is_empty());
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        assert!(app.resume_ui.error.as_deref().unwrap().contains("run history"));
     }
 
     #[test]
