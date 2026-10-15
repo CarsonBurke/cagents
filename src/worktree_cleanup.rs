@@ -529,6 +529,24 @@ impl WindowProtections {
         self.requested.clear();
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture_prepare_sync(
+        mut self,
+        runtime: &Path,
+        paths: Vec<PathBuf>,
+    ) -> io::Result<(Self, Option<crate::instance::PreparedLock>)> {
+        self.suppress_readiness = true;
+        self.sync_with(
+            paths,
+            std::time::Instant::now(),
+            |path| path.canonicalize(),
+            |path| acquire(runtime, path, false),
+            || panic!("the preparation worker must not publish readiness"),
+        )?;
+        let ready = crate::instance::fixture_prepared_lock(&runtime.join("fixture-window-ready"))?;
+        Ok((self, Some(ready)))
+    }
+
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
         if let Some(protection) = protect(directory)? {
             self.resolved

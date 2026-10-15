@@ -164,6 +164,11 @@ impl PreparedLock {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_prepared_lock(path: &Path) -> io::Result<PreparedLock> {
+    prepare_owned_lock(path)
+}
+
 fn prepare_owned_lock(path: &Path) -> io::Result<PreparedLock> {
     let lock = OpenOptions::new()
         .create(true)
