@@ -99,15 +99,6 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<(), String> {
 
 /// Keep the exact cleanup owner even when helper spawn/installation replies
 /// fail. A later retry must prove this owner's teardown before any new launch.
-pub(super) fn reserve_startup(host: &SharedHost, source: &Session, context: Arc<chat::protocol::ExecutionContext>) -> Result<(), String> {
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state.native_actor_startups.contains_key(&source.id) || state.native_actor_startups.len() >= 128 {
-        return Err("An exact retained startup still owns cleanup or startup capacity is exhausted".into());
-    }
-    state.native_actor_startups.insert(source.id, (source.clone(), context));
-    Ok(())
-}
-
 pub(super) fn forget_startup(host: &SharedHost, source: &Session, context: &Arc<chat::protocol::ExecutionContext>) {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.native_actor_startups.get(&source.id).is_some_and(|(expected, current)| expected == source && Arc::ptr_eq(current, context)) {

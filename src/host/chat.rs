@@ -514,10 +514,9 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     }
 }
 fn session_snapshot(record: &Record) -> ServerResponse {
-    let snapshot = record
-        .handle
-        .snapshot(None)
-        .expect("unconditional snapshot");
+    // Remote attachment metadata is resident and bounded. Full transcript
+    // hydration uses ChatRead outside HostState after visibility is established.
+    let snapshot = record.handle.attachment_snapshot();
     let mut session = record.session.clone();
     session.launch.session_id = snapshot.session_id.clone();
     session.native_continuity = snapshot.native_continuity.clone();
@@ -1169,6 +1168,15 @@ fn start_with_execution(
             retired = state.chats.remove(&session.id);
         }
         session.proof = Some(state.proof().clone());
+        if session.launch.provider == Provider::Claude
+            && matches!(spec.transport, chat::protocol::TransportSpec::JsonLines)
+        {
+            if state.native_actor_startups.contains_key(&session.id) || state.native_actor_startups.len() >= 128 {
+                return Err(unavailable("Retained startup cleanup or capacity prevents another launch; no source was stopped"));
+            }
+            let context = execution.as_ref().expect("Claude startup captured its exact context");
+            state.native_actor_startups.insert(session.id, (session.clone(), context.clone()));
+        }
         state.chat_spawning.insert(session.id, session.clone());
         state.inventory_generation += 1;
         source_handle
@@ -1326,8 +1334,6 @@ fn start_with_execution(
             && matches!(spec.transport, chat::protocol::TransportSpec::JsonLines);
         let startup_source = session.clone();
         let handle = if remote {
-            let context = execution.as_ref().expect("Claude retained startup captured its context");
-            retained_actor::reserve_startup(host, &session, context.clone()).map_err(unavailable)?;
             // The holder creates and retains the sole reducer/Store. Host
             // preparation above is a reversible validation before source stop.
             drop((adapter, initial, store));
