@@ -102,6 +102,8 @@ pub enum Reply {
         kind: crate::model::ProjectKind,
         #[serde(default)]
         checkout: Option<PathBuf>,
+        #[serde(default)]
+        primary_checkout: Option<PathBuf>,
     },
     Directory {
         path: PathBuf,
@@ -253,7 +255,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
                 path,
                 key: location.key,
                 kind: location.kind,
-                checkout: location.checkout,
+                checkout: location.checkout, primary_checkout: location.primary_checkout,
             })
         }
         Operation::List { path } => {

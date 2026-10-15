@@ -17,6 +17,7 @@ pub struct State {
     /// Discovery roots keyed by canonical repository identity. Device values
     /// remain in that device's namespace and are never inspected locally.
     pub(super) checkout_roots: HashMap<PathBuf, PathBuf>,
+    pub(super) primary_checkout_roots: HashMap<PathBuf, PathBuf>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
@@ -218,7 +219,7 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn known_project_checkout(&self, repository: &Path, project_id: ProjectId) -> Option<(PathBuf, PathBuf)> {
-        if let Some(checkout) = self.project_ui.checkout_roots.get(repository) {
+        if let Some(checkout) = self.project_ui.primary_checkout_roots.get(repository).or_else(|| self.project_ui.checkout_roots.get(repository)) {
             return Some((checkout.clone(), repository.to_owned()));
         }
         let project = self.sidebar_model.project(project_id)?;
@@ -2877,14 +2878,14 @@ mod tests {
         let model = WorkspaceModel {
             projects: vec![
                 ModelProject {
-                    checkout: None,
+                    checkout: None, primary_checkout: None,
                     repository: child.clone(),
                     name: "Child folder".into(),
                     kind: ProjectKind::Folder,
                     ordinal: 1,
                 },
                 ModelProject {
-                    checkout: None,
+                    checkout: None, primary_checkout: None,
                     repository: git_root.join(".git"),
                     name: "Other Git".into(),
                     kind: ProjectKind::Git,

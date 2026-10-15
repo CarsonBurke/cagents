@@ -226,7 +226,7 @@ mod tests {
         let repository = root.path().to_path_buf();
         registry
             .apply(&ModelEdit::OpenProject {
-                checkout: None,
+                checkout: None, primary_checkout: None,
                 repository: repository.clone(),
                 name: "Consent fixture".into(),
                 kind: ProjectKind::Folder,
@@ -464,7 +464,7 @@ mod tests {
         std::fs::create_dir(&other).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
-                checkout: None,
+                checkout: None, primary_checkout: None,
                 repository: other.clone(),
                 name: "Other".into(),
                 kind: ProjectKind::Folder,
