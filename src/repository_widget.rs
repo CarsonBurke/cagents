@@ -4377,8 +4377,9 @@ impl RepositoryRuntime {
                 self.editor_command_capabilities() & bit != 0
             }
             RepositoryAction::OpenExternal { editor_id, .. } => self.can_open_external() && self.external_editors.iter().any(|editor| editor.id == *editor_id),
-            RepositoryAction::Save { overwrite, .. } => self.can_save() && (!overwrite || matches!(&self.document, DocumentState::Editable(document) if document.conflict)),
-            RepositoryAction::Reload { .. } => !self.is_saving() && matches!(&self.document, DocumentState::Editable(document) if document.conflict || document.durability_warning.is_some()),
+            RepositoryAction::Save { overwrite, .. } => self.editor_surface_command_action(card,
+                if *overwrite { EditorSurfaceCommand::Overwrite } else { EditorSurfaceCommand::Save }).is_some(),
+            RepositoryAction::Reload { .. } => self.editor_surface_command_action(card, EditorSurfaceCommand::Reload).is_some(),
             RepositoryAction::DiscardEdits { .. } => self.can_discard_edits(),
             RepositoryAction::ApplyMarkdownMode { preview, .. } => self.can_apply_markdown_mode(*preview),
             RepositoryAction::ApplySourceSurface { diff: true, .. } => self.can_show_diff(),
@@ -19003,7 +19004,18 @@ mod tests {
         warning.source_surface = SourceSurface::Diff;
         assert!(warning.registered_surface_command_action(card, Command::EditorReload).is_none());
         assert!(warning.registered_surface_command_action(card, Command::EditorOverwrite).is_none());
-        let (saving, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        let (mut saving, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        saving.source_surface = SourceSurface::Editor;
+        let DocumentState::Editable(document) = &mut saving.document else { unreachable!() };
+        document.dirty = true;
+        document.conflict = true;
+        document.error = Some("The file changed on disk".into());
+        let ticket = document.active_save.take().expect("actual saving fixture");
+        assert!(saving.registered_surface_command_action(card, Command::EditorReload).is_some());
+        assert!(saving.registered_surface_command_action(card, Command::EditorOverwrite).is_some());
+        let DocumentState::Editable(document) = &mut saving.document else { unreachable!() };
+        document.active_save = Some(ticket);
+        assert!(saving.is_saving());
         assert!(saving.registered_surface_command_action(card, Command::EditorReload).is_none());
         assert!(saving.registered_surface_command_action(card, Command::EditorOverwrite).is_none());
     }
