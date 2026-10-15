@@ -78,6 +78,7 @@ struct Composer {
     authority: Authority,
     range: Option<PullRequestRange>,
     destination: Destination,
+    original_body: Option<String>,
     content: text_editor::Content<cosmic::Renderer>,
     preview: bool,
     markdown: Vec<markdown::Item>,
@@ -208,6 +209,7 @@ impl State {
                         range: composer.range.clone(),
                         destination: composer.destination.clone(),
                         body: composer.content.text(),
+                        original_body: composer.original_body.clone(),
                     }),
                 summary: self.discussion.summary.text(),
                 event: self.discussion.event,
@@ -238,6 +240,7 @@ impl State {
             },
             range: draft.range,
             destination: draft.destination,
+            original_body: draft.original_body,
             content: text_editor::Content::with_text(&draft.body),
             preview: false,
             markdown: markdown::parse(&draft.body).collect(),
@@ -711,6 +714,7 @@ impl State {
                     authority,
                     range: self.range.clone(),
                     destination: Destination::Line(anchor),
+                    original_body: None,
                     content: text_editor::Content::new(),
                     preview: false,
                     markdown: Vec::new(),
@@ -732,6 +736,7 @@ impl State {
                     authority: self.authority().expect("loaded review authority"),
                     range: self.range.clone(),
                     destination: Destination::File(path),
+                    original_body: None,
                     content: text_editor::Content::new(),
                     preview: false,
                     markdown: Vec::new(),
@@ -749,6 +754,7 @@ impl State {
                     authority: self.authority().expect("loaded review authority"),
                     range: self.range.clone(),
                     destination: Destination::Reply(id),
+                    original_body: None,
                     content: text_editor::Content::new(),
                     preview: false,
                     markdown: Vec::new(),
@@ -770,6 +776,7 @@ impl State {
                     authority: self.authority().expect("loaded review authority"),
                     range: self.range.clone(),
                     destination: Destination::Edit(id),
+                    original_body: Some(comment.body.clone()),
                     content: text_editor::Content::with_text(&comment.body),
                     preview: false,
                     markdown: markdown::parse(&comment.body).collect(),
@@ -826,6 +833,7 @@ impl State {
                     Destination::Edit(comment) => Mutation::Edit {
                         comment: comment.clone(),
                         body,
+                        expected_body: composer.original_body.clone(),
                     },
                 };
                 return self.send_discussion(authority, mutation);
@@ -2121,6 +2129,29 @@ mod tests {
         assert_eq!(restored.discussion.unknown, state.discussion.unknown);
         assert!(!restored.can_mutate_discussion());
         assert!(restored.restart_blocker().is_some());
+    }
+
+    #[test]
+    fn published_inline_edit_persists_its_original_text_and_keeps_refused_input() {
+        let mut state = ready();
+        let comment = serde_json::from_value(serde_json::json!({"id":"comment","body":"Original text","createdAt":"now","url":"https://github.com/o/r/pull/1#comment","viewerDidAuthor":true,"viewerCanUpdate":true,"commentState":"SUBMITTED"})).unwrap();
+        state.discussion.conversation = Some(Arc::new(PullRequestConversation { threads: vec![PullRequestReviewThread {
+            id:"thread".into(),path:"file.rs".into(),line:Some(1),start_line:None,side:ReviewDiffSide::Right,start_side:None,
+            outdated:false,resolved:false,collapsed:false,viewer_can_resolve:true,viewer_can_unresolve:false,truncated:false,comments:vec![comment],
+        }], ..Default::default() }));
+        drop(state.update_discussion(Action::Edit("comment".into())));
+        state.discussion.composer.as_mut().unwrap().content = text_editor::Content::with_text("My retained edit");
+        let serialized = serde_json::to_value(state.local_drafts()).unwrap();
+        let mut restored = ready(); restored.restore_drafts(serde_json::from_value(serialized.clone()).unwrap(),None);
+        let composer = restored.discussion.composer.as_ref().unwrap();
+        assert_eq!(composer.original_body.as_deref(),Some("Original text"));
+        assert_eq!(composer.content.text(),"My retained edit");
+        drop(restored.update_discussion(Action::Finished { generation:restored.generation,outcome:Outcome::Refused("The comment changed on GitHub".into()) }));
+        assert_eq!(restored.discussion.composer.as_ref().unwrap().content.text(),"My retained edit");
+        let mut legacy = serialized; legacy["composer"].as_object_mut().unwrap().remove("original_body");
+        let mut restored = ready(); restored.restore_drafts(serde_json::from_value(legacy).unwrap(),None);
+        assert!(restored.discussion.composer.as_ref().unwrap().original_body.is_none());
+        assert_eq!(restored.discussion.composer.as_ref().unwrap().content.text(),"My retained edit");
     }
 
     #[test]

@@ -3307,6 +3307,7 @@ pub(crate) struct ScriptedApi {
     pub page: std::sync::Mutex<Option<crate::github::PullRequestFilePage>>,
     pub batch_calls: std::sync::atomic::AtomicUsize,
     pub replies: std::sync::Mutex<Vec<crate::github::ReplyToThreadRequest>>,
+    pub updated_comments: std::sync::Mutex<Vec<(String, String)>>,
     pub discarded: std::sync::Mutex<Vec<String>>,
     pub merge_base: std::sync::Mutex<Option<String>>,
 }
@@ -3330,6 +3331,7 @@ impl ScriptedApi {
             page: Default::default(),
             batch_calls: Default::default(),
             replies: Default::default(),
+            updated_comments: Default::default(),
             discarded: Default::default(),
             merge_base: Default::default(),
         }
@@ -3468,12 +3470,13 @@ impl GitHubReviewApi for ScriptedApi {
     fn update_comment(
         &self,
         _repository: &GitHubRepoKey,
-        _comment_id: &str,
-        _body: &str,
+        comment_id: &str,
+        body: &str,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<crate::github::PullRequestComment>, crate::github::GitHubError>
     {
-        unreachable!()
+        self.updated_comments.lock().unwrap().push((comment_id.into(), body.into()));
+        Ok(ReviewMutationOutcome::Applied(serde_json::from_value(serde_json::json!({"id":comment_id,"body":body,"createdAt":"now","url":"https://github.com/o/r/pull/1#comment"})).unwrap()))
     }
 
     fn delete_comment(

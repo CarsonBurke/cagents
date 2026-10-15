@@ -99,6 +99,9 @@ pub struct Draft {
     pub range: Option<PullRequestRange>,
     pub destination: super::discussion_ui::Destination,
     pub body: String,
+    /// Original server text for optimistic conflict detection on inline edits.
+    #[serde(default)]
+    pub original_body: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drafts {
@@ -167,7 +170,7 @@ impl Snapshot {
                 || drafts
                     .composer
                     .as_ref()
-                    .is_some_and(|draft| draft.body.len() > 65536)
+                    .is_some_and(|draft| draft.body.len() > 65536 || draft.original_body.as_ref().is_some_and(|body| body.len() > 65536))
         }) {
             return Err("Cached review draft exceeds its text limit".into());
         }
