@@ -2795,6 +2795,25 @@ mod tests {
     }
 
     #[test]
+    fn retired_save_chord_can_be_reassigned_to_an_editor_action() {
+        let mut app = settings_focus_fixture();
+        let binding = settings::parse_shortcut("Ctrl+S").unwrap();
+        assert!(settings::shortcut_chord_refusal_for("editor_undo", binding).is_none());
+        assert!(settings::shortcut_chord_refusal_for("new_terminal", binding).is_some(), "terminal flow control stays protected");
+        drop(app.update_palette(Action::Record(SettingsField::ShortcutEditorUndo)));
+        drop(app.record_shortcut(SettingsField::ShortcutEditorUndo, "Ctrl+S".into()));
+        assert!(app.palette.reassign.is_some(), "the registered Save binding owns the ordinary collision");
+        drop(app.update_palette(Action::Reassign));
+        assert!(app.settings.keyboard_shortcuts.editor_save.is_empty());
+        assert!(app.settings.keyboard_shortcuts.editor_undo.contains(&"Ctrl+S".to_owned()));
+        assert!(app.settings.clone().validate().is_ok());
+        assert!(workspace_widget::editor_shortcut(&keyboard::Key::Character("s".into()), keyboard::key::Physical::Code(keyboard::key::Code::KeyS), keyboard::Modifiers::CTRL, &app.settings.keyboard_shortcuts).is_some());
+        for pane in [workspace_widget::FocusedPane::Terminal, workspace_widget::FocusedPane::Chat, workspace_widget::FocusedPane::TextInput] {
+            assert!(workspace_widget::global_shortcut(&keyboard::Event::KeyPressed { key: keyboard::Key::Character("s".into()), modified_key: keyboard::Key::Character("s".into()), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false }, &app.settings.keyboard_shortcuts, pane).is_none(), "{pane:?} retains its own editing/flow-control keys");
+        }
+    }
+
+    #[test]
     fn send_to_terminal_setting_updates_live_policy_and_retained_controls() {
         let mut app = settings_focus_fixture();
         let action = "rename_pane";

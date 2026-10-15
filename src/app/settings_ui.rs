@@ -1262,7 +1262,7 @@ fn keyboard_groups<'a>(
         for fixed in settings::FIXED_SHORTCUTS
             .iter()
             .chain(settings::TEXT_EDITING_SHORTCUTS)
-            .filter(|fixed| fixed.scope == group && fixed.owner.is_none())
+            .filter(|fixed| fixed.scope == group)
         {
             let keys = fixed.chords.join(", ");
             let row = widget::row::with_children(vec![

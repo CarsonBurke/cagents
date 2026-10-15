@@ -1121,8 +1121,6 @@ pub struct ShortcutFault {
 /// A chord handled directly by a native surface rather than the action table.
 #[derive(Debug, Clone, Copy)]
 pub struct FixedShortcut {
-    /// A registered native action may own its conventional reserved chord.
-    pub owner: Option<&'static str>,
     pub label: &'static str,
     pub chords: &'static [&'static str],
     pub scope: &'static str,
@@ -1131,56 +1129,42 @@ pub struct FixedShortcut {
 
 pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
     FixedShortcut {
-        owner: None,
         label: "Cycle recent panes",
         chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
         scope: "Navigation",
         refusal: "This chord is reserved for Cycle recent panes",
     },
     FixedShortcut {
-        owner: None,
         label: "Increase font size",
         chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"],
         scope: "Editor",
         refusal: "This chord is reserved for Increase font size",
     },
     FixedShortcut {
-        owner: None,
         label: "Decrease font size",
         chords: &["Ctrl+-"],
         scope: "Editor",
         refusal: "This chord is reserved for Decrease font size",
     },
     FixedShortcut {
-        owner: None,
         label: "Reset font size",
         chords: &["Ctrl+0"],
         scope: "Editor",
         refusal: "This chord is reserved for Reset font size",
     },
     FixedShortcut {
-        owner: Some("editor_save"),
-        label: "Save file",
-        chords: &["Ctrl+S"],
-        scope: "Editor",
-        refusal: "This chord is reserved for Save file",
-    },
-    FixedShortcut {
-        owner: None,
         label: "Stage / unstage selected lines",
         chords: &["Ctrl+Shift+S"],
         scope: "Editor",
         refusal: "This chord is reserved for Stage / unstage selected lines",
     },
     FixedShortcut {
-        owner: None,
         label: "Copy terminal selection",
         chords: &["Ctrl+Shift+C"],
         scope: "Panes",
         refusal: "This chord is reserved for Copy terminal selection",
     },
     FixedShortcut {
-        owner: None,
         label: "Paste into terminal",
         chords: &["Ctrl+Shift+V"],
         scope: "Panes",
@@ -1193,42 +1177,36 @@ pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
 /// default such as Reopen pane on the editor's Redo chord.
 pub const TEXT_EDITING_SHORTCUTS: &[FixedShortcut] = &[
     FixedShortcut {
-        owner: None,
         label: "Undo text edit",
         chords: &["Ctrl+Z"],
         scope: "Editor",
         refusal: "Text inputs keep Undo; this action is available outside text editing",
     },
     FixedShortcut {
-        owner: None,
         label: "Redo text edit",
         chords: &["Ctrl+Shift+Z", "Ctrl+Y"],
         scope: "Editor",
         refusal: "Text inputs keep Redo; this action is available outside text editing",
     },
     FixedShortcut {
-        owner: None,
         label: "Select all text",
         chords: &["Ctrl+A"],
         scope: "Editor",
         refusal: "Text inputs keep Select all; this action is available outside text editing",
     },
     FixedShortcut {
-        owner: None,
         label: "Copy / cut / paste text",
         chords: &["Ctrl+C", "Ctrl+X", "Ctrl+V"],
         scope: "Editor",
         refusal: "Text inputs keep clipboard editing; this action is available outside text editing",
     },
     FixedShortcut {
-        owner: None,
         label: "Find in text",
         chords: &["Ctrl+F"],
         scope: "Editor",
         refusal: "Text inputs keep Find; other actions are available outside text editing",
     },
     FixedShortcut {
-        owner: None,
         label: "Navigate / delete words",
         chords: &[
             "Ctrl+Left",
@@ -1284,7 +1262,9 @@ pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBind
 }
 
 pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
-    if FIXED_SHORTCUTS.iter().any(|fixed| fixed.owner == Some(action) && fixed.chords.iter().any(|chord| parse_shortcut(chord).ok() == Some(binding))) { return None; }
+    // Registered editor/repository commands never capture a terminal's flow
+    // control. Ctrl+S is an ordinary configurable chord in those scopes.
+    if (is_editor_command(action) || matches!(action, "editor_save" | "editor_discard_edits" | "editor_edit" | "editor_preview" | "editor_diff")) && parse_shortcut("Ctrl+S").ok() == Some(binding) { return None; }
     if (is_editor_command(action) && text_editing_shortcut_conflict(binding).is_some())
         || (action == "diff_copy" && parse_shortcut("Ctrl+C").ok() == Some(binding))
         || (action == "diff_select_all" && parse_shortcut("Ctrl+A").ok() == Some(binding))
