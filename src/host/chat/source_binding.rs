@@ -9,6 +9,8 @@ const CAPACITY: usize = 1024;
 pub(in crate::host) struct History {
     entries: BTreeMap<TerminalId, Entry>,
     order: VecDeque<TerminalId>,
+    #[cfg(test)]
+    lose_next_return_start_reply: bool,
 }
 /// A bounded history slot held across an off-host operation. Dropping a caller
 /// never evicts its pending phase; the Entry itself retains that phase.
@@ -121,6 +123,14 @@ impl History {
             reservations.push(self.mutating(TerminalId::new()).unwrap());
         }
         reservations
+    }
+    #[cfg(test)]
+    pub(in crate::host) fn lose_next_return_start_reply_for_test(&mut self) {
+        self.lose_next_return_start_reply = true;
+    }
+    #[cfg(test)]
+    pub(in crate::host) fn return_attempt_for_test(&self, id: TerminalId) -> Option<crate::terminal::TerminalStartAttempt> {
+        self.entries.get(&id)?.pending_handoff.as_ref()?.returned.as_ref()?.attempt.clone()
     }
     #[cfg(test)]
     pub(in crate::host) fn pressure_for_test(&mut self) {
@@ -854,12 +864,16 @@ pub(super) fn prepare_return_attempt(
 }
 pub(super) fn mark_return_attempt(host: &SharedHost, id: TerminalId, continuation: &Continuation) -> Result<crate::terminal::TerminalStartAttempt, ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    #[cfg(test)]
+    let lose_start_reply = std::mem::take(&mut state.native_sources.lose_next_return_start_reply);
     let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
         .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
         .ok_or_else(|| unavailable("The exact closed source operation is unavailable"))?;
     let target = pending.returned.as_mut().ok_or_else(|| unavailable("The exact return target was not reserved"))?;
     if target.attempt.is_some() { return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")); }
     let attempt = crate::terminal::TerminalStartAttempt::new(target.source.clone());
+    #[cfg(test)]
+    if lose_start_reply { attempt.lose_worker_start_reply_for_test(); }
     target.attempt = Some(attempt.clone());
     Ok(attempt)
 }
