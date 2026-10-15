@@ -592,12 +592,19 @@ impl Cagents {
                     // Prepare the same project removal used by its row, then
                     // consume the already-confirmed intent without displaying
                     // another modal for each member of the group.
+                    let previous = self.project_ui.removal_request();
                     drop(self.handle_project_action(project_ui::Action::Command {
                         project_id,
                         worktree_id: None,
                         command: sidebar::ProjectCommand::Remove,
                     }));
-                    self.handle_project_action(project_ui::Action::ConfirmRemove)
+                    // This is synchronous preparation of the group's original
+                    // consent. A refusal must not consume an older dialog.
+                    match self.project_ui.removal_request_for(project_id) {
+                        Some(request) if Some(request) != previous =>
+                            self.handle_project_action(project_ui::Action::ConfirmRemove(request)),
+                        _ => Task::none(),
+                    }
                 }
             });
         }

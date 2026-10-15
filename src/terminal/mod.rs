@@ -32,6 +32,8 @@ pub use snapshot::{
 };
 #[cfg(feature = "ui")]
 pub use surface::TerminalSurface;
+#[cfg(feature = "ui")]
+pub(crate) use surface::TerminalSurfaceIdentity;
 pub use types::{
     KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, PasteOrigin,
     TerminalConfig, TerminalEvent, TerminalKey, TerminalSendError, TerminalSize,

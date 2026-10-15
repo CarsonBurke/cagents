@@ -6,7 +6,7 @@
 //! thread, because a redraw must not wait on a daemon that may not be running.
 
 use super::*;
-use crate::control::{ControlClient, ControlError};
+use crate::control::{ControlClient, ControlError, WorkspaceUpdate};
 use crate::model::{ChannelId, ProjectChannel};
 use crate::workspace_model::{
     ModelChannel, ModelEdit, ModelProject, NO_REGISTRY, PENDING_ORDINAL, WorkspaceModel,
@@ -55,6 +55,11 @@ pub enum ModelUpdate {
         operation: Option<uuid::Uuid>,
         model: WorkspaceModel,
     },
+    /// An inventory edge from the same registry connection as the model.
+    WorktreesChanged {
+        registry: uuid::Uuid,
+        repository: PathBuf,
+    },
     NavigationFailed(String),
     Ranked {
         channel: ChannelId,
@@ -94,13 +99,23 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
     let model = client
         .watch_workspace_model()
         .map_err(|error| error.to_string())?;
+    let registry = model.identity;
     sender
         .send_blocking(ModelUpdate::Connected(model))
         .map_err(|error| error.to_string())?;
     loop {
-        let (sequence, edit) = client
-            .next_workspace_model_edit()
-            .map_err(|error| error.to_string())?;
+        let (sequence, edit) = match client
+            .next_workspace_update()
+            .map_err(|error| error.to_string())?
+        {
+            WorkspaceUpdate::Edited { sequence, edit } => (sequence, edit),
+            WorkspaceUpdate::WorktreesChanged { repository } => {
+                sender
+                    .send_blocking(ModelUpdate::WorktreesChanged { registry, repository })
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+        };
         // A create's rank is assigned by the registry, so it is not in the edit.
         // Reading the model afterwards is how an adopting window learns where
         // the new channel sorts, and it is one request on a connection that is
@@ -395,6 +410,24 @@ impl Cagents {
 
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::WorktreesChanged { registry, repository } => {
+                if registry == NO_REGISTRY || registry != self.workspace_model.identity {
+                    return Task::none();
+                }
+                // This edge invalidates inventory only. Keep the loaded project
+                // identities, filing and focus; the usual loader fences late
+                // results by generation and preserves remote project routing.
+                let targets = self.sidebar_model.projects.iter()
+                    .filter(|project| project.kind == ProjectKind::Git
+                        && project.repository == repository
+                        && !self.project_ui.closing.contains_key(&project.id)
+                        && !self.project_ui.closed.contains(&project.repository))
+                    .map(|project| (project.id, project.repository.clone(), project.kind))
+                    .collect::<Vec<_>>();
+                Task::batch(targets.into_iter().map(|(id, repository, kind)| {
+                    self.project_load_task(repository, Some(id), false, Some(kind))
+                }))
+            }
             ModelUpdate::NavigationFailed(error) => {
                 self.status = Some(TransientNotice::warning(format!(
                     "Could not reorder the sidebar: {error}"
@@ -1534,6 +1567,59 @@ mod tests {
             views: Vec::new(),
             agents: Vec::new(),
         }
+    }
+
+    #[test]
+    fn worktree_inventory_edge_refreshes_only_loaded_repository_without_navigation() {
+        let (mut app, project, repository) = app_with_project();
+        let other = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            other, RepositoryId::new(), "other".into(), PathBuf::from("/other/.git"),
+            Vec::new(), Vec::new(),
+        ));
+        app.workspace_model = registry(Vec::new());
+        let registry = app.workspace_model.identity;
+        let channels = app.durable.channels.clone();
+        let cards = app.durable.cards.clone();
+        let active = app.durable.active_channel;
+        let focused = app.workspace.focused();
+        let sequence = app.workspace_model.sequence;
+        let old_generation = app.repository_generations.get(&project).copied();
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::WorktreesChanged {
+            registry, repository: repository.clone(),
+        })));
+        assert_ne!(app.repository_generations.get(&project).copied(), old_generation);
+        assert!(app.sidebar_model.project(project).unwrap().reloading);
+        assert!(!app.repository_generations.contains_key(&other));
+        assert_eq!(app.workspace_model.sequence, sequence);
+        assert_eq!(app.durable.channels, channels);
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.durable.active_channel, active);
+        assert_eq!(app.workspace.focused(), focused);
+    }
+
+    #[test]
+    fn stale_unknown_or_closing_worktree_inventory_does_not_start_a_read() {
+        let (mut app, project, repository) = app_with_project();
+        app.workspace_model = registry(Vec::new());
+        let registry = app.workspace_model.identity;
+        for (registry, repository) in [
+            (uuid::Uuid::new_v4(), repository.clone()),
+            (NO_REGISTRY, repository.clone()),
+            (registry, PathBuf::from("/unknown/.git")),
+        ] {
+            drop(app.apply_workspace_model_update(ModelUpdate::WorktreesChanged { registry, repository }));
+            assert!(!app.repository_generations.contains_key(&project));
+        }
+        app.project_ui.closing.insert(project, repository.clone());
+        drop(app.apply_workspace_model_update(ModelUpdate::WorktreesChanged {
+            registry, repository: repository.clone(),
+        }));
+        assert!(!app.repository_generations.contains_key(&project));
+        app.project_ui.closing.remove(&project);
+        app.project_ui.closed.insert(repository.clone());
+        drop(app.apply_workspace_model_update(ModelUpdate::WorktreesChanged { registry, repository }));
+        assert!(!app.repository_generations.contains_key(&project));
     }
 
     #[test]
