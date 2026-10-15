@@ -185,7 +185,7 @@ pub(crate) struct ReapedFamily(());
 pub(crate) fn terminate_owned_family(deadline: Instant) -> io::Result<Option<ReapedFamily>> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let mut subreaper = 0i32;
-    if unsafe {libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut subreaper, 0, 0, 0)} != 0 {
+    if unsafe {libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut subreaper, 0, 0, 0)} != 0 {
         return Err(io::Error::last_os_error());
     }
     if subreaper != 1 || std::fs::read_dir("/proc/self/task")?.collect::<io::Result<Vec<_>>>()?.len() != 1 {
