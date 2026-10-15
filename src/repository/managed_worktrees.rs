@@ -38,7 +38,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 // A linked invocation cannot discover a separate primary with
                 // no core.worktree backlink. Its own registered checkout is
                 // still usable; do not invent a primary path for migration.
-                Err(RepositoryError::Process(error)) if error.exit_code == Some(1) => {
+                Err(RepositoryError::Process(error))
+                    if error.kind == ProcessFailureKind::Exit && error.exit_code == Some(1) =>
+                {
                     return Ok(None);
                 }
                 Err(error) => return Err(error),
