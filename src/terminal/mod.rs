@@ -49,3 +49,5 @@ pub(crate) use worker::UpgradeSnapshot;
 pub(crate) use worker::flush_archived_notices;
 #[cfg(feature = "host")]
 pub(crate) use worker::holder::inspect as inspect_holder;
+#[cfg(feature = "host")]
+pub(crate) use worker::holder::inspect_until as inspect_holder_until;

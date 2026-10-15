@@ -33,6 +33,10 @@ pub enum ModelUpdate {
     Connected(WorkspaceModel),
     /// A fresh read, taken because an edge does not carry the ranks it changed.
     Read(WorkspaceModel),
+    Relocated {
+        relocation: crate::project_recovery::Relocation,
+        model: WorkspaceModel,
+    },
     Reopened {
         repository: PathBuf,
         model: WorkspaceModel,
@@ -117,6 +121,15 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             sender
                 .send_blocking(ModelUpdate::Read(model))
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+        if let ModelEdit::RelocateProject { relocation, .. } = edit {
+            let model = client
+                .read_workspace_model()
+                .map_err(|error| error.to_string())?;
+            sender
+                .send_blocking(ModelUpdate::Relocated { relocation, model })
                 .map_err(|error| error.to_string())?;
             continue;
         }
@@ -434,9 +447,21 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                self.join_workspace_model(model.identity);
                 self.workspace_model = model;
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
+            }
+            ModelUpdate::Relocated { relocation, model } => {
+                if model.identity != self.workspace_model.identity
+                    || model.sequence < self.workspace_model.sequence
+                {
+                    return Task::none();
+                }
+                self.workspace_model = model;
+                let relocated = self.apply_project_relocation(&relocation);
+                let closed = self.apply_closed_project_tombstones();
+                Task::batch([relocated, closed, self.reconcile_workspace_model()])
             }
             ModelUpdate::Reopened { repository, model } => {
                 if model.identity == self.workspace_model.identity
@@ -481,7 +506,10 @@ impl Cagents {
                     _ => None,
                 };
                 let closing = match &edit {
-                    ModelEdit::CloseProject { repository } => Some(repository.clone()),
+                    ModelEdit::CloseProject { repository }
+                    | ModelEdit::CloseProjectInstance {
+                        project: crate::project_recovery::ProjectInstance { repository, .. },
+                    } => Some(repository.clone()),
                     ModelEdit::ReopenProject { repository, .. } => {
                         self.cancel_shared_project_close(repository);
                         self.project_ui.closed.remove(repository);
@@ -494,6 +522,11 @@ impl Cagents {
                     _ => None,
                 };
                 self.workspace_model.fold(sequence, &edit);
+                let relocation = if let ModelEdit::RelocateProject { relocation, .. } = &edit {
+                    self.apply_project_relocation(relocation)
+                } else {
+                    Task::none()
+                };
                 let removed = closing.map_or_else(Task::none, |repository| {
                     self.close_shared_project(&repository)
                 });
@@ -510,7 +543,12 @@ impl Cagents {
                     }
                     self.retire_peer_channel(id)
                 });
-                Task::batch([removed, retired, self.reconcile_workspace_model()])
+                Task::batch([
+                    relocation,
+                    removed,
+                    retired,
+                    self.reconcile_workspace_model(),
+                ])
             }
             ModelUpdate::Ranked { channel, ordinal } => {
                 let Some(index) = self
@@ -548,6 +586,7 @@ impl Cagents {
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
+        let relocated = self.recover_shared_project_relocations();
         let closed = self
             .workspace_model
             .closed_projects
@@ -559,9 +598,11 @@ impl Cagents {
             .cloned()
             .collect::<Vec<_>>();
         Task::batch(
-            closed
-                .into_iter()
-                .map(|repository| self.close_shared_project(&repository)),
+            std::iter::once(relocated).chain(
+                closed
+                    .into_iter()
+                    .map(|repository| self.close_shared_project(&repository)),
+            ),
         )
     }
 
@@ -581,6 +622,7 @@ impl Cagents {
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
+        durable.shared_project_bindings.clear();
         for channel in durable.channels.iter_mut() {
             channel.shared = false;
         }
@@ -796,7 +838,13 @@ impl Cagents {
         durable.cards.push(card.clone());
         let scope_path = match &agent.placement {
             crate::agent_execution::Placement::Worktree { path, .. } => path.clone(),
-            crate::agent_execution::Placement::Channel(_) => agent.spec.target.directory.clone(),
+            crate::agent_execution::Placement::Channel(_) => self
+                .workspace_model
+                .agent_locations
+                .iter()
+                .find(|location| location.agent == agent.id)
+                .map(|location| location.logical_directory().to_path_buf())
+                .unwrap_or_else(|| agent.spec.target.directory.clone()),
         };
         durable.card_scopes.insert(card_id, scope_path.clone());
         if let Some(index) = channel_index {
@@ -912,9 +960,36 @@ impl Cagents {
         if self.project_ui.closed.contains(&shared.repository) {
             return Adoption::Retained;
         }
+        let primary_changed = shared.primary_checkout.as_ref().is_some_and(|checkout| {
+            self.project_ui
+                .primary_checkout_roots
+                .insert(shared.repository.clone(), checkout.clone())
+                .as_ref()
+                != Some(checkout)
+        });
+        let checkout_changed = shared.checkout.as_ref().is_some_and(|checkout| {
+            self.project_ui
+                .checkout_roots
+                .insert(shared.repository.clone(), checkout.clone())
+                .as_ref()
+                != Some(checkout)
+        });
         if let Some(project_id) = self.project_for_repository(&shared.repository) {
-            if crate::device::is_remote()
-                && !self.workspace_model_opens.contains(&shared.repository)
+            self.remember_project_binding(project_id, shared);
+            let needs_checkout_read = primary_changed
+                || (checkout_changed
+                    && self
+                        .sidebar_model
+                        .project(project_id)
+                        .is_some_and(|project| {
+                            project.kind == ProjectKind::Git
+                                && (project.unreachable.is_some()
+                                    || project.worktrees.is_empty()
+                                    || project.reloading)
+                        }));
+            if needs_checkout_read
+                || (crate::device::is_remote()
+                    && !self.workspace_model_opens.contains(&shared.repository))
             {
                 return Adoption::Opening(self.project_load_task(
                     shared.repository.clone(),
@@ -969,6 +1044,7 @@ impl Cagents {
         self.sidebar_model
             .apply_project_order(&self.durable.project_order);
         self.sidebar_model.data_state = SidebarDataState::Ready;
+        self.remember_project_binding(project.id, shared);
         Adoption::Opening(self.project_load_task(
             shared.repository.clone(),
             Some(project.id),
@@ -1078,10 +1154,26 @@ impl Cagents {
         let repository = project.repository.clone();
         let name = project.name.clone();
         let kind = project.kind;
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
         // The project first: a channel in a repository no project owns is
         // reachable from no sidebar. Both edits go through one queue, so the
         // registry sees them in this order.
         self.publish_model_edit(ModelEdit::OpenProject {
+            checkout: checkout.clone(),
+            primary_checkout: primary_checkout.clone(),
             kind,
             repository: repository.clone(),
             name,
@@ -1113,7 +1205,23 @@ impl Cagents {
         }
         let name = project.name.clone();
         let kind = project.kind;
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
         self.publish_model_edit(ModelEdit::OpenProject {
+            checkout: checkout.clone(),
+            primary_checkout: primary_checkout.clone(),
             kind,
             repository: repository.clone(),
             name,
@@ -1140,14 +1248,32 @@ impl Cagents {
         let repository = project.repository.clone();
         let name = project.name.clone();
         let kind = project.kind;
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
         let edit = if self.project_ui.is_reopening(&repository) {
             ModelEdit::ReopenProject {
+                checkout: checkout.clone(),
+                primary_checkout: primary_checkout.clone(),
                 repository,
                 name,
                 kind,
             }
         } else {
             ModelEdit::OpenProject {
+                checkout: checkout.clone(),
+                primary_checkout: primary_checkout.clone(),
                 repository,
                 name,
                 kind,
@@ -1182,6 +1308,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linked_checkout_keeps_primary_read_root_without_changing_actual_checkout() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let repository = PathBuf::from("/metadata/separate.git");
+        let primary = PathBuf::from("/checkouts/primary");
+        let linked = PathBuf::from("/checkouts/linked");
+        let shared = ModelProject {
+            repository: repository.clone(),
+            checkout: Some(linked.clone()),
+            primary_checkout: Some(primary.clone()),
+            name: "project".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        };
+        drop(app.adopt_shared_project(&shared));
+        let project = ProjectId::new();
+        assert_eq!(
+            app.known_project_checkout(&repository, project),
+            Some((linked.clone(), repository.clone()))
+        );
+        assert_eq!(
+            app.project_ui.primary_checkout_roots.get(&repository),
+            Some(&primary)
+        );
+        assert_eq!(
+            app.project_ui.checkout_roots.get(&repository),
+            Some(&linked)
+        );
+    }
+
+    #[test]
+    fn shared_checkout_metadata_is_kept_separate_from_project_identity() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let repository = PathBuf::from("/metadata/separate.git");
+        let checkout = PathBuf::from("/checkouts/project");
+        let shared = ModelProject {
+            repository: repository.clone(),
+            checkout: Some(checkout.clone()),
+            primary_checkout: None,
+            name: "project".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        };
+        // Unavailable roots remain absent rather than becoming local folders.
+        drop(app.adopt_shared_project(&shared));
+        assert_eq!(
+            app.project_ui.checkout_roots.get(&repository),
+            Some(&checkout)
+        );
+        assert!(app.project_for_repository(&checkout).is_none());
+    }
+
+    #[test]
     fn device_project_metadata_creates_durable_sidebar_without_local_filesystem() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let storage = tempfile::tempdir().unwrap();
@@ -1201,6 +1379,8 @@ mod tests {
             "fixture must be absent on the displaying host"
         );
         let metadata = ModelProject {
+            checkout: None,
+            primary_checkout: None,
             repository: repository.clone(),
             name: "Device repository".into(),
             kind: ProjectKind::Git,
@@ -1533,6 +1713,8 @@ mod tests {
             closed_projects: Vec::new(),
             views: Vec::new(),
             agents: Vec::new(),
+            agent_locations: Vec::new(),
+            session_location_refusals: Vec::new(),
         }
     }
 
@@ -1570,6 +1752,8 @@ mod tests {
         drop(app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 2,
             edit: ModelEdit::ReopenProject {
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: repository.clone(),
                 name: "repo".into(),
@@ -1600,6 +1784,8 @@ mod tests {
         app.project_ui.reopening.insert(project, repository.clone());
         let mut model = registry(Vec::new());
         model.projects.push(ModelProject {
+            checkout: None,
+            primary_checkout: None,
             kind: Default::default(),
             repository: repository.clone(),
             name: "repo".into(),
@@ -1690,6 +1876,8 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.workspace_model = WorkspaceModel {
             projects: vec![ModelProject {
+                checkout: None,
+                primary_checkout: None,
                 repository: repository.clone(),
                 name: "Folder".into(),
                 kind: ProjectKind::Folder,
@@ -1720,6 +1908,8 @@ mod tests {
             canonical_repository(&checkout.path().join(".git")).expect("an absolute key");
         app.workspace_model = WorkspaceModel {
             projects: vec![ModelProject {
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: repository.clone(),
                 name: "opened elsewhere".into(),
@@ -1941,6 +2131,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ModelEdit::OpenProject {
+                    checkout: None,
+                    primary_checkout: None,
                     kind: Default::default(),
                     repository: repository.clone(),
                     name: "repo".into(),

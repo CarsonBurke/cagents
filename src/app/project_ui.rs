@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent_execution::HostedSession;
 use crate::repository::{CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
 use crate::{
     github::avatar::{self, OwnerKey},
@@ -14,6 +15,10 @@ struct AutomaticAttempt {
 
 #[derive(Debug, Default)]
 pub struct State {
+    /// Discovery roots keyed by canonical repository identity. Device values
+    /// remain in that device's namespace and are never inspected locally.
+    pub(super) checkout_roots: HashMap<PathBuf, PathBuf>,
+    pub(super) primary_checkout_roots: HashMap<PathBuf, PathBuf>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
@@ -146,10 +151,12 @@ struct ProjectRemoval {
     project: ProjectId,
     repository: PathBuf,
     kind: ProjectKind,
+    missing: bool,
     name: String,
     worktrees: Vec<PathBuf>,
     channels: usize,
     project_sessions: ProjectSessionOwnership,
+    expected: crate::project_recovery::ProjectInstance,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +197,7 @@ pub enum Action {
     ConfirmRemove,
     RemovedProject {
         repository: PathBuf,
+        expected: crate::project_recovery::ProjectInstance,
         result: Result<crate::workspace_model::WorkspaceModel, String>,
     },
     AwaitClosedProject(ProjectId, u64),
@@ -214,6 +222,42 @@ pub enum Action {
 }
 
 impl Cagents {
+    pub(super) fn known_project_checkout(
+        &self,
+        repository: &Path,
+        project_id: ProjectId,
+    ) -> Option<(PathBuf, PathBuf)> {
+        if let Some(checkout) = self
+            .project_ui
+            .checkout_roots
+            .get(repository)
+            .or_else(|| self.project_ui.primary_checkout_roots.get(repository))
+        {
+            return Some((checkout.clone(), repository.to_owned()));
+        }
+        let project = self.sidebar_model.project(project_id)?;
+        if project.kind == ProjectKind::Folder {
+            return Some((project.repository.clone(), project.repository.clone()));
+        }
+        let checkout = project
+            .worktrees
+            .iter()
+            .find(|row| {
+                project
+                    .repository
+                    .file_name()
+                    .is_some_and(|name| name == ".git")
+                    && project.repository.parent() == Some(row.path.as_path())
+            })
+            .or_else(|| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|row| row.path != project.repository)
+            })?;
+        Some((checkout.path.clone(), project.repository.clone()))
+    }
+
     pub(super) fn sync_worktree_protections(&mut self) {
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {
@@ -522,7 +566,10 @@ impl Cagents {
             let generation = self.project_ui.close_generation[&project];
             let repository = row.repository.clone();
             let kind = row.kind;
-            let roots = project_worktree_roots(row);
+            let mut roots = project_worktree_roots(row);
+            let primary = self.project_root(row);
+            if !roots.contains(&primary) { roots.push(primary); }
+            let missing = row.missing;
             let scope = self.project_session_scope(project);
             let project_sessions = self.project_session_ownership(project);
             let pending = self.durable.cards.iter().any(|card| {
@@ -551,8 +598,8 @@ impl Cagents {
                 .insert(project, cancellation.clone());
             cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let roots = project_session_roots(&repository, kind, roots);
-                    close_sessions_in_scope(&roots, Some(&repository), &project_sessions, Some(&cancellation))
+                    let roots = if missing { roots } else { project_session_roots(&repository, kind, roots) };
+                    close_sessions_in_scope(&roots, Some(&repository), &project_sessions, Some(&cancellation), None)
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -611,6 +658,26 @@ impl Cagents {
         }
     }
 
+    pub(super) fn project_instance(
+        &self,
+        project: ProjectId,
+    ) -> Option<crate::project_recovery::ProjectInstance> {
+        let registry = self.durable.workspace_model_identity.filter(|identity| {
+            *identity == self.workspace_model.identity
+                && *identity != crate::workspace_model::NO_REGISTRY
+        })?;
+        let binding = self.durable.shared_project_bindings.get(&project)?;
+        let repository = self.sidebar_model.project(project)?.repository.clone();
+        self.workspace_model
+            .project(&repository)
+            .filter(|shared| shared.ordinal == binding.ordinal)?;
+        Some(crate::project_recovery::ProjectInstance {
+            registry,
+            repository,
+            ordinal: binding.ordinal,
+        })
+    }
+
     fn project_session_ownership(&self, project: ProjectId) -> ProjectSessionOwnership {
         let mut ownership = ProjectSessionOwnership {
             local_database: self
@@ -645,17 +712,22 @@ impl Cagents {
                         .push(directory.clone());
                 }
             };
-            match &card.kind {
-                CardKind::Terminal(session) => {
-                    record(session.id);
-                }
-                CardKind::Chat(session) => {
-                    record(session.id);
-                    if let Some(terminal) = &session.terminal {
-                        record(terminal.id);
-                    }
-                }
-                _ => {}
+            let sources = match &card.kind {
+                CardKind::Terminal(session) => vec![HostedSession::Terminal(session.clone())],
+                CardKind::Chat(session) => std::iter::once(HostedSession::Chat(session.clone()))
+                    .chain(session.terminal.clone().map(HostedSession::Terminal))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for source in &sources {
+                record(source.id());
+            }
+            for source in sources {
+                ownership
+                    .sources
+                    .entry(source.id())
+                    .or_default()
+                    .push(source);
             }
         }
         ownership
@@ -730,6 +802,9 @@ impl Cagents {
             .as_deref()
             .is_some_and(|active| scope.contains(active));
         self.sidebar_model.projects.remove(index);
+        Arc::make_mut(&mut self.durable)
+            .shared_project_bindings
+            .remove(&id);
         self.refresh_ui.git.forget(id);
         self.github_availability.remove(&id);
         self.review_repositories.remove(&id);
@@ -1105,11 +1180,22 @@ impl Cagents {
                             ));
                             return Task::none();
                         }
-                        let worktrees = project_worktree_roots(project);
+                        let Some(expected) = self.project_instance(project_id) else {
+                            self.status = Some(TransientNotice::warning(
+                                "This project's shared identity changed or has not loaded. Refresh Projects before removing it; its sessions were preserved.",
+                            ));
+                            return Task::none();
+                        };
+                        let mut worktrees = project_worktree_roots(project);
+                        let primary = self.project_root(project);
+                        if !worktrees.contains(&primary) {
+                            worktrees.push(primary);
+                        }
                         self.project_ui.remove_dialog = Some(ProjectRemoval {
                             project: project_id,
                             repository: project.repository.clone(),
                             kind: project.kind,
+                            missing: project.missing,
                             name: project.name.clone(),
                             worktrees,
                             channels: self
@@ -1119,6 +1205,7 @@ impl Cagents {
                                 .filter(|channel| channel.project_id == project_id)
                                 .count(),
                             project_sessions: ProjectSessionOwnership::default(),
+                            expected,
                         });
                         return iced::widget::operation::focus(self.project_ui.focus_target())
                             .map(cosmic::Action::App);
@@ -1203,6 +1290,13 @@ impl Cagents {
                     ));
                     return self.project_dialog_closed();
                 }
+                if self.project_instance(removal.project).as_ref() != Some(&removal.expected) {
+                    self.status = Some(TransientNotice::warning(
+                        "The selected project was replaced or its registry changed. Refresh Projects before removing it; no sessions were closed.",
+                    ));
+                    return self.project_dialog_closed();
+                }
+                removal.missing = self.project_missing(removal.project);
                 if self.project_has_unsaved_editors(removal.project) {
                     self.status = Some(TransientNotice::warning(
                         "Save or close this project's unsaved editor buffers before removing it.",
@@ -1210,6 +1304,7 @@ impl Cagents {
                     return self.project_dialog_closed();
                 }
                 let repository = removal.repository.clone();
+                let expected = removal.expected.clone();
                 removal.project_sessions = self.project_session_ownership(removal.project);
                 self.project_ui.close_failed.remove(&removal.project);
                 self.project_ui
@@ -1224,12 +1319,26 @@ impl Cagents {
                             .await
                             .map_err(|error| error.to_string())
                             .and_then(|result| result);
-                    Message::ProjectUi(Action::RemovedProject { repository, result })
+                    Message::ProjectUi(Action::RemovedProject {
+                        repository,
+                        expected,
+                        result,
+                    })
                 });
                 return Task::batch([close, self.project_dialog_closed()]);
             }
-            Action::RemovedProject { repository, result } => match result {
+            Action::RemovedProject {
+                repository,
+                expected,
+                result,
+            } => match result {
                 Ok(model) => {
+                    self.project_ui.removing.remove(&repository);
+                    if model.identity != expected.registry
+                        || self.workspace_model.identity != expected.registry
+                    {
+                        return Task::none();
+                    }
                     if model.sequence <= self.workspace_model.sequence {
                         return if self.workspace_model.project(&repository).is_none() {
                             self.close_shared_project(&repository)
@@ -1242,7 +1351,9 @@ impl Cagents {
                     return self.apply_workspace_model_update(
                         super::workspace_model_sync::ModelUpdate::Edited {
                             sequence: model.sequence,
-                            edit: crate::workspace_model::ModelEdit::CloseProject { repository },
+                            edit: crate::workspace_model::ModelEdit::CloseProjectInstance {
+                                project: expected,
+                            },
                         },
                     );
                 }
@@ -1890,7 +2001,14 @@ fn close_worktree_sessions(target: &Target) -> Result<(), String> {
 }
 
 fn close_sessions_in_worktrees(worktrees: &[PathBuf]) -> Result<(), String> {
-    close_sessions_in_scope(worktrees, None, &ProjectSessionOwnership::default(), None).map(|_| ())
+    close_sessions_in_scope(
+        worktrees,
+        None,
+        &ProjectSessionOwnership::default(),
+        None,
+        None,
+    )
+    .map(|_| ())
 }
 
 fn close_sessions_in_scope(
@@ -1898,6 +2016,7 @@ fn close_sessions_in_scope(
     project: Option<&Path>,
     project_sessions: &ProjectSessionOwnership,
     cancellation: Option<&CancellationToken>,
+    guarded: Option<&crate::project_recovery::ProjectInstance>,
 ) -> Result<ProjectSessionClosure, String> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return Err("Project removal was cancelled.".into());
@@ -1916,6 +2035,7 @@ fn close_sessions_in_scope(
                 Err("Cannot verify project ownership while the daemon is unavailable.".into())
             } else {
                 Ok(ProjectSessionClosure {
+                    removed_model: None,
                     scope: ProjectSessionScope::new(worktrees.to_vec(), Vec::new()),
                     ownership: project_sessions.clone(),
                 })
@@ -1936,6 +2056,7 @@ fn close_sessions_in_scope(
             format!("Could not verify project ownership before closing sessions: {error}")
         })?;
         let scope = shared_project_session_scope(worktrees, project, &model)?;
+        project_sessions.extend_model(&model, project);
         let paths = crate::instance::window_database_paths().map_err(|error| {
             format!("Could not locate other windows before closing sessions: {error}")
         })?;
@@ -1963,6 +2084,29 @@ fn close_sessions_in_scope(
     } else {
         ProjectSessionScope::new(worktrees.to_vec(), Vec::new())
     };
+    if let Some(expected) = guarded {
+        let inventory = client
+            .project_close_inventory(expected.clone())
+            .map_err(|error| format!("Could not verify this project's exact sessions: {error}"))?;
+        let mut sessions = Vec::new();
+        for session in inventory {
+            let directory = match &session.source {
+                HostedSession::Chat(source) => &source.launch.recipe.working_directory,
+                HostedSession::Terminal(source) => &source.launch.working_directory,
+            };
+            if project_sessions.check_source(&session.source, directory, &scope)? {
+                sessions.push(session);
+            }
+        }
+        let model = client
+            .close_project_guarded(expected.clone(), sessions)
+            .map_err(|error| format!("Could not remove the selected project: {error}"))?;
+        return Ok(ProjectSessionClosure {
+            scope,
+            ownership: project_sessions,
+            removed_model: Some(model),
+        });
+    }
     for session in client
         .list_chats()
         .map_err(|error| format!("Cannot list the worktree's chats: {error}"))?
@@ -1970,8 +2114,11 @@ fn close_sessions_in_scope(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err("Project removal was cancelled.".into());
         }
-        if !project_sessions.contains(session.id, &session.launch.recipe.working_directory, &scope)
-        {
+        if !project_sessions.check_source(
+            &HostedSession::Chat(session.clone()),
+            &session.launch.recipe.working_directory,
+            &scope,
+        )? {
             continue;
         }
         let id = session.id;
@@ -1997,38 +2144,23 @@ fn close_sessions_in_scope(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err("Project removal was cancelled.".into());
         }
-        if !project_sessions.contains(
-            terminal.session.id,
+        if !project_sessions.check_source(
+            &HostedSession::Terminal(terminal.session.clone()),
             &terminal.session.launch.working_directory,
             &scope,
-        ) {
+        )? {
             continue;
         }
         let id = terminal.session.id;
-        let result = if matches!(
-            terminal.session.continuity,
-            TerminalContinuity::Exited { .. }
-                | TerminalContinuity::RelaunchAvailable {
-                    last_exit: Some(_),
-                    ..
-                }
-        ) {
-            client
-                .release_completed_terminal(terminal.session, true)
-                .map_err(|error| error.to_string())
-                .and_then(|outcome| match outcome {
-                    crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
-                })
-        } else {
-            client
-                .close_terminal_checked(id, true)
-                .map_err(|error| error.to_string())
-                .and_then(|outcome| match outcome {
-                    crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
-                })
-        };
+        // Completed workers also need their captured worker UUID: a same-ID,
+        // same-recipe replacement may finish before this request arrives.
+        let result = client
+            .close_terminal_source_checked(terminal.session, terminal.execution_instance, true)
+            .map_err(|error| error.to_string())
+            .and_then(|outcome| match outcome {
+                crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
+                other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+            });
         if let Err(error) = result {
             // Another window or a natural exit may have won the race. Query a
             // fresh connection; a failed request can desynchronize this one.
@@ -2045,6 +2177,7 @@ fn close_sessions_in_scope(
         }
     }
     Ok(ProjectSessionClosure {
+        removed_model: None,
         scope,
         ownership: project_sessions,
     })
@@ -2054,6 +2187,7 @@ fn close_sessions_in_scope(
 pub struct ProjectSessionClosure {
     scope: ProjectSessionScope,
     ownership: ProjectSessionOwnership,
+    removed_model: Option<crate::workspace_model::WorkspaceModel>,
 }
 
 #[cfg(test)]
@@ -2062,6 +2196,7 @@ impl ProjectSessionClosure {
         Self {
             scope: ProjectSessionScope::new(roots, Vec::new()),
             ownership: ProjectSessionOwnership::default(),
+            removed_model: None,
         }
     }
 }
@@ -2070,6 +2205,7 @@ impl ProjectSessionClosure {
 struct ProjectSessionScope {
     roots: Vec<PathBuf>,
     protected: Vec<PathBuf>,
+    unavailable_projects: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2077,10 +2213,142 @@ struct ProjectSessionOwnership {
     owned: HashSet<TerminalId>,
     protected: HashSet<TerminalId>,
     directories: std::collections::HashMap<TerminalId, Vec<PathBuf>>,
+    sources: HashMap<TerminalId, Vec<HostedSession>>,
     local_database: Option<PathBuf>,
 }
 
 impl ProjectSessionOwnership {
+    fn extend_model(&mut self, model: &crate::workspace_model::WorkspaceModel, project: &Path) {
+        let mut record = |source: HostedSession, repository: &Path| {
+            let id = source.id();
+            if repository == project {
+                self.owned.insert(id);
+            } else {
+                self.protected.insert(id);
+            }
+            self.sources.entry(id).or_default().push(source);
+        };
+        for agent in &model.agents {
+            let repository = model
+                .agent_locations
+                .iter()
+                .find(|location| location.agent == agent.id)
+                .map(|location| &location.repository)
+                .unwrap_or(&agent.spec.target.repository);
+            for source in agent
+                .session
+                .clone()
+                .into_iter()
+                .chain(agent.console.clone().map(HostedSession::Terminal))
+            {
+                record(source, repository);
+            }
+        }
+        for view in &model.views {
+            let repository = match &view.scope {
+                crate::workspace_model::views::Scope::Worktree { repository, .. } => {
+                    Some(repository)
+                }
+                crate::workspace_model::views::Scope::Channel(channel) => model
+                    .channels
+                    .iter()
+                    .find(|entry| entry.id == *channel)
+                    .map(|entry| &entry.repository),
+            };
+            let Some(repository) = repository else {
+                continue;
+            };
+            for pane in &view.panes {
+                match &pane.kind {
+                    CardKind::Terminal(session) => {
+                        record(HostedSession::Terminal(session.clone()), repository)
+                    }
+                    CardKind::Chat(session) => {
+                        record(HostedSession::Chat(session.clone()), repository);
+                        if let Some(terminal) = &session.terminal {
+                            record(HostedSession::Terminal(terminal.clone()), repository);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn check_source(
+        &self,
+        source: &HostedSession,
+        directory: &Path,
+        scope: &ProjectSessionScope,
+    ) -> Result<bool, String> {
+        let id = source.id();
+        if !self.check(id, directory, scope)? {
+            return Ok(false);
+        }
+        if let Some(saved) = self.sources.get(&id) {
+            if !saved
+                .iter()
+                .any(|saved| saved == source || saved.same_process(source))
+            {
+                return Err(format!(
+                    "Session {id} no longer matches its saved provider incarnation. Refresh its original pane or close it explicitly before removing this project; the current process was preserved."
+                ));
+            }
+        } else if self.owned.contains(&id)
+            && (scope.topology_uncertain() || !scope.contains(directory))
+        {
+            return Err(format!(
+                "Session {id} has only a saved numeric identity at {}. Recover its original pane or close it explicitly before removing this project; the current process was preserved.",
+                directory.display()
+            ));
+        }
+        Ok(true)
+    }
+
+    fn check(
+        &self,
+        id: TerminalId,
+        directory: &Path,
+        scope: &ProjectSessionScope,
+    ) -> Result<bool, String> {
+        if self.contains(id, directory, scope) {
+            return Ok(true);
+        }
+        let retained_elsewhere = self
+            .directories
+            .get(&id)
+            .is_some_and(|paths| paths.iter().any(|path| !scope.contains(path)));
+        let maybe_owned = scope.contains(directory)
+            || self
+                .directories
+                .get(&id)
+                .is_some_and(|paths| paths.iter().any(|path| scope.contains(path)));
+        if scope.topology_uncertain()
+            && !self.owned.contains(&id)
+            && !self.protected.contains(&id)
+            && !retained_elsewhere
+            && maybe_owned
+        {
+            return Err(format!(
+                "Cannot verify which project owns session {id} at {} before removing {}: worktree locations are unavailable for {}. Restore those folders or close this session explicitly, then retry removing the project.",
+                directory.display(),
+                scope
+                    .roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                scope
+                    .unavailable_projects
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Ok(false)
+    }
+
     fn extend_saved(
         &mut self,
         owners: Vec<(TerminalId, crate::persistence::SavedSessionOwner)>,
@@ -2110,13 +2378,17 @@ impl ProjectSessionOwnership {
             if directories.iter().any(|path| !scope.contains(path)) {
                 return false;
             }
-            return true;
+            return !scope.topology_uncertain() || self.owned.contains(&id);
         }
-        self.owned.contains(&id) || scope.contains(directory)
+        self.owned.contains(&id) || (!scope.topology_uncertain() && scope.contains(directory))
     }
 }
 
 impl ProjectSessionScope {
+    fn topology_uncertain(&self) -> bool {
+        !self.unavailable_projects.is_empty()
+    }
+
     fn new(roots: Vec<PathBuf>, protected: Vec<PathBuf>) -> Self {
         let canonical = |paths: Vec<PathBuf>| {
             paths
@@ -2127,6 +2399,7 @@ impl ProjectSessionScope {
         Self {
             roots: canonical(roots),
             protected: canonical(protected),
+            unavailable_projects: Vec::new(),
         }
     }
 
@@ -2155,6 +2428,7 @@ fn shared_project_session_scope(
     model: &crate::workspace_model::WorkspaceModel,
 ) -> Result<ProjectSessionScope, String> {
     let mut protected = Vec::new();
+    let mut unavailable_projects = Vec::new();
     let service = RepositoryService::system("git");
     for project in &model.projects {
         if project.repository == repository {
@@ -2163,13 +2437,78 @@ fn shared_project_session_scope(
         match project.kind {
             ProjectKind::Folder => protected.push(project.repository.clone()),
             ProjectKind::Git => {
+                let primary = project
+                    .primary_checkout
+                    .as_deref()
+                    .or(project.checkout.as_deref())
+                    .unwrap_or(&project.repository);
+                if crate::project_recovery::root_missing(primary)
+                    || crate::project_recovery::root_missing(&project.repository)
+                {
+                    unavailable_projects.push(project.repository.clone());
+                    protected.extend(
+                        project
+                            .primary_checkout
+                            .iter()
+                            .chain(project.checkout.iter())
+                            .cloned(),
+                    );
+                    protected.push(
+                        if project
+                            .repository
+                            .file_name()
+                            .is_some_and(|name| name == ".git")
+                        {
+                            project
+                                .repository
+                                .parent()
+                                .unwrap_or(&project.repository)
+                                .to_path_buf()
+                        } else {
+                            project.repository.clone()
+                        },
+                    );
+                    protected.extend(model.views.iter().filter_map(|view| match &view.scope {
+                        crate::workspace_model::views::Scope::Worktree { repository, path }
+                            if *repository == project.repository =>
+                        {
+                            Some(path.clone())
+                        }
+                        _ => None,
+                    }));
+                    protected.extend(
+                        model
+                            .agents
+                            .iter()
+                            .filter(|agent| {
+                                model
+                                    .agent_locations
+                                    .iter()
+                                    .find(|location| location.agent == agent.id)
+                                    .map(|location| &location.repository)
+                                    .unwrap_or(&agent.spec.target.repository)
+                                    == &project.repository
+                            })
+                            .map(|agent| {
+                                model
+                                    .agent_locations
+                                    .iter()
+                                    .find(|location| location.agent == agent.id)
+                                    .map(|location| location.logical_directory().to_path_buf())
+                                    .unwrap_or_else(|| agent.spec.target.directory.clone())
+                            }),
+                    );
+                    continue;
+                }
                 let records = service.list_worktrees(&project.repository, &CancellationToken::default())
                     .map_err(|error| format!("Could not verify worktrees owned by {} before removing this project: {error}", project.name))?;
                 protected.extend(records.into_iter().map(|record| record.path));
             }
         }
     }
-    Ok(ProjectSessionScope::new(roots.to_vec(), protected))
+    let mut scope = ProjectSessionScope::new(roots.to_vec(), protected);
+    scope.unavailable_projects = unavailable_projects;
+    Ok(scope)
 }
 
 fn project_session_roots(
@@ -2177,7 +2516,7 @@ fn project_session_roots(
     kind: ProjectKind,
     mut roots: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
-    if kind == ProjectKind::Folder {
+    if kind == ProjectKind::Folder || crate::project_recovery::root_missing(repository) {
         return roots;
     }
     let service = RepositoryService::system("git");
@@ -2198,21 +2537,20 @@ fn project_session_roots(
 fn remove_project_from_cagents(
     removal: &ProjectRemoval,
 ) -> Result<crate::workspace_model::WorkspaceModel, String> {
-    let roots = project_session_roots(&removal.repository, removal.kind, removal.worktrees.clone());
+    let roots = if removal.missing {
+        removal.worktrees.clone()
+    } else {
+        project_session_roots(&removal.repository, removal.kind, removal.worktrees.clone())
+    };
     close_sessions_in_scope(
         &roots,
         Some(&removal.repository),
         &removal.project_sessions,
         None,
-    )?;
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client =
-        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-    client
-        .edit_workspace_model(crate::workspace_model::ModelEdit::CloseProject {
-            repository: removal.repository.clone(),
-        })
-        .map_err(|error| error.to_string())
+        Some(&removal.expected),
+    )?
+    .removed_model
+    .ok_or_else(|| "The guarded project removal did not return its verified model".into())
 }
 
 /// Removes the worktree through Git once Git confirms it is the one the user
@@ -2296,6 +2634,176 @@ fn worktree_removal_command(target: &Target) -> CommandSpec {
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn delayed_removal_reply_cannot_retire_a_project_from_a_recreated_registry() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let id = ProjectId::new();
+        let repository = PathBuf::from("/project");
+        app.sidebar_model.projects.push(
+            SidebarProject::new(
+                id,
+                RepositoryId::new(),
+                "Replacement".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        let registry = uuid::Uuid::new_v4();
+        app.workspace_model = crate::workspace_model::WorkspaceModel {
+            identity: registry,
+            projects: vec![crate::workspace_model::ModelProject {
+                repository: repository.clone(),
+                name: "Replacement".into(),
+                kind: ProjectKind::Folder,
+                ordinal: 0,
+                checkout: None,
+                primary_checkout: None,
+            }],
+            ..Default::default()
+        };
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.workspace_model_identity = Some(registry);
+        durable.shared_project_bindings.insert(
+            id,
+            crate::model::SharedProjectBinding {
+                ordinal: 0,
+                root: Some(repository.clone()),
+            },
+        );
+        let expected = crate::project_recovery::ProjectInstance {
+            registry: uuid::Uuid::new_v4(),
+            repository: repository.clone(),
+            ordinal: 0,
+        };
+        let stale = crate::workspace_model::WorkspaceModel {
+            identity: expected.registry,
+            sequence: 10,
+            closed_projects: vec![repository.clone()],
+            ..Default::default()
+        };
+        drop(app.handle_project_action(Action::RemovedProject {
+            repository: repository.clone(),
+            expected,
+            result: Ok(stale),
+        }));
+        assert_eq!(app.workspace_model.identity, registry);
+        assert!(app.workspace_model.project(&repository).is_some());
+        assert!(app.sidebar_model.project(id).is_some());
+        assert_eq!(app.project_instance(id).unwrap().registry, registry);
+    }
+
+    #[test]
+    fn project_removal_preserves_a_replacement_with_the_same_session_id() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.add_terminal("/old/project".into()));
+        let card = app.durable.cards.last().unwrap().id;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!()
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("original"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("host"),
+        };
+        let original = HostedSession::Terminal(session.clone());
+        let mut ownership = ProjectSessionOwnership::default();
+        ownership.owned.insert(original.id());
+        ownership
+            .sources
+            .insert(original.id(), vec![original.clone()]);
+        let scope = ProjectSessionScope::new(vec!["/old/project".into()], Vec::new());
+        assert!(
+            ownership
+                .check_source(&original, Path::new("/old/project"), &scope)
+                .unwrap()
+        );
+        let HostedSession::Terminal(mut replacement) = original else {
+            panic!()
+        };
+        replacement.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("replacement"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("host"),
+        };
+        assert!(
+            ownership
+                .check_source(
+                    &HostedSession::Terminal(replacement),
+                    Path::new("/old/project"),
+                    &scope
+                )
+                .unwrap_err()
+                .contains("incarnation")
+        );
+        ownership.sources.clear();
+        assert!(
+            ownership
+                .check_source(
+                    &HostedSession::Terminal(session.clone()),
+                    Path::new("/unrelated"),
+                    &scope
+                )
+                .unwrap_err()
+                .contains("numeric identity")
+        );
+    }
+
+    #[test]
+    fn missing_project_cleanup_respects_shared_pane_identity_over_directory() {
+        use crate::workspace_model::{
+            WorkspaceModel,
+            views::{Pane, Scope, View},
+        };
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.add_terminal(PathBuf::from("/target")));
+        let card = app.durable.cards.last().unwrap().clone();
+        let CardKind::Terminal(session) = &card.kind else {
+            panic!()
+        };
+        let id = session.id;
+        let mut view = View::empty(Scope::Worktree {
+            repository: "/other/.git".into(),
+            path: "/target/linked".into(),
+        });
+        view.panes.push(Pane {
+            id: card.id,
+            title: card.title,
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: card.width_fraction,
+            kind: card.kind,
+            scope: Some("/target/linked".into()),
+        });
+        let mut model = WorkspaceModel {
+            views: vec![view],
+            ..Default::default()
+        };
+        let mut ownership = ProjectSessionOwnership::default();
+        ownership.extend_model(&model, Path::new("/target/.git"));
+        let mut scope = ProjectSessionScope::new(vec!["/target".into()], Vec::new());
+        scope
+            .unavailable_projects
+            .push("/missing-other/.git".into());
+        assert!(
+            !ownership
+                .check(id, Path::new("/target/linked"), &scope)
+                .unwrap()
+        );
+        model.views[0].scope = Scope::Worktree {
+            repository: "/target/.git".into(),
+            path: "/target".into(),
+        };
+        let mut owned = ProjectSessionOwnership::default();
+        owned.extend_model(&model, Path::new("/target/.git"));
+        assert!(
+            owned
+                .check(id, Path::new("/target/linked"), &scope)
+                .unwrap()
+        );
+    }
 
     /// A window with session storage and one project at `repository` whose
     /// linked worktree is `linked`, both of them saved.
@@ -2763,7 +3271,14 @@ mod tests {
         assert!(!app.refuse_in_deleting_worktree(&child_path));
         assert!(!app.refuse_for_deleting_card(child_card));
         assert!(app.refuse_in_deleting_worktree(&parent_path));
-        drop(app.finish_closed_project(parent, ProjectSessionClosure { scope, ownership }));
+        drop(app.finish_closed_project(
+            parent,
+            ProjectSessionClosure {
+                removed_model: None,
+                scope,
+                ownership,
+            },
+        ));
         assert!(!app.card_state(parent_card).unwrap().existence.is_open());
         assert!(app.card_state(child_card).unwrap().existence.is_open());
         assert!(app.sidebar_model.project(child).is_some());
@@ -2793,6 +3308,7 @@ mod tests {
         let card = app.durable.cards.last().unwrap().id;
         app.project_ui.closing.insert(parent, root.clone());
         let closure = ProjectSessionClosure {
+            removed_model: None,
             scope: ProjectSessionScope::new(vec![root], vec![child.clone()]),
             ownership: app.project_session_ownership(parent),
         };
@@ -2859,12 +3375,16 @@ mod tests {
         let model = WorkspaceModel {
             projects: vec![
                 ModelProject {
+                    checkout: None,
+                    primary_checkout: None,
                     repository: child.clone(),
                     name: "Child folder".into(),
                     kind: ProjectKind::Folder,
                     ordinal: 1,
                 },
                 ModelProject {
+                    checkout: None,
+                    primary_checkout: None,
                     repository: git_root.join(".git"),
                     name: "Other Git".into(),
                     kind: ProjectKind::Git,
@@ -2885,7 +3405,30 @@ mod tests {
         );
         let mut missing = model;
         missing.projects[1].repository = root.join("missing.git");
-        assert!(shared_project_session_scope(&[folder.clone()], &folder, &missing).is_err());
+        let uncertain = shared_project_session_scope(&[folder.clone()], &folder, &missing).unwrap();
+        assert!(uncertain.topology_uncertain());
+        let mut ownership = ProjectSessionOwnership::default();
+        let unknown = TerminalId::new();
+        assert!(
+            ownership
+                .check(unknown, &folder.join("owned"), &uncertain)
+                .is_err(),
+            "unknown actor ownership must still refuse shutdown when Git topology is unavailable"
+        );
+        ownership.owned.insert(unknown);
+        assert!(
+            ownership
+                .check(unknown, &folder.join("owned"), &uncertain)
+                .unwrap(),
+            "explicit project identity permits cleanup even while another project's folder is missing"
+        );
+        ownership.protected.insert(unknown);
+        assert!(
+            !ownership
+                .check(unknown, &folder.join("owned"), &uncertain)
+                .unwrap(),
+            "another retained project still wins"
+        );
     }
 
     #[test]

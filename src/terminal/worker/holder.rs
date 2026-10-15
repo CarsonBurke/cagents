@@ -95,6 +95,9 @@ enum Request {
         size: PtySize,
         #[serde(default)]
         recovery: Option<Recovery>,
+        /// Exactly one SCM_RIGHTS directory descriptor accompanies this spawn.
+        #[serde(default)]
+        anchored_directory: bool,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -180,12 +183,35 @@ pub(super) fn spawn(
     spawn_recoverable(command, size, exits, None)
 }
 
+fn validate_execution_directory(directory: &File) -> Result<(), String> {
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("inspect terminal working directory: {error}"))?;
+    if !metadata.is_dir() || metadata.nlink() == 0 {
+        return Err("The terminal's verified working directory is no longer available".into());
+    }
+    Ok(())
+}
+
 pub(super) fn spawn_recoverable(
     command: CommandBuilder,
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Held, String> {
+    spawn_recoverable_at_directory(command, size, exits, recovery, None)
+}
+
+pub(super) fn spawn_recoverable_at_directory(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>,
+) -> Result<Held, String> {
+    if let Some(directory) = &directory {
+        validate_execution_directory(directory)?;
+    }
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -234,6 +260,10 @@ pub(super) fn spawn_recoverable(
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
+    let directory_descriptors: Vec<RawFd> = directory
+        .iter()
+        .map(|directory| directory.as_raw_fd())
+        .collect();
     let started = holder
         .control
         .set_read_timeout(Some(START_TIMEOUT))
@@ -245,8 +275,9 @@ pub(super) fn spawn_recoverable(
                     command,
                     size,
                     recovery,
+                    anchored_directory: directory.is_some(),
                 },
-                &[],
+                &directory_descriptors,
             )
         })
         .and_then(|()| receive::<Report>(&holder.control))
@@ -1033,17 +1064,31 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery) = match receive::<Request>(&control) {
-        Ok(Some((
-            Request::Spawn {
-                command,
-                size,
-                recovery,
-            },
-            _,
-        ))) => (command, size, recovery),
-        _ => return 1,
+    let (command, size, mut recovery, anchored_directory, mut descriptors) =
+        match receive::<Request>(&control) {
+            Ok(Some((
+                Request::Spawn {
+                    command,
+                    size,
+                    recovery,
+                    anchored_directory,
+                },
+                descriptors,
+            ))) => (command, size, recovery, anchored_directory, descriptors),
+            _ => return 1,
+        };
+    let directory = match (anchored_directory, descriptors.len()) {
+        (true, 1) => Some(File::from(
+            descriptors.pop().expect("checked directory descriptor"),
+        )),
+        (false, 0) => None,
+        _ => return fail("terminal spawn sent the wrong working-directory descriptors".into()),
     };
+    if let Some(directory) = &directory {
+        if let Err(error) = validate_execution_directory(directory) {
+            return fail(error);
+        }
+    }
     if let Some(recovery) = &recovery {
         let authority = (|| {
             let boot = crate::daemon::read_boot_id()?;
@@ -1067,7 +1112,7 @@ fn serve(control: UnixStream) -> i32 {
             return fail(format!("authorize terminal holder: {error}"));
         }
     }
-    let command = match STANDARD
+    let mut command = match STANDARD
         .decode(command)
         .map_err(|error| error.to_string())
         .and_then(|command| {
@@ -1076,6 +1121,17 @@ fn serve(control: UnixStream) -> i32 {
         Ok(command) => command,
         Err(error) => return fail(format!("decode terminal command: {error}")),
     };
+    if let Some(directory) = &directory {
+        // portable-pty resolves relative executables before fork and closes
+        // extra child descriptors in pre_exec. Reference the holder's pinned
+        // descriptor so both cwd and relative executable resolution survive
+        // that close; spawn keeps this descriptor alive through exec success.
+        command.cwd(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            directory.as_raw_fd()
+        ));
+    }
     let program = command
         .get_argv()
         .first()
@@ -1092,6 +1148,11 @@ fn serve(control: UnixStream) -> i32 {
         Ok(child) => child,
         Err(error) => return fail(format!("spawn {program}: {error:#}")),
     };
+    // Retain the directory for this holder's entire lifetime. For a shebang
+    // program exec success only starts its interpreter; the interpreter can
+    // open argv[0] through /proc/<holder>/fd/N afterwards. Closing this pin at
+    // spawn return would race that open even though the child's cwd is valid.
+    let _execution_directory = directory;
     drop(pair.slave);
     let Some(pid) = child.process_id().map(|pid| pid as libc::pid_t) else {
         return fail(format!("spawn {program}: no process id"));
@@ -1569,8 +1630,17 @@ pub(crate) fn inspect(
     expected: &Record,
     proof: &crate::model::HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
+    inspect_until(socket, expected, proof, Instant::now() + HANDOVER_TIMEOUT * 2)
+}
+
+pub(crate) fn inspect_until(
+    socket: &Path,
+    expected: &Record,
+    proof: &crate::model::HostSessionProof,
+    deadline: Instant,
+) -> Result<(Recovery, bool), String> {
     let control =
-        crate::daemon::holder_registry::connect(socket).map_err(|error| error.to_string())?;
+        crate::daemon::holder_registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
     let peer = peer_credentials(&control).map_err(|error| error.to_string())?;
     if peer.uid != crate::daemon::current_uid()
         || peer.pid != expected.holder.pid
@@ -1578,18 +1648,13 @@ pub(crate) fn inspect(
     {
         return Err("holder socket does not belong to the recorded process".into());
     }
-    control
-        .set_read_timeout(Some(HANDOVER_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    control
-        .set_write_timeout(Some(HANDOVER_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    send(
+    send_before(
         &control,
         &Request::Inspect {
             proof: proof.clone(),
         },
         &[],
+        Some(deadline),
     )
     .map_err(|error| error.to_string())?;
     let Some((
@@ -1599,7 +1664,7 @@ pub(crate) fn inspect(
             screen_lost,
         },
         descriptors,
-    )) = receive::<Report>(&control).map_err(|error| error.to_string())?
+    )) = receive_before::<Report>(&control, Some(deadline)).map_err(|error| error.to_string())?
     else {
         return Err("holder did not return discovery evidence".into());
     };
@@ -1637,6 +1702,18 @@ fn reap(pid: libc::pid_t) -> Option<libc::c_int> {
 }
 
 fn send(control: &UnixStream, message: &impl Serialize, descriptors: &[RawFd]) -> io::Result<()> {
+    send_before(control, message, descriptors, None)
+}
+
+fn io_budget(control: &UnixStream, deadline: Option<Instant>, write: bool) -> io::Result<()> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline.checked_duration_since(Instant::now()).filter(|duration| !duration.is_zero()).ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut,"Holder inspection deadline expired"))?;
+        if write { control.set_write_timeout(Some(remaining))?; } else { control.set_read_timeout(Some(remaining))?; }
+    }
+    Ok(())
+}
+
+fn send_before(control: &UnixStream, message: &impl Serialize, descriptors: &[RawFd], deadline: Option<Instant>) -> io::Result<()> {
     let body = serde_json::to_vec(message)?;
     let length = u32::try_from(body.len())
         .ok()
@@ -1647,6 +1724,7 @@ fn send(control: &UnixStream, message: &impl Serialize, descriptors: &[RawFd]) -
     frame.extend_from_slice(&body);
     let mut sent = 0;
     while sent < frame.len() {
+        io_budget(control, deadline, true)?;
         // Descriptors ride on the frame's first byte, so only the first call
         // carries them.
         let attached = if sent == 0 { descriptors } else { &[] };
@@ -1661,10 +1739,15 @@ fn send(control: &UnixStream, message: &impl Serialize, descriptors: &[RawFd]) -
 
 /// Reads one message, or `None` when the peer hung up between messages.
 fn receive<T: DeserializeOwned>(control: &UnixStream) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
+    receive_before(control, None)
+}
+
+fn receive_before<T: DeserializeOwned>(control: &UnixStream, deadline: Option<Instant>) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
     let mut header = [0u8; 4];
     let mut descriptors = Vec::new();
     let mut filled = 0;
     while filled < header.len() {
+        io_budget(control, deadline, false)?;
         match receive_with_descriptors(control, &mut header[filled..], &mut descriptors) {
             Ok(0) if filled == 0 && descriptors.is_empty() => return Ok(None),
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
@@ -1681,7 +1764,20 @@ fn receive<T: DeserializeOwned>(control: &UnixStream) -> io::Result<Option<(T, V
         ));
     }
     let mut body = vec![0; length as usize];
-    (&*control).read_exact(&mut body)?;
+    if deadline.is_some() {
+        let mut filled=0;
+        while filled<body.len() {
+            io_budget(control,deadline,false)?;
+            match (&*control).read(&mut body[filled..]) {
+                Ok(0)=>return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(count)=>filled+=count,
+                Err(error) if error.kind()==io::ErrorKind::Interrupted=>{},
+                Err(error)=>return Err(error),
+            }
+        }
+    } else {
+        (&*control).read_exact(&mut body)?;
+    }
     let message = serde_json::from_slice(&body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(Some((message, descriptors)))
@@ -1775,6 +1871,25 @@ fn receive_with_descriptors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspection_deadline_is_not_extended_by_partial_frame_progress() {
+        let (reader,mut writer)=UnixStream::pair().unwrap();
+        let body=serde_json::to_vec(&Report::Failed("x".repeat(128))).unwrap();
+        let producer=thread::spawn(move || {
+            if writer.write_all(&(body.len() as u32).to_le_bytes()).is_err() { return; }
+            for byte in body {
+                if writer.write_all(&[byte]).is_err() { break; }
+                thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let start=Instant::now();
+        let failure=receive_before::<Report>(&reader,Some(start+Duration::from_millis(80))).unwrap_err();
+        assert!(matches!(failure.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut));
+        assert!(start.elapsed()<Duration::from_secs(2));
+        drop(reader);
+        producer.join().unwrap();
+    }
 
     #[test]
     fn failed_adoption_commit_acknowledgement_keeps_unconsumed_replay() {
@@ -1990,6 +2105,92 @@ mod tests {
         assert!(descriptors.is_empty());
         drop(left);
         assert!(receive::<Report>(&right).unwrap().is_none());
+    }
+
+    #[test]
+    fn pinned_spawn_uses_renamed_directory_and_relative_program_not_reused_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let old = root.path().join("old");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("marker"), "ORIGINAL_DIRECTORY\n").unwrap();
+        // The outer interpreter deliberately waits until spawn has returned
+        // before opening the anchored script. This makes an early FD drop a
+        // deterministic failure instead of relying on interpreter scheduling.
+        let interpreter = root.path().join("delayed-interpreter");
+        std::fs::write(
+            &interpreter,
+            "#!/bin/sh\nprintf 'INTERPRETER_READY\\n'\nread latch\nexec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            old.join("probe"),
+            format!(
+                "#!{}\npwd -P\ncat marker\nprintf 'PINNED_DONE\\n'\n",
+                interpreter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let directory = std::sync::Arc::new(File::open(&old).unwrap());
+        std::fs::rename(&old, &moved).unwrap();
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("marker"), "WRONG_DIRECTORY\n").unwrap();
+        std::fs::write(
+            old.join("probe"),
+            "#!/bin/sh\nprintf 'WRONG_EXECUTABLE\\n'\nexit 43\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let mut command = CommandBuilder::new("./probe");
+        command.cwd(&old);
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held =
+            spawn_recoverable_at_directory(command, size(), exits, None, Some(directory)).unwrap();
+        read_until(&held.master, "INTERPRETER_READY");
+        std::io::Write::write_all(&mut File::from(held.master.duplicate().unwrap()), b"\n")
+            .unwrap();
+        let output = read_until(&held.master, "PINNED_DONE");
+        assert!(output.contains(moved.to_str().unwrap()), "{output}");
+        assert!(output.contains("ORIGINAL_DIRECTORY"), "{output}");
+        assert!(!output.contains("WRONG_"), "{output}");
+        assert!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn unavailable_directory_descriptor_is_refused_before_holder_spawn() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let removed = root.path().join("removed");
+        std::fs::create_dir(&removed).unwrap();
+        let directory = std::sync::Arc::new(File::open(&removed).unwrap());
+        std::fs::remove_dir(&removed).unwrap();
+        let marker = root.path().join("must-not-execute");
+        for directory in [
+            directory,
+            std::sync::Arc::new(tempfile::tempfile().unwrap()),
+        ] {
+            let (exits, _) = crossbeam_channel::bounded(1);
+            let result = spawn_recoverable_at_directory(
+                command(&format!("touch '{}'", marker.display())),
+                size(),
+                exits,
+                None,
+                Some(directory),
+            );
+            assert!(result.is_err());
+            assert!(!marker.exists());
+        }
     }
 
     #[test]

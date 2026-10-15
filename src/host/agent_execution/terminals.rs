@@ -57,8 +57,11 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ShutdownTerminal { terminal_id }
         | R::CloseTerminalChecked { terminal_id, .. } => Access::Control(*terminal_id),
         R::ReleaseCompletedTerminal { session, .. } => Access::Control(session.id),
+        R::CloseTerminalSourceChecked { source, .. } => Access::Control(source.id),
         R::Spawn { session, .. } => Access::Spawn(session),
-        R::CompletePendingTerminal { .. }
+        R::ProjectCloseInventory { .. }
+        | R::CloseProjectGuarded { .. }
+        | R::CompletePendingTerminal { .. }
         | R::DeviceOperation { .. }
         | R::Agent { .. }
         | R::Automation { .. }

@@ -349,6 +349,7 @@ pub(crate) fn flush_archived_notices() {
 }
 
 struct PublishedState {
+    execution_instance: uuid::Uuid,
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
     acknowledged_generation: AtomicU64,
@@ -393,6 +394,7 @@ impl PublishedState {
     fn new(visible: bool, wake: Arc<WakeCallback>) -> Self {
         let (capture_tx, capture_rx) = crossbeam_channel::bounded(1);
         Self {
+            execution_instance: uuid::Uuid::new_v4(),
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             published_generation: AtomicU64::new(0),
             acknowledged_generation: AtomicU64::new(0),
@@ -908,6 +910,11 @@ impl TerminalHandle {
     /// A stopped parser or foreground-process exit alone releases no ownership.
     pub fn is_completed(&self) -> bool {
         self.inner.published.completed.load(Ordering::Acquire)
+    }
+    /// Ephemeral identity of this exact resident worker, never a durable
+    /// terminal ID or a daemon-wide ownership proof.
+    pub(crate) fn execution_instance(&self) -> uuid::Uuid {
+        self.inner.published.execution_instance
     }
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -1604,6 +1611,13 @@ impl Worker {
             "CAGENTS_RECOVERY_ORIGIN",
             session.recovery_origin.unwrap_or(session.id).to_string(),
         );
+        let operational_directory = config
+            .execution_directory
+            .as_ref()
+            .map(|directory| PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())));
+        if let Some(directory) = &operational_directory {
+            command.cwd(directory);
+        }
         let executable = interactive_shell_launch(&session.launch)
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
@@ -1648,7 +1662,9 @@ impl Worker {
                 crate::agent_execution::bundled::install(
                     crate::agent::Provider::from_program(&session.launch.program),
                     &skill_environment,
-                    &session.launch.working_directory,
+                    operational_directory
+                        .as_deref()
+                        .unwrap_or(&session.launch.working_directory),
                 );
                 if let Some(path) = crate::agent_execution::bundled::matched_path(
                     command.get_env("PATH").and_then(|value| value.to_str()),
@@ -1656,11 +1672,12 @@ impl Worker {
                     command.env("PATH", path);
                 }
                 (
-                    holder::spawn_recoverable(
+                    holder::spawn_recoverable_at_directory(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        config.execution_directory.clone(),
                     )?,
                     Vec::new(),
                 )
