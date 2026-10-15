@@ -1390,6 +1390,17 @@ impl Claude {
                     }
                     "tool_result" => {
                         let tool_id = required(block, "tool_use_id")?.to_owned();
+                        // A history result may be on this page while its proven
+                        // original call is older. Capture that exact selected
+                        // call as source before grouping the page's items.
+                        if child.is_none()&&let Some(call)=correlated_call {
+                            let name=required(call,"name")?;
+                            let projected=tool_content(name,&call["input"],&self.cwd);
+                            step.events.push(Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{
+                                source:crate::chat::cache::SourceKey{agent_id:None,source_id:tool_id.clone()},
+                                name:name.into(),input:call["input"].to_string(),command:crate::chat::cache::raw::RawCommandCall::from_content(&projected),
+                            }));
+                        }
                         let cached=match self.cached_tool(child,&tool_id) {
                             Ok(cached)=>cached,
                             // History supplied this result's exact original
@@ -1846,6 +1857,9 @@ impl Adapter for Claude {
             for event in history_step.events {
                 match event {
                     Event::Item(item) => items.push(item),
+                    // Source capture must precede the grouped History event;
+                    // display grouping is not permission to discard originals.
+                    Event::RawToolCapture(_) => step.events.push(event),
                     Event::Subagent { .. }
                     | Event::SubagentItem { .. }
                     | Event::SubagentTextDelta { .. }
@@ -2069,24 +2083,16 @@ impl Adapter for Claude {
                     self.history_message(&frame, &mut step)?;
                 }
                 self.background_agents = running;
-                let items = step
-                    .events
-                    .into_iter()
-                    .filter_map(|e| {
-                        if let Event::Item(i) = e {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                Ok(Step {
-                    events: vec![Event::History {
-                        items: settled(items),
-                        has_earlier,
-                    }],
-                    ..Step::default()
-                })
+                let mut items=Vec::new();let mut captures=Vec::new();
+                for event in step.events {
+                    match event {
+                        Event::Item(item)=>items.push(item),
+                        Event::RawToolCapture(_)=>captures.push(event),
+                        _=>{},
+                    }
+                }
+                captures.push(Event::History{items:settled(items),has_earlier});
+                Ok(Step{events:captures,..Step::default()})
             }
         }
     }
@@ -10107,6 +10113,26 @@ mod tests {
         file.rewind().unwrap();
         History::index(file, session).unwrap()
     }
+    #[test]
+    fn native_history_grouping_retains_raw_originals_on_restart_and_older_pages(){
+        use crate::chat::cache::{SourceKey,raw::{RawSourceQuery,RawSourceField,RawRepresentation}};
+        let earlier=json!({"file_path":"/project/earlier.txt","content":"earlier native input"});let old=json!({"file_path":"/project/old.txt","content":"native input joined from an older call"});
+        let call=|id:&str,input:Value|json!({"type":"assistant","uuid":format!("carrier-{id}"),"message":{"content":[{"type":"tool_use","id":id,"name":"Write","input":input}]}});
+        let mut frames=vec![call("earlier",earlier.clone()),call("old",old.clone())];
+        for index in 0..110{frames.push(json!({"type":"assistant","uuid":format!("filler-{index}"),"message":{"content":"filler"}}));}
+        frames.push(json!({"type":"user","uuid":"old-result","message":{"content":[{"type":"tool_result","tool_use_id":"old","content":"saved","is_error":false}]}}));
+        let mut adapter=Claude{history:Some(correlation_history(frames)),..Claude::default()};
+        let mut initial=adapter.initialize().unwrap();
+        assert!(initial.events.iter().any(|event|matches!(event,Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{source,..}) if source.source_id=="old")),"latest result must retain its exact older call dependency");
+        let spec=ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:super::super::TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:Default::default()};
+        let mut store=crate::chat::runtime::preflight(&spec,&mut initial).unwrap();
+        let query=|id:&str|RawSourceQuery{source:SourceKey{agent_id:None,source_id:id.into()},field:RawSourceField::ToolInput,offset:0,limit:256*1024,expected_epoch:None,until:None};
+        let page=store.raw_source_page(query("old")).unwrap();assert_eq!(page.text,old.to_string());assert_eq!(page.metadata.tool_name,"Write");assert_eq!(page.metadata.representation,RawRepresentation::CanonicalJson);
+        let older=adapter.command(Command::LoadEarlier).unwrap();assert!(older.events.iter().any(|event|matches!(event,Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{source,..}) if source.source_id=="earlier")));
+        for event in older.events{store.apply(event).unwrap();}
+        assert_eq!(store.raw_source_page(query("earlier")).unwrap().text,earlier.to_string());assert_eq!(store.raw_source_page(query("old")).unwrap().epoch,page.epoch,"equivalent older replay preserves original source epoch");
+    }
+
     fn correlation_call(id: &str, path: &str) -> Value {
         json!({"type":"tool_use","id":id,"name":"Edit","input":{"file_path":path,"old_string":"old","new_string":"requested"}})
     }
@@ -10145,7 +10171,7 @@ mod tests {
         while adapter.history.as_ref().unwrap().offset > 0 {
             let step = adapter.command(Command::LoadEarlier).unwrap();
             pages += 1;
-            let Event::History { items: page, .. } = step.events.into_iter().next().unwrap() else {
+            let Event::History { items: page, .. } = step.events.into_iter().find(|event|matches!(event,Event::History{..})).unwrap() else {
                 panic!("history")
             };
             for item in page {
