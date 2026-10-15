@@ -5,6 +5,8 @@ mod close_processes;
 mod close_tests;
 #[cfg(test)]
 mod event_dispatch_tests;
+#[cfg(test)]
+mod pty_reader_tests;
 pub(crate) mod holder;
 
 use close_processes::{FrozenFamily, RootIdentity};
@@ -73,6 +75,10 @@ const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 /// immediately in every case we can construct; this only bounds the ones we
 /// cannot, because a hung join here wedges the daemon's dispatch thread.
 const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+/// A full parser inbox must not hide closure of the reader's original wake
+/// pipe. Keep backpressure lossless while the owner is running, and check its
+/// cancellation between bounded channel waits.
+const READER_SEND_POLL: Duration = Duration::from_millis(10);
 /// How long a synchronized update (DEC mode 2026) may withhold output from the
 /// published grid. A program brackets a frame it has to emit in several writes
 /// - clearing the screen, then repainting it - so that no half-drawn frame is
@@ -3492,34 +3498,63 @@ fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: Owned
             Readiness::Readable => {}
             Readiness::Shutdown => return,
             Readiness::Failed(error) => {
-                let _ = sender.send(PtyMessage::Error(error));
+                send_pty_message(sender, PtyMessage::Error(error), &wake);
                 return;
             }
         }
         match reader.read(&mut buffer) {
             Ok(0) => {
-                let _ = sender.send(PtyMessage::Eof);
+                send_pty_message(sender, PtyMessage::Eof, &wake);
                 return;
             }
             // A PTY master reads EIO, not end of file, once its terminal's
             // last slave closes: the ordinary end of a terminal.
             Err(error) if error.raw_os_error() == Some(libc::EIO) => {
-                let _ = sender.send(PtyMessage::Eof);
+                send_pty_message(sender, PtyMessage::Eof, &wake);
                 return;
             }
             Ok(read) => {
-                if sender
-                    .send(PtyMessage::Bytes(buffer[..read].to_vec()))
-                    .is_err()
-                {
+                if !send_pty_message(sender, PtyMessage::Bytes(buffer[..read].to_vec()), &wake) {
                     return;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            // A duplicate shares file-status flags with the writer. If that
+            // owner uses nonblocking I/O, another read/line-discipline change
+            // can consume readiness before this read. Re-arm the original
+            // descriptor instead of treating EAGAIN as terminal failure.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
             Err(error) => {
-                let _ = sender.send(PtyMessage::Error(error.to_string()));
+                send_pty_message(sender, PtyMessage::Error(error.to_string()), &wake);
                 return;
             }
+        }
+    }
+}
+
+fn send_pty_message(sender: &Sender<PtyMessage>, mut message: PtyMessage, wake: &OwnedFd) -> bool {
+    loop {
+        let mut cancellation = libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut cancellation, 1, 0) } < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if cancellation.revents != 0 {
+            return false;
+        }
+        match sender.send_timeout(message, READER_SEND_POLL) {
+            Ok(()) => return true,
+            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => message = pending,
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return false,
         }
     }
 }
