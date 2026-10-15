@@ -1450,7 +1450,7 @@ impl State {
         .width(Length::Fill);
         let mut content = widget::column::with_children(Vec::<Element<'_, Action>>::new())
             .spacing(space::M)
-            .padding([0, space::L, space::L, space::L])
+            .padding([0.0, space::L, space::L, space::L])
             .width(Length::Fill);
         if let Some(error) = &self.error
             && self.draft.is_none()
@@ -1806,7 +1806,7 @@ impl State {
             let list = widget::scrollable(
                 widget::column::with_children(listing)
                     .spacing(space::XS)
-                    .padding([0, space::L, space::L, space::L]),
+                    .padding([0.0, space::L, space::L, space::L]),
             );
             if width >= 700.0 {
                 widget::row::with_children(vec![

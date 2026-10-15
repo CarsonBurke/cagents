@@ -6680,7 +6680,7 @@ impl Cagents {
                     Ok(_) => {} // A newer durable descriptor owns the pane.
                     Err(error) => self.fail_runtime(target.card, error.clone()),
                 }
-                Task::none()
+                return Task::none();
             }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());

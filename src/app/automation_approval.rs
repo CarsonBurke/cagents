@@ -78,7 +78,7 @@ impl Cagents {
         if pending.is_empty() && self.automation_approval.total == 0 {
             return iced::widget::Space::new().height(Length::Shrink).into();
         }
-        let rows = pending
+        let rows: Vec<Element<'_, Message>> = pending
             .iter()
             .map(|proposal| {
                 widget::row::with_children(vec![
