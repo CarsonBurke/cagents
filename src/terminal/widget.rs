@@ -4835,9 +4835,28 @@ mod tests {
             map_iced_key(&key("ü"), physical(keyboard::key::Code::BracketLeft)),
             TerminalKey::Character('ü')
         );
-        // A non-Latin key with no US key in its place stays itself.
+        // Recognized international positions retain their physical identity,
+        // while the layout's text and unshifted character stay available to
+        // the encoder. A genuinely unidentified position uses its logical key.
+        let international = key_press(
+            &key("ё"),
+            &key("ё"),
+            physical(keyboard::key::Code::IntlBackslash),
+            keyboard::Modifiers::empty(),
+            Some("ё"),
+            false,
+        );
+        assert_eq!(international.key, TerminalKey::IntlBackslash);
+        assert_eq!(international.text.as_deref(), Some("ё"));
+        assert_eq!(international.unshifted_codepoint, Some('ё'));
         assert_eq!(
-            map_iced_key(&key("ё"), physical(keyboard::key::Code::IntlBackslash)),
+            key_release(&key("ё"), physical(keyboard::key::Code::IntlBackslash),
+                keyboard::Modifiers::empty()).key,
+            international.key
+        );
+        assert_eq!(
+            map_iced_key(&key("ё"), keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified)),
             TerminalKey::Character('ё')
         );
 
