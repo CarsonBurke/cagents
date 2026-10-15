@@ -7613,6 +7613,13 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                // Both scoped restoration feedback and ordinary failures must
+                // release a rejected history request immediately.
+                if result.is_err() && pending.page.is_some() {
+                    runtime.page_request=None;
+                    runtime.earlier_asked=None;
+                    runtime.later_asked=None;
+                }
                 let first_prompt = match result {
                     Ok(()) => {
                         if pending.followup {
@@ -7661,11 +7668,6 @@ impl Cagents {
                         return Task::none();
                     }
                     Err(error) => {
-                        if pending.page.is_some() {
-                            runtime.page_request = None;
-                            runtime.earlier_asked = None;
-                            runtime.later_asked = None;
-                        }
                         if pending.followup {
                             runtime.restore_followups();
                         }
@@ -17160,6 +17162,29 @@ mod tests {
             assert_eq!(runtime.error.as_deref(),Some("existing provider transport failure"));
             assert_eq!(runtime.snapshot.error.as_deref(),Some("API Error: 529 Overloaded"));
             assert_eq!(runtime.recovery.notice.as_deref(),result.err().as_deref().map(|_|"Original restoration: Wait for effective settings readback"));
+        }
+    }
+
+    #[test]
+    fn held_history_refusal_releases_page_bookkeeping_without_replacing_provider_error() {
+        for command in [Command::LoadEarlier,Command::LoadLater] {
+            let mut app=crate::app::tests::context_inspector_test_app(false);
+            let card=live_chat(&mut app,Some(KNOWN_THREAD));let target=chat_runtime(&app,card).target;
+            let runtime=app.chat_runtime_mut(target).unwrap();
+            let snapshot=Arc::make_mut(&mut runtime.snapshot);snapshot.original_retry_pending=true;
+            snapshot.has_earlier=true;snapshot.has_later=true;snapshot.error=Some("API Error: 529 Overloaded".into());
+            runtime.earlier_asked=Some(900.0);runtime.later_asked=Some(900.0);
+            drop(app.chat_send(target,command,false));
+            assert!(chat_runtime(&app,card).pending.as_ref().unwrap().page.is_some());
+            // A newer generation arriving before ACK must not be required to
+            // wake or repair this command's bookkeeping after refusal.
+            Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).generation+=1;
+            settle(&mut app,card,Err("History temporarily unavailable".into()));
+            let runtime=chat_runtime(&app,card);
+            assert!(runtime.page_request.is_none() && runtime.earlier_asked.is_none() && runtime.later_asked.is_none());
+            assert!(runtime.error.is_none());
+            assert_eq!(runtime.snapshot.error.as_deref(),Some("API Error: 529 Overloaded"));
+            assert_eq!(runtime.recovery.notice.as_deref(),Some("Original restoration: History temporarily unavailable"));
         }
     }
 
