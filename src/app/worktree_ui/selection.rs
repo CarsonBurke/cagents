@@ -21,6 +21,7 @@ pub(in crate::app) enum Intent {
     Navigate,
     Terminal(TerminalSession),
     NewTerminal(PathBuf),
+    NewNativeThread,
     Chat { session: chat::Session, beside: Option<CardId>, ephemeral: bool },
     Resume { entry: crate::persistence::SavedConversation, replace: Option<CardId> },
     Focus { card: CardId, activate: bool },
@@ -171,6 +172,7 @@ impl Cagents {
             Intent::Navigate => Task::none(),
             Intent::Terminal(session) => self.insert_terminal_card(session,None),
             Intent::NewTerminal(path) => self.add_terminal(path),
+            Intent::NewNativeThread => self.new_native_thread(),
             Intent::Chat {session,beside,ephemeral} => self.insert_chat_card_with_lifetime(session,beside,ephemeral,None),
             Intent::Resume {entry,replace} => self.commit_resumed_conversation(entry,replace),
             Intent::Focus {card,activate} => {
