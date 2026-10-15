@@ -2830,6 +2830,9 @@ fn completion_navigates(message: &Message) -> bool {
             open_cards: true,
             result: Ok(_),
             ..
+        } | Message::ProjectWorktreeCreated {
+            result: Ok(WorktreeCreationOutcome::Created { .. }),
+            ..
         } | Message::WorktreeCreated {
             result: Ok(WorktreeCreationOutcome::Created { .. }),
             ..
@@ -7142,6 +7145,14 @@ pub enum Message {
         result: Result<crate::repository::WorktreeOperationReport, String>,
     },
     WorktreeOperationsRehydrated(Result<Vec<crate::repository::WorktreeOperationReport>, String>),
+    ProjectWorktreeCreated {
+        project_id: ProjectId,
+        source_id: OperationId,
+        operation: OperationId,
+        project_generation: u64,
+        repository: PathBuf,
+        result: Result<WorktreeCreationOutcome, String>,
+    },
     WorktreeCreated {
         project_id: ProjectId,
         repository: PathBuf,
@@ -20425,64 +20436,15 @@ impl Application for Cagents {
                 self.restore_worktree_operations(result)
             }
             Message::SubmitWorktree => self.submit_worktree_dialog(),
-            Message::WorktreeCreated {
-                project_id,
-                repository,
-                result,
-            } => {
-                match result {
-                    Ok(WorktreeCreationOutcome::Created { worktree, .. }) => {
-                        if let Some(session) = &self.session {
-                            session.save_worktrees([WorktreeState {
-                                id: worktree.id,
-                                project_id,
-                                generation: 0,
-                                path: worktree.path.clone(),
-                                branch: worktree.branch.as_deref().map(|branch| {
-                                    branch
-                                        .strip_prefix("refs/heads/")
-                                        .unwrap_or(branch)
-                                        .to_owned()
-                                }),
-                                existence: Existence::Open,
-                            }]);
-                        }
-                        self.status = Some(TransientNotice::success(format!(
-                            "Created worktree {}",
-                            worktree.path.display()
-                        )));
-                        if let Some(project) = self
-                            .sidebar_model
-                            .projects
-                            .iter_mut()
-                            .find(|project| project.id == project_id)
-                        {
-                            project
-                                .worktrees
-                                .push(SidebarWorktree::from_repository(&worktree, None));
-                        }
-                        let terminal = self.select_worktree(worktree.path, true);
-                        let chrome = self.sync_chrome();
-                        return Task::batch([
-                            terminal,
-                            chrome,
-                            self.repository_load_task(repository, Some(project_id), false),
-                        ]);
-                    }
-                    Ok(WorktreeCreationOutcome::NotCreated { failure }) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Could not create the worktree: {failure}"
-                        )));
-                    }
-                    Ok(WorktreeCreationOutcome::OutcomeUnknown { failure, .. }) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "The worktree creation outcome is unknown. Refresh the project before trying again. {failure}"
-                        )));
-                    }
-                    Err(error) => self.status = Some(TransientNotice::error(error)),
+            Message::ProjectWorktreeCreated { project_id, source_id, operation, project_generation, repository, result } => {
+                if !result.as_ref().is_ok_and(|outcome|
+                    self.completed_project_creation_matches(operation, project_id, source_id, project_generation, &repository, outcome)) {
+                    return Task::none();
                 }
-                Task::none()
+                self.apply_worktree_created(project_id, repository, result)
             }
+            Message::WorktreeCreated { project_id, repository, result } =>
+                self.apply_worktree_created(project_id, repository, result),
             Message::PullRequestBaseChanged(value) => {
                 if let Some(dialog) = &mut self.pull_request_dialog {
                     dialog.base = value;
