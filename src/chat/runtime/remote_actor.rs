@@ -142,6 +142,7 @@ impl RemoteActor {
     pub fn identity(&self)->ActorIdentity {self.0.identity.clone()}
     pub fn state(&self)->Arc<Resident> {self.0.state.lock().unwrap_or_else(|p|p.into_inner()).clone()}
     pub fn execution_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {self.0.environment.clone()}
+    pub fn restart_environment(&self)->BTreeMap<String,String> {self.0.recovery_environment.clone()}
     pub fn recovery_environment_matches(&self,value:&BTreeMap<String,String>)->bool {&self.0.recovery_environment==value}
     #[cfg(test)]
     pub fn resource_lifetime(&self)->Box<dyn Fn()->bool> {let weak=Arc::downgrade(&self.0);Box::new(move||weak.upgrade().is_some())}
@@ -400,7 +401,7 @@ impl Server {
         let published=changed.clone();let outcomes=journal.clone();
         let account_reports=Arc::new(Mutex::new(Vec::<Update>::new()));let reported=account_reports.clone();
         if disconnected(control)? {return Err("Retained actor launch cancelled before process creation".into());}
-        let actor=LocalHandle::start_inner(spec_and_adapter.0,spec_and_adapter.1,initial,store,startup.source.launch.session_id.clone(),None,move|update|{
+        let actor=LocalHandle::start_inner(spec_and_adapter.0,spec_and_adapter.1,initial,store,None,startup.source.launch.session_id.clone(),None,move|update|{
             let mut journal=outcomes.lock().unwrap_or_else(|p|p.into_inner());
             if let Err(error)=journal.append(&update) {let _=journal.record_loss(&format!("Retained actor outcome continuity is unconfirmed: {error}"));}
             drop(journal);

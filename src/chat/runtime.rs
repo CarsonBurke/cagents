@@ -176,7 +176,7 @@ impl LocalHandle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
+        Self::start_inner(spec, adapter, initial, store, None, session_id, None, notify)
     }
 
     pub(crate) fn start_owned(
@@ -186,6 +186,7 @@ impl LocalHandle {
         store: Store,
         source: super::Session,
         recovery_environment: BTreeMap<String, String>,
+        previous: Option<&LocalHandle>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
@@ -194,6 +195,7 @@ impl LocalHandle {
             adapter,
             initial,
             store,
+            previous.map(|handle|handle.0.store.clone()),
             id,
             Some(NativeOwnership::New(source, recovery_environment)),
             notify,
@@ -207,6 +209,7 @@ impl LocalHandle {
         store: Store,
         recovery: super::native_holder::Recovery,
         holder: super::native_holder::Holder,
+        previous:Option<&LocalHandle>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let server = recovery
@@ -218,6 +221,7 @@ impl LocalHandle {
             adapter,
             initial,
             store,
+            previous.map(|handle|handle.0.store.clone()),
             recovery.confirmed_thread,
             Some(NativeOwnership::Adopted(holder, server)),
             notify,
@@ -229,6 +233,7 @@ impl LocalHandle {
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
+        retained_store:Option<Arc<Mutex<Store>>>,
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
         notify: impl Fn(Update) + Send + Sync + 'static,
@@ -302,7 +307,7 @@ impl LocalHandle {
         let completed = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
-        let store = Arc::new(Mutex::new(store));
+        let store = retained_store.unwrap_or_else(||Arc::new(Mutex::new(store)));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
@@ -1045,6 +1050,7 @@ impl LocalHandle {
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
     }
+    pub(crate) fn restart_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {crate::terminal_ipc::ChatExecutionEnvironment(self.0.recovery_environment.clone())}
     pub(crate) fn recovery_environment_matches(
         &self,
         environment: &BTreeMap<String, String>,
@@ -1265,6 +1271,24 @@ impl LocalHandle {
 /// Validate local launch and adapter initialization before stopping an existing CLI.
 pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
     preflight_inner(spec, initial, false)
+}
+
+/// Same-daemon completed local actors retain streamed items that a provider
+/// has not yet written to its own history. A remote actor is always reattached.
+pub(crate) fn preflight_restart(spec:&ProcessSpec,initial:&mut Step,previous:&Handle)->Result<Store,String> {
+    preflight_with_previous(spec,initial,previous.local_actor()?,false)
+}
+pub(crate) fn preflight_retained_restart(spec:&ProcessSpec,initial:&mut Step,previous:&Handle)->Result<Store,String> {
+    if !matches!(spec.transport,TransportSpec::UnixWebSocket {..}) {return Err("Retained preflight cannot launch a provider".into());}
+    preflight_with_previous(spec,initial,previous.local_actor()?,true)
+}
+fn preflight_with_previous(spec:&ProcessSpec,initial:&mut Step,previous:&LocalHandle,retained:bool)->Result<Store,String> {
+    if !previous.is_completed() {return Err("The previous provider still owns this conversation".into());}
+    let events=initial.events.clone();
+    let validation=preflight_inner(spec,initial,retained)?;
+    let mut store=previous.0.store.lock().unwrap_or_else(|p|p.into_inner());
+    let mut metadata=Vec::new();for event in events {metadata.extend(store.apply(event)?);}
+    initial.events=metadata;Ok(validation)
 }
 
 /// Only an authenticated retained server can restore its read-only connection
@@ -4892,6 +4916,40 @@ mod tests {
         );
         assert_eq!(state.selected_model.as_deref(), Some("model"));
         assert!(state.reasoning.is_none());
+    }
+
+    #[test]
+    fn recovery_preflight_preserves_partial_output_missing_from_provider_history() {
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step {
+            writes: Vec::new(),
+            events: vec![Event::Item(text("partial", "answer before the crash"))],
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let previous =
+            Handle::start(spec.clone(), Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        previous.close().unwrap();
+        let mut resumed = Step {
+            writes: Vec::new(),
+            events: vec![Event::LatestHistory {
+                items: Vec::new(),
+                has_earlier: false,
+            }],
+        };
+        let _validation = preflight_restart(&spec, &mut resumed, &previous).unwrap();
+        let window = previous.local_actor().unwrap().0.store.lock().unwrap().window().unwrap();
+        assert_eq!(window.items.len(), 1);
+        assert!(
+            matches!(&window.items[0].content, ItemContent::Text { text, .. }
+            if text == "answer before the crash")
+        );
     }
 
     struct Echo;

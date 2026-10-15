@@ -15,11 +15,21 @@ impl Handle {
         LocalHandle::start(spec,adapter,initial,store,session_id,notify).map(|local|Self(Owner::Local(local)))
     }
     pub(crate) fn start_owned(spec:ProcessSpec,adapter:Box<dyn Adapter>,initial:Step,store:Store,source:chat::Session,recovery_environment:BTreeMap<String,String>,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
-        LocalHandle::start_owned(spec,adapter,initial,store,source,recovery_environment,notify).map(|local|Self(Owner::Local(local)))
+        LocalHandle::start_owned(spec,adapter,initial,store,source,recovery_environment,None,notify).map(|local|Self(Owner::Local(local)))
     }
     pub(crate) fn start_adopted(spec:ProcessSpec,adapter:Box<dyn Adapter>,initial:Step,store:Store,recovery:chat::native_holder::Recovery,holder:chat::native_holder::Holder,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
-        LocalHandle::start_adopted(spec,adapter,initial,store,recovery,holder,notify).map(|local|Self(Owner::Local(local)))
+        LocalHandle::start_adopted(spec,adapter,initial,store,recovery,holder,None,notify).map(|local|Self(Owner::Local(local)))
     }
+    pub(super) fn local_actor(&self)->Result<&LocalHandle,String> {match &self.0 {Owner::Local(local)=>Ok(local),Owner::Remote(_)=>Err("A retained actor must reconnect to its existing reducer; never replace it with a local provider".into())}}
+    pub(crate) fn start_owned_with_previous(spec:ProcessSpec,adapter:Box<dyn Adapter>,initial:Step,store:Store,source:chat::Session,recovery_environment:BTreeMap<String,String>,previous:Option<&Handle>,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
+        let previous=previous.map(Handle::local_actor).transpose()?;
+        LocalHandle::start_owned(spec,adapter,initial,store,source,recovery_environment,previous,notify).map(|local|Self(Owner::Local(local)))
+    }
+    pub(crate) fn start_adopted_with_previous(spec:ProcessSpec,adapter:Box<dyn Adapter>,initial:Step,store:Store,recovery:chat::native_holder::Recovery,holder:chat::native_holder::Holder,previous:Option<&Handle>,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
+        let previous=previous.map(Handle::local_actor).transpose()?;
+        LocalHandle::start_adopted(spec,adapter,initial,store,recovery,holder,previous,notify).map(|local|Self(Owner::Local(local)))
+    }
+    pub(crate) fn restart_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {match &self.0 {Owner::Local(local)=>local.restart_environment(),Owner::Remote(remote)=>crate::terminal_ipc::ChatExecutionEnvironment(remote.restart_environment())}}
     /// The host selects this after preparing the exact authorized launch. It
     /// must drain/commit/ACK the outbox; ordinary notification is only a wakeup.
     pub(crate) fn start_remote_owned(spec:ProcessSpec,source:chat::Session,recovery_environment:BTreeMap<String,String>,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
