@@ -5344,6 +5344,18 @@ impl Cagents {
         }
     }
 
+    pub(super) fn defer_channel_title_suggestion(&mut self, edit: &crate::workspace_model::ModelEdit) {
+        let crate::workspace_model::ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } = edit else { return; };
+        for (target, observation) in &mut self.chat_ui.channel_names {
+            if target.card == *card && observation.last_view == Some((*id, *expected_revision))
+                && observation.title.as_ref().is_some_and(|(current, kind)| current == title && kind == source) {
+                observation.pending = true;
+            }
+        }
+        // No task is emitted: a future genuine Wake or changed view proof
+        // samples/adopts current metadata before another optional publication.
+    }
+
     /// A title may precede its pane's first shared-view acknowledgement. Retry
     /// the retained candidate after projection, with the newly accepted proof.
     pub(super) fn refresh_channel_title_suggestions(&mut self) {
@@ -12744,6 +12756,24 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn deferred_title_marker_only_rearms_the_exact_current_candidate_without_an_eager_task() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD)); let target = chat_runtime(&app, card).target;
+        let id = crate::model::ChannelId::new();
+        app.chat_ui.channel_names.insert(target, ChannelNameObservation { session: Some(KNOWN_THREAD.into()),
+            title: Some(("Encryption review".into(), crate::model::ChannelTitleSource::Provider)),
+            last_view: Some((id, 17)), ..Default::default() });
+        let candidate = |revision, name: &str| crate::workspace_model::ModelEdit::SuggestConversationTitle { id, card,
+            expected_revision: revision, title: name.into(), source: crate::model::ChannelTitleSource::Provider };
+        app.defer_channel_title_suggestion(&candidate(16, "Encryption review"));
+        app.defer_channel_title_suggestion(&candidate(17, "Older name"));
+        assert!(!app.chat_ui.channel_names[&target].pending);
+        let task = app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::TitleDeferred(candidate(17, "Encryption review")));
+        assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+        assert!(app.chat_ui.channel_names[&target].pending);
     }
 
     #[test]
