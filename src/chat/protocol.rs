@@ -346,6 +346,9 @@ pub trait Adapter: Send {
     fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> {
         Ok(())
     }
+    /// Pending setting acknowledgments must settle before account metadata can
+    /// describe an idle choice. This is not a backend conditional-close proof.
+    fn account_switch_ready(&self)->bool {true}
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(

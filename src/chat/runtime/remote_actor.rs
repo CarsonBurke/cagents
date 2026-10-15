@@ -117,6 +117,11 @@ struct ClosePublication {
     resident: Resident,
 }
 #[derive(Serialize, Deserialize)]
+struct AccountSwitchClose {
+    options: Option<super::AccountSwitchOptions>,
+    publication: Option<ClosePublication>,
+}
+#[derive(Serialize, Deserialize)]
 struct DirectoryEvidence {
     process: Process,
     identity: crate::agent_execution::DirectoryIdentity,
@@ -1387,6 +1392,19 @@ impl RemoteActor {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    pub fn close_for_account_switch(&self,generation:u64)->Result<Option<super::AccountSwitchOptions>,String> {
+        let result:AccountSwitchClose=self.call("close_for_account_switch",json!([generation]))?;
+        match (result.options,result.publication) {
+            (None,None)=>Ok(None),
+            (Some(options),Some(publication))=>{
+                *self.0.state.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(publication.resident);
+                self.publish_closed(publication.snapshot);
+                (self.0.notify)(Update::RetainedOutcomes);
+                Ok(Some(options))
+            },
+            _=>Err("The account handoff did not return matching final options and cleanup publication".into()),
+        }
+    }
     pub fn close(&self) -> Result<(), String> {
         self.close_method("close", Value::Null)
     }
@@ -1871,6 +1889,25 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
+            "account_switch_generation" => value!(self.actor.account_switch_generation()?),
+            "completed_account_options" => value!(self.actor.completed_account_options()?),
+            "account_switch_notice" => {
+                let (source,target)=decode!((chat::Launch,chat::Launch));
+                self.actor.account_switch_notice(&source,&target)?;
+                Ok(Value::Null)
+            },
+            "restore_account_options" => {
+                let (options,budget)=decode!((super::AccountSwitchOptions,u64));
+                if self.session_stopping || budget==0 {return Err("Account option restoration is unavailable while the actor is stopping or its budget expired".into());}
+                self.actor.restore_account_options(&options,Instant::now()+Duration::from_millis(budget.min(4000)),||false)?;
+                Ok(Value::Null)
+            },
+            "close_for_account_switch" => {
+                let (generation,)=decode!((u64,));
+                let options=self.actor.close_for_account_switch(generation)?;
+                let publication=if options.is_some() {reap_orphans()?;self.finish_inputs();Some(self.publish_close()?)} else {None};
+                value!(AccountSwitchClose{options,publication})
+            },
             "execution_environment" => value!(self.environment.clone()),
             "restart" => {
                 if self.session_stopping {
@@ -3714,4 +3751,76 @@ done"#;
         ));
         assert!(!terminal_endpoint_error("timed out", true));
     }
+
+    #[test]
+    fn account_switch_helper_refuses_live_replacement_and_preserves_completed_controls() {
+        const CHILD:&str="CAGENTS_ACCOUNT_SWITCH_HELPER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let name=thread::current().name().unwrap().to_owned();
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",&name,"--nocapture"]).env(CHILD,"1").output().unwrap();
+            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        assert_eq!(unsafe{libc::prctl(libc::PR_SET_CHILD_SUBREAPER,1,0,0,0)},0);
+        let mut fixture=resident_fixture();
+        let server=&mut fixture.server;
+        let issued=server.source.clone();
+        let process=server.actor.provider_process().unwrap();
+        let invoke=|server:&mut Server,method:&str,args:Value|server.invoke(Invocation{
+            proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args,
+        });
+        let generation:Option<u64>=serde_json::from_value(invoke(server,"account_switch_generation",Value::Null).unwrap()).unwrap();
+        let error=invoke(server,"close_for_account_switch",json!([generation.unwrap()])).unwrap_err();
+        assert!(error.contains("cannot prove safe exact account handoff"));
+        assert!(process.is_current(),"a scalar idle observation cannot stop the live fixture provider");
+        assert!(!server.actor.0.stop.load(Ordering::Acquire));
+        assert!(server.closed_snapshot.is_none());
+        assert_eq!(server.source,issued,"account choice cannot mutate issued launch provenance");
+        {
+            let mut state=server.actor.0.state.lock().unwrap();
+            state.selected_model=Some("chosen-before-next-send".into());
+            state.reasoning=Some("high".into());
+            state.permission_mode=Some("plan".into());
+        }
+        // Explicit fixture teardown is separate from the account selector.
+        server.actor.close().unwrap();
+        let options:Option<super::super::AccountSwitchOptions>=serde_json::from_value(invoke(server,"completed_account_options",Value::Null).unwrap()).unwrap();
+        let options=options.unwrap();
+        assert_eq!(options.model.as_deref(),Some("chosen-before-next-send"));
+        assert_eq!(options.reasoning.as_deref(),Some("high"));
+        assert_eq!(options.permission_mode.as_deref(),Some("plan"));
+        let generation:Option<u64>=serde_json::from_value(invoke(server,"account_switch_generation",Value::Null).unwrap()).unwrap();
+        let stale:AccountSwitchClose=serde_json::from_value(invoke(server,"close_for_account_switch",json!([generation.unwrap().wrapping_add(1)])).unwrap()).unwrap();
+        assert!(stale.options.is_none()&&stale.publication.is_none());
+        let admitted:AccountSwitchClose=serde_json::from_value(invoke(server,"close_for_account_switch",json!([generation.unwrap()])).unwrap()).unwrap();
+        assert_eq!(admitted.options,Some(options));
+        assert!(admitted.publication.unwrap().resident.completed);
+        assert!(!process.is_current());
+        assert_eq!(server.source,issued);
+    }
+
+    #[test]
+    fn account_switch_proxy_refuses_partial_final_publication_without_cleanup_or_options_claim() {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket=root.path().join("account-switch.sock");
+        let listener=UnixListener::bind(&socket).unwrap();
+        let mut actor=RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket=socket;
+        let peer=thread::spawn(move||{
+            let (control,_)=listener.accept().unwrap();
+            let request:Invocation=receive(&control,TIMEOUT).unwrap();
+            assert_eq!(request.method,"close_for_account_switch");
+            assert_eq!(request.args,json!([42]));
+            send(&control,&Ok::<_,String>(AccountSwitchClose{options:Some(super::super::AccountSwitchOptions{
+                model:Some("acknowledged-model".into()),reasoning:Some("high".into()),permission_mode:None,fast_mode:None,permissions:None,
+            }),publication:None}),TIMEOUT).unwrap();
+        });
+        let error=actor.close_for_account_switch(42).unwrap_err();
+        assert!(error.contains("matching final options"));
+        assert!(actor.owns_work(),"a partial reply is not cleanup proof");
+        assert!(!actor.state().completed);
+        peer.join().unwrap();
+    }
+
 }

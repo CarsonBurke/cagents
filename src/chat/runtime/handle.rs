@@ -316,6 +316,29 @@ impl Handle {
             }
         }
     }
+    pub(crate) fn account_switch_generation(&self)->Result<Option<u64>,String> {
+        match &self.0 {Owner::Local(local)=>local.account_switch_generation(),Owner::Remote(remote)=>remote.call("account_switch_generation",serde_json::Value::Null)}
+    }
+    pub(crate) fn completed_account_options(&self)->Result<Option<super::AccountSwitchOptions>,String> {
+        match &self.0 {Owner::Local(local)=>local.completed_account_options(),Owner::Remote(remote)=>remote.call("completed_account_options",serde_json::Value::Null)}
+    }
+    pub(crate) fn close_for_account_switch(&self,generation:u64)->Result<Option<super::AccountSwitchOptions>,String> {
+        match &self.0 {Owner::Local(local)=>local.close_for_account_switch(generation),Owner::Remote(remote)=>remote.close_for_account_switch(generation)}
+    }
+    pub(crate) fn restore_account_options(&self,options:&super::AccountSwitchOptions,deadline:std::time::Instant,cancelled:impl Fn()->bool)->Result<(),String> {
+        if cancelled() {return Err("Account options restoration was cancelled".into());}
+        match &self.0 {
+            Owner::Local(local)=>local.restore_account_options(options,deadline,cancelled),
+            Owner::Remote(remote)=>{
+                let budget=deadline.saturating_duration_since(std::time::Instant::now()).as_millis().min(4000) as u64;
+                if budget==0 {return Err("Account options restoration budget expired".into());}
+                remote.call("restore_account_options",serde_json::json!([options,budget]))
+            }
+        }
+    }
+    pub(crate) fn account_switch_notice(&self,source:&chat::Launch,target:&chat::Launch)->Result<(),String> {
+        match &self.0 {Owner::Local(local)=>local.account_switch_notice(source,target),Owner::Remote(remote)=>remote.call("account_switch_notice",serde_json::json!([source,target]))}
+    }
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.close_if_idle(generation),
