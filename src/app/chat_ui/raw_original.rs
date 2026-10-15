@@ -144,6 +144,12 @@ impl State {
         }
         if changed {self.revision=self.revision.wrapping_add(1);}changed
     }
+    /// Checkpoint index allocations are metadata, outside the shared raw body
+    /// pool and ReaderCapacity. Descriptor clones share these same allocations.
+    pub(super) fn retained_checkpoint_bytes(&self)->usize {
+        self.entries.values().filter_map(|entry|entry.loaded.as_ref())
+            .map(|loaded|loaded.prefixes.capacity().saturating_mul(std::mem::size_of::<[u8;32]>())).sum()
+    }
     pub(super) fn retained_bytes(&self)->usize {self.entries.values().map(|entry|entry.loaded.as_ref().map_or(0,|loaded|loaded.view.text.len())+entry.restored.as_ref().map_or(0,|text|text.len())).sum()}
     pub(super) fn capture(&self)->ResidentRawCalls {
         ResidentRawCalls {calls:self.entries.values().filter_map(|entry|entry.loaded.as_ref().map(|loaded|(loaded.view.text.clone(),loaded.record.clone()))
