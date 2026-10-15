@@ -7613,6 +7613,7 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     runtime.deferred_page = None;
+                    raw_original::sync(runtime);
                     images::sync(runtime);
                 }
             }
