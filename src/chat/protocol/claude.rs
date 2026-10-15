@@ -467,7 +467,7 @@ impl Claude {
     }
 
     fn control(&mut self, mut request: Value) -> Result<Step, String> {
-        let expired = self.expire_controls(std::time::Instant::now());
+        let mut expired = self.expire_controls(std::time::Instant::now());
         let interrupt = string(&request, "subtype") == "interrupt";
         if !interrupt && self.controls.len() >= MAX_PENDING {
             return Err("Too many pending Claude control operations".into());
@@ -483,10 +483,24 @@ impl Claude {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in old {
-                self.controls.remove(&id);
+                let old = self.controls.remove(&id).unwrap();
                 self.control_deadlines.remove(&id);
+                if let Some(generation) = old["_cagents_turn"].as_u64()
+                    && let Some((key, outcome, run)) = self.deferred_attention.remove(&generation)
+                {
+                    // We received this old turn's native result, but never a
+                    // confirming interrupt ACK. Retire its known result just
+                    // as timeout does, using only its captured generation/run.
+                    self.publish_deferred_finish(generation, key, outcome, &mut expired);
+                    if let Some(run) = run {
+                        expired.events.push(Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Finished { outcome },
+                        });
+                    }
+                }
                 self.control_replies.push((
-                    id,
+                    old["_cagents_ack"].as_str().unwrap_or(&id).to_owned(),
                     Err("A newer interrupt request superseded this one".into()),
                 ));
             }
@@ -5479,7 +5493,7 @@ mod tests {
     }
 
     #[test]
-    fn expiring_an_old_interrupt_cannot_clear_a_newer_turns_pending_interrupt() {
+    fn superseding_an_old_interrupt_settles_only_its_captured_result_and_keeps_the_new_interrupt() {
         let mut adapter = Claude {
             busy: true,
             ..Default::default()
@@ -5494,27 +5508,20 @@ mod tests {
         let mut started = Step::default();
         adapter.start_turn(&mut started);
         adapter.busy = true;
-        let current = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let now = std::time::Instant::now();
-        adapter
-            .control_deadlines
-            .insert(old, now - std::time::Duration::from_millis(1));
-        adapter
-            .control_deadlines
-            .insert(current.clone(), now + std::time::Duration::from_secs(10));
-        let expired = adapter.expire_controls(now);
+        let superseding = adapter.command(Command::Interrupt).unwrap();
+        let current = superseding.writes[0]["request_id"].as_str().unwrap().to_owned();
         assert_eq!(adapter.interruption, Some(false));
-        assert!(expired.events.iter().any(|event| matches!(
-            event,
-            Event::PastTurnFinished {
-                outcome: crate::notifications::Kind::Succeeded,
-                ..
-            }
+        assert!(!adapter.controls.contains_key(&old));
+        assert!(!adapter.control_deadlines.contains_key(&old));
+        assert!(adapter.deferred_attention.is_empty(), "the superseded old result must not become an orphan");
+        assert!(superseding.events.iter().any(|event| matches!(
+            event, Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Succeeded } if key=="claude:old"
         )));
+        assert!(!superseding.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
         assert!(adapter.controls.contains_key(&current));
+        let late = adapter.receive(reply(&old, json!({}))).unwrap();
+        assert!(!late.events.iter().any(|event| matches!(event, Event::TurnFinished { .. } | Event::PastTurnFinished { .. })));
+        assert_eq!(adapter.interruption, Some(false));
         adapter
             .receive(json!({"type":"result","uuid":"new","subtype":"success","is_error":false}))
             .unwrap();
@@ -8850,7 +8857,7 @@ mod tests {
             } else {
                 crate::notifications::Kind::Succeeded
             };
-            assert!(acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
+            assert!(acknowledged.events.iter().any(|event| matches!(event, Event::PastTurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
             let second = adapter
                 .receive(
                     json!({"type":"result","subtype":"success","uuid":"second","is_error":false}),

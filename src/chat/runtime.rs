@@ -4184,6 +4184,95 @@ mod tests {
     }
 
     #[test]
+    fn actual_claude_late_interrupt_and_supersession_keep_new_turn_scalar_and_attention_authority() {
+        struct Driver {
+            claude: Box<dyn Adapter>, interrupts: Vec<String>, ack: usize, result: usize, accepted: bool,
+        }
+        impl Adapter for Driver {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let mut step = match command {
+                    command @ Command::Prompt { .. } => self.claude.command(command)?,
+                    Command::Interrupt => {
+                        let step = self.claude.command(Command::Interrupt)?;
+                        self.interrupts.push(step.writes[0]["request_id"].as_str().unwrap().into());
+                        step
+                    }
+                    Command::Compact => {
+                        let id = if self.result == 0 { "A" } else { "B" };
+                        self.result += 1;
+                        self.claude.receive(json!({"type":"result","subtype":"success","uuid":id,"is_error":false}))?
+                    }
+                    Command::RefreshPermissions => {
+                        let id = &self.interrupts[self.ack]; self.ack += 1;
+                        let response = if self.accepted { json!({"request_id":id,"subtype":"success","response":{}}) }
+                            else { json!({"request_id":id,"subtype":"error","error":"already settled"}) };
+                        self.claude.receive(json!({"type":"control_response","response":response}))?
+                    }
+                    Command::SetFastMode { enabled: true } => self.claude.receive(json!({"type":"control_request","request_id":"approval-B","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-B","input":{"command":"true"}}}))?,
+                    Command::SetFastMode { enabled: false } => self.claude.receive(json!({"type":"control_cancel_request","request_id":"approval-B"}))?,
+                    _ => return Err("Unexpected decoder-to-actor fixture command".into()),
+                };
+                // Commands above exercise the actual decoder/reducer, with
+                // transport input driven explicitly instead of echoed outbound
+                // requests being mistaken for provider responses.
+                step.writes.clear();
+                Ok(step)
+            }
+        }
+        for supersede in [false, true] {
+            for accepted in [false, true] {
+                let mut claude = super::super::protocol::claude::fixture_adapter();
+                let initialize = claude.initialize().unwrap();
+                let id = initialize.writes[0]["request_id"].clone();
+                let mut initial = claude.receive(json!({"type":"control_response","response":{"request_id":id,"subtype":"success","response":{"commands":[]}}})).unwrap();
+                initial.writes.clear();
+                assert!(initial.events.contains(&Event::Ready(true)));
+                let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+                let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(),
+                    transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(),
+                    working_directory: directory.path().into(), environment: BTreeMap::new() };
+                let store = preflight(&spec, &mut initial).unwrap();
+                let (send, receive) = crossbeam_channel::unbounded();
+                let handle = Handle::start(spec, Box::new(Driver { claude, interrupts: Vec::new(), ack: 0, result: 0, accepted }), initial, store, None,
+                    move |update| { let _ = send.send(update); }).unwrap();
+                until(&handle, |state| state.ready);
+                let prompt = |text: &str| Command::Prompt { text: text.into(), attachments: Vec::new(), mode: super::super::PromptMode::Send };
+                handle.command(prompt("turn A")).unwrap();
+                handle.command(Command::Interrupt).unwrap();
+                handle.command(Command::Compact).unwrap(); // Native result A, before ACK.
+                handle.command(prompt("turn B")).unwrap();
+                handle.command(Command::SetFastMode { enabled: true }).unwrap();
+                let before = handle.snapshot(None).unwrap();
+                assert!(before.outcome.is_none());
+                assert_eq!(before.activity(), ActivityState::Waiting);
+                if supersede { handle.command(Command::Interrupt).unwrap(); }
+                else { handle.command(Command::RefreshPermissions).unwrap(); }
+                let after = handle.snapshot(None).unwrap();
+                assert_eq!(after.turn_generation, before.turn_generation);
+                assert_eq!(after.outcome, before.outcome);
+                assert_eq!(after.finished_at, before.finished_at);
+                assert_eq!(after.requests, before.requests);
+                assert_eq!(after.activity(), ActivityState::Waiting);
+                let updates = receive.try_iter().collect::<Vec<_>>();
+                let old_outcome = if !supersede && accepted { crate::notifications::Kind::Cancelled } else { crate::notifications::Kind::Succeeded };
+                assert_eq!(updates.iter().filter(|update| matches!(update, Update::PastAttention(evidence) if evidence.key=="claude:A" && evidence.kind==old_outcome)).count(), 1);
+                assert!(!updates.iter().any(|update| matches!(update, Update::Attention(evidence) if evidence.key=="claude:A")), "old proof must not replace current B journal/desktop attention");
+                handle.command(Command::SetFastMode { enabled: false }).unwrap();
+                handle.command(Command::Compact).unwrap(); // Native result B.
+                if supersede {
+                    handle.command(Command::RefreshPermissions).unwrap(); // Late ignored A ACK.
+                    handle.command(Command::RefreshPermissions).unwrap(); // Exact B ACK.
+                }
+                assert_eq!(handle.snapshot(None).unwrap().outcome,
+                    Some(if supersede && accepted { crate::agent::ActivityOutcome::Cancelled } else { crate::agent::ActivityOutcome::Succeeded }));
+                handle.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn adapter_refusals_and_fatal_provider_errors_are_bounded_at_the_runtime_boundary() {
         struct Verbose;
         impl Adapter for Verbose {
