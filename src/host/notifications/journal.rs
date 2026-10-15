@@ -351,6 +351,7 @@ mod tests {
         message: crate::model::MessageId,
     ) -> Event {
         Event {
+            content: None,
             target: Target::SessionInbox(lineage),
             source_session: Some(session),
             provider: None,
@@ -744,6 +745,7 @@ mod tests {
 
     fn event(session: TerminalId, key: &str) -> Event {
         Event {
+            content: None,
             target: crate::notifications::Target::Session(session),
             source_session: Some(session),
             provider: Some(Provider::Codex),
@@ -810,6 +812,7 @@ mod tests {
             request: "request-one".into(),
         };
         let make = |request: ReviewRequest| Event {
+            content: None,
             evidence: Evidence {
                 key: request.request.clone(),
                 kind: Kind::ReviewRequested,

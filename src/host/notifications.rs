@@ -893,6 +893,7 @@ mod tests {
         let session = TerminalId::new();
         let lineage = crate::agent_execution::Lineage(session);
         let inbox = Event {
+            content: None,
             target: Target::SessionInbox(lineage),
             source_session: Some(session),
             provider: None,
@@ -951,6 +952,7 @@ mod tests {
         let notice = Notice {
             id: Uuid::new_v4(),
             event: Event {
+                content: None,
                 target: Target::Session(TerminalId::new()),
                 source_session: None,
                 provider: None,
@@ -1017,6 +1019,7 @@ mod tests {
         }));
         let session = TerminalId::new();
         let event = |key: &str| Event {
+            content: None,
             target: crate::notifications::Target::Session(session),
             source_session: Some(session),
             provider: Some(crate::agent::Provider::Codex),
