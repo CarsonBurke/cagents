@@ -3920,6 +3920,30 @@ mod tests {
     }
 
     #[test]
+    fn notification_secret_question_revisions_notify_without_exposing_prompts() {
+        let question = |wording: &str| json!({
+            "id":73, "method":"item/tool/requestUserInput",
+            "params":{"threadId":"thread-exact", "turnId":"notification-turn",
+                "questions":[{"id":"secret", "header":"PRIVATE_HEADER", "question":wording,
+                    "isSecret":true, "options":[]}]}
+        });
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(adapter()), vec![
+                question("PRIVATE_FIRST_QUESTION"), question("PRIVATE_CHANGED_QUESTION"),
+                question("PRIVATE_CHANGED_QUESTION"),
+            ], false,
+        );
+        assert_eq!(receipts.len(), 2, "changed secret prompts still need fresh attention");
+        assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        for (evidence, content) in receipts {
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(content.request, Some(crate::notifications::RequestType::Question));
+            assert_eq!(content.preview, "Codex is waiting for your answer.");
+            assert!(!content.preview.contains("PRIVATE"));
+        }
+    }
+
+    #[test]
     fn notification_callback_sees_completed_frame_text_and_failed_frame_diagnosis() {
         for (status, expected_kind, error, expected) in [
             (

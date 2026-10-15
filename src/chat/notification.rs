@@ -232,15 +232,17 @@ impl Snapshot {
             super::RequestKind::Question => 1,
             super::RequestKind::Consent => 2,
         }]);
-        // A provider can replace the public question/options while keeping its
-        // RPC request ID. Answer/default values never define a new notice.
-        for field in request.fields.iter().filter(|field| !field.secret) {
+        // A provider can replace a question or its options under the same RPC ID.
+        // This fingerprint is internal, never a preview or serialized evidence;
+        // secret prompt changes still need fresh attention. Answer/default
+        // values never define a new notice or enter this digest.
+        for field in &request.fields {
             digest.update([0]);
             for text in [field.id.as_str(), field.label.as_str(), field.description.as_str()] {
                 digest.update(text.len().to_le_bytes());
                 digest.update(text.as_bytes());
             }
-            digest.update([u8::from(field.multiple)]);
+            digest.update([u8::from(field.multiple), u8::from(field.secret)]);
             digest.update(field.choices.len().to_le_bytes());
             for choice in &field.choices {
                 for text in [choice.id.as_str(), choice.label.as_str(), choice.description.as_str()] {
@@ -309,11 +311,14 @@ mod tests {
         assert!(!content.preview.contains("PRIVATE"));
         let original = snapshot.waiting_fingerprint();
         snapshot.requests[0].fields[0].initial = "EDITED_ANSWER".into();
-        snapshot.requests[0].fields[1].label = "EDITED_SECRET_LABEL".into();
         snapshot.requests[0].fields[1].initial = "EDITED_SECRET".into();
         assert_eq!(snapshot.waiting_fingerprint(), original);
+        snapshot.requests[0].fields[1].label = "EDITED_SECRET_LABEL".into();
+        let changed_secret_prompt = snapshot.waiting_fingerprint();
+        assert_ne!(changed_secret_prompt, original);
+        assert!(!snapshot.notification_content(Kind::Waiting).preview.contains("SECRET_LABEL"));
         snapshot.requests[0].fields[0].choices[0].label = "Keep revised option".into();
-        assert_ne!(snapshot.waiting_fingerprint(), original);
+        assert_ne!(snapshot.waiting_fingerprint(), changed_secret_prompt);
         snapshot.requests[0].fields[0].label = "λ".repeat(RETAINED_BYTES * 2);
         let content = snapshot.notification_content(Kind::Waiting);
         assert!(content.preview.chars().count() <= 240);
