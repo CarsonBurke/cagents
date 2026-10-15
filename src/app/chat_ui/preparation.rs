@@ -376,8 +376,9 @@ fn execute(shared: Arc<Shared>,permit:tokio::sync::OwnedSemaphorePermit) -> Resu
         if shared.cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
         let (parsed,blocks) = if request.growing {
             // Cloning happens deliberately on the worker. Unchanged syntax
-            // palettes and inline spans share immutable Arc backing. Code and
-            // parser continuation copies remain an explicit O(source) residual.
+            // palettes, fenced bodies and inline spans share immutable Arc
+            // backing. Parser continuation/raw-normalizer copies remain an
+            // explicit O(source) residual.
             let parsed=canonical.parsed.clone();
             let blocks=canonical.blocks.iter().map(|(key,block)|(*key,block.settled_clone())).collect();
             if shared.cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
