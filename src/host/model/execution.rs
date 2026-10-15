@@ -2168,28 +2168,51 @@ mod tests {
         for process in [false, true] {
             let (mut registry, directory, accepted, pane) = closed_pane_fixture();
             let scope = Scope::Channel(accepted.agent.channel().unwrap());
-            registry.apply(&ModelEdit::SeedView {
-                scope: scope.clone(), panes: vec![pane.clone()], closed: vec![],
-            }).unwrap();
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
             if process {
                 let source = registry.agent(accepted.agent.id).unwrap().session.unwrap();
                 assert!(registry.retire_agent_process(&source, 4).unwrap());
             } else {
-                registry.close_agent(&Origin::User, accepted.agent.id).unwrap();
+                registry
+                    .close_agent(&Origin::User, accepted.agent.id)
+                    .unwrap();
             }
             let later = (0..300).map(|_| crate::model::CardId::new()).collect();
-            registry.apply(&ModelEdit::SeedView {
-                scope: scope.clone(), panes: vec![], closed: later,
-            }).unwrap();
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![],
+                    closed: later,
+                })
+                .unwrap();
             let view = super::super::views::read(&registry.db, &scope).unwrap();
-            assert_eq!(view.retired.len(), crate::workspace_model::views::RECENT_RETIRED_LIMIT);
-            assert!(!view.retired.contains(&pane.id), "test must evict the managed ID from the JSON cache");
+            assert_eq!(
+                view.retired.len(),
+                crate::workspace_model::views::RECENT_RETIRED_LIMIT
+            );
+            assert!(
+                !view.retired.contains(&pane.id),
+                "test must evict the managed ID from the JSON cache"
+            );
             drop(registry);
             let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
             let before = registry.model().unwrap();
-            assert!(!registry.apply(&ModelEdit::SeedView {
-                scope: scope.clone(), panes: vec![pane], closed: vec![],
-            }).unwrap().changed);
+            assert!(
+                !registry
+                    .apply(&ModelEdit::SeedView {
+                        scope: scope.clone(),
+                        panes: vec![pane],
+                        closed: vec![],
+                    })
+                    .unwrap()
+                    .changed
+            );
             assert_eq!(registry.model().unwrap(), before);
             assert!(registry.agent(accepted.agent.id).unwrap().closed);
         }
@@ -2201,22 +2224,32 @@ mod tests {
         for process in [false, true] {
             let (mut registry, _directory, accepted, pane) = console_pane_fixture();
             let scope = Scope::Channel(accepted.agent.channel().unwrap());
-            registry.apply(&ModelEdit::SeedView {
-                scope: scope.clone(), panes: vec![pane.clone()], closed: vec![],
-            }).unwrap();
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
             publish_console(&mut registry, &scope, &pane, &ended_console(&pane)).unwrap();
             let before = registry.model().unwrap();
             let agent = registry.agent(accepted.agent.id).unwrap();
             let run = registry.agent_run(accepted.run.id).unwrap();
-            let proof: (String, String) = registry.db.query_row(
-                "SELECT source,ended FROM shared_view_terminal_sources WHERE pane=?1",
-                [pane.id.to_string()], |row| Ok((row.get(0)?,row.get(1)?)),
-            ).unwrap();
+            let proof: (String, String) = registry
+                .db
+                .query_row(
+                    "SELECT source,ended FROM shared_view_terminal_sources WHERE pane=?1",
+                    [pane.id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
             // TEMP is intentional: the actual admitted main schema remains
             // canonical, and the failure occurs after real retirement writes.
             registry.db.execute_batch("CREATE TEMP TRIGGER reject_retirement AFTER UPDATE OF closed ON agents BEGIN SELECT RAISE(ABORT, 'after retirement writes'); END;").unwrap();
             let result = if process {
-                registry.retire_agent_process(agent.session.as_ref().unwrap(), 4).map(drop)
+                registry
+                    .retire_agent_process(agent.session.as_ref().unwrap(), 4)
+                    .map(drop)
             } else {
                 registry.close_agent(&Origin::User, agent.id).map(drop)
             };
@@ -2225,26 +2258,64 @@ mod tests {
             assert_eq!(registry.agent(agent.id).unwrap(), agent);
             assert_eq!(registry.agent_run(run.id).unwrap(), run);
             let scope_key = serde_json::to_string(&scope).unwrap();
-            assert_eq!(registry.db.query_row(
-                "SELECT count(*) FROM retired_view_panes WHERE scope=?1 AND id=?2",
-                params![scope_key, pane.id.to_string()], |row| row.get::<_,usize>(0),
-            ).unwrap(), 0);
-            assert_eq!(registry.db.query_row(
-                "SELECT source,ended FROM shared_view_terminal_sources WHERE pane=?1",
-                [pane.id.to_string()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
-            ).unwrap(), proof);
-            registry.db.execute_batch("DROP TRIGGER reject_retirement;").unwrap();
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM retired_view_panes WHERE scope=?1 AND id=?2",
+                        params![scope_key, pane.id.to_string()],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT source,ended FROM shared_view_terminal_sources WHERE pane=?1",
+                        [pane.id.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .unwrap(),
+                proof
+            );
+            registry
+                .db
+                .execute_batch("DROP TRIGGER reject_retirement;")
+                .unwrap();
             if process {
-                assert!(registry.retire_agent_process(agent.session.as_ref().unwrap(), 5).unwrap());
+                assert!(
+                    registry
+                        .retire_agent_process(agent.session.as_ref().unwrap(), 5)
+                        .unwrap()
+                );
             } else {
                 registry.close_agent(&Origin::User, agent.id).unwrap();
             }
             assert!(registry.agent(agent.id).unwrap().closed);
-            assert_eq!(registry.db.query_row(
-                "SELECT count(*) FROM retired_view_panes WHERE scope=?1 AND id=?2",
-                params![scope_key, pane.id.to_string()], |row| row.get::<_,usize>(0),
-            ).unwrap(), 1);
-            assert_eq!(registry.db.query_row("SELECT count(*) FROM shared_view_terminal_sources", [], |row| row.get::<_,usize>(0)).unwrap(), 0);
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM retired_view_panes WHERE scope=?1 AND id=?2",
+                        params![scope_key, pane.id.to_string()],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM shared_view_terminal_sources",
+                        [],
+                        |row| row.get::<_, usize>(0)
+                    )
+                    .unwrap(),
+                0
+            );
         }
     }
 
@@ -2253,29 +2324,56 @@ mod tests {
         for process in [false, true] {
             for future in [false, true] {
                 let (mut registry, _directory, accepted, pane) = closed_pane_fixture();
-                let scope = crate::workspace_model::views::Scope::Channel(accepted.agent.channel().unwrap());
-                registry.apply(&ModelEdit::SeedView {
-                    scope, panes: vec![pane], closed: vec![],
-                }).unwrap();
+                let scope = crate::workspace_model::views::Scope::Channel(
+                    accepted.agent.channel().unwrap(),
+                );
+                registry
+                    .apply(&ModelEdit::SeedView {
+                        scope,
+                        panes: vec![pane],
+                        closed: vec![],
+                    })
+                    .unwrap();
                 let before = registry.model().unwrap();
                 let run = registry.agent_run(accepted.run.id).unwrap();
                 let agent = registry.agent(accepted.agent.id).unwrap();
                 let other = Connection::open(&registry.path).unwrap();
                 if future {
-                    other.pragma_update(None, "user_version", super::super::SCHEMA_VERSION + 1).unwrap();
+                    other
+                        .pragma_update(None, "user_version", super::super::SCHEMA_VERSION + 1)
+                        .unwrap();
                 } else {
-                    other.execute_batch("ALTER TABLE projects ADD COLUMN unknown_retirement_payload TEXT;").unwrap();
+                    other
+                        .execute_batch(
+                            "ALTER TABLE projects ADD COLUMN unknown_retirement_payload TEXT;",
+                        )
+                        .unwrap();
                 }
                 let result = if process {
-                    registry.retire_agent_process(agent.session.as_ref().unwrap(), 4).map(drop)
+                    registry
+                        .retire_agent_process(agent.session.as_ref().unwrap(), 4)
+                        .map(drop)
                 } else {
                     registry.close_agent(&Origin::User, agent.id).map(drop)
                 };
-                assert!(result.unwrap_err().contains(if future {"newer"} else {"layout"}));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains(if future { "newer" } else { "layout" })
+                );
                 assert_eq!(registry.model().unwrap(), before);
                 assert_eq!(registry.agent(agent.id).unwrap(), agent);
                 assert_eq!(registry.agent_run(run.id).unwrap(), run);
-                assert_eq!(registry.db.query_row("SELECT count(*) FROM retired_view_panes", [], |row| row.get::<_,usize>(0)).unwrap(), 0);
+                assert_eq!(
+                    registry
+                        .db
+                        .query_row("SELECT count(*) FROM retired_view_panes", [], |row| row
+                            .get::<_, usize>(
+                            0
+                        ))
+                        .unwrap(),
+                    0
+                );
             }
         }
     }

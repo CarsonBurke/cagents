@@ -92,11 +92,7 @@ pub(super) fn edit(
         if let ModelEdit::ChangeView { scope, change, .. } = &edit {
             match registry.view_change_refusal(scope, change) {
                 Ok(Some(reason)) => {
-                    return ProtocolError::new(
-                        ProtocolErrorCode::InvalidRequest,
-                        reason,
-                        false,
-                    );
+                    return ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason, false);
                 }
                 Err(storage) => return unavailable(storage),
                 Ok(None) => {}
@@ -248,53 +244,130 @@ mod tests {
     fn public_edits_keep_transfer_refusals_and_source_conflicts_after_writer_move() {
         use crate::{
             model::{BrowserId, BrowserSession, CardId, CardKind, ChannelId},
-            workspace_model::views::{Change, Pane, Scope},
             terminal_ipc::ClientRequest,
+            workspace_model::views::{Change, Pane, Scope},
         };
         let directory = tempfile::tempdir().unwrap();
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-        registry.apply(&ModelEdit::OpenProject { repository: directory.path().into(), name: "Fixture".into(), kind: Default::default() }).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: directory.path().into(),
+                name: "Fixture".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
         let channel = ChannelId::new();
-        registry.apply(&ModelEdit::CreateChannel { id: channel, repository: directory.path().into(), title: "Fixture".into(), title_source: Default::default() }).unwrap();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: channel,
+                repository: directory.path().into(),
+                title: "Fixture".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
         let scope = Scope::Channel(channel);
         let original = Pane {
-            id: CardId::new(), title: "Browser".into(), user_title: None, pending_terminal_start: false,
-            width_fraction: 0.5, scope: Some(directory.path().into()),
+            id: CardId::new(),
+            title: "Browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: Some(directory.path().into()),
             kind: CardKind::Browser(BrowserSession {
-                id: BrowserId::new(), current_url: "https://example.com/a".parse().unwrap(), history: vec![], history_index: 0,
-                scroll_x: 0.0, scroll_y: 0.0, fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+                id: BrowserId::new(),
+                current_url: "https://example.com/a".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
             }),
         };
-        registry.apply(&ModelEdit::SeedView { scope: scope.clone(), panes: vec![original.clone()], closed: vec![] }).unwrap();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![original.clone()],
+                closed: vec![],
+            })
+            .unwrap();
         let mut successor = original.clone();
-        let CardKind::Browser(browser) = &mut successor.kind else { unreachable!() };
+        let CardKind::Browser(browser) = &mut successor.kind else {
+            unreachable!()
+        };
         browser.current_url = "https://example.com/b".parse().unwrap();
-        registry.apply(&ModelEdit::ChangeView {
-            scope: scope.clone(), expected_revision: registry.view_revision(&scope).unwrap(), operation: uuid::Uuid::new_v4(),
-            change: Change::Update { before: original.clone(), pane: successor.clone() },
-        }).unwrap();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: registry.view_revision(&scope).unwrap(),
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: original.clone(),
+                    pane: successor.clone(),
+                },
+            })
+            .unwrap();
         let mut state = HostState::new(HostSessionProof {
-            host_session_id: HostSessionId::new("workspace-errors"), boot_id: BootId::new("fixture"), host_incarnation: HostIncarnation::new("fixture"),
+            host_session_id: HostSessionId::new("workspace-errors"),
+            boot_id: BootId::new("fixture"),
+            host_incarnation: HostIncarnation::new("fixture"),
         });
         state.install_model(registry);
         let host = Arc::new(HostLock::new(state));
         let before = snapshot(&host, None).unwrap();
-        let revision = before.views.iter().find(|view| view.scope == scope).unwrap().revision;
+        let revision = before
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision;
         let mut stale = original.clone();
         stale.scope = Some(directory.path().join("changed"));
         let stale_operation = uuid::Uuid::new_v4();
         let missing_operation = uuid::Uuid::new_v4();
         for (operation, expected_revision, change, expected) in [
-            (stale_operation, revision, Change::Update { before: original, pane: stale }, ProtocolErrorCode::ViewConflict),
-            (missing_operation, 0, Change::Transfer { id: successor.id, destination: Scope::Channel(ChannelId::new()), before: None }, ProtocolErrorCode::InvalidRequest),
+            (
+                stale_operation,
+                revision,
+                Change::Update {
+                    before: original,
+                    pane: stale,
+                },
+                ProtocolErrorCode::ViewConflict,
+            ),
+            (
+                missing_operation,
+                0,
+                Change::Transfer {
+                    id: successor.id,
+                    destination: Scope::Channel(ChannelId::new()),
+                    before: None,
+                },
+                ProtocolErrorCode::InvalidRequest,
+            ),
         ] {
-            let error = super::super::client::process_request(&host, 2, ClientRequest::EditWorkspaceModel {
-                edit: ModelEdit::ChangeView { scope: scope.clone(), expected_revision, operation, change },
-            }).unwrap_err();
+            let error = super::super::client::process_request(
+                &host,
+                2,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::ChangeView {
+                        scope: scope.clone(),
+                        expected_revision,
+                        operation,
+                        change,
+                    },
+                },
+            )
+            .unwrap_err();
             assert_eq!(error.code, expected);
             assert_eq!(snapshot(&host, None).unwrap(), before);
             let writer = writer(&host).unwrap();
-            assert!(!writer.lock().unwrap().view_operation_seen(operation).unwrap());
+            assert!(
+                !writer
+                    .lock()
+                    .unwrap()
+                    .view_operation_seen(operation)
+                    .unwrap()
+            );
         }
     }
 

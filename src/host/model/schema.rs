@@ -697,109 +697,111 @@ mod tests {
     fn published_baselines_history_migrate_atomically_once_and_keep_full_durability() {
         let _clear = Clear;
         for version in [12, 13] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history12.sqlite3");
-        let (identity, channel) = legacy(&path, version);
-        let scope =
-            serde_json::to_string(&crate::workspace_model::views::Scope::Channel(channel)).unwrap();
-        let ids = (0..1500)
-            .map(|_| crate::model::CardId::new())
-            .collect::<Vec<_>>();
-        let mut db = Connection::open(&path).unwrap();
-        let tx = db.transaction().unwrap();
-        tx.execute(
-            "INSERT INTO shared_view_scopes(scope,channel) VALUES(?1,?2)",
-            rusqlite::params![scope, channel.to_string()],
-        )
-        .unwrap();
-        tx.execute(
-            "INSERT INTO shared_views VALUES(?1,9,'[]',?2)",
-            rusqlite::params![scope, serde_json::to_string(&ids).unwrap()],
-        )
-        .unwrap();
-        for _ in 0..2100 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("history12.sqlite3");
+            let (identity, channel) = legacy(&path, version);
+            let scope =
+                serde_json::to_string(&crate::workspace_model::views::Scope::Channel(channel))
+                    .unwrap();
+            let ids = (0..1500)
+                .map(|_| crate::model::CardId::new())
+                .collect::<Vec<_>>();
+            let mut db = Connection::open(&path).unwrap();
+            let tx = db.transaction().unwrap();
             tx.execute(
-                "INSERT INTO shared_view_edits VALUES(?1,?2)",
-                rusqlite::params![uuid::Uuid::new_v4().to_string(), scope],
+                "INSERT INTO shared_view_scopes(scope,channel) VALUES(?1,?2)",
+                rusqlite::params![scope, channel.to_string()],
             )
             .unwrap();
-        }
-        tx.commit().unwrap();
-        drop(db);
-        let before = bytes(&path);
-        for step in (version + 1)..=14 {
-            FAIL_STEP.with(|failure| failure.set(Some(step)));
-            let error = Registry::at(&path)
-                .err()
-                .expect("each actual migration body must roll back");
-            FAIL_STEP.with(|failure| failure.set(None));
-            assert!(error.contains(&format!("failure at {step}")), "{error}");
-            assert_eq!(
-                bytes(&path), before,
-                "provenance and history DDL, trimming and metadata must roll back together"
-            );
-            assert!(!wal(&path).exists());
-        }
-
-        let registry = Registry::at(&path).unwrap();
-        require_current(&registry.db).unwrap();
-        let model = registry.model().unwrap();
-        assert_eq!(model.identity.to_string(), identity);
-        assert_eq!(model.sequence, 8);
-        let view = model
-            .views
-            .iter()
-            .find(|view| serde_json::to_string(&view.scope).unwrap() == scope)
+            tx.execute(
+                "INSERT INTO shared_views VALUES(?1,9,'[]',?2)",
+                rusqlite::params![scope, serde_json::to_string(&ids).unwrap()],
+            )
             .unwrap();
-        assert_eq!(view.revision, 10);
-        let limit = crate::workspace_model::views::RECENT_RETIRED_LIMIT;
-        assert_eq!(view.retired, ids[ids.len() - limit..]);
-        assert_eq!(
-            registry
-                .db
-                .query_row(
-                    "SELECT count(*) FROM retired_view_panes WHERE scope=?1",
-                    [&scope],
-                    |row| row.get::<_, usize>(0)
+            for _ in 0..2100 {
+                tx.execute(
+                    "INSERT INTO shared_view_edits VALUES(?1,?2)",
+                    rusqlite::params![uuid::Uuid::new_v4().to_string(), scope],
                 )
-                .unwrap(),
-            ids.len()
-        );
-        assert_eq!(
-            registry
-                .db
-                .query_row("SELECT count(*) FROM shared_view_edits", [], |row| row
-                    .get::<_, usize>(0))
-                .unwrap(),
-            2048
-        );
-        assert_eq!(
-            registry
-                .db
-                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            registry
-                .db
-                .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            registry
-                .db
-                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
-                .unwrap(),
-            "wal"
-        );
-        drop(registry);
-        assert_eq!(
-            Registry::at(&path).unwrap().model().unwrap(),
-            model,
-            "reopen must not repeat history trimming or sequence publication"
-        );
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            drop(db);
+            let before = bytes(&path);
+            for step in (version + 1)..=14 {
+                FAIL_STEP.with(|failure| failure.set(Some(step)));
+                let error = Registry::at(&path)
+                    .err()
+                    .expect("each actual migration body must roll back");
+                FAIL_STEP.with(|failure| failure.set(None));
+                assert!(error.contains(&format!("failure at {step}")), "{error}");
+                assert_eq!(
+                    bytes(&path),
+                    before,
+                    "provenance and history DDL, trimming and metadata must roll back together"
+                );
+                assert!(!wal(&path).exists());
+            }
+
+            let registry = Registry::at(&path).unwrap();
+            require_current(&registry.db).unwrap();
+            let model = registry.model().unwrap();
+            assert_eq!(model.identity.to_string(), identity);
+            assert_eq!(model.sequence, 8);
+            let view = model
+                .views
+                .iter()
+                .find(|view| serde_json::to_string(&view.scope).unwrap() == scope)
+                .unwrap();
+            assert_eq!(view.revision, 10);
+            let limit = crate::workspace_model::views::RECENT_RETIRED_LIMIT;
+            assert_eq!(view.retired, ids[ids.len() - limit..]);
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM retired_view_panes WHERE scope=?1",
+                        [&scope],
+                        |row| row.get::<_, usize>(0)
+                    )
+                    .unwrap(),
+                ids.len()
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .query_row("SELECT count(*) FROM shared_view_edits", [], |row| row
+                        .get::<_, usize>(0))
+                    .unwrap(),
+                2048
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "wal"
+            );
+            drop(registry);
+            assert_eq!(
+                Registry::at(&path).unwrap().model().unwrap(),
+                model,
+                "reopen must not repeat history trimming or sequence publication"
+            );
         }
     }
 
@@ -912,12 +914,23 @@ mod tests {
         let before = bytes(&path);
         let reached = Rc::new(Cell::new(false));
         let observed = Rc::clone(&reached);
-        hook(move |_| { observed.set(true); Ok(()) });
-        let error = Registry::at(&path).err().expect("an incompatible draft13 is not canonical provenance13");
+        hook(move |_| {
+            observed.set(true);
+            Ok(())
+        });
+        let error = Registry::at(&path)
+            .err()
+            .expect("an incompatible draft13 is not canonical provenance13");
         assert!(error.contains("published schema 13"), "{error}");
-        assert!(!reached.get(), "refuse before opening a writable connection");
+        assert!(
+            !reached.get(),
+            "refuse before opening a writable connection"
+        );
         assert_eq!(bytes(&path), before);
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         assert!(!wal(&path).exists());
     }
 

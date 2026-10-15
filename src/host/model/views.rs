@@ -2023,16 +2023,40 @@ mod tests {
         let live = live_source_pane();
         seed(&mut registry, channel, vec![live.clone()]);
         let mut ended = live.clone();
-        let CardKind::Terminal(session) = &mut ended.kind else { unreachable!() };
+        let CardKind::Terminal(session) = &mut ended.kind else {
+            unreachable!()
+        };
         session.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
             recipe: session.launch.clone(),
-            last_exit: Some(crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1 }),
+            last_exit: Some(crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            }),
         };
-        let change = edit(&mut registry, channel, Change::Update { before: live, pane: ended.clone() });
+        let change = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: live,
+                pane: ended.clone(),
+            },
+        );
         registry.apply(&change).unwrap();
-        let original = terminal_source(&registry.db, ended.id).unwrap().expect("actual live-to-ended update must issue provenance");
+        let original = terminal_source(&registry.db, ended.id)
+            .unwrap()
+            .expect("actual live-to-ended update must issue provenance");
         let retired_ids = (0..1500).map(|_| CardId::new()).collect::<Vec<_>>();
-        registry.db.execute("UPDATE shared_views SET retired=?1 WHERE scope=?2", params![serde_json::to_string(&retired_ids).unwrap(), key(&scope).unwrap()]).unwrap();
+        registry
+            .db
+            .execute(
+                "UPDATE shared_views SET retired=?1 WHERE scope=?2",
+                params![
+                    serde_json::to_string(&retired_ids).unwrap(),
+                    key(&scope).unwrap()
+                ],
+            )
+            .unwrap();
         let before = registry.model().unwrap();
         registry.db.execute_batch("DROP TABLE retired_view_panes; DROP INDEX agents_open_by_recency; PRAGMA user_version=13;").unwrap();
         drop(registry);
@@ -2042,11 +2066,25 @@ mod tests {
         assert_eq!(model.sequence, before.sequence + 1);
         let current = read(&registry.db, &scope).unwrap();
         assert_eq!(current.panes, vec![ended.clone()]);
-        assert_eq!(current.retired, retired_ids[retired_ids.len()-crate::workspace_model::views::RECENT_RETIRED_LIMIT..]);
-        assert_eq!(terminal_source(&registry.db, ended.id).unwrap(), Some(original));
-        for id in retired_ids { assert!(retired(&registry.db, &scope, id).unwrap()); }
+        assert_eq!(
+            current.retired,
+            retired_ids[retired_ids.len() - crate::workspace_model::views::RECENT_RETIRED_LIMIT..]
+        );
+        assert_eq!(
+            terminal_source(&registry.db, ended.id).unwrap(),
+            Some(original)
+        );
+        for id in retired_ids {
+            assert!(retired(&registry.db, &scope, id).unwrap());
+        }
         drop(registry);
-        assert_eq!(Registry::at(&directory.path().join("model.sqlite3")).unwrap().model().unwrap(), model);
+        assert_eq!(
+            Registry::at(&directory.path().join("model.sqlite3"))
+                .unwrap()
+                .model()
+                .unwrap(),
+            model
+        );
     }
 
     #[test]
@@ -2056,42 +2094,105 @@ mod tests {
             let live = live_source_pane();
             seed(&mut registry, a, vec![live.clone()]);
             let mut ended = live.clone();
-            let CardKind::Terminal(session) = &mut ended.kind else { unreachable!() };
+            let CardKind::Terminal(session) = &mut ended.kind else {
+                unreachable!()
+            };
             session.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
                 recipe: session.launch.clone(),
-                last_exit: Some(crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1 }),
+                last_exit: Some(crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                }),
             };
-            let update = edit(&mut registry, a, Change::Update { before: live, pane: ended.clone() });
+            let update = edit(
+                &mut registry,
+                a,
+                Change::Update {
+                    before: live,
+                    pane: ended.clone(),
+                },
+            );
             registry.apply(&update).unwrap();
             let proof = terminal_source(&registry.db, ended.id).unwrap().unwrap();
-            registry.apply(&ModelEdit::SeedView { scope: Scope::Channel(b), panes: vec![], closed: vec![ended.id] }).unwrap();
-            let transfer = edit(&mut registry, a, Change::Transfer { id: ended.id, destination: Scope::Channel(b), before: None });
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: Scope::Channel(b),
+                    panes: vec![],
+                    closed: vec![ended.id],
+                })
+                .unwrap();
+            let transfer = edit(
+                &mut registry,
+                a,
+                Change::Transfer {
+                    id: ended.id,
+                    destination: Scope::Channel(b),
+                    before: None,
+                },
+            );
             let before = registry.model().unwrap();
             registry.db.execute_batch("CREATE TEMP TRIGGER refuse_transfer BEFORE UPDATE OF scope ON shared_view_panes BEGIN SELECT RAISE(ABORT, 'after target writes'); END;").unwrap();
-            assert!(registry.apply(&transfer).unwrap_err().contains("after target writes"));
+            assert!(
+                registry
+                    .apply(&transfer)
+                    .unwrap_err()
+                    .contains("after target writes")
+            );
             assert_eq!(registry.model().unwrap(), before);
             assert!(!retired(&registry.db, &Scope::Channel(a), ended.id).unwrap());
             assert!(retired(&registry.db, &Scope::Channel(b), ended.id).unwrap());
-            assert_eq!(terminal_source(&registry.db, ended.id).unwrap(), Some(proof.clone()));
-            registry.db.execute_batch("DROP TRIGGER refuse_transfer;").unwrap();
+            assert_eq!(
+                terminal_source(&registry.db, ended.id).unwrap(),
+                Some(proof.clone())
+            );
+            registry
+                .db
+                .execute_batch("DROP TRIGGER refuse_transfer;")
+                .unwrap();
             registry.apply(&transfer).unwrap();
-            for (source, target) in [(b,a), (a,b), (b,a)] {
+            for (source, target) in [(b, a), (a, b), (b, a)] {
                 let source_scope = Scope::Channel(source);
                 let target_scope = Scope::Channel(target);
-                let transfer = edit(&mut registry, source, Change::Transfer { id: ended.id, destination: target_scope.clone(), before: None });
+                let transfer = edit(
+                    &mut registry,
+                    source,
+                    Change::Transfer {
+                        id: ended.id,
+                        destination: target_scope.clone(),
+                        before: None,
+                    },
+                );
                 registry.apply(&transfer).unwrap();
                 assert!(retired(&registry.db, &source_scope, ended.id).unwrap());
                 assert!(!retired(&registry.db, &target_scope, ended.id).unwrap());
                 assert_eq!(owner(&registry.db, ended.id).unwrap(), Some(target_scope));
-                assert_eq!(terminal_source(&registry.db, ended.id).unwrap(), Some(proof.clone()));
+                assert_eq!(
+                    terminal_source(&registry.db, ended.id).unwrap(),
+                    Some(proof.clone())
+                );
             }
             drop(registry);
             let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-            assert_eq!(terminal_source(&registry.db, ended.id).unwrap(), Some(proof));
+            assert_eq!(
+                terminal_source(&registry.db, ended.id).unwrap(),
+                Some(proof)
+            );
             match removal {
-                0 => { let remove = edit(&mut registry, a, Change::Remove { id: ended.id }); registry.apply(&remove).unwrap(); }
-                1 => { registry.apply(&ModelEdit::DeleteChannel { id: a }).unwrap(); }
-                2 => { registry.apply(&ModelEdit::CloseProject { repository: "/repo".into() }).unwrap(); }
+                0 => {
+                    let remove = edit(&mut registry, a, Change::Remove { id: ended.id });
+                    registry.apply(&remove).unwrap();
+                }
+                1 => {
+                    registry.apply(&ModelEdit::DeleteChannel { id: a }).unwrap();
+                }
+                2 => {
+                    registry
+                        .apply(&ModelEdit::CloseProject {
+                            repository: "/repo".into(),
+                        })
+                        .unwrap();
+                }
                 _ => unreachable!(),
             }
             assert!(terminal_source(&registry.db, ended.id).unwrap().is_none());
