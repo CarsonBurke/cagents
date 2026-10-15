@@ -4894,6 +4894,8 @@ mod tests {
             let queue = state.register_client(17);
             let mut record = Record {
                 execution_instance: instance,
+                handoff_receipt: None,
+                source_binding: None,
                 console_recipe: None,
                 paired_terminal: None,
                 session: Session {

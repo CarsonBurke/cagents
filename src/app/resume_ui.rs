@@ -1806,6 +1806,7 @@ mod tests {
 
     #[test]
     fn existing_report_reuse_requires_the_exact_original_source_reference() {
+        for change_format in [false, true] {
         let (mut app, original, owner, _) = crate::app::chat_ui::qualified_closed_console_archive_for_test();
         let mut issued = app.chat_return_session(original).unwrap();
         let reference = chat::ArchiveReportReference {
@@ -1816,7 +1817,6 @@ mod tests {
         let (report_card, hydration) = app.new_archive_report_card(issued.clone()).unwrap();
         drop(hydration); // No private-body or provider task runs in this identity fixture.
         assert_eq!(app.existing_conversation_card(&issued), Some(report_card));
-        for change_format in [false, true] {
             let mut other = issued.clone();
             let other_reference = other.archive_report.as_mut().unwrap();
             if change_format { other_reference.format += 1; }
@@ -1826,12 +1826,12 @@ mod tests {
             let entry = SavedConversation { card: CardId::new(), title: "Another original receipt".into(),
                 session: other.clone(), open: false, updated_at_unix_ms: 2 };
             drop(app.resume_saved_conversation(entry));
-            assert_eq!(app.resume_ui.report_query.as_ref().unwrap().entry.session, other,
+            assert_eq!(app.resume_ui.report_query.as_ref().unwrap().session, other,
                 "a different receipt must reach exact private qualification, never reuse the open report");
             assert!(app.card_state(report_card).unwrap().existence.is_open());
             assert!(app.terminal_starts.lock().unwrap().is_empty());
-        }
         assert_eq!(app.existing_conversation_card(&issued), Some(report_card));
+        }
     }
 
     // Joint fixture: requires the real protected-selection provider plus the
