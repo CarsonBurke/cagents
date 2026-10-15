@@ -299,6 +299,24 @@ failure rolls back only when its status proves it stopped; if startup state is
 ambiguous, the installer keeps the new installation and recovery state rather
 than risk a second writer. Inspect `cagents daemon status` before retrying.
 
+Startup waits use the checkpoint's per-session restoration allowance, including
+large inventories that take longer than 30 seconds. A readiness timeout leaves
+the matched successor and its recovery evidence running; it does not kill a
+daemon-start process group or reopen an older UI against that successor.
+An upgrade daemon carrying an inherited admission fence joins an independent
+user scope before restoring its inventory, when a user service manager is
+available. Failure to establish that isolation retains the checkpoint and
+defers restoration. Saved-pane recovery reports one bounded inventory allowance
+to the launcher; an incomplete recovery keeps the visible recovery window open
+and reports failure rather than claiming the upgrade completed.
+
+Before closing windows, the reviewed updater checks the private companions of
+running Ceditor instances in the same runtime namespace. An incompatible or
+unverifiable companion defers the update while the existing windows remain
+usable. Close or update that Ceditor instance first. A standalone installer with
+`--restart-daemon` requires private editors to close because it has no verified
+destination protocol at the window-coordination step; staging keeps them running.
+
 A retained native conversation that its provider refuses to reattach, for
 example because Codex no longer finds the thread's rollout in its account
 storage, does not fail the restore. The replacement daemon still starts and
