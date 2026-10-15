@@ -3047,7 +3047,7 @@ mod tests {
             }).unwrap();
             codec.write(&mut server, &ServerEnvelope {
                 version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(),
-                message: ServerMessage::ChatActivity { chat_id, state: ActivityState::Working, generation: 100 },
+                message: ServerMessage::HostShuttingDown,
             }).unwrap();
             done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         });
@@ -3075,7 +3075,7 @@ mod tests {
         assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
         done_tx.send(()).unwrap();
         loop {
-            if matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Activity) { break; }
+            if matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(_)) { break; }
         }
         assert_eq!(handle.snapshot().error.as_deref(), Some("Original provider crash"));
         done_tx.send(()).unwrap();
