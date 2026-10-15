@@ -3665,6 +3665,14 @@ enum SettingsDecision {
     Persist(AppSettings),
 }
 
+/// Settings and recorded recipes store UTF-8 paths. Refuse a discovery
+/// that cannot round-trip rather than silently selecting a different file.
+fn detected_executable_path(path: PathBuf) -> Result<String, String> {
+    path.into_os_string().into_string().map_err(|_| {
+        "The detected executable path is not valid UTF-8. Choose a path with valid text characters.".to_owned()
+    })
+}
+
 fn settings_update(
     current: &AppSettings,
     field: SettingsField,
@@ -16426,7 +16434,7 @@ impl Application for Cagents {
                     let result = tokio::task::spawn_blocking(move || {
                         configuration
                             .resolve_executable(provider, search.as_deref())
-                            .map(|path| path.to_string_lossy().into_owned())
+                            .and_then(detected_executable_path)
                     })
                     .await
                     .unwrap_or_else(|_| Err("Could not detect the executable. Try again.".into()));
@@ -19886,6 +19894,28 @@ mod tests {
             app.settings_invalid[&SettingsField::Agent(provider, AgentSetting::Executable)]
                 .contains("absolute")
         );
+    }
+
+    #[test]
+    fn settings_detect_refuses_non_utf8_instead_of_selecting_a_lossy_path_alias() {
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        let alias = directory.path().join("\u{fffd}");
+        for bin in [&original, &alias] {
+            std::fs::create_dir(bin).unwrap();
+            let program = bin.join("claude");
+            std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let found = settings::AgentLaunchSettings::default().resolve_executable(
+            crate::agent::Provider::Claude, Some(original.as_os_str()),
+        ).unwrap();
+        assert_eq!(found, original.join("claude"));
+        assert_eq!(PathBuf::from(found.to_string_lossy().into_owned()), alias.join("claude"));
+        assert!(alias.join("claude").is_file());
+        assert!(detected_executable_path(found).unwrap_err().contains("UTF-8"));
+        assert_eq!(detected_executable_path(alias.join("claude")).unwrap(), alias.join("claude").to_str().unwrap());
     }
 
     #[test]
