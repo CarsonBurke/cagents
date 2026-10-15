@@ -4,6 +4,7 @@ mod journal;
 pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
 pub(crate) mod final_snapshot;
+mod deadline_io;
 use super::{LocalHandle, Rejection, Update};
 use crate::{
     chat::{
@@ -914,6 +915,23 @@ impl RemoteActor {
         let response: Result<Value, String> = receive(&control, TIMEOUT)?;
         serde_json::from_value(response?).map_err(|error| error.to_string())
     }
+    // One budget covers connection, verified peer and every partial frame.
+    fn call_until<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Value,
+        deadline: Instant,
+    ) -> Result<T, String> {
+        let control = registry::connect_until(&self.0.socket, deadline)
+            .map_err(|error| error.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        deadline_io::send_until(&control, &Invocation {
+            proof: self.0.proof.clone(), epoch: Some(self.0.epoch), method: method.into(), args,
+        }, deadline)?;
+        let response: Result<T, String> = deadline_io::receive_until(&control, deadline)?;
+        response
+    }
+
     pub fn enqueue(
         &self,
         run: Option<crate::model::RunId>,
