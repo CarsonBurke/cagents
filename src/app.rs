@@ -13880,7 +13880,7 @@ impl Application for Cagents {
                         runtime.selected_path().map(|path| {
                             (
                                 runtime.descriptor.worktree.join(path),
-                                runtime.editor_caret(),
+                                runtime.editor_caret_for(&editor_id),
                             )
                         })
                     }
