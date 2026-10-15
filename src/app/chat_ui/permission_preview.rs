@@ -14,6 +14,62 @@ pub(super) struct Reply {
     pub(super) mode: Option<String>,
 }
 
+struct Replies {
+    pending: Arc<Mutex<HashMap<Target, Reply>>>,
+    wake: async_channel::Sender<()>,
+}
+
+#[derive(Clone)]
+struct ReplyReceiver {
+    pending: Arc<Mutex<HashMap<Target, Reply>>>,
+    wake: async_channel::Receiver<()>,
+}
+
+impl Replies {
+    fn channel() -> (Self, ReplyReceiver) {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = async_channel::bounded(1);
+        (
+            Self { pending: pending.clone(), wake: sender },
+            ReplyReceiver { pending, wake: receiver },
+        )
+    }
+
+    fn retain(&self, desired: &Desired) {
+        self.pending.lock().unwrap_or_else(|error| error.into_inner())
+            .retain(|target, _| desired.contains_key(target));
+    }
+
+    fn publish(&self, reply: Reply) -> Result<(), ()> {
+        self.pending.lock().unwrap_or_else(|error| error.into_inner())
+            .insert(reply.target, reply);
+        match self.wake.try_send(()) {
+            Ok(()) | Err(async_channel::TrySendError::Full(())) => Ok(()),
+            Err(async_channel::TrySendError::Closed(())) => Err(()),
+        }
+    }
+}
+
+impl ReplyReceiver {
+    async fn recv(&self) -> Result<Reply, async_channel::RecvError> {
+        loop {
+            let reply = {
+                let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
+                let target = pending.keys().next().copied();
+                target.and_then(|target| pending.remove(&target))
+            };
+            if let Some(reply) = reply {
+                return Ok(reply);
+            }
+            self.wake.recv().await?;
+        }
+    }
+
+    fn same_channel(&self, other: &Self) -> bool {
+        self.wake.same_channel(&other.wake)
+    }
+}
+
 pub(super) struct Monitor {
     desired: Arc<Mutex<Desired>>,
     dirty: Arc<AtomicBool>,
@@ -21,7 +77,7 @@ pub(super) struct Monitor {
     watch_broken: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     wake: crossbeam_channel::Sender<()>,
-    receiver: async_channel::Receiver<Reply>,
+    receiver: ReplyReceiver,
 }
 
 impl Monitor {
@@ -52,7 +108,7 @@ impl Monitor {
         let watch_broken = Arc::new(AtomicBool::new(false));
         let worker_watch_broken = watch_broken.clone();
         let (wake, wake_rx) = crossbeam_channel::bounded(1);
-        let (replies, receiver) = async_channel::unbounded();
+        let (replies, receiver) = Replies::channel();
         let worker_desired = desired.clone();
         let worker_dirty = dirty.clone();
         let worker_stopped = stopped.clone();
@@ -73,6 +129,7 @@ impl Monitor {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .clone();
+                    replies.retain(&next);
                     let invalidated = worker_dirty.swap(false, Ordering::AcqRel);
                     let mut watch_changed = false;
                     if watch_files {
@@ -126,7 +183,7 @@ impl Monitor {
                             // retry; retain the last successfully read policy.
                             worker_dirty.store(true, Ordering::Release);
                             for (&target, (launch, _)) in &next {
-                                if replies.send_blocking(Reply {
+                                if replies.publish(Reply {
                                     target,
                                     launch: launch.clone(),
                                     mode: (current.get(&target) == next.get(&target))
@@ -153,7 +210,7 @@ impl Monitor {
                         };
                         if changed_recipe || modes.get(&target) != Some(&mode) || watch_changed {
                             if replies
-                                .send_blocking(Reply {
+                                .publish(Reply {
                                     target,
                                     launch: launch.clone(),
                                     mode: mode.clone(),
@@ -397,7 +454,7 @@ fn config_paths(launch: &chat::Launch) -> Vec<PathBuf> {
 }
 
 #[derive(Clone)]
-struct Source(async_channel::Receiver<Reply>);
+struct Source(ReplyReceiver);
 impl PartialEq for Source {
     fn eq(&self, other: &Self) -> bool {
         self.0.same_channel(&other.0)
@@ -430,6 +487,37 @@ mod tests {
             recipe: session.launch,
             session_id: None,
         }
+    }
+
+    #[test]
+    fn stalled_preview_receiver_retains_only_latest_policy_per_live_target() {
+        let (replies, receiver) = Replies::channel();
+        let target = Target { card: CardId::new(), generation: 1 };
+        let retired = Target { card: CardId::new(), generation: 1 };
+        let launch = launch();
+        for revision in 0..1000 {
+            replies.publish(Reply {
+                target,
+                launch: launch.clone(),
+                mode: Some(revision.to_string()),
+            }).unwrap();
+        }
+        replies.publish(Reply {
+            target: retired,
+            launch: launch.clone(),
+            mode: Some("retired".into()),
+        }).unwrap();
+        assert_eq!(receiver.pending.lock().unwrap().len(), 2);
+        assert_eq!(receiver.wake.len(), 1);
+        replies.retain(&HashMap::from([(target, (launch, 0))]));
+        assert_eq!(receiver.pending.lock().unwrap().len(), 1);
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let reply = runtime.block_on(receiver.recv()).unwrap();
+        assert_eq!(reply.target, target);
+        assert_eq!(reply.mode.as_deref(), Some("999"));
+        assert!(receiver.pending.lock().unwrap().is_empty());
+        drop(replies);
+        assert!(runtime.block_on(receiver.recv()).is_err());
     }
 
     #[test]
