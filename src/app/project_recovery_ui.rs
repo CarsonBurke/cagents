@@ -164,6 +164,7 @@ impl Cagents {
                         project.unreachable = None;
                         tasks.push(self.project_load_task(path, Some(id), false, None));
                     }
+                    tasks.push(self.project_search_availability_changed(id));
                 }
                 Task::batch(tasks)
             }
@@ -368,6 +369,7 @@ impl Cagents {
         if relocation.verification_only() { return Task::none(); }
         let Some(id) = self.sidebar_model.projects.iter().find(|project| project.repository == relocation.repository).map(|project| project.id) else { return Task::none(); };
         let owned = self.project_cards(id);
+        self.invalidate_project_search(id);
         for roots in [&mut self.project_ui.checkout_roots, &mut self.project_ui.primary_checkout_roots] {
             if let Some(previous) = roots.remove(&relocation.repository) { roots.insert(relocation.destination.clone(), relocation.mapped(&previous)); }
         }
