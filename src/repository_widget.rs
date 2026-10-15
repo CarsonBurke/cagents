@@ -372,6 +372,8 @@ pub enum LspIntent {
 /// File-surface commands share availability with their mounted toolbar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorSurfaceCommand {
+    Reload,
+    Overwrite,
     Save,
     DiscardEdits,
     Edit,
@@ -5222,6 +5224,8 @@ impl RepositoryRuntime {
             Command::EditorEdit => EditorSurfaceCommand::Edit,
             Command::EditorPreview => EditorSurfaceCommand::Preview,
             Command::EditorDiff => EditorSurfaceCommand::Diff,
+            Command::EditorReload => EditorSurfaceCommand::Reload,
+            Command::EditorOverwrite => EditorSurfaceCommand::Overwrite,
             _ => return None,
         };
         self.editor_surface_command_action(card, surface)
@@ -5235,6 +5239,8 @@ impl RepositoryRuntime {
             Command::EditorEdit,
             Command::EditorPreview,
             Command::EditorDiff,
+            Command::EditorReload,
+            Command::EditorOverwrite,
         ]
         .into_iter()
         .filter_map(|command| {
@@ -5253,6 +5259,12 @@ impl RepositoryRuntime {
     ) -> Option<RepositoryAction> {
         self.selected.as_ref()?;
         Some(match command {
+            EditorSurfaceCommand::Reload if !self.is_saving()
+                && self.source_surface == SourceSurface::Editor
+                && matches!(&self.document, DocumentState::Editable(document) if (document.error.is_some() || document.durability_warning.is_some()) && (document.conflict || document.durability_warning.is_some())) => RepositoryAction::Reload { card },
+            EditorSurfaceCommand::Overwrite if self.can_save()
+                && self.source_surface == SourceSurface::Editor
+                && matches!(&self.document, DocumentState::Editable(document) if document.conflict && document.error.is_some()) => RepositoryAction::Save { card, overwrite: true },
             EditorSurfaceCommand::Save if self.can_save() => RepositoryAction::Save {
                 card,
                 overwrite: false,
@@ -9933,7 +9945,7 @@ fn editable_document_view<'a>(
             actions.push(
                 icon_button(Icon::Refresh, "Reload file from disk")
                     .on_press_maybe(
-                        (!runtime.is_saving()).then(|| RepositoryAction::Reload { card }),
+                        runtime.editor_surface_command_action(card, EditorSurfaceCommand::Reload),
                     )
                     .into(),
             );
@@ -9941,19 +9953,13 @@ fn editable_document_view<'a>(
         if document.conflict {
             actions.push(
                 icon_button(Icon::Save, "Overwrite conflicting file on disk")
-                    .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
-                        card,
-                        overwrite: true,
-                    }))
+                    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Overwrite))
                     .into(),
             );
         } else if document.durability_warning.is_some() {
             actions.push(
                 icon_button(Icon::Save, "Retry save")
-                    .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
-                        card,
-                        overwrite: false,
-                    }))
+                    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Save))
                     .into(),
             );
         }
@@ -18838,6 +18844,28 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn registered_reload_and_overwrite_require_the_actual_error_toolbar_context() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let card = CardId::new();
+        let (clean, _) = RepositoryRuntime::lsp_open_fixture(card, "source");
+        assert!(clean.registered_surface_command_action(card, Command::EditorReload).is_none());
+        assert!(clean.registered_surface_command_action(card, Command::EditorOverwrite).is_none());
+        let mut warning = RepositoryRuntime::post_persist_warning_fixture(card);
+        assert!(matches!(warning.registered_surface_command_action(card, Command::EditorReload), Some(RepositoryAction::Reload { card: actual }) if actual == card));
+        assert!(warning.registered_surface_command_action(card, Command::EditorOverwrite).is_none());
+        let DocumentState::Editable(document) = &mut warning.document else { unreachable!() };
+        document.conflict = true;
+        document.error = Some("The file changed on disk".into());
+        assert!(matches!(warning.registered_surface_command_action(card, Command::EditorOverwrite), Some(RepositoryAction::Save { overwrite: true, card: actual }) if actual == card));
+        warning.source_surface = SourceSurface::Diff;
+        assert!(warning.registered_surface_command_action(card, Command::EditorReload).is_none());
+        assert!(warning.registered_surface_command_action(card, Command::EditorOverwrite).is_none());
+        let (saving, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        assert!(saving.registered_surface_command_action(card, Command::EditorReload).is_none());
+        assert!(saving.registered_surface_command_action(card, Command::EditorOverwrite).is_none());
     }
 
     #[test]

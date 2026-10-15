@@ -2603,6 +2603,8 @@ impl Cagents {
             | Command::GitUnstageAllStaged
             | Command::GitDiscardAllUnstaged
             | Command::GitDiscardAllUntracked
+            | Command::EditorReload
+            | Command::EditorOverwrite
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -2936,6 +2938,8 @@ impl SettingsField {
             Self::ShortcutGitUnstageAllStaged => Some(Command::GitUnstageAllStaged),
             Self::ShortcutGitDiscardAllUnstaged => Some(Command::GitDiscardAllUnstaged),
             Self::ShortcutGitDiscardAllUntracked => Some(Command::GitDiscardAllUntracked),
+            Self::ShortcutEditorReload => Some(Command::EditorReload),
+            Self::ShortcutEditorOverwrite => Some(Command::EditorOverwrite),
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -3310,6 +3314,8 @@ impl ShortcutDraft {
             (Command::GitUnstageAllStaged, self.git_unstage_all_staged.as_str()),
             (Command::GitDiscardAllUnstaged, self.git_discard_all_unstaged.as_str()),
             (Command::GitDiscardAllUntracked, self.git_discard_all_untracked.as_str()),
+            (Command::EditorReload, self.editor_reload.as_str()),
+            (Command::EditorOverwrite, self.editor_overwrite.as_str()),
         ]
     }
 }

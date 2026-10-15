@@ -446,6 +446,8 @@ pub struct KeyboardShortcuts {
     pub git_unstage_all_staged: Vec<String>,
     pub git_discard_all_unstaged: Vec<String>,
     pub git_discard_all_untracked: Vec<String>,
+    pub editor_reload: Vec<String>,
+    pub editor_overwrite: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -658,6 +660,8 @@ impl Default for KeyboardShortcuts {
             git_unstage_all_staged: Vec::new(),
             git_discard_all_unstaged: Vec::new(),
             git_discard_all_untracked: Vec::new(),
+            editor_reload: Vec::new(),
+            editor_overwrite: Vec::new(),
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -690,7 +694,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 199] {
+    pub fn actions(&self) -> [&Vec<String>; 201] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -891,12 +895,14 @@ impl KeyboardShortcuts {
             &self.git_unstage_all_staged,
             &self.git_discard_all_unstaged,
             &self.git_discard_all_untracked,
+            &self.editor_reload,
+            &self.editor_overwrite,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 199] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 201] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -1097,6 +1103,8 @@ impl KeyboardShortcuts {
             &mut self.git_unstage_all_staged,
             &mut self.git_discard_all_unstaged,
             &mut self.git_discard_all_untracked,
+            &mut self.editor_reload,
+            &mut self.editor_overwrite,
         ]
     }
 
@@ -1158,7 +1166,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 199] = [
+const SHORTCUT_ACTIONS: [&str; 201] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1358,6 +1366,8 @@ const SHORTCUT_ACTIONS: [&str; 199] = [
     "git_unstage_all_staged",
     "git_discard_all_unstaged",
     "git_discard_all_untracked",
+    "editor_reload",
+    "editor_overwrite",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1592,6 +1602,8 @@ pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Opt
                 | "editor_edit"
                 | "editor_preview"
                 | "editor_diff"
+                | "editor_reload"
+                | "editor_overwrite"
         ))
         && parse_shortcut("Ctrl+S").ok() == Some(binding)
     {
@@ -2640,7 +2652,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 194] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 196] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2835,6 +2847,8 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 194] = [
     "git_unstage_all_staged",
     "git_discard_all_unstaged",
     "git_discard_all_untracked",
+    "editor_reload",
+    "editor_overwrite",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {

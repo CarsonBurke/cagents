@@ -546,3 +546,9 @@ Group header controls use the selected-changes commands when rows are selected.
 Captured whole-area commands refuse a changed selection, and the backend reads
 the complete current area when the queued operation runs. Discard retains its
 confirmation.
+
+`editor_reload` and `editor_overwrite` are unbound recovery commands in
+Keyboard → Editor. They appear only for the active editor's existing disk
+conflict or durability warning. Reload reads the selected file again; Overwrite
+is available only when that file has an explicit save conflict. Ordinary Save
+continues to preserve its disk-conflict checks.

@@ -219,6 +219,8 @@ pub enum GlobalShortcut {
     GitUnstageAllStaged,
     GitDiscardAllUnstaged,
     GitDiscardAllUntracked,
+    EditorReload,
+    EditorOverwrite,
 
     CommandPalette,
     NewThread,
@@ -537,6 +539,8 @@ impl GlobalShortcut {
             Self::GitUnstageAllStaged => "git_unstage_all_staged",
             Self::GitDiscardAllUnstaged => "git_discard_all_unstaged",
             Self::GitDiscardAllUntracked => "git_discard_all_untracked",
+            Self::EditorReload => "editor_reload",
+            Self::EditorOverwrite => "editor_overwrite",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -2167,6 +2171,8 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::GitUnstageAllStaged, label: "Unstage all staged changes", repeatable: false, scope: ShortcutScope::Workspace },
     ShortcutDescriptor { action: GlobalShortcut::GitDiscardAllUnstaged, label: "Discard all unstaged changes…", repeatable: false, scope: ShortcutScope::Workspace },
     ShortcutDescriptor { action: GlobalShortcut::GitDiscardAllUntracked, label: "Delete all untracked files…", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::EditorReload, label: "Reload file from disk", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::EditorOverwrite, label: "Overwrite conflicting file on disk", repeatable: false, scope: ShortcutScope::Repository },
 
 ];
 
@@ -2352,6 +2358,8 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::GitUnstageAllStaged => &shortcuts.git_unstage_all_staged,
         GlobalShortcut::GitDiscardAllUnstaged => &shortcuts.git_discard_all_unstaged,
         GlobalShortcut::GitDiscardAllUntracked => &shortcuts.git_discard_all_untracked,
+        GlobalShortcut::EditorReload => &shortcuts.editor_reload,
+        GlobalShortcut::EditorOverwrite => &shortcuts.editor_overwrite,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -3169,6 +3177,8 @@ pub const fn editor_surface_command_bit(command: GlobalShortcut) -> Option<u8> {
         GlobalShortcut::EditorEdit => Some(1 << 2),
         GlobalShortcut::EditorPreview => Some(1 << 3),
         GlobalShortcut::EditorDiff => Some(1 << 4),
+        GlobalShortcut::EditorReload => Some(1 << 5),
+        GlobalShortcut::EditorOverwrite => Some(1 << 6),
         _ => None,
     }
 }

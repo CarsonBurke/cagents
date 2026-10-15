@@ -2957,11 +2957,13 @@ pub enum SettingsField {
     ShortcutGitUnstageAllStaged,
     ShortcutGitDiscardAllUnstaged,
     ShortcutGitDiscardAllUntracked,
+    ShortcutEditorReload,
+    ShortcutEditorOverwrite,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 199] = [
+    const SHORTCUTS: [Self; 201] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3161,6 +3163,8 @@ impl SettingsField {
         Self::ShortcutGitUnstageAllStaged,
         Self::ShortcutGitDiscardAllUnstaged,
         Self::ShortcutGitDiscardAllUntracked,
+        Self::ShortcutEditorReload,
+        Self::ShortcutEditorOverwrite,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3369,6 +3373,8 @@ impl SettingsField {
             Self::ShortcutGitUnstageAllStaged => "Unstage all staged changes",
             Self::ShortcutGitDiscardAllUnstaged => "Discard all unstaged changes…",
             Self::ShortcutGitDiscardAllUntracked => "Delete all untracked files…",
+            Self::ShortcutEditorReload => "Reload file from disk",
+            Self::ShortcutEditorOverwrite => "Overwrite conflicting file on disk",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3631,6 +3637,8 @@ impl SettingsField {
             | Self::ShortcutGitUnstageAllStaged
             | Self::ShortcutGitDiscardAllUnstaged
             | Self::ShortcutGitDiscardAllUntracked
+            | Self::ShortcutEditorReload
+            | Self::ShortcutEditorOverwrite
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3857,6 +3865,8 @@ struct ShortcutDraft {
     git_unstage_all_staged: String,
     git_discard_all_unstaged: String,
     git_discard_all_untracked: String,
+    editor_reload: String,
+    editor_overwrite: String,
 
     command_palette: String,
     new_native_thread: String,
@@ -4072,6 +4082,8 @@ impl ShortcutDraft {
             git_unstage_all_staged: settings::format_chords(&shortcuts.git_unstage_all_staged),
             git_discard_all_unstaged: settings::format_chords(&shortcuts.git_discard_all_unstaged),
             git_discard_all_untracked: settings::format_chords(&shortcuts.git_discard_all_untracked),
+            editor_reload: settings::format_chords(&shortcuts.editor_reload),
+            editor_overwrite: settings::format_chords(&shortcuts.editor_overwrite),
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -4598,6 +4610,8 @@ impl SettingsDraft {
             SettingsField::ShortcutGitUnstageAllStaged => { self.keyboard_shortcuts.git_unstage_all_staged = value }
             SettingsField::ShortcutGitDiscardAllUnstaged => { self.keyboard_shortcuts.git_discard_all_unstaged = value }
             SettingsField::ShortcutGitDiscardAllUntracked => { self.keyboard_shortcuts.git_discard_all_untracked = value }
+            SettingsField::ShortcutEditorReload => { self.keyboard_shortcuts.editor_reload = value }
+            SettingsField::ShortcutEditorOverwrite => { self.keyboard_shortcuts.editor_overwrite = value }
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5316,6 +5330,8 @@ fn settings_update(
         SettingsField::ShortcutGitUnstageAllStaged => { next.keyboard_shortcuts.git_unstage_all_staged = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutGitDiscardAllUnstaged => { next.keyboard_shortcuts.git_discard_all_unstaged = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutGitDiscardAllUntracked => { next.keyboard_shortcuts.git_discard_all_untracked = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorReload => { next.keyboard_shortcuts.editor_reload = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorOverwrite => { next.keyboard_shortcuts.editor_overwrite = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
