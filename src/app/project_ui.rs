@@ -1581,7 +1581,7 @@ impl Cagents {
                     Ok(snapshot) => {
                         let unchanged = dialog.safety.as_ref() == Some(&snapshot);
                         dialog.safety = Some(snapshot.clone());
-                        if !confirming && !dialog.branch_choice_edited && !dialog.branch_elsewhere { dialog.delete_branch = default_branch; }
+                        if !dialog.branch_choice_edited && !dialog.branch_elsewhere { dialog.delete_branch = default_branch; }
                         if confirming && busy > 0 && dialog.busy_confirmed != Some(busy) {
                             dialog.busy_confirmed = None;
                             dialog.failure = Some("The number of working agents changed. Review and confirm their interruption again.".into());
@@ -2276,16 +2276,18 @@ impl Cagents {
             _ => "Delete worktree".to_owned(),
         };
         let label = if dialog.stale_lock { format!("Unlock and {}", label.to_lowercase()) } else { label };
-        rows.push(super::dialog_ui::confirmation_actions(
+        let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.project.close"))
                 .on_press(Message::ProjectUi(Action::Dismiss)),
             crate::ui_controls::button::destructive(label)
-            .id(widget::Id::new("dialog.project.confirm"))
-            .on_press_maybe(confirm),
-        ));
+                .id(widget::Id::new("dialog.project.confirm"))
+                .on_press_maybe(confirm),
+        );
+        let form = widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(Length::Shrink))
+            .max_height((self.window_height - 180.0).max(120.0));
         Some(super::dialog_ui::surface(
-            widget::column::with_children(rows).spacing(space::M),
+            widget::column::with_children(vec![form.into(), actions]).spacing(space::M),
             480.0,
         ))
     }
