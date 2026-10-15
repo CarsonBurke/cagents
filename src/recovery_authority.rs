@@ -238,7 +238,13 @@ impl RecoveryAuthority {
         &self.0.description
     }
     pub fn is_resolved(&self) -> bool {
-        self.0.resolved.load(Ordering::Acquire)
+        // Groups are immutable flat views of reserved leaves. A newer group
+        // can resolve those same leaves without retrying this exact older Arc.
+        // Old refusal markers must then observe completion as well.
+        match &self.0.leaves {
+            Some(leaves) => leaves.iter().all(|leaf| leaf.0.resolved.load(Ordering::Acquire)),
+            None => self.0.resolved.load(Ordering::Acquire),
+        }
     }
     /// Blocking worker only. The producer revalidates retained authority and
     /// must refuse foreign names/no-clobber collisions on every retry.
@@ -399,6 +405,46 @@ mod tests {
         b.retry().unwrap();
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
+    #[test]
+    fn older_exact_group_observes_its_leaves_resolving_through_a_newer_group() {
+        let budget = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: 3,
+        });
+        let a = RecoverySlot::from_budget(budget.clone())
+            .unwrap()
+            .retain("a".into(), || Ok(()));
+        let b = RecoverySlot::from_budget(budget.clone())
+            .unwrap()
+            .retain("b".into(), || Ok(()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let captured = attempts.clone();
+        let c = RecoverySlot::from_budget(budget.clone())
+            .unwrap()
+            .retain("c".into(), move || {
+                if captured.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err("c remains pending".into())
+                } else {
+                    Ok(())
+                }
+            });
+        let original = a.combine(b);
+        let marker = original.clone();
+        let newer = original.combine(c);
+        assert!(!marker.is_resolved());
+        assert!(newer.retry().is_err());
+        assert!(
+            marker.is_resolved(),
+            "the exact original refusal marker must not wait for an unrelated later leaf"
+        );
+        assert!(!newer.is_resolved());
+        assert_eq!(budget.used.load(Ordering::Acquire), 1);
+        newer.retry().unwrap();
+        assert!(newer.is_resolved());
+        assert!(marker.is_resolved());
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn cleanup_context_capacity_stays_charged_until_guard_destructor_finishes() {
         struct Guard {
