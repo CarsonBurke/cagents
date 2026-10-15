@@ -14822,10 +14822,12 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::SettingsSaved { generation, result } => {
+                let mut refresh_accounts = false;
                 match result {
                     Ok(saved) => {
                         if saved.generation >= self.settings_ack_generation {
                             self.settings_save_error = None;
+                            refresh_accounts = saved.settings.agents != self.settings_base.agents;
                         }
                         self.acknowledge_settings_save(saved);
                     }
@@ -14838,7 +14840,12 @@ impl Application for Cagents {
                     Err(_) => {}
                 }
                 self.refresh_settings_feedback();
-                Task::none()
+                if refresh_accounts {
+                    // Discovery reads saved execution policy. Run after the
+                    // write acknowledgement, so it cannot observe old paths
+                    // or environment while the settings save is still queued.
+                    self.accounts_surface_changed()
+                } else { Task::none() }
             }
             Message::UiUpdate(request) => match request.action {
                 instance::UiUpdateAction::Prepare => {
