@@ -1994,6 +1994,27 @@ pub(in crate::host) fn reserved_automation_actor(
     Ok(record.handle.clone())
 }
 
+/// Hydration happened without HostState. An already-consumed update after its
+/// snapshot still belongs to the new reader; arming at the newer current clock
+/// would silently hide that only observation until another provider event.
+fn subscribe_reserved_automation_reader(
+    record: &mut Record,
+    client: ClientId,
+    snapshot_generation: u64,
+) -> Option<u64> {
+    if let std::collections::btree_map::Entry::Vacant(entry) = record.subscribers.entry(client) {
+        entry.insert(false);
+        let current = record.handle.observe_next_update();
+        record.observations.insert(client, Observation {
+            after_generation: snapshot_generation,
+            ..Default::default()
+        });
+        (current > snapshot_generation).then_some(current)
+    } else {
+        None
+    }
+}
+
 /// Attach an OPEN reserved conversation directly to its issued live actor.
 /// Snapshot hydration runs outside HostState, including retained native RPCs.
 pub(in crate::host) fn attach_reserved_automation_actor(
@@ -2026,9 +2047,12 @@ pub(in crate::host) fn attach_reserved_automation_actor(
         .filter(|record| reserved_automation_descriptor_matches(agent, &record.session, &record.handle.native_continuity()))
         .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id && record.handle.native_continuity() == issued.native_continuity)
         .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
-    if let std::collections::btree_map::Entry::Vacant(entry) = record.subscribers.entry(client) {
-        entry.insert(false);
-        record.observations.insert(client, Observation { after_generation: record.handle.observe_next_update(), ..Default::default() });
+    let advanced = subscribe_reserved_automation_reader(record, client, snapshot.generation);
+    drop(state);
+    if let Some(generation) = advanced {
+        // The client retains ChatObserved edges received before ChatAttached.
+        // Use the ordinary coalescer, including its successful-delivery receipt.
+        changed(&Arc::downgrade(host), requested.id, Update::Observed { generation });
     }
     Ok(ServerResponse::ChatAttached { session: issued, snapshot })
 }
@@ -3142,6 +3166,88 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn pending_automation_archive_attachment_observes_changes_after_its_hydrated_snapshot() {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("pending-archive-observation"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
+        let chat_id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let weak = Arc::downgrade(&host);
+        let (completed, seen) = crossbeam_channel::bounded(8);
+        let handle = Handle::start(spec, Box::new(Echo(false)), initial, store, None, move |update| {
+            let generation = match &update {
+                Update::Activity { generation, .. } => Some(*generation),
+                _ => None,
+            };
+            // Finish the real producer callback while no reader is subscribed.
+            changed(&weak, chat_id, update);
+            if let Some(generation) = generation { let _ = completed.try_send(generation); }
+        }).unwrap();
+        let hydrated = handle.snapshot(None).unwrap();
+        handle.command(Command::Interrupt).unwrap();
+        let generation = loop {
+            let generation = seen.recv_timeout(Duration::from_secs(5)).expect("provider update after snapshot");
+            if generation > hydrated.generation { break generation; }
+        };
+        let (queue, advanced) = {
+            let mut state = host.lock().unwrap();
+            let queue = state.register_client(17);
+            let mut record = Record {
+                execution_instance: uuid::Uuid::nil(),
+                console_recipe: None,
+                paired_terminal: None,
+                session: Session {
+                    id: chat_id,
+                    launch: chat::Launch { provider: Provider::Claude, recipe, session_id: None },
+                    proof: Some(proof),
+                    terminal: None,
+                    owned_codex_listener: None,
+                    native_continuity: Default::default(),
+                },
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            };
+            let advanced = subscribe_reserved_automation_reader(&mut record,17,hydrated.generation);
+            assert_eq!(record.observations[&17].after_generation, hydrated.generation);
+            state.chats.insert(chat_id,record);
+            (queue,advanced)
+        };
+        assert!(advanced.is_some_and(|current| current >= generation));
+        for _ in 0..2 {
+            changed(&Arc::downgrade(&host),chat_id,Update::Observed { generation: advanced.unwrap() });
+        }
+        queue.close_after_drain();
+        let mut observations = Vec::new();
+        while let Some(envelope) = queue.pop() {
+            match envelope.message {
+                ServerMessage::ChatObserved { chat_id: observed, epoch } => {
+                    assert_eq!(observed,chat_id);
+                    observations.push(epoch);
+                }
+                other => panic!("attachment requested unsolicited presentation: {other:?}"),
+            }
+        }
+        assert_eq!(observations, vec![0], "the consumed update must be observed once without another provider event");
+        handle.close().unwrap();
+    }
 
     #[test]
     fn pending_automation_archive_attachment_learns_only_the_exact_actors_native_promotion() {
