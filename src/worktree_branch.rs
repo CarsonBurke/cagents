@@ -159,11 +159,14 @@ pub fn delete_branch_checked_at(
     // Fence checkout transitions in all currently registered worktrees. Git's
     // final native deletion still rechecks its complete checkout inventory.
     let head_guards = if force {
-        let mut guards=registered_heads::RegisteredHeads::capture(&service,repository,cancellation)
-            .map_err(other)?;
+        let mut guards =
+            registered_heads::RegisteredHeads::capture(&service, repository, cancellation)
+                .map_err(other)?;
         guards.acquire().map_err(other)?;
         Some(guards)
-    } else { None };
+    } else {
+        None
+    };
     checked_out()?;
     if force {
         force_delete::delete(
@@ -172,7 +175,9 @@ pub fn delete_branch_checked_at(
             &full_ref,
             observed.as_str(),
             cancellation,
-            head_guards.as_ref().expect("force captured registered HEADs"),
+            head_guards
+                .as_ref()
+                .expect("force captured registered HEADs"),
         )
         .map_err(other)?;
     } else {
@@ -486,7 +491,14 @@ exec /usr/bin/git "$@"
     }
 
     #[cfg(target_os = "linux")]
-    fn registration_fixture(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, String) {
+    fn registration_fixture(
+        root: &Path,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
         let repository = root.join("repo");
         fs::create_dir(&repository).unwrap();
         git(&repository, &["init", "-q", "-b", "main"]);
@@ -494,11 +506,20 @@ exec /usr/bin/git "$@"
         git(&repository, &["add", "file"]);
         git(&repository, &["commit", "-qm", "base"]);
         git(&repository, &["branch", "topic"]);
-        git(&repository, &["config", "branch.topic.description", "preserve"]);
+        git(
+            &repository,
+            &["config", "branch.topic.description", "preserve"],
+        );
         let y = root.join("Y");
         let z = root.join("Z");
-        git(&repository, &["worktree", "add", "-qb", "y", y.to_str().unwrap()]);
-        git(&repository, &["worktree", "add", "-qb", "z", z.to_str().unwrap()]);
+        git(
+            &repository,
+            &["worktree", "add", "-qb", "y", y.to_str().unwrap()],
+        );
+        git(
+            &repository,
+            &["worktree", "add", "-qb", "z", z.to_str().unwrap()],
+        );
         let oid = git(&repository, &["rev-parse", "refs/heads/topic"]);
         (repository, y, z, oid)
     }
@@ -509,18 +530,45 @@ exec /usr/bin/git "$@"
         let directory = tempfile::tempdir().unwrap();
         let (repository, y, _, oid) = registration_fixture(directory.path());
         let moved = directory.path().join("moved 'checkout\n");
-        git(&repository, &["worktree", "move", y.to_str().unwrap(), moved.to_str().unwrap()]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "move",
+                y.to_str().unwrap(),
+                moved.to_str().unwrap(),
+            ],
+        );
         // Native move and an explicit completed repair remain ordinary supported
         // registrations. The unusual path also exercises byte quoting in proof.
-        git(&repository, &["worktree", "repair", moved.to_str().unwrap()]);
-        delete_branch_checked_at(&repository, "topic", true, Some(&oid), &CancellationToken::new()).unwrap();
+        git(
+            &repository,
+            &["worktree", "repair", moved.to_str().unwrap()],
+        );
+        delete_branch_checked_at(
+            &repository,
+            "topic",
+            true,
+            Some(&oid),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(git(&moved, &["symbolic-ref", "HEAD"]), "refs/heads/y");
         assert!(git(&repository, &["branch", "--list", "topic"]).is_empty());
         let bare = directory.path().join("bare.git");
-        git(directory.path(), &["clone", "--bare", repository.to_str().unwrap(), bare.to_str().unwrap()]);
+        git(
+            directory.path(),
+            &[
+                "clone",
+                "--bare",
+                repository.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
         git(&bare, &["branch", "topic"]);
         let oid = git(&bare, &["rev-parse", "refs/heads/topic"]);
-        delete_branch_checked_at(&bare, "topic", true, Some(&oid), &CancellationToken::new()).unwrap();
+        delete_branch_checked_at(&bare, "topic", true, Some(&oid), &CancellationToken::new())
+            .unwrap();
         assert!(git(&bare, &["branch", "--list", "topic"]).is_empty());
     }
 
@@ -535,15 +583,35 @@ exec /usr/bin/git "$@"
             let original_y_head = fs::read(admin_y.join("HEAD")).unwrap();
             let original_z_head = fs::read(admin_z.join("HEAD")).unwrap();
             match mode {
-                "alias" => fs::copy(z.join(".git"), y.join(".git")).map(|_| ()).unwrap(),
+                "alias" => fs::copy(z.join(".git"), y.join(".git"))
+                    .map(|_| ())
+                    .unwrap(),
                 "missing" => fs::remove_file(admin_y.join("gitdir")).unwrap(),
-                "duplicate" => fs::copy(admin_y.join("gitdir"), admin_z.join("gitdir")).map(|_| ()).unwrap(),
+                "duplicate" => fs::copy(admin_y.join("gitdir"), admin_z.join("gitdir"))
+                    .map(|_| ())
+                    .unwrap(),
                 _ => unreachable!(),
             }
-            let result = delete_branch_checked_at(&repository, "topic", true, Some(&oid), &CancellationToken::new());
+            let result = delete_branch_checked_at(
+                &repository,
+                "topic",
+                true,
+                Some(&oid),
+                &CancellationToken::new(),
+            );
             assert!(result.is_err(), "{mode}: {result:?}");
-            assert_eq!(git(&repository, &["rev-parse", "refs/heads/topic"]), oid, "{mode}");
-            assert_eq!(git(&repository, &["config", "--get", "branch.topic.description"]), "preserve");
+            assert_eq!(
+                git(&repository, &["rev-parse", "refs/heads/topic"]),
+                oid,
+                "{mode}"
+            );
+            assert_eq!(
+                git(
+                    &repository,
+                    &["config", "--get", "branch.topic.description"]
+                ),
+                "preserve"
+            );
             assert_eq!(fs::read(admin_y.join("HEAD")).unwrap(), original_y_head);
             assert_eq!(fs::read(admin_z.join("HEAD")).unwrap(), original_z_head);
             assert!(!admin_y.join("HEAD.lock").exists());
@@ -554,10 +622,14 @@ exec /usr/bin/git "$@"
     #[test]
     #[cfg(target_os = "linux")]
     fn registered_head_fences_recheck_at_native_transaction_and_policy_boundary() {
-        use std::{os::unix::fs::PermissionsExt, time::{Duration, Instant}};
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{Duration, Instant},
+        };
         const MODE: &str = "CAGENTS_REGISTERED_HEAD_MODE";
         if let Ok(mode) = std::env::var(MODE) {
-            let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_REGISTERED_HEAD_ROOT").unwrap());
+            let root =
+                std::path::PathBuf::from(std::env::var_os("CAGENTS_REGISTERED_HEAD_ROOT").unwrap());
             let (repository, y, z, oid) = registration_fixture(&root);
             let admin_y = std::path::PathBuf::from(git(&y, &["rev-parse", "--absolute-git-dir"]));
             let admin_z = std::path::PathBuf::from(git(&z, &["rev-parse", "--absolute-git-dir"]));
@@ -581,16 +653,31 @@ elif [ "$CAGENTS_REGISTERED_HEAD_MODE" = registration ]; then
 fi
 "##).unwrap();
             fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
-            let result = delete_branch_checked_at(&repository, "topic", true, Some(&oid), &CancellationToken::new());
+            let result = delete_branch_checked_at(
+                &repository,
+                "topic",
+                true,
+                Some(&oid),
+                &CancellationToken::new(),
+            );
             if mode == "checkout" {
                 result.unwrap();
                 assert_eq!(fs::read(root.join("checkout-result")).unwrap(), b"refused");
-                assert_eq!(fs::read(admin_y.join("HEAD")).unwrap(), b"ref: refs/heads/y\n");
+                assert_eq!(
+                    fs::read(admin_y.join("HEAD")).unwrap(),
+                    b"ref: refs/heads/y\n"
+                );
                 assert!(git(&repository, &["branch", "--list", "topic"]).is_empty());
             } else {
                 assert!(result.is_err(), "{mode}: {result:?}");
                 assert_eq!(git(&repository, &["rev-parse", "refs/heads/topic"]), oid);
-                assert_eq!(git(&repository, &["config", "--get", "branch.topic.description"]), "preserve");
+                assert_eq!(
+                    git(
+                        &repository,
+                        &["config", "--get", "branch.topic.description"]
+                    ),
+                    "preserve"
+                );
                 if mode == "registration" {
                     assert!(root.join("policy-ran").exists());
                     assert_eq!(git(&root.join("new"), &["rev-parse", "HEAD"]), oid);
@@ -600,7 +687,10 @@ fi
                     assert!(!root.join("policy-ran").exists());
                 }
                 if mode == "admin" {
-                    assert_eq!(fs::read(admin_y.join("foreign")).unwrap(), b"foreign registration");
+                    assert_eq!(
+                        fs::read(admin_y.join("foreign")).unwrap(),
+                        b"foreign registration"
+                    );
                     assert!(!admin_y.join("HEAD.lock").exists());
                     assert!(!admin_y.with_extension("old").join("HEAD.lock").exists());
                 }
@@ -612,7 +702,9 @@ fi
             let root = directory.path();
             fs::create_dir(root.join("bin")).unwrap();
             let wrapper = root.join("bin/git");
-            fs::write(&wrapper, r##"#!/bin/sh
+            fs::write(
+                &wrapper,
+                r##"#!/bin/sh
 set -eu
 case " $* " in
   *' branch -D -- topic '*)
@@ -627,10 +719,13 @@ case " $* " in
     ;;
 esac
 exec /usr/bin/git "$@"
-"##).unwrap();
+"##,
+            )
+            .unwrap();
             fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
             let mut path = std::ffi::OsString::from(root.join("bin"));
-            path.push(":"); path.push(std::env::var_os("PATH").unwrap_or_default());
+            path.push(":");
+            path.push(std::env::var_os("PATH").unwrap_or_default());
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "worktree_branch::branch_delete_tests::registered_head_fences_recheck_at_native_transaction_and_policy_boundary", "--nocapture"])
                 .env(MODE, mode).env("CAGENTS_REGISTERED_HEAD_ROOT", root).env("PATH", path)
@@ -640,7 +735,10 @@ exec /usr/bin/git "$@"
             while child.try_wait().unwrap().is_none() {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    panic!("registration race child timed out: {:?}", child.wait_with_output());
+                    panic!(
+                        "registration race child timed out: {:?}",
+                        child.wait_with_output()
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -649,13 +747,23 @@ exec /usr/bin/git "$@"
         }
     }
 
-
     #[test]
     #[cfg(target_os = "linux")]
     fn registered_head_fences_resolve_configured_separate_primary_checkout() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        git(root, &["init", "-q", "-b", "main", "--separate-git-dir", "metadata", "checkout"]);
+        git(
+            root,
+            &[
+                "init",
+                "-q",
+                "-b",
+                "main",
+                "--separate-git-dir",
+                "metadata",
+                "checkout",
+            ],
+        );
         let checkout = root.join("checkout");
         let metadata = root.join("metadata");
         git(&checkout, &["config", "core.worktree", "../checkout"]);
@@ -663,17 +771,26 @@ exec /usr/bin/git "$@"
         git(&checkout, &["add", "file"]);
         git(&checkout, &["commit", "-qm", "base"]);
         let linked = root.join("linked");
-        git(&checkout, &["worktree", "add", "-qb", "linked", linked.to_str().unwrap()]);
+        git(
+            &checkout,
+            &["worktree", "add", "-qb", "linked", linked.to_str().unwrap()],
+        );
         // Both metadata and a linked invocation must resolve the primary from
         // the original common config, then prove its locator back to common.
         for invocation in [&checkout, &metadata, &linked] {
             git(&checkout, &["branch", "topic"]);
             let oid = git(&checkout, &["rev-parse", "refs/heads/topic"]);
-            delete_branch_checked_at(invocation, "topic", true, Some(&oid), &CancellationToken::new()).unwrap();
+            delete_branch_checked_at(
+                invocation,
+                "topic",
+                true,
+                Some(&oid),
+                &CancellationToken::new(),
+            )
+            .unwrap();
             assert!(git(&checkout, &["branch", "--list", "topic"]).is_empty());
             assert_eq!(git(&checkout, &["symbolic-ref", "HEAD"]), "refs/heads/main");
             assert_eq!(git(&linked, &["symbolic-ref", "HEAD"]), "refs/heads/linked");
         }
     }
-
 }

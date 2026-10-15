@@ -6169,8 +6169,13 @@ impl GitFileLock {
     /// Lock an actual registered administrative directory already retained by
     /// its common namespace, without reopening a mutable checkout locator.
     pub(crate) fn acquire_beneath(parent: &fs_safety::Root, name: &OsStr) -> Result<Self, String> {
-        if !matches!((Path::new(name).components().next(), Path::new(name).components().count()),
-            (Some(std::path::Component::Normal(_)), 1)) {
+        if !matches!(
+            (
+                Path::new(name).components().next(),
+                Path::new(name).components().count()
+            ),
+            (Some(std::path::Component::Normal(_)), 1)
+        ) {
             return Err("Git lock name must be one ordinary component".into());
         }
         Self::acquire_in(parent.try_clone().map_err(|error| error.to_string())?, name)
@@ -10804,22 +10809,36 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Read its explicit common-local worktree setting through this service's
     /// existing executor; a linked-worktree invocation must not rediscover or
     /// grant command authority to a foreign checkout just to resolve it.
-    pub(crate) fn configured_primary_worktree(&self, repository: &Path,
-        cancellation: &CancellationToken) -> Result<PathBuf, RepositoryError>
-    {
-        let command=self.git_read(repository,["config","--local","--path","--get","core.worktree"]);
-        let output=self.run_checked(&command,cancellation)?;
-        attach_repository_process(parse_path_line(&output.stdout,"primary_worktree"),&output)
+    pub(crate) fn configured_primary_worktree(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let command = self.git_read(
+            repository,
+            ["config", "--local", "--path", "--get", "core.worktree"],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout, "primary_worktree"), &output)
     }
 
-    pub(crate) fn uses_files_ref_storage(&self, repository: &Path,
-        cancellation: &CancellationToken) -> Result<bool, RepositoryError>
-    {
-        let command=self.git_read(repository,["config","--local","--get","extensions.refStorage"]);
-        let output=self.run(&command,cancellation)?;
-        if output.exit_code==Some(1) { return Ok(true); }
-        if output.success { return Ok(trim_one_line_ending(&output.stdout)==b"files"); }
-        Err(git_failure(&command,output).into())
+    pub(crate) fn uses_files_ref_storage(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let command = self.git_read(
+            repository,
+            ["config", "--local", "--get", "extensions.refStorage"],
+        );
+        let output = self.run(&command, cancellation)?;
+        if output.exit_code == Some(1) {
+            return Ok(true);
+        }
+        if output.success {
+            return Ok(trim_one_line_ending(&output.stdout) == b"files");
+        }
+        Err(git_failure(&command, output).into())
     }
 
     /// The canonical common directory of `repository`, the one a creation
