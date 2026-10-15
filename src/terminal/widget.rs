@@ -5013,9 +5013,15 @@ mod tests {
     #[test]
     fn settings_missing_named_font_uses_monospace_for_editor_and_terminal_metrics() {
         let requested = "Cagents Missing Font Fixture 6C1B";
-        assert_eq!(monospace_font(requested).family, cosmic::iced::font::Family::Monospace);
+        assert_eq!(
+            monospace_font(requested).family,
+            cosmic::iced::font::Family::Monospace
+        );
         assert_eq!(resolved_family(requested), "");
-        assert_eq!(CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, requested).family, "");
+        assert_eq!(
+            CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, requested).family,
+            ""
+        );
         assert_eq!(resolved_family("  Cagents Missing Font Fixture 6C1B  "), "");
     }
 
