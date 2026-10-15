@@ -567,7 +567,6 @@ mod tests {
             if state == WorktreeOperationState::ReconcileRequired {
                 assert_eq!(app.worktree_operations[&id].row(&[]).unwrap().0, WorktreeOperationPhase::Failed);
                 assert_eq!(app.worktree_operations[&id].setup_intent, Some(intent));
-            assert_eq!(app.setup_ui.recovered_creation(&path), if superseded { Some(newer) } else { (state == WorktreeOperationState::Created).then_some(id) }, "only the verified nonsuperseded generation is current regardless of imported history order");
             }
         }
     }
@@ -608,6 +607,7 @@ mod tests {
             let task = app.restore_worktree_operations(Ok(Rehydrated { reports, current_setups: HashSet::from([id]), observed_runs: HashMap::new() }));
             assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
             assert_eq!(app.worktree_operations[&id].setup_intent, Some(intent));
+            assert_eq!(app.setup_ui.recovered_creation(&path), if superseded { Some(newer) } else { (state == WorktreeOperationState::Created).then_some(id) }, "only the verified nonsuperseded generation is current regardless of imported history order");
             assert!(!app.setup_ui.active());
             assert_eq!(app.durable.cards.len(), 0);
         }
