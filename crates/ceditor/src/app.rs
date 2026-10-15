@@ -693,6 +693,7 @@ pub struct Editor {
     // creation session across dialog close, stale receipt and history eviction.
     // Final release needs the producer's pending-artifact/clean-transfer proof.
     checkout_owners: BTreeMap<cagents::model::OperationId, Option<cagents::repository::RetainedWorktreeCreation>>,
+    checkout_retry_pending: BTreeSet<cagents::model::OperationId>,
     checkout_history_open: bool,
     checkout_error: Option<String>,
     closing: Option<CardId>,
@@ -3529,6 +3530,7 @@ impl Application for Editor {
             checkout_journal: None,
             checkout_history: Vec::new(),
             checkout_owners: BTreeMap::new(),
+            checkout_retry_pending: BTreeSet::new(),
             checkout_history_open: false,
             checkout_error: None,
             closing: None,
@@ -7318,6 +7320,7 @@ mod tests {
             checkout_journal: None,
             checkout_history: Vec::new(),
             checkout_owners: BTreeMap::new(),
+            checkout_retry_pending: BTreeSet::new(),
             checkout_history_open: false,
             checkout_error: None,
             closing: None,

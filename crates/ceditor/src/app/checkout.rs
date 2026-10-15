@@ -28,6 +28,8 @@ pub(crate) enum Action {
     Create,
     Finished(OperationId, Result<RetainedWorktreeCreation, String>),
     CreatedOpened(u64, Result<(Opened, SettledCreatedWorktree), String>),
+    RetryPrivate(OperationId),
+    PrivateRetried(OperationId, Result<cagents::repository::CreationPrivateRetry, String>),
     Cancel,
     Edit,
     Open(PathBuf),
@@ -180,7 +182,7 @@ impl Editor {
             }
             Action::OpenRecorded(id) => {
                 if self.checkout_history_open {
-                    let created = self.checkout_owners.get(&id).and_then(Option::as_ref).and_then(|retained| retained.created.clone());
+                    let created = self.retained_created_checkout(id);
                     if let Some(created) = created {
                         self.checkout_history_open = false;
                         return self.open_created_checkout(created);
@@ -365,12 +367,44 @@ impl Editor {
                     // proved the ORIGINAL destination; no path recapture here.
                     let index = self.tabs.len();
                     let task = self.add(opened, epoch == self.selection_epoch);
-                    if let Some(tab) = self.tabs.get_mut(index) { tab.created_worktree = Some(created); }
+                    if let Some(tab) = self.tabs.get_mut(index) {
+                        let operation = created.operation();
+                        let generation = created.generation();
+                        tab.created_worktree = Some(created);
+                        // The producer only grants this SAME settled carrier
+                        // after exact durable unlock and private-clear proof.
+                        // Release duplicate archive ownership AFTER adoption.
+                        if self.checkout_owners.get(&operation).and_then(Option::as_ref).and_then(|retained| retained.created.as_ref()).is_some_and(|original| original.generation() == generation) {
+                            self.checkout_owners.remove(&operation);
+                        }
+                    }
                     return task;
                 }
                 Ok(_) => {},
                 Err(error) => self.notice = Some(error),
             },
+            Action::RetryPrivate(id) => {
+                if self.checkout_retry_pending.contains(&id) { return Task::none(); }
+                let Some(owner) = self.checkout_owners.get(&id).and_then(Option::as_ref).and_then(|retained| retained.retention()).cloned() else { return Task::none(); };
+                if owner.recovery_summary().is_clear() { return Task::none(); }
+                self.checkout_retry_pending.insert(id);
+                return cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || owner.retry_private_steps().map_err(|error| error.to_string())).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    Message::Checkout(Action::PrivateRetried(id, result))
+                });
+            }
+            Action::PrivateRetried(id, result) => {
+                if !self.checkout_retry_pending.remove(&id) { return Task::none(); }
+                // A successful private retry never grants a new settled cap or
+                // reconciles an Unknown result, and never evicts its owner.
+                if self.checkout_owners.contains_key(&id) {
+                    self.notice = Some(match result {
+                        Ok(result) if result.pending.is_clear() => "Private creation cleanup finished. The original operation still needs reconciliation; no worktree was opened.".into(),
+                        Ok(result) => format!("Private creation recovery remains pending: {}", result.failures.join("; ")),
+                        Err(error) => format!("Private creation recovery was retained: {error}"),
+                    });
+                }
+            }
             Action::Edit => {
                 if let Some(dialog) = self
                     .checkout_dialog
@@ -395,6 +429,11 @@ impl Editor {
             }
         }
         Task::none()
+    }
+
+    fn retained_created_checkout(&self, operation: OperationId) -> Option<SettledCreatedWorktree> {
+        self.checkout_owners.get(&operation).and_then(Option::as_ref).and_then(|retained| retained.created.clone())
+            .or_else(|| self.tabs.iter().find_map(|tab| tab.created_worktree.as_ref().filter(|created| created.operation() == operation).cloned()))
     }
 
     fn open_created_checkout(&mut self, created: SettledCreatedWorktree) -> Task<Message> {
@@ -444,7 +483,14 @@ impl Editor {
                     );
                 }
                 rows.push(design::caption(&report.detail).into());
-                if self.checkout_owners.get(&report.operation_id).and_then(Option::as_ref).is_some_and(|retained| retained.created.is_some()) {
+                if let Some(owner) = self.checkout_owners.get(&report.operation_id).and_then(Option::as_ref).and_then(|retained| retained.retention()) {
+                    let pending = owner.recovery_summary();
+                    if !pending.is_clear() {
+                        rows.push(widget::text::body(format!("Private recovery pending: {} preparations, {} publications.", pending.pending_preparations, pending.pending_publications)).into());
+                        rows.push(widget::button::standard("Retry private recovery").on_press_maybe((!self.checkout_retry_pending.contains(&report.operation_id)).then_some(Message::Checkout(Action::RetryPrivate(report.operation_id)))).into());
+                    }
+                }
+                if self.retained_created_checkout(report.operation_id).is_some() {
                     rows.push(
                         widget::button::standard("Open worktree")
                             .on_press(Message::Checkout(Action::OpenRecorded(report.operation_id)))
@@ -616,13 +662,15 @@ mod tests {
         let created = app.checkout_owners[&id].as_ref().unwrap().created.clone().unwrap();
         let task = app.open_created_checkout(created.clone()); run_tasks(&mut app, task);
         assert!(app.tabs.iter().any(|tab| tab.created_worktree.as_ref().is_some_and(|cap| cap.operation() == id)));
+        assert!(app.checkout_owners.is_empty(), "the SAME settled carrier is now owned by the mounted tab");
         app.tabs.clear(); app.active = None;
         std::fs::rename(&destination, data.path().join("parked")).unwrap();
         std::fs::create_dir(&destination).unwrap(); std::fs::write(destination.join("foreign"), "untouched").unwrap();
         let task = app.open_created_checkout(created); run_tasks(&mut app, task);
         assert!(app.tabs.is_empty(), "the original created scope cannot recapture its replacement path");
         assert_eq!(std::fs::read_to_string(destination.join("foreign")).unwrap(), "untouched");
-        assert!(app.checkout_owners[&id].as_ref().unwrap().retention().is_some());
+        assert!(app.checkout_owners.is_empty(), "clean ownership was transferred to the original mounted carrier, not reconstructed from history");
+        drop(app.update(Message::CloseWindow)); assert!(app.exiting, "clean successful adoption does not permanently starve ordinary exit");
     }
 
     #[test]
