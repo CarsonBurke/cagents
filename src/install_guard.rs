@@ -68,13 +68,17 @@ struct ResultPipe {
 
 impl ResultPipe {
     fn new() -> io::Result<Self> {
-        let mut fds = [-1; 2];
-        // SAFETY: pipe2 initializes both owned descriptors atomically.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let reader = unsafe { File::from_raw_fd(fds[0]) };
-        let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+        #[cfg(target_os = "macos")]
+        let (reader, mut writer) = crate::unix_descriptor::nonblocking_pipe()?;
+        #[cfg(not(target_os = "macos"))]
+        let (reader, mut writer) = {
+            let mut fds = [-1; 2];
+            // SAFETY: pipe2 initializes both owned descriptors atomically.
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+        };
         if matches!(writer.as_raw_fd(), 197 | 198) {
             // These slots belong to UI/worker leases. Keep our descriptor
             // outside them before the child installs its launch-fence lease.
@@ -624,6 +628,32 @@ fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn result_pipe_retains_private_nonblocking_cloexec_ends_and_exact_receipt() {
+        let mut pipe = ResultPipe::new().unwrap();
+        for descriptor in [&pipe.reader, &pipe.writer] {
+            let metadata = descriptor.metadata().unwrap();
+            assert!(metadata.file_type().is_fifo());
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.mode() & 0o077, 0);
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+            let status = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+            assert!(status >= 0 && status & libc::O_NONBLOCK != 0);
+        }
+        assert!(!pipe.deferred().unwrap(), "an empty live pipe must not block");
+        pipe.writer.write_all(DEFERRED_RECEIPT).unwrap();
+        assert!(pipe.deferred().unwrap());
+        assert!(!pipe.deferred().unwrap());
+    }
+
+    #[test]
+    fn result_pipe_refuses_unrecognized_routing_receipts() {
+        let mut pipe = ResultPipe::new().unwrap();
+        pipe.writer.write_all(b"{\"version\":2,\"preserve_previous_ui\":true}\n").unwrap();
+        assert!(pipe.deferred().is_err());
+    }
+
     #[test]
     fn repeated_staging_keeps_the_running_version_even_when_current_is_newer() {
         let root = tempfile::tempdir().unwrap();
