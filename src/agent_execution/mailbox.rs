@@ -328,7 +328,9 @@ impl Seal {
 
     /// Transfer only over the private inherited actor startup channel. Never
     /// put this key in discovery records, environment variables, or diagnostics.
-    pub(crate) fn export_private_key(&self) -> [u8; 32] { self.0 }
+    pub(crate) fn export_private_key(&self) -> [u8; 32] {
+        self.0
+    }
 
     /// A truncated HMAC-SHA-256: 128 bits are far beyond what forging one
     /// displayed message could be worth, and keep the frame short.
@@ -460,7 +462,11 @@ mod tests {
         let message = message();
         let sealed = daemon.seal(&message, 0);
         assert_eq!(actor.open(&sealed).unwrap().body, message.body.trim_end());
-        assert!(actor.open(&sealed.replace("Hold off", "Go ahead")).is_none());
+        assert!(
+            actor
+                .open(&sealed.replace("Hold off", "Go ahead"))
+                .is_none()
+        );
         assert_eq!(format!("{actor:?}"), "Seal(<redacted>)");
     }
 

@@ -482,8 +482,12 @@ enum Pending {
     /// Compaction rewrites the thread's history and its context occupancy, so
     /// its acknowledgement is what a re-read hangs off: nothing else on the
     /// wire announces that the figures a reader was looking at have moved.
-    Compact { revision:u64 },
-    CompactRead { revision:u64 },
+    Compact {
+        revision: u64,
+    },
+    CompactRead {
+        revision: u64,
+    },
     Other,
     FastMode {
         enabled: bool,
@@ -1074,7 +1078,13 @@ impl Codex {
             step,
             "thread/read",
             json!({"threadId":self.thread,"includeTurns":false}),
-            if self.compaction_acknowledged {Pending::CompactRead {revision:self.compaction_revision}} else {Pending::Other},
+            if self.compaction_acknowledged {
+                Pending::CompactRead {
+                    revision: self.compaction_revision,
+                }
+            } else {
+                Pending::Other
+            },
         )?;
         self.history(step, None)
     }
@@ -1541,7 +1551,11 @@ impl Codex {
 }
 
 impl Adapter for Codex {
-    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> { self.cwd = directory.to_path_buf(); self.start["cwd"] = serde_json::Value::String(directory.to_string_lossy().into_owned()); Ok(()) }
+    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
+        self.cwd = directory.to_path_buf();
+        self.start["cwd"] = serde_json::Value::String(directory.to_string_lossy().into_owned());
+        Ok(())
+    }
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -1875,10 +1889,11 @@ impl Adapter for Codex {
                         detail: "Turn failed".into(),
                     });
                 }
-                if matches!(pending,Pending::Compact {revision} if revision==self.compaction_revision) {
-                    self.compaction_pending=false;
-                    self.compaction_acknowledged=false;
-                    step.events.push(Event::Compaction {active:false});
+                if matches!(pending,Pending::Compact {revision} if revision==self.compaction_revision)
+                {
+                    self.compaction_pending = false;
+                    self.compaction_acknowledged = false;
+                    step.events.push(Event::Compaction { active: false });
                 }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 let message = format!(
@@ -1891,7 +1906,9 @@ impl Adapter for Codex {
                     error["message"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| "The provider reported an error without a readable message".into())
+                        .unwrap_or_else(|| {
+                            "The provider reported an error without a readable message".into()
+                        })
                 );
                 step.events
                     .push(if matches!(pending, Pending::History { .. }) {
@@ -2297,21 +2314,24 @@ impl Adapter for Codex {
                 // Without this the reader pressed a control and the gauge it
                 // exists to move kept its old reading until some later frame
                 // happened to carry a new one.
-                Pending::Compact {revision} => {
-                    if revision==self.compaction_revision && self.compaction_pending {
-                        self.compaction_acknowledged=true;
+                Pending::Compact { revision } => {
+                    if revision == self.compaction_revision && self.compaction_pending {
+                        self.compaction_acknowledged = true;
                         self.reread(&mut step)?;
                     }
                 }
-                Pending::CompactRead {revision} => {
-                    if revision!=self.compaction_revision || !self.compaction_pending {return Ok(step);}
-                    self.thread_state(&result["thread"],&mut step)?;
-                    if self.compaction_acknowledged && result["thread"]["status"]["type"]=="idle" {
-                        self.compaction_pending=false;
-                        self.compaction_acknowledged=false;
-                        step.events.push(Event::Compaction {active:false});
+                Pending::CompactRead { revision } => {
+                    if revision != self.compaction_revision || !self.compaction_pending {
+                        return Ok(step);
                     }
-                },
+                    self.thread_state(&result["thread"], &mut step)?;
+                    if self.compaction_acknowledged && result["thread"]["status"]["type"] == "idle"
+                    {
+                        self.compaction_pending = false;
+                        self.compaction_acknowledged = false;
+                        step.events.push(Event::Compaction { active: false });
+                    }
+                }
                 Pending::QueueAdd => self.read_queue(&mut step)?,
                 Pending::QueueDelete(id) => {
                     step.events.push(Event::QueueRemoval(chat::QueueRemoval {
@@ -2913,9 +2933,10 @@ impl Adapter for Codex {
                     .as_str()
                     .or_else(|| params["summary"].as_str())
                     .filter(|text| !text.trim().is_empty());
-                let mut message = summary
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| "Codex reported a configuration warning; check the provider log for details".into());
+                let mut message = summary.map(str::to_owned).unwrap_or_else(|| {
+                    "Codex reported a configuration warning; check the provider log for details"
+                        .into()
+                });
                 if summary.is_some() {
                     for key in ["details", "path"] {
                         if let Some(text) = params[key].as_str().filter(|text| !text.is_empty()) {
@@ -2959,9 +2980,9 @@ impl Adapter for Codex {
             ))),
             "thread/compacted" => {
                 if self.compaction_pending {
-                    self.compaction_pending=false;
-                    self.compaction_acknowledged=false;
-                    step.events.push(Event::Compaction {active:false});
+                    self.compaction_pending = false;
+                    self.compaction_acknowledged = false;
+                    step.events.push(Event::Compaction { active: false });
                 }
             }
             "item/reasoning/summaryPartAdded" => {}
@@ -6435,23 +6456,62 @@ mod tests {
 
     #[test]
     fn compaction_acknowledgement_waits_for_matching_post_ack_idle_metadata() {
-        let mut adapter=adapter();
-        let requested=adapter.command(Command::Compact).unwrap();
-        assert!(requested.events.contains(&Event::Compaction {active:true}));
+        let mut adapter = adapter();
+        let requested = adapter.command(Command::Compact).unwrap();
+        assert!(
+            requested
+                .events
+                .contains(&Event::Compaction { active: true })
+        );
         let unrelated=adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
-        assert!(!unrelated.events.contains(&Event::Compaction {active:false}));
+        assert!(
+            !unrelated
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
         assert!(adapter.command(Command::Compact).is_err());
-        let acknowledged=adapter.receive(json!({"id":requested.writes[0]["id"],"result":{}})).unwrap();
-        assert!(!acknowledged.events.contains(&Event::Compaction {active:false}));
-        let probe=acknowledged.writes.iter().find(|frame|frame["method"]=="thread/read").unwrap();
+        let acknowledged = adapter
+            .receive(json!({"id":requested.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(
+            !acknowledged
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        let probe = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/read")
+            .unwrap();
         let completed=adapter.receive(json!({"id":probe["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"idle"},"canAcceptDirectInput":true}}})).unwrap();
-        assert!(completed.events.contains(&Event::Compaction {active:false}));
-        assert!(!completed.events.iter().any(|event|matches!(event,Event::TurnFinished{..})));
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
         adapter.command(Command::Compact).unwrap();
-        let wrong_thread=adapter.receive(json!({"method":"thread/compacted","params":{"threadId":"unrelated"}})).unwrap();
-        assert!(!wrong_thread.events.contains(&Event::Compaction {active:false}));
-        let completed=adapter.receive(json!({"method":"thread/compacted","params":{"threadId":"thread-exact"}})).unwrap();
-        assert!(completed.events.contains(&Event::Compaction {active:false}));
+        let wrong_thread = adapter
+            .receive(json!({"method":"thread/compacted","params":{"threadId":"unrelated"}}))
+            .unwrap();
+        assert!(
+            !wrong_thread
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        let completed = adapter
+            .receive(json!({"method":"thread/compacted","params":{"threadId":"thread-exact"}}))
+            .unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
     }
 
     /// A plan reaches the surface as the steps it is made of. It used to

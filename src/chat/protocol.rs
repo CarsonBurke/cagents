@@ -97,7 +97,7 @@ pub(crate) struct ExecutionContext {
     owned_directory: std::sync::Mutex<Option<std::sync::Arc<std::fs::File>>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
-    provider_directory:std::sync::Mutex<Option<PathBuf>>,
+    provider_directory: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl ExecutionContext {
@@ -106,17 +106,30 @@ impl ExecutionContext {
     /// opening a replacement at the old spelling never changes its identity.
     pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
         use std::os::unix::fs::OpenOptionsExt;
-        let relative = path.strip_prefix("/").map_err(|_| "The selected provider directory must be absolute".to_owned())?;
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|_| "The selected provider directory must be absolute".to_owned())?;
         let root = crate::fs_safety::Root::open("/".as_ref()).map_err(|error| error.to_string())?;
         let directory = if relative.as_os_str().is_empty() {
-            std::fs::OpenOptions::new().read(true)
+            std::fs::OpenOptions::new()
+                .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open("/").map_err(|error| error.to_string())
+                .open("/")
+                .map_err(|error| error.to_string())
         } else {
             crate::fs_safety::open_beneath(&root, relative).map_err(|error| error.to_string())
         }
-            .map_err(|error| format!("Cannot pin the selected provider directory {}: {error}", path.display()))?;
-        if !directory.metadata().map_err(|error| error.to_string())?.is_dir() {
+        .map_err(|error| {
+            format!(
+                "Cannot pin the selected provider directory {}: {error}",
+                path.display()
+            )
+        })?;
+        if !directory
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
             return Err("The selected provider directory is not a folder".into());
         }
         let context = Self::new(Some(std::sync::Arc::new(directory)));
@@ -152,21 +165,44 @@ impl ExecutionContext {
         }
     }
     pub(crate) fn directory_descriptor(&self) -> Option<std::sync::Arc<std::fs::File>> {
-        self.directory.clone().or_else(|| self.owned_directory.lock().unwrap_or_else(|p| p.into_inner()).clone())
+        self.directory.clone().or_else(|| {
+            self.owned_directory
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        })
     }
     /// Only positive owned-process cwd evidence may add a legacy pin. Keep
     /// this same shared context so its launch cleanup/ownership stays intact.
-    pub(crate) fn pin_owned_directory(&self, directory: std::sync::Arc<std::fs::File>) -> Result<(), String> {
-        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&directory.metadata().map_err(|error| error.to_string())?);
-        if self.directory_identity()?.is_some_and(|approved| approved != identity) {
-            return Err("The owned process directory differs from its approved launch identity".into());
+    pub(crate) fn pin_owned_directory(
+        &self,
+        directory: std::sync::Arc<std::fs::File>,
+    ) -> Result<(), String> {
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &directory.metadata().map_err(|error| error.to_string())?,
+        );
+        if self
+            .directory_identity()?
+            .is_some_and(|approved| approved != identity)
+        {
+            return Err(
+                "The owned process directory differs from its approved launch identity".into(),
+            );
         }
         // A fresh launch already retains this exact inode. Avoid adding a
         // second long-lived descriptor merely because Locate verified it.
-        if self.directory.is_some() { return Ok(()); }
-        let mut pinned = self.owned_directory.lock().unwrap_or_else(|p| p.into_inner());
+        if self.directory.is_some() {
+            return Ok(());
+        }
+        let mut pinned = self
+            .owned_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(previous) = pinned.as_ref()
-            && crate::agent_execution::DirectoryIdentity::from_metadata(&previous.metadata().map_err(|error| error.to_string())?) != identity {
+            && crate::agent_execution::DirectoryIdentity::from_metadata(
+                &previous.metadata().map_err(|error| error.to_string())?,
+            ) != identity
+        {
             return Err("The approved process directory changed during capture".into());
         }
         *pinned = Some(directory);
@@ -221,23 +257,48 @@ impl ExecutionContext {
     /// updated the adapter before initialize. A process cwd alone is no proof
     /// of a resumed provider thread's operational directory.
     pub(crate) fn observe_provider_directory(&self, path: &std::path::Path) -> Result<(), String> {
-        if self.directory_descriptor().is_none() { return Err("Provider scope requires its admitted directory descriptor".into()); }
+        if self.directory_descriptor().is_none() {
+            return Err("Provider scope requires its admitted directory descriptor".into());
+        }
         self.verify_directory(path)?;
-        *self.provider_directory.lock().unwrap_or_else(|p|p.into_inner()) = Some(path.to_owned());
+        *self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(path.to_owned());
         Ok(())
     }
-    pub(crate) fn provider_directory_observed(&self, path: &std::path::Path) -> Result<bool, String> {
-        if self.provider_directory.lock().unwrap_or_else(|p|p.into_inner()).as_deref() != Some(path) { return Ok(false); }
+    pub(crate) fn provider_directory_observed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, String> {
+        if self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            != Some(path)
+        {
+            return Ok(false);
+        }
         self.verify_directory(path)?;
         Ok(true)
     }
     /// Preserve an existing provider scope across a verified same-inode
     /// relocation. A newly pinned legacy process never gains scope here.
-    pub(crate) fn relocate_observed_provider_directory(&self, previous: &std::path::Path, path: &std::path::Path) -> Result<bool, String> {
-        let mut observed=self.provider_directory.lock().unwrap_or_else(|p|p.into_inner());
-        if observed.as_deref()!=Some(previous) {return Ok(false);}
+    pub(crate) fn relocate_observed_provider_directory(
+        &self,
+        previous: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Result<bool, String> {
+        let mut observed = self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if observed.as_deref() != Some(previous) {
+            return Ok(false);
+        }
         self.verify_directory(path)?;
-        *observed=Some(path.to_owned());
+        *observed = Some(path.to_owned());
         Ok(true)
     }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
@@ -278,7 +339,9 @@ pub struct ServerIdentity {
 pub trait Adapter: Send {
     /// Refresh cached operational paths after the caller verified the same
     /// approved directory inode. This never changes provider launch provenance.
-    fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> { Ok(()) }
+    fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(
@@ -359,18 +422,32 @@ mod launch_tests {
 
     #[test]
     fn verified_provider_scope_moves_without_granting_legacy_scope() {
-        let root=tempfile::tempdir().unwrap();
-        let original=root.path().join("original");let moved=root.path().join("moved");
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let moved = root.path().join("moved");
         std::fs::create_dir(&original).unwrap();
-        let observed=ExecutionContext::capture(&original).unwrap();
-        let legacy=ExecutionContext::capture(&original).unwrap();
+        let observed = ExecutionContext::capture(&original).unwrap();
+        let legacy = ExecutionContext::capture(&original).unwrap();
         observed.observe_provider_directory(&original).unwrap();
-        std::fs::rename(&original,&moved).unwrap();std::fs::create_dir(&original).unwrap();
-        assert!(observed.relocate_observed_provider_directory(&original,&moved).unwrap());
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        assert!(
+            observed
+                .relocate_observed_provider_directory(&original, &moved)
+                .unwrap()
+        );
         assert!(observed.provider_directory_observed(&moved).unwrap());
-        assert!(!legacy.relocate_observed_provider_directory(&original,&moved).unwrap());
+        assert!(
+            !legacy
+                .relocate_observed_provider_directory(&original, &moved)
+                .unwrap()
+        );
         assert!(!legacy.provider_directory_observed(&moved).unwrap());
-        assert!(observed.relocate_observed_provider_directory(&moved,&original).is_err());
+        assert!(
+            observed
+                .relocate_observed_provider_directory(&moved, &original)
+                .is_err()
+        );
     }
 
     #[test]

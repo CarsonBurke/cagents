@@ -289,8 +289,8 @@ impl Actor {
             }
         };
         self.step(initial)?;
-        self.close_input_fd=Some(socket.get_ref().socket.as_raw_fd());
-        self.close_input_drained=false;
+        self.close_input_fd = Some(socket.get_ref().socket.as_raw_fd());
+        self.close_input_drained = false;
         let mut flushing = false;
         let mut closing = None;
         let mut close_sent = false;
@@ -377,7 +377,7 @@ impl Actor {
             let stream = socket.get_mut();
             stream.budget = 64 * 1024;
             let mut read_again = false;
-            self.close_input_drained=false;
+            self.close_input_drained = false;
             // Keep adapter ordering: all requests from one Step are sent before
             // processing the next application message. Control replies are
             // driven by tungstenite and share the bounded flush deadline.
@@ -422,7 +422,8 @@ impl Actor {
                     }
                     Err(error) if would_block(&error) => {
                         read_again = socket.get_ref().budget == 0;
-                        self.close_input_drained=!read_again && socket.get_ref().progress.partial_started().is_none();
+                        self.close_input_drained =
+                            !read_again && socket.get_ref().progress.partial_started().is_none();
                     }
                     Err(error) => return Err(format!("Codex WebSocket read: {error}")),
                 }
