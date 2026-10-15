@@ -57,6 +57,7 @@ pub(crate) type HostLock = super::lock::HostMutex<HostState>;
 pub(crate) type SharedHost = Arc<HostLock>;
 
 pub(crate) struct TerminalRecord {
+    pub(super) instance: uuid::Uuid,
     screen_lost_after_crash: bool,
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
@@ -238,6 +239,7 @@ pub(crate) struct HostState {
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
     spawning: BTreeSet<TerminalId>,
+    pub(super) spawning_scopes: BTreeMap<TerminalId, (uuid::Uuid, PathBuf)>,
     /// Covers the interval before a login's live TerminalRecord exists.
     browser_logins_spawning: BTreeSet<TerminalId>,
     pub(super) clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
@@ -328,6 +330,7 @@ impl HostState {
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
+            spawning_scopes: BTreeMap::new(),
             browser_logins_spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
@@ -995,7 +998,7 @@ impl HostState {
 
     #[cfg(test)]
     pub(crate) fn reserve_spawn(&mut self, terminal_id: TerminalId) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view(terminal_id, None)
+        self.reserve_spawn_for_view(terminal_id, None, None)
     }
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
@@ -1042,6 +1045,7 @@ impl HostState {
         &mut self,
         terminal_id: TerminalId,
         paired: Option<&TerminalSession>,
+        directory: Option<&std::path::Path>,
     ) -> Result<(), ProtocolError> {
         if self.shutting_down {
             return Err(ProtocolError::new(
@@ -1080,8 +1084,15 @@ impl HostState {
                 false,
             ));
         }
+        if let Some(directory) = directory {
+            self.spawning_scopes.insert(terminal_id, (uuid::Uuid::new_v4(), directory.to_owned()));
+        }
         self.inventory_generation += 1;
         Ok(())
+    }
+
+    pub(super) fn has_unscoped_spawn(&self) -> bool {
+        self.spawning.iter().any(|id| !self.spawning_scopes.contains_key(id))
     }
 
     /// Whether any of `sessions` runs, or is starting or handing off, here.
@@ -1114,6 +1125,7 @@ impl HostState {
     }
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
+        self.spawning_scopes.remove(&terminal_id);
         self.browser_logins_spawning.remove(&terminal_id);
         if self.spawning.remove(&terminal_id) {
             self.inventory_generation += 1;
@@ -1178,6 +1190,7 @@ impl HostState {
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
+                instance: uuid::Uuid::new_v4(),
                 screen_lost_after_crash: false,
                 session,
                 handle,
@@ -3461,7 +3474,7 @@ fn start_terminal_view_owned(
         if setup&&adoption.is_none()&&!reviewed {
             return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,"Worktree setup was interrupted; review and explicitly resume it instead of replaying its saved recipe",false));
         }
-        state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
+        state.reserve_spawn_for_view(terminal_id, paired.then_some(&session), Some(&session.launch.working_directory))?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
                 // An adopted process already owns its callback listener.

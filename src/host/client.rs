@@ -465,7 +465,7 @@ pub(super) fn process_request(
                 operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
             | ClientRequest::DeviceOperation {
-                operation: crate::device_service::Operation::Worktree { operation: crate::worktree_control::Operation::Remove { .. } | crate::worktree_control::Operation::DeleteBranch { .. } | crate::worktree_control::Operation::StaleLock {unlock:true,..} }
+                operation: crate::device_service::Operation::Worktree { operation: crate::worktree_control::Operation::CloseSessions { .. } | crate::worktree_control::Operation::Remove { .. } | crate::worktree_control::Operation::DeleteBranch { .. } | crate::worktree_control::Operation::StaleLock {unlock:true,..} }
             }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
@@ -476,6 +476,15 @@ pub(super) fn process_request(
     let reviewed_setup_run=match &request {ClientRequest::StartWorktreeSetup {run_id,..}=>Some(*run_id),_=>None};
     match request {
         ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Worktree { operation } } => {
+            let session_reply = match &operation {
+                crate::worktree_control::Operation::BusySessions {repository,path} => Some(super::worktree_sessions::busy(host, repository, path)),
+                crate::worktree_control::Operation::CloseSessions {repository,path,agents,census} => Some(super::worktree_sessions::close(host, repository, path, agents, census)),
+                _ => None,
+            };
+            if let Some(reply) = session_reply {
+                let reply = reply.map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
+                return Ok((ServerResponse::DeviceOperation { reply: crate::device_service::Reply::Worktree(reply) }, Vec::new(), false));
+            }
             let repository=operation.repository().map(std::path::Path::to_path_buf);
             let mutates=operation.mutates();
             let mut scope=if matches!(&operation,crate::worktree_control::Operation::Remove {..}) {
