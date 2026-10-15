@@ -127,6 +127,7 @@ impl Handle {
     }
 }
 struct Inner {
+    native_holder_identity: Option<crate::daemon::holder_registry::Record>,
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
@@ -302,6 +303,7 @@ impl Handle {
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let inner = Arc::new(Inner {
+            native_holder_identity: native_holder.as_ref().map(|holder| holder.record().clone()),
             commands,
             wake: Mutex::new(wake),
             state: state.clone(),
@@ -1041,6 +1043,11 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .native_continuity
             .clone()
+    }
+
+    /// Exact process evidence captured before ownership moves to the actor.
+    pub(crate) fn native_holder_identity(&self) -> Option<&crate::daemon::holder_registry::Record> {
+        self.0.native_holder_identity.as_ref()
     }
 
     pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {

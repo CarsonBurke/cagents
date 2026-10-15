@@ -830,7 +830,8 @@ pub struct AppSettings {
     /// Absolute, or resolved relative to the repository root.
     #[serde(default = "default_managed_worktree_directory")]
     pub managed_worktree_directory: String,
-    /// Automatic cleanup is opt-in and never discards changes or stops work.
+    /// Opt-in cleanup preserves uncommitted, untracked and non-disposable ignored files.
+    /// It waits for hosted processes; ignored build directories follow the per-project policy.
     #[serde(default)]
     pub auto_delete_merged_worktrees: bool,
     #[serde(default)]

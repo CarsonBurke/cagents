@@ -18,6 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod worktree_safety;
+mod worktree_unlock;
+pub use worktree_safety::{WorktreeSafetySnapshot, default_disposable_ignored_directories};
+
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
 use crate::persistence::{PendingOperation, PendingOperationStatus, StateStore, StoreError};
@@ -6024,7 +6028,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// `rm --cached` and `commit` all refresh the index. A repository that
     /// arrived as an archive carries its own `.git/config`, so without this a
     /// single click on Stage would run code the repository chose.
-    fn git_base(&self, repository: &Path, literal_pathspecs: bool) -> CommandSpec {
+    pub(crate) fn git_base(&self, repository: &Path, literal_pathspecs: bool) -> CommandSpec {
         let mut command = CommandSpec::new(&self.git);
         if literal_pathspecs {
             command = command.arg("--literal-pathspecs");
@@ -11794,6 +11798,90 @@ mod worktree_journal_tests {
                 cancellation,
                 &sender,
             )
+        }
+    }
+
+    #[test]
+    fn explicit_stale_unlock_requires_receipt_and_exclusive_process_lease() {
+        let fixture = Fixture::new();
+        let token = CancellationToken::new();
+        assert_eq!(fixture.run(&token).state, WorktreeOperationState::Created);
+        let destination = fixture.request.destination.to_str().unwrap();
+        let label = format!("cagents:{}", fixture.request.operation_id);
+        fixture.git(&["worktree", "lock", "--reason", &label, destination]);
+        let journal = fixture.journal(fixture.request.operation_id);
+        let live = worktree_lease(&journal.lease_path, false).unwrap();
+        assert!(
+            fixture
+                .service
+                .stale_worktree_lock(
+                    &fixture.store,
+                    &fixture.request.repository,
+                    &fixture.request.destination,
+                    &token
+                )
+                .is_err()
+        );
+        assert!(
+            fixture
+                .service
+                .unlock_stale_worktree(
+                    &fixture.store,
+                    &fixture.request.repository,
+                    &fixture.request.destination,
+                    &token
+                )
+                .is_err()
+        );
+        drop(live);
+        fixture
+            .service
+            .stale_worktree_lock(
+                &fixture.store,
+                &fixture.request.repository,
+                &fixture.request.destination,
+                &token,
+            )
+            .unwrap();
+        fixture
+            .service
+            .unlock_stale_worktree(
+                &fixture.store,
+                &fixture.request.repository,
+                &fixture.request.destination,
+                &token,
+            )
+            .unwrap();
+        assert!(
+            !fixture
+                .service
+                .list_worktrees(&fixture.request.repository, &token)
+                .unwrap()
+                .into_iter()
+                .find(|record| record.path == fixture.request.destination)
+                .unwrap()
+                .lock
+                .locked
+        );
+        // Foreign locks and plausible cagents labels without the matching
+        // durable operation cannot be cleared by this action.
+        for reason in [
+            "another tool".to_owned(),
+            format!("cagents:{}", OperationId::new()),
+        ] {
+            fixture.git(&["worktree", "lock", "--reason", &reason, destination]);
+            assert!(
+                fixture
+                    .service
+                    .unlock_stale_worktree(
+                        &fixture.store,
+                        &fixture.request.repository,
+                        &fixture.request.destination,
+                        &token
+                    )
+                    .is_err()
+            );
+            fixture.git(&["worktree", "unlock", destination]);
         }
     }
 

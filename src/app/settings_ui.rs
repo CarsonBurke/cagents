@@ -194,6 +194,7 @@ pub(super) struct SettingsContext<'a> {
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
+    pub cleanup_projects: Vec<(ProjectId, String)>,
 }
 
 fn settings_category_controls<'a>(
@@ -406,7 +407,7 @@ fn settings_category_controls<'a>(
             );
             let cleanup = setting_field(
                 "Merged worktree cleanup",
-                "Delete clean, inactive GitHub worktrees after their exact current commit is merged. Cleanup waits until hosted processes have ended, preserves branches, and never discards changes.",
+                "Delete clean, inactive GitHub worktrees after their exact current commit is merged. Uncommitted, untracked and non-disposable ignored files block cleanup. Cleanup waits for hosted processes and preserves branches. Configure which ignored build directories are disposable for each project below.",
                 crate::settings_widgets::toggle(
                     "Delete merged worktrees automatically",
                     draft.auto_delete_merged_worktrees,
@@ -415,6 +416,25 @@ fn settings_category_controls<'a>(
                         value: enabled.to_string(),
                     },
                 ),
+            );
+            let cleanup_policy = setting_field(
+                "Per-project disposable directories",
+                "Default build directories include node_modules, target, dist, build, .venv and __pycache__. Ignored files outside this project's configured directories are kept. Select a project to edit its clone-local policy.",
+                widget::column::with_children(
+                    context
+                        .cleanup_projects
+                        .iter()
+                        .map(|(project, name)| {
+                            crate::ui_controls::button::secondary(format!("Configure {name}"))
+                                .on_press(Message::ProjectUi(
+                                    project_ui::Action::OpenCleanupPolicy(*project),
+                                ))
+                                .into()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(space::XS)
+                .into(),
             );
             let channel_pane = settings_choice(
                 "Default channel pane",
@@ -465,7 +485,7 @@ fn settings_category_controls<'a>(
                 settings_group(
                     "Worktrees",
                     "Locations, ordering and the first pane in a worktree.",
-                    vec![directory, worktree_pane, cleanup, order],
+                    vec![directory, worktree_pane, cleanup, cleanup_policy, order],
                 ),
                 settings_group(
                     "Workspace",

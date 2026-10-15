@@ -60,6 +60,9 @@ pub enum Operation {
         root: PathBuf,
         operation: GitOperation,
     },
+    Worktree {
+        operation: crate::worktree_control::Operation,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -105,13 +108,47 @@ pub enum Reply {
     },
     Text(String),
     Saved,
-    MergedWorktreeRemoved(Option<crate::worktree_cleanup::RemovedWorktree>),
+    MergedWorktreeRemoved(Result<crate::worktree_cleanup::RemovedWorktree, CleanupRefusal>),
     ProjectNavigation(Navigation),
     /// The replacement is published, but its directory entry could not be
     /// synced. Callers must advance their disk baseline and show this warning.
     SavedUnconfirmed {
         error: String,
     },
+    Worktree(crate::worktree_control::Reply),
+}
+
+/// A declined automatic removal is an expected outcome, with enough detail
+/// for the window to explain why the merged worktree was kept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupRefusal {
+    pub kind: CleanupRefusalKind,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupRefusalKind {
+    ProtectionUnavailable,
+    BusySession,
+    OwnershipUncertain,
+    ShutdownOrUpgrade,
+    SafetyCheckFailed,
+}
+
+impl CleanupRefusal {
+    pub(crate) fn new(kind: CleanupRefusalKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CleanupRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -169,6 +206,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::Worktree { .. } => {
+            Err("Worktree control requires the daemon lifecycle fence".into())
+        }
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }
@@ -1517,6 +1557,30 @@ mod wire_tests {
         roundtrip(&Reply::SavedUnconfirmed {
             error: "directory sync failed".into(),
         });
+    }
+
+    #[test]
+    fn automatic_cleanup_refusals_and_removal_roundtrip() {
+        for kind in [
+            CleanupRefusalKind::ProtectionUnavailable,
+            CleanupRefusalKind::BusySession,
+            CleanupRefusalKind::OwnershipUncertain,
+            CleanupRefusalKind::ShutdownOrUpgrade,
+            CleanupRefusalKind::SafetyCheckFailed,
+        ] {
+            roundtrip(&Reply::MergedWorktreeRemoved(Err(CleanupRefusal::new(
+                kind,
+                "Merged, kept: ignored files .env, data.db",
+            ))));
+        }
+        roundtrip(&Reply::MergedWorktreeRemoved(Ok(
+            crate::worktree_cleanup::RemovedWorktree {
+                common_dir: "/repo/.git".into(),
+                admin_dir: "/repo/.git/worktrees/feature".into(),
+                path: "/repo-feature".into(),
+                branch: Some("refs/heads/feature".into()),
+            },
+        )));
     }
 
     #[test]

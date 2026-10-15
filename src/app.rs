@@ -2577,7 +2577,16 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::NativeWindowAction(_)
                 | Message::ProjectUi(
                     project_ui::Action::Command { .. }
-                        | project_ui::Action::ConfirmDelete
+                        | project_ui::Action::ConfirmDelete(_)
+                        | project_ui::Action::DeleteBranchChanged(..)
+                        | project_ui::Action::ForceDeleteBranch(_)
+                        | project_ui::Action::KeepBranch(_)
+                        | project_ui::Action::BusyAgentsConfirmed(..)
+                        | project_ui::Action::OpenCleanupPolicy(_)
+                        | project_ui::Action::CleanupPolicyChanged(..)
+                        | project_ui::Action::SaveCleanupPolicy(_)
+                        | project_ui::Action::ConfirmRemove
+                        | project_ui::Action::RetryDelete(_)
                         | project_ui::Action::Dismiss
                 )
                 | Message::ChannelUi(
@@ -9265,6 +9274,9 @@ impl Cagents {
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
+                    cleanup_projects: self.sidebar_model.projects.iter()
+                        .filter(|project| project.kind == ProjectKind::Git)
+                        .map(|project| (project.id, project.name.clone())).collect(),
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
@@ -11272,8 +11284,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -26992,7 +27007,7 @@ mod tests {
             "with nothing blocking it, the confirming button is offered: {labels:?}"
         );
 
-        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete));
+        app.confirm_worktree_delete_fixture();
         assert!(
             app.project_ui
                 .deleting_directory(Path::new("/repo/feature")),
