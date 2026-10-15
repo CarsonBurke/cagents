@@ -8,6 +8,7 @@ pub(super) fn owns_request(request: u64) -> bool {
     request & REQUEST_NAMESPACE != 0
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct Output {
     /// At most 24 MiB: each of the retained 8 MiB raw bytes can require
@@ -31,6 +32,7 @@ pub(super) struct PendingReply {
     pub ownership: Option<diagnostic_read::DiagnosticResponseCharge>,
 }
 impl PendingReply {
+    #[cfg(test)]
     fn legacy(reply: crossbeam_channel::Sender<Result<Page, String>>) -> Self {
         Self {
             reply: Some(reply),
@@ -85,6 +87,7 @@ pub(super) fn append_page(
     Ok(page.next_offset)
 }
 
+#[cfg(test)]
 pub(super) fn readable(bytes: Vec<u8>) -> String {
     let text = String::from_utf8(bytes)
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
@@ -93,6 +96,9 @@ pub(super) fn readable(bytes: Vec<u8>) -> String {
     text
 }
 
+// The production consumer uses only charged, cancellable diagnostic jobs.
+// Keep this older synchronous path solely for the existing wire regression.
+#[cfg(test)]
 impl ClientHandle {
     /// Read the immutable retained log over this authenticated connection.
     /// The caller runs this on its blocking pool; there is no new idle thread.

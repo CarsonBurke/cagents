@@ -28,7 +28,6 @@ use std::{
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
 mod provider_exit;
-pub(crate) use provider_exit::Output as ProviderExitOutput;
 mod diagnostic_decode;
 mod diagnostic_read;
 pub(crate) use diagnostic_read::{
