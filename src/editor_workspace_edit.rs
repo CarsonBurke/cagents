@@ -177,10 +177,15 @@ fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree
 pub struct PublicationReport { pub durability_warnings: Vec<String> }
 
 pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, String> {
+    publish_unopened_with_before_file(plan, |_| {})
+}
+
+fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(usize)) -> Result<PublicationReport, String> {
     verify_root(&plan.root)?;
     let mut report = PublicationReport::default();
     let mut published: Vec<&DocumentPlan> = Vec::new();
-    for document in plan.documents.iter().filter(|document| !document.open && document.before != document.after) {
+    for (index, document) in plan.documents.iter().filter(|document| !document.open && document.before != document.after).enumerate() {
+        before_file(index);
         let saved = verify_root(&plan.root).and_then(|()| editor::save_file_at(&plan.root, &document.relative, &document.after, document.before_hash, false).map_err(|error| error.to_string()));
         let failure = match saved {
             Ok(SaveOutcome::Saved { durability, .. }) => {
@@ -308,6 +313,29 @@ mod tests {
         assert!(matches!(editor::save_file_at(&plan.root, Path::new("a.rs"), "original only", blake3::hash(b"old"), false), Ok(SaveOutcome::Saved { .. })));
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "old");
         assert_eq!(std::fs::read_to_string(moved.join("a.rs")).unwrap(), "original only");
+    }
+
+    #[test]
+    fn root_replacement_mid_publication_rolls_back_only_the_original_tree() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("worktree");
+        let moved = parent.path().join("original");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["a.rs", "b.rs"] { std::fs::write(root.join(name), "old").unwrap(); }
+        let documents = ["a.rs", "b.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }).collect();
+        let plan = prepare(&root, documents, &HashMap::new()).unwrap();
+        let result = publish_unopened_with_before_file(&plan, |index| {
+            if index == 1 {
+                assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "new");
+                std::fs::rename(&root, &moved).unwrap();
+                std::fs::create_dir(&root).unwrap();
+                for name in ["a.rs", "b.rs"] { std::fs::write(root.join(name), "old").unwrap(); }
+            }
+        });
+        assert!(result.unwrap_err().contains("Earlier writes were restored"));
+        for tree in [&root, &moved] {
+            for name in ["a.rs", "b.rs"] { assert_eq!(std::fs::read_to_string(tree.join(name)).unwrap(), "old"); }
+        }
     }
 
     #[test]
