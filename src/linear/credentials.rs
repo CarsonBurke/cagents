@@ -11,7 +11,9 @@ use std::{
 use super::Error;
 
 const APPLICATION: &str = "com.carson.cagents.linear";
-const MAX_KEY_BYTES: usize = 16 * 1024;
+// Including the newline, the stdin write fits Linux PIPE_BUF (4096). A
+// helper waiting for a locked vault cannot block us before the timeout starts.
+const MAX_KEY_BYTES: usize = 4095;
 
 /// A UI input/message whose debug representation cannot disclose its value.
 #[derive(Clone, Default)]

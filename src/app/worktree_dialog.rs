@@ -300,7 +300,7 @@ impl WorktreeDialog {
             LinearLookup::Unavailable(reason) => {
                 let branch = crate::repository::worktree_branch_input(&self.draft.branch)
                     .unwrap_or_else(|_| self.draft.branch.clone());
-                Some(format!("Issue not fetched: {reason}. Branch: {branch}; the checkout will not be linked."))
+                Some(format!("Issue not fetched from the default Linear workspace: {reason}. Branch: {branch}; the checkout will not be linked."))
             },
         }
     }
