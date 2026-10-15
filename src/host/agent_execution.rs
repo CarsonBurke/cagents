@@ -165,11 +165,7 @@ pub(super) fn submit(
         None
     };
     let pinned_directory = selected.as_ref().map(|spec| {
-        let root = crate::fs_safety::Root::open(std::path::Path::new("/")).map_err(|error| error.to_string())?;
-        let relative = spec.target.directory.strip_prefix("/").map_err(|error| error.to_string())?;
-        let directory = crate::fs_safety::open_beneath(&root, relative).map_err(|error| error.to_string())?;
-        if !directory.metadata().map_err(|error| error.to_string())?.is_dir() { return Err("The agent working directory is not a directory".to_owned()); }
-        Ok::<_,String>(Arc::new(directory))
+        chat::protocol::ExecutionContext::capture(&spec.target.directory)?.directory_descriptor().ok_or_else(|| "The selected agent directory could not be pinned".to_owned())
     }).transpose()?;
     let directory_identity = pinned_directory.as_ref().map(|directory| directory.metadata().map(|metadata| crate::agent_execution::DirectoryIdentity::from_metadata(&metadata)).map_err(|error| error.to_string())).transpose()?;
     let accepted = registry
