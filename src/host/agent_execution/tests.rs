@@ -865,6 +865,63 @@ fn settled(host: &SharedHost, run: RunId) -> Run {
 }
 
 #[test]
+fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup_usable() {
+    if isolated("legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup_usable").is_some() { return; }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let (agent, pane, scope) = {
+        let mut store = store.lock().unwrap();
+        let agent = store.agent(accepted.agent.id).unwrap();
+        let HostedSession::Chat(source) = agent.session.as_ref().unwrap() else {unreachable!()};
+        // Persist the old UI's ended-console projection directly, as an old
+        // store would contain it after console /quit or EOF (neither closes
+        // the provider). The provider below is an actual running fixture.
+        let terminal = crate::model::TerminalSession {id: source.id, owned_codex_listener: None,
+            recovery_origin: None, predecessor: None, launch: source.launch.recipe.clone(),
+            transcript_path: None, resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Exited {last_exit: crate::model::TerminalExit {
+                code: Some(0), signal: None, occurred_at_unix_ms: 1}}};
+        let agent = store.bind_agent_console(agent.id, agent.session.as_ref().unwrap(), terminal.clone()).unwrap();
+        let scope = agent.placement.clone();
+        let pane = crate::workspace_model::views::Pane {id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Legacy ended console".into(), user_title: None, pending_terminal_start: false,
+            width_fraction: 1.0, kind: crate::model::CardKind::Terminal(terminal), scope: None};
+        store.apply(&ModelEdit::SeedView {scope: scope.clone(), panes: vec![pane.clone()], closed: vec![]}).unwrap();
+        (agent, pane, scope)
+    };
+    let source = agent.session.as_ref().unwrap().id();
+    let handle = host.lock().unwrap().chats[&source].handle.clone();
+    let before = store.lock().unwrap().model().unwrap();
+    let prompts = std::fs::read(path.parent().unwrap().join("prompts")).unwrap();
+    assert!(close(&host, &Authority::default(), agent.id).unwrap_err().contains("historical generation proof"));
+    assert!(crate::host::chat::process(&host, EXECUTION_CLIENT, ClientRequest::ChatClose {chat_id: source})
+        .unwrap_err().message.contains("historical generation proof"));
+    assert!(crate::host::chat::close_terminal_actor(&host, source, &handle)
+        .unwrap_err().message.contains("historical generation proof"));
+    let HostedSession::Chat(retained) = agent.session.as_ref().unwrap() else {unreachable!()};
+    assert!(crate::host::chat::close_retained_native(&host, retained)
+        .unwrap_err().contains("historical generation proof"));
+    assert!(!handle.is_completed(), "refusal must precede provider freeze/stop");
+    assert!(host.lock().unwrap().chats[&source].handle.same_actor(&handle));
+    assert_eq!(store.lock().unwrap().model().unwrap(), before);
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), agent);
+    assert_eq!(store.lock().unwrap().agent_run(run.id).unwrap(), run);
+    assert_eq!(std::fs::read(path.parent().unwrap().join("prompts")).unwrap(), prompts);
+    let followup = submit(&host, &Authority::default(), Submit {name: None, destination: Destination::Existing(agent.id),
+        prompt: "Still usable after refused close".into(), idempotency_key: "after-refusal".into()}).unwrap();
+    assert_eq!(settled(&host, followup.run.id).result.text, "SERVICE_RESULT_2");
+    assert_eq!(std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(), "spawn\n");
+    // Test-owned cleanup after proving refusal had no teardown side effect.
+    {let mut store = store.lock().unwrap(); let revision = store.view_revision(&scope).unwrap();
+        store.apply(&ModelEdit::ChangeView {scope, expected_revision: revision, operation: uuid::Uuid::new_v4(),
+            change: crate::workspace_model::views::Change::Remove {id: pane.id}}).unwrap();}
+    close(&host, &Authority::default(), agent.id).unwrap();
+}
+
+#[test]
 fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authority() {
     if isolated("committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authority")
         .is_some()

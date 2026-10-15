@@ -1226,6 +1226,33 @@ impl Registry {
         Ok(agent)
     }
 
+    /// Refuse known unavailable presentation authority before stopping a
+    /// provider. The commit repeats the same predicate under its write TX.
+    pub(crate) fn preflight_agent_close(&mut self, origin: &Origin, id: AgentId) -> Result<Agent, String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let agent = read_agent(&tx, id)?;
+        if &agent.origin != origin { return Err("This caller does not own the agent".into()); }
+        super::views::preflight_retire_agent(&tx, &agent)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(agent)
+    }
+
+    pub(crate) fn preflight_agent_retirement(&mut self, source: &HostedSession) -> Result<(), String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let row: Option<(String, Option<String>)> = tx.query_row(
+            "SELECT a.record,p.source FROM agents a LEFT JOIN agent_launches p ON p.agent=a.id
+             WHERE (a.session_id=?1 OR p.session_id=?1) AND a.closed=0", [source.id().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(|error| error.to_string())?;
+        if let Some((record, pending)) = row {
+            let agent: Agent = decode(&record)?;
+            let pending = pending.map(|record| decode::<HostedSession>(&record)).transpose()?;
+            if agent.session.as_ref().or(pending.as_ref()).is_some_and(|expected| expected.same_process(source)) {
+                super::views::preflight_retire_agent(&tx, &agent)?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     /// Until exact live prompt evidence can be reconciled, restart records an
     /// uncertain outcome rather than authorizing another delivery of effects.
     pub(crate) fn interrupt_unproven_agent_runs(&mut self, now_ms: u64) -> Result<(), String> {

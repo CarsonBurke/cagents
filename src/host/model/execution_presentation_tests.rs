@@ -1,4 +1,24 @@
 // Included in execution::tests to reuse the real durable managed-agent fixtures.
+#[test]
+fn legacy_open_presentation_close_preflight_is_read_only_and_repeats_commit_predicate() {
+    let (mut registry, _directory, accepted, pane) = console_pane_fixture();
+    let scope = crate::workspace_model::views::Scope::Channel(accepted.agent.channel().unwrap());
+    registry.apply(&ModelEdit::SeedView {scope: scope.clone(), panes: vec![ended_console(&pane)], closed: vec![]}).unwrap();
+    let agent = registry.agent(accepted.agent.id).unwrap();
+    assert!(!agent.closed);
+    let before = registry.model().unwrap();
+    let run = registry.agent_run(accepted.run.id).unwrap();
+    assert!(registry.preflight_agent_close(&Origin::User, agent.id).unwrap_err().contains("historical generation proof"));
+    assert!(registry.preflight_agent_retirement(agent.session.as_ref().unwrap()).unwrap_err().contains("historical generation proof"));
+    assert_eq!(registry.model().unwrap(), before);
+    assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+    assert_eq!(registry.agent(agent.id).unwrap(), agent);
+    registry.apply(&ModelEdit::ChangeView {scope: scope.clone(), expected_revision: registry.view_revision(&scope).unwrap(),
+        operation: uuid::Uuid::new_v4(), change: crate::workspace_model::views::Change::Remove {id: pane.id}}).unwrap();
+    assert_eq!(registry.preflight_agent_close(&Origin::User, agent.id).unwrap(), agent);
+    registry.preflight_agent_retirement(agent.session.as_ref().unwrap()).unwrap();
+}
+
 fn presentation_repair_fixture() -> (Registry, tempfile::TempDir, Accepted, crate::agent_execution::PresentationRepairTarget) {
     let (mut registry, directory, accepted, pane) = console_pane_fixture();
     registry.close_agent(&Origin::User, accepted.agent.id).unwrap();

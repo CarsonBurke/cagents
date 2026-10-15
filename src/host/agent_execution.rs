@@ -674,6 +674,15 @@ pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), 
     Ok(())
 }
 
+/// Reads only the managed presentation. No registry means ordinary interactive
+/// conversations still close without the optional managed-agent subsystem.
+pub(super) fn preflight_retirement(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    let Ok(registry) = registry(host) else { return Ok(()); };
+    let result = registry.lock().unwrap_or_else(|p| p.into_inner())
+        .preflight_agent_retirement(&HostedSession::Chat(session.clone()));
+    result
+}
+
 fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -691,10 +700,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     let agent = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .agent(id)?;
-    if agent.origin != origin {
-        return Err("This caller does not own the agent".into());
-    }
+        .preflight_agent_close(&origin, id)?;
     if agent.closed {
         // Older daemons closed the worker without retiring its shared pane.
         // Repeating close repairs only that retained presentation; it does not

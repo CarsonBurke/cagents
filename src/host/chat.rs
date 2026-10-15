@@ -2469,15 +2469,17 @@ fn process_inner(
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatClose { chat_id } => {
-            let handle = {
+            let (handle, source) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
                     return Err(error(
                         "This chat already returned to terminal; complete the retained handoff before closing its card",
                     ));
                 }
-                attached(&state, client, chat_id)?.handle.clone()
+                let record = attached(&state, client, chat_id)?;
+                (record.handle.clone(), record.session.clone())
             };
+            super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
             handle.close_for_resume().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
             let (retained, pending_cleanup) = {
@@ -2973,6 +2975,11 @@ pub(super) fn close_terminal_actor(
     terminal_id: TerminalId,
     handle: &Handle,
 ) -> Result<(), ProtocolError> {
+    let source = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&terminal_id)
+        .filter(|record| record.handle.same_actor(handle)).map(|record| record.session.clone());
+    if let Some(source) = source {
+        super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+    }
     handle.close().map_err(unavailable)?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let removed = if state
