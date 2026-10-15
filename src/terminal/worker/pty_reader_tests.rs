@@ -35,7 +35,13 @@ impl ReaderOwner {
         let reader_discard_pending = Arc::clone(&discard_pending);
         let thread = thread::spawn(move || {
             let _done = done_tx;
-            read_pty(&mut reader, &sender, readiness, wake_rx, &reader_discard_pending);
+            read_pty(
+                &mut reader,
+                &sender,
+                readiness,
+                wake_rx,
+                &reader_discard_pending,
+            );
         });
         Self {
             wake: Some(wake),
@@ -100,10 +106,16 @@ fn private_pty() -> (File, File) {
     let master = unsafe { File::from_raw_fd(master) };
     let slave = unsafe { File::from_raw_fd(slave) };
     for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
     }
     let mut attributes = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut attributes) }, 0);
+    assert_eq!(
+        unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut attributes) },
+        0
+    );
     unsafe { libc::cfmakeraw(&mut attributes) };
     assert_eq!(
         unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attributes) },
@@ -118,7 +130,9 @@ fn original_reader_cancellation_escapes_a_full_output_queue() {
     let readiness = reader.try_clone().unwrap().into();
     let (observed, read) = crossbeam_channel::bounded(1);
     let (sender, output) = crossbeam_channel::bounded(1);
-    sender.send(PtyMessage::Bytes(b"already queued".to_vec())).unwrap();
+    sender
+        .send(PtyMessage::Bytes(b"already queued".to_vec()))
+        .unwrap();
     let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
     slave.write_all(b"blocked output").unwrap();
     assert!(read.recv_timeout(Duration::from_secs(2)).unwrap() > 0);
@@ -139,7 +153,9 @@ fn actual_pty_output_survives_parser_backpressure_in_order_until_eof() {
     let readiness = reader.try_clone().unwrap().into();
     let (observed, read) = crossbeam_channel::bounded(1);
     let (sender, output) = crossbeam_channel::bounded(1);
-    sender.send(PtyMessage::Bytes(b"earlier output".to_vec())).unwrap();
+    sender
+        .send(PtyMessage::Bytes(b"earlier output".to_vec()))
+        .unwrap();
     let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
     slave.write_all(b"later output").unwrap();
     assert!(read.recv_timeout(Duration::from_secs(2)).unwrap() > 0);
@@ -163,7 +179,9 @@ fn stopping_for_carry_keeps_already_read_bytes_behind_a_full_output_queue() {
     let readiness = reader.try_clone().unwrap().into();
     let (observed, read) = crossbeam_channel::bounded(1);
     let (sender, output) = crossbeam_channel::bounded(1);
-    sender.send(PtyMessage::Bytes(b"previous screen".to_vec())).unwrap();
+    sender
+        .send(PtyMessage::Bytes(b"previous screen".to_vec()))
+        .unwrap();
     let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
     slave.write_all(b"already read").unwrap();
     let consumed = read.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -179,10 +197,7 @@ fn stopping_for_carry_keeps_already_read_bytes_behind_a_full_output_queue() {
     // The exact master duplicate keeps unread kernel output, then accepts
     // fresh output after the old reader ends. Neither path replays bytes.
     slave.write_all(b"successor").unwrap();
-    let expected = [
-        &b"already read"[consumed..],
-        b"successor".as_slice(),
-    ].concat();
+    let expected = [&b"already read"[consumed..], b"successor".as_slice()].concat();
     assert_eq!(read_private_pty(&mut successor, expected.len()), expected);
 }
 
@@ -233,7 +248,10 @@ fn shared_nonblocking_pty_readiness_race_rearms_without_losing_output() {
     let (raced, race) = crossbeam_channel::bounded(1);
     let (sender, output) = crossbeam_channel::bounded(1);
     let mut owner = ReaderOwner::start(
-        ConsumedReadiness { reader, raced: Some(raced) },
+        ConsumedReadiness {
+            reader,
+            raced: Some(raced),
+        },
         readiness,
         sender,
     );
@@ -272,14 +290,20 @@ fn read_private_pty(reader: &mut File, length: usize) -> Vec<u8> {
     let mut bytes = vec![0; length];
     let mut offset = 0;
     while offset < length {
-        let remaining = deadline.checked_duration_since(std::time::Instant::now()).unwrap();
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap();
         let mut readiness = libc::pollfd {
             fd: reader.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
         let ready = unsafe {
-            libc::poll(&mut readiness, 1, remaining.as_millis().max(1).min(i32::MAX as u128) as i32)
+            libc::poll(
+                &mut readiness,
+                1,
+                remaining.as_millis().max(1).min(i32::MAX as u128) as i32,
+            )
         };
         if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
             continue;
@@ -288,7 +312,14 @@ fn read_private_pty(reader: &mut File, length: usize) -> Vec<u8> {
         match reader.read(&mut bytes[offset..]) {
             Ok(0) => panic!("private successor PTY closed before expected output"),
             Ok(count) => offset += count,
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(error) => panic!("read private successor PTY: {error}"),
         }
     }
