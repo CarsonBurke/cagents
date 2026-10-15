@@ -101,11 +101,28 @@ pub(super) fn migrate_after_read(db: &Connection, after_read: impl FnOnce() -> R
     migrate_with_hooks(db, after_read, |_| Ok(()))
 }
 
-fn migrate_with_hooks(db: &Connection, after_read: impl FnOnce() -> Result<(), String>, mut after_table: impl FnMut(usize) -> Result<(), String>) -> Result<(), String> {
+/// The constructor carries its real read transaction across read-write open.
+/// Release it only after this connection owns the writer reservation: keeping
+/// it through COMMIT would block our own rollback-journal writer.
+pub(super) fn migrate_with_admission(db: &Connection, inspection: Connection,
+    after_read: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    migrate_with_admission_hooks(db, after_read, |_| Ok(()), move || {
+        inspection.execute_batch("ROLLBACK").map_err(|error| error.to_string())?;
+        drop(inspection);
+        Ok(())
+    })
+}
+
+fn migrate_with_hooks(db: &Connection, after_read: impl FnOnce() -> Result<(), String>, after_table: impl FnMut(usize) -> Result<(), String>) -> Result<(), String> {
+    migrate_with_admission_hooks(db, after_read, after_table, || Ok(()))
+}
+
+fn migrate_with_admission_hooks(db: &Connection, after_read: impl FnOnce() -> Result<(), String>, mut after_table: impl FnMut(usize) -> Result<(), String>, after_writer: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     check_readonly(db)?;
     after_read()?;
     let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
+    after_writer()?;
     let current = version(&tx)?;
     admit(current)?;
     validate_selected(&tx, current)?;
@@ -222,8 +239,8 @@ mod tests {
         seed.execute("UPDATE projects SET name='retained before admission'", []).unwrap();
         drop(seed);
         let mut expected = None;
-        let result = Registry::at_with_migration(&path, |db| {
-            migrate_after_read(db, || {
+        let result = Registry::at_with_migration(&path, |db, inspection| {
+            migrate_with_admission(db, inspection, || {
                 let writer = Connection::open(&path).unwrap();
                 writer.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
                 let tx = writer.unchecked_transaction().unwrap();
