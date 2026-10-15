@@ -83,8 +83,10 @@ impl FilesystemRecoveryContext {
         Ok(FilesystemRecoveryReservation { context: self.clone(), slot })
     }
     pub(crate) fn reserve(&self) -> Result<RecoverySlot, String> {
-        self.placement.require_payload_registration().map_err(|error| error.to_string())?;
-        self.context.reserve()
+        // Cleanup validation remains available after retirement. NEW directory
+        // creation needs a separate atomic admission retained by this SAMEslot.
+        let guard = self.placement.begin_payload_creation().map_err(|error| error.to_string())?;
+        self.context.reserve().map(|slot| slot.with_creation_guard(guard))
     }
 }
 
