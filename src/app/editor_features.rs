@@ -22,7 +22,6 @@ pub enum Action {
     PreviewRepository { ticket: u64, action: RepositoryAction },
     ApplyPreview,
     CancelPreview,
-    ExpireServerNotice { id: u64, ticket: u64 },
     Published { ticket: u64, result: Result<workspace::PublicationReport, String> },
 }
 
@@ -230,12 +229,13 @@ mod tests {
         drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Error, message: "server failed".into() })));
         assert!(app.notices.recent().any(|entry| entry.notice.message == "server failed"));
         drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Info, message: "indexing complete".into() })));
-        let (id, previous) = app.editor_features.notice_expiry.iter().map(|(id, ticket)| (*id, *ticket)).next().unwrap();
-        drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Info, message: "indexing complete".into() })));
-        let current = app.editor_features.notice_expiry[&id];
-        drop(app.update_editor_features(Action::ExpireServerNotice { id, ticket: previous }));
+        let info = app.notices.recent().find(|entry| entry.notice.message == "indexing complete").unwrap();
+        let first_expiry = info.expires_at.expect("server info uses the canonical success expiry");
+        let replacement = info.notice.clone();
+        app.notices.record_at(replacement, first_expiry - Duration::from_secs(3));
+        app.notices.expire(first_expiry);
         assert!(app.notices.recent().any(|entry| entry.notice.message == "indexing complete"));
-        drop(app.update_editor_features(Action::ExpireServerNotice { id, ticket: current }));
+        app.notices.expire(first_expiry + Duration::from_secs(4));
         assert!(!app.notices.recent().any(|entry| entry.notice.message == "indexing complete"));
         assert!(app.notices.recent().any(|entry| entry.notice.message == "server failed"));
     }
@@ -266,7 +266,6 @@ mod tests {
         drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Info, message: "Background indexing done".into() })));
         assert_eq!(app.notices.len(), NOTICE_LOG_CAPACITY);
         assert!(app.notices.recent().all(|entry| entry.notice.severity == NoticeSeverity::Error));
-        assert!(app.editor_features.notice_expiry.is_empty());
     }
 
     #[test]
@@ -560,7 +559,6 @@ struct Publication {
 #[derive(Default)]
 pub(super) struct State {
     next_ticket: u64,
-    notice_expiry: HashMap<u64, u64>,
     requests: HashMap<LspRequestId, Operation>,
     preparing: HashMap<u64, Operation>,
     renames: HashMap<CardId, Rename>,
@@ -760,20 +758,9 @@ impl Cagents {
                     LspMessageLevel::Log => tracing::info!(target: "cagents::lsp::server", ?doc, message),
                     LspMessageLevel::Error => self.feature_failure(card, message.clone()),
                     LspMessageLevel::Warning => self.status = Some(TransientNotice::warning(message.clone())),
-                    LspMessageLevel::Info => {
-                        let notice = TransientNotice::success(message.clone());
-                        self.notices.record(notice.clone());
-                        // A log filled with persistent failures may choose to
-                        // discard this lower-severity transient immediately.
-                        let Some(id) = self.notices.recent().find(|entry| entry.notice == notice).map(|entry| entry.id) else { return Some(Task::none()); };
-                        self.editor_features.notice_expiry.retain(|id, _| self.notices.entries.iter().any(|entry| entry.id == *id));
-                        let ticket = self.editor_features.next();
-                        self.editor_features.notice_expiry.insert(id, ticket);
-                        return Some(cosmic::task::future(async move {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            Message::EditorFeatures(Action::ExpireServerNotice { id, ticket })
-                        }));
-                    },
+                    // Canonical NoticeLog owns the one success-expiry timer.
+                    // A broadcast is recorded once, without per-document keys.
+                    LspMessageLevel::Info => self.notices.record(TransientNotice::success(message.clone())),
                 }
                 Some(Task::none())
             }
@@ -1067,13 +1054,6 @@ impl Cagents {
                 if let Some(preview) = self.editor_features.preview.take() {
                     preview.cancellation.cancel();
                     self.reject_server_edit(&preview.operation, "The user canceled the preview");
-                }
-                Task::none()
-            }
-            Action::ExpireServerNotice { id, ticket } => {
-                if self.editor_features.notice_expiry.get(&id) == Some(&ticket) {
-                    self.editor_features.notice_expiry.remove(&id);
-                    self.notices.dismiss(id);
                 }
                 Task::none()
             }
