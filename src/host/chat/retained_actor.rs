@@ -61,7 +61,10 @@ fn run(host: Weak<HostLock>, inbox: Arc<Inbox>) {
         if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down { return; }
         for id in work {
             match drain(&host, id) {
-                Ok(()) => { warned.remove(&id); }
+                Ok(more) => {
+                    warned.remove(&id);
+                    if more { retry.insert(id); }
+                }
                 Err(error) => {
                     if warned.insert(id) { tracing::warn!(%id, %error, "retained actor outcome is not committed; helper retains it for retry"); }
                     retry.insert(id);
@@ -71,11 +74,11 @@ fn run(host: Weak<HostLock>, inbox: Arc<Inbox>) {
     }
 }
 
-fn drain(host: &SharedHost, id: TerminalId) -> Result<(), String> {
+fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     let (handle, source, identity, notifications) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(record) = state.chats.get(&id) else { return Ok(()); };
-        let Some(identity) = record.handle.actor_identity() else { return Ok(()); };
+        let Some(record) = state.chats.get(&id) else { return Ok(false); };
+        let Some(identity) = record.handle.actor_identity() else { return Ok(false); };
         (record.handle.clone(), record.session.clone(), identity, state.notifications.clone())
     };
     let registry = super::super::agent_execution::registry(host)?;
@@ -91,7 +94,9 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<(), String> {
     }
     // Always ask the HELPER for its unacknowledged page. The local cursor alone
     // cannot prove that a notification committed before a previous daemon died.
-    for entry in handle.uncommitted_outcomes()? {
+    let page = handle.uncommitted_outcomes()?;
+    let more = !page.is_empty();
+    for entry in page {
         let semantic = match entry.update {
             Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
             Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
@@ -115,7 +120,10 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<(), String> {
         if !current { return Err("Retained actor ownership changed before semantic acknowledgement".into()); }
         handle.commit_retained_outcomes(entry.sequence)?;
     }
-    Ok(())
+    // One bounded page per actor per pass. A detached actor can have many
+    // pages without another latest-sequence edge; explicitly revisit it until
+    // an empty page confirms the helper's entire outbox is acknowledged.
+    Ok(more)
 }
 
 /// Keep the exact cleanup owner even when helper spawn/installation replies
