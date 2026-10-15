@@ -5031,14 +5031,13 @@ mod tests {
                 Icon::Warning,
             ),
         ] {
-            let snapshot = Arc::make_mut(&mut runtime.snapshot);
-            snapshot.finished_at = Some(42);
-            snapshot.outcome = Some(outcome);
-            assert_eq!(runtime.conversation_status(false), (Some(glyph), label));
             let mut next = (*runtime.snapshot).clone();
+            next.finished_at = Some(42);
+            next.outcome = Some(outcome);
             next.generation += 1;
             _handle.replace_snapshot_for_test(next);
             runtime.refresh();
+            assert_eq!(runtime.conversation_status(false), (Some(glyph), label));
             assert!(
                 runtime
                     .finished_stamp
