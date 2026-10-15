@@ -3795,8 +3795,6 @@ impl RepositoryRuntime {
         }
     }
 
-    /// Complete bounded document/history census, including cached roots while
-    /// the new document is loading or read-only. Recovery/operation leases are
     /// Reuse original enrolled roots across file loads in this runtime. This
     /// is a bounded pure ownership snapshot; worker validation remains required.
     pub fn retained_editor_root_admissions(&self) -> Vec<crate::editor::FileRootIdentity> {
@@ -3811,6 +3809,8 @@ impl RepositoryRuntime {
         roots
     }
 
+    /// Complete bounded document/history census, including cached roots while
+    /// the new document is loading or read-only. Recovery/operation leases are
     /// additionally enrolled with the domain issuer until their own release.
     pub fn retained_filesystem_roots(&self) -> Vec<Arc<crate::fs_safety::Root>> {
         let mut roots = self.retained_filesystem_root().into_iter().collect::<Vec<_>>();
