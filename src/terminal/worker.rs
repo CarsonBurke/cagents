@@ -6701,8 +6701,12 @@ mod tests {
         while owners.iter().any(|owner| owner.upgrade().is_some()) { assert!(Instant::now() < deadline); thread::yield_now(); }
         assert!(slots.iter().all(|slot| slot.upgrade().is_none()));
         let handle = TerminalHandle::spawn(source, Default::default(), |_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !std::fs::read_to_string(&marker).is_ok_and(|text| text == "started") {
+            assert!(Instant::now() < deadline, "admission recovery must actually start the retained recipe");
+            thread::yield_now();
+        }
         handle.input(b"capacity-recovered\n").unwrap(); wait_for_text(&handle, "capacity-recovered");
-        assert_eq!(std::fs::read_to_string(marker).unwrap(), "started");
         handle.shutdown().unwrap();
     }
 
