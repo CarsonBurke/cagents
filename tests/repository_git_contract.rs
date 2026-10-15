@@ -32,6 +32,10 @@ use cagents::repository::{
     ValidatedRefName,
 };
 
+#[cfg(target_os = "linux")]
+#[path = "support/recovery_context.rs"]
+mod recovery_context;
+
 /// Applies configuration isolation and a fixed identity to every command,
 /// including the ones the service builds itself.
 struct IsolatedExecutor(SystemProcessExecutor);
@@ -135,6 +139,16 @@ impl Fixture {
 
     fn service(&self) -> RepositoryService<IsolatedExecutor> {
         RepositoryService::new(&self.git, Arc::new(IsolatedExecutor(SystemProcessExecutor)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recovery_context(&self) -> cagents::filesystem_recovery_context::FilesystemRecoveryContext {
+        recovery_context::context(&self.work())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recovery_service(&self) -> RepositoryService<IsolatedExecutor> {
+        self.service().with_recovery_context(self.recovery_context())
     }
 
     /// Runs a raw `git` command and requires success, so a broken fixture fails
@@ -5607,8 +5621,10 @@ fn cancelling_sync_after_pull_reports_the_completed_local_step() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn recoverable_discard_restores_contents_modes_and_deleted_paths() {
+    if recovery_context::run_isolated_case("recoverable_discard_restores_contents_modes_and_deleted_paths") { return; }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Some(fixture) = Fixture::new() else {
         return;
@@ -5636,7 +5652,7 @@ fn recoverable_discard_restores_contents_modes_and_deleted_paths() {
     )
     .unwrap();
     let cancellation = CancellationToken::new();
-    let service = fixture.service();
+    let service = fixture.recovery_service();
     let result = service
         .discard_recoverable(
             &DiscardRequest {
@@ -5707,8 +5723,10 @@ fn recoverable_discard_restores_contents_modes_and_deleted_paths() {
     assert!(!receipt.info.exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn recoverable_discard_refuses_newer_files_independently() {
+    if recovery_context::run_isolated_case("recoverable_discard_refuses_newer_files_independently") { return; }
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -5719,7 +5737,7 @@ fn recoverable_discard_refuses_newer_files_independently() {
     fixture.write("first.txt", b"old first work\n");
     fixture.write("second.txt", b"old second work\n");
     fixture.write("new.txt", b"old untracked work\n");
-    let service = fixture.service();
+    let service = fixture.recovery_service();
     let cancellation = CancellationToken::new();
     let result = service
         .discard_recoverable(
@@ -5766,8 +5784,10 @@ fn recoverable_discard_refuses_newer_files_independently() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn recoverable_discard_preserves_literal_symlinks_and_protects_changed_trash() {
+    if recovery_context::run_isolated_case("recoverable_discard_preserves_literal_symlinks_and_protects_changed_trash") { return; }
     use std::os::unix::fs::symlink;
     let Some(fixture) = Fixture::new() else {
         return;
@@ -5778,7 +5798,7 @@ fn recoverable_discard_preserves_literal_symlinks_and_protects_changed_trash() {
     fs::remove_file(fixture.work().join("tracked-link")).unwrap();
     symlink("../outside-target", fixture.work().join("tracked-link")).unwrap();
     symlink("literal-untracked-target", fixture.work().join("new-link")).unwrap();
-    let service = fixture.service();
+    let service = fixture.recovery_service();
     let cancel = CancellationToken::new();
     let result = service
         .discard_recoverable(
@@ -5825,8 +5845,10 @@ fn recoverable_discard_preserves_literal_symlinks_and_protects_changed_trash() {
     fs::remove_file(&receipt.info).unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn undo_discard_refuses_a_replaced_worktree_root() {
+    if recovery_context::run_isolated_case("undo_discard_refuses_a_replaced_worktree_root") { return; }
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -5834,7 +5856,7 @@ fn undo_discard_refuses_a_replaced_worktree_root() {
     fixture.git_in_work(&["add", "."]);
     fixture.commit("base");
     fixture.write("f.txt", b"saved work\n");
-    let service = fixture.service();
+    let service = fixture.recovery_service();
     let cancel = CancellationToken::new();
     let result = service
         .discard_recoverable(
@@ -5858,8 +5880,10 @@ fn undo_discard_refuses_a_replaced_worktree_root() {
     assert_eq!(fs::read(original.join("f.txt")).unwrap(), b"base\n");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn worktree_patch_recovery_handles_new_deleted_and_renamed_files() {
+    if recovery_context::run_isolated_case("worktree_patch_recovery_handles_new_deleted_and_renamed_files") { return; }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     for kind in ["new", "deleted", "renamed"] {
         let Some(fixture) = Fixture::new() else {
@@ -5890,7 +5914,7 @@ fn worktree_patch_recovery_handles_new_deleted_and_renamed_files() {
                 fixture.git_in_work(&["diff", "--cached", "--binary"])
             }
         };
-        let service = fixture.service();
+        let service = fixture.recovery_service();
         let cancel = CancellationToken::new();
         let result = service
             .apply_patch_recoverable(&fixture.work(), &patch, true, None, &cancel)
@@ -6066,6 +6090,7 @@ fn recovery_refuses_late_writes_during_other_batches_and_destructive_prechecks()
 #[cfg(target_os = "linux")]
 #[test]
 fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
+    if recovery_context::run_isolated_case("undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it") { return; }
     struct SubstituteUnpacked {
         changed: std::sync::atomic::AtomicBool,
     }
@@ -6129,7 +6154,10 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
     let executor = Arc::new(SubstituteUnpacked {
         changed: std::sync::atomic::AtomicBool::new(false),
     });
+    let context = fixture.recovery_context();
+    let outside = context.placement().directory().path().to_owned();
     let result = RepositoryService::new("git", executor.clone())
+        .with_recovery_context(context)
         .undo_discard(&receipt, &cancel)
         .unwrap();
     assert!(executor.changed.load(std::sync::atomic::Ordering::Acquire));
@@ -6157,7 +6185,7 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
             })
     }
     assert!(
-        preserved_artifact(&fixture.work(), 0),
+        preserved_artifact(&outside, 0),
         "the unexpected generated entry must be retained rather than blindly unlinked"
     );
     let before = receipt
@@ -6181,7 +6209,9 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
         receipt.can_undo(),
         "a live recovery cannot expire while it owns unresolved filesystem state"
     );
-    let holding = fs::read_dir(fixture.work())
+    fixture.git_in_work(&["add", "--all"]);
+    assert_eq!(fixture.git_in_work(&["ls-files", "-z"]), b"tracked.txt\0");
+    let holding = fs::read_dir(&outside)
         .unwrap()
         .filter_map(Result::ok)
         .find(|entry| {
@@ -6206,7 +6236,7 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
     ));
     // Explicitly resolve the unexpected entry; retry may remove only the exact
     // empty original holding using retained descriptors, never the new B path.
-    for entry in fs::read_dir(parked.join(&holding)).unwrap() {
+    for entry in fs::read_dir(outside.join(&holding)).unwrap() {
         let entry = entry.unwrap();
         assert_eq!(fs::read(entry.path()).unwrap(), b"EVIL");
         fs::remove_file(entry.path()).unwrap();
@@ -6239,6 +6269,7 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
 #[cfg(target_os = "linux")]
 #[test]
 fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_permission_recovery() {
+    if recovery_context::run_isolated_case("undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_permission_recovery") { return; }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicBool, Ordering};
     struct ChangeParentMode {
@@ -6295,7 +6326,7 @@ fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_per
         root: fixture.work(),
         changed: AtomicBool::new(false),
     });
-    let service = RepositoryService::new("git", executor.clone());
+    let service = RepositoryService::new("git", executor.clone()).with_recovery_context(fixture.recovery_context());
     let first = service.undo_discard(&receipt, &cancel).unwrap();
     let MutationOutcome::PartiallyApplied { paths, failures } = first else {
         panic!("partial outcome required: {first:?}");
