@@ -1,5 +1,7 @@
 #[cfg(feature = "host")]
 pub(crate) mod holder;
+#[cfg(feature = "host")]
+pub(crate) mod reactor;
 mod hosted;
 pub(crate) mod transport;
 pub mod ipc;

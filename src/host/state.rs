@@ -3606,7 +3606,6 @@ fn start_terminal_view_owned(
     handle
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
 
-    let event_rx = handle.events();
     let redraw_handle = handle.clone();
     let descriptor = {
         let mut state = shared
@@ -3674,44 +3673,15 @@ fn start_terminal_view_owned(
     );
     redraw_handle.set_agent_process_observer(move || activity_wake.notify());
     let event_host = Arc::downgrade(shared);
-    let archived_host = Arc::downgrade(shared);
-    redraw_handle.set_archived_event_observer(move |handle, event| {
-        record_event_from(&archived_host, terminal_id, event, Some(handle));
-    });
-    let completion_handle = redraw_handle.clone();
-    let event_thread = thread::Builder::new()
-        .name(format!("cagentsd-events-{terminal_id}"))
-        .spawn(move || {
-            while let Ok(event) = event_rx.recv() {
-                let completed = matches!(event, TerminalEvent::Completed { .. });
-                record_event_from(&event_host, terminal_id, event, Some(&completion_handle));
-                if completed {
-                    break;
-                }
-            }
-            // The final grid is captured after the exit event and may race a
-            // reveal queued just as the worker stops accepting commands.
-            // Notify only visible subscribers once teardown has preserved it.
-            broadcast_redraw(&event_host, terminal_id, completion_handle.generation());
-        });
-    if let Err(error) = event_thread {
-        let _ = redraw_handle.shutdown();
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state
-            .terminals
-            .get(&terminal_id)
-            .is_some_and(|record| record.handle.same_worker(&redraw_handle))
-        {
-            state.retire_terminal(terminal_id);
+    redraw_handle.set_event_observer(move |handle, event| {
+        let completed = matches!(event, TerminalEvent::Completed { .. });
+        record_event_from(&event_host, terminal_id, event, Some(handle));
+        if completed {
+            // Completion certifies the final grid, including a reveal queued
+            // just as the terminal stopped accepting parser commands.
+            broadcast_redraw(&event_host, terminal_id, handle.generation());
         }
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::Internal,
-            format!("could not start terminal event monitor: {error}"),
-            true,
-        ));
-    }
+    });
     Ok((descriptor, redraw_handle))
 }
 

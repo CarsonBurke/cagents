@@ -237,3 +237,19 @@ The isolated transport census tests warm shared resources before recording
 These tests cover transport growth only; the full native measurement must also
 include the daemon's emulator workers, holder PSS, eight provider chats, and
 `scripts/benchmark-terminal input` p99 on the same workload before and after.
+## Terminal process memory and threads
+
+Measure the daemon and UI separately from the per-terminal holder processes.
+A holder maps the matched daemon executable, so summing holder RSS counts
+shared file-backed pages repeatedly. Record PSS from `/proc/PID/smaps_rollup`
+for each explicitly owned holder and sum PSS for a proportional memory total;
+retain RSS alongside it to make the measurement comparable to system tools.
+Pin each sampled PID with its process start time before and after sampling.
+
+PTY reads and holder control observers use one shared terminal I/O reactor.
+A full terminal output inbox returns credit before its reader runs again;
+it does not block unrelated streams on the reactor. Semantic terminal events
+share a separate dispatcher because host callbacks can acquire host locks.
+The emulator remains on one worker per live terminal. Connection transport,
+provider processes and transcript writers need separate accounting when
+comparing an attached window with CLI-only terminals.

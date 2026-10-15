@@ -196,6 +196,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
     crate::terminal::transport::initialize_host().map_err(io::Error::other)?;
+    crate::terminal::reactor::initialize()?;
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id()?,

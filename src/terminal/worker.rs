@@ -11,7 +11,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     fs::File,
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
     rc::Rc,
@@ -22,6 +22,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::io::Read;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
@@ -299,6 +302,8 @@ enum Visibility {
     Hibernated,
 }
 
+type EventObserver = dyn Fn(TerminalEvent) + Send + Sync;
+
 type WakeCallback = dyn Fn(TerminalWake) + Send + Sync + 'static;
 
 enum ArchivePhase {
@@ -313,37 +318,32 @@ enum ArchivePhase {
 
 type ArchiveObserver = dyn Fn(TerminalEvent) + Send + Sync;
 
-/// Runs a completed terminal's subscriber callback on a thread of its own.
-///
-/// A completed terminal has no worker, so its commands execute on whichever
-/// thread sends them, and the daemon sends them while holding the host mutex
-/// its wake and event callbacks lock. Calling either inline deadlocks that
-/// thread against itself and, behind it, every other user of the host. One
-/// shared thread keeps the notifications of all completed terminals ordered.
-fn notify_archived(notice: impl FnOnce() + Send + 'static) {
-    type Notice = Box<dyn FnOnce() + Send>;
-    static NOTIFIER: OnceLock<Sender<Notice>> = OnceLock::new();
-    let notifier = NOTIFIER.get_or_init(|| {
+type Notice = Box<dyn FnOnce() + Send>;
+
+/// Both live and completed host callbacks share one dispatcher. A sender may
+/// hold a host or metadata lock, so invoking these callbacks inline can deadlock.
+fn event_dispatcher() -> Result<&'static Sender<Notice>, String> {
+    static NOTIFIER: OnceLock<Result<Sender<Notice>, String>> = OnceLock::new();
+    NOTIFIER.get_or_init(|| {
         let (notices, pending) = crossbeam_channel::unbounded::<Notice>();
-        if let Err(error) = thread::Builder::new()
-            .name("terminal-archive-notify".into())
-            .spawn(move || {
-                for notice in pending {
-                    // This thread serves every completed terminal for the life
-                    // of the process. A subscriber that panics has already
-                    // been reported by the panic hook; it must not take the
-                    // redraws and search results of all the others with it.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
-                }
-            })
-        {
-            tracing::error!(%error, "completed terminals cannot notify their subscribers");
-        }
-        notices
-    });
-    // Sending fails only when that thread never started, which is reported
-    // above.
-    let _ = notifier.send(Box::new(notice));
+        thread::Builder::new().name("terminal-events".into()).spawn(move || {
+            for notice in pending {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
+            }
+        }).map_err(|error| format!("start shared terminal event dispatcher: {error}"))?;
+        Ok(notices)
+    }).as_ref().map_err(Clone::clone)
+}
+
+fn notify_archived(notice: impl FnOnce() + Send + 'static) {
+    match event_dispatcher() {
+        Ok(notifier) => { let _ = notifier.send(Box::new(notice)); },
+        Err(error) => tracing::error!(%error, "terminal semantic events cannot be delivered"),
+    }
+}
+
+pub(super) fn initialize_event_dispatch() -> Result<(), String> {
+    event_dispatcher().map(|_| ())
 }
 
 /// Returns once every notice queued before this call has run.
@@ -375,6 +375,7 @@ struct PublishedState {
     agent_process: Mutex<Option<AgentProcess>>,
     agent_observer: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     semantic_events: OnceLock<Weak<Sender<TerminalEvent>>>,
+    event_observer: Mutex<Option<Arc<EventObserver>>>,
     conversation_title: Mutex<Option<String>>,
     searches: Mutex<HashMap<Option<u64>, Weak<AtomicU64>>>,
     archive: Mutex<ArchivePhase>,
@@ -423,6 +424,7 @@ impl PublishedState {
             agent_process: Mutex::new(None),
             agent_observer: OnceLock::new(),
             semantic_events: OnceLock::new(),
+            event_observer: Mutex::new(None),
             conversation_title: Mutex::new(None),
             searches: Mutex::new(HashMap::new()),
             archive: Mutex::new(ArchivePhase::Live),
@@ -611,6 +613,17 @@ impl PublishedState {
         Ok(())
     }
 
+    fn emit_event(&self, events: &Sender<TerminalEvent>, event: TerminalEvent) {
+        let observer = self.event_observer.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(observer) = observer.as_ref().cloned() {
+            // The caller can hold either an agent-state or host lock. Schedule
+            // callbacks on the shared notifier, never invoke under those locks.
+            notify_archived(move || observer(event));
+        } else {
+            let _ = events.send(event);
+        }
+    }
+
     fn emit_archived(&self, events: &Sender<TerminalEvent>, event: TerminalEvent) {
         if let Some(observer) = self.archive_observer.get().cloned() {
             notify_archived(move || observer(event));
@@ -630,7 +643,7 @@ impl PublishedState {
             // from another thread. The weak sender cannot keep a dead worker's
             // semantic stream open through its host event receiver.
             if let Some(events) = self.semantic_events.get().and_then(Weak::upgrade) {
-                let _ = events.send(TerminalEvent::AgentActivityChanged(activity));
+                self.emit_event(&events, TerminalEvent::AgentActivityChanged(activity));
             }
         }
     }
@@ -1111,6 +1124,27 @@ impl TerminalHandle {
         })
     }
 
+    /// Moves startup backlog and subsequent semantic events to one shared host
+    /// dispatcher. Registration serializes with publication, so no event can
+    /// be stranded between draining the startup receiver and installing it.
+    pub(crate) fn set_event_observer(
+        &self,
+        observer: impl Fn(&TerminalHandle, TerminalEvent) + Send + Sync + 'static,
+    ) {
+        let handle = Arc::downgrade(&self.inner);
+        let observer: Arc<EventObserver> = Arc::new(move |event| {
+            if let Some(inner) = handle.upgrade() { observer(&TerminalHandle { inner }, event); }
+        });
+        let mut current = self.inner.published.event_observer.lock().unwrap_or_else(|p| p.into_inner());
+        for event in self.inner.events.try_iter() {
+            let observer = Arc::clone(&observer);
+            notify_archived(move || observer(event));
+        }
+        let _ = self.inner.published.archive_observer.set(Arc::clone(&observer));
+        *current = Some(observer);
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_archived_event_observer(
         &self,
         observer: impl Fn(&TerminalHandle, TerminalEvent) + Send + Sync + 'static,
@@ -1603,7 +1637,8 @@ struct Worker {
     /// The process that owns this terminal's PTY and reaps its root.
     /// Released last, once nothing here reads or writes the terminal.
     holder: holder::Holder,
-    reader: Option<JoinHandle<()>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+    reader_credit: Arc<tokio::sync::Notify>,
     /// Write end of the reader's wake pipe. Closing it releases a read that a
     /// disowned grandchild would otherwise hold open indefinitely.
     reader_wake: Option<OwnedFd>,
@@ -1613,10 +1648,11 @@ struct Worker {
     pty_capacity: usize,
 }
 
-/// The thread that reads a terminal's PTY into its worker.
+/// A PTY read task on the shared terminal I/O reactor.
 struct Reader {
-    thread: JoinHandle<()>,
-    start: Option<Sender<()>>,
+    thread: tokio::task::JoinHandle<()>,
+    start: Option<tokio::sync::oneshot::Sender<()>>,
+    credit: Arc<tokio::sync::Notify>,
     /// Closing this releases the reader, however long a read would block.
     wake: OwnedFd,
     done: Receiver<()>,
@@ -1648,33 +1684,30 @@ impl Reader {
                 .duplicate()
                 .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
         };
-        let mut reader = File::from(duplicate("reading")?);
-        // Closing the master does not release a read already blocked on a
-        // duplicate: a PTY master read only fails with EIO once the last slave
-        // descriptor closes, which a disowned grandchild can defer forever.
-        // Wait for readiness on a descriptor this worker hands over instead,
-        // alongside a pipe whose closure is the shutdown signal, so the reader
-        // always has a way out.
-        let readiness = duplicate("readiness")?;
+        let reader = duplicate("reading")?;
+        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(format!("make PTY reader nonblocking: {}", std::io::Error::last_os_error()));
+        }
         let (wake_rx, wake) = wake_pipe()?;
         let (pty_tx, output) = crossbeam_channel::bounded(capacity.max(1));
-        if !pending.is_empty() {
-            let _ = pty_tx.send(PtyMessage::Bytes(pending));
-        }
+        if !pending.is_empty() { let _ = pty_tx.try_send(PtyMessage::Bytes(pending)); }
         let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
-        let (start, started) = crossbeam_channel::bounded(1);
-        let thread = thread::Builder::new()
-            .name(format!("terminal-pty-reader-{terminal_id:?}"))
-            .spawn(move || {
-                let _done = done_tx;
-                if started.recv().is_ok() {
-                    read_pty(&mut reader, &pty_tx, readiness, wake_rx);
+        let (start, started) = tokio::sync::oneshot::channel();
+        let credit = Arc::new(tokio::sync::Notify::new());
+        let consumer_credit = Arc::clone(&credit);
+        let thread = super::reactor::runtime()?.spawn(async move {
+            let _done = done_tx;
+            if started.await.is_ok() {
+                if let Err(error) = read_pty_shared(reader, wake_rx, &pty_tx, &consumer_credit).await {
+                    let _ = pty_tx.try_send(PtyMessage::Error(format!("terminal {terminal_id}: {error}")));
                 }
-            })
-            .map_err(|error| format!("start PTY reader: {error}"))?;
+            }
+        });
         Ok(Self {
             thread,
             start: Some(start),
+            credit,
             wake,
             done,
             output,
@@ -1961,6 +1994,7 @@ impl Worker {
             holder: held.holder,
             pty_capacity: config.pty_capacity,
             reader: Some(reader.thread),
+            reader_credit: reader.credit,
             reader_wake: Some(reader.wake),
             reader_done: reader.done,
         })
@@ -1986,7 +2020,7 @@ impl Worker {
             .completed
             .store(completion.ownership_released, Ordering::Release);
         if let Some(completion) = completion.event {
-            let _ = events.send(completion);
+            published.emit_event(&events, completion);
         }
     }
 
@@ -2134,12 +2168,12 @@ impl Worker {
         drop(self.reader_wake.take());
         if let Some(reader) = self.reader.take() {
             match self.reader_done.recv_timeout(READER_SHUTDOWN_GRACE) {
-                Err(RecvTimeoutError::Timeout) => tracing::warn!(
-                    terminal_id = %self.terminal_id,
-                    "abandoning PTY reader thread still blocked on its descriptor"
-                ),
+                Err(RecvTimeoutError::Timeout) => {
+                    reader.abort();
+                    tracing::warn!(terminal_id = %self.terminal_id, "canceling PTY reader task after its shutdown deadline");
+                },
                 _ => {
-                    let _ = reader.join();
+                    drop(reader);
                 }
             }
         }
@@ -2249,11 +2283,15 @@ impl Worker {
     }
 
     fn handle_pty_message(&mut self, message: Option<PtyMessage>) -> bool {
+        self.reader_credit.notify_one();
         match message {
             Some(PtyMessage::Bytes(mut bytes)) => {
                 while bytes.len() < PTY_BATCH_LIMIT {
                     match self.pty_rx.try_recv() {
-                        Ok(PtyMessage::Bytes(next)) => bytes.extend_from_slice(&next),
+                        Ok(PtyMessage::Bytes(next)) => {
+                            bytes.extend_from_slice(&next);
+                            self.reader_credit.notify_one();
+                        },
                         Ok(PtyMessage::Eof) => {
                             self.process_output(bytes);
                             return false;
@@ -3025,6 +3063,7 @@ impl Worker {
             ) {
                 Ok(reader) => {
                     self.reader = Some(reader.thread);
+                    self.reader_credit = reader.credit;
                     self.reader_wake = Some(reader.wake);
                     self.reader_done = reader.done;
                     self.pty_rx = reader.output;
@@ -3050,7 +3089,10 @@ impl Worker {
         while reading {
             crossbeam_channel::select! {
                 recv(self.pty_rx) -> message => match message {
-                    Ok(PtyMessage::Bytes(bytes)) => self.process_output(bytes),
+                    Ok(PtyMessage::Bytes(bytes)) => {
+                        self.reader_credit.notify_one();
+                        self.process_output(bytes);
+                    },
                     // Nothing more to read; the holder has the rest.
                     Ok(PtyMessage::Eof | PtyMessage::Error(_)) | Err(_) => reading = false,
                 },
@@ -3063,7 +3105,7 @@ impl Worker {
             }
         }
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            drop(reader);
         }
         while let Ok(message) = self.pty_rx.try_recv() {
             if let PtyMessage::Bytes(bytes) = message {
@@ -3367,7 +3409,7 @@ impl Worker {
     }
 
     fn emit(&self, event: TerminalEvent) {
-        let _ = self.events.send(event);
+        self.published.emit_event(&self.events, event);
     }
 
     fn error(&self, operation: &'static str, message: String) {
@@ -3778,6 +3820,58 @@ fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
     unsafe { Ok((OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1]))) }
 }
 
+/// Bounded per-stream flow control on the shared reactor. A saturated terminal
+/// yields until its worker returns credit; other streams keep draining.
+async fn read_pty_shared(
+    reader: OwnedFd,
+    wake: OwnedFd,
+    sender: &Sender<PtyMessage>,
+    credit: &tokio::sync::Notify,
+) -> std::io::Result<()> {
+    use tokio::io::unix::AsyncFd;
+    let reader = AsyncFd::new(reader)?;
+    let wake = AsyncFd::new(wake)?;
+    let mut buffer = vec![0u8; PTY_READ_SIZE];
+    loop {
+        let mut readiness = tokio::select! {
+            result = reader.readable() => result?,
+            _ = wake.readable() => return Ok(()),
+        };
+        let result = readiness.try_io(|fd| {
+            // SAFETY: the owned descriptor and writable buffer span this call.
+            let count = unsafe { libc::read(fd.get_ref().as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if count < 0 { Err(std::io::Error::last_os_error()) } else { Ok(count as usize) }
+        });
+        let message = match result {
+            Err(_) => continue,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(error)) if error.raw_os_error() == Some(libc::EIO) => PtyMessage::Eof,
+            Ok(Err(error)) => PtyMessage::Error(error.to_string()),
+            Ok(Ok(0)) => PtyMessage::Eof,
+            Ok(Ok(count)) => PtyMessage::Bytes(buffer[..count].to_vec()),
+        };
+        let finished = !matches!(message, PtyMessage::Bytes(_));
+        let mut pending = message;
+        loop {
+            match sender.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return Ok(()),
+                Err(TrySendError::Full(message)) => pending = message,
+            }
+            // Bytes already read belong to this daemon until delivered.
+            // Carry drains the receiver and returns credit, so never let its
+            // stop wake discard this in-flight batch. Explicit shutdown still
+            // aborts a reader that exceeds its bounded cleanup deadline.
+            credit.notified().await;
+        }
+        if finished { return Ok(()); }
+        // Every successful descriptor turn handles at most16KiB, bounding one
+        // busy terminal's share of the reactor before another task can run.
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(test)]
 enum Readiness {
     Readable,
     Shutdown,
@@ -3788,6 +3882,7 @@ enum Readiness {
 /// pipe. A PTY master read only fails with EIO once the last slave descriptor
 /// closes, so a disowned grandchild can keep a blocking read - and therefore
 /// shutdown - waiting indefinitely; the pipe is the way out.
+#[cfg(test)]
 fn wait_readable(readiness: &OwnedFd, wake: &OwnedFd) -> Readiness {
     let mut fds = [
         libc::pollfd {
@@ -3823,6 +3918,7 @@ fn wait_readable(readiness: &OwnedFd, wake: &OwnedFd) -> Readiness {
     }
 }
 
+#[cfg(test)]
 fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: OwnedFd, wake: OwnedFd) {
     let mut buffer = vec![0u8; PTY_READ_SIZE];
     loop {
@@ -6490,6 +6586,53 @@ mod tests {
         assert_eq!(handle.shutdown(), Err(TerminalSendError::Closed));
         assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_secs(1));
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn terminal_io_reactor_costs_only_one_worker_per_terminal() {
+        const FIXTURE: &str = "CAGENTS_TERMINAL_REACTOR_CENSUS";
+        if std::env::var_os(FIXTURE).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::worker::tests::terminal_io_reactor_costs_only_one_worker_per_terminal", "--nocapture", "--test-threads=1"])
+                .env(FIXTURE, "1").output().unwrap();
+            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        crate::terminal::reactor::initialize().unwrap();
+        let count = || std::fs::read_dir("/proc/self/task").unwrap().count();
+        let idle = count();
+        let mut handles = Vec::new();
+        for _ in 0..30 {
+            handles.push(TerminalHandle::spawn(shell_session("exec sleep 600"),
+                TerminalConfig { initially_visible: false, ..TerminalConfig::default() }, |_| {}).unwrap());
+        }
+        let after = count();
+        assert!(after <= idle + 30, "idle={idle}, thirty_terminals={after}");
+        println!("terminal_thread_census idle={idle} thirty_terminals={after}");
+        for handle in handles { handle.shutdown().unwrap(); }
+    }
+
+    #[test]
+    fn shared_event_observer_replays_startup_and_never_runs_under_sender_locks() {
+        let handle = TerminalHandle::spawn(shell_session("printf '\\033]2;startup-title\\007ready'; read line"),
+            TerminalConfig::default(), |_| {}).unwrap();
+        wait_for_text(&handle, "ready");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::clone(&observed);
+        handle.set_event_observer(move |_, event| events.lock().unwrap().push(event));
+        {
+            let _sender_lock = observed.lock().unwrap();
+            handle.inner.published.set_agent_activity(Some(crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Working,
+            }));
+        }
+        flush_archived_notices();
+        let events = observed.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(event, TerminalEvent::TitleChanged(title) if title == "startup-title")));
+        assert!(events.iter().any(|event| matches!(event, TerminalEvent::AgentActivityChanged(Some(_)))));
+        drop(events);
+        handle.shutdown().unwrap();
     }
 
     #[test]
