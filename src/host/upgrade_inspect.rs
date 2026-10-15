@@ -150,10 +150,10 @@ fn inspect(request: Request) -> Result<(), String> {
     let mut ids = HashSet::new();
     for session in &inventory {
         if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
-            return Err("Source inventory contains ambiguous conversation ownership".into());
+            return Err(format!("Source conversation {} has ambiguous ownership; reconnect or close it before updating. Source windows remain usable", session.id));
         }
         validate_live_chat(session, request.require_resumable)
-            .map_err(|_| "A source conversation has no qualified immutable migration; source windows remain usable")?;
+            .map_err(|_| format!("Source conversation {} has no qualified immutable migration; reconnect or close it before updating. Source windows remain usable", session.id))?;
     }
     for (card, kind) in saved {
         if let CardKind::Terminal(source) = &kind {
