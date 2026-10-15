@@ -2182,6 +2182,14 @@ fn process_inner(
                 }
                 attached(&state, client, chat_id)?.handle.clone()
             };
+            if let chat::Command::LoadOriginal { user_id, expected_session, offset, limit } = command {
+                let result = crate::chat::original::validate_query(
+                    user_id.as_deref(), expected_session.as_deref(), offset, limit,
+                ).and_then(|()| handle.original_prompt(
+                    user_id.as_deref(), expected_session.as_deref(), offset, limit,
+                ));
+                return Ok(ServerResponse::ChatOriginal { chat_id, result });
+            }
             if let Some(reply) = handle.file_query(&command).map_err(unavailable)? {
                 return Ok(match reply {
                     crate::chat::FileChangeReply::Files(summary) => {

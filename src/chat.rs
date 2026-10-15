@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod coordination;
 pub mod presentation;
 pub mod annotations;
+pub mod original;
 pub mod pricing;
 
 pub const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
@@ -1221,6 +1222,13 @@ pub enum Command {
     },
     /// Read the next bounded window of already cached transcript history.
     LoadLater,
+    /// Read only an immutable, provider-confirmed original command.
+    LoadOriginal {
+        user_id: Option<String>,
+        expected_session: Option<String>,
+        offset: usize,
+        limit: usize,
+    },
     /// Read cached provider edit metadata; never asks the provider to do work.
     LoadFileChanges {
         request_id: u64,
