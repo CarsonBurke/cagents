@@ -74,14 +74,16 @@ impl Runtime {
         let has_text = self.has_unsent_text();
         widget::column::with_children(vec![
             design::body("Closed in another window. Your conversation and unsent draft are kept here. Copy the draft into another conversation, or discard its text. Attachments remain until you remove them.").into(),
-            widget::row::with_children(vec![
+            widget::flex_row(vec![
                 widget::button::custom(design::caption("Copy draft"))
+                    .class(crate::ui_controls::control_style(false, None))
                     .on_press_maybe(has_text.then(|| Message::ChatUi(Action::CopyClosedDraft(target, revision))))
                     .into(),
                 widget::button::custom(design::caption("Discard draft text"))
+                    .class(crate::ui_controls::control_style(false, None))
                     .on_press_maybe((has_text && !transitioning && self.closed_draft_can_discard()).then(|| Message::ChatUi(Action::DiscardClosedDraft(target, revision))))
                     .into(),
-            ]).spacing(space::S).into(),
+            ]).spacing(space::S as u16).into(),
         ]).spacing(space::S).into()
     }
 }

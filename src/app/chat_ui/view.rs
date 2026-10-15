@@ -913,7 +913,7 @@ impl Cagents {
                     accounts,
                     offers,
                 );
-                if let Some(recovery) = self.account_recovery_controls(card) {
+                if !runtime.closed_elsewhere && let Some(recovery) = self.account_recovery_controls(card) {
                     widget::column::with_children(vec![recovery, view]).into()
                 } else {
                     view
