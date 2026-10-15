@@ -338,16 +338,18 @@ fn original_creation_journal_retains_connection_and_refuses_its_shutdown() {
 #[test]
 fn original_ui_session_token_answers_only_its_creator_and_exact_recipient() {
     const CASE: &str = "CAGENTS_ORIGINAL_UI_STORE_RESPONSE_FIXTURE";
-    if std::env::var_os(CASE).is_none() {
-        let root=tempfile::tempdir().unwrap();
-        let runtime=root.path().join("runtime");fs::create_dir(&runtime).unwrap();
+    let case_root = std::env::var_os(CASE);
+    if case_root.is_none() {
+        let root=tempfile::Builder::new().prefix("cagents-original-ui-journal-").tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.path(),fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime=root.path().join("runtime");fs::create_dir(&runtime).unwrap();
         fs::set_permissions(&runtime,fs::Permissions::from_mode(0o700)).unwrap();
         let name=concat!(module_path!(),"::original_ui_session_token_answers_only_its_creator_and_exact_recipient");
         let name=name.strip_prefix(concat!(env!("CARGO_CRATE_NAME"),"::")).unwrap_or(name);
         let spec=CommandSpec::new(std::env::current_exe().unwrap())
             .args(["--exact",name,"--nocapture"])
-            .env(CASE,"1").env("XDG_DATA_HOME",root.path().join("data"))
+            .env(CASE,root.path()).env("XDG_DATA_HOME",root.path().join("data"))
             .env("XDG_CONFIG_HOME",root.path().join("config"))
             .env("XDG_RUNTIME_DIR",&runtime)
             .timeout(Duration::from_secs(60)).output_limits(65536,65536);
@@ -359,6 +361,22 @@ fn original_ui_session_token_answers_only_its_creator_and_exact_recipient() {
     use crate::control::created_journal::UiJournalChallenge;
     use crate::model::{CardId,DirectoryStartKind,DirectoryStartRequirement,HostSessionProof,TerminalId};
     use std::os::unix::fs::MetadataExt;
+    // Refuse before ANY default store open if a manually inherited marker
+    // does not name the parent's actual private, isolated fixture profile.
+    let case_root=PathBuf::from(case_root.unwrap());
+    assert!(case_root.is_absolute());
+    assert_eq!(fs::canonicalize(&case_root).unwrap(),case_root);
+    let metadata=fs::symlink_metadata(&case_root).unwrap();
+    assert!(metadata.is_dir() && metadata.uid()==unsafe {libc::geteuid()}
+        && metadata.mode() & 0o077 == 0);
+    assert!(case_root.file_name().unwrap().as_encoded_bytes()
+        .starts_with(b"cagents-original-ui-journal-"));
+    for (name,leaf) in [("XDG_DATA_HOME","data"),("XDG_CONFIG_HOME","config"),
+        ("XDG_RUNTIME_DIR","runtime")] {
+        assert_eq!(std::env::var_os(name).map(PathBuf::from),Some(case_root.join(leaf)));
+    }
+    assert!(crate::session::SessionRuntime::default_database_path().unwrap()
+        .starts_with(case_root.join("data")));
     let (session,_)=crate::session::SessionRuntime::open_default().unwrap();
     let token=session.original_creation_journal_store().unwrap();
     let mut fixture=Fixture::new();
