@@ -84,6 +84,19 @@ mod tests {
         Arc::new(workspace::prepare(root, documents, &open).unwrap())
     }
 
+    impl Cagents {
+        /// Starts the production publisher for a project-owned participant and
+        /// an unopened file. The caller owns the real project/card fixture and
+        /// retains this task until its original Published result is delivered.
+        pub(in crate::app) fn project_editor_publication_fixture(
+            &mut self, card: CardId, root: &Path, ticket: u64,
+        ) -> Task<Message> {
+            let plan = plan(self, root, &["participant.rs", "unopened.rs"]);
+            let operation = operation(self, card);
+            self.publish_editor_workspace_edit(ticket, operation, plan)
+        }
+    }
+
     async fn finish(app: &mut Cagents, task: Task<Message>) {
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
             while let Some(action) = stream.next().await {
