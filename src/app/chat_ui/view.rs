@@ -1546,7 +1546,7 @@ impl Runtime {
         let transcript_index = content.len();
         let (catalog, bookmark) = self.selection_document();
         content.push(selection::transcript_virtualized(
-            scroll::transcript(
+            scroll::transcript_observed(
                 transcript,
                 target,
                 self.selected_subagent.as_deref(),
@@ -1568,6 +1568,7 @@ impl Runtime {
                         })
                     }))
                     .collect(),
+                self.observed_scroll.clone(),
             ),
             target,
             self.selected_subagent.as_deref(),
