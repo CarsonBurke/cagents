@@ -18,7 +18,7 @@ fn entry(service: &Service, record: &WorktreeRecord, primary: bool, cancellation
     };
     Ok(Entry {
         path: record.path.clone(),
-        branch: record.branch.as_deref().map(|branch| branch.trim_start_matches("refs/heads/").to_owned()),
+        branch: record.branch.as_deref().map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch).to_owned()),
         head_oid: record.head_oid.clone(), primary, detached:record.detached, locked:record.lock.locked,
         dirty:status.dirty.is_dirty(), ahead,behind,live_sessions:Vec::new(),
     })
@@ -85,7 +85,7 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
         }
         Operation::Remove {repository,target,force,delete_branch:delete,expected_fingerprint} => {
             let records=service.list_worktrees(&repository,&cancellation).map_err(|error|error.to_string())?;
-            let full_branch=format!("refs/heads/{}",target.trim_start_matches("refs/heads/"));
+            let full_branch=format!("refs/heads/{target}");
             let candidate=if Path::new(&target).is_absolute() { PathBuf::from(&target) } else {
                 records.first().map(|record|record.path.join(&target)).ok_or("Repository has no primary checkout")?
             };
@@ -117,8 +117,8 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
                 .map_err(|failures|format!("Worktree was removed, but its creation receipt could not be retired: {}",failures.into_iter().map(|error|error.to_string()).collect::<Vec<_>>().join("; ")))?;
             let branch_deleted=if delete {
                 if let Some(branch)=&record.branch {
-                    delete_branch(&repository,branch,false,&cancellation).map_err(|error|format!("Worktree was removed, but its branch was retained: {error}"))?;
-                    Some(branch.trim_start_matches("refs/heads/").to_owned())
+                    delete_branch(&repository,branch.strip_prefix("refs/heads/").unwrap_or(branch),false,&cancellation).map_err(|error|format!("Worktree was removed, but its branch was retained: {error}"))?;
+                    Some(branch.strip_prefix("refs/heads/").unwrap_or(branch).to_owned())
                 } else {None}
             } else {None};
             Ok(Reply::Removed {path:record.path.clone(),branch_deleted})
