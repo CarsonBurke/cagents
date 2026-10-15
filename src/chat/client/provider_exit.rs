@@ -22,14 +22,32 @@ pub(super) struct Page {
     pub bytes: Vec<u8>,
     pub next_offset: Option<u64>,
     pub omitted: u64,
+    // Declared after bytes: drop the actual Vec BEFORE its admission owner.
+    pub _ownership: Option<diagnostic_read::DiagnosticResponseCharge>,
 }
 
-pub(super) type Pending =
-    Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<Page, String>>>>>;
+pub(super) struct PendingReply {
+    pub reply: Option<crossbeam_channel::Sender<Result<Page, String>>>,
+    pub ownership: Option<diagnostic_read::DiagnosticResponseCharge>,
+}
+impl PendingReply {
+    fn legacy(reply: crossbeam_channel::Sender<Result<Page, String>>) -> Self { Self { reply:Some(reply), ownership:None } }
+}
+pub(super) type Pending = Arc<Mutex<BTreeMap<u64, PendingReply>>>;
 
+pub(super) fn compact_error(error: String) -> String {
+    let mut end=error.len().min(512);
+    while !error.is_char_boundary(end) { end-=1; }
+    // A fresh bounded allocation: truncating would retain the old capacity.
+    let compact=error[..end].to_owned();
+    drop(error);
+    compact
+}
 pub(super) fn disconnected(pending: &Pending, reason: &str) {
-    for (_, reply) in std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner())) {
-        let _ = reply.try_send(Err(reason.to_owned()));
+    for (_, pending) in std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner())) {
+        if let Some(reply)=pending.reply { let _=reply.try_send(Err(reason.chars().take(512).collect())); }
+        // The reader has stopped decoding before this drain. The ownership
+        // charge survives any already-delivered Page in its actual receiver.
     }
 }
 
@@ -124,7 +142,7 @@ impl ClientHandle {
             if pending.len() >= 8 {
                 return Err("Provider output requests are busy; try again shortly".into());
             }
-            pending.insert(request, reply);
+            pending.insert(request, PendingReply::legacy(reply));
         }
         let result = transmit(
             &self.inner.wire,
@@ -188,6 +206,7 @@ mod tests {
                     &mut output,
                     &log,
                     Page {
+                        _ownership: None,
                         log_id: log.id.clone(),
                         offset: 0,
                         bytes: raw[..split].to_vec(),
@@ -203,6 +222,7 @@ mod tests {
                     &mut output,
                     &log,
                     Page {
+                        _ownership: None,
                         log_id: log.id.clone(),
                         offset: split as u64,
                         bytes: raw[split..].to_vec(),
@@ -225,6 +245,7 @@ mod tests {
             omitted: 1,
         };
         let page = || Page {
+                        _ownership: None,
             log_id: log.id.clone(),
             offset: 0,
             bytes: vec![b'a'],

@@ -72,6 +72,7 @@ struct Job {
     cancel_tx: crossbeam_channel::Sender<()>,
     cancel_rx: crossbeam_channel::Receiver<()>,
     _queued: OwnedSemaphorePermit,
+    _metadata: Charge, // One64KiB unit bounds small source/summary/error metadata.
 }
 #[derive(Clone)]
 pub(crate) struct DiagnosticReadRequest(Arc<Job>);
@@ -210,6 +211,9 @@ struct Charge {
 impl Charge {
     fn reserve(capacity: usize, request: &DiagnosticReadRequest) -> Result<Self, String> {
         request.check()?;
+        Self::reserve_capacity(capacity)
+    }
+    fn reserve_capacity(capacity: usize) -> Result<Self, String> {
         if lane().retirement_failed.load(Ordering::Acquire) {
             return Err("Saved output cleanup is unavailable".into());
         }
@@ -239,34 +243,44 @@ struct Retired {
     worker: Option<Arc<Worker>>,
     request: DiagnosticReadRequest,
 }
-fn retire(value: Retired) {
-    static RETIRE: OnceLock<std::sync::mpsc::Sender<Retired>> = OnceLock::new();
-    let sender = RETIRE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Retired>();
-        std::thread::Builder::new()
-            .name("diagnostic-reclaim".into())
-            .spawn(move || {
-                for value in rx {
-                    let Retired {
-                        body,
-                        charge,
-                        worker,
-                        request,
-                    } = value;
-                    drop(body); // Return the capacity only AFTER the allocation.
-                    drop(charge);
-                    drop(worker);
-                    drop(request);
-                }
-            })
-            .expect("diagnostic reclaimer could not start");
-        tx
+type Reclaimer = Result<std::sync::mpsc::Sender<Retired>, ()>;
+fn start_reclaimer_with(spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>) -> Reclaimer {
+    let (tx, rx) = std::sync::mpsc::channel::<Retired>();
+    let task = Box::new(move || {
+        for value in rx {
+            let Retired { body, charge, worker, request } = value;
+            drop(body); // Return capacity only AFTER the actual allocation.
+            drop(charge); drop(worker); drop(request);
+        }
     });
-    if let Err(error) = sender.send(value) {
-        // Fail closed. Keep its byte/queue/worker charges; losing the reclaimer
-        // cannot admit unbounded allocations or free a heavy body on the UI.
+    spawn(task).map_err(|_|())?;
+    Ok(tx)
+}
+fn reclaimer() -> &'static Reclaimer {
+    static RETIRE: OnceLock<Reclaimer> = OnceLock::new();
+    RETIRE.get_or_init(|| start_reclaimer_with(|task| {
+        thread::Builder::new().name("diagnostic-reclaim".into()).spawn(task).map(|_|())
+    }))
+}
+fn ensure_reclaimer() -> Result<(), String> {
+    if reclaimer().is_err() {
         lane().retirement_failed.store(true, Ordering::Release);
-        std::mem::forget(error.0);
+        return Err("Saved output cleanup could not start".into());
+    }
+    Ok(())
+}
+fn try_retire(value: Retired, reclaimer: &Reclaimer) -> Result<(), Retired> {
+    match reclaimer {
+        Ok(sender) => sender.send(value).map_err(|error|error.0),
+        Err(()) => Err(value),
+    }
+}
+fn retire(value: Retired) {
+    if let Err(value) = try_retire(value, reclaimer()) {
+        // Fail closed even if initialization failed: preserve the ENTIRE
+        // body/charge/worker/queue owner. Never unwind/drop heavy data inline.
+        lane().retirement_failed.store(true, Ordering::Release);
+        std::mem::forget(value);
     }
 }
 
@@ -320,6 +334,8 @@ fn allocate_bytes(
     request: &DiagnosticReadRequest,
     worker: &Arc<Worker>,
 ) -> Result<Buffer<Vec<u8>>, String> {
+    request.check()?;
+    ensure_reclaimer()?; // Fallible initialization precedes EVERY heavy allocation.
     let charge = Charge::reserve(capacity, request)?;
     let bytes = if capacity == 0 {
         Vec::new()
@@ -382,6 +398,13 @@ impl DiagnosticOutput {
     }
     pub(crate) fn source(&self) -> &DiagnosticSource {
         &self.source
+    }
+    /// Cached text belongs to its ORIGINAL receiver/source authority. A new
+    /// copy deadline does not authorize an old body on a replacement receiver.
+    pub(crate) fn current_for(&self, request: &DiagnosticReadRequest) -> bool {
+        self.source == *request.source()
+            && Weak::ptr_eq(&self.text.request.0.receiver, &request.0.receiver)
+            && (self.text.request.0.authority)()
     }
 }
 #[derive(Clone)]
@@ -472,6 +495,18 @@ impl DiagnosticCopyCompletion {
     }
 }
 
+/// Small metadata is validated BEFORE async admission: never queue an
+/// arbitrary spare-capacity String alongside a waiting copy job.
+#[derive(Clone)]
+pub(crate) struct DiagnosticCopySummary(Arc<str>);
+impl DiagnosticCopySummary {
+    pub(crate) fn new(summary: &str) -> Result<Self, String> {
+        if summary.len() > MAX_SUMMARY { return Err("The saved output summary is too large".into()); }
+        Ok(Self(Arc::from(summary)))
+    }
+    pub(crate) fn as_str(&self) -> &str { &self.0 }
+}
+
 impl ClientHandle {
     pub(crate) fn diagnostic_request(
         &self,
@@ -514,6 +549,7 @@ impl ClientHandle {
             cancel_tx,
             cancel_rx,
             _queued: queued,
+            _metadata: Charge::reserve_capacity(0)?,
         }));
         request.check()?;
         if !disclosed && !copy {
@@ -549,9 +585,9 @@ impl ClientHandle {
         &self,
         request: DiagnosticReadRequest,
         output: DiagnosticOutput,
-        summary: String,
+        summary: DiagnosticCopySummary,
     ) -> DiagnosticCopyCompletion {
-        if !request.matches_receiver(self) || output.source != request.0.source {
+        if !request.matches_receiver(self) || !output.current_for(&request) {
             return DiagnosticCopyCompletion::new(
                 request,
                 Err("The saved output belongs to a different conversation".into()),
@@ -563,7 +599,7 @@ impl ClientHandle {
         };
         let job = request.clone();
         let result =
-            tokio::task::spawn_blocking(move || copy_output(&job, &worker, output, &summary))
+            tokio::task::spawn_blocking(move || copy_output(&job, &worker, output, summary.as_str()))
                 .await
                 .map_err(|_| "Saved output copy could not finish".to_owned())
                 .and_then(|result| result);
@@ -578,6 +614,7 @@ fn copy_output(
     summary: &str,
 ) -> Result<Buffer<String>, String> {
     request.check()?;
+    if !output.current_for(request) { return Err("The cached saved output belongs to an older conversation source".into()); }
     if summary.len() > MAX_SUMMARY {
         return Err("The saved output summary is too large".into());
     }
@@ -603,7 +640,13 @@ fn copy_output(
     value.push_str(&suffix);
     debug_assert_eq!(value.capacity(), capacity);
     request.check()?;
+    if !output.current_for(request) { return Err("The conversation changed while its saved output was copied".into()); }
     Ok(text)
+}
+
+pub(super) struct DiagnosticResponseCharge {
+    _charge: Charge,
+    _request: DiagnosticReadRequest,
 }
 
 impl ClientHandle {
@@ -618,7 +661,7 @@ impl ClientHandle {
         let mut offset = 0;
         loop {
             request.check()?;
-            let (page, page_charge) = self.diagnostic_page(request, offset)?;
+            let page = self.diagnostic_page(request, offset)?;
             let capacity = bytes.capacity();
             let next = provider_exit::append_page(bytes.value.as_mut().unwrap(), log, page)?;
             assert_eq!(
@@ -626,7 +669,6 @@ impl ClientHandle {
                 capacity,
                 "validated diagnostic append must not grow its allocation"
             );
-            drop(page_charge); // append_page consumed/dropped the actual page.
             match next {
                 Some(next) => offset = next,
                 None => break,
@@ -646,7 +688,7 @@ impl ClientHandle {
         &self,
         request: &DiagnosticReadRequest,
         offset: u64,
-    ) -> Result<(provider_exit::Page, Charge), String> {
+    ) -> Result<provider_exit::Page, String> {
         request.check()?;
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Reconnect this conversation before loading its saved output".into());
@@ -666,33 +708,22 @@ impl ClientHandle {
             if pending.len() >= 8 {
                 return Err("Provider output requests are busy; try again shortly".into());
             }
-            pending.insert(id, reply);
+            pending.insert(id, provider_exit::PendingReply { reply:Some(reply), ownership:Some(DiagnosticResponseCharge { _charge:page_charge, _request:request.clone() }) });
         }
-        struct PendingPage<'a> {
-            pending: &'a provider_exit::Pending,
-            id: u64,
-        }
+        let posted=std::cell::Cell::new(false);
+        struct PendingPage<'a> { pending: &'a provider_exit::Pending, id:u64, posted:&'a std::cell::Cell<bool> }
         impl Drop for PendingPage<'_> {
             fn drop(&mut self) {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&self.id);
+                let mut pending=self.pending.lock().unwrap_or_else(|e|e.into_inner());
+                if self.posted.get() {
+                    if let Some(retired)=pending.get_mut(&self.id) { retired.reply=None; }
+                    // A typed retired tombstone owns admission until the
+                    // actual late decoded reply or reader disconnect drains it.
+                } else { pending.remove(&self.id); }
             }
         }
-        let _pending = PendingPage {
-            pending: &self.inner.diagnostic_pending,
-            id,
-        };
-        self.transmit_diagnostic(
-            request,
-            id,
-            ClientRequest::ChatProviderExitOutput {
-                chat_id: self.inner.id,
-                log_id: request.source().log.id.clone(),
-                offset,
-            },
-        )?;
+        let _pending=PendingPage { pending:&self.inner.diagnostic_pending,id,posted:&posted };
+        self.transmit_diagnostic(request,id,ClientRequest::ChatProviderExitOutput { chat_id:self.inner.id,log_id:request.source().log.id.clone(),offset },&posted)?;
         let wait = request.remaining()?.min(Duration::from_secs(5));
         let page = crossbeam_channel::select! {
             recv(request.cancel_receiver()) -> _ => return Err("Saved output reading was cancelled".into()),
@@ -703,7 +734,7 @@ impl ClientHandle {
         if page.bytes.capacity() > ipc::MAX_FRAME_BYTES {
             return Err("The daemon returned an oversized saved output allocation".into());
         }
-        Ok((page, page_charge))
+        Ok(page)
     }
 
     fn transmit_diagnostic(
@@ -711,6 +742,7 @@ impl ClientHandle {
         request: &DiagnosticReadRequest,
         id: u64,
         message: ClientRequest,
+        posted: &std::cell::Cell<bool>,
     ) -> Result<(), String> {
         // Diagnostic requests have small bounded metadata. A stack frame avoids
         // a second geometrically grown codec buffer and never mutates the
@@ -730,7 +762,9 @@ impl ClientHandle {
         .len();
         frame[..4].copy_from_slice(&(payload as u32).to_be_bytes());
         let wire = lock_wire(&self.inner.wire, request)?;
-        send_frame(&wire.stream, &frame[..payload + 4], request)
+        send_frame(&wire.stream, &frame[..payload + 4], request)?;
+        posted.set(true);
+        request.check()
     }
 }
 
@@ -806,7 +840,7 @@ fn send_frame(
             }
         }
     }
-    request.check()
+    Ok(())
 }
 
 fn push_fixed(value: &mut Buffer<String>, text: &str) -> Result<(), String> {
@@ -817,46 +851,40 @@ fn push_fixed(value: &mut Buffer<String>, text: &str) -> Result<(), String> {
     output.push_str(text);
     Ok(())
 }
-fn normalize(
-    bytes: Buffer<Vec<u8>>,
-    request: &DiagnosticReadRequest,
-    worker: &Arc<Worker>,
-) -> Result<Buffer<String>, String> {
-    let capacity = bytes
-        .len()
-        .checked_mul(3)
-        .ok_or("Saved output is too large")?;
-    let mut decoded = allocate_text(capacity, request, worker)?;
-    let mut remaining = bytes.as_slice();
-    while !remaining.is_empty() {
-        request.check()?;
-        match std::str::from_utf8(remaining) {
-            Ok(valid) => {
-                push_fixed(&mut decoded, valid)?;
-                break;
+fn normalize(mut bytes: Buffer<Vec<u8>>, request: &DiagnosticReadRequest, worker: &Arc<Worker>) -> Result<Buffer<String>, String> {
+    request.check()?;
+    // Reuse already-valid UTF-8's fixed raw layout and its original charge.
+    let raw = bytes.value.take().unwrap();
+    let mut decoded = match String::from_utf8(raw) {
+        Ok(text) => Buffer { value: Some(text), charge: bytes.charge.take(), worker: Mutex::new(bytes.worker.get_mut().unwrap_or_else(|e|e.into_inner()).take()), request: request.clone() },
+        Err(error) => {
+            bytes.value = Some(error.into_bytes());
+            let capacity = bytes.len().checked_mul(3).ok_or("Saved output is too large")?;
+            let mut decoded = allocate_text(capacity, request, worker)?;
+            let mut remaining = bytes.as_slice();
+            let mut checked_at = remaining.len();
+            while !remaining.is_empty() {
+                if checked_at.saturating_sub(remaining.len()) >= 4096 {
+                    request.check()?;
+                    checked_at = remaining.len();
+                }
+                match std::str::from_utf8(remaining) {
+                    Ok(valid) => { push_fixed(&mut decoded, valid)?; break; }
+                    Err(error) => {
+                        let valid = error.valid_up_to();
+                        push_fixed(&mut decoded, std::str::from_utf8(&remaining[..valid]).unwrap())?;
+                        push_fixed(&mut decoded, "\u{fffd}")?;
+                        remaining = &remaining[valid + error.error_len().unwrap_or(remaining.len() - valid)..];
+                    }
+                }
             }
-            Err(error) => {
-                let valid = error.valid_up_to();
-                push_fixed(
-                    &mut decoded,
-                    std::str::from_utf8(&remaining[..valid]).unwrap(),
-                )?;
-                push_fixed(&mut decoded, "\u{fffd}")?;
-                remaining =
-                    &remaining[valid + error.error_len().unwrap_or(remaining.len() - valid)..];
-            }
+            bytes.release_on_worker();
+            decoded
         }
-    }
-    bytes.release_on_worker();
-    if !decoded
-        .bytes()
-        .any(|byte| (byte < 0x20 && !matches!(byte, b'\n' | b'\t')) || byte == 0x7f)
-    {
-        decoded
-            .value
-            .as_mut()
-            .unwrap()
-            .retain(|c| !c.is_control() || matches!(c, '\n' | '\t'));
+    };
+    request.check()?;
+    if !decoded.bytes().any(|byte|(byte < 0x20 && !matches!(byte,b'\n'|b'\t')) || byte==0x7f) {
+        decoded.value.as_mut().unwrap().retain(|c|!c.is_control() || matches!(c,'\n'|'\t'));
         return Ok(decoded);
     }
     let mut text = allocate_text(decoded.len(), request, worker)?;
@@ -869,28 +897,40 @@ fn normalize(
     for character in text.chars() {
         match character {
             '\r' => returned = true,
-            '\n' => {
-                push_fixed(&mut shown, "\n")?;
-                line = shown.len();
-                returned = false;
-            }
+            '\n' => { push_fixed(&mut shown, "\n")?; line=shown.len(); returned=false; }
             character => {
-                if std::mem::take(&mut returned) {
-                    shown.value.as_mut().unwrap().truncate(line);
-                }
-                let mut encoded = [0; 4];
-                push_fixed(&mut shown, character.encode_utf8(&mut encoded))?;
+                if std::mem::take(&mut returned) { shown.value.as_mut().unwrap().truncate(line); }
+                let mut encoded=[0;4]; push_fixed(&mut shown, character.encode_utf8(&mut encoded))?;
             }
         }
     }
     text.release_on_worker();
-    shown
-        .value
-        .as_mut()
-        .unwrap()
-        .retain(|c| !c.is_control() || matches!(c, '\n' | '\t'));
+    shown.value.as_mut().unwrap().retain(|c|!c.is_control() || matches!(c,'\n'|'\t'));
     request.check()?;
     Ok(shown)
+}
+
+#[cfg(test)]
+impl ClientHandle {
+    pub(crate) fn fixture_diagnostic_completion(&self, card:CardId, generation:u64, turn:u64, log:super::super::ProviderExitLog, body:&[u8], authority:DiagnosticAuthority) -> Result<(DiagnosticReadRequest,DiagnosticCompletion),String> {
+        if log.bytes!=body.len() as u64 { return Err("Fixture body/log size mismatch".into()); }
+        let request=self.diagnostic_request(card,generation,turn,log,true,false,authority)?;
+        let worker=Arc::new(Worker { _permit:lane().workers.clone().try_acquire_owned().map_err(|_|"Fixture readers busy")? });
+        let running=worker.clone();let job=request.clone();let body=body.to_vec();
+        let result=thread::spawn(move|| {
+            let mut raw=allocate_bytes(body.len(),&job,&running)?;
+            raw.value.as_mut().unwrap().extend_from_slice(&body);
+            let text=normalize(raw,&job,&running)?;
+            Ok(DiagnosticOutput { text:Arc::new(text),omitted:job.source().log.omitted,source:job.source().clone() })
+        }).join().map_err(|_|"Fixture reader panicked".to_owned())?;
+        Ok((request.clone(),DiagnosticCompletion::new(request,result,Some(worker))))
+    }
+}
+#[cfg(test)]
+impl DiagnosticCopyCompletion {
+    pub(crate) fn contains_text_for_test(&self, expected:&str)->bool {
+        self.result.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(|result|result.as_ref().is_ok_and(|buffer|buffer.contains(expected)))
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +964,7 @@ mod tests {
             cancel_tx,
             cancel_rx,
             _queued: lane().queued.clone().try_acquire_owned().unwrap(),
+            _metadata: Charge::reserve_capacity(0).unwrap(),
         }))
     }
     fn worker() -> Arc<Worker> {
@@ -999,11 +1040,12 @@ mod tests {
         assert!(lane().queued.clone().try_acquire_owned().is_err());
         let job = jobs.first().unwrap();
         let worker = worker();
-        let all = Charge::reserve(CAPACITY_LIMIT, job).unwrap();
+        let admitted=lane().bytes.available_permits()*UNIT;
+        let all = Charge::reserve(admitted, job).unwrap();
         assert!(allocate_bytes(1, job, &worker).is_err());
         assert_eq!(
             lane().owned_capacity.load(Ordering::Acquire),
-            CAPACITY_LIMIT
+            admitted
         );
         drop(all);
         drop(jobs);
