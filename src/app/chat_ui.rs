@@ -1089,7 +1089,7 @@ impl CachedItem {
 
     fn accepts_find_source(&self, proof: &find::SourceProof) -> bool {
         self.item.as_ref().is_some_and(|item| {
-            proof.item.as_ptr() == Arc::as_ptr(item)
+            proof.external.is_none() && proof.item.as_ptr() == Arc::as_ptr(item)
                 && (Self::prose(&item.content).is_none()
                     || (!self.placeholder && proof.growing == self.find_source_growing))
         })
@@ -1621,6 +1621,8 @@ pub(super) struct Runtime {
     find_matches: Arc<Vec<find::Match>>,
     find_blocks: Arc<HashMap<u64, Arc<[std::ops::Range<usize>]>>>,
     find_sources: Arc<HashMap<String, find::SourceProof>>,
+    find_external: HashMap<String, Arc<find::External>>,
+    find_external_complete: bool,
     find_signatures: Arc<HashMap<Arc<str>, u64>>,
     find_turns: Arc<HashSet<Arc<str>>>,
     find_items: Arc<HashSet<Arc<str>>>,
@@ -2278,6 +2280,8 @@ impl Runtime {
             find_matches: Default::default(),
             find_blocks: Default::default(),
             find_sources: Default::default(),
+            find_external: Default::default(),
+            find_external_complete: true,
             find_signatures: Default::default(),
             find_turns: Default::default(),
             find_items: Default::default(),
@@ -2383,6 +2387,8 @@ impl Runtime {
         self.find_reveal = None;
         self.find_waiting = None;
         self.find_worker = Default::default();
+        self.find_external.clear();
+        self.find_external_complete = true;
         self.find_matches = Default::default();
         self.find_blocks = Default::default();
         self.find_sources = Default::default();
@@ -3097,7 +3103,7 @@ impl Runtime {
         let Some(cached) = self.cache.get(reveal.found.item.as_ref()) else { return false; };
         let Some(proof) = self.find_sources.get(reveal.found.item.as_ref()) else { return false; };
         if proof.growing != (self.find_growing_item() == Some(reveal.found.item.as_ref()))
-            || !cached.accepts_find_source(proof) { return false; }
+            || !self.find_source_current(reveal.found.item.as_ref(), proof) { return false; }
         reveal.source.upgrade().zip(cached.item.as_ref())
             .is_some_and(|(source, current)| Arc::ptr_eq(&source, current))
     }
@@ -3162,6 +3168,7 @@ impl Runtime {
         let worker = self.find_worker.clone();
         let provider = self.session.launch.provider;
         let inputs = self.find_inputs();
+        let external = self.find_external.clone();
         let scope = self.find_scope_revision;
         Some(cosmic::task::future(async move {
             let matches = if current.load(Ordering::Relaxed) != generation {
@@ -3171,8 +3178,8 @@ impl Runtime {
                     worker
                         .lock()
                         .ok()?
-                        .search(&inputs, provider, &query, generation, &current)
-                        .map(|matches| find::Results::with_revisions(matches, &inputs, scope))
+                        .search_with_external(&inputs, provider, &query, generation, &current, &external)
+                        .map(|matches| find::Results::with_external_revisions(matches, &inputs, scope, &external))
                 })
                 .await
                 .ok()
@@ -3189,6 +3196,8 @@ impl Runtime {
     /// Explicit selection and automatic child disappearance cross the same
     /// logical search boundary, preserving the destination reader's anchor.
     fn reset_find_scope(&mut self) {
+        self.find_external.clear();
+        self.find_external_complete = true;
         self.find_scope_revision = self.find_scope_revision.wrapping_add(1);
         if self.find.is_none() { return; }
         self.find_disclosure.restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
@@ -3260,11 +3269,72 @@ impl Runtime {
         inputs
     }
 
+    fn find_source_current(&self, id: &str, proof: &find::SourceProof) -> bool {
+        if !proof.matches_external(self.find_external.get(id)) { return false; }
+        if proof.external.is_some() {
+            self.cache.get(id).and_then(|cached| cached.item.as_ref())
+                .is_some_and(|item| proof.item.as_ptr() == Arc::as_ptr(item))
+        } else {
+            self.cache.get(id).is_some_and(|cached| cached.accepts_find_source(proof))
+        }
+    }
+
     fn find_paint_for(&self, item: &chat::Item) -> Option<Arc<find::Paint>> {
         let paint = self.find_paint.as_ref()?;
         let proof = paint.sources.get(&item.id)?;
-        (proof.growing == (self.find_growing_item() == Some(item.id.as_str())))
-            .then(|| paint.for_item(item)).flatten()
+        if proof.growing != (self.find_growing_item() == Some(item.id.as_str())) { return None; }
+        match self.find_external.get(&item.id) {
+            Some(external) => paint.for_external_item(item, external),
+            None => paint.for_item(item),
+        }
+    }
+
+    fn find_render_revision(&self, item: &chat::Item, cached: &CachedItem) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::hash::DefaultHasher::new();
+        cached.render_revision().hash(&mut hash);
+        self.find_external.get(&item.id).map(|owner| owner.revision).hash(&mut hash);
+        if let Some(paint) = self.find_paint_for(item) {
+            paint.signatures.get(item.id.as_str()).hash(&mut hash);
+            paint.current.as_ref().filter(|found| found.item.as_ref() == item.id)
+                .map(|found| (found.identity, found.range.start, found.range.end)).hash(&mut hash);
+        }
+        hash.finish()
+    }
+
+    /// Replace the selected transcript's memoized complete sidecar documents.
+    /// The source owner prepares blocks off-thread and calls this after its
+    /// exact source/epoch/revision checks. Missing bodies keep complete=false.
+    pub(super) fn set_find_external(&mut self, documents: HashMap<String, Arc<find::External>>, complete: bool) {
+        let valid = documents.iter().all(|(id, owner)| owner.item.as_ref() == id);
+        let changed = self.find_external.len() != documents.len()
+            || documents.iter().any(|(id, owner)| self.find_external.get(id)
+                .is_none_or(|previous| !Arc::ptr_eq(previous, owner)));
+        self.find_external_complete = complete && valid;
+        if !changed && valid { return; }
+        self.find_external = if valid { documents } else { HashMap::new() };
+        self.find_scope_revision = self.find_scope_revision.wrapping_add(1);
+        self.find_generation.fetch_add(1, Ordering::Relaxed);
+        self.find_navigation = self.find_navigation.wrapping_add(1);
+        self.find_locating = None;
+        self.find_reveal = None;
+        self.find_waiting = None;
+        self.find_matches = Default::default();
+        self.find_blocks = Default::default();
+        self.find_sources = Default::default();
+        self.find_signatures = Default::default();
+        self.find_turns = Default::default();
+        self.find_items = Default::default();
+        self.find_debounce = true;
+        self.find_dirty = self.find.as_ref().is_some_and(|query| !query.is_empty());
+        self.update_find_paint();
+    }
+
+    fn find_result_label(&self) -> String {
+        let label = if self.find_matches.is_empty() {
+            if self.find_waiting.is_some() { "Searching…".into() } else { "0 matches".into() }
+        } else { format!("{} of {} matches", self.find_index + 1, self.find_matches.len()) };
+        if self.find_external_complete { label } else { format!("{label} · Search incomplete") }
     }
 
     fn update_find_paint(&mut self) {
@@ -3290,6 +3360,8 @@ impl Runtime {
             self.find_reveal = None;
             self.find_waiting = None;
             self.find_worker = Default::default();
+            self.find_external.clear();
+            self.find_external_complete = true;
             self.find_matches = Default::default();
             self.find_blocks = Default::default();
             self.find_sources = Default::default();
@@ -3331,7 +3403,40 @@ impl Runtime {
         }
         result
     }
+    /// Cancel search work and shed its parsed/indexed/sidecar source owners.
+    /// Captured background tasks retain their own worker until cancellation
+    /// completes. Query text and the reader's restoration anchor are cheap state.
+    pub(super) fn release_find_sources(&mut self) {
+        self.find_generation.fetch_add(1, Ordering::Relaxed);
+        self.find_navigation = self.find_navigation.wrapping_add(1);
+        self.find_locating = None;
+        self.find_reveal = None;
+        self.find_waiting = None;
+        self.find_worker = Default::default();
+        self.find_external.clear();
+        self.find_external_complete = true;
+        self.find_matches = Default::default();
+        self.find_blocks = Default::default();
+        self.find_sources = Default::default();
+        self.find_signatures = Default::default();
+        self.find_turns = Default::default();
+        self.find_items = Default::default();
+        self.find_dirty = self.find.as_ref().is_some_and(|query| !query.is_empty());
+        self.update_find_paint();
+    }
+
+    /// Logical text bytes referenced by the current worker and sidecars.
+    /// These classes can share allocations; neither value is unique memory or
+    /// RSS. A busy captured worker is unknown, and in-flight owners are separate.
+    pub(super) fn find_retained_source_bytes(&self) -> Option<(usize, usize)> {
+        let worker = self.find_worker.try_lock().ok()?.text_bytes();
+        let external = self.find_external.values().map(|owner|
+            owner.blocks.iter().map(|block| block.text.len()).sum::<usize>()).sum();
+        Some((worker, external))
+    }
+
     fn release_transcript_caches(&mut self) {
+        self.release_find_sources();
         self.preparation.clear();
         self.cache = HashMap::new();
         self.selection_document.get_mut().take();
@@ -8148,7 +8253,7 @@ impl Cagents {
                     let growing = runtime.find_growing_item();
                     if matches.sources.iter().any(|(id, source)| {
                         source.growing != (growing == Some(id.as_str()))
-                            || runtime.cache.get(id).is_none_or(|cached| !cached.accepts_find_source(source))
+                            || !runtime.find_source_current(id, source)
                     }) || matches.scope != runtime.find_scope_revision
                         || matches.revisions.iter().any(|(item, revision)| {
                             runtime
@@ -8295,6 +8400,8 @@ impl Cagents {
                     runtime.find_waiting = None;
                     runtime.find_dirty = false;
                     runtime.find_worker = Default::default();
+                    runtime.find_external.clear();
+                    runtime.find_external_complete = true;
                     runtime.find_disclosure.restore(
                         &mut runtime.expanded,
                         &mut runtime.unfolded,
@@ -11851,18 +11958,20 @@ mod tests {
         let matches = {
             let mut worker = runtime.find_worker.lock().unwrap();
             worker
-                .search(
+                .search_with_external(
                     &runtime.find_inputs(),
                     runtime.session.launch.provider,
                     runtime.find.as_deref().unwrap_or_default(),
                     generation,
                     &runtime.find_generation,
+                    &runtime.find_external,
                 )
                 .map(|matches| {
-                    find::Results::with_revisions(
+                    find::Results::with_external_revisions(
                         matches,
                         &runtime.find_inputs(),
                         runtime.find_scope_revision,
+                        &runtime.find_external,
                     )
                 })
                 .map(Arc::new)
@@ -11957,6 +12066,63 @@ mod tests {
             runtime.find_locating.is_none(),
             "background results update highlights without taking the reader back"
         );
+    }
+
+    #[test]
+    fn find_external_runtime_fences_source_changes_reports_incomplete_and_releases_on_close() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("complete-patch-find"));
+        let target = chat_runtime(&app, card).target;
+        let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![Arc::new(chat::Item { id: "patch-root".into(), role: chat::Role::Assistant,
+            content: ItemContent::Changes { status: chat::ToolStatus::Succeeded, changes: Vec::new() }, at: None, started_at: None })];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let document = Arc::new(find::External { item: "patch-root".into(), revision: 1,
+            blocks: vec![find::Block { identity: selection::logical_identity("patch-root", &[6, 5]), text: Arc::from("needle needle") }].into() });
+        let weak = Arc::downgrade(&document);
+        let old_body = Arc::downgrade(&document.blocks[0].text);
+        let old_blocks = Arc::downgrade(&document.blocks);
+        app.chat_runtime_mut(target).unwrap().set_find_external(HashMap::from([("patch-root".into(), document)]), false);
+        complete_find_for_test(&mut app, target);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.find_matches.len(), 2);
+        assert_eq!(runtime.find_retained_source_bytes(), Some((13, 13)), "logical reference classes overlap, not summed unique memory");
+        assert!(runtime.find_result_label().contains("Search incomplete"), "loaded occurrences do not imply every authoritative patch was read");
+        let item = &runtime.snapshot.items[0];
+        let paint = runtime.find_paint_for(item).unwrap();
+        let old = runtime.find_sources["patch-root"].clone();
+        let revision = runtime.find_render_revision(item, &runtime.cache["patch-root"]);
+        let replacement = Arc::new(find::External { item: "patch-root".into(), revision: 2,
+            blocks: vec![find::Block { identity: selection::logical_identity("patch-root", &[6, 5]), text: Arc::from("needle") }].into() });
+        app.chat_runtime_mut(target).unwrap().set_find_external(HashMap::from([("patch-root".into(), replacement)]), true);
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.find_source_current("patch-root", &old));
+        assert!(runtime.find_matches.is_empty() && runtime.find_locating.is_none());
+        assert_ne!(runtime.find_render_revision(&runtime.snapshot.items[0], &runtime.cache["patch-root"]), revision);
+        assert!(paint.sources["patch-root"].external.as_ref().unwrap().upgrade().is_none());
+        assert!(weak.upgrade().is_none());
+        assert!(old_body.upgrade().is_some() && old_blocks.upgrade().is_some(),
+            "the old worker cache still explicitly owns its indexed document until replacement");
+        complete_find_for_test(&mut app, target);
+        assert!(old_body.upgrade().is_none() && old_blocks.upgrade().is_none(),
+            "reindex replacement drops the actual old patch text and block owners");
+        assert_eq!(chat_runtime(&app, card).find_matches.len(), 1);
+        assert!(!chat_runtime(&app, card).find_result_label().contains("incomplete"));
+        let weak = Arc::downgrade(&chat_runtime(&app, card).find_external["patch-root"]);
+        let body = Arc::downgrade(&chat_runtime(&app, card).find_external["patch-root"].blocks[0].text);
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(weak.upgrade().is_none() && body.upgrade().is_none(), "CloseFind retires both sidecar and worker body owners");
+        assert_eq!(chat_runtime(&app, card).find_retained_source_bytes(), Some((0, 0)));
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let document = Arc::new(find::External { item: "patch-root".into(), revision: 3,
+            blocks: vec![find::Block { identity: selection::logical_identity("patch-root", &[6, 5]), text: Arc::from("needle after reveal") }].into() });
+        let body = Arc::downgrade(&document.blocks[0].text);
+        app.chat_runtime_mut(target).unwrap().set_find_external(HashMap::from([("patch-root".into(), document)]), true);
+        complete_find_for_test(&mut app, target);
+        let _ = app.chat_runtime_mut(target).unwrap().set_visible(false);
+        assert!(body.upgrade().is_none(), "hidden search retires its full body owners independently of source-pool policy");
     }
 
     #[test]

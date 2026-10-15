@@ -1419,7 +1419,12 @@ impl Runtime {
                     plain(builder, &[8, 1, index as u32, 2], &result.snippet);
                 }
             }
-            ItemContent::Image { description, .. } => plain(builder, &[9, 0], description),
+            ItemContent::Image { path, description } => {
+                plain(builder, &[9, 0], description);
+                if opened && let Some(path) = find::image_path_caption(path) {
+                    plain(builder, &[9, 1], path);
+                }
+            }
             _ => {}
         }
         if opened {
@@ -1591,7 +1596,7 @@ impl Runtime {
                 ("selected-child-item", &item.id).hash(&mut key);
                 let mut revision = std::hash::DefaultHasher::new();
                 (
-                    cached.render_revision(),
+                    self.find_render_revision(item, cached),
                     self.expanded.contains(&item.id),
                     self.find
                         .as_ref()
@@ -1835,19 +1840,7 @@ impl Runtime {
                         .width(Length::Fill),
                     move || action(Action::CloseFind(target)),
                 ),
-                design::caption(if self.find_matches.is_empty() {
-                    if self.find_waiting.is_some() {
-                        "Searching…".to_owned()
-                    } else {
-                        "0 matches".to_owned()
-                    }
-                } else {
-                    format!(
-                        "{} of {} matches",
-                        self.find_index + 1,
-                        self.find_matches.len()
-                    )
-                })
+                design::caption(self.find_result_label())
                 .into(),
                 small_icon(
                     Icon::ChevronUp,
@@ -3552,7 +3545,7 @@ impl Runtime {
                 .map(|cached| {
                     (
                         cached.token,
-                        cached.render_revision(),
+                        self.find_render_revision(item, cached),
                         cached.image.as_ref().map(iced::widget::image::Handle::id),
                         cached.image_source.is_some(),
                         self.preview_request.as_deref() == Some(item.id.as_str()),
@@ -3675,7 +3668,7 @@ impl Runtime {
                     .filter_map(|placed_step| placed(placed_step.index))
                     .map(|(item, cached)| {
                         let key = selection::logical_identity(&item.id, &[9]);
-                        let revision = cached.render_revision();
+                        let revision = self.find_render_revision(item, cached);
                         // Header elements are cheap owned metadata; only a
                         // mounted row creates their widget tree and geometry.
                         let row = step(item, cached);

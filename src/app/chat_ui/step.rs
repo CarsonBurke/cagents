@@ -849,7 +849,7 @@ impl Runtime {
                             .on_press(action(Action::OpenUrl(path.clone())))
                             .into(),
                     );
-                } else if !path.is_empty() && !path.starts_with("data:") {
+                } else if find::image_path_caption(path).is_some() {
                     rows.push(find::text(
                         self.target,
                         &item.id,

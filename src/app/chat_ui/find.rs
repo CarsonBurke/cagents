@@ -6,7 +6,14 @@ use std::{
 use unicode_casefold::UnicodeCaseFold;
 
 mod index;
-pub(super) use index::{Input, Match, Paint, Results, SourceProof, Worker};
+pub(super) use index::{Block, External, Input, Match, Paint, Results, SourceProof, Worker};
+
+/// Only local image paths are rendered as text. Remote URLs remain a button
+/// target and data URLs remain opaque image payloads, not searchable captions.
+pub(super) fn image_path_caption(path: &str) -> Option<&str> {
+    (!path.is_empty() && !path.starts_with("http://") && !path.starts_with("https://")
+        && !path.starts_with("data:")).then_some(path)
+}
 
 pub(super) const HIGHLIGHT_LIMIT: usize = 4096;
 pub(super) struct Highlights {
