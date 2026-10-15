@@ -9,6 +9,7 @@ type Interceptor = Box<dyn FnMut(&CommandSpec) + Send>;
 #[derive(Default)]
 struct NativeExecutor {
     interceptor: Mutex<Option<Interceptor>>,
+    fetch_failure: Mutex<Option<Result<ProcessOutput, ProcessFailure>>>,
 }
 
 impl ProcessExecutor for NativeExecutor {
@@ -20,12 +21,16 @@ impl ProcessExecutor for NativeExecutor {
         if let Some(interceptor) = &mut *self.interceptor.lock().unwrap() {
             interceptor(command);
         }
+        if command.arguments.iter().any(|argument| argument == "fetch") {
+            if let Some(failure) = self.fetch_failure.lock().unwrap().take() { return failure; }
+        }
+        let inherited_count = command.environment.get(OsStr::new("GIT_CONFIG_COUNT")).cloned().unwrap_or_else(|| "0".into());
         let command = command
             .clone()
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_COUNT", "0")
+            .env("GIT_CONFIG_COUNT", inherited_count)
             .env_remove("GIT_CONFIG_PARAMETERS")
             .env("GIT_AUTHOR_NAME", "Fixture")
             .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
@@ -1072,4 +1077,68 @@ fn preserve_local_never_repairs_missing_tracking_or_accepts_changed_confirmation
     run_git(&fixture.root, &["config", "branch.feature.merge", "refs/heads/different"]);
     assert_eq!(fixture.apply(&plan).unwrap_err().kind, PrCheckoutFailureKind::Refused);
     assert_eq!(git_text(&fixture.root, &["config", "branch.feature.merge"]), "refs/heads/different");
+}
+
+
+#[derive(Clone)]
+struct PrivateFetchLogSink(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for PrivateFetchLogSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+#[test]
+fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() {
+    const CHILD: &str = "CAGENTS_PRIVATE_FETCH_LOG_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap()).args(["--exact", "repository::pr_checkout::tests::private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr", "--nocapture"]).env(CHILD, "1").output().unwrap();
+        assert!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    for timeout in [false, true] {
+        let fixture = Fixture::new(false);
+        let token = "synthetic-private-transport-token";
+        run_git(&fixture.root, &["config", "remote.origin.url", &format!("https://{token}@fixture.invalid/owner/repo.git")]);
+        let request = fixture.request(fixture.original.clone());
+        let plan = fixture.prepare(&request);
+        let stderr = format!("fatal: transport failed for https://{token}@fixture.invalid/owner/repo.git\n").into_bytes();
+        *fixture.executor.fetch_failure.lock().unwrap() = Some(if timeout {
+            Err(ProcessFailure { kind: ProcessFailureKind::TimedOut, program: "git".into(), exit_code: None, signal: Some(15), stdout: vec![], stderr: stderr.clone(), message: "synthetic private timeout".into(), started: true })
+        } else { Ok(ProcessOutput { exit_code: Some(128), signal: None, success: false, stdout: vec![], stderr: stderr.clone() }) });
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_hook = observed.clone();
+        fixture.intercept(move |command| if command.arguments.iter().any(|argument| argument == "fetch") {
+            assert!(!command.arguments.iter().any(|argument| argument.to_string_lossy().contains(token)));
+            assert!(command.arguments.iter().any(|argument| argument.to_string_lossy().starts_with("cagents-pr-fetch-")));
+            assert!(command.environment.iter().any(|(key, value)| key.to_string_lossy().starts_with("GIT_CONFIG_VALUE_") && value.to_string_lossy().contains(token)));
+            observed_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let sink = Arc::new(Mutex::new(Vec::new())); let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || PrivateFetchLogSink(writer.clone())).with_ansi(false).with_max_level(tracing::Level::TRACE).finish();
+        let failure = tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("private_fetch_capture_ready");
+            fixture.apply(&plan).unwrap_err()
+        });
+        let logs = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("private_fetch_capture_ready"));
+        assert!(!logs.contains(token), "transport secrets must not reach tracing");
+        assert!(!failure.detail.contains(token));
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        let private = fs::read_dir(fixture.root.join(".git")).unwrap().map(Result::unwrap).find(|entry| entry.file_name().to_string_lossy().starts_with("cagents-pr-checkout-")).unwrap().path();
+        assert_eq!(fs::metadata(&private).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::read(private.join("fetch.stderr")).unwrap(), stderr);
+        assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+    }
+}
+
+
+#[test]
+fn captured_raw_fetch_endpoint_applies_git_url_rewrites_exactly_once() {
+    let fixture = Fixture::new(false);
+    let missing = fixture.temporary.path().join("must-not-be-used");
+    run_git(&fixture.root, &["config", &format!("url.file://{}/.insteadOf", missing.display()), &format!("file://{}/", fixture.bare.display())]);
+    let verified = fixture.apply(&fixture.prepare(&fixture.request(fixture.original.clone()))).unwrap();
+    assert_eq!(verified.head(), &fixture.original);
+    assert_eq!(verified.upstream(), Some("refs/remotes/origin/feature"));
+    assert!(!missing.exists());
 }

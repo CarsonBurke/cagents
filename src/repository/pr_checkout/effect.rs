@@ -500,6 +500,47 @@ fn settle_descendants(observer: &fs::File) -> bool {
     }
 }
 
+fn fetch_captured_head<E: ProcessExecutor>(
+    service: &RepositoryService<E>, plan: &ExistingPrCheckoutPlan,
+    pinned: &PinnedDirectories, private: &Path, private_ref: &str,
+    lease: &Arc<fs::File>, cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let count = match std::env::var_os("GIT_CONFIG_COUNT") {
+        None => 0,
+        Some(value) => value.to_str().and_then(|value| value.parse::<u32>().ok())
+            .ok_or("Git environment configuration count is invalid")?,
+    };
+    if count >= i32::MAX as u32 { return Err("Git environment configuration count cannot be extended safely".into()); }
+    let alias = format!("cagents-pr-fetch-{}", Uuid::new_v4().simple());
+    let endpoint = plan.remote.fetch_url.as_ref().ok_or("PR remote has no fetch URL")?;
+    // A synthetic remote carries the captured RAW endpoint in environment
+    // configuration. Git applies its usual URL rewrite once, while neither a
+    // credential-bearing URL nor a rewritten secret enters process argv.
+    let fetch = pinned.command(service, false)?.args([
+        OsString::from("fetch"), "--quiet".into(), "--no-tags".into(),
+        "--no-recurse-submodules".into(), "--no-write-fetch-head".into(),
+        "--refmap=".into(), "--end-of-options".into(), alias.clone().into(),
+        format!("+{}:{private_ref}", plan.request.head_branch.full_ref()).into(),
+    ]).env("GIT_CONFIG_COUNT", (count + 1).to_string())
+      .env(format!("GIT_CONFIG_KEY_{count}"), format!("remote.{alias}.url"))
+      .env(format!("GIT_CONFIG_VALUE_{count}"), endpoint)
+      .env("GIT_NO_REPLACE_OBJECTS", "1")
+      .inherit_file(lease.clone()).map_err(|error| error.to_string())?;
+    // Generic repository failure logging includes both argv and stderr.
+    // Transport stderr may repeat credentials even with a safe alias, so
+    // capture it privately and return only typed status metadata to the UI.
+    let outcome = service.executor.execute(&fetch, cancellation);
+    drop(fetch);
+    let (stdout, stderr, detail) = match outcome {
+        Ok(output) if output.success => return Ok(()),
+        Ok(output) => (output.stdout, output.stderr, format!("Fetching the reviewed PR head failed (status {:?}, signal {:?})", output.exit_code, output.signal)),
+        Err(failure) => (failure.stdout, failure.stderr, format!("Fetching the reviewed PR head failed ({:?}, status {:?}, signal {:?})", failure.kind, failure.exit_code, failure.signal)),
+    };
+    fs::write(private.join("fetch.stdout"), stdout).map_err(|_| "Private fetch diagnostics could not be retained".to_owned())?;
+    fs::write(private.join("fetch.stderr"), stderr).map_err(|_| "Private fetch diagnostics could not be retained".to_owned())?;
+    Err(format!("{detail}; transport diagnostics are retained in the private operation directory"))
+}
+
 pub(super) fn reconcile<E: ProcessExecutor>(
     service: &RepositoryService<E>,
     plan: &ExistingPrCheckoutPlan,
@@ -574,30 +615,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         if matches!(plan.disposition, PrCheckoutDisposition::AlreadyCurrent | PrCheckoutDisposition::OpenPreservingLocal) {
             return Ok(());
         }
-        let fetch = pinned
-            .command(service, false)?
-            .args([
-                OsString::from("fetch"),
-                "--quiet".into(),
-                "--no-tags".into(),
-                "--no-recurse-submodules".into(),
-                "--no-write-fetch-head".into(),
-                "--refmap=".into(),
-                "--end-of-options".into(),
-                plan.remote
-                    .fetch_url
-                    .as_ref()
-                    .ok_or("PR remote has no fetch URL")?
-                    .into(),
-                format!("+{}:{private_ref}", plan.request.head_branch.full_ref()).into(),
-            ])
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .inherit_file(lease.clone())
-            .map_err(|error| error.to_string())?;
-        service
-            .run_checked(&fetch, cancellation)
-            .map_err(|error| error.reported_detail())?;
-        drop(fetch);
+        fetch_captured_head(service, plan, &pinned, private.path(), &private_ref, &lease, cancellation)?;
         let head = pinned.command(service, true)?.args([
             "rev-parse",
             "--verify",
