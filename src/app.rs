@@ -25,6 +25,7 @@ mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
+mod onboarding_ui;
 mod palette_ui;
 mod project_ui;
 mod pull_request_ui;
@@ -2476,7 +2477,8 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::TerminalFailure(action) => action.is_user_action(),
-        Message::NewTerminal
+        Message::Onboarding(onboarding_ui::Action::Clone | onboarding_ui::Action::HomeChat)
+        | Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
         | Message::TerminalReviewMode { .. }
@@ -3936,6 +3938,7 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Onboarding(onboarding_ui::Action),
     Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -11188,6 +11191,7 @@ impl Cagents {
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
             || self.resume_ui.open
+            || self.chrome_ui.clone_repository.is_some()
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
@@ -11212,6 +11216,9 @@ impl Cagents {
         }
         if self.resume_ui.open {
             return self.update_resume(resume_ui::Action::Close);
+        }
+        if self.chrome_ui.clone_repository.is_some() {
+            return self.update_onboarding(onboarding_ui::Action::Cancel);
         }
         if let Some(dialog) = self.worktree_dialog.take() {
             dialog.cancel();
@@ -11945,6 +11952,9 @@ impl Cagents {
         }
         if self.resume_ui.open {
             return Some(resume_ui::focus_id());
+        }
+        if self.chrome_ui.clone_repository.is_some() {
+            return Some(onboarding_ui::clone_focus_id());
         }
         if let Some(dialog) = &self.sidebar_selection_ui.dialog {
             Some(dialog.focus_target())
@@ -13386,6 +13396,7 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::Onboarding(action) => self.update_onboarding(action),
             Message::OpenRepository => cosmic::task::future(async {
                 let dialog = file_chooser::open::Dialog::new().title("Open project folder");
                 let result = dialog
@@ -16862,6 +16873,10 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(surface, dismiss, 1.0));
         }
 
+        if let Some(dialog) = self.clone_repository_dialog() {
+            return Some(dialog);
+        }
+
         if let Some(dialog) = self.resume_dialog() {
             return Some(dialog);
         }
@@ -17014,142 +17029,7 @@ impl Application for Cagents {
         let has_multiple_panes = self.workspace.cards().len() > 1;
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
-            let directory = self
-                .terminal_directory()
-                .unwrap_or_else(|| STARTING_DIRECTORY.clone());
-            let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
-            let scope_name = self
-                .durable
-                .active_channel
-                .and_then(|id| {
-                    self.durable
-                        .channels
-                        .iter()
-                        .find(|channel| channel.id == id)
-                        .map(|channel| channel.title.clone())
-                })
-                .or_else(|| {
-                    directory
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "Workspace".into());
-            let quick = |glyph, label, id, message| {
-                Element::from(
-                    crate::ui_controls::icon_button(glyph, label)
-                        .on_press(message)
-                        .id(widget::Id::new(id)),
-                )
-            };
-            let mut actions: Vec<Element<'_, Message>> = vec![
-                crate::interaction::tooltip(
-                    crate::ui_controls::button::primary("New conversation")
-                        .icon(Icon::Chat)
-                        .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
-                            chrome_ui::NewTab::Thread,
-                        ))),
-                    workspace_widget::shortcut_tooltip(
-                        workspace_widget::GlobalShortcut::NewThread,
-                        &self.settings.keyboard_shortcuts,
-                    ),
-                ),
-                quick(
-                    Icon::History,
-                    "Resume conversation".to_owned(),
-                    "empty.resume-conversation",
-                    Message::ResumeConversation(resume_ui::Action::Open),
-                ),
-                quick(
-                    Icon::Terminal,
-                    workspace_widget::shortcut_tooltip(
-                        workspace_widget::GlobalShortcut::NewTerminal,
-                        &self.settings.keyboard_shortcuts,
-                    ),
-                    "empty.new-terminal",
-                    Message::NewTerminal,
-                ),
-                quick(
-                    Icon::Browser,
-                    if cfg!(feature = "integrated-browser") {
-                        "New browser"
-                    } else {
-                        "Open in system browser"
-                    }
-                    .to_owned(),
-                    "empty.new-browser",
-                    Message::NewBrowser,
-                ),
-                quick(
-                    Icon::Avatar,
-                    "Agent accounts".to_owned(),
-                    "empty.accounts",
-                    Message::AccountUi(account_ui::Action::OpenPane),
-                ),
-            ];
-            if !scoped {
-                actions.pop();
-            }
-            let primary = actions.remove(0);
-            let actions = widget::column::with_children(vec![
-                primary,
-                widget::row::with_children(actions)
-                    .align_y(Alignment::Center)
-                    .spacing(space::S)
-                    .into(),
-            ])
-            .spacing(space::M);
-            let mut content: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::passive_icon(Icon::Chat, 32),
-                design::display(if scoped {
-                    scope_name
-                } else {
-                    "Workspace".into()
-                })
-                .into(),
-                crate::interaction::tooltip(
-                    design::caption(display_path(&directory).into_owned())
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Fill),
-                    directory.display().to_string(),
-                ),
-                actions.into(),
-            ];
-            if !scoped {
-                content.push(
-                    widget::row::with_children(
-                        crate::agent::Provider::ALL
-                            .into_iter()
-                            .map(|provider| {
-                                let status = self.account_ui.provider_status(provider);
-                                let control = crate::ui_controls::icon_button(
-                                    crate::ui_controls::provider_icon(provider),
-                                    format!("{} · {status} · Manage accounts", provider.label()),
-                                )
-                                .on_press(Message::AccountUi(account_ui::Action::OpenPane));
-                                Element::from(if status == "Account available" {
-                                    control.tone(design::Tone::Themed(design::success_color))
-                                } else {
-                                    control
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .spacing(space::M)
-                    .into(),
-                );
-            }
-            let surface =
-                widget::container(widget::column::with_children(content).spacing(space::L))
-                    .padding(space::XL)
-                    .width(Length::Fill)
-                    .max_width(440);
-            widget::container(surface)
-                .center(Length::Fill)
-                .padding(space::XL)
-                .into()
+            self.empty_workspace_view()
         } else {
             workspace_widget::view(
                 &self.workspace,
@@ -17291,7 +17171,13 @@ impl Application for Cagents {
                         .align_x(Alignment::End)
                         .width(Length::Fill)
                         .height(Length::Fill);
-                    let foreground = crate::interaction::layer(dismiss, aligned.into());
+                    let overlay_content = widget::column::with_children(vec![
+                        self.overlay_window_header(),
+                        aligned.into(),
+                    ])
+                    .width(Length::Fill)
+                    .height(Length::Fill);
+                    let foreground = crate::interaction::layer(dismiss, overlay_content.into());
                     inspector::ModalOverlay::new(background, foreground).into()
                 }
             }
@@ -19929,9 +19815,10 @@ mod tests {
                 .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
         for provider in crate::agent::Provider::ALL {
             let expected = format!(
-                "{} · {} · Manage accounts",
+                "{} · {} · {}",
                 provider.label(),
-                app.account_ui.provider_status(provider)
+                app.account_ui.provider_status(provider),
+                app.account_ui.onboarding_action(provider).map_or("Checking…", |(label, _)| label)
             );
             assert!(
                 nodes.root().iter().chain(nodes.children()).any(|node| {

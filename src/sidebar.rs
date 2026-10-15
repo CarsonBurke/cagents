@@ -4480,17 +4480,17 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
     } else {
         Icon::Tree
     };
-    let action_button =
-        crate::ui_controls::icon_button(action_icon, format!("{action_label} · {detail}"))
-            .on_press_maybe(gated(action, modal_open))
-            .id(stable_id("empty.action"));
     widget::container(
-        widget::row::with_children(vec![
-            design::caption(title).width(Length::Fill).into(),
-            action_button.into(),
+        widget::column::with_children(vec![
+            design::caption(title).into(),
+            crate::ui_controls::button::secondary(action_label)
+                .icon(action_icon)
+                .width(Length::Fill)
+                .on_press_maybe(gated(action, modal_open))
+                .id(stable_id("empty.action"))
+                .into(),
         ])
-        .spacing(space::S)
-        .align_y(Alignment::Center),
+        .spacing(space::S),
     )
     .padding(space::M)
     .width(Length::Fill)
