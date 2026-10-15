@@ -5274,9 +5274,18 @@ impl RepositoryRuntime {
                 if let DocumentState::Editable(document) = &mut self.document {
                     if let Some((path, source_line)) = self.pending_source_location.take()
                         && document.path == path
-                        && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
-                        && *pending_path == path {
-                        let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
+                        && let Some((pending_path, navigation)) =
+                            &mut self.pending_editor_navigation
+                        && *pending_path == path
+                    {
+                        let line = document
+                            .content
+                            .source_line_ranges()
+                            .get(source_line)
+                            .map_or_else(
+                                || document.content.line_count().saturating_sub(1),
+                                |range| range.start,
+                            );
                         navigation.caret.line = line;
                         navigation.caret.column = 0;
                         navigation.scroll_line = line.saturating_sub(10);
@@ -6643,10 +6652,23 @@ impl RepositoryRuntime {
 
     /// Opens a Git/diff source line counted by LF separators. Native editor
     /// lines also split bare CR, so defer mapping until the actual file loads.
-    pub fn open_source_file_location(&mut self, card: CardId, path: PathBuf, source_line: usize) -> Task<RepositoryAction> {
+    pub fn open_source_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        source_line: usize,
+    ) -> Task<RepositoryAction> {
         if self.selected_path() == Some(path.as_path())
-            && let DocumentState::Editable(document) = &self.document {
-            let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
+            && let DocumentState::Editable(document) = &self.document
+        {
+            let line = document
+                .content
+                .source_line_ranges()
+                .get(source_line)
+                .map_or_else(
+                    || document.content.line_count().saturating_sub(1),
+                    |range| range.start,
+                );
             return self.open_file_location(card, path, line, 0, 0);
         }
         let task = self.open_file_location(card, path.clone(), 0, 0, 0);
@@ -6654,11 +6676,27 @@ impl RepositoryRuntime {
             match &mut self.document {
                 DocumentState::Loading => self.pending_source_location = Some((path, source_line)),
                 DocumentState::Editable(document) => {
-                    let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
-                    document.content.set_cursor(text_editor::Cursor { position: text_editor::Position { line, column: 0 }, selection: None });
-                    document.content.restore_scroll_position(text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 });
+                    let line = document
+                        .content
+                        .source_line_ranges()
+                        .get(source_line)
+                        .map_or_else(
+                            || document.content.line_count().saturating_sub(1),
+                            |range| range.start,
+                        );
+                    document.content.set_cursor(text_editor::Cursor {
+                        position: text_editor::Position { line, column: 0 },
+                        selection: None,
+                    });
+                    document
+                        .content
+                        .restore_scroll_position(text_editor::ScrollPosition {
+                            line: line.saturating_sub(10),
+                            vertical: 0.0,
+                            horizontal: 0.0,
+                        });
                 }
-                _ => {},
+                _ => {}
             }
         }
         task
@@ -11557,22 +11595,46 @@ mod tests {
     #[tokio::test]
     async fn async_diff_source_locations_map_lf_lines_across_bare_cr_and_crlf() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("mixed.rs"), "first\rcontinued\nsecond\r\nthird\n").unwrap();
+        std::fs::write(
+            root.path().join("mixed.rs"),
+            "first\rcontinued\nsecond\r\nthird\n",
+        )
+        .unwrap();
         let card = CardId::new();
-        let mut runtime = RepositoryRuntime::new_directory(RepositoryView { project: ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: None });
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().into(),
+            worktree: root.path().into(),
+            selected_file: None,
+        });
         let task = runtime.open_source_file_location(card, "mixed.rs".into(), 1);
         assert!(matches!(&runtime.document, DocumentState::Loading));
         finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position, text_editor::Position { line: 2, column: 0 });
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position,
+            text_editor::Position { line: 2, column: 0 }
+        );
         let task = runtime.open_source_file_location(card, "mixed.rs".into(), 2);
         finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position, text_editor::Position { line: 3, column: 0 });
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position,
+            text_editor::Position { line: 3, column: 0 }
+        );
         let task = runtime.open_source_file_location(card, "mixed.rs".into(), usize::MAX);
         finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position.line, document.content.line_count() - 1);
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position.line,
+            document.content.line_count() - 1
+        );
     }
 
     #[tokio::test]
