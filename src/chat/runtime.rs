@@ -151,6 +151,8 @@ pub(crate) enum Update {
     },
     /// Older-turn evidence must never sample or replace current attention.
     PastAttention(crate::notifications::Evidence),
+    /// Persist/replay this semantic update before acknowledging its journal entry.
+    TurnOutcome { update: crate::chat::turn_outcomes::TurnUpdate },
 }
 
 #[derive(Clone)]
@@ -3287,6 +3289,15 @@ impl Actor {
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+        // Native terminal evidence survives independent transcript/storage or
+        // outbound request failures. Persistence/ACK belongs to the host's
+        // semantic journal, not this presentation Store.
+        for event in &step.events {
+            if let Event::TurnOutcome(update) = event {
+                update.validate()?;
+                (self.notify)(Update::TurnOutcome { update: update.clone() });
+            }
+        }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -3325,6 +3336,7 @@ impl Actor {
         });
         let mut execution_events = Vec::new();
         for mut event in step.events {
+            if matches!(&event, Event::TurnOutcome(_)) { continue; }
             if let Event::Error { message, .. } | Event::HistoryError(message) = &mut event {
                 *message = super::protocol::preview(message.as_bytes(), 1024);
             }
@@ -3409,6 +3421,10 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        if let Event::TurnOutcome(update) = event {
+            (self.notify)(Update::TurnOutcome { update });
+            return;
+        }
         if matches!(&event, Event::PastTurnFinished { .. }) {
             if let Some(evidence) = self.attention.apply(&event) {
                 (self.notify)(Update::PastAttention(evidence));
@@ -3862,7 +3878,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 _ => state.outcome.take(),
             };
         }
-        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished { .. } => {}
+        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished { .. } | Event::TurnOutcome(_) => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -6731,6 +6747,20 @@ mod tests {
         handle.close().unwrap();
     }
 
+    #[test]
+    fn exact_historical_outcome_never_changes_current_turn_scalars() {
+        use crate::chat::turn_outcomes::{TurnIdentity, TurnIdentityKind, TurnUpdate};
+        let mut state = Snapshot { busy: true, turn_generation: 2, ..Default::default() };
+        apply_event(&mut state, &mut BTreeMap::new(), Event::TurnOutcome(TurnUpdate::Finish {
+            identity: TurnIdentity { session_id:"confirmed".into(), kind:TurnIdentityKind::NativeTurn, id:"A".into() },
+            outcome:crate::agent::ActivityOutcome::Cancelled, finished_at:1234,
+        }));
+        assert!(state.busy);
+        assert_eq!(state.turn_generation, 2);
+        assert!(state.finished_at.is_none());
+        assert!(state.outcome.is_none());
+    }
+
     fn text(id: &str, value: &str) -> Item {
         Item {
             id: id.into(),
@@ -8407,6 +8437,7 @@ mod tests {
                 | Update::AttentionContext { .. }
                 | Update::PastAttention(_)
                 | Update::RetainedOutcomes
+                | Update::TurnOutcome { .. }
                 | Update::Ready
                 | Update::Execution { .. } => None,
             })

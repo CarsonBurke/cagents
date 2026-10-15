@@ -2146,6 +2146,8 @@ pub enum Event {
         key: Option<String>,
         outcome: crate::notifications::Kind,
     },
+    /// Exact historical ownership/results; never authority over current activity.
+    TurnOutcome(turn_outcomes::TurnUpdate),
 }
 
 #[cfg(test)]
