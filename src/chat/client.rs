@@ -106,6 +106,7 @@ pub struct ClientHandle {
 struct Wire {
     stream: UnixStream,
     codec: FrameCodec,
+    body_requested: Arc<AtomicBool>,
 }
 type Pending = Arc<
     Mutex<
@@ -274,7 +275,7 @@ fn transmit(
         ClientRequest::ChatVisibility { visible: false, .. }
     );
     let mut wire = wire.lock().unwrap_or_else(|p| p.into_inner());
-    let Wire { stream, codec } = &mut *wire;
+    let Wire { stream, codec, body_requested } = &mut *wire;
     codec
         .write(
             stream,
@@ -286,7 +287,7 @@ fn transmit(
             },
         )
         .map_err(|e| e.to_string())?;
-    if hidden {
+    if hidden || !body_requested.load(Ordering::Acquire) {
         codec.release_spare();
     }
     Ok(())
@@ -494,6 +495,7 @@ impl ClientHandle {
     /// handle does not look like a protocol failure to a test that only draws.
     #[cfg(test)]
     pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+        let body_requested = Arc::new(AtomicBool::new(true));
         let user_item_seen = snapshot
             .items
             .iter()
@@ -518,6 +520,7 @@ impl ClientHandle {
                 wire: Arc::new(Mutex::new(Wire {
                     stream,
                     codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                    body_requested: body_requested.clone(),
                 })),
                 cancel,
                 source_clock: Arc::new(Mutex::new(SourceClock::from_sample(
@@ -526,7 +529,7 @@ impl ClientHandle {
                 ))),
                 snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
                 transcript_resident: Arc::new(AtomicBool::new(true)),
-                body_requested: Arc::new(AtomicBool::new(true)),
+                body_requested,
                 user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
                 activity: Arc::new(Mutex::new(ActivityObservation {
                     generation: 0,
@@ -962,9 +965,11 @@ impl ClientHandle {
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
+        let body_requested = Arc::new(AtomicBool::new(true));
         let wire = Arc::new(Mutex::new(Wire {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
+            body_requested: body_requested.clone(),
         }));
         let mut activity = ActivityObservation {
             generation: initial.generation,
@@ -992,7 +997,6 @@ impl ClientHandle {
                 .any(|item| item.role == super::Role::User),
         ));
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
-        let body_requested = Arc::new(AtomicBool::new(true));
         let transcript_resident = Arc::new(AtomicBool::new(true));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
@@ -1028,7 +1032,6 @@ impl ClientHandle {
         let visibility_wire = wire.clone();
         let visibility_alive = alive.clone();
         let visibility_value = visible.clone();
-        let visibility_body_requested = body_requested.clone();
         let visibility_proof = proof.clone();
         let visibility_next = next.clone();
         let visibility_worker = thread::Builder::new()
@@ -1057,9 +1060,6 @@ impl ClientHandle {
                             .stream
                             .shutdown(Shutdown::Both);
                         break;
-                    }
-                    if !visibility_body_requested.load(Ordering::Acquire) {
-                        visibility_wire.lock().unwrap_or_else(|p| p.into_inner()).codec.release_spare();
                     }
                 }
             })
@@ -3195,6 +3195,13 @@ mod tests {
                     },
                 },
             );
+            let command: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(&command.request, ClientRequest::ChatCommand {
+                command: Command::Prompt { text, .. }, ..
+            } if text.len() > 1024 * 1024));
+            respond(&mut codec, &mut server, Some(command.request_id), ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            });
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             respond(
                 &mut codec,
@@ -3308,6 +3315,11 @@ mod tests {
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
         assert!(handle.has_observed_user_item());
         assert!(handle.resident_snapshot_with_clock().is_none());
+        handle.send(Command::Prompt {
+            text: "large prompt".repeat(128 * 1024), attachments: vec![], mode: super::super::PromptMode::Send,
+        }).unwrap();
+        assert!(handle.inner.wire.lock().unwrap().codec.buffer_capacities_for_test().1 <= 256 * 1024,
+            "new large hidden commands release scratch without another visibility transition");
         advance_tx.send(()).unwrap();
         stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         while !matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Activity) {}
