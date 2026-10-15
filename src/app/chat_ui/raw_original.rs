@@ -14,7 +14,7 @@ fn eligible(part:&RawSourcePart)->Result<(),String> {
     Ok(())
 }
 struct Pending {
-    part:RawSourcePart,text:Arc<str>,key:u64,deadline:Instant,
+    part:RawSourcePart,text:Arc<str>,key:u64,prefixes:Arc<Vec<[u8;32]>>,deadline:Instant,
     _reader:tokio::sync::OwnedSemaphorePermit,_capacity:chat::source_owners::ReaderCapacity,
 }
 /// The same two readers bound prose, patches and original calls, including
@@ -43,14 +43,31 @@ where F:FnMut(RawSourceQuery)->Fut,Fut:std::future::Future<Output=Result<RawSour
         tokio::task::spawn_blocking(move || {
             // All source hashing is performed on the reader worker. The final
             // canonical reader port adopts this immutable allocation directly.
-            let key=tail_digest(0,&text);
-            Pending {part,text,key,deadline,_reader:reader,_capacity:capacity}
+            let key=tail_digest(0,&text);let prefixes=prefixes(&text);
+            Pending {part,text,key,prefixes,deadline,_reader:reader,_capacity:capacity}
         }).await.map_err(|_|"Original call preparation stopped.".to_owned())
     }).await.map_err(|_|"The original call could not be read in time.".to_owned())?
 }
 static REVISIONS:AtomicU64=AtomicU64::new(1);
 fn next_revision()->u64 {REVISIONS.fetch_add(1,Ordering::Relaxed)}
-struct Loaded {record:ResidentRaw,view:tool_text::ToolText}
+/// Exact displayed, complete call leaf. The body and validation checkpoints
+/// are prepared off-thread and shared with reader, Catalog and Find.
+#[derive(Clone)]
+pub(super) struct Leaf {
+    pub(super) record:ResidentRaw,
+    pub(super) text:Arc<str>,
+    pub(super) prefixes:Arc<Vec<[u8;32]>>,
+}
+impl Leaf {
+    pub(super) fn path(&self)->[u32;2] {[10,field_index(self.record.field)]}
+}
+fn field_index(field:RawSourceField)->u32 {match field {RawSourceField::ToolInput=>0,RawSourceField::CommandCall=>1}}
+fn prefixes(text:&str)->Arc<Vec<[u8;32]>> {
+    let mut hasher=blake3::Hasher::new();let mut values=vec![*hasher.finalize().as_bytes()];
+    for chunk in text.as_bytes().chunks_exact(4096) {hasher.update(chunk);values.push(*hasher.finalize().as_bytes());}
+    Arc::new(values)
+}
+struct Loaded {record:ResidentRaw,view:tool_text::ToolText,prefixes:Arc<Vec<[u8;32]>>}
 struct Entry {part:RawSourcePart,revision:u64,opened:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
 impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,attempt:None,loaded:None,restored:None,error:None}}}
 #[derive(Default)]
@@ -98,6 +115,22 @@ impl State {
         entry.revision=next_revision();self.revision=self.revision.wrapping_add(1);
     }
     pub(super) fn revision(&self)->u64 {self.revision}
+    pub(super) fn context_token(&self)->u64 {self.context}
+    /// Display order matches detail(), with no source/body reconstruction.
+    /// Restored bytes remain unavailable until their worker preparation is
+    /// installed; stale descriptors are removed synchronously by sync().
+    pub(super) fn loaded_leaves(&self,item:&str)->Vec<Leaf> {
+        [RawSourceField::ToolInput,RawSourceField::CommandCall].into_iter().filter_map(|field| {
+            let key=self.key(item,field)?;let entry=self.entries.get(&key)?;
+            if !entry.opened {return None;}
+            let loaded=entry.loaded.as_ref()?;
+            (loaded.record==record(&entry.part)).then(||Leaf {record:loaded.record.clone(),text:loaded.view.text.clone(),prefixes:loaded.prefixes.clone()})
+        }).collect()
+    }
+    pub(super) fn complete_for_find(&self,item:&str)->bool {
+        self.aliases.get(item).into_iter().flatten().filter_map(|key|self.entries.get(key)).filter(|entry|entry.opened)
+            .all(|entry|entry.loaded.as_ref().is_some_and(|loaded|loaded.record==record(&entry.part)))
+    }
     pub(super) fn item_revision(&self,item:&str)->u64 {
         self.aliases.get(item).into_iter().flatten().filter_map(|key|self.entries.get(key)).map(|entry|entry.revision.max(self.notice_revision)).max().unwrap_or(0)
     }
@@ -149,7 +182,7 @@ fn stream(request:&Request)->Pin<Box<dyn iced::futures::Stream<Item=Message>+Sen
         let result=tokio::time::timeout(Duration::from_secs(40),async {
             let pending=if let Some(text)=request.offline {
                 let reader=chat::source_owners::readers().clone().acquire_owned().await.map_err(|_|"Original loading stopped.".to_owned())?;
-                let part=request.part.clone();tokio::task::spawn_blocking(move || Pending {key:tail_digest(0,&text),part,text,deadline:Instant::now()+Duration::from_secs(40),_reader:reader,_capacity:Default::default()})
+                let part=request.part.clone();tokio::task::spawn_blocking(move || Pending {key:tail_digest(0,&text),prefixes:prefixes(&text),part,text,deadline:Instant::now()+Duration::from_secs(40),_reader:reader,_capacity:Default::default()})
                     .await.map_err(|_|"Original preparation stopped.".to_owned())?
             } else {
                 let handle=request.handle.ok_or("Reconnect to load the complete original call.")?;
@@ -184,7 +217,7 @@ pub(super) fn complete(runtime:&mut Runtime,source:SourceKey,field:RawSourceFiel
     match result {
         Ok(pending) if record(&pending.part)==record(&entry.part) && pending.deadline>Instant::now() && chat::source_owners::resident_raw(&pending.text).as_ref()==Some(&record(&entry.part))=>{
             let view=tool_text::ToolText::from_captured(pending.text.clone(),pending.key);
-            if let Some(old)=entry.loaded.replace(Loaded {record:record(&entry.part),view}) {retire_loaded(old);}
+            if let Some(old)=entry.loaded.replace(Loaded {record:record(&entry.part),view,prefixes:pending.prefixes.clone()}) {retire_loaded(old);}
             entry.restored=None;retire(pending);
         }
         Ok(pending)=>{retire(pending);entry.error=Some("The original call changed before it was displayed. Retry its current source.".into());}
@@ -222,7 +255,7 @@ fn retire_loaded(loaded:Loaded) {
     // ToolText's canonical flow cache contains UI-only Rc owners. Keep one
     // pure body Arc alive while dropping that UI presentation, then transfer
     // the final source allocation to the background reclaimer. No Send cast.
-    let text=loaded.view.text.clone();drop(loaded.view);retire((text,loaded.record));
+    let text=loaded.view.text.clone();drop(loaded.view);retire((text,loaded.record,loaded.prefixes));
 }
 fn retire_entry(mut entry:Entry) {
     if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}
@@ -472,9 +505,30 @@ mod tests {
         let stable=state.item_revision(&second.item_id);state.toggle(&first.item_id,first.field);
         assert_eq!(state.item_revision(&second.item_id),stable,"ordinary disclosure still has item-local invalidation");
     }
+    #[tokio::test]
+    async fn loaded_leaf_sources_are_exact_ordered_shared_and_withdrawn_before_new_epoch_ready() {
+        let text="{ \"exact\": \"λ\" }";let(mut runtime,part)=runtime_fixture(text);
+        toggle(&mut runtime,&part.item_id,part.field,false);
+        assert!(!runtime.raw_original.complete_for_find(&part.item_id));
+        let context=runtime.raw_original.context;let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        let leaves=runtime.raw_original.loaded_leaves(&part.item_id);assert_eq!(leaves.len(),1);
+        assert_eq!(leaves[0].path(),[10,0]);assert_eq!(leaves[0].record,record(&part));
+        let second=runtime.raw_original.loaded_leaves(&part.item_id);
+        assert!(Arc::ptr_eq(&leaves[0].text,&second[0].text));assert!(Arc::ptr_eq(&leaves[0].prefixes,&second[0].prefixes));
+        assert!(runtime.raw_original.complete_for_find(&part.item_id));
+        Arc::make_mut(&mut runtime.snapshot).raw_source_parts[0].epoch.revision+=1;sync(&mut runtime);
+        assert!(runtime.raw_original.loaded_leaves(&part.item_id).is_empty(),"old epoch cannot be exposed while replacement is pending");
+        assert!(runtime.raw_original.loaded_leaves("unknown alias").is_empty());
+    }
+    #[test]
+    fn raw_prefix_checkpoints_follow_exact_display_bytes_including_utf8_and_newlines() {
+        let text="λ\r\n".repeat(3000);let values=prefixes(&text);
+        for (index,value) in values.iter().enumerate() {assert_eq!(*value,*blake3::hash(&text.as_bytes()[..index*4096]).as_bytes());}
+    }
     #[test]
     fn source_reader_and_retirement_payloads_require_safe_send() {
-        fn send<T:Send>() {}send::<Pending>();send::<Reply>();send::<ResidentRawCalls>();
+        fn send<T:Send>() {}send::<Pending>();send::<Reply>();send::<ResidentRawCalls>();send::<Leaf>();
         fn future<T:Send>(_:T) {}future(read(part("{}"),|_|std::future::ready(Err(SourceError::NotFound))));
     }
 }
