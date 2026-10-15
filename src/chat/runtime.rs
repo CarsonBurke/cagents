@@ -5261,7 +5261,11 @@ mod tests {
         }
         assert_eq!(handle.source_authority_unavailable(),Some(super::super::SourceAuthorityUnavailableCause::RevocationFailed));
         assert!(handle.source_authority().is_none(),"failure must not mint a new token or acknowledgement");
-        assert_eq!(handle.0.store.lock().unwrap().source_authority(),Some(before),"failed kernel revocation leaves Store token unchanged");
+        {
+            let store=handle.0.store.lock().unwrap();
+            assert_eq!(store.source_incarnation,before.incarnation,"failed kernel revocation leaves Store incarnation unchanged");
+            assert!(store.source_authority().is_none(),"typed unavailability withholds the old token rather than inventing a new proof");
+        }
         assert!(!handle.0.visible.load(Ordering::Acquire));
         handle.close().unwrap();
     }
