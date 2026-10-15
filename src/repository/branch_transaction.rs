@@ -11,19 +11,6 @@ fn invalid(message: impl Into<String>) -> RepositoryError {
     ValidationError::Io(message.into()).into()
 }
 
-fn head_lock(root: &fs_safety::Root) -> Result<GitFileLock, RepositoryError> {
-    let (file, temporary) = fs_safety::create_temporary_in(root, 0o600)
-        .map_err(|error| invalid(error.to_string()))?;
-    let name = OsString::from("HEAD.lock");
-    if let Err(error) = fs_safety::rename_new_within(root, &temporary, &name) {
-        let _ = fs_safety::unlink_within(root, &temporary);
-        return Err(invalid(format!("A registered checkout is busy: {error}")));
-    }
-    let metadata = file.metadata().map_err(|error| invalid(error.to_string()))?;
-    Ok(GitFileLock { parent: root.try_clone().map_err(|error| invalid(error.to_string()))?,
-        name, version: GitFileLock::version(&metadata), file, active: true })
-}
-
 impl<E: ProcessExecutor> RepositoryService<E> {
     /// No caller gets a general unscoped executor. The source is the journal's
     /// already-held original repository and every command still passes its
@@ -40,7 +27,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .ok_or_else(|| invalid("Branch advancement needs the verified provisional checkout"))?;
         let mut held = vec![source, private, common];
         held.extend(created.transaction_roots()?);
-        let common = held[2].try_clone().map_err(|error| invalid(error.to_string()))?;
         let old = journal.existing_branch_oid.as_deref()
             .ok_or_else(|| invalid("No existing branch consent was recorded"))?;
         let new = journal.base_oid.as_deref()
@@ -49,62 +35,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let repository = &journal.request.repository;
         let branch = &journal.request.branch;
         let full_ref = branch.full_ref();
-        // Files HEAD.lock guards do not constrain a reftable HEAD backend.
-        let storage = self.run(&self.git_read(repository,
-            ["config", "--local", "--get", "extensions.refStorage"]), cancellation)?;
-        if !(storage.exit_code == Some(1) || (storage.success
-            && trim_one_line_ending(&storage.stdout) == b"files"))
-        { return Err(invalid("This branch transaction requires Git's files reference backend")); }
         let census = || self.list_worktrees(repository, cancellation);
-        let records = census()?;
-        if records.iter().any(|record| record.branch.as_deref() == Some(full_ref.as_str())) {
+        if census()?.iter().any(|record| record.branch.as_deref() == Some(full_ref.as_str())) {
             return Err(invalid("The existing branch became checked out elsewhere; it was retained"));
         }
-        // Native Git resolves registered HEADs from its common metadata, not
-        // from mutable <checkout>/.git aliases. Lock those exact admin roots.
-        let mut roots = vec![common.try_clone().map_err(|error| invalid(error.to_string()))?];
-        let mut linked_paths = HashSet::new();
-        let registry = match fs_safety::open_directory_beneath(&common, Path::new("worktrees")) {
-            Ok(root) => Some(root),
-            Err(error) if error.is_not_found() => None,
-            Err(error) => return Err(invalid(error.to_string())),
-        };
-        if let Some(registry) = registry {
-            for (index, entry) in registry.read_dir().map_err(|error| invalid(error.to_string()))?.enumerate() {
-                if index >= 4096 { return Err(invalid("The registered checkout inventory exceeds its safe bound")); }
-                let entry = entry.map_err(|error| invalid(error.to_string()))?;
-                let admin = fs_safety::open_directory_beneath(&registry, Path::new(&entry.file_name()))
-                    .map_err(|error| invalid(error.to_string()))?;
-                let backlink = creation_authority::regular_locator(&admin, "gitdir")?;
-                let marker = bytes_to_path(trim_one_line_ending(&backlink));
-                let record = records.iter().find(|record| !record.bare && record.path.join(".git") == marker)
-                    .ok_or_else(|| invalid("A registered admin has no matching native checkout record; repair or prune it first"))?;
-                if !linked_paths.insert(record.path.clone()) {
-                    return Err(invalid("Multiple registered admins claim the same checkout path"));
-                }
-                if !fs_safety::metadata_beneath(&admin, Path::new("HEAD"))
-                    .map_err(|error| invalid(error.to_string()))?.is_file() {
-                    return Err(invalid("A registered checkout has no regular files-backend HEAD"));
-                }
-                roots.push(admin);
-            }
-        }
-        let primary = records.iter().filter(|record| !record.bare && !linked_paths.contains(&record.path))
-            .collect::<Vec<_>>();
-        if primary.len() > 1 { return Err(invalid("The primary checkout registration is ambiguous")); }
-        for record in primary {
-            let captured = WorktreeAuthority::capture(&record.path)?;
-            let (_, admin, _) = captured.retained_roots()?;
-            let actual = admin.metadata().map_err(|error| invalid(error.to_string()))?;
-            let expected = common.metadata().map_err(|error| invalid(error.to_string()))?;
-            if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
-                return Err(invalid("The primary checkout locator no longer names its registered admin"));
-            }
-        }
-        held.extend(roots.iter().map(|root| root.try_clone().map_err(|error| invalid(error.to_string())))
-            .collect::<Result<Vec<_>, _>>()?);
-        let locks = roots.iter().map(head_lock).collect::<Result<Vec<_>, _>>()?;
-        for lock in &locks { lock.check().map_err(invalid)?; }
+        // Reuse the exact actual-admin association and policy proof used by
+        // landed branch deletion. The service already pins source command scope;
+        // the registry never substitutes or unwraps that executor.
+        let mut registry = registered_heads::RegisteredHeads::capture(self, repository, cancellation)
+            .map_err(invalid)?;
+        registry.acquire().map_err(invalid)?;
         if census()?.iter().any(|record| record.branch.as_deref() == Some(full_ref.as_str())) {
             return Err(invalid("The branch became checked out while acquiring checkout guards"));
         }
@@ -120,6 +60,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let directory = tempfile::Builder::new().prefix("cagents-branch-advance-")
             .tempdir_in(session.common_operand()?).map_err(|error| invalid(error.to_string()))?;
         let directory = directory.keep();
+        registry.write_proof(&directory).map_err(invalid)?;
         let hook = directory.join("reference-transaction");
         let proof = directory.join("prepared");
         let write = |path: &Path, bytes: &[u8], mode| -> Result<(), RepositoryError> {
@@ -195,7 +136,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map_err(|error| invalid(error.to_string()))?;
         drop(file);
         session.validate()?;
-        for lock in &locks { lock.check().map_err(invalid)?; }
+        registry.check().map_err(invalid)?;
         let command = environment(self.git_mutation(repository, [OsString::from("-c"), hooks,
             "branch".into(), "--force".into(), "--".into(), branch.as_str().into(), new.into()]))?;
         self.run_checked(&command, cancellation)?;
@@ -205,6 +146,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // The caller must still attach the child and independently reconcile
         // exact final branch/OID/registration after inherited lease retirement.
         session.validate()?;
+        registry.check().map_err(invalid)?;
         Ok(())
     }
 }

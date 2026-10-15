@@ -22,6 +22,9 @@ mod authority;
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
 mod creation_authority;
 mod branch_transaction;
+// The same source owns the landed deletion and journal branch fences.
+#[path = "worktree_branch/registered_heads.rs"]
+mod registered_heads;
 mod browse_reveal;
 mod ignore_path;
 pub use browse_reveal::include as include_revealed_path;
@@ -7779,10 +7782,22 @@ impl GitFileLock {
         }
         let parent = index.parent().ok_or("Git reported no index parent")?;
         let parent = fs_safety::Root::open(parent).map_err(|error| error.to_string())?;
-        let mut name = index
-            .file_name()
-            .ok_or("Git reported no index name")?
-            .to_owned();
+        let name = index.file_name().ok_or("Git reported no index name")?;
+        Self::acquire_in(parent, name)
+    }
+
+    /// Lock an actual registered administrative directory already retained by
+    /// its common namespace, without reopening a mutable checkout locator.
+    pub(crate) fn acquire_beneath(parent: &fs_safety::Root, name: &OsStr) -> Result<Self, String> {
+        if !matches!((Path::new(name).components().next(), Path::new(name).components().count()),
+            (Some(std::path::Component::Normal(_)), 1)) {
+            return Err("Git lock name must be one ordinary component".into());
+        }
+        Self::acquire_in(parent.try_clone().map_err(|error| error.to_string())?, name)
+    }
+
+    fn acquire_in(parent: fs_safety::Root, name: &OsStr) -> Result<Self, String> {
+        let mut name = name.to_owned();
         name.push(".lock");
         let (file, temporary) =
             fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;
@@ -7810,6 +7825,13 @@ impl GitFileLock {
             file,
             active: true,
         })
+    }
+
+    pub(crate) fn retained_identity(&self) -> Result<(u64, u64), String> {
+        use std::os::unix::fs::MetadataExt;
+        self.owns_lock()?;
+        let metadata = self.file.metadata().map_err(|error| error.to_string())?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     fn version(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
@@ -13248,6 +13270,28 @@ impl WorktreeJournal {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// A separate primary Git directory has no portable checkout backlink.
+    /// Read its explicit common-local worktree setting through this service's
+    /// existing executor; a linked-worktree invocation must not rediscover or
+    /// grant command authority to a foreign checkout just to resolve it.
+    pub(crate) fn configured_primary_worktree(&self, repository: &Path,
+        cancellation: &CancellationToken) -> Result<PathBuf, RepositoryError>
+    {
+        let command=self.git_read(repository,["config","--local","--path","--get","core.worktree"]);
+        let output=self.run_checked(&command,cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout,"primary_worktree"),&output)
+    }
+
+    pub(crate) fn uses_files_ref_storage(&self, repository: &Path,
+        cancellation: &CancellationToken) -> Result<bool, RepositoryError>
+    {
+        let command=self.git_read(repository,["config","--local","--get","extensions.refStorage"]);
+        let output=self.run(&command,cancellation)?;
+        if output.exit_code==Some(1) { return Ok(true); }
+        if output.success { return Ok(trim_one_line_ending(&output.stdout)==b"files"); }
+        Err(git_failure(&command,output).into())
+    }
+
     /// The canonical common directory of `repository`, the one a creation
     /// journal records and its identity is keyed by.
     pub fn common_dir(
@@ -14895,7 +14939,8 @@ mod worktree_journal_tests {
     #[test]
     fn scoped_branch_advance_guards_actual_registered_admins_and_rejects_replacement() {
         use std::os::unix::fs::PermissionsExt;
-        for replace_admin in [false, true] {
+        for mode in ["alias", "checkout", "replacement"] {
+            let replace_admin = mode == "replacement";
             let (fixture, _remote, old, new) = existing_branch_advance_fixture();
             let y = fixture.directory.path().join("other-y");
             let z = fixture.directory.path().join("other-z");
@@ -14906,7 +14951,7 @@ mod worktree_journal_tests {
             let original_head = fs::read(admin_y.join("HEAD")).unwrap();
             // Native worktree inventory still reads adminY. Looking up Y's
             // mutable locator instead would incorrectly lock adminZ twice.
-            fs::write(y.join(".git"), format!("gitdir: {}\n", admin_z.display())).unwrap();
+            if mode == "alias" { fs::write(y.join(".git"), format!("gitdir: {}\n", admin_z.display())).unwrap(); }
             let result = fixture.directory.path().join("policy-result");
             let hook = fixture.request.repository.join(".git/hooks/reference-transaction");
             fs::write(&hook, r#"#!/bin/sh
@@ -14941,6 +14986,14 @@ printf refused > "$CAGENTS_ALIAS_RESULT"
             let (sender, _) = async_channel::bounded(8);
             let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
                 7, &CancellationToken::new(), &sender);
+            if mode == "alias" {
+                assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{report:?}");
+                assert!(!executor.inner.attempted.load(Ordering::SeqCst));
+                assert_eq!(fixture.git(&["rev-parse", "feature"]), old);
+                assert!(!result.exists(), "inconsistent registration must refuse before policy/effect");
+                assert_eq!(fs::read(admin_y.join("HEAD")).unwrap(), original_head);
+                continue;
+            }
             assert!(executor.inner.attempted.load(Ordering::SeqCst));
             assert_eq!(fs::read(admin_y.join("HEAD")).unwrap(), original_head);
             if replace_admin {

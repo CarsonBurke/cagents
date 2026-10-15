@@ -13,6 +13,7 @@ repo_git() (
 )
 verify() {
     . "$CAGENTS_BRANCH_PRIVATE/check-identities"
+    "$CAGENTS_BRANCH_PRIVATE/check-registered-heads"
     count=0
     while IFS=' ' read -r old new ref extra; do
         [ -z "$extra" ]
