@@ -169,8 +169,35 @@ impl TextSnapshot {
             (Some(left),Some(right)) if Arc::ptr_eq(left,right) => return true,
             _ => {},
         }
-        Chunks::new(self.root.as_deref()).flat_map(str::bytes)
-            .eq(Chunks::new(other.root.as_deref()).flat_map(str::bytes))
+        let mut left: Vec<_> = self.root.as_deref().into_iter().collect();
+        let mut right: Vec<_> = other.root.as_deref().into_iter().collect();
+        fn expand<'a>(stack:&mut Vec<&'a Node>,node:&'a Node)->bool {
+            if let Node::Branch {left,right,..} = node {
+                stack.pop();stack.push(right);stack.push(left);true
+            } else {false}
+        }
+        while let (Some(&a),Some(&b)) = (left.last(),right.last()) {
+            if std::ptr::eq(a,b) {left.pop();right.pop();continue;}
+            if a.bytes() == b.bytes() {
+                if let (Node::Line(a),Node::Line(b)) = (a,b) {
+                    if !a.text.bytes().chain(a.terminator.bytes()).eq(b.text.bytes().chain(b.terminator.bytes())) {return false;}
+                    left.pop();right.pop();continue;
+                }
+                let expanded_left = expand(&mut left,a);
+                let expanded_right = expand(&mut right,b);
+                debug_assert!(expanded_left || expanded_right);
+            } else if a.bytes() > b.bytes() && expand(&mut left,a) {
+                continue;
+            } else if b.bytes() > a.bytes() && expand(&mut right,b) {
+                continue;
+            } else {
+                // Equal bytes can have different native line topology. Keep
+                // exact semantics in that rare case without materialization.
+                return Chunks::new(self.root.as_deref()).flat_map(str::bytes)
+                    .eq(Chunks::new(other.root.as_deref()).flat_map(str::bytes));
+            }
+        }
+        left.iter().all(|node| node.bytes()==0) && right.iter().all(|node| node.bytes()==0)
     }
     pub fn protocol_compatible_lines(&self) -> bool { self.root.as_ref().is_none_or(|root| root.compatible()) }
     pub fn byte_offset(&self, position: Position) -> Option<usize> { self.root.as_ref()?.byte_offset(position) }
