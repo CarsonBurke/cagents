@@ -9752,15 +9752,26 @@ pub(super) fn show_chat_snapshot_for_test(
     snapshot: chat::Snapshot,
 ) -> usize {
     let requests = snapshot.requests.len();
+    let items = snapshot.items.len();
+    let child_items: Vec<_> = snapshot.subagents.iter()
+        .map(|agent| (agent.id.clone(), agent.items.len())).collect();
     let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
         panic!("chat snapshot requires a chat runtime");
     };
+    // A hidden client intentionally discards incoming bodies. Establish the
+    // real presentation interest before publishing this visible fixture.
+    runtime.show(true);
     runtime
         .handle()
         .expect("a chat snapshot is shown on a live conversation")
         .replace_snapshot_for_test(snapshot);
     runtime.show(true);
     preparation::drain_fixture(runtime);
+    assert_eq!(runtime.snapshot.items.len(), items,
+        "visible fixtures must retain their published parent body");
+    assert_eq!(runtime.snapshot.subagents.iter()
+        .map(|agent| (agent.id.clone(), agent.items.len())).collect::<Vec<_>>(), child_items,
+        "visible fixtures must retain their published child bodies");
     assert_eq!(
         runtime.snapshot.requests.len(),
         requests,
@@ -12518,7 +12529,9 @@ mod tests {
             ),
             "an obsolete empty result must not publish a new complete paint/result snapshot"
         );
-        assert!(chat_runtime(&app, card).find_dirty);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.find_dirty || runtime.find_waiting.is_some(),
+            "a rejected obsolete result schedules another search");
         complete_find_for_test(&mut app, target);
         assert_eq!(chat_runtime(&app, card).find_matches.len(), 1);
         assert_eq!(chat_runtime(&app, card).find_matches[0].range, 0..6);

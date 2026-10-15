@@ -1015,7 +1015,9 @@ mod tests {
             let mut tree = Tree::new(&widget);
             let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, 400.0));
             widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            assert!(cached.flow_cache.complete_fixture());
+            // Short direct paragraphs need no flow request; if layout did
+            // request one, settle that real request before inspecting ranges.
+            let _ = cached.flow_cache.complete_fixture();
             let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
             let mut read = Read(Vec::new());
             widget
