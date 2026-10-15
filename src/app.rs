@@ -2510,7 +2510,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
-        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
+        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmClipboard(..) | terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
@@ -2732,6 +2732,9 @@ pub enum SettingsField {
     HibernationDelayMs,
     TerminalFontSize,
     TerminalFontFamily,
+    AlwaysShowTerminalReviewBar,
+    TerminalClipboardWrite,
+    TerminalScrollToBottomOnInput,
     ConfirmMultilinePaste,
     BrowserSearchUrl,
     EditorFontFamily,
@@ -2798,11 +2801,12 @@ pub enum SettingsField {
     ShortcutFocusPane9,
     ShortcutToggleProjects,
     ShortcutRenamePane,
+    ShortcutTerminalReview,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 39] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2841,6 +2845,7 @@ impl SettingsField {
         Self::ShortcutFocusPane9,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
+        Self::ShortcutTerminalReview,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -2879,8 +2884,12 @@ impl SettingsField {
             Self::EditorFontFamily => "Editor font family",
             Self::EditorFontSize => "Editor font size",
             Self::BrowserSearchUrl => "Browser search URL",
+            Self::AlwaysShowTerminalReviewBar => "Always show terminal review bar",
+            Self::TerminalClipboardWrite => "Terminal clipboard writes",
+            Self::TerminalScrollToBottomOnInput => "Scroll to bottom on input",
             Self::ConfirmMultilinePaste => "Confirm multiline paste",
             Self::ShortcutToggleProjects => "Toggle Projects sidebar",
+            Self::ShortcutTerminalReview => "Toggle terminal text review",
             Self::ShortcutRenamePane => "Rename focused pane",
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -2955,6 +2964,9 @@ impl SettingsField {
             | Self::TerminalFontFamily
             | Self::TerminalScrollbackMib
             | Self::ConfirmTerminalClose
+            | Self::AlwaysShowTerminalReviewBar
+            | Self::TerminalClipboardWrite
+            | Self::TerminalScrollToBottomOnInput
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
@@ -2981,6 +2993,7 @@ impl SettingsField {
             | Self::BrowserSearchUrl => SettingsCategory::Links,
             Self::ShortcutNewTerminal
             | Self::ShortcutToggleProjects
+            | Self::ShortcutTerminalReview
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3040,6 +3053,7 @@ enum SettingsFeedback {
 struct ShortcutDraft {
     toggle_projects: String,
     rename_pane: String,
+    terminal_review: String,
     command_palette: String,
     new_native_thread: String,
     chat_permissions: String,
@@ -3083,6 +3097,7 @@ impl ShortcutDraft {
         Self {
             toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
+            terminal_review: settings::format_chords(&shortcuts.terminal_review),
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
             chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
@@ -3141,6 +3156,9 @@ struct SettingsDraft {
     terminal_font_family: String,
     editor_font_family: String,
     editor_font_size: String,
+    terminal_clipboard_write: String,
+    always_show_terminal_review_bar: bool,
+    terminal_scroll_to_bottom_on_input: bool,
     confirm_multiline_paste: bool,
     browser_search_url: String,
     terminal_scrollback_mib: String,
@@ -3214,6 +3232,9 @@ impl SettingsDraft {
             editor_wrap_lines: settings.editor_wrap_lines,
             diff_hide_unchanged: settings.diff_hide_unchanged,
             confirm_terminal_close: settings.confirm_terminal_close,
+            terminal_clipboard_write: settings.terminal_clipboard_write.as_str().into(),
+            always_show_terminal_review_bar: settings.always_show_terminal_review_bar,
+            terminal_scroll_to_bottom_on_input: settings.terminal_scroll_to_bottom_on_input,
             confirm_multiline_paste: settings.confirm_multiline_paste,
             browser_search_url: settings.browser_search_url.clone(),
             chat_enter_sends: settings.chat_enter_sends,
@@ -3248,6 +3269,13 @@ impl SettingsDraft {
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
             SettingsField::TerminalFontFamily => self.terminal_font_family = value,
+            SettingsField::AlwaysShowTerminalReviewBar => {
+                self.always_show_terminal_review_bar = value == "true"
+            }
+            SettingsField::TerminalClipboardWrite => self.terminal_clipboard_write = value,
+            SettingsField::TerminalScrollToBottomOnInput => {
+                self.terminal_scroll_to_bottom_on_input = value == "true"
+            }
             SettingsField::ConfirmMultilinePaste => self.confirm_multiline_paste = value == "true",
             SettingsField::BrowserSearchUrl => self.browser_search_url = value,
             SettingsField::EditorFontFamily => self.editor_font_family = value,
@@ -3309,6 +3337,9 @@ impl SettingsDraft {
             SettingsField::ShortcutNewTerminal => self.keyboard_shortcuts.new_terminal = value,
             SettingsField::ShortcutToggleProjects => {
                 self.keyboard_shortcuts.toggle_projects = value
+            }
+            SettingsField::ShortcutTerminalReview => {
+                self.keyboard_shortcuts.terminal_review = value
             }
             SettingsField::ShortcutRenamePane => self.keyboard_shortcuts.rename_pane = value,
             SettingsField::ShortcutCommandPalette => {
@@ -3500,6 +3531,23 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.confirm_terminal_close = enabled)
             .map_err(|_| "Choose whether active terminal closes require confirmation.".to_owned()),
+        SettingsField::AlwaysShowTerminalReviewBar => value
+            .parse::<bool>()
+            .map(|enabled| next.always_show_terminal_review_bar = enabled)
+            .map_err(|_| "Choose whether the review bar is always visible.".into()),
+        SettingsField::TerminalClipboardWrite => {
+            next.terminal_clipboard_write = match value {
+                "allow" => crate::settings::TerminalClipboardWritePolicy::Allow,
+                "ask" => crate::settings::TerminalClipboardWritePolicy::Ask,
+                "deny" => crate::settings::TerminalClipboardWritePolicy::Deny,
+                _ => return Err("Choose allow, ask or deny for terminal clipboard writes.".into()),
+            };
+            Ok(())
+        }
+        SettingsField::TerminalScrollToBottomOnInput => value
+            .parse::<bool>()
+            .map(|value| next.terminal_scroll_to_bottom_on_input = value)
+            .map_err(|_| "Choose whether typing follows the live prompt.".to_owned()),
         SettingsField::ConfirmMultilinePaste => value
             .parse::<bool>()
             .map(|value| next.confirm_multiline_paste = value)
@@ -3724,6 +3772,10 @@ fn settings_update(
         }
         SettingsField::ShortcutCloseFocusedColumn => {
             next.keyboard_shortcuts.close_focused_column = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutTerminalReview => {
+            next.keyboard_shortcuts.terminal_review = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutFindInPane => {
@@ -4057,6 +4109,10 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    AssistiveTechnologyActive {
+        window: window::Id,
+        active: bool,
+    },
     TerminalReviewMode {
         card: CardId,
         terminal: crate::model::TerminalId,
@@ -4755,11 +4811,13 @@ pub struct Cagents {
     terminal_working_directories: HashMap<CardId, PathBuf>,
     terminal_find: HashMap<CardId, terminal_ui::Find>,
     terminal_review_card: Option<CardId>,
+    assistive_technology_active: bool,
     terminal_review_revision: u64,
     terminal_review_identity: Option<crate::model::TerminalId>,
     terminal_review_input: crate::terminal::ReviewInputBarrier,
     terminal_context: Option<terminal_ui::Context>,
     terminal_paste: Option<(CardId, String)>,
+    terminal_clipboard: Option<(CardId, crate::model::TerminalId, bool, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
     navigation_cache: sidebar::NavigationCache,
@@ -4995,6 +5053,8 @@ impl Cagents {
     }
 
     fn reconcile_terminal_review_owner(&mut self) {
+        if self.terminal_clipboard.as_ref().is_some_and(|(card, terminal, ..)| !matches!(self.cards.get(card), Some(CardRuntime::Terminal(handle)) if handle.terminal_id() == *terminal)) { self.terminal_clipboard = None; }
+
         if let Some(owner) = self.terminal_review_card {
             let current_identity = match self.cards.get(&owner) {
                 Some(CardRuntime::Terminal(handle)) => Some(handle.terminal_id()),
@@ -8530,6 +8590,12 @@ impl Cagents {
                 TerminalEvent::WorkingDirectoryChanged(path) => {
                     self.terminal_working_directories.insert(card, path);
                 }
+                TerminalEvent::ClipboardWrite { primary, text } => {
+                    clipboard_task = Task::batch([
+                        clipboard_task,
+                        self.handle_terminal_clipboard_write(card, primary, text),
+                    ]);
+                }
                 TerminalEvent::ClipboardText { request, text } => {
                     if let Some(find) = self.terminal_find.get_mut(&card)
                         && find.pending_copy == Some(request)
@@ -9103,6 +9169,9 @@ impl Cagents {
                 let find = self.terminal_find.get(&id).filter(|find| find.open);
                 let terminal = crate::file_drop::target(
                     TerminalWidget::new(handle.clone())
+                        .review_shortcuts(&self.settings.keyboard_shortcuts.terminal_review)
+                        .review_bar(self.assistive_technology_active, self.settings.always_show_terminal_review_bar)
+                        .scroll_to_bottom_on_input(self.settings.terminal_scroll_to_bottom_on_input)
                         .review_boundary(
                             self.terminal_review_input.clone(),
                             self.terminal_review_card.is_some(),
@@ -11247,6 +11316,7 @@ impl Cagents {
             || self.automation_ui.draft_dialog_open()
             || self.chat_ui.image_viewer.is_some()
             || self.terminal_paste.is_some()
+            || self.terminal_clipboard.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
@@ -12658,6 +12728,7 @@ impl Cagents {
             && !self.device_ui.open
             && self.chat_ui.image_viewer.is_none()
             && self.terminal_paste.is_none()
+            && self.terminal_clipboard.is_none()
             && !self.session_recovery.open()
             && !self.daemon_health_ui.confirmation
             && self.update_ui.confirmation.is_none()
@@ -12839,11 +12910,13 @@ impl Application for Cagents {
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
             terminal_review_card: None,
+            assistive_technology_active: false,
             terminal_review_revision: 0,
             terminal_review_identity: None,
             terminal_review_input: crate::terminal::ReviewInputBarrier::default(),
             terminal_context: None,
             terminal_paste: None,
+            terminal_clipboard: None,
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
             navigation_cache: sidebar::NavigationCache::default(),
@@ -14598,6 +14671,12 @@ impl Application for Cagents {
                 self.set_terminal_review_owner(None);
                 self.focus_workspace_card(id)
             }
+            Message::AssistiveTechnologyActive { window, active } => {
+                if self.core.main_window_id() == Some(window) {
+                    self.assistive_technology_active = active;
+                }
+                Task::none()
+            }
             Message::TerminalReviewMode {
                 card,
                 terminal,
@@ -15839,6 +15918,11 @@ impl Application for Cagents {
                     if let Some(action) = self.automation_ui.keep_draft_action() {
                         return self.update_automation_ui(action);
                     }
+                    if let Some((card, ..)) = &self.terminal_clipboard {
+                        return self.handle_terminal_find(terminal_ui::Action::ConfirmClipboard(
+                            *card, false,
+                        ));
+                    }
                     if let Some((card, _)) = &self.terminal_paste {
                         return self
                             .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
@@ -16552,6 +16636,12 @@ impl Application for Cagents {
                     event,
                     captured: matches!(status, event::Status::Captured),
                 }),
+                iced::Event::Window(window::Event::AccessibilityEnabled(active)) => {
+                    Some(Message::AssistiveTechnologyActive {
+                        window: event_window,
+                        active,
+                    })
+                }
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
@@ -16685,6 +16775,9 @@ impl Application for Cagents {
         }
         if let Some(gallery) = &self.chat_ui.image_viewer {
             return Some(gallery.view());
+        }
+        if let Some(dialog) = self.terminal_clipboard_dialog() {
+            return Some(dialog);
         }
         if let Some(dialog) = self.terminal_paste_dialog() {
             return Some(dialog);
@@ -17767,6 +17860,34 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_assistive_technology_signal_tracks_only_the_primary_window() {
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::unique();
+        let auxiliary = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        drop(app.update(Message::AssistiveTechnologyActive {
+            window: auxiliary,
+            active: true,
+        }));
+        assert!(!app.assistive_technology_active);
+        drop(app.update(Message::AssistiveTechnologyActive {
+            window: main,
+            active: true,
+        }));
+        assert!(app.assistive_technology_active);
+        drop(app.update(Message::AssistiveTechnologyActive {
+            window: auxiliary,
+            active: false,
+        }));
+        assert!(app.assistive_technology_active);
+        drop(app.update(Message::AssistiveTechnologyActive {
+            window: main,
+            active: false,
+        }));
+        assert!(!app.assistive_technology_active);
+    }
+
     #[test]
     fn completed_push_observation_warning_preserves_known_completion() {
         let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
@@ -25112,6 +25233,7 @@ mod tests {
             terminal_find: HashMap::new(),
             terminal_context: None,
             terminal_paste: None,
+            terminal_clipboard: None,
             cards: card_id
                 .map(|card_id| HashMap::from([(card_id, CardRuntime::Loading)]))
                 .unwrap_or_default(),
@@ -25175,6 +25297,7 @@ mod tests {
             browser_import: browser_import_ui::State::default(),
             terminal_teardowns: Vec::new(),
             terminal_review_card: None,
+            assistive_technology_active: false,
             terminal_review_revision: 0,
             terminal_review_identity: None,
             terminal_review_input: crate::terminal::ReviewInputBarrier::default(),
