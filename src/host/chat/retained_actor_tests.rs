@@ -1,5 +1,6 @@
 //! Real execed holder/provider and kernel daemon-lease qualification. This
 //! isolates HOME/runtime/data; native UI qualification separately kills cagentsd.
+use crate::daemon::owned_children::FixtureProcessPin;
 use super::*;
 use crate::{
     agent_execution::{
@@ -127,6 +128,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         owner: crate::daemon::holder_registry::Record,
         pair: Option<crate::daemon::holder_registry::Record>,
         proof: Arc<std::sync::Mutex<HostSessionProof>>,
+        pins: Vec<FixtureProcessPin>,
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -144,21 +146,14 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
                 return;
             }
             // Only this fixture's exact process incarnations; no name/group sweep.
-            for owner in std::iter::once(&self.owner).chain(self.pair.iter()) {
-                for process in [&owner.root, &owner.holder] {
-                    if process.is_current() {
-                        unsafe {
-                            libc::kill(process.pid, libc::SIGKILL);
-                        }
-                    }
-                }
-            }
+            for process in &self.pins {let _ = process.signal(libc::SIGKILL);}
         }
     }
     let mut cleanup = Cleanup {
         owner: identity.record.clone(),
         pair: None,
         proof: active_proof.clone(),
+        pins: vec![FixtureProcessPin::capture(&identity.record.root).unwrap(), FixtureProcessPin::capture(&identity.record.holder).unwrap()],
     };
     // A real holder-owned thin console shares this native actor's exact ID.
     // The raw terminal record will retain RelaunchAvailable on later adoption;
@@ -194,6 +189,8 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         .holder_identity()
         .expect("fixture requires actual terminal holder")
         .clone();
+    cleanup.pins.push(FixtureProcessPin::capture(&pair.root).unwrap());
+    cleanup.pins.push(FixtureProcessPin::capture(&pair.holder).unwrap());
     cleanup.pair = Some(pair.clone());
     let mut paired_source = handle
         .actor_identity()
@@ -556,6 +553,8 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
             crate::daemon::holder_registry::Kind::Native,
         ) {
             for record in records {
+                let pins = [&record.root, &record.holder].into_iter()
+                    .filter_map(|process| FixtureProcessPin::capture(process).ok()).collect::<Vec<_>>();
                 if let Ok(inspection) = Handle::inspect_remote(&record, proof.clone())
                     && let Ok(handle) =
                         Handle::adopt_remote(&record, inspection.source, proof.clone(), |_| {})
@@ -567,13 +566,7 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
                 // On a failing assertion there may be uncommitted outcomes;
                 // never misreport that as semantic retirement. Kill only the
                 // exact fixture-created process incarnations for test hygiene.
-                for process in [&record.root, &record.holder] {
-                    if process.is_current() {
-                        unsafe {
-                            libc::kill(process.pid, libc::SIGKILL);
-                        }
-                    }
-                }
+                for process in pins {let _ = process.signal(libc::SIGKILL);}
             }
         }
         return;
@@ -854,6 +847,14 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
         "actor never initialized",
     );
     let identity = handle.actor_identity().unwrap();
+    struct Cleanup(Vec<FixtureProcessPin>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for process in &self.0 {let _ = process.signal(libc::SIGKILL);}
+        }
+    }
+    let _cleanup = Cleanup(vec![FixtureProcessPin::capture(&identity.record.root).unwrap(),
+        FixtureProcessPin::capture(&identity.record.holder).unwrap()]);
     assert!(
         matches!(
             host.lock().unwrap().chats[&id].session.native_continuity,
@@ -874,19 +875,6 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
             host.lock().unwrap().chats[&id].session.clone()
         )
     );
-    struct Cleanup(crate::daemon::holder_registry::Record);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            for process in [&self.0.root, &self.0.holder] {
-                if process.is_current() {
-                    unsafe {
-                        libc::kill(process.pid, libc::SIGKILL);
-                    }
-                }
-            }
-        }
-    }
-    let _cleanup = Cleanup(identity.record.clone());
     let ServerResponse::ChatAttached {
         session: source, ..
     } = session_snapshot(&host.lock().unwrap().chats[&id])
