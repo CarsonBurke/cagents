@@ -1215,6 +1215,7 @@ dependencies = [
  "notify",
  "portable-pty",
  "postcard",
+ "pulldown-cmark",
  "raw-window-handle",
  "resvg",
  "roxmltree",

@@ -113,13 +113,13 @@ fn kind_glyph(content: &ItemContent) -> Icon {
 /// rather than floating above it. `copy` puts a copy control on that same
 /// header, which is where a reader looks for it and the only way to take a
 /// command's output without dragging a selection through a scrolling box.
-pub(super) fn code_surface<'a>(
-    text: &'a str,
-    caption: Option<&'a str>,
+pub(super) fn code_surface(
+    text: &str,
+    caption: Option<&str>,
     limit: Option<f32>,
     copy: Option<Action>,
     target: Target,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let body = widget::container(selectable_prose::plain(
         text,
         design::TEXT_BODY,
@@ -148,6 +148,18 @@ pub(super) fn code_frame<'a>(
     caption: Option<String>,
     copy: Option<Action>,
 ) -> Element<'a, Message> {
+    code_frame_label(
+        body,
+        caption.map(|caption| design::caption(caption).into()),
+        copy,
+    )
+}
+
+fn code_frame_label<'a>(
+    body: Element<'a, Message>,
+    caption: Option<Element<'a, Message>>,
+    copy: Option<Action>,
+) -> Element<'a, Message> {
     let Some(caption) = caption else {
         return widget::container(body)
             .class(design::surface(
@@ -167,7 +179,7 @@ pub(super) fn code_frame<'a>(
         .width(Length::Fill)
         .into();
     let block = widget::column::with_children(vec![
-        widget::container(design::caption(caption))
+        widget::container(caption)
             .padding(iced::Padding::ZERO.right(24))
             .width(Length::Fill)
             .height(24)
@@ -199,21 +211,49 @@ fn change_verb(kind: &ChangeKind) -> &'static str {
     }
 }
 
-fn change_view(change: &FileChange) -> Element<'_, Message> {
+fn change_view(
+    change: &FileChange,
+    target: Target,
+    item: &str,
+    index: usize,
+    paint: Option<Arc<find::Paint>>,
+) -> Element<'static, Message> {
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
             design::caption(change_verb(&change.kind)).into(),
-            design::body(change.path.as_str())
-                .font(iced::Font::MONOSPACE)
-                .width(Length::Fill)
-                .into(),
+            widget::container(find::text(
+                target,
+                item,
+                &[7, index as u32, 0],
+                change.path.clone(),
+                design::TEXT_BODY,
+                iced::Font::MONOSPACE,
+                paint.clone(),
+            ))
+            .width(Length::Fill)
+            .into(),
         ])
         .spacing(GAP_S)
         .align_y(Alignment::Center)
         .into(),
     ];
     if let ChangeKind::Renamed { from } = &change.kind {
-        rows.push(design::caption(format!("from {from}")).into());
+        rows.push(
+            widget::row::with_children(vec![
+                design::caption("from").into(),
+                find::text(
+                    target,
+                    item,
+                    &[7, index as u32, 1],
+                    from.clone(),
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    paint.clone(),
+                ),
+            ])
+            .spacing(GAP_XS)
+            .into(),
+        );
     }
     widget::column::with_children(rows)
         .spacing(GAP_XS)
@@ -221,7 +261,13 @@ fn change_view(change: &FileChange) -> Element<'_, Message> {
         .into()
 }
 
-fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Message> {
+fn search_result_view(
+    result: &SearchResult,
+    target: Target,
+    item: &str,
+    index: usize,
+    paint: Option<Arc<find::Paint>>,
+) -> Element<'static, Message> {
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
     let title = if result.title.is_empty() {
         result.url.as_str()
@@ -229,14 +275,17 @@ fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Mess
         result.title.as_str()
     };
     if result.url.is_empty() {
-        rows.push(selectable_prose::plain(
+        rows.push(find::text(
+            target,
+            item,
+            &[8, 1, index as u32, 0],
             title,
             design::TEXT_BODY,
             iced::Font::default(),
-            target,
+            paint.clone(),
         ));
     } else {
-        rows.push(selectable_prose::text(
+        rows.push(selectable_prose::logical_text(
             vec![
                 iced::widget::text::Span::new(title.to_owned())
                     .link(result.url.clone())
@@ -247,20 +296,41 @@ fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Mess
             iced::Font::default(),
             target,
             None,
+            selectable_prose::Logical {
+                identity: selection::logical_identity(
+                    item,
+                    &[
+                        8,
+                        1,
+                        index as u32,
+                        if result.title.is_empty() { 1 } else { 0 },
+                    ],
+                ),
+                start: 0,
+                paint: paint.clone(),
+            },
         ));
-        rows.push(selectable_prose::plain(
-            result.url.as_str(),
-            design::TEXT_CAPTION,
-            iced::Font::default(),
-            target,
-        ));
+        if !result.title.is_empty() {
+            rows.push(find::text(
+                target,
+                item,
+                &[8, 1, index as u32, 1],
+                result.url.as_str(),
+                design::TEXT_CAPTION,
+                iced::Font::default(),
+                paint.clone(),
+            ));
+        }
     }
     if !result.snippet.is_empty() {
-        rows.push(selectable_prose::plain(
+        rows.push(find::text(
+            target,
+            item,
+            &[8, 1, index as u32, 2],
             result.snippet.as_str(),
             design::TEXT_BODY,
             iced::Font::default(),
-            target,
+            paint.clone(),
         ));
     }
     widget::column::with_children(rows)
@@ -270,14 +340,14 @@ fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Mess
 }
 
 impl Runtime {
-    fn tool_code_surface<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    fn tool_code_surface(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         part: CopyPart,
-        caption: &'a str,
+        caption: &str,
         limit: Option<f32>,
-    ) -> Element<'a, Message> {
+    ) -> Element<'static, Message> {
         let block = match part {
             CopyPart::Input => cached.tool_input.as_ref(),
             CopyPart::Change(index) => cached.patches.get(index),
@@ -302,14 +372,44 @@ impl Runtime {
                     ..
                 }
             );
-        code_frame(
-            match limit {
-                Some(height) if !follows => {
-                    block.view_from_start(self.syntax_theme, height, target, self.find.as_deref())
-                }
-                limit => block.view(self.syntax_theme, limit, target, self.find.as_deref()),
-            },
-            Some(caption.to_owned()),
+        code_frame_label(
+            block.view_logical_with_reader(
+                self.syntax_theme,
+                limit.map(|height| (height, follows)),
+                target,
+                self.find.as_deref(),
+                selectable_prose::Logical {
+                    identity: selection::logical_identity(
+                        &item.id,
+                        &match part {
+                            CopyPart::Input => vec![4],
+                            CopyPart::Change(index) => vec![6, index as u32],
+                            _ => vec![5],
+                        },
+                    ),
+                    start: 0,
+                    paint: self.find_paint.clone(),
+                },
+                self.scroll_memory.clone(),
+                self.selected_subagent.clone(),
+            ),
+            Some(
+                if matches!(part, CopyPart::Input)
+                    && matches!(&item.content,ItemContent::Command {working_directory,..} if !working_directory.is_empty())
+                {
+                    find::text(
+                        target,
+                        &item.id,
+                        &[3, 1],
+                        caption,
+                        design::TEXT_CAPTION,
+                        iced::Font::default(),
+                        self.find_paint.clone(),
+                    )
+                } else {
+                    design::caption(caption.to_owned()).into()
+                },
+            ),
             Some(copy),
         )
     }
@@ -329,7 +429,7 @@ impl Runtime {
     pub(super) fn step_strip<'a>(
         &self,
         turn: &turn::Turn,
-        steps: impl FnOnce() -> Vec<Element<'a, Message>>,
+        steps: impl FnOnce() -> Vec<virtualized::Row<'a>>,
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
@@ -412,10 +512,7 @@ impl Runtime {
                         }
                     }))
                     .into(),
-                widget::column::with_children(rows)
-                    .spacing(GAP_XS)
-                    .width(Length::Fill)
-                    .into(),
+                virtualized::column(rows, Default::default()),
             ])
             .spacing(RAIL_INSET)
             .padding(iced::Padding::ZERO.left(THREAD_RAIL_OFFSET))
@@ -428,12 +525,12 @@ impl Runtime {
     }
 
     /// One step: a summary line that discloses its own detail.
-    pub(super) fn step_view<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    pub(super) fn step_view(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         settings: markdown::Settings,
-    ) -> Element<'a, Message> {
+    ) -> Element<'static, Message> {
         let open = self.expanded.contains(&item.id);
         let header = self.step_header(item, cached, open);
         if !open {
@@ -512,10 +609,29 @@ impl Runtime {
                 );
             }
         } else if matches!(item.content, ItemContent::Tool { .. }) {
-            preview.push(design::body(label.clone()).into());
+            preview.push(find::text(
+                target,
+                &item.id,
+                &[3, 0],
+                label.clone(),
+                design::TEXT_BODY,
+                iced::Font::default(),
+                self.find_paint.clone(),
+            ));
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }
+        } else if matches!(&item.content,ItemContent::Command {label,command,..} if !label.is_empty() && label != command)
+        {
+            preview.push(find::text(
+                target,
+                &item.id,
+                &[3, 0],
+                label.clone(),
+                design::TEXT_BODY,
+                iced::Font::MONOSPACE,
+                self.find_paint.clone(),
+            ));
         } else {
             preview.push(cached.preview.view());
         }
@@ -562,13 +678,13 @@ impl Runtime {
     /// steps that follow it.
     const OUTPUT_HEIGHT: f32 = 320.0;
 
-    pub(super) fn step_detail<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    pub(super) fn step_detail(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         settings: markdown::Settings,
-    ) -> Element<'a, Message> {
-        let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    ) -> Element<'static, Message> {
+        let mut rows: Vec<Element<'static, Message>> = Vec::new();
         // Messages a coordinating step collected read as messages, ahead of
         // the command and output they were printed in.
         if let Some(coordinated) = cached
@@ -636,7 +752,13 @@ impl Runtime {
                     rows.push(design::caption("No file changes were reported.").into());
                 }
                 for (index, change) in changes.iter().enumerate() {
-                    rows.push(change_view(change));
+                    rows.push(change_view(
+                        change,
+                        self.target,
+                        &item.id,
+                        index,
+                        self.find_paint.clone(),
+                    ));
                     if !change.diff.is_empty() {
                         rows.push(self.tool_code_surface(
                             item,
@@ -649,20 +771,27 @@ impl Runtime {
                 }
             }
             ItemContent::WebSearch { query, results } => {
-                rows.push(selectable_prose::plain(
+                rows.push(find::text(
+                    self.target,
+                    &item.id,
+                    &[8, 0],
                     query.as_str(),
                     design::TEXT_BODY,
                     iced::Font::default(),
-                    self.target,
+                    self.find_paint.clone(),
                 ));
                 if results.is_empty() {
                     rows.push(design::caption("No results were reported.").into());
                 }
-                rows.extend(
-                    results
-                        .iter()
-                        .map(|result| search_result_view(result, self.target)),
-                );
+                rows.extend(results.iter().enumerate().map(|(index, result)| {
+                    search_result_view(
+                        result,
+                        self.target,
+                        &item.id,
+                        index,
+                        self.find_paint.clone(),
+                    )
+                }));
             }
             ItemContent::Tool { input, output, .. } => {
                 if !input.is_empty() {
@@ -704,11 +833,14 @@ impl Runtime {
                     );
                 }
                 if !description.is_empty() {
-                    rows.push(selectable_prose::plain(
+                    rows.push(find::text(
+                        self.target,
+                        &item.id,
+                        &[9, 0],
                         description.as_str(),
                         design::TEXT_BODY,
                         iced::Font::default(),
-                        self.target,
+                        self.find_paint.clone(),
                     ));
                 }
                 if path.starts_with("http://") || path.starts_with("https://") {
@@ -718,11 +850,14 @@ impl Runtime {
                             .into(),
                     );
                 } else if !path.is_empty() && !path.starts_with("data:") {
-                    rows.push(selectable_prose::plain(
+                    rows.push(find::text(
+                        self.target,
+                        &item.id,
+                        &[9, 1],
                         path.as_str(),
                         design::TEXT_CAPTION,
                         iced::Font::default(),
-                        self.target,
+                        self.find_paint.clone(),
                     ));
                 }
             }

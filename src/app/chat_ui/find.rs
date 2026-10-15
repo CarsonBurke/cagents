@@ -5,6 +5,9 @@ use std::{
 };
 use unicode_casefold::UnicodeCaseFold;
 
+mod index;
+pub(super) use index::{Input, Match, Paint, Results, Worker};
+
 pub(super) const HIGHLIGHT_LIMIT: usize = 4096;
 pub(super) struct Highlights {
     pub(super) ranges: Vec<Range<usize>>,
@@ -111,15 +114,31 @@ impl Matcher {
     }
 }
 fn matched_ranges(text: &str, query: &str, limit: usize) -> Highlights {
+    matched_ranges_cancellable(text, query, limit, || true).unwrap()
+}
+
+fn matched_ranges_cancellable(
+    text: &str,
+    query: &str,
+    limit: usize,
+    mut current: impl FnMut() -> bool,
+) -> Option<Highlights> {
     if query.is_empty() {
-        return Highlights::empty();
+        return Some(Highlights::empty());
     }
     let needle: Vec<char> = query.case_fold().collect();
     if needle.is_empty() {
-        return Highlights::empty();
+        return Some(Highlights::empty());
     }
     let mut matcher = Matcher::new(needle, limit);
+    let mut next_cancel = 0;
     'source: for (offset, character) in text.char_indices() {
+        if offset >= next_cancel {
+            if !current() {
+                return None;
+            }
+            next_cancel = offset.saturating_add(4096);
+        }
         if character.is_ascii() {
             if matcher.push(
                 character.to_ascii_lowercase(),
@@ -148,7 +167,7 @@ fn matched_ranges(text: &str, query: &str, limit: usize) -> Highlights {
             }
         }
     }
-    matcher.result
+    current().then_some(matcher.result)
 }
 pub(super) fn contains(text: &str, query: &str) -> bool {
     matched_ranges(text, query, 0).truncated
@@ -371,4 +390,29 @@ mod tests {
         search.restore(&mut expanded, &mut unfolded, &mut opened);
         assert!(!expanded.contains("automatic"));
     }
+}
+
+/// A named rendered field uses the same logical coordinates as prose/code.
+/// Preview echoes are not a second search occurrence of their source field.
+pub(super) fn text(
+    target: super::Target,
+    item: &str,
+    path: &[u32],
+    text: impl Into<String>,
+    size: f32,
+    font: cosmic::iced::Font,
+    paint: Option<std::sync::Arc<Paint>>,
+) -> super::Element<'static, super::Message> {
+    super::selectable_prose::logical_text(
+        vec![cosmic::iced::widget::text::Span::new(text.into())].into(),
+        size.into(),
+        font,
+        target,
+        None,
+        super::selectable_prose::Logical {
+            identity: super::selection::logical_identity(item, path),
+            start: 0,
+            paint,
+        },
+    )
 }

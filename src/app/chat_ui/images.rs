@@ -664,20 +664,36 @@ impl Runtime {
             }
             _ => "Image".into(),
         };
+        let caption = |suffix: &str| -> Element<'static, Message> {
+            widget::row::with_children(vec![
+                find::text(
+                    self.target,
+                    &item.id,
+                    &[9, 0],
+                    label.clone(),
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.find_paint.clone(),
+                ),
+                design::caption(suffix.to_owned()).into(),
+            ])
+            .spacing(step::GAP_XS)
+            .into()
+        };
         let Some(handle) = &cached.image else {
             return if cached.image_unavailable {
-                design::caption(format!("{label} · Preview unavailable")).into()
+                caption("· Preview unavailable")
             } else if cached.image_wait.is_some() {
-                design::caption(format!("{label} · Waiting for preview memory…")).into()
+                caption("· Waiting for preview memory…")
             } else if cached.image_source.is_some()
                 && interest(self)
                     .iter()
                     .any(|candidate| candidate.id == item.id)
             {
-                design::caption(format!("{label} · Loading preview…")).into()
+                caption("· Loading preview…")
             } else {
                 widget::column::with_children(vec![
-                    design::caption(label).into(),
+                    caption(""),
                     crate::ui_controls::button::secondary("Load preview")
                         .on_press(action(Action::LoadImage(self.target, item.id.clone())))
                         .into(),
@@ -697,7 +713,7 @@ impl Runtime {
                 .on_press(action(Action::OpenImage(self.target, item.id.clone())))
                 .width(Length::Fill)
                 .into(),
-            design::caption(format!("{label} · Click to enlarge")).into(),
+            caption("· Click to enlarge"),
         ])
         .spacing(step::GAP_XS)
         .width(Length::Fill)

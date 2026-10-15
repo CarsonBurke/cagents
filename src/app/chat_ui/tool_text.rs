@@ -56,6 +56,10 @@ pub(super) struct Preview {
 }
 
 impl Preview {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.text.capacity() + self.tail.capacity() + self.block.retained_span_bytes()
+    }
+
     pub(super) fn update(
         previous: Option<Self>,
         content: &ItemContent,
@@ -165,6 +169,15 @@ impl Preview {
 }
 
 impl ToolText {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.text.len()
+            + self
+                .syntax
+                .borrow()
+                .as_ref()
+                .map_or(0, |(_, block)| block.retained_span_bytes())
+    }
+
     pub(super) fn update(previous: Option<Self>, text: &str, language: Language) -> Self {
         let language = if text.len() > CachedItem::HIGHLIGHT_LIMIT {
             Language::Plain
@@ -198,7 +211,14 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, limit.map(|height| (height, true)), target, find)
+        self.surface(
+            theme,
+            limit.map(|height| (height, true)),
+            target,
+            find,
+            None,
+            None,
+        )
     }
 
     /// Patches and read results open at their first line.
@@ -209,20 +229,57 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, Some((height, false)), target, find)
+        self.surface(theme, Some((height, false)), target, find, None, None)
+    }
+
+    pub(super) fn view_logical(
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        limit: Option<(f32, bool)>,
+        target: Target,
+        find: Option<&str>,
+        logical: selectable_prose::Logical,
+    ) -> Element<'static, Message> {
+        self.surface(theme, limit, target, find, Some(logical), None)
     }
 
     /// `limit` is the height the text scrolls within and whether it follows
     /// its end.
+    pub(super) fn view_logical_with_reader(
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        limit: Option<(f32, bool)>,
+        target: Target,
+        find: Option<&str>,
+        logical: selectable_prose::Logical,
+        memory: scroll::Memory,
+        context: Option<String>,
+    ) -> Element<'static, Message> {
+        let identity = logical.identity;
+        self.surface(
+            theme,
+            limit,
+            target,
+            find,
+            Some(logical),
+            Some((memory, context, identity)),
+        )
+    }
+
     fn surface(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
         limit: Option<(f32, bool)>,
         target: Target,
         find: Option<&str>,
+        logical: Option<selectable_prose::Logical>,
+        reader: Option<(scroll::Memory, Option<String>, u64)>,
     ) -> Element<'static, Message> {
+        let reader = Some(reader.unwrap_or_else(|| (scroll::Memory::default(), None, self.key)));
         let mut syntax = self.syntax.borrow_mut();
-        if syntax
+        if self.text.len() > CachedItem::HIGHLIGHT_LIMIT {
+            *syntax = None;
+        } else if syntax
             .as_ref()
             .is_none_or(|(previous, _)| *previous != theme)
         {
@@ -233,41 +290,65 @@ impl ToolText {
         }
         let spans = syntax
             .as_ref()
-            .unwrap()
-            .1
-            .spans(cosmic::theme::is_dark())
-            .clone();
-        let body: Element<'static, Message> = widget::container(selectable_prose::text(
-            spans,
-            design::TEXT_BODY.into(),
-            iced::Font::MONOSPACE,
-            target,
-            find,
+            .map(|(_, block)| block.spans(cosmic::theme::is_dark()).clone())
+            .unwrap_or_else(|| Arc::from([]));
+        let matching = logical.as_ref().is_some_and(|logical| {
+            logical
+                .paint
+                .as_ref()
+                .is_some_and(|paint| paint.blocks.contains_key(&logical.identity))
+        });
+        let logical_id = logical.as_ref().map(|logical| logical.identity);
+        let previous_width = reader.as_ref().map_or(0.0, |(memory, context, identity)|
+            memory.reader_width(context.as_deref(), scroll::reader_key(*identity, scroll::ReaderAxis::Horizontal)));
+        let body = widget::container(prose::code_text(
+            self.text.clone(), spans, design::TEXT_BODY.into(), iced::Font::MONOSPACE,
+            target, find, logical,
         ))
         .padding(design::with_vertical_rail(iced::Padding::from([
             step::GAP_S,
             step::GAP_M,
         ])))
-        .width(Length::Fill)
-        .into();
+        .width(Length::Shrink)
+        .min_width(previous_width);
+        let mut horizontal = widget::scrollable(body)
+            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .width(Length::Fill);
+        if let Some(identity) = logical_id {
+            let context = reader.as_ref().and_then(|(_, context, _)| context.as_deref());
+            horizontal = horizontal.id(scroll::block_id(target, context,
+                scroll::reader_key(identity, scroll::ReaderAxis::Horizontal)));
+        }
+        let body: Element<'static, Message> = match &reader {
+            Some((memory, context, identity)) => scroll::block(horizontal, memory.clone(), context.clone(),
+                scroll::reader_key(*identity, scroll::ReaderAxis::Horizontal), false),
+            None => horizontal.into(),
+        };
         // Find reveals the matching source in the outer transcript. A nested
         // viewport would otherwise keep a deep match hidden at its old offset.
-        let limit = limit.filter(|_| !find.is_some_and(|query| find::contains(&self.text, query)));
+        let limit = limit.filter(|_| !matching);
         let Some((height, follows)) = limit else {
             return body;
         };
-        let scrolled = widget::scrollable(body)
+        let mut scrolled = widget::scrollable(body)
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))
             .height(Length::Shrink);
-        if follows {
-            widget::container(scroll::tool_output(scrolled.anchor_bottom()))
-                .max_height(height)
-                .into()
-        } else {
-            widget::container(scrolled).max_height(height).into()
+        if let Some(identity) = logical_id {
+            let context = reader.as_ref().and_then(|(_, context, _)| context.as_deref());
+            scrolled = scrolled.id(scroll::block_id(target, context,
+                scroll::reader_key(identity, scroll::ReaderAxis::Vertical)));
         }
+        let scrolled: Element<'static, Message> = if follows {
+            scroll::tool_output(scrolled.anchor_bottom())
+        } else { scroll::viewport(scrolled) };
+        let scrolled = match reader {
+            Some((memory, context, identity)) => scroll::block(scrolled, memory, context,
+                scroll::reader_key(identity, scroll::ReaderAxis::Vertical), follows),
+            None => scrolled,
+        };
+        widget::container(scrolled).max_height(height).into()
     }
 }
 
@@ -355,6 +436,129 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn long_tool_lines_have_distinct_horizontal_viewports_and_accessible_tail_glyphs() {
+        use iced::advanced::{Layout, layout, widget::{Operation, Tree, operation}};
+        struct Move { horizontal: widget::Id, vertical: widget::Id, bottom: bool }
+        impl Operation for Move {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn scrollable(&mut self, id: Option<&widget::Id>, _: iced::Rectangle, _: iced::Rectangle,
+                _: iced::Vector, state: &mut dyn operation::Scrollable) {
+                if id == Some(&self.horizontal) {
+                    state.scroll_to(iced::widget::scrollable::AbsoluteOffset { x: Some(f32::MAX), y: None });
+                } else if id == Some(&self.vertical) {
+                    state.scroll_to(iced::widget::scrollable::AbsoluteOffset { x: None,
+                        y: Some(if self.bottom { 0.0 } else { f32::MAX }) });
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Tail { translation: iced::Vector, pending: Option<iced::Vector>, glyphs: Vec<iced::Rectangle>,
+            ids: HashSet<widget::Id>, duplicate: bool, horizontal_travel: f32 }
+        impl Operation for Tail {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                let before = self.translation;
+                if let Some(translation) = self.pending.take() { self.translation += translation; }
+                visit(self); self.translation = before;
+            }
+            fn scrollable(&mut self, id: Option<&widget::Id>, viewport: iced::Rectangle, content: iced::Rectangle,
+                translation: iced::Vector, _: &mut dyn operation::Scrollable) {
+                if let Some(id) = id { self.duplicate |= !self.ids.insert(id.clone()); }
+                self.horizontal_travel = self.horizontal_travel.max(content.width - viewport.width);
+                self.pending = Some(translation);
+            }
+            fn custom(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, state: &mut dyn std::any::Any) {
+                let Some(state) = state.downcast_ref::<selectable_prose::State>() else { return; };
+                let byte = 300 * "ordinary line\n".len() + 5999;
+                if let Some(mut glyph) = state.logical_byte_bounds(42, byte) {
+                    glyph.x += bounds.x - self.translation.x;
+                    glyph.y += bounds.y - self.translation.y;
+                    self.glyphs.push(glyph);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let source = format!("{}{}", "ordinary line\n".repeat(300), "x".repeat(6000));
+        let block = ToolText::update(None, &source, Language::Plain);
+        for limit in [None, Some((120.0, false)), Some((120.0, true))] {
+            let mut element = scroll::viewport(block.view_logical_with_reader(
+                crate::settings::EditorSyntaxTheme::Auto, limit, target, None,
+                selectable_prose::Logical { identity: 42, start: 0, paint: None }, scroll::Memory::default(), None));
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 20000.0));
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut Move {
+                horizontal: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Horizontal)),
+                vertical: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Vertical)),
+                bottom: limit.is_some_and(|(_, bottom)| bottom),
+            });
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut tail = Tail::default();
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut tail);
+            assert!(!tail.duplicate, "nested axes must have distinct IDs");
+            assert!(tail.horizontal_travel > 10000.0, "long line needs real native horizontal travel");
+            assert!(tail.glyphs.iter().any(|glyph| glyph.x >= -1.0 && glyph.x + glyph.width <= 401.0
+                && glyph.y >= -1.0 && glyph.y + glyph.height <= node.size().height + 1.0),
+                "tail glyph must be accessible on both axes inside {:?}: {:?}", node.size(), tail.glyphs);
+        }
+    }
+
+    #[test]
+    fn horizontal_bookmark_survives_wide_line_eviction_and_tree_remount() {
+        use iced::advanced::{Layout, layout, widget::{Operation, Tree, operation}};
+        struct Probe { horizontal: widget::Id, vertical: widget::Id, x: Option<f32>, y: Option<f32>,
+            observed: Option<(f32, f32)> }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn scrollable(&mut self, id: Option<&widget::Id>, _: iced::Rectangle, content: iced::Rectangle,
+                translation: iced::Vector, state: &mut dyn operation::Scrollable) {
+                if id == Some(&self.horizontal) {
+                    self.observed = Some((translation.x, content.width));
+                    if let Some(x) = self.x { state.scroll_to(iced::widget::scrollable::AbsoluteOffset { x: Some(x), y: None }); }
+                } else if id == Some(&self.vertical) && let Some(y) = self.y {
+                    state.scroll_to(iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(y) });
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let memory = scroll::Memory::default();
+        let block = ToolText::update(None, &format!("{}\n{}", "x".repeat(6000), "short line\n".repeat(1000)), Language::Plain);
+        let make = || block.view_logical_with_reader(crate::settings::EditorSyntaxTheme::Auto,
+            Some((120.0, false)), target, None, selectable_prose::Logical { identity: 42, start: 0, paint: None }, memory.clone(), None);
+        let probe = |x, y| Probe {
+            horizontal: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Horizontal)),
+            vertical: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Vertical)),
+            x, y, observed: None,
+        };
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 2000.0));
+        let mut element = make(); let mut tree = Tree::new(&element);
+        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(Some(10000.0), None));
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut read = probe(None, None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        let (x, width) = read.observed.unwrap();
+        assert!((x - 10000.0).abs() < 1.0 && width > 30000.0);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(None, Some(f32::MAX)));
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut read = probe(None, None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert_eq!(read.observed.unwrap(), (x, width), "short visible lines must not collapse measured horizontal travel");
+        drop(tree); drop(element);
+        let mut element = make(); let mut tree = Tree::new(&element);
+        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut read = probe(None, None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert_eq!(read.observed.unwrap(), (x, width), "cheap geometry restores x while the wide line is still evicted");
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(None, Some(0.0)));
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut read = probe(None, None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert!((read.observed.unwrap().0 - x).abs() < 1.0, "returning to the wide line keeps the horizontal bookmark");
+    }
+
     /// Output is opened at its last line and a patch at its first.
     #[test]
     fn output_opens_at_its_end_and_a_patch_at_its_start() {
@@ -370,12 +574,12 @@ mod tests {
             fn scrollable(
                 &mut self,
                 _: Option<&widget::Id>,
-                _: iced::Rectangle,
-                _: iced::Rectangle,
+                viewport: iced::Rectangle,
+                content: iced::Rectangle,
                 translation: iced::Vector,
                 _: &mut dyn operation::Scrollable,
             ) {
-                self.0.push(translation.y);
+                if content.height > viewport.height + 0.5 { self.0.push(translation.y); }
             }
         }
         let renderer = crate::app::tests::headless_renderer();

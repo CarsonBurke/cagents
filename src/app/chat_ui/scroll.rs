@@ -1,5 +1,10 @@
 //! Layout-time anchoring around iced's native scrollable. Its own state remains
 //! authoritative for wheel, thumb, keyboard and touch input.
+mod block;
+mod viewport;
+pub(super) use block::block;
+pub(super) use viewport::viewport;
+
 use super::view::Scroll;
 use super::*;
 use iced::advanced::{
@@ -18,6 +23,112 @@ pub(super) fn transcript<'a>(
     anchors: Vec<(usize, &'a str)>,
     follow_end: bool,
     items: Vec<(Id, &'a str)>,
+) -> Element<'a, Message> {
+    transcript_impl(
+        content.into(),
+        target,
+        subagent,
+        anchors,
+        follow_end,
+        items,
+        None,
+        Memory::default(),
+        false,
+    )
+}
+
+pub(super) type Observations = Rc<std::cell::RefCell<HashMap<Option<String>, Scroll>>>;
+
+/// Persist only reader geometry and stable row IDs across native tree eviction.
+/// No source text, widgets, fonts or shaped paragraphs are retained here.
+#[derive(Clone, Default)]
+pub(super) struct Memory(
+    Rc<std::cell::RefCell<Anchor>>,
+    Rc<std::cell::RefCell<block::Positions>>,
+);
+struct ReaderState {
+    memory: Memory,
+    restore: bool,
+}
+
+impl Memory {
+    pub fn clear(&self) {
+        *self.0.borrow_mut() = Anchor::default();
+        *self.1.borrow_mut() = block::Positions::default();
+    }
+    pub fn retain_children(&self, children: &[chat::Subagent]) {
+        let mut state = self.0.borrow_mut();
+        let active = state
+            .active
+            .and_then(|index| state.contexts.get(index))
+            .map(|context| context.subagent.clone());
+        state.contexts.retain(|context| {
+            context
+                .subagent
+                .as_ref()
+                .is_none_or(|id| children.iter().any(|child| &child.id == id))
+        });
+        state.active = active.and_then(|active| {
+            state
+                .contexts
+                .iter()
+                .position(|context| context.subagent == active)
+        });
+        self.1.borrow_mut().entries.retain(|(context, _), _| {
+            context
+                .as_ref()
+                .is_none_or(|id| children.iter().any(|child| &child.id == id))
+        });
+        if state.reported.as_ref().is_some_and(|report| {
+            report
+                .subagent
+                .as_ref()
+                .is_some_and(|id| !children.iter().any(|child| &child.id == id))
+        }) {
+            state.reported = None;
+        }
+    }
+    pub fn reader_width(&self, context: Option<&str>, identity: u64) -> f32 {
+        self.1.borrow().entries.get(&(context.map(str::to_owned), identity))
+            .map_or(0.0, |saved| saved.content_width).max(0.0)
+    }
+    pub fn retained_rows(&self) -> usize { self.0.borrow().contexts.iter().map(|context| context.rows.len()).sum() }
+}
+
+pub(super) fn transcript_observed<'a>(
+    content: impl Into<Element<'a, Message>>,
+    target: Target,
+    subagent: Option<&'a str>,
+    anchors: Vec<(usize, &'a str)>,
+    follow_end: bool,
+    items: Vec<(Id, &'a str)>,
+    observations: Observations,
+    memory: Memory,
+    find_open: bool,
+) -> Element<'a, Message> {
+    transcript_impl(
+        content.into(),
+        target,
+        subagent,
+        anchors,
+        follow_end,
+        items,
+        Some(observations),
+        memory,
+        find_open,
+    )
+}
+
+fn transcript_impl<'a>(
+    content: Element<'a, Message>,
+    target: Target,
+    subagent: Option<&'a str>,
+    anchors: Vec<(usize, &'a str)>,
+    follow_end: bool,
+    items: Vec<(Id, &'a str)>,
+    observations: Option<Observations>,
+    memory: Memory,
+    find_open: bool,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
@@ -39,6 +150,9 @@ pub(super) fn transcript<'a>(
         anchors,
         follow_end,
         items,
+        observations,
+        memory,
+        find_open,
     })
 }
 
@@ -53,6 +167,9 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         anchors: Vec::new(),
         follow_end: true,
         items: Vec::new(),
+        observations: None,
+        memory: Memory::default(),
+        find_open: false,
     })
 }
 
@@ -65,17 +182,285 @@ pub(super) fn item<'a>(id: &str, content: impl Into<Element<'a, Message>>) -> El
 pub(super) fn item_id(id: &str) -> Id {
     Id::new(format!("chat-scroll-item-{id}"))
 }
+#[derive(Clone, Copy, Hash)]
+pub(super) enum ReaderAxis { Horizontal, Vertical }
+pub(super) fn reader_key(logical: u64, axis: ReaderAxis) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut key = std::hash::DefaultHasher::new();
+    ("reader-axis", logical, axis).hash(&mut key);
+    key.finish()
+}
+pub(super) fn block_id(target: Target, context: Option<&str>, logical: u64) -> Id {
+    use std::hash::{Hash, Hasher};
+    let mut key = std::hash::DefaultHasher::new();
+    (target.generation, context, logical).hash(&mut key);
+    card_control_id(
+        target.card,
+        &format!("chat-block-scroll-{:016x}", key.finish()),
+    )
+}
+
 pub(super) fn steps_id(id: &str) -> Id {
     Id::new(format!("chat-scroll-steps-{id}"))
+}
+
+/// One explicit Find navigation measurement. The caller accepts it only for
+/// its current query/document/navigation generations, applies `offset`, waits
+/// for the resulting layout, and retries until `exact` or its bounded limit.
+/// Wheel/drag navigation must cancel that pending correction in the caller.
+#[derive(Clone, Debug)]
+pub(super) struct LogicalLocation {
+    pub offset: f32,
+    pub exact: bool,
+    pub stage: u8,
+    pub horizontal: Vec<HorizontalLocation>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct HorizontalLocation {
+    id: Id,
+    offset: f32,
+}
+
+struct LogicalScope(bool);
+
+struct LocateLogical {
+    scroll: Id,
+    item: Id,
+    identity: u64,
+    byte: usize,
+    content: Option<Rectangle>,
+    viewport: Option<Rectangle>,
+    found: Option<(Rectangle, u8, Vec<HorizontalLocation>)>,
+    horizontal: Vec<(Id, Rectangle, Rectangle)>,
+    pending_horizontal: Option<(Id, Rectangle, Rectangle)>,
+    active: bool,
+    scopes: Vec<bool>,
+}
+impl LocateLogical {
+    fn candidate(&mut self, bounds: Rectangle, stage: u8) {
+        if self
+            .found
+            .as_ref()
+            .is_none_or(|(_, previous, _)| stage >= *previous)
+        {
+            // Inner corrections change the glyph's position in each outer
+            // content space. Center from the innermost viewport outward.
+            let mut projected = bounds;
+            let horizontal = if stage >= 2 {
+                self.horizontal.iter().rev().map(|(id, viewport, content)| {
+                    let offset = (projected.x - content.x - (viewport.width - projected.width) / 2.0)
+                        .clamp(0.0, (content.width - viewport.width).max(0.0));
+                    projected.x -= offset;
+                    HorizontalLocation { id: id.clone(), offset }
+                }).collect()
+            } else { vec![] };
+            self.found = Some((bounds, stage, horizontal));
+        }
+    }
+}
+impl Operation<Option<LogicalLocation>> for LocateLogical {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<LogicalLocation>>)) {
+        let previous = self.horizontal.len();
+        if let Some(viewport) = self.pending_horizontal.take() { self.horizontal.push(viewport); }
+        visit(self);
+        self.horizontal.truncate(previous);
+    }
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        viewport: Rectangle,
+        content: Rectangle,
+        _: Vector,
+        _: &mut dyn operation::Scrollable,
+    ) {
+        if !self.active { return; }
+        if id == Some(&self.scroll) {
+            self.content = Some(content);
+            self.viewport = Some(viewport);
+        } else if content.width > viewport.width + 1.0 {
+            if let Some(id) = id {
+                self.pending_horizontal = Some((id.clone(), viewport, content));
+            }
+        }
+    }
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        if self.active && id == Some(&self.item) {
+            self.candidate(bounds, 0);
+        }
+    }
+    fn custom(&mut self, id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(scope) = state.downcast_ref::<LogicalScope>() {
+            if scope.0 {
+                self.scopes.push(self.active);
+                self.active = id == Some(&self.scroll);
+            } else {
+                self.active = self.scopes.pop().unwrap_or(false);
+            }
+            return;
+        }
+        if !self.active { return; }
+        if let Some((bounds, stage)) =
+            virtualized::logical_bounds(state, bounds, self.identity, self.byte)
+        {
+            self.candidate(bounds, stage);
+        }
+        if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+            && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+        {
+            self.candidate(
+                Rectangle {
+                    x: bounds.x + local.x,
+                    y: bounds.y + local.y,
+                    ..local
+                },
+                3,
+            );
+        }
+    }
+    fn finish(&self) -> operation::Outcome<Option<LogicalLocation>> {
+        operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found.as_ref()).map(
+            |((content, viewport), (found, stage, horizontal))| {
+                let travel = (content.height - viewport.height).max(0.0);
+                let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0).clamp(0.0, travel);
+                LogicalLocation { offset: travel - from_top, exact: *stage == 3, stage: *stage, horizontal: horizontal.clone() }
+            },
+        ))
+    }
+}
+
+pub(super) fn locate_logical(
+    target: Target,
+    item: String,
+    identity: u64,
+    byte: usize,
+) -> iced::Task<Option<LogicalLocation>> {
+    iced::advanced::widget::operate(LocateLogical {
+        scroll: card_control_id(target.card, "chat-transcript"),
+        item: item_id(&item),
+        identity,
+        byte,
+        content: None,
+        viewport: None,
+        found: None,
+        horizontal: Vec::new(),
+        pending_horizontal: None,
+        active: false,
+        scopes: Vec::new(),
+    })
+}
+
+/// Reveal a far-right code glyph without moving its vertical code/transcript offset.
+pub(super) fn find_scroll_horizontal<T: Send + 'static>(
+    location: HorizontalLocation,
+) -> iced::Task<T> {
+    iced::advanced::widget::operate(operation::scrollable::scroll_to(
+        location.id,
+        operation::scrollable::AbsoluteOffset {
+            x: Some(location.offset),
+            y: None,
+        },
+    ))
+}
+
+struct FindScrollMarker(bool);
+
+/// Find corrections position an existing result; they must not become user
+/// edge navigation that asks the provider to replace the history window.
+pub(super) fn find_scroll_to<T: Send + 'static>(target: Target, offset: f32) -> iced::Task<T> {
+    struct Scroll {
+        id: Id,
+        offset: f32,
+    }
+    impl<T: 'static> Operation<T> for Scroll {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn custom(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if id == Some(&self.id)
+                && let Some(marker) = state.downcast_mut::<FindScrollMarker>()
+            {
+                marker.0 = true;
+            }
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            _: Rectangle,
+            _: Rectangle,
+            _: Vector,
+            state: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.id) {
+                state.scroll_to(operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(self.offset),
+                });
+            }
+        }
+    }
+    iced::advanced::widget::operate(Scroll {
+        id: card_control_id(target.card, "chat-transcript"),
+        offset,
+    })
+}
+
+/// Restore a source offset after the Find bar and temporary disclosures
+/// change the viewport height. Native chat offsets are bottom anchored.
+pub(super) fn restore_top<T: Send + 'static>(target: Target, top: f32) -> iced::Task<T> {
+    struct Restore {
+        scroll: Id,
+        top: f32,
+    }
+    impl<T: 'static> Operation<T> for Restore {
+        fn custom(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if id == Some(&self.scroll)
+                && let Some(marker) = state.downcast_mut::<FindScrollMarker>()
+            {
+                marker.0 = true;
+            }
+        }
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            viewport: Rectangle,
+            content: Rectangle,
+            _: Vector,
+            state: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.scroll) {
+                state.scroll_to(operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(((content.height - viewport.height).max(0.0) - self.top).max(0.0)),
+                });
+            }
+        }
+    }
+    iced::advanced::widget::operate(Restore {
+        scroll: card_control_id(target.card, "chat-transcript"),
+        top,
+    })
 }
 
 struct ItemBounds<'a> {
     ids: std::collections::HashMap<Id, Vec<&'a str>>,
     rows: std::collections::HashMap<&'a str, Rectangle>,
+    wanted: HashSet<u64>,
+    virtual_rows: Vec<(String, Rectangle)>,
 }
 impl Operation for ItemBounds<'_> {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         visit(self);
+    }
+    fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        self.virtual_rows.extend(
+            virtualized::anchor_points(state, bounds, &self.wanted)
+                .into_iter()
+                .map(|(key, bounds)| (format!("virtual-chunk-{key:016x}"), bounds)),
+        );
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
         if let Some(id) = id.and_then(|id| self.ids.get(id)) {
@@ -87,6 +472,7 @@ impl Operation for ItemBounds<'_> {
 }
 
 struct Anchored<'a> {
+    find_open: bool,
     captured: Option<Rc<Cell<bool>>>,
     target: Option<Target>,
     content: Element<'a, Message>,
@@ -94,6 +480,8 @@ struct Anchored<'a> {
     anchors: Vec<(usize, &'a str)>,
     follow_end: bool,
     items: Vec<(Id, &'a str)>,
+    observations: Option<Observations>,
+    memory: Memory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -151,6 +539,11 @@ impl Context {
         {
             return next.travel();
         }
+        // A recreated widget can restore authoritative native geometry from
+        // the Runtime before it has any measured row anchors.
+        if self.rows.is_empty() {
+            return top.clamp(0.0, next.travel());
+        }
         // Most relayouts only refresh a timer or hover state. Avoid building
         // a lookup table when every measured row is unchanged.
         if self.rows.len() == rows.len()
@@ -165,12 +558,21 @@ impl Context {
         let next_rows: std::collections::HashMap<_, _> = rows.iter().copied().collect();
         // Preserve the first visible surviving exchange, not the transcript's
         // total height: a page may arrive while the live answer also grows.
-        let visible = self.rows.iter().filter(|row| {
-            row.bounds.y + row.bounds.height > top && row.bounds.y < top + previous.viewport.height
-        });
-        let overlap = visible
+        let visible = || {
+            self.rows.iter().filter(|row| {
+                row.bounds.y + row.bounds.height > top
+                    && row.bounds.y < top + previous.viewport.height
+            })
+        };
+        let overlap = visible()
+            .filter(|row| row.id.starts_with("virtual-chunk-"))
             .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
             .next()
+            .or_else(|| {
+                visible()
+                    .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
+                    .next()
+            })
             .or_else(|| {
                 // Front eviction can remove every visible exchange. Keep the
                 // nearest surviving boundary instead of jumping to live output.
@@ -231,6 +633,7 @@ struct Anchor {
     reported: Option<Report>,
     pending_input: bool,
     modifiers: iced::keyboard::Modifiers,
+    seed: Option<Scroll>,
 }
 
 impl Anchor {
@@ -299,7 +702,18 @@ impl Anchor {
                 }
             });
         self.clock += 1;
+        let seed = self.seed.take();
         let context = &mut self.contexts[index];
+        if context.geometry.is_none()
+            && let Some(seed) = seed
+        {
+            context.geometry = Some(Geometry {
+                viewport: Size::new(next.viewport.width, seed.window_height()),
+                content: Size::new(next.content.width, seed.content()),
+            });
+            context.top = Some(seed.from_top());
+            context.follow_end = seed.at_bottom() && follow_end;
+        }
         let switched = previous_active != Some(index) || context.geometry.is_none();
         let old_bottom = context
             .geometry
@@ -506,11 +920,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
     }
 
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<Anchor>()
+        tree::Tag::of::<ReaderState>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(Anchor::default())
+        tree::State::new(ReaderState {
+            memory: self.memory.clone(),
+            restore: true,
+        })
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -535,10 +952,27 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let anchor = tree.state.downcast_mut::<Anchor>();
+        let state = tree.state.downcast_mut::<ReaderState>();
+        let mut restore = std::mem::take(&mut state.restore);
+        let mut anchor = state.memory.0.borrow_mut();
+        if restore {
+            anchor.pending_input = false;
+        }
+        if !anchor
+            .contexts
+            .iter()
+            .any(|context| context.subagent.as_deref() == self.subagent)
+        {
+            anchor.seed = self.observations.as_ref().and_then(|observations| {
+                observations
+                    .borrow()
+                    .get(&self.subagent.map(str::to_owned))
+                    .copied()
+            });
+        }
         let child = &mut tree.children[0];
         let mut top = ReadTop::default();
-        if let Some(previous) = anchor.geometry() {
+        if let Some(previous) = anchor.geometry().filter(|_| !restore) {
             self.content.as_widget_mut().operate(
                 child,
                 Layout::new(&previous.node()),
@@ -546,29 +980,41 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut top,
             );
         }
-        let node = self.content.as_widget_mut().layout(child, renderer, limits);
-        let next = Geometry {
-            viewport: node.size(),
-            content: node.children()[0].size(),
-        };
-        let mut rows: Vec<_> = self
-            .anchors
-            .iter()
-            .filter_map(|(index, id)| {
-                node.children()[0]
-                    .children()
-                    .get(*index)
-                    .map(|child| (*id, child.bounds()))
-            })
-            .collect();
-        if !self.items.is_empty() {
+        let mut node = self.content.as_widget_mut().layout(child, renderer, limits);
+        for _ in 0..4 {
+            let next = Geometry {
+                viewport: node.size(),
+                content: node.children()[0].size(),
+            };
+            let mut rows: Vec<_> = self
+                .anchors
+                .iter()
+                .filter_map(|(index, id)| {
+                    node.children()[0]
+                        .children()
+                        .get(*index)
+                        .map(|child| (*id, child.bounds()))
+                })
+                .collect();
             let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
             for (id, item) in &self.items {
                 ids.entry(id.clone()).or_default().push(item);
             }
+            let wanted = anchor
+                .active
+                .into_iter()
+                .flat_map(|index| anchor.contexts[index].rows.iter())
+                .filter_map(|row| {
+                    row.id
+                        .strip_prefix("virtual-chunk-")
+                        .and_then(|key| u64::from_str_radix(key, 16).ok())
+                })
+                .collect();
             let mut measured = ItemBounds {
                 ids,
                 rows: Default::default(),
+                wanted,
+                virtual_rows: vec![],
             };
             self.content.as_widget_mut().operate(
                 child,
@@ -576,19 +1022,46 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut measured,
             );
-            // Item bounds take precedence over coarser direct-child anchors.
             rows.extend(measured.rows);
+            rows.extend(
+                measured
+                    .virtual_rows
+                    .iter()
+                    .map(|(key, bounds)| (key.as_str(), *bounds)),
+            );
             rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
-        }
-        if let Some(offset) =
-            anchor.layout_following(self.subagent, &rows, next, top.0, self.follow_end)
-        {
+            let offset = anchor
+                .layout_following(self.subagent, &rows, next, top.0, self.follow_end)
+                .or_else(|| {
+                    restore.then(|| {
+                        next.travel()
+                            - anchor
+                                .active
+                                .and_then(|index| anchor.contexts[index].top)
+                                .unwrap_or_default()
+                    })
+                });
+            if let Some(offset) = offset {
+                self.content.as_widget_mut().operate(
+                    child,
+                    Layout::new(&node),
+                    renderer,
+                    &mut SetBottom(offset),
+                );
+                top.0 = Some((next.travel() - offset).max(0.0));
+            }
+            restore = false;
+            let mut virtual_viewport = virtualized::UpdateViewport::default();
             self.content.as_widget_mut().operate(
                 child,
                 Layout::new(&node),
                 renderer,
-                &mut SetBottom(offset),
+                &mut virtual_viewport,
             );
+            if !virtual_viewport.changed {
+                break;
+            }
+            node = self.content.as_widget_mut().layout(child, renderer, limits);
         }
         node
     }
@@ -600,6 +1073,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         renderer: &cosmic::Renderer,
         operation: &mut dyn Operation,
     ) {
+        let mut find_scroll = FindScrollMarker(false);
+        if let Some(target) = self.target {
+            operation.custom(
+                Some(&card_control_id(target.card, "chat-transcript")),
+                layout.bounds(),
+                &mut find_scroll,
+            );
+        }
         let mut before = ReadTop::default();
         if self.target.is_some() {
             self.content.as_widget_mut().operate(
@@ -609,9 +1090,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut before,
             );
         }
+        if let Some(target) = self.target {
+            operation.custom(Some(&card_control_id(target.card, "chat-transcript")), layout.bounds(), &mut LogicalScope(true));
+        }
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
+        if let Some(target) = self.target {
+            operation.custom(Some(&card_control_id(target.card, "chat-transcript")), layout.bounds(), &mut LogicalScope(false));
+        }
         if self.target.is_some() {
             let mut after = ReadTop::default();
             self.content.as_widget_mut().operate(
@@ -620,15 +1107,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut after,
             );
-            let anchor = tree.state.downcast_mut::<Anchor>();
+            let mut anchor = tree
+                .state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow_mut();
             if let Some((top, geometry)) = after.0.zip(anchor.geometry()) {
-                anchor.pending_input |= navigation_input(
-                    before.0,
-                    top,
-                    Scroll::new(top, geometry.content.height, geometry.viewport.height),
-                    None,
-                    false,
-                );
+                anchor.pending_input |= !find_scroll.0
+                    && navigation_input(
+                        before.0,
+                        top,
+                        Scroll::new(top, geometry.content.height, geometry.viewport.height),
+                        None,
+                        false,
+                    );
             }
         }
     }
@@ -666,6 +1159,16 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             shell,
             viewport,
         );
+        let mut virtual_viewport = virtualized::UpdateViewport::default();
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            &mut virtual_viewport,
+        );
+        if virtual_viewport.changed {
+            shell.invalidate_layout();
+        }
         if self.target.is_none() {
             return;
         }
@@ -683,7 +1186,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .bounds()
                     .size(),
             };
-            let anchor = tree.state.downcast_mut::<Anchor>();
+            let mut anchor = tree
+                .state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow_mut();
             let changed = anchor.reported.as_ref().is_none_or(|previous| {
                 previous.subagent.as_deref() != self.subagent
                     || previous.top != top
@@ -716,8 +1224,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .captured
                 .as_ref()
                 .is_some_and(|captured| captured.get());
-            let user_input = navigation_input(before.0, top, scroll, wheel, child_captured)
-                || anchor.pending_input;
+            let gesture = navigation_input(before.0, top, scroll, wheel, child_captured);
+            if self.find_open
+                && gesture
+                && let Some(target) = self.target
+            {
+                shell.publish(action(Action::FindNavigationInput(target)));
+            }
+            let user_input = gesture || anchor.pending_input;
             if changed || user_input {
                 anchor.pending_input = false;
                 anchor.reported = Some(Report {
@@ -725,7 +1239,18 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     top,
                     geometry,
                 });
-                if let Some(target) = self.target {
+                if let Some(observations) = &self.observations {
+                    observations
+                        .borrow_mut()
+                        .insert(self.subagent.map(str::to_owned), scroll);
+                }
+                // Native geometry is shared directly with the Runtime. Only
+                // navigation needs a model message; a streamed height change
+                // must not cause another complete update/view/layout cycle.
+                if let Some(target) = self
+                    .target
+                    .filter(|_| self.observations.is_none() || user_input)
+                {
                     shell.publish(action(Action::Scrolled(
                         target,
                         self.subagent.map(str::to_owned),
@@ -853,6 +1378,784 @@ mod tests {
             Some(0.0)
         );
         anchor
+    }
+
+    #[test]
+    fn dropping_and_recreating_native_trees_preserves_only_the_reader_anchor_memory() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let memory = Memory::default();
+        let observations = Observations::default();
+        let make = || {
+            transcript_observed(
+                widget::column::with_children(
+                    ["first", "middle", "last"]
+                        .into_iter()
+                        .map(|id| item(id, widget::Space::new().height(500).width(Length::Fill)))
+                        .collect::<Vec<_>>(),
+                ),
+                target,
+                None,
+                vec![],
+                true,
+                ["first", "middle", "last"]
+                    .into_iter()
+                    .map(|id| (item_id(id), id))
+                    .collect(),
+                observations.clone(),
+                memory.clone(),
+                false,
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        {
+            let mut element = make();
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(500.0),
+            );
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+        }
+        assert!(
+            memory.retained_rows() > 0,
+            "only stable row IDs and geometry survive tree drop"
+        );
+        let mut recreated = make();
+        let mut tree = Tree::new(&recreated);
+        let node = recreated
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut actual = ReadTop::default();
+        recreated
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(
+            actual.0,
+            Some(600.0),
+            "revealing a hidden transcript does not jump to its end"
+        );
+    }
+
+    #[test]
+    fn find_scroll_corrections_do_not_arm_provider_history_navigation() {
+        use iced::futures::StreamExt;
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let mut element = transcript(
+            widget::Space::new().height(1600).width(Length::Fill),
+            target,
+            None,
+            vec![],
+            true,
+            vec![],
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0)),
+        );
+        let mut actions =
+            iced::runtime::task::into_stream(find_scroll_to::<()>(target, 1200.0)).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        while let Some(action) = executor.block_on(actions.next()) {
+            if let iced::runtime::Action::Widget(mut operation) = action {
+                loop {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation,
+                    );
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        assert!(
+            !tree
+                .state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow()
+                .pending_input,
+            "centering a search result must not request another history page"
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(0.0),
+        );
+        assert!(
+            tree.state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow()
+                .pending_input,
+            "ordinary keyboard/edge operations retain their paging intent"
+        );
+    }
+
+    #[test]
+    fn logical_find_uses_horizontal_ancestors_without_moving_overlapping_siblings() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let identity = 0x7618;
+        let earlier = Id::new("earlier-overlapping-content");
+        let outer = Id::new("actual-outer-viewport");
+        let inner = Id::new("actual-inner-viewport");
+        for nested in [false, true] {
+            let prose = selectable_prose::logical_text(
+                vec![iced::widget::text::Span::new("matching prose".to_owned())].into(),
+                design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
+                selectable_prose::Logical { identity, start: 0, paint: None });
+            let matched: Element<'static, Message> = if nested {
+                widget::scrollable(widget::container(widget::scrollable(widget::container(prose).width(4000))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+                    .width(600).id(inner.clone())).width(6000))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+                    .id(outer.clone()).into()
+            } else { prose };
+            let sibling = widget::scrollable(widget::Space::new().width(30000).height(10000))
+                .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+                .height(80).id(earlier.clone());
+            let mut element = transcript(widget::column::with_children(vec![sibling.into(), item("answer", matched),
+                widget::Space::new().height(1000).into()]), target, None, vec![], false, vec![]);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0)));
+            let result = Arc::new(std::sync::Mutex::new(None)); let sink = result.clone();
+            let mut locate = operation::map(LocateLogical {
+                scroll: card_control_id(target.card, "chat-transcript"), item: item_id("answer"), identity, byte: 0,
+                content: None, viewport: None, found: None, horizontal: vec![], pending_horizontal: None,
+                active: false, scopes: vec![],
+            }, move |location| { *sink.lock().unwrap() = location; });
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
+            let _ = locate.finish();
+            let location = result.lock().unwrap().take().expect("target glyph is mounted");
+            assert!(location.exact);
+            assert_eq!(location.horizontal.into_iter().map(|viewport| viewport.id).collect::<Vec<_>>(), if nested { vec![inner.clone(), outer.clone()] } else { vec![] },
+                "only the nearest native ancestor belongs to this match; overlapping sibling content is unrelated");
+        }
+    }
+
+    #[test]
+    fn logical_find_reveals_a_glyph_through_every_nested_horizontal_viewport() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let identity = 0x9927;
+        let outer = Id::new("nested-outer"); let inner = Id::new("nested-inner");
+        let text = selectable_prose::logical_text(
+            vec![iced::widget::text::Span::new(format!("{}needle", "w".repeat(3000)))].into(),
+            design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
+            selectable_prose::Logical { identity, start: 0, paint: None });
+        let nested = widget::scrollable(widget::container(text).width(40000))
+            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .width(600).id(inner.clone());
+        let outer_scroll = widget::scrollable(widget::row::with_children(vec![
+            widget::Space::new().width(2000).into(), nested.into(), widget::Space::new().width(3000).into(),
+        ])).direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .width(Length::Fill).id(outer.clone());
+        let mut element = transcript(widget::column::with_children(vec![item("nested", outer_scroll),
+            widget::Space::new().height(1000).into()]), target, None, vec![], false, vec![]);
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let result = Arc::new(std::sync::Mutex::new(None)); let sink = result.clone();
+        let mut locate = operation::map(LocateLogical {
+            scroll: card_control_id(target.card, "chat-transcript"), item: item_id("nested"), identity, byte: 3000,
+            content: None, viewport: None, found: None, horizontal: vec![], pending_horizontal: None,
+            active: false, scopes: vec![],
+        }, move |location| { *sink.lock().unwrap() = location; });
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
+        let _ = locate.finish();
+        let location = result.lock().unwrap().take().unwrap();
+        assert!(location.exact);
+        assert_eq!(location.horizontal.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>(), vec![inner.clone(), outer.clone()]);
+        assert!(location.horizontal.iter().all(|entry| entry.offset > 1000.0), "both nested viewports need correction");
+        for entry in location.horizontal {
+            let mut correction = operation::scrollable::scroll_to::<()>(entry.id,
+                operation::scrollable::AbsoluteOffset { x: Some(entry.offset), y: None });
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut correction);
+        }
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        struct Screen {
+            translation: Vector, pending: Option<Vector>,
+            viewports: HashMap<Id, Rectangle>, glyph: Option<Rectangle>, identity: u64,
+        }
+        impl Operation for Screen {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                let previous = self.translation;
+                if let Some(offset) = self.pending.take() { self.translation += offset; }
+                visit(self); self.translation = previous;
+            }
+            fn scrollable(&mut self, id: Option<&Id>, viewport: Rectangle, _: Rectangle, translation: Vector, _: &mut dyn operation::Scrollable) {
+                if let Some(id) = id { self.viewports.insert(id.clone(), Rectangle::new(viewport.position() - self.translation, viewport.size())); }
+                self.pending = Some(translation);
+            }
+            fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                    && let Some(local) = prose.logical_byte_bounds(self.identity, 3000) {
+                    self.glyph = Some(Rectangle::new(bounds.position() + Vector::new(local.x, local.y) - self.translation, local.size()));
+                }
+            }
+        }
+        let mut screen = Screen { translation: Vector::ZERO, pending: None, viewports: HashMap::new(), glyph: None, identity };
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut screen);
+        let glyph = screen.glyph.unwrap();
+        for id in [outer, inner] {
+            let viewport = screen.viewports[&id];
+            assert!(glyph.x >= viewport.x && glyph.x + glyph.width <= viewport.x + viewport.width
+                && glyph.y >= viewport.y && glyph.y + glyph.height <= viewport.y + viewport.height,
+                "actual glyph must be visible through every native ancestor: {id:?}, {glyph:?}, {viewport:?}");
+        }
+    }
+
+    #[test]
+    fn logical_find_geometry_is_scoped_to_its_transcript_when_source_ids_repeat() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let other = Target { card: CardId::new(), generation: 0 };
+        let identity = 0x5517;
+        let make = |target, prefix: f32| transcript(widget::column::with_children(vec![
+            widget::Space::new().height(prefix).into(),
+            item("shared-source", selectable_prose::logical_text(
+                vec![iced::widget::text::Span::new("same imported source".to_owned())].into(),
+                design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
+                selectable_prose::Logical { identity, start: 0, paint: None })),
+            widget::Space::new().height(2000).into(),
+        ]), target, None, vec![], false, vec![]);
+        let mut first = make(target, 0.0);
+        let mut decoy = make(other, 1500.0);
+        let mut first_tree = Tree::new(&first);
+        let mut other_tree = Tree::new(&decoy);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+        let first_node = first.as_widget_mut().layout(&mut first_tree, &renderer, &limits);
+        let other_node = decoy.as_widget_mut().layout(&mut other_tree, &renderer, &limits);
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let sink = result.clone();
+        let mut locate = operation::map(LocateLogical {
+            scroll: card_control_id(target.card, "chat-transcript"), item: item_id("shared-source"),
+            identity, byte: 0, content: None, viewport: None, found: None,
+            horizontal: vec![], pending_horizontal: None, active: false, scopes: vec![],
+        }, move |location| { *sink.lock().unwrap() = location; });
+        first.as_widget_mut().operate(&mut first_tree, Layout::new(&first_node), &renderer, &mut locate);
+        let _ = locate.finish();
+        let expected = result.lock().unwrap().take().expect("target transcript has an exact glyph");
+        assert!(expected.exact);
+        decoy.as_widget_mut().operate(&mut other_tree, Layout::new(&other_node), &renderer, &mut locate);
+        let _ = locate.finish();
+        let after = result.lock().unwrap().take().unwrap();
+        assert_eq!(after.offset, expected.offset,
+            "another pane displaying identical source IDs cannot replace the target glyph geometry");
+    }
+
+    #[test]
+    fn logical_find_reveals_a_far_right_code_glyph_without_changing_vertical_scroll() {
+        let renderer = crate::app::tests::headless_renderer();
+        for byte in [400, 4000] {
+            let target = Target {
+                card: CardId::new(),
+                generation: 0,
+            };
+            let identity = 9357;
+            let horizontal_id = Id::new("find-horizontal-code");
+            let source: Arc<str> = format!("{}needle", "w".repeat(byte)).into();
+            let text = prose::code_text(
+                source,
+                Arc::from([]),
+                design::TEXT_BODY.into(),
+                iced::Font::MONOSPACE,
+                target,
+                None,
+                Some(selectable_prose::Logical {
+                    identity,
+                    start: 0,
+                    paint: None,
+                }),
+            );
+            let code = widget::scrollable(widget::container(text).width(50000))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    design::scrollbar(),
+                ))
+                .id(horizontal_id.clone());
+            let mut element = transcript(
+                widget::column::with_children(vec![
+                    item("code", code),
+                    widget::Space::new().height(1000).into(),
+                ]),
+                target,
+                None,
+                vec![],
+                false,
+                vec![],
+            );
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut realized = false;
+            for _ in 0..6 {
+                let found = Arc::new(std::sync::Mutex::new(None));
+                let sink = found.clone();
+                let mut locate = operation::map(
+                    LocateLogical {
+                        scroll: card_control_id(target.card, "chat-transcript"),
+                        item: item_id("code"),
+                        identity,
+                        byte,
+                        content: None,
+                        viewport: None,
+                        found: None,
+                        horizontal: Vec::new(),
+        pending_horizontal: None,
+        active: false,
+        scopes: Vec::new(),
+                    },
+                    move |location| {
+                        *sink.lock().unwrap() = location;
+                    },
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut locate,
+                );
+                let _ = locate.finish();
+                let location = found
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("mounted code glyph exists");
+                let horizontal = location
+                    .horizontal.into_iter().next()
+                    .expect("glyph belongs to a horizontal code viewport");
+                assert_eq!(horizontal.id, horizontal_id);
+                assert!(
+                    horizontal.offset > 600.0,
+                    "far-right glyph needs horizontal realization"
+                );
+                struct Position {
+                    horizontal: Id,
+                    transcript: Id,
+                    identity: u64,
+                    byte: usize,
+                    x: f32,
+                    y: f32,
+                    viewport: Option<Rectangle>,
+                    glyph: Option<Rectangle>,
+                }
+                impl Operation for Position {
+                    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                        visit(self);
+                    }
+                    fn scrollable(
+                        &mut self,
+                        id: Option<&Id>,
+                        viewport: Rectangle,
+                        _: Rectangle,
+                        translation: Vector,
+                        _: &mut dyn operation::Scrollable,
+                    ) {
+                        if id == Some(&self.transcript) {
+                            self.y = translation.y;
+                        }
+                        if id == Some(&self.horizontal) {
+                            self.x = translation.x;
+                            self.viewport = Some(viewport);
+                        }
+                    }
+                    fn custom(
+                        &mut self,
+                        _: Option<&Id>,
+                        bounds: Rectangle,
+                        state: &mut dyn std::any::Any,
+                    ) {
+                        if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                            && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+                        {
+                            self.glyph = Some(Rectangle {
+                                x: bounds.x + local.x - self.x,
+                                y: bounds.y + local.y,
+                                ..local
+                            });
+                        }
+                    }
+                }
+                let mut before = Position {
+                    horizontal: horizontal_id.clone(),
+                    transcript: card_control_id(target.card, "chat-transcript"),
+                    identity,
+                    byte,
+                    x: 0.0,
+                    y: 0.0,
+                    viewport: None,
+                    glyph: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut before,
+                );
+                let mut correction = operation::scrollable::scroll_to::<()>(
+                    horizontal.id,
+                    operation::scrollable::AbsoluteOffset {
+                        x: Some(horizontal.offset),
+                        y: None,
+                    },
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut correction,
+                );
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut after = Position {
+                    glyph: None,
+                    viewport: None,
+                    ..before
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after,
+                );
+                assert_eq!(
+                    after.y, before.y,
+                    "horizontal correction preserves the transcript offset"
+                );
+                let Some(glyph) = after.glyph else {
+                    continue;
+                };
+                let viewport = after.viewport.unwrap();
+                assert!(
+                    glyph.x >= viewport.x && glyph.x + glyph.width <= viewport.x + viewport.width,
+                    "highlighted glyph is visible after horizontal realization: {glyph:?}, {viewport:?}"
+                );
+                realized = true;
+                break;
+            }
+            assert!(
+                realized,
+                "far-right match at byte {byte} must become an actual visible glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn logical_find_realizes_a_distant_chunk_and_centers_its_mounted_glyph() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let identity = 9876;
+        let line = "measured source line αβ\n";
+        let source: Arc<str> = line.repeat(5000).into();
+        let byte = line.len() * 1500;
+        let text = prose::code_text(
+            source,
+            Arc::from([]),
+            design::TEXT_BODY.into(),
+            iced::Font::MONOSPACE,
+            target,
+            None,
+            Some(selectable_prose::Logical {
+                identity,
+                start: 0,
+                paint: None,
+            }),
+        );
+        let mut cases = vec![(text, identity, byte)];
+        let list = format!(
+            "{}{}",
+            "prefix\n\n".repeat(4),
+            (0..10000)
+                .map(|index| format!("- bullet {index} target\n"))
+                .collect::<String>()
+        );
+        let table = format!(
+            "{}| First | Second |\n| --- | --- |\n{}",
+            "prefix\n\n".repeat(4),
+            (0..10000)
+                .map(|index| format!("| row {index} | target {index} |\n"))
+                .collect::<String>()
+        );
+        for (source, path) in [
+            (list, vec![0, 4, 9999, 0]),
+            (table, vec![0, 4, 10000, 1, 0]),
+        ] {
+            let cached = CachedItem::new(
+                &ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            let identity =
+                selection::logical_identity(&format!("unbound-{}", cached.revision), &path);
+            cases.push((
+                prose::view(
+                    &cached,
+                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                    target,
+                    None,
+                ),
+                identity,
+                0,
+            ));
+        }
+        for (text, identity, byte) in cases {
+            let before = virtualized::constructed_rows();
+            let mut element = transcript(
+                widget::column::with_children(vec![
+                    widget::Space::new().height(10000).into(),
+                    item("answer", text),
+                    widget::Space::new().height(10000).into(),
+                ]),
+                target,
+                None,
+                vec![],
+                true,
+                vec![],
+            );
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+            let limits = layout::Limits::new(Size::ZERO, viewport.size());
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(f32::MAX),
+            );
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut exact = false;
+            for _ in 0..6 {
+                let found = Arc::new(std::sync::Mutex::new(None));
+                let sink = found.clone();
+                let mut locate = operation::map(
+                    LocateLogical {
+                        scroll: card_control_id(target.card, "chat-transcript"),
+                        item: item_id("answer"),
+                        identity,
+                        byte,
+                        content: None,
+                        viewport: None,
+                        found: None,
+                        horizontal: Vec::new(),
+        pending_horizontal: None,
+        active: false,
+        scopes: Vec::new(),
+                    },
+                    move |location| {
+                        *sink.lock().unwrap() = location;
+                    },
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut locate,
+                );
+                let _ = locate.finish();
+                let location = found
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("offscreen descriptors remain navigable");
+                exact = location.exact;
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut SetBottom(location.offset),
+                );
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                if exact {
+                    break;
+                }
+            }
+            assert!(
+                exact,
+                "estimate navigation converges to actual mounted glyph geometry"
+            );
+            struct Visible {
+                identity: u64,
+                byte: usize,
+                translation: Vector,
+                viewport: Option<Rectangle>,
+                glyph: Option<Rectangle>,
+            }
+            impl Operation for Visible {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn scrollable(
+                    &mut self,
+                    _: Option<&Id>,
+                    viewport: Rectangle,
+                    _: Rectangle,
+                    translation: Vector,
+                    _: &mut dyn operation::Scrollable,
+                ) {
+                    self.translation = translation;
+                    self.viewport = Some(viewport);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&Id>,
+                    bounds: Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                        && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+                    {
+                        self.glyph = Some(Rectangle {
+                            x: bounds.x + local.x - self.translation.x,
+                            y: bounds.y + local.y - self.translation.y,
+                            ..local
+                        });
+                    }
+                }
+            }
+            let mut visible = Visible {
+                identity,
+                byte,
+                translation: Vector::ZERO,
+                viewport: None,
+                glyph: None,
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
+            let glyph = visible.glyph.expect("the requested chunk is mounted");
+            let viewport = visible.viewport.unwrap();
+            assert!(
+                glyph.y >= viewport.y && glyph.y + glyph.height <= viewport.y + viewport.height
+            );
+            assert!(
+                (glyph.y + glyph.height / 2.0 - viewport.y - viewport.height / 2.0).abs()
+                    <= glyph.height + 1.0,
+                "mounted match glyph is centered: {glyph:?}, {viewport:?}"
+            );
+            assert!(
+                virtualized::constructed_rows() - before < 1500,
+                "staged navigation must not instantiate ten thousand hidden rows"
+            );
+        }
+    }
+
+    #[test]
+    fn native_geometry_updates_the_reader_without_echoing_a_model_message() {
+        let renderer = crate::app::tests::headless_renderer();
+        let observations: Observations = Default::default();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let make = |height| {
+            transcript_observed(
+                widget::Space::new().height(height).width(Length::Fill),
+                target,
+                None,
+                vec![],
+                true,
+                vec![],
+                observations.clone(),
+                Memory::default(),
+                false,
+            )
+        };
+        let bounds = Rectangle::with_size(Size::new(400.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, bounds.size());
+        let mut element = make(100.0);
+        let mut tree = Tree::new(&element);
+        let mut messages = Vec::new();
+        for height in [100.0, 2000.0, 4000.0] {
+            element = make(height);
+            tree.diff(element.as_widget_mut());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert!(
+                messages.is_empty(),
+                "streamed geometry does not enqueue another model/view cycle"
+            );
+            let scroll = observations.borrow()[&None];
+            assert_eq!(scroll.content(), height);
+            assert!(
+                scroll.at_bottom(),
+                "the direct observation keeps authoritative native geometry"
+            );
+        }
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                Message::ChatUi(Action::Scrolled(_, None, _, true))
+            )),
+            "user navigation still drives paging"
+        );
     }
 
     #[test]
@@ -1480,7 +2783,8 @@ mod tests {
             initial
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
-            let context = &tree.state.downcast_ref::<Anchor>().contexts[0];
+            let memory = tree.state.downcast_ref::<ReaderState>().memory.0.borrow();
+            let context = &memory.contexts[0];
             assert_eq!(
                 context
                     .rows
@@ -1489,6 +2793,7 @@ mod tests {
                     .map(|row| row.bounds.y),
                 Some(300.0)
             );
+            drop(memory);
             let mut next = element(
                 vec![("answer", 500.0), ("tool", 600.0), ("newer", 1000.0)],
                 "new-group",
@@ -1498,7 +2803,8 @@ mod tests {
             let mut actual = ReadTop::default();
             next.as_widget_mut()
                 .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
-            let context = &tree.state.downcast_ref::<Anchor>().contexts[0];
+            let memory = tree.state.downcast_ref::<ReaderState>().memory.0.borrow();
+            let context = &memory.contexts[0];
             assert_eq!(
                 actual.0,
                 Some(top - 300.0),

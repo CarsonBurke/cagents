@@ -25,6 +25,8 @@ use std::{
 // Native holder startup can spend 30 seconds sending its control request and
 // another 30 seconds receiving the reply. Leave room for the daemon response
 // and a busy desktop scheduler.
+mod append;
+
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
@@ -135,6 +137,7 @@ struct Inner {
     cancel: UnixStream,
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
     source_clock: Arc<Mutex<Option<SourceClock>>>,
+    append_lineage: Arc<Mutex<append::Lineage>>,
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
@@ -475,6 +478,7 @@ impl ClientHandle {
                     Instant::now(),
                 ))),
                 snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
+                append_lineage: Arc::default(),
                 activity: Arc::new(Mutex::new(ActivityObservation {
                     generation: 0,
                     state: ActivityState::Idle,
@@ -929,6 +933,7 @@ impl ClientHandle {
             Instant::now(),
         )));
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
+        let append_lineage = Arc::new(Mutex::new(append::Lineage::default()));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
         let visible = Arc::new(AtomicBool::new(false));
@@ -944,6 +949,7 @@ impl ClientHandle {
             cancel,
             snapshot: snapshot.clone(),
             source_clock: source_clock.clone(),
+            append_lineage: append_lineage.clone(),
             activity: activity.clone(),
             observed: observed.clone(),
             account_usage: account_usage.clone(),
@@ -1086,6 +1092,7 @@ impl ClientHandle {
                             resync = false;
                             let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                             SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), update.sampled_at, Instant::now());
+                            append_lineage.lock().unwrap_or_else(|p| p.into_inner()).clear();
                             *state = Arc::new(update);
                             drop(state);
                             if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
@@ -1095,8 +1102,10 @@ impl ClientHandle {
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                         let sampled_at = update.metadata.sampled_at;
+                        let candidates = append::Lineage::candidates(&update, &state);
                         let applied = match update.apply(&state) {
                             Ok(next) => {
+                                append_lineage.lock().unwrap_or_else(|p| p.into_inner()).record(candidates, &next);
                                 *state = Arc::new(next);
                                 SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
                                 true
@@ -1339,7 +1348,26 @@ impl ClientHandle {
             command,
         })
     }
+    pub(crate) fn known_append(
+        &self,
+        previous: &Arc<super::Item>,
+        current: &Arc<super::Item>,
+    ) -> bool {
+        self.inner
+            .append_lineage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proves(previous, current)
+    }
+
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
+        if !visible {
+            self.inner
+                .append_lineage
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        }
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }

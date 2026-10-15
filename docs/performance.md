@@ -4,6 +4,7 @@
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
+- [Native chat viewport](#native-chat-viewport)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -179,6 +180,44 @@ ASCII ingestion with the same benchmark fixtures; its bulk-append benchmark
 helper delegates to the original character-by-character implementation.
 The two additional Unicode-miss guard workloads have optimized samples only
 in this reference; no before/after claim is made for those cases.
+
+## Native chat viewport
+
+Run the headless viewport contract with optimized application code, separately
+from native application measurements:
+
+```sh
+CARGO_BUILD_JOBS=2 cargo test --locked --no-default-features --features ui \
+  --profile dev-runtime --config 'profile.dev-runtime.opt-level=2' \
+  --config 'profile.dev-runtime.debug-assertions=false' --lib \
+  chat_ui::view::frame_cost::viewport_cost_with_a_megabyte_answer_and_three_hundred_tools \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The workload compares a 16 KiB answer with ten tool rows against single 1 MiB
+paragraph, many-paragraph and fenced-code answers with 300 tool rows, at a fixed
+viewport. It warms the real pane/composer, then records refresh, view, native
+widget layout, pointer update and headless draw CPU time. The event median must
+be at most 2 ms and at most twice the small workload. These are explicit test
+budgets, not claims of achieved results. The test excludes GPU submission and
+compositor presentation. Run the neighboring long-streaming workloads separately
+for a busy parent and a selected running child whose parent is idle.
+
+A native comparison must use the same scripted provider, workload text, pane
+geometry and build profile on both revisions. Record the exact commit and dirty
+state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
+raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
+40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
+the 1 MiB answer has a 150 MB RSS growth budget; after switching away, the UI
+must return within 30 MB of its prior baseline. Repeat hide/reveal and close
+cycles, including Hide tab. Use the isolated development runner described in
+[development.md](development.md), preserving existing sessions.
+
+The pane inspector's diagnostics disclose known source, prepared-presentation
+and logical-selection payload owners for the selected chat. These counters
+exclude opaque parser/font/renderer/image allocations and allocator retention;
+they are not RSS or a complete heap estimate. Use process measurements to verify
+residency budgets rather than inferring them from logical byte counts.
 
 ## Reference results
 

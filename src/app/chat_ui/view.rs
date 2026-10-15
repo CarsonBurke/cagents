@@ -81,6 +81,66 @@ impl<'a> TranscriptRows<'a> {
     }
 }
 
+/// The loaded transcript keeps row descriptions; only its visible exchanges
+/// create widget trees. Finished visible exchanges still use retained::kept.
+struct VirtualRows<'a> {
+    children: Vec<virtualized::Row<'a>>,
+    gap: f32,
+    trailing_footer: f32,
+}
+impl<'a> VirtualRows<'a> {
+    fn new(gap: f32) -> Self {
+        Self {
+            children: vec![],
+            gap,
+            trailing_footer: 0.0,
+        }
+    }
+    fn push(&mut self, row: Element<'a, Message>) -> usize {
+        self.message(row, 0.0)
+    }
+    fn message(&mut self, row: Element<'a, Message>, footer: f32) -> usize {
+        self.append(
+            virtualized::Row::once(0, 0, 80.0, None, move || row),
+            self.gap,
+            footer,
+        )
+    }
+    fn lazy(
+        &mut self,
+        key: u64,
+        revision: u64,
+        estimate: f32,
+        aliases: Vec<iced::advanced::widget::Id>,
+        gap: f32,
+        footer: f32,
+        build: impl Fn() -> Element<'a, Message> + 'a,
+    ) -> usize {
+        let mut row = virtualized::Row::new(key, revision, estimate, None, build);
+        row.aliases = aliases;
+        self.append(row, gap, footer)
+    }
+    fn append(&mut self, mut row: virtualized::Row<'a>, gap: f32, footer: f32) -> usize {
+        if !self.children.is_empty() {
+            let gap = (gap - self.trailing_footer).max(0.0);
+            if gap > 0.0 {
+                let key = self.children.len() as u64;
+                self.children
+                    .push(virtualized::Row::new(key, 0, gap, None, move || {
+                        widget::Space::new().height(gap).into()
+                    }));
+            }
+        }
+        let index = self.children.len();
+        if row.key == 0 {
+            row.key = index as u64;
+        }
+        self.children.push(row);
+        self.trailing_footer = footer;
+        index
+    }
+}
+
 /// Reserve an external action row so hovering never shifts the transcript.
 /// Iced's hover widget also keeps controls visible while keyboard-focused.
 pub(super) fn message_actions<'a>(
@@ -365,13 +425,31 @@ fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
 
 /// A failure, as an entry of the transcript: what went wrong, set apart the
 /// way a system notice is and read in sequence with what it interrupted.
-fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
+fn visible_notice_body(body: &str, expanded: bool) -> String {
+    if !expanded && body.lines().count() > NOTICE_LINES {
+        body.lines()
+            .take(NOTICE_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        body.to_owned()
+    }
+}
+
+fn notice_identity(anchor: Option<&str>, message: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::hash::DefaultHasher::new();
+    ("transcript-notice", anchor, message).hash(&mut hash);
+    hash.finish()
+}
+
+fn notice_entry(message: &str, target: Target, identity: u64) -> Element<'static, Message> {
     widget::container(
         widget::row::with_children(vec![
             widget::icon(Icon::Warning.handle())
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),
-            widget::container(selectable_prose::text(
+            widget::container(selectable_prose::logical_text(
                 vec![
                     iced::widget::text::Span::new(message.to_owned())
                         .color(design::warning_color(&cosmic::theme::active())),
@@ -381,6 +459,11 @@ fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
                 iced::Font::default(),
                 target,
                 None,
+                selectable_prose::Logical {
+                    identity,
+                    start: 0,
+                    paint: None,
+                },
             ))
             .width(Length::Fill)
             .into(),
@@ -675,8 +758,16 @@ impl Scroll {
 
     /// The height of the loaded transcript, which is what tells the page the
     /// reader has already asked for from the one they are asking for now.
+    pub(super) fn from_top(self) -> f32 {
+        self.from_top
+    }
+
     pub(super) fn content(self) -> f32 {
         self.content
+    }
+
+    pub(super) fn window_height(self) -> f32 {
+        self.window
     }
 
     pub(super) fn page_height(self) -> f32 {
@@ -903,7 +994,11 @@ impl Cagents {
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
                     &self.settings.keyboard_shortcuts,
-                    self.workspace.viewport_width() * self.settings.chat_content_fraction,
+                    self.workspace
+                        .presentation_geometry()
+                        .card(card)
+                        .map_or(self.workspace.viewport_width(), |card| card.width())
+                        .min(design::READABLE_MEASURE + 2.0 * step::GAP_M),
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -1114,6 +1209,241 @@ impl Runtime {
         }
     }
 
+    /// The logical copy/selection catalog is rebuilt only when exposed text
+    /// or disclosure changes, never for mouse motion, copying, find or timers.
+    fn selection_document(
+        &self,
+    ) -> (
+        Arc<selection::Catalog>,
+        std::rc::Rc<std::cell::RefCell<selection::Bookmark>>,
+    ) {
+        use std::hash::{Hash, Hasher};
+        let mut fingerprint = std::hash::DefaultHasher::new();
+        self.selected_subagent.hash(&mut fingerprint);
+        let selected = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let items = selected.map_or(self.snapshot.items.as_slice(), |agent| {
+            agent.items.as_slice()
+        });
+        // Cache preparation advances this epoch only for presented text or
+        // ordering edits. Metadata-only heartbeats and hidden-child streams
+        // must not rebuild the entire logical catalog.
+        self.presentation_revision.hash(&mut fingerprint);
+        selected
+            .map_or(self.snapshot.busy, |agent| {
+                agent.status == chat::ToolStatus::Running
+            })
+            .hash(&mut fingerprint);
+        let mut expanded: Vec<_> = self.expanded.iter().collect();
+        expanded.sort_unstable();
+        expanded.hash(&mut fingerprint);
+        let mut opened: Vec<_> = self.opened.iter().collect();
+        opened.sort_unstable();
+        opened.hash(&mut fingerprint);
+        self.tool_groups_expanded.hash(&mut fingerprint);
+        self.failures.hash(&mut fingerprint);
+        self.error
+            .as_ref()
+            .or(self.snapshot.error.as_ref())
+            .hash(&mut fingerprint);
+        self.queued
+            .as_ref()
+            .map(|queued| &queued.text)
+            .hash(&mut fingerprint);
+        let fingerprint = fingerprint.finish();
+        let mut document = self.selection_document.borrow_mut();
+        if document
+            .as_ref()
+            .is_none_or(|(revision, _)| *revision != fingerprint)
+        {
+            let mut builder = selection::Catalog::builder();
+            if selected.is_some() {
+                for item in items {
+                    self.selection_item(&mut builder, item, turn::slot_of(item), true);
+                }
+            } else {
+                for (anchor, error) in self.failures.iter().filter(|(anchor, error)| {
+                    anchor.is_none() && !self.active_auth_notice(anchor, error)
+                }) {
+                    builder.logical(
+                        notice_identity(anchor.as_deref(), error),
+                        Arc::from(error.as_str()),
+                    );
+                }
+                for turn in &self.turns {
+                    for index in &turn.prompt {
+                        if let Some(item) = items.get(*index) {
+                            self.selection_item(&mut builder, item, turn::Slot::Prose, true);
+                        }
+                    }
+                    if self
+                        .opened
+                        .get(&turn.key)
+                        .copied()
+                        .unwrap_or(self.tool_groups_expanded)
+                    {
+                        for placed in &turn.steps {
+                            if let Some(item) = items.get(placed.index) {
+                                self.selection_item(&mut builder, item, placed.slot, true);
+                            }
+                        }
+                    }
+                    for placed in &turn.prose {
+                        if let Some(item) = items.get(placed.index) {
+                            self.selection_item(&mut builder, item, placed.slot, true);
+                        }
+                    }
+                    for (anchor, error) in self.failures.iter().filter(|(anchor, error)| {
+                        anchor.as_ref() == Some(&turn.key)
+                            && !self.active_auth_notice(anchor, error)
+                    }) {
+                        builder.logical(
+                            notice_identity(anchor.as_deref(), error),
+                            Arc::from(error.as_str()),
+                        );
+                    }
+                }
+                if let Some(queued) = &self.queued {
+                    builder.plain("queued-prompt", &[2], Arc::from(queued.text.trim_end()));
+                }
+            }
+            if let Some(error) = self.error.as_ref().or(self.snapshot.error.as_ref())
+                && !chat::requires_sign_in(self.session.launch.provider, error)
+                && !self.failures.iter().any(|(_, recorded)| recorded == error)
+            {
+                builder.logical(notice_identity(None, error), Arc::from(error.as_str()));
+            }
+            let catalog =
+                builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
+            *document = Some((fingerprint, catalog));
+        }
+        let catalog = document.as_ref().unwrap().1.clone();
+        let bookmark = self
+            .selection_bookmarks
+            .borrow_mut()
+            .entry(self.selected_subagent.clone())
+            .or_insert_with(Default::default)
+            .clone();
+        (catalog, bookmark)
+    }
+
+    fn selection_item(
+        &self,
+        builder: &mut selection::DocumentBuilder,
+        item: &chat::Item,
+        slot: turn::Slot,
+        detail: bool,
+    ) {
+        if item.role == chat::Role::User && !matches!(item.content, ItemContent::Delivery { .. }) {
+            let (text, _, _) = self.prompt_text(item);
+            builder.plain(&item.id, &[2], text.into());
+            return;
+        }
+        let Some(cached) = self.cache.get(&item.id) else {
+            return;
+        };
+        if slot == turn::Slot::Thinking && !self.expanded.contains(&item.id) {
+            let selected = self
+                .selected_subagent
+                .as_ref()
+                .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+            let (items, busy) = selected.map_or(
+                (self.snapshot.items.as_slice(), self.snapshot.busy),
+                |agent| {
+                    (
+                        agent.items.as_slice(),
+                        agent.status == chat::ToolStatus::Running,
+                    )
+                },
+            );
+            if reasoning_finished(items, busy, &item.id) {
+                return;
+            }
+        }
+        if matches!(
+            item.content,
+            ItemContent::Text { .. } | ItemContent::Delivery { .. }
+        ) {
+            if let ItemContent::Delivery {
+                kind: chat::DeliveryKind::Notice,
+                body,
+                ..
+            } = &item.content
+            {
+                let body = visible_notice_body(body, self.expanded.contains(&item.id));
+                if !body.is_empty() {
+                    builder.plain(&item.id, &[2], body.into());
+                }
+            } else {
+                builder.markdown(&item.id, &[0], cached.markdown.items());
+            }
+        }
+        if let Some(coordinated) = &cached.coordination {
+            for (index, content) in coordinated.contents().enumerate() {
+                builder.markdown(&item.id, &[1, index as u32], content.items());
+            }
+        }
+        let opened = detail && self.expanded.contains(&item.id);
+        let plain = |builder: &mut selection::DocumentBuilder, path: &[u32], text: &str| {
+            if !text.is_empty() {
+                builder.plain(&item.id, path, Arc::from(text));
+            }
+        };
+        match &item.content {
+            ItemContent::Command {
+                label,
+                command,
+                working_directory,
+                ..
+            } => {
+                if cached.coordination.is_none() && !label.is_empty() && label != command {
+                    plain(builder, &[3, 0], turn::step_label(&item.content));
+                }
+                if opened {
+                    plain(builder, &[3, 1], working_directory);
+                }
+            }
+            ItemContent::Tool { name, .. } if cached.coordination.is_none() => {
+                plain(builder, &[3, 0], name)
+            }
+            ItemContent::WebSearch { query, results } if opened => {
+                plain(builder, &[8, 0], query);
+                for (index, result) in results.iter().enumerate() {
+                    plain(builder, &[8, 1, index as u32, 0], &result.title);
+                    plain(builder, &[8, 1, index as u32, 1], &result.url);
+                    plain(builder, &[8, 1, index as u32, 2], &result.snippet);
+                }
+            }
+            ItemContent::Image { description, .. } => plain(builder, &[9, 0], description),
+            _ => {}
+        }
+        if opened {
+            if let Some(input) = &cached.tool_input {
+                builder.plain(&item.id, &[4], input.text.clone());
+            }
+            if let Some(output) = &cached.tool_output
+                && !output.text.is_empty()
+            {
+                builder.plain(&item.id, &[5], output.text.clone());
+            }
+            if let ItemContent::Changes { changes, .. } = &item.content {
+                for (index, change) in changes.iter().enumerate() {
+                    plain(builder, &[7, index as u32, 0], &change.path);
+                    if let chat::ChangeKind::Renamed { from } = &change.kind {
+                        plain(builder, &[7, index as u32, 1], from);
+                    }
+                    if let Some(patch) = cached.patches.get(index)
+                        && !patch.text.is_empty()
+                    {
+                        builder.plain(&item.id, &[6, index as u32], patch.text.clone());
+                    }
+                }
+            }
+        }
+    }
+
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
@@ -1148,7 +1478,7 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let mut anchors = Vec::new();
-        let mut transcript = TranscriptRows::new(step::GAP_L);
+        let mut transcript = VirtualRows::new(step::GAP_L);
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
             let provider = match self.session.launch.provider {
@@ -1227,48 +1557,95 @@ impl Runtime {
                 let Some(cached) = self.cache.get(&item.id) else {
                     continue;
                 };
-                let row_index = transcript.message(
-                    if item.role == chat::Role::User && !item.content.is_step() {
-                        if matches!(item.content, ItemContent::Delivery { .. }) {
-                            self.delivery_view(item, cached, markdown_settings)
-                        } else {
-                            self.prompt_view(item)
-                        }
-                    } else if let Some(coordinated) = cached
+                let footer = if (item.role == chat::Role::User && !item.content.is_step())
+                    || matches!(item.content, ItemContent::Text { .. })
+                    || cached
                         .coordination
                         .as_deref()
-                        .filter(|coordinated| coordinated.is_card())
-                    {
-                        let raw = self
-                            .expanded
-                            .contains(&item.id)
-                            .then(|| self.step_detail(item, cached, markdown_settings));
-                        self.coordination_card(item, cached, coordinated, markdown_settings, raw)
-                    } else {
-                        match &item.content {
-                            ItemContent::Text { .. } => self.prose_view(
-                                item,
-                                cached,
-                                turn::slot_of(item),
-                                markdown_settings,
-                            ),
-                            ItemContent::Image { .. } => self.image_preview(item, cached),
-                            _ => self.step_view(item, cached, markdown_settings),
-                        }
-                    },
-                    if (item.role == chat::Role::User && !item.content.is_step())
-                        || matches!(item.content, ItemContent::Text { .. })
-                        || cached
-                            .coordination
-                            .as_deref()
-                            .is_some_and(Coordinated::is_card)
-                    {
-                        MESSAGE_ACTION_FOOTER
-                    } else {
-                        0.0
+                        .is_some_and(Coordinated::is_card)
+                {
+                    MESSAGE_ACTION_FOOTER
+                } else {
+                    0.0
+                };
+                use std::hash::{Hash, Hasher};
+                let mut key = std::hash::DefaultHasher::new();
+                ("selected-child-item", &item.id).hash(&mut key);
+                let mut revision = std::hash::DefaultHasher::new();
+                (
+                    cached.revision,
+                    self.expanded.contains(&item.id),
+                    self.find
+                        .as_ref()
+                        .filter(|_| self.find_items.contains(item.id.as_str())),
+                    self.find_paint
+                        .as_ref()
+                        .and_then(|paint| paint.current.as_ref())
+                        .filter(|found| found.item.as_ref() == item.id.as_str())
+                        .map(|found| (found.identity, found.range.start)),
+                    dark,
+                )
+                    .hash(&mut revision);
+                let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
+                    (body.len() as f32 / (content_width / 8.0).max(20.0))
+                        .ceil()
+                        .max(1.0)
+                        * 22.0
+                        + footer
+                });
+                let row_index = transcript.lazy(
+                    key.finish(),
+                    revision.finish(),
+                    estimate,
+                    vec![scroll::item_id(&item.id)],
+                    step::GAP_L,
+                    footer,
+                    move || {
+                        scroll::item(
+                            &item.id,
+                            widget::container(
+                                if item.role == chat::Role::User && !item.content.is_step() {
+                                    if matches!(item.content, ItemContent::Delivery { .. }) {
+                                        self.delivery_view(item, cached, markdown_settings)
+                                    } else {
+                                        self.prompt_view(item)
+                                    }
+                                } else if let Some(coordinated) = cached
+                                    .coordination
+                                    .as_deref()
+                                    .filter(|coordinated| coordinated.is_card())
+                                {
+                                    let raw = self
+                                        .expanded
+                                        .contains(&item.id)
+                                        .then(|| self.step_detail(item, cached, markdown_settings));
+                                    self.coordination_card(
+                                        item,
+                                        cached,
+                                        coordinated,
+                                        markdown_settings,
+                                        raw,
+                                    )
+                                } else {
+                                    match &item.content {
+                                        ItemContent::Text { .. } => self.prose_view(
+                                            item,
+                                            cached,
+                                            turn::slot_of(item),
+                                            markdown_settings,
+                                        ),
+                                        ItemContent::Image { .. } => {
+                                            self.image_preview(item, cached)
+                                        }
+                                        _ => self.step_view(item, cached, markdown_settings),
+                                    }
+                                },
+                            )
+                            .width(Length::Fill),
+                        )
                     },
                 );
-                anchors.push((row_index, item.id.as_str()));
+                let _ = row_index; // Virtual placeholder bounds supply item anchors.
             }
         } else {
             if snapshot.has_earlier {
@@ -1297,22 +1674,61 @@ impl Runtime {
             for (_, error) in self.failures.iter().filter(|(anchor, error)| {
                 anchor.is_none() && !self.active_auth_notice(anchor, error)
             }) {
-                transcript.push(notice_entry(error, target));
+                transcript.push(notice_entry(error, target, notice_identity(None, error)));
             }
             for turn in &self.turns {
-                transcript.push_with_gap(
-                    self.turn_view(turn, markdown_settings, dark),
+                use std::hash::{Hash, Hasher};
+                let mut key = std::hash::DefaultHasher::new();
+                turn.key.hash(&mut key);
+                let estimate = turn
+                    .prompt
+                    .iter()
+                    .chain(turn.prose.iter().map(|placed| &placed.index))
+                    .filter_map(|index| snapshot.items.get(*index))
+                    .map(|item| {
+                        CachedItem::prose(&item.content).map_or(60.0, |body| {
+                            ((body.len() as f32 / (content_width / 8.0).max(20.0))
+                                .ceil()
+                                .max(1.0)
+                                * 22.0)
+                                + 40.0
+                        })
+                    })
+                    .sum::<f32>()
+                    + if turn.steps.is_empty() { 0.0 } else { 48.0 };
+                let aliases = turn
+                    .prompt
+                    .iter()
+                    .chain(
+                        turn.prose
+                            .iter()
+                            .chain(&turn.steps)
+                            .map(|placed| &placed.index),
+                    )
+                    .filter_map(|index| snapshot.items.get(*index))
+                    .map(|item| scroll::item_id(&item.id))
+                    .collect();
+                transcript.lazy(
+                    key.finish(),
+                    self.turn_fingerprint(turn, dark),
+                    estimate,
+                    aliases,
                     if turn.prompt.is_empty() {
                         step::GAP_M
                     } else {
                         step::GAP_L
                     },
                     self.turn_trailing_footer(turn),
+                    move || self.turn_view(turn, markdown_settings, dark),
                 );
                 for (_, error) in self.failures.iter().filter(|(anchor, error)| {
                     anchor.as_ref() == Some(&turn.key) && !self.active_auth_notice(anchor, error)
                 }) {
-                    transcript.push(notice_entry(error, target));
+                    transcript.push(notice_entry(
+                        error,
+                        target,
+                        notice_identity(Some(&turn.key), error),
+                    ));
                 }
             }
             if !snapshot.has_later
@@ -1374,87 +1790,113 @@ impl Runtime {
             && !chat::requires_sign_in(self.session.launch.provider, error)
             && !self.failures.iter().any(|(_, recorded)| recorded == error)
         {
-            transcript.push(notice_entry(error, target));
+            transcript.push(notice_entry(error, target, notice_identity(None, error)));
         }
         content.extend(self.plan_view());
-        if let Some(query) = &self.find {
-            content.push(
-                widget::row::with_children(vec![
-                    crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
+        let find_bar: Element<'_, Message> = if let Some(query) = &self.find {
+            widget::row::with_children(vec![
+                crate::interaction::focused_escape(
+                    crate::ui_controls::field::search("Find in conversation", query)
                         .id(card_control_id(target.card, "chat-find"))
                         .on_input(move |query| action(Action::Find(target, query)))
                         .on_focus(action(Action::FindFocused(target, true)))
                         .on_unfocus(action(Action::FindFocused(target, false)))
                         .width(Length::Fill),
-                        move || action(Action::CloseFind(target)),
-                    ),
-                    design::caption(if self.find_matches.is_empty() {
-                        "0 matches".to_owned()
+                    move || action(Action::CloseFind(target)),
+                ),
+                design::caption(if self.find_matches.is_empty() {
+                    if self.find_waiting.is_some() {
+                        "Searching…".to_owned()
                     } else {
-                        format!(
-                            "{} of {} turns",
-                            self.find_index + 1,
-                            self.find_matches.len()
-                        )
-                    })
-                    .into(),
-                    small_icon(
-                        Icon::ChevronUp,
-                        "Previous match — Shift+Enter in search",
-                        Action::FindNext(target, false),
-                    ),
-                    small_icon(
-                        Icon::ChevronDown,
-                        "Next match — Enter in search",
-                        Action::FindNext(target, true),
-                    ),
-                    small_icon(
-                        Icon::Close,
-                        "Close find — Escape",
-                        Action::CloseFind(target),
-                    ),
-                ])
-                .align_y(Alignment::Center)
-                .spacing(step::GAP_S)
+                        "0 matches".to_owned()
+                    }
+                } else {
+                    format!(
+                        "{} of {} matches",
+                        self.find_index + 1,
+                        self.find_matches.len()
+                    )
+                })
                 .into(),
-            );
-        }
-        let transcript = widget::column::with_children(transcript.children)
-            .padding(design::with_vertical_rail(iced::Padding::new(step::GAP_M)))
-            .width(Length::Fill);
+                small_icon(
+                    Icon::ChevronUp,
+                    "Previous match — Shift+Enter in search",
+                    Action::FindNext(target, false),
+                ),
+                small_icon(
+                    Icon::ChevronDown,
+                    "Next match — Enter in search",
+                    Action::FindNext(target, true),
+                ),
+                small_icon(
+                    Icon::Close,
+                    "Close find — Escape",
+                    Action::CloseFind(target),
+                ),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(step::GAP_S)
+            .into()
+        } else {
+            widget::Space::new().height(0).into()
+        };
+        let transcript =
+            widget::container(virtualized::column(transcript.children, Default::default()))
+                .padding(iced::Padding::new(step::GAP_M))
+                .width(Length::Fill);
         let transcript_index = content.len();
-        content.push(selection::transcript(
-            scroll::transcript(
-                transcript,
+        let selected_transcript = if self.visible.load(Ordering::Relaxed) {
+            let (catalog, bookmark) = self.selection_document();
+            crate::ui_memory::gate(selection::transcript_virtualized(
+                scroll::transcript_observed(
+                    transcript,
+                    target,
+                    self.selected_subagent.as_deref(),
+                    anchors,
+                    selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
+                    selected
+                        .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
+                        .iter()
+                        .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
+                        .chain(self.turns.iter().flat_map(|turn| {
+                            let key = turn
+                                .steps
+                                .first()
+                                .and_then(|step| snapshot.items.get(step.index));
+                            turn.steps.iter().filter_map(move |step| {
+                                Some((
+                                    scroll::steps_id(&key?.id),
+                                    snapshot.items.get(step.index)?.id.as_str(),
+                                ))
+                            })
+                        }))
+                        .collect(),
+                    self.observed_scroll.clone(),
+                    self.scroll_memory.clone(),
+                    self.find.is_some(),
+                ),
                 target,
                 self.selected_subagent.as_deref(),
-                anchors,
-                selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
-                snapshot
-                    .items
-                    .iter()
-                    .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
-                    .chain(self.turns.iter().flat_map(|turn| {
-                        let key = turn
-                            .steps
-                            .first()
-                            .and_then(|step| snapshot.items.get(step.index));
-                        turn.steps.iter().filter_map(move |step| {
-                            Some((
-                                scroll::steps_id(&key?.id),
-                                snapshot.items.get(step.index)?.id.as_str(),
-                            ))
-                        })
-                    }))
-                    .collect(),
-            ),
-            target,
-            self.selected_subagent.as_deref(),
-        ));
+                catalog,
+                bookmark,
+            ))
+        } else {
+            crate::ui_memory::gate(
+                widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+        };
+        content.push(
+            widget::column::with_children(vec![find_bar, selected_transcript])
+                .spacing(if self.find.is_some() {
+                    step::GAP_S
+                } else {
+                    0.0
+                })
+                .height(Length::Fill)
+                .into(),
+        );
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
                 widget::button::custom(design::caption("↓ New activity"))
@@ -2325,7 +2767,6 @@ impl Runtime {
                     iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
                 )
                 .into(),
-            content_width.max(1.0),
         ))
         .width(Length::Fill)
         .height(Length::Fill);
@@ -2857,7 +3298,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2947,14 +3393,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -2962,17 +3412,16 @@ impl Runtime {
     /// An exchange is kept between frames, and built and laid out again only
     /// when something it draws changes, which is what stops a streaming
     /// answer from paying for every exchange above it twenty times a second.
-    /// The one thing that cannot be kept is an open step's raw output, whose
-    /// read-only editor borrows its text from the cache; an exchange showing
-    /// one is built afresh each frame, in the same place in the tree.
+    /// Open details own their text and share the same retained path. A
+    /// disclosure or changed item only invalidates its own exchange.
     fn turn_view<'a>(
         &'a self,
         turn: &'a turn::Turn,
         settings: markdown::Settings,
         dark: bool,
     ) -> Element<'a, Message> {
-        if !self.retainable(turn) {
-            return retained::fresh(self.turn_rows(
+        retained::kept(self.turn_fingerprint(turn, dark), move || {
+            self.turn_rows(
                 turn,
                 |item, cached| self.step_view(item, cached, settings),
                 |item, cached, coordinated| {
@@ -2981,16 +3430,6 @@ impl Runtime {
                         .contains(&item.id)
                         .then(|| self.step_detail(item, cached, settings));
                     self.coordination_card(item, cached, coordinated, settings, raw)
-                },
-                settings,
-            ));
-        }
-        retained::kept(self.turn_fingerprint(turn, dark), move || {
-            self.turn_rows(
-                turn,
-                |item, cached| self.step_header(item, cached, false),
-                |item, cached, coordinated| {
-                    self.coordination_card(item, cached, coordinated, settings, None)
                 },
                 settings,
             )
@@ -3003,25 +3442,15 @@ impl Runtime {
         self.turn_view(&self.turns[0], settings, cosmic::theme::is_dark())
     }
 
-    /// Whether `turn` can be kept between frames: none of its steps is open.
-    fn retainable(&self, turn: &turn::Turn) -> bool {
-        turn.prompt
-            .iter()
-            .chain(
-                turn.steps
-                    .iter()
-                    .chain(&turn.prose)
-                    .map(|placed| &placed.index),
-            )
-            .filter_map(|index| self.snapshot.items.get(*index))
-            .all(|item| !self.expanded.contains(&item.id))
-    }
-
     /// Everything a retained exchange draws, folded into the value that
     /// decides whether it is drawn again.
     ///
     /// It reads the items' change tokens rather than their bodies, so it
     /// costs the same for a one-line answer as for a long one.
+    pub(super) fn find_turn_matches(&self, key: &str) -> bool {
+        self.find_turns.contains(key)
+    }
+
     fn turn_fingerprint(&self, turn: &turn::Turn, dark: bool) -> u64 {
         self.turn_fingerprint_at(turn, dark, self.source_now_ms())
     }
@@ -3038,17 +3467,16 @@ impl Runtime {
             .hash(&mut hasher);
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
-        self.find.hash(&mut hasher);
-        // Only reasoning uses the transcript's busy state to decide whether
-        // its disclosure has finished. Other rows derive activity from their
-        // own items and the group's status and duration.
-        if turn
-            .prose
-            .iter()
-            .any(|placed| placed.slot == turn::Slot::Thinking)
-        {
-            self.snapshot.busy.hash(&mut hasher);
-        }
+        self.find
+            .as_ref()
+            .filter(|_| self.find_turn_matches(&turn.key))
+            .hash(&mut hasher);
+        self.find_paint
+            .as_ref()
+            .and_then(|paint| paint.current.as_ref())
+            .filter(|found| found.turn.as_ref() == turn.key.as_str())
+            .map(|found| (found.identity, found.range.start))
+            .hash(&mut hasher);
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
@@ -3069,7 +3497,19 @@ impl Runtime {
             };
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
-            (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
+            (
+                &item.id,
+                item.started_at.or(item.at),
+                slot,
+                self.expanded.contains(&item.id),
+            )
+                .hash(&mut hasher);
+            if slot == Some(turn::Slot::Thinking) {
+                // A newer turn starting does not revive old reasoning that
+                // already has a final answer or later prompt after it.
+                reasoning_finished(&self.snapshot.items, self.snapshot.busy, &item.id)
+                    .hash(&mut hasher);
+            }
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied
@@ -3202,7 +3642,27 @@ impl Runtime {
                 turn.steps
                     .iter()
                     .filter_map(|placed_step| placed(placed_step.index))
-                    .map(|(item, cached)| scroll::item(&item.id, step(item, cached)))
+                    .map(|(item, cached)| {
+                        let key = selection::logical_identity(&item.id, &[9]);
+                        let revision = cached.revision;
+                        // Header elements are cheap owned metadata; only a
+                        // mounted row creates their widget tree and geometry.
+                        let row = step(item, cached);
+                        let id = item.id.clone();
+                        let mut row = virtualized::Row::once(
+                            key,
+                            revision,
+                            56.0 + step::GAP_XS,
+                            Some(scroll::item_id(&id)),
+                            move || {
+                                widget::container(scroll::item(&id, row))
+                                    .padding(iced::Padding::ZERO.bottom(step::GAP_XS))
+                                    .into()
+                            },
+                        );
+                        row.anchor = true;
+                        row
+                    })
                     .collect()
             });
             // One measured strip supplies aliases for folded steps; expanded
@@ -3258,7 +3718,7 @@ impl Runtime {
     /// no name at all, because its "path" is the payload itself, so the tail of
     /// it is base64 and the provider's description is the only thing that reads
     /// as a label.
-    fn attachment_label<'a>(path: &'a str, description: &'a str) -> &'a str {
+    pub(super) fn attachment_label<'a>(path: &'a str, description: &'a str) -> &'a str {
         if !path.starts_with("data:") {
             if let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) {
                 return name;
@@ -3485,11 +3945,20 @@ impl Runtime {
             .as_ref()
             .is_some_and(|pending| pending.queued == Some(super::QueuedStep::Prompt));
         let mut rows: Vec<Element<'a, Message>> = vec![
-            widget::container(selectable_prose::plain(
-                queued.text.trim_end(),
-                design::TEXT_PROSE,
+            widget::container(selectable_prose::logical_text(
+                vec![iced::widget::text::Span::new(
+                    queued.text.trim_end().to_owned(),
+                )]
+                .into(),
+                design::TEXT_PROSE.into(),
                 iced::Font::default(),
                 self.target,
+                None,
+                selectable_prose::Logical {
+                    identity: selection::logical_identity("queued-prompt", &[2]),
+                    start: 0,
+                    paint: self.find_paint.clone(),
+                },
             ))
             .class(design::surface(
                 Some(design::accent_wash),
@@ -3548,7 +4017,7 @@ impl Runtime {
     /// its author squared off. That asymmetry is what identifies the author
     /// without printing "You" above every message, and the narrower measure
     /// keeps a turn's opening findable when scrolling back.
-    fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
+    fn prompt_text(&self, item: &chat::Item) -> (String, bool, bool) {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
@@ -3572,25 +4041,40 @@ impl Runtime {
         } else {
             text
         };
+        (text, attachment, long)
+    }
+
+    fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
+        let (text, attachment, long) = self.prompt_text(item);
+        let expanded = self.expanded.contains(&item.id);
+        let logical = selectable_prose::Logical {
+            identity: selection::logical_identity(&item.id, &[2]),
+            start: 0,
+            paint: self.find_paint.clone(),
+        };
         let body: Element<'static, Message> = if attachment {
             widget::row::with_children(vec![
                 widget::icon(Icon::Attachment.handle()).size(12).into(),
-                selectable_prose::plain(
-                    text,
-                    design::TEXT_CAPTION,
+                selectable_prose::logical_text(
+                    vec![iced::widget::text::Span::new(text)].into(),
+                    design::TEXT_CAPTION.into(),
                     iced::Font::default(),
                     self.target,
+                    None,
+                    logical,
                 ),
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
             .into()
         } else {
-            let text = selectable_prose::plain(
-                text,
-                design::TEXT_PROSE,
+            let text = selectable_prose::logical_text(
+                vec![iced::widget::text::Span::new(text)].into(),
+                design::TEXT_PROSE.into(),
                 iced::Font::default(),
                 self.target,
+                None,
+                logical,
             );
             if long {
                 widget::column::with_children(vec![
@@ -3686,20 +4170,19 @@ impl Runtime {
             ];
             if !body.is_empty() {
                 let long = body.lines().count() > NOTICE_LINES;
-                let text = if long && !expanded {
-                    body.lines()
-                        .take(NOTICE_LINES)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    body.clone()
-                };
+                let text = visible_notice_body(body, expanded);
                 rows.push(
-                    widget::container(selectable_prose::plain(
-                        text,
-                        design::TEXT_CAPTION,
+                    widget::container(selectable_prose::logical_text(
+                        vec![iced::widget::text::Span::new(text)].into(),
+                        design::TEXT_CAPTION.into(),
                         iced::Font::MONOSPACE,
                         self.target,
+                        None,
+                        selectable_prose::Logical {
+                            identity: selection::logical_identity(&item.id, &[2]),
+                            start: 0,
+                            paint: self.find_paint.clone(),
+                        },
                     ))
                     .width(Length::Fill)
                     .into(),
@@ -5789,7 +6272,11 @@ mod tests {
         let content = widget::column::with_children(vec![
             runtime.prompt_view(prompt),
             transcript_body("Queued message", runtime.target),
-            notice_entry("Provider warning", runtime.target),
+            notice_entry(
+                "Provider warning",
+                runtime.target,
+                notice_identity(None, "Provider warning"),
+            ),
             output.view(
                 crate::settings::EditorSyntaxTheme::Auto,
                 None,
@@ -5909,6 +6396,390 @@ mod tests {
             clipboard.0,
             format!("{expected}\n\nQueued message\n\nProvider warning\n\ntool output\n")
         );
+    }
+
+    #[test]
+    fn forgetting_a_conversation_releases_catalog_and_selection_contexts() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
+        let (catalog, _) = runtime.selection_document();
+        let backing = Arc::downgrade(&catalog);
+        assert!(catalog.retained_plain_bytes() > 0);
+        drop(catalog);
+        runtime.forget_transcript();
+        assert!(runtime.selection_document.borrow().is_none());
+        assert!(runtime.selection_bookmarks.borrow().is_empty());
+        assert!(
+            backing.upgrade().is_none(),
+            "no orphan logical plaintext owner survives reset"
+        );
+    }
+
+    #[test]
+    fn notice_projection_keeps_exact_visible_newlines() {
+        for body in ["short", "short\n", "short\n\n"] {
+            assert_eq!(visible_notice_body(body, false), body);
+            assert_eq!(visible_notice_body(body, true), body);
+        }
+        let long = "line\n".repeat(NOTICE_LINES + 1);
+        assert_eq!(
+            visible_notice_body(&long, false),
+            vec!["line"; NOTICE_LINES].join("\n")
+        );
+        assert_eq!(visible_notice_body(&long, true), long);
+    }
+
+    #[test]
+    fn failure_catalog_keeps_visible_turn_order_and_duplicate_messages_distinct() {
+        let items = frame_cost::transcript(2);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        assert_eq!(runtime.turns.len(), 2);
+        let first = runtime.turns[0].key.clone();
+        let second = runtime.turns[1].key.clone();
+        runtime.failures = vec![
+            (Some(first.clone()), "Repeated failure".into()),
+            (Some(second.clone()), "Repeated failure".into()),
+        ];
+        runtime.error = Some("Current failure".into());
+        let (catalog, _) = runtime.selection_document();
+        let blocks = catalog.search_blocks();
+        let identities: Vec<_> = blocks.iter().map(|(identity, _)| *identity).collect();
+        let position = |identity| {
+            identities
+                .iter()
+                .position(|candidate| *candidate == identity)
+                .unwrap()
+        };
+        let first_notice = position(notice_identity(Some(&first), "Repeated failure"));
+        let second_notice = position(notice_identity(Some(&second), "Repeated failure"));
+        let second_prompt = &items[runtime.turns[1].prompt[0]];
+        assert!(first_notice < position(selection::logical_identity(&second_prompt.id, &[2])));
+        assert!(second_notice > first_notice);
+        assert_eq!(blocks.last().unwrap().1.as_ref(), "Current failure");
+    }
+
+    #[test]
+    fn queued_and_notice_widgets_copy_through_logical_catalog() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let items = frame_cost::transcript(1);
+        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        let queued = Queued {
+            text: "Queued message".into(),
+            resolved_text: "Queued message".into(),
+            attachments: vec![],
+            model: None,
+            draft: runtime.session.clone(),
+            since: None,
+            rechecking: false,
+        };
+        let mut delivery = items[0].clone();
+        delivery.id = "delivery-notice".into();
+        delivery.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "Provider report".into(),
+            body: "Delivered warning".into(),
+        };
+        let cached = CachedItem::new(&delivery.content, crate::settings::EditorSyntaxTheme::Auto);
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let first = notice_identity(Some("turn-a"), "Repeated failure");
+        let second = notice_identity(Some("turn-b"), "Repeated failure");
+        assert_ne!(first, second);
+        let mut builder = selection::Catalog::builder();
+        builder.logical(first, Arc::from("Repeated failure"));
+        builder.plain("queued-prompt", &[2], Arc::from("Queued message"));
+        builder.plain(&delivery.id, &[2], Arc::from("Delivered warning"));
+        builder.logical(second, Arc::from("Repeated failure"));
+        let content = widget::column::with_children(vec![
+            notice_entry("Repeated failure", runtime.target, first),
+            runtime.queued_view(&queued),
+            runtime.delivery_view(&delivery, &cached, settings),
+            notice_entry("Repeated failure", runtime.target, second),
+        ]);
+        let mut element = selection::transcript_virtualized(
+            content,
+            runtime.target,
+            None,
+            builder.finish(),
+            Default::default(),
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1200.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        #[derive(Default)]
+        struct ReadText(Vec<(String, iced::Rectangle)>);
+        impl Operation for ReadText {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                    self.0.push((prose.plain.to_string(), bounds));
+                }
+            }
+        }
+        let mut text = ReadText::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut text,
+        );
+        assert_eq!(
+            text.0
+                .iter()
+                .map(|(text, _)| text.clone())
+                .collect::<Vec<_>>(),
+            [
+                "Repeated failure",
+                "Queued message",
+                "Delivered warning",
+                "Repeated failure"
+            ]
+        );
+        #[derive(Default)]
+        struct ClipboardText(String);
+        impl iced::advanced::Clipboard for ClipboardText {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+                self.0 = contents;
+            }
+        }
+        let first = text.0.first().unwrap().1;
+        let last = text.0.last().unwrap().1;
+        let start = iced::Point::new(first.x, first.y + 3.0);
+        let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+        let mut clipboard = ClipboardText::default();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 1200.0));
+        for (event, pointer) in [
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                start,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                end,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+                end,
+            ),
+            (
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("c".into()),
+                    modified_key: keyboard::Key::Character("c".into()),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                }),
+                end,
+            ),
+        ] {
+            let mut messages = Vec::new();
+            let mut shell = iced::advanced::Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                iced::mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_event_captured());
+            if shell.is_layout_invalid() {
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+        }
+        assert_eq!(
+            clipboard.0,
+            "Repeated failure\n\nQueued message\n\nDelivered warning\n\nRepeated failure"
+        );
+    }
+
+    #[test]
+    fn pointer_copy_across_visual_paragraph_and_code_chunks_adds_no_separators() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let items = frame_cost::transcript(1);
+        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        for source in [
+            "bounded αβ words ".repeat(300),
+            format!("```\n{}```", "αβ item line\n".repeat(100)),
+        ] {
+            let cached = CachedItem::new(
+                &ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            let mut builder = selection::Catalog::builder();
+            builder.markdown(
+                &format!("unbound-{}", cached.revision),
+                &[0],
+                cached.markdown.items(),
+            );
+            let catalog = builder.finish();
+            let expected = catalog
+                .search_blocks()
+                .into_iter()
+                .map(|(_, text)| text.to_string())
+                .collect::<String>();
+            let content = scroll::transcript(
+                prose::view(&cached, settings, runtime.target, None),
+                runtime.target,
+                None,
+                vec![],
+                true,
+                vec![],
+            );
+            let mut element = selection::transcript_virtualized(
+                content,
+                runtime.target,
+                None,
+                catalog,
+                Default::default(),
+            );
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 3000.0));
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            #[derive(Default)]
+            struct ReadText(Vec<(String, iced::Rectangle)>);
+            impl Operation for ReadText {
+                fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                    operate(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&iced::advanced::widget::Id>,
+                    bounds: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                        self.0.push((prose.plain.to_string(), bounds));
+                    }
+                }
+            }
+            let mut text = ReadText::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &renderer,
+                &mut text,
+            );
+            assert!(
+                text.0.len() >= 2,
+                "fixture crosses a real visual chunk seam"
+            );
+            assert_eq!(
+                text.0
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>(),
+                expected
+            );
+            #[derive(Default)]
+            struct ClipboardText(String);
+            impl iced::advanced::Clipboard for ClipboardText {
+                fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                    Some(self.0.clone())
+                }
+                fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+                    self.0 = contents;
+                }
+            }
+            let first = text.0.first().unwrap().1;
+            let last = text.0.last().unwrap().1;
+            let start = iced::Point::new(first.x, first.y + 3.0);
+            let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+            let mut clipboard = ClipboardText::default();
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 3000.0));
+            for (event, pointer) in [
+                (
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                    start,
+                ),
+                (
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                    end,
+                ),
+                (
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )),
+                    end,
+                ),
+                (
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character("c".into()),
+                        modified_key: keyboard::Key::Character("c".into()),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::CTRL,
+                        text: None,
+                        repeat: false,
+                    }),
+                    end,
+                ),
+            ] {
+                let mut messages = Vec::new();
+                let mut shell = iced::advanced::Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    iced::advanced::Layout::new(&node),
+                    iced::mouse::Cursor::Available(pointer),
+                    &renderer,
+                    &mut clipboard,
+                    &mut shell,
+                    &viewport,
+                );
+                assert!(shell.is_event_captured());
+                if shell.is_layout_invalid() {
+                    node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                }
+            }
+            assert_eq!(
+                clipboard.0, expected,
+                "visual chunk seams are absent from copied logical source"
+            );
+        }
     }
 
     #[test]
@@ -6072,6 +6943,19 @@ mod tests {
     }
 
     #[test]
+    fn new_turn_activity_keeps_completed_historical_reasoning_retained() {
+        let items = frame_cost::transcript(3);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let idle = fingerprints(&runtime, true);
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        assert_eq!(
+            idle,
+            fingerprints(&runtime, true),
+            "all fixture reasoning already has a later final answer"
+        );
+    }
+
+    #[test]
     fn busy_changes_invalidate_only_turns_containing_reasoning() {
         let mut items = frame_cost::transcript(2);
         items.retain(|item| !matches!(item.content, ItemContent::Text { thinking: true, .. }));
@@ -6217,6 +7101,31 @@ mod tests {
             ..Snapshot::default()
         });
         runtime.refresh();
+    }
+
+    #[test]
+    fn prose_only_refresh_keeps_prompt_strings_and_turn_group_allocations() {
+        let mut items = frame_cost::transcript(1);
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let prompt = runtime.history[0].as_ptr();
+        let turns = runtime.turns.as_ptr();
+        let prose = runtime.turns.last().unwrap().prose.as_ptr();
+        let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content else {
+            unreachable!()
+        };
+        text.push_str(" More streamed text.");
+        publish(&mut runtime, &handle, &items, 20);
+        assert_eq!(
+            runtime.history[0].as_ptr(),
+            prompt,
+            "unchanged history strings are not cloned"
+        );
+        assert_eq!(
+            runtime.turns.as_ptr(),
+            turns,
+            "unchanged placement is not regrouped"
+        );
+        assert_eq!(runtime.turns.last().unwrap().prose.as_ptr(), prose);
     }
 
     #[test]
@@ -6432,10 +7341,10 @@ mod tests {
         assert_ne!(toggled, fingerprint(&runtime, false), "the syntax theme");
     }
 
-    /// An open step shows its output in an editor that borrows from the
-    /// cache, so its exchange is built afresh rather than kept.
+    /// Open details own their content, and remain reusable until a rendered
+    /// input changes. Disclosure itself must change that key.
     #[test]
-    fn an_exchange_with_an_open_step_is_not_retained() {
+    fn an_open_steps_retained_key_changes_once_for_its_disclosure() {
         let items = frame_cost::transcript(1);
         let (mut runtime, _handle) = frame_cost::live_runtime(&items);
         let strip = runtime
@@ -6443,12 +7352,17 @@ mod tests {
             .iter()
             .position(|turn| !turn.steps.is_empty())
             .expect("a group with steps");
-        assert!(runtime.retainable(&runtime.turns[strip]));
+        let closed = runtime.turn_fingerprint(&runtime.turns[strip], true);
         let step = runtime.turns[strip].steps[0].index;
         runtime
             .expanded
             .insert(runtime.snapshot.items[step].id.clone());
-        assert!(!runtime.retainable(&runtime.turns[strip]));
+        let opened = runtime.turn_fingerprint(&runtime.turns[strip], true);
+        assert_ne!(closed, opened);
+        assert_eq!(
+            opened,
+            runtime.turn_fingerprint(&runtime.turns[strip], true)
+        );
     }
 
     /// Every kind of Markdown block an answer can hold is drawn by the
@@ -7349,8 +8263,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -7600,10 +8520,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(

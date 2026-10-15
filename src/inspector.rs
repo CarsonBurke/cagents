@@ -503,6 +503,32 @@ pub struct InspectorModel {
     pub actions: Vec<Action>,
 }
 
+/// Known chat payload owners, not process RSS or a complete heap estimate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatMemory {
+    pub source_bytes: usize,
+    pub presentation_bytes: usize,
+    pub selection_bytes: usize,
+    pub prepared_items: usize,
+}
+
+pub fn with_chat_memory(mut model: InspectorModel, memory: ChatMemory) -> InspectorModel {
+    if let Some(section) = model
+        .sections
+        .iter_mut()
+        .find(|section| section.title == "Chat")
+    {
+        section.facts.extend([
+            Fact::new("Loaded transcript payload", format!("{} bytes", memory.source_bytes)).diagnostic(),
+            Fact::new("Prepared presentation payload", format!("{} bytes", memory.presentation_bytes)).diagnostic(),
+            Fact::new("Logical selection payload", format!("{} bytes", memory.selection_bytes)).diagnostic(),
+            Fact::new("Prepared transcript items", memory.prepared_items.to_string()).diagnostic(),
+            Fact::new("Memory accounting", "Known payload only. Shared bodies, parser/font/renderer allocations and images are not a complete heap or RSS estimate.").diagnostic(),
+        ]);
+    }
+    model
+}
+
 pub fn model_for_card(
     card: &CardState,
     runtime: RuntimeStatus,

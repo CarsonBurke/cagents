@@ -11,10 +11,15 @@ use iced::{Event, Point, Rectangle, Size, Vector};
 use std::any::Any;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
+use std::{cell::RefCell, rc::Rc};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod boundary;
+mod document;
 pub(super) use boundary::{Kind, wrap};
+pub(super) use document::{
+    Bookmark, Builder as DocumentBuilder, Catalog, identity as logical_identity,
+};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -25,20 +30,40 @@ pub(super) fn transcript<'a>(
     subagent: Option<&'a str>,
 ) -> Element<'a, Message> {
     Element::new(Selection {
+        catalog: None,
+        bookmark: None,
         content: content.into(),
         context: Some((target, subagent)),
         click_clock: iced::time::Instant::now,
     })
 }
 
+pub(super) fn transcript_virtualized<'a>(
+    content: impl Into<Element<'a, Message>>,
+    target: Target,
+    subagent: Option<&'a str>,
+    catalog: Arc<Catalog>,
+    bookmark: Rc<RefCell<Bookmark>>,
+) -> Element<'a, Message> {
+    Element::new(Selection {
+        content: content.into(),
+        context: Some((target, subagent)),
+        catalog: Some(catalog),
+        bookmark: Some(bookmark),
+        click_clock: iced::time::Instant::now,
+    })
+}
+
 struct Selection<'a> {
+    catalog: Option<Arc<Catalog>>,
+    bookmark: Option<Rc<RefCell<Bookmark>>>,
     content: Element<'a, Message>,
     context: Option<(Target, Option<&'a str>)>,
     click_clock: fn() -> iced::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Endpoint {
+pub(super) struct Endpoint {
     identity: u64,
     byte: usize,
 }
@@ -110,10 +135,16 @@ impl State {
         };
         if let Some((start, end)) = self.initial {
             let index = |point: Endpoint| {
-                read.blocks
-                    .iter()
-                    .position(|block| block.identity == point.identity)
-                    .map(|index| (index, point.byte))
+                if let Some(catalog) = &read.catalog {
+                    catalog
+                        .position(point.identity)
+                        .map(|index| (index, point.byte))
+                } else {
+                    read.blocks
+                        .iter()
+                        .position(|block| block.identity == point.identity)
+                        .map(|index| (index, point.byte))
+                }
             };
             if index(low) < index(start) {
                 self.anchor = Some(end);
@@ -197,6 +228,7 @@ struct Ranges {
     blocks: Vec<Range<usize>>,
     lo: (usize, usize),
     hi: (usize, usize),
+    logical: Option<(Endpoint, Endpoint)>,
 }
 impl std::ops::Deref for Ranges {
     type Target = [Range<usize>];
@@ -216,7 +248,13 @@ struct Block {
     cell: Option<Cell>,
 }
 
+struct LogicalText {
+    identity: u64,
+    plain: Arc<str>,
+}
+
 struct Read {
+    catalog: Option<Arc<Catalog>>,
     blocks: Vec<Block>,
     pointer: Option<Point>,
     translation: Vector,
@@ -230,6 +268,7 @@ struct Read {
 impl Read {
     fn new(pointer: Option<Point>) -> Self {
         Self {
+            catalog: None,
             blocks: Vec::new(),
             pointer,
             translation: Vector::ZERO,
@@ -241,6 +280,12 @@ impl Read {
         }
     }
 
+    fn with_catalog(pointer: Option<Point>, catalog: Option<Arc<Catalog>>) -> Self {
+        Self {
+            catalog,
+            ..Self::new(pointer)
+        }
+    }
     fn list_markers(&self) -> Vec<ListMarker> {
         let mut lists = Vec::new();
         let mut indent = 0;
@@ -279,6 +324,19 @@ impl Read {
     }
 
     fn ranges(&self, anchor: Endpoint, end: Endpoint) -> Option<Ranges> {
+        if let Some(catalog) = &self.catalog {
+            catalog.bounds(anchor, end)?;
+            return Some(Ranges {
+                lo: (0, 0),
+                hi: (self.blocks.len().saturating_sub(1), 0),
+                blocks: self
+                    .blocks
+                    .iter()
+                    .map(|block| catalog.range(anchor, end, block.identity))
+                    .collect(),
+                logical: Some((anchor, end)),
+            });
+        }
         let locate = |point: Endpoint| {
             self.blocks
                 .iter()
@@ -297,6 +355,7 @@ impl Read {
         Some(Ranges {
             lo,
             hi,
+            logical: None,
             blocks: self
                 .blocks
                 .iter()
@@ -391,6 +450,12 @@ impl Read {
     }
 
     fn copy(&self, ranges: &Ranges) -> String {
+        if let Some(catalog) = &self.catalog {
+            return ranges
+                .logical
+                .and_then(|(anchor, end)| catalog.copy(anchor, end))
+                .unwrap_or_default();
+        }
         let values = self.table_values(ranges);
         let mut result = String::new();
         let mut emitted = false;
@@ -549,6 +614,10 @@ impl Operation for Read {
     }
 
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.visit = false;
+            return;
+        }
         if let Some(enter) = state.downcast_ref::<boundary::Enter>() {
             if let Kind::Table { columns, rows } = &enter.kind {
                 self.table_order.push(enter.identity);
@@ -594,19 +663,38 @@ impl Operation for Read {
             }
             return;
         }
-        let Some(prose) = state.downcast_mut::<Prose>() else {
-            return;
-        };
-        prose.managed = true;
         let bounds = Rectangle {
             x: bounds.x - self.translation.x,
             y: bounds.y - self.translation.y,
             ..bounds
         };
-        let position = self
-            .clip
-            .map_or(self.pointer, |clip| clipped_pointer(self.pointer, clip))
-            .map(|point| point - Vector::new(bounds.x, bounds.y));
+        let (identity, plain, hit, link, mounted) =
+            if let Some(prose) = state.downcast_mut::<Prose>() {
+                prose.managed = true;
+                prose.logical_active = self.catalog.is_some() && prose.logical.is_some();
+                let logical = prose.logical.as_ref().filter(|_| prose.logical_active);
+                let position = self
+                    .clip
+                    .map_or(self.pointer, |clip| clipped_pointer(self.pointer, clip))
+                    .map(|point| point - Vector::new(bounds.x, bounds.y));
+                (
+                    logical.map_or(prose.identity, |logical| logical.identity),
+                    logical
+                        .and_then(|logical| self.catalog.as_ref()?.text(logical.identity))
+                        .unwrap_or_else(|| prose.plain.clone()),
+                    position.map_or(0, |point| {
+                        prose.hit(point) + logical.map_or(0, |logical| logical.start)
+                    }),
+                    position
+                        .filter(|_| self.pointer.is_some_and(|point| bounds.contains(point)))
+                        .and_then(|point| prose.target.zip(prose.link(point))),
+                    true,
+                )
+            } else if let Some(logical) = state.downcast_ref::<LogicalText>() {
+                (logical.identity, logical.plain.clone(), 0, None, false)
+            } else {
+                return;
+            };
         let lists = self.list_markers();
         let mut table = None;
         let mut cell = None;
@@ -626,7 +714,7 @@ impl Operation for Read {
                 }
             }
         }
-        if !prose.plain.is_empty() {
+        if !plain.is_empty() {
             for frame in &self.frames {
                 if let Some(table) = self.tables.get_mut(&frame.identity) {
                     table.has_text = true;
@@ -634,18 +722,19 @@ impl Operation for Read {
             }
         }
         self.blocks.push(Block {
-            identity: prose.identity,
+            identity,
             lists,
             cell,
-            plain: prose.plain.clone(),
+            plain,
             bounds,
-            visible: self
-                .clip
-                .map_or(Some(bounds), |clip| bounds.intersection(&clip)),
-            hit: position.map_or(0, |point| prose.hit(point)),
-            link: position
-                .filter(|_| self.pointer.is_some_and(|point| bounds.contains(point)))
-                .and_then(|point| prose.target.zip(prose.link(point))),
+            visible: mounted
+                .then(|| {
+                    self.clip
+                        .map_or(Some(bounds), |clip| bounds.intersection(&clip))
+                })
+                .flatten(),
+            hit,
+            link,
         });
     }
 }
@@ -664,6 +753,11 @@ struct DragScroll {
     bottom_id: Option<Id>,
 }
 impl Operation for DragScroll {
+    fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Any) {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.visit = false;
+        }
+    }
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         if !self.visited {
             visit(self);
@@ -727,6 +821,10 @@ impl Operation for Apply<'_> {
         operate(self);
     }
     fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Any) {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.visit = false;
+            return;
+        }
         if let Some(invalidation) = state.downcast_mut::<retained::LayoutInvalidation>() {
             match invalidation {
                 retained::LayoutInvalidation::Enter => self.exchanges.push(self.changed),
@@ -742,7 +840,17 @@ impl Operation for Apply<'_> {
         let Some(prose) = state.downcast_mut::<Prose>() else {
             return;
         };
-        let range = self.ranges.get(self.index).cloned().unwrap_or(0..0);
+        let mut range = self.ranges.get(self.index).cloned().unwrap_or(0..0);
+        if let Some(logical) = prose.logical.as_ref().filter(|_| prose.logical_active) {
+            range = range
+                .start
+                .saturating_sub(logical.start)
+                .min(prose.plain.len())
+                ..range
+                    .end
+                    .saturating_sub(logical.start)
+                    .min(prose.plain.len());
+        }
         self.index += 1;
         if (prose.anchor, prose.end) != (range.start, range.end) {
             prose.anchor = range.start;
@@ -771,7 +879,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         tree::Tag::of::<State>()
     }
     fn state(&self) -> tree::State {
+        let bookmark = self
+            .bookmark
+            .as_ref()
+            .map(|bookmark| *bookmark.borrow())
+            .unwrap_or_default();
         tree::State::new(State {
+            anchor: bookmark.anchor,
+            end: bookmark.end,
             context: self
                 .context
                 .map(|(target, subagent)| (target, subagent.map(str::to_owned))),
@@ -794,6 +909,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                     .context
                     .map(|(target, subagent)| (target, subagent.map(str::to_owned))),
                 reset: true,
+                anchor: self
+                    .bookmark
+                    .as_ref()
+                    .and_then(|bookmark| bookmark.borrow().anchor),
+                end: self
+                    .bookmark
+                    .as_ref()
+                    .and_then(|bookmark| bookmark.borrow().end),
                 ..State::default()
             };
         }
@@ -816,8 +939,28 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits);
         let state = tree.state.downcast_mut::<State>();
+        if let (Some(catalog), Some(bookmark)) = (&self.catalog, &self.bookmark) {
+            let saved = *bookmark.borrow();
+            let changed = saved
+                .anchor
+                .zip(saved.anchor_prefix)
+                .is_some_and(|(point, hash)| {
+                    catalog.fingerprint(point).is_some_and(|now| now != hash)
+                })
+                || saved
+                    .end
+                    .zip(saved.end_prefix)
+                    .is_some_and(|(point, hash)| {
+                        catalog.fingerprint(point).is_some_and(|now| now != hash)
+                    });
+            if changed {
+                state.anchor = None;
+                state.end = None;
+                *bookmark.borrow_mut() = Bookmark::default();
+            }
+        }
         if state.anchor.is_some() || std::mem::take(&mut state.reset) {
-            let mut read = Read::new(None);
+            let mut read = Read::with_catalog(None, self.catalog.clone());
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 Layout::new(&node),
@@ -828,7 +971,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 .anchor
                 .zip(state.end)
                 .and_then(|(anchor, end)| read.ranges(anchor, end));
-            if ranges.is_none() {
+            if ranges.is_none()
+                && !self
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.is_empty())
+            {
                 state.anchor = None;
                 state.end = None;
                 state.dragging = false;
@@ -959,11 +1107,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             }
         }
         if press || (state.dragging && (motion || release)) || command.is_some() {
-            let mut read = Read::new(if state.dragging && !press {
-                clipped_pointer(cursor.position(), visible)
-            } else {
-                cursor.position()
-            });
+            let mut read = Read::with_catalog(
+                if state.dragging && !press {
+                    clipped_pointer(cursor.position(), visible)
+                } else {
+                    cursor.position()
+                },
+                self.catalog.clone(),
+            );
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
@@ -1049,21 +1200,32 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 }
                 captured = true;
             } else if command.is_some_and(|key| key.eq_ignore_ascii_case("a")) {
-                state.anchor = read.blocks.first().map(|block| Endpoint {
-                    identity: block.identity,
-                    byte: 0,
-                });
-                state.end = read.blocks.last().map(|block| Endpoint {
-                    identity: block.identity,
-                    byte: block.plain.len(),
-                });
+                if let Some(catalog) = &self.catalog {
+                    let endpoints = catalog.endpoints();
+                    state.anchor = endpoints.map(|(anchor, _)| anchor);
+                    state.end = endpoints.map(|(_, end)| end);
+                } else {
+                    state.anchor = read.blocks.first().map(|block| Endpoint {
+                        identity: block.identity,
+                        byte: 0,
+                    });
+                    state.end = read.blocks.last().map(|block| Endpoint {
+                        identity: block.identity,
+                        byte: block.plain.len(),
+                    });
+                }
                 captured = state.anchor.is_some();
             }
             let ranges = state
                 .anchor
                 .zip(state.end)
                 .and_then(|(anchor, end)| read.ranges(anchor, end));
-            if ranges.is_none() {
+            if ranges.is_none()
+                && !self
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.is_empty())
+            {
                 state.anchor = None;
                 state.end = None;
                 state.dragging = false;
@@ -1107,10 +1269,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         {
             // Scrollables update their native offsets above. Hit-test again
             // in that coordinate space even when the pointer stayed still.
-            let mut read = Read::new(clipped_pointer(
-                tree.state.downcast_ref::<State>().pointer,
-                visible,
-            ));
+            let mut read = Read::with_catalog(
+                clipped_pointer(tree.state.downcast_ref::<State>().pointer, visible),
+                self.catalog.clone(),
+            );
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
@@ -1141,6 +1303,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             if apply.changed > 0 {
                 shell.invalidate_layout();
             }
+        }
+        if let Some(bookmark) = &self.bookmark {
+            let state = tree.state.downcast_ref::<State>();
+            *bookmark.borrow_mut() = Bookmark {
+                anchor: state.anchor,
+                end: state.end,
+                anchor_prefix: state
+                    .anchor
+                    .and_then(|point| self.catalog.as_ref()?.fingerprint(point)),
+                end_prefix: state
+                    .end
+                    .and_then(|point| self.catalog.as_ref()?.fingerprint(point)),
+            };
         }
         if captured {
             shell.capture_event();
@@ -1519,6 +1694,8 @@ mod tests {
     }
     fn surface<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
         Element::new(Selection {
+            catalog: None,
+            bookmark: None,
             content: content.into(),
             context: None,
             click_clock: iced::time::Instant::now,
@@ -1620,6 +1797,8 @@ mod tests {
         // Renderer/font work may exceed the real double-click deadline under
         // parallel tests. Keep the actual event path with explicit click times.
         let mut element = Element::new(Selection {
+            catalog: None,
+            bookmark: None,
             content: content.into(),
             context: None,
             click_clock: next_click_time,
@@ -2475,5 +2654,82 @@ mod tests {
         );
         read.pointer = Some(Point::new(30.0, 25.0));
         assert!(read.endpoint(true).is_some());
+    }
+    #[test]
+    fn logical_search_data_can_leave_the_ui_thread_without_presentation_state() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Catalog>();
+        send_sync::<Vec<(u64, Arc<str>)>>();
+        let content = markdown::Content::parse("Search **rendered** text.");
+        let mut builder = Catalog::builder();
+        builder.markdown("item", &[0], content.items());
+        let catalog = builder.finish();
+        let blocks = catalog.search_blocks();
+        assert_eq!(blocks[0].1.as_ref(), "Search rendered text.");
+        assert_eq!(
+            catalog.retained_plain_bytes(),
+            blocks.iter().map(|(_, text)| text.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn logical_catalog_uses_the_existing_structure_aware_copy_oracle() {
+        for body in [
+            "A **bold** paragraph.\n\n```rust\nlet value = 42;\n```\n",
+            "7. α first\n8. β second\n\n- [x] done\n  - nested\n- [ ] pending\n",
+            "| α | β |\n| --- | --- |\n| first | second |\n| | |\n",
+            "> A quoted paragraph.\n>\n> - one\n> - two\n",
+        ] {
+            let content = markdown::Content::parse(body);
+            let mut builder = Catalog::builder();
+            builder.markdown("message", &[0], content.items());
+            let catalog = builder.finish();
+            let (start, end) = catalog.endpoints().unwrap();
+            let mut element = rendered_markdown(body, |_| {});
+            let mut tree = Tree::new(&element);
+            let read = read_rendered(&mut element, &mut tree);
+            let last = read.blocks.len() - 1;
+            let expected = copy_between(&read, 0, 0, last, read.blocks[last].plain.len());
+            assert_eq!(catalog.copy(start, end).unwrap(), expected, "{body:?}");
+            assert_eq!(catalog.copy(end, start).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn logical_endpoints_survive_offscreen_eviction_and_catalog_rehydration() {
+        let body = format!(
+            "α first\n\n{}\n\nβ last",
+            "offscreen paragraph\n\n".repeat(10000)
+        );
+        let build = || {
+            let content = markdown::Content::parse(&body);
+            let mut builder = Catalog::builder();
+            builder.markdown("stable-item", &[0], content.items());
+            builder.finish()
+        };
+        let first = build();
+        let (start, end) = first.endpoints().unwrap();
+        let bookmark = Bookmark {
+            anchor: Some(start),
+            end: Some(end),
+            ..Default::default()
+        };
+        let expected = first.copy(start, end).unwrap();
+        drop(first);
+        let rehydrated = build();
+        assert_eq!(
+            rehydrated
+                .copy(bookmark.anchor.unwrap(), bookmark.end.unwrap())
+                .unwrap(),
+            expected
+        );
+        // A sparse pointer frame has no widget for either endpoint. It can
+        // still resolve the logical range without traversing hidden widgets.
+        let sparse = Read::with_catalog(None, Some(rehydrated));
+        let ranges = sparse
+            .ranges(start, end)
+            .expect("offscreen logical endpoints");
+        assert!(ranges.blocks.is_empty());
+        assert_eq!(sparse.copy(&ranges), expected);
     }
 }
