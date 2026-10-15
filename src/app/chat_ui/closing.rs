@@ -134,11 +134,11 @@ impl Cagents {
     /// separately, including the legitimate unlearned/learned thread pair.
     pub(in crate::app) fn capture_conversation_end_target(&self, card: CardId) -> Option<Arc<sidebar::ConversationEndTarget>> {
         let source = self.chat_close_source(card)?;
-        let (channel, channel_project, worktree, shared_scope, shared_repository, shared_worktree, shared_worktree) = self.conversation_end_placement(card)?;
+        let (channel, channel_project, worktree, shared_scope, shared_repository, shared_worktree) = self.conversation_end_placement(card)?;
         if !self.conversation_end_shared_source_current(card, &source.descriptor, shared_scope.as_ref()) { return None; }
         Some(Arc::new(sidebar::ConversationEndTarget {
             card, registry: source.registry, issued: Arc::new(source.descriptor), observed: Arc::new(source.session),
-            channel, channel_project, worktree, shared_scope, shared_repository,
+            channel, channel_project, worktree, shared_scope, shared_repository, shared_worktree,
         }))
     }
     /// The registry can replace a pane before the local descriptor adopts it.
