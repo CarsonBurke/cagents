@@ -111,7 +111,7 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
 };
 
-pub(super) fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     a.is_file() && b.is_file() && a.dev() == b.dev() && a.ino() == b.ino()
 }
 
@@ -129,14 +129,14 @@ fn full_version(m: &fs::Metadata) -> ((u64, u32, u32, u32, i64, i64), i64, i64) 
     (stable_version(m), m.ctime(), m.ctime_nsec())
 }
 
-pub(super) struct SaveBaseline {
+struct SaveBaseline {
     metadata: fs::Metadata,
     attributes: BTreeMap<OsString, Vec<u8>>,
     hash: blake3::Hash,
     hash_limit: u64,
 }
 impl SaveBaseline {
-    pub(super) fn capture(file: &File, hash: Option<blake3::Hash>) -> Result<Self, FileIoError> {
+    fn capture(file: &File, hash: Option<blake3::Hash>) -> Result<Self, FileIoError> {
         let metadata = file.metadata().map_err(io_error)?;
         let attributes = fs_safety::content_attributes(file).map_err(io_error)?;
         // Forced Save ignores the old loaded hash, not a concurrent writer.
@@ -162,7 +162,7 @@ impl SaveBaseline {
             hash_limit,
         })
     }
-    pub(super) fn ensure_initial(&self, metadata: &fs::Metadata) -> Result<(), FileIoError> {
+    fn ensure_initial(&self, metadata: &fs::Metadata) -> Result<(), FileIoError> {
         if !same_file(&self.metadata, metadata)
             || full_version(&self.metadata) != full_version(metadata)
         {
@@ -408,7 +408,7 @@ std::thread_local! {
 /// The replacement is prepared privately, then the actual current destination
 /// is acquired and verified. Publication and error restoration never replace
 /// an entry another writer installed at the destination.
-pub(super) fn publish_replacement(
+fn publish_replacement(
     parent: &Root,
     name: &Path,
     destination: &File,
@@ -801,4 +801,3 @@ fn clean_before_acquire(
         remove_temporary(holding, name, file, baseline).and_then(|()| holding.remove_empty(parent));
     append_cleanup(error, cleanup)
 }
-
