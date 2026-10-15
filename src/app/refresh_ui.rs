@@ -319,6 +319,7 @@ impl Cagents {
     }
 
     pub(super) fn cancel_source_read(&mut self) {
+        tracing::debug!(target: "cagents::source_control", phase = "read_cancel", request = self.refresh_ui.source_generation, had_reader = self.refresh_ui.source_cancel.is_some(), "source control read generation advanced");
         if let Some(cancel) = self.refresh_ui.source_cancel.take() {
             cancel.cancel();
         }

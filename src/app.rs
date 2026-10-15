@@ -10063,6 +10063,9 @@ impl Cagents {
         let changed = self
             .sidebar_state
             .sync_active_worktree(&self.sidebar_model, &focus);
+        if changed {
+            tracing::debug!(target: "cagents::source_control", phase = "rebind", old = ?self.sidebar_model.source_control.as_ref().map(|source| &source.key), new = ?self.sidebar_state.active_worktree(), "source control binding changed");
+        }
         if crate::device::is_remote() {
             if changed
                 || self.sidebar_model.source_control.is_some()
@@ -10900,6 +10903,7 @@ impl Cagents {
         }
         self.cancel_source_read();
         let request = self.refresh_ui.source_generation;
+        tracing::debug!(target: "cagents::source_control", phase = "read_start", request, worktree = %key.canonical_path.display(), "source control read started");
         let cancellation = CancellationToken::default();
         self.refresh_ui.source_cancel = Some(cancellation.clone());
         if self.folder_scope(&key) {
@@ -10985,6 +10989,7 @@ impl Cagents {
             .map_err(|error| format!("source-control reader join failed: {error}"))
             .and_then(|result| result)
             .map(Box::new);
+            tracing::debug!(target: "cagents::source_control", phase = "read_finished", request, worktree = %key.canonical_path.display(), elapsed_ms = started.elapsed().as_millis() as u64, ok = result.is_ok(), staged = ?result.as_ref().ok().map(|snapshot| snapshot.status.area(crate::repository::ChangeArea::Staged).count()), unstaged = ?result.as_ref().ok().map(|snapshot| snapshot.status.area(crate::repository::ChangeArea::Unstaged).count()), "source control read finished");
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -11065,6 +11070,7 @@ impl Cagents {
         );
         source.set_error(None);
         source.set_mutation(Some(kind));
+        tracing::debug!(target: "cagents::source_control", phase = "mutation_start", operation = %id, ?kind, worktree = %key.canonical_path.display(), "source control mutation started");
         Some(id)
     }
 
@@ -11088,6 +11094,7 @@ impl Cagents {
                 Ok(outcome) => outcome,
                 Err(error) => (Some(format!("Git worker failed: {error}")), false),
             };
+            tracing::debug!(target: "cagents::source_control", phase = "mutation_finished", operation = %operation, worktree = %key.canonical_path.display(), elapsed_ms = started.elapsed().as_millis() as u64, failed = report.is_some(), "source control mutation finished");
             Message::SourceControlMutated {
                 key,
                 operation,
@@ -16300,6 +16307,7 @@ impl Application for Cagents {
                 request,
                 result,
             } => {
+                tracing::debug!(target: "cagents::source_control", phase = "read_delivery", request, current_request = self.refresh_ui.source_generation, bound = self.source_control_is_bound(&key), worktree = %key.canonical_path.display(), "source control read delivered");
                 if request != self.refresh_ui.source_generation
                     || !self.source_control_is_bound(&key)
                 {
@@ -16332,6 +16340,9 @@ impl Application for Cagents {
                     previous.carry_mutation_into(&mut next);
                 }
                 self.sidebar_model.source_control = Some(next);
+                if let Some(source) = &self.sidebar_model.source_control {
+                    tracing::debug!(target: "cagents::source_control", phase = "model_installed", request, worktree = %source.key.canonical_path.display(), staged = source.staged_count, unstaged = source.group(crate::repository::ChangeArea::Unstaged).map_or(0, |group| group.rows().len()), busy = source.busy(), "source control model installed");
+                }
                 match result {
                     Ok(snapshot) => self.refresh_branch_changes(&snapshot),
                     Err(_) => {
@@ -16383,6 +16394,7 @@ impl Application for Cagents {
                 report,
                 committed,
             } => {
+                tracing::debug!(target: "cagents::source_control", phase = "mutation_delivery", operation = %operation, owner = ?self.source_control_mutations.get(&key.canonical_path).map(|mutation| mutation.id), worktree = %key.canonical_path.display(), "source control mutation delivered");
                 let Some(mutation) = self
                     .source_control_mutations
                     .get(&key.canonical_path)
@@ -24258,6 +24270,90 @@ mod tests {
         assert_eq!(parked.at, LspPosition::new(4, 2));
         assert_eq!(parked.coordinates, LspCoordinates::Utf16);
         assert_eq!(notice(&app), None);
+    }
+
+    #[test]
+    fn bulk_unstage_completion_installs_current_snapshot_and_rejects_older_staged_read() {
+        use crate::repository::{
+            ChangeArea, ChangeKind, ChangedPath, RepositorySnapshot, StatusSnapshot, WorkingFiles,
+        };
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let staged = RepositorySnapshot {
+            status: StatusSnapshot {
+                entries: (0..40_000)
+                    .map(|index| ChangedPath {
+                        path: crate::repository::RepoPath::parse(format!(
+                            "generated/file-{index:05}.txt"
+                        ))
+                        .unwrap(),
+                        old_path: None,
+                        area: ChangeArea::Staged,
+                        kind: ChangeKind::Modified,
+                        conflict: None,
+                        submodule: false,
+                        added_lines: Some(1),
+                        removed_lines: Some(1),
+                    })
+                    .collect(),
+                ..StatusSnapshot::default()
+            },
+            files: WorkingFiles::default(),
+            remotes: Vec::new(),
+            local_refs: Vec::new(),
+            remote_refs: Vec::new(),
+            remote_heads: Vec::new(),
+        };
+        let old_request = app.refresh_ui.source_generation;
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: old_request,
+            result: Ok(Box::new(staged.clone())),
+        }));
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .staged_count,
+            40_000
+        );
+        let operation = app
+            .begin_mutation(&key, MutationKind::Unstage, None)
+            .unwrap();
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation,
+            report: None,
+            committed: false,
+        }));
+        let current_request = app.refresh_ui.source_generation;
+        assert_ne!(current_request, old_request);
+        let mut unstaged = staged.clone();
+        for entry in &mut unstaged.status.entries {
+            entry.area = ChangeArea::Unstaged;
+        }
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: current_request,
+            result: Ok(Box::new(unstaged)),
+        }));
+        drop(app.update(Message::SourceControlLoaded {
+            key,
+            request: old_request,
+            result: Ok(Box::new(staged)),
+        }));
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert!(!source.busy());
+        assert_eq!(source.staged_count, 0);
+        assert_eq!(source.group(ChangeArea::Staged).unwrap().rows().len(), 0);
+        assert_eq!(
+            source.group(ChangeArea::Unstaged).unwrap().rows().len(),
+            40_000
+        );
     }
 
     #[test]

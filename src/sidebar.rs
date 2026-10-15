@@ -6916,6 +6916,7 @@ fn source_control_panel<'a>(
     navigation: PanelNavigation,
     width: f32,
 ) -> Element<'a, SidebarAction> {
+    tracing::trace!(target: "cagents::source_control", phase = "panel_view", worktree = %source.key.canonical_path.display(), staged = source.staged_count, unstaged = source.group(ChangeArea::Unstaged).map_or(0, |group| group.rows().len()), busy = source.busy(), reloading = source.reloading, "source control panel view");
     let chrome = &source.chrome;
     let key = &source.key;
     let view = PanelView::new(panel, navigation, state);
