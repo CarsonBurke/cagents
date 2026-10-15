@@ -2712,6 +2712,9 @@ mod tests {
                 Ok(Step::default())
             }
         }
+        resident_fixture_with_adapter(Box::new(Idle))
+    }
+    fn resident_fixture_with_adapter(mut adapter: Box<dyn crate::chat::protocol::Adapter>) -> Fixture {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let remote = RemoteActor::fixture();
         let mut identity = remote.identity();
@@ -2736,7 +2739,6 @@ mod tests {
             native_continuity: chat::NativeContinuity::ReconnectOnly,
         };
         let spec = ProcessSpec::from(&recipe);
-        let mut adapter: Box<dyn Adapter> = Box::new(Idle);
         let mut initial = adapter.initialize().unwrap();
         let store = super::super::preflight(&spec, &mut initial).unwrap();
         let actor = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
@@ -4359,6 +4361,83 @@ done"#;
         assert!(error.contains("policy"), "{error}");
         assert_eq!(server.source, source);
         assert!(process.is_current());
+        assert!(server.closed_snapshot.is_none());
+        assert!(!server.actor.0.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn continuation_capture_actual_live_helper_transports_some_exact_controls_without_prompt() {
+        use crate::chat::protocol::{Adapter, Step};
+        struct ReadOnlyPolicy {
+            fresh: bool,
+            settings: chat::PermissionSettings,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Adapter for ReadOnlyPolicy {
+            fn initialize(&mut self) -> Result<Step, String> {
+                let mut capabilities = chat::Capabilities::default();
+                capabilities.permission_modes = vec!["plan".into()];
+                Ok(Step { events: vec![
+                    chat::Event::Ready(true),
+                    chat::Event::Models {
+                        models: vec![chat::Model { id: "actual-current".into(), label: "Current".into(), reasoning: vec!["high".into()] }],
+                        selected: Some("actual-current".into()), reasoning: Some("high".into()),
+                    },
+                    chat::Event::Capabilities(capabilities),
+                    chat::Event::PermissionMode(Some("plan".into())),
+                    chat::Event::FastMode(chat::FastMode::default()),
+                ], ..Step::default() })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                if !matches!(command, Command::RefreshPermissions) {
+                    return Err("fixture refuses every provider mutation and Prompt".into());
+                }
+                self.fresh = true;
+                self.reads.fetch_add(1, Ordering::AcqRel);
+                Ok(Step { events: vec![chat::Event::PermissionSettings(self.settings.clone())], ..Step::default() })
+            }
+            fn account_continuation_policy(&self, _: &Snapshot) -> Result<chat::PermissionSettings, String> {
+                if !self.fresh { return Err("fixture requires an actual fresh settings getter".into()); }
+                Ok(self.settings.clone())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        let settings = chat::PermissionSettings {
+            rules: vec![chat::PermissionRule { behavior: chat::PermissionBehavior::Deny, rule: "Bash(secret)".into(), source: "flagSettings".into() }],
+            environment: vec![chat::PermissionEnvironment { text: "private-project".into(), source: "flagSettings".into() }],
+        };
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut fixture = resident_fixture_with_adapter(Box::new(ReadOnlyPolicy {
+            fresh: false, settings: settings.clone(), reads: reads.clone(),
+        }));
+        let server = &mut fixture.server;
+        let issued = server.source.clone();
+        let process = server.actor.provider_process().unwrap();
+        let mut proxy = RemoteActor::fixture();
+        {
+            let inner = Arc::get_mut(&mut proxy.0).unwrap();
+            inner.socket = server.socket.clone();
+            inner.identity = server.identity.clone();
+            inner.proof = server.proof.clone();
+            inner.epoch = server.epoch;
+        }
+        let client = thread::spawn(move || proxy.capture_continuation_options(Instant::now() + Duration::from_secs(2)));
+        let (control, _) = server.listener.accept().unwrap();
+        let request: Invocation = receive(&control, TIMEOUT).unwrap();
+        assert_eq!(request.method, "capture_continuation_options");
+        // This private same-process peer tests actual method dispatch + exact
+        // attachment proof. Production serve additionally checks daemon lease.
+        let result = server.invoke(request);
+        send(&control, &result, TIMEOUT).unwrap();
+        let options = client.join().unwrap().unwrap().unwrap();
+        assert_eq!(options.controls().model.as_deref(), Some("actual-current"));
+        assert_eq!(options.controls().reasoning.as_deref(), Some("high"));
+        assert_eq!(options.controls().permission_mode.as_deref(), Some("plan"));
+        assert_eq!(options.controls().fast_mode, Some(false));
+        assert_eq!(options.controls().permissions.as_ref(), Some(&settings));
+        assert_eq!(reads.load(Ordering::Acquire), 1);
+        assert!(process.is_current());
+        assert_eq!(server.source, issued);
         assert!(server.closed_snapshot.is_none());
         assert!(!server.actor.0.stop.load(Ordering::Acquire));
     }
