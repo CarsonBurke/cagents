@@ -11,7 +11,7 @@ use std::{
 };
 
 #[path = "editor_widget.rs"]
-mod text_editor;
+pub(crate) mod text_editor;
 
 mod diff_layout;
 mod diff_actions;
