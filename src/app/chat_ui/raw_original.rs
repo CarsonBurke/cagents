@@ -651,6 +651,39 @@ mod tests {
         complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
         assert!(runtime.raw_original.pending_paths(&part.item_id).is_empty());assert_eq!(runtime.raw_original.loaded_leaves(&part.item_id)[0].text.as_ref(),text);
     }
+    #[tokio::test]
+    async fn full_revocation_rejects_successful_raw_read_and_copy_with_unchanged_source_proof() {
+        use iced::futures::StreamExt as _;
+        let text=r#"{ "secret": "exact original input" }"#;
+        let (mut runtime,part)=runtime_fixture(text);let target=runtime.target;
+        toggle(&mut runtime,&part.item_id,part.field,false);
+        let context=runtime.raw_original.context;
+        let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        let loaded=Arc::downgrade(&runtime.raw_original.loaded_leaves(&part.item_id)[0].text);
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        let task=app.handle_chat_ui(Action::RawOriginalCopy(target,part.item_id.clone(),part.field));
+        let mut stream=iced::runtime::task::into_stream(task).unwrap();
+        let copy=loop {if let Some(iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(action@Action::RawOriginalCopied(..)))))=stream.next().await {break action;}};
+        if let Action::RawOriginalCopied(_,_,_,reply)=&copy {
+            assert_eq!(reply.0.value.lock().unwrap().as_ref().unwrap().as_ref().unwrap().text,text);
+        } else {unreachable!()}
+        let pending=reply(part.clone(),text).await;
+        let pending_owner={let slot=pending.0.0.lock().unwrap();Arc::downgrade(&slot.as_ref().unwrap().as_ref().unwrap().text)};
+        let runtime=app.chat_runtime_mut(target).unwrap();let snapshot=runtime.snapshot.clone();
+        let actor=runtime.handle().cloned().unwrap();runtime.forget_transcript();
+        assert!(Arc::ptr_eq(&snapshot,&runtime.snapshot));assert!(Arc::ptr_eq(&actor,runtime.handle().unwrap()));
+        assert_ne!(runtime.raw_original.context,context);
+        flush();assert!(loaded.upgrade().is_none(),"full clear retires the visible external body");
+        drop(app.handle_chat_ui(Action::RawOriginalReady(target,part.source.clone(),part.field,context,attempt,pending)));
+        drop(app.handle_chat_ui(copy));flush();
+        assert!(pending_owner.upgrade().is_none(),"obsolete successful reader output is retired");
+        let runtime=app.chat_runtime_mut(target).unwrap();assert_eq!(runtime.raw_original.retained_bytes(),0);
+        assert!(runtime.raw_original.entries.values().all(|entry|!entry.opened));
+        assert!(runtime.copied.is_none(),"a current clipboard intent cannot authorize a revoked source");
+    }
+
     #[test]
     fn source_reader_and_retirement_payloads_require_safe_send() {
         fn send<T:Send>() {}send::<Pending>();send::<Reply>();send::<ResidentRawCalls>();send::<Leaf>();
