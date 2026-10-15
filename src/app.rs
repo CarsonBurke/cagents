@@ -5411,13 +5411,24 @@ impl Cagents {
     fn start_terminal_from_handoff(
         &self, card: CardId, descriptor: crate::terminal_ipc::TerminalDescriptor, visible: bool,
     ) -> Task<Message> {
+        let Some(proof) = descriptor.session.continuity.live_proof() else {
+            return Task::done(Message::TerminalStarted { card, terminal: descriptor.session.id,
+                result: Err("Completed handoff requires its original authenticated operation proof".into()) });
+        };
+        self.start_terminal_from_handoff_proved(card, descriptor, proof, visible)
+    }
+
+    fn start_terminal_from_handoff_proved(
+        &self, card: CardId, descriptor: crate::terminal_ipc::TerminalDescriptor,
+        proof: crate::model::HostSessionProof, visible: bool,
+    ) -> Task<Message> {
         self.begin_terminal_start(card);
         let sender = self.terminal_wake_tx.clone();
         let terminal = descriptor.session.id;
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let session = descriptor.session.clone();
-                let handle = HostedTerminalHandle::connect_descriptor(descriptor, visible, move |wake| {
+                let handle = HostedTerminalHandle::connect_descriptor_proved(descriptor, proof, visible, move |wake| {
                     let _ = sender.try_send(TerminalWakeup { card, generation: wake.generation });
                 }).map_err(|error| error.to_string())?;
                 handle.wait_until_attached(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(10))?;

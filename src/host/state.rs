@@ -742,8 +742,17 @@ impl HostState {
         &mut self, client_id: ClientId, source: &TerminalSession,
         execution_instance: uuid::Uuid,
     ) -> Result<TerminalDescriptor, ProtocolError> {
-        crate::terminal_ipc::validate_proof(source.continuity.live_proof().as_ref(), self.proof())?;
         let record = self.terminals.get(&source.id).ok_or_else(|| not_found(source.id))?;
+        // The request envelope is authenticated before this route. A completed
+        // operation carries that proof separately; its descriptor must not
+        // invent Live continuity. Only this exact monotonically completed
+        // resident worker can be attached without a descriptor live proof.
+        if let Some(proof) = source.continuity.live_proof() {
+            crate::terminal_ipc::validate_proof(Some(&proof), self.proof())?;
+        } else if !record.handle.is_completed() {
+            return Err(ProtocolError::new(ProtocolErrorCode::ProofMismatch,
+                "A running returned terminal requires its complete original daemon proof", false));
+        }
         if execution_instance.is_nil() || record.handle.execution_instance() != execution_instance
             || record.session.launch != source.launch
             || record.session.owned_codex_listener != source.owned_codex_listener
@@ -4655,6 +4664,34 @@ mod tests {
             None,
             "activation is consumed once"
         );
+    }
+
+    #[test]
+    fn source_bound_completed_attachment_keeps_exact_worker_without_fabricating_live_proof() {
+        let recipe = crate::model::LaunchRecipe { program: "/bin/sleep".into(), arguments: vec!["60".into()],
+            working_directory: "/".into(), environment: BTreeMap::new(), unset_environment: Default::default() };
+        let id = TerminalId::new();
+        let source = TerminalSession { id, launch: recipe.clone(), owned_codex_listener: None,
+            recovery_origin: None, predecessor: None, transcript_path: None, resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None } };
+        let original = TerminalHandle::spawn(source.clone(), Default::default(), |_| {}).unwrap();
+        let mut state = test_host();
+        state.register_client(1); state.register_client(2); state.register_client(3);
+        state.reserve_spawn(id).unwrap();
+        state.finish_spawn(1, source.clone(), original.clone(), false).unwrap();
+        assert!(state.attach_source(2, &source, original.execution_instance()).is_err(),
+            "unproven running descriptors cannot acquire live worker authority");
+        original.shutdown().unwrap();
+        assert!(original.is_completed());
+        let attached = state.attach_source(2, &source, original.execution_instance()).unwrap();
+        assert_eq!(attached.execution_instance, original.execution_instance());
+        assert!(attached.session.continuity.live_proof().is_none());
+        assert!(state.attach_source(3, &source, uuid::Uuid::nil()).is_err());
+        let successor = TerminalHandle::spawn(source.clone(), Default::default(), |_| {}).unwrap();
+        state.terminals.get_mut(&id).unwrap().handle = successor.clone();
+        assert!(state.attach_source(3, &source, original.execution_instance()).is_err());
+        assert!(!state.subscriptions.attached(3, id));
+        successor.shutdown().unwrap();
     }
 
     #[test]

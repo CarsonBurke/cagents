@@ -1034,11 +1034,9 @@ impl HostedTerminalHandle {
         terminal: super::ipc::TerminalDescriptor, initially_visible: bool,
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, HostedTerminalStartError> {
-        if terminal.execution_instance.is_nil()
-            || terminal.session.continuity.live_proof().is_none_or(|proof| !proof.is_complete())
-        { return Err(HostedTerminalStartError::InvalidProof); }
-        let socket = ensure_daemon_ready()?;
-        Self::connect_descriptor_at(socket, terminal, initially_visible, wake)
+        let proof = terminal.session.continuity.live_proof()
+            .filter(HostSessionProof::is_complete).ok_or(HostedTerminalStartError::InvalidProof)?;
+        Self::connect_descriptor_proved(terminal, proof, initially_visible, wake)
     }
     pub fn connect_descriptor_at(
         socket: impl Into<PathBuf>, terminal: super::ipc::TerminalDescriptor,
@@ -1046,7 +1044,32 @@ impl HostedTerminalHandle {
     ) -> Result<Self, HostedTerminalStartError> {
         let proof = terminal.session.continuity.live_proof()
             .filter(HostSessionProof::is_complete).ok_or(HostedTerminalStartError::InvalidProof)?;
-        if terminal.execution_instance.is_nil() { return Err(HostedTerminalStartError::InvalidProof); }
+        Self::connect_descriptor_proved_at(socket, terminal, proof, initially_visible, wake)
+    }
+
+    /// Completed returned workers have no Live continuity claim. The original
+    /// authenticated operation still supplies the exact daemon proof; retain
+    /// it separately rather than fabricating a running-session descriptor.
+    pub fn connect_descriptor_proved(
+        terminal: super::ipc::TerminalDescriptor, proof: HostSessionProof, initially_visible: bool,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, HostedTerminalStartError> {
+        Self::validate_descriptor_proof(&terminal, &proof)?;
+        let socket = ensure_daemon_ready()?;
+        Self::connect_descriptor_proved_at(socket, terminal, proof, initially_visible, wake)
+    }
+    fn validate_descriptor_proof(terminal: &super::ipc::TerminalDescriptor, proof: &HostSessionProof) -> Result<(), HostedTerminalStartError> {
+        if !proof.is_complete() || terminal.execution_instance.is_nil()
+            || terminal.session.continuity.live_proof().as_ref().is_some_and(|source| source != proof) {
+            return Err(HostedTerminalStartError::InvalidProof);
+        }
+        Ok(())
+    }
+    pub fn connect_descriptor_proved_at(
+        socket: impl Into<PathBuf>, terminal: super::ipc::TerminalDescriptor, proof: HostSessionProof,
+        initially_visible: bool, wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, HostedTerminalStartError> {
+        Self::validate_descriptor_proof(&terminal, &proof)?;
         let id = terminal.session.id;
         Self::start_seeded(socket.into(), id, ConnectionIntent::Attach, Some(proof), Arc::new(wake),
             Some(HostedTerminalBinding { source: terminal.session, execution_instance: terminal.execution_instance }),
@@ -4281,7 +4304,7 @@ mod tests {
 
     #[test]
     fn returned_descriptor_pins_first_io_and_never_attaches_same_id_successor() {
-        for successor in [false, true] {
+        for (successor, completed) in [(false, false), (true, false), (false, true), (true, true)] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let socket = directory.path().join("handoff-attach.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -4295,9 +4318,13 @@ mod tests {
             descriptor.session = source.clone();
             descriptor.execution_instance = uuid::Uuid::new_v4();
             descriptor.attached = true;
-            let handle = HostedTerminalHandle::connect_descriptor_at(socket, descriptor.clone(), false, |_| {}).unwrap();
+            if completed {
+                source.continuity = crate::model::TerminalContinuity::RelaunchAvailable { recipe: source.launch.clone(), last_exit: None };
+                descriptor.session = source.clone();
+            }
+            let handle = HostedTerminalHandle::connect_descriptor_proved_at(socket, descriptor.clone(), proof.clone(), false, |_| {}).unwrap();
             assert_eq!(handle.execution_instance(), Some(descriptor.execution_instance), "binding exists before peer IO");
-            handle.input(b"queued only for original worker".to_vec()).unwrap();
+            if !completed { handle.input(b"queued only for original worker".to_vec()).unwrap(); }
             let mut stream = accept_connection(&listener);
             let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             assert!(matches!(&connect.request, ClientRequest::Connect { expected_host: Some(expected), resume } if expected == &proof && resume.is_empty()), "Connect must not attach an ID-only successor");
@@ -4318,6 +4345,9 @@ mod tests {
                 assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None,
                     "successor must receive no queued input or presentation effects");
                 assert!(!handle.events().try_iter().any(|event| matches!(event, TerminalEvent::TitleChanged(_))));
+            } else if completed {
+                assert!(handle.worker_binding().unwrap().source.continuity.live_proof().is_none(),
+                    "ended descriptor keeps honest continuity; authentication is the separate original proof");
             } else {
                 let mut delivered = false;
                 let deadline = Instant::now() + Duration::from_secs(2);
