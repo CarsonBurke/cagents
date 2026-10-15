@@ -34,6 +34,7 @@ pub enum Action {
     MovePane(CardId),
     RunDiffMutation(Command, Box<RepositoryAction>),
     RunChatUser(chat_ui::RegisteredChatCommand),
+    RunOriginCommand(Command, Arc<PaletteOrigin>),
     RunGitStash(
         sidebar::git_commands::GitTarget,
         Command,
@@ -48,6 +49,21 @@ pub enum Action {
     RunPane(CardId, Command),
     RunChatPane(chat_ui::Target, Command),
 }
+/// One small shared context per result pass, rather than one document/path
+/// copy per row. Global commands do not acquire a pane-relative dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteOrigin {
+    pane: Option<(CardId, u64)>,
+    session: Option<TerminalId>,
+    chat: Option<chat_ui::Target>,
+    browser: Option<(crate::model::BrowserId, usize, [u8; 32])>,
+    repository: Option<repository_widget::RepositoryCommandTarget>,
+    directory: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+    channel: Option<crate::model::ChannelId>,
+    worktree: Option<sidebar::ActiveWorktreeKey>,
+}
+
 // Box breaks the recursive Message/Action representation.
 #[derive(Debug, Clone)]
 pub struct MessageBox(pub Box<Message>);
@@ -84,8 +100,18 @@ fn entry_category(message: &Message) -> char {
     }
 }
 
+fn entry_command(message: &Message) -> Option<Command> {
+    match message {
+        Message::RunCommand(command)
+        | Message::Palette(Action::RunOriginCommand(command, _) | Action::RunDiffMutation(command, _) | Action::RunGitStash(_, command, _)) => Some(*command),
+        Message::Palette(Action::RunChatUser(request)) => Some(request.command),
+        _ => None,
+    }
+}
+
 fn entry_key(message: &Message) -> String {
     match message {
+        Message::Palette(Action::RunOriginCommand(command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::RunChatUser(request)) => {
             format!("command:{}", request.command.id())
         }
@@ -116,6 +142,7 @@ fn entry_key(message: &Message) -> String {
 /// Compare captured intent without formatting IDs or cloning target snapshots.
 fn same_palette_entry(left: &Message, right: &Message) -> bool {
     match (left, right) {
+        (Message::Palette(Action::RunOriginCommand(left, lo)), Message::Palette(Action::RunOriginCommand(right, ro))) => left == right && lo == ro,
         (
             Message::Palette(Action::RunChatUser(left)),
             Message::Palette(Action::RunChatUser(right)),
@@ -360,6 +387,12 @@ fn browser_embedded_command_available(
     }
 }
 
+fn palette_command_uses_origin(command: Command, context: &workspace_widget::CommandContext) -> bool {
+    if context.sidebar_commands.is_some() && command.sidebar_command_bit().is_some() { return false; }
+    if matches!(workspace_widget::shortcut_descriptor(command).scope, workspace_widget::ShortcutScope::Chat | workspace_widget::ShortcutScope::Review | workspace_widget::ShortcutScope::Editor | workspace_widget::ShortcutScope::EditorHistory | workspace_widget::ShortcutScope::Repository | workspace_widget::ShortcutScope::Browser) { return true; }
+    matches!(command, Command::RenamePane | Command::ClonePane | Command::CloseFocusedCard | Command::CloseOtherPanes | Command::ClosePanesToRight | Command::CopyPath | Command::RevealInProjects | Command::SwitchPane | Command::ForkConversation | Command::ReviewConversationChanges | Command::EndConversation | Command::MovePaneToChannel | Command::OpenInExternalEditor | Command::FindInPane | Command::NewThread | Command::NewTerminal | Command::NewBrowser | Command::NewChannel | Command::NewWorktree | Command::SearchInProject | Command::ReopenPane | Command::MovePaneLeft | Command::MovePaneRight | Command::CyclePaneWidth | Command::FocusAdjacent(_) | Command::CycleWorkspace(_))
+}
+
 impl Cagents {
     pub(super) fn update_palette(&mut self, action: Action) -> Task<Message> {
         match action {
@@ -491,6 +524,13 @@ impl Cagents {
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
+            }
+            Action::RunOriginCommand(command, origin) => {
+                if self.palette_origin() != *origin || !self.command_available(command) || self.workspace_inputs_blocked() {
+                    self.status = Some(TransientNotice::warning("The original pane or document changed; choose the action again"));
+                    return Task::none();
+                }
+                self.run_workspace_command(command, keyboard::Modifiers::empty())
             }
             Action::RunChatUser(request) => {
                 if self.workspace_inputs_blocked()
@@ -923,7 +963,7 @@ impl Cagents {
                 match message {
                     Message::FocusAttention(_) => "Needs attention",
                     Message::RunCommand(_)
-                    | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_)) => {
+                    | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_) | Action::RunOriginCommand(_, _)) => {
                         "Commands"
                     }
                     Message::Palette(Action::FocusPane(_)) => "Panes",
@@ -1109,6 +1149,7 @@ impl Cagents {
             && category.is_none_or(|category| category == '>')
         {
             let context = self.command_context(self.workspace.focused());
+            let origin = Arc::new(self.palette_origin());
             workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
                 .iter()
                 .filter(|descriptor| descriptor.action != Command::CommandPalette)
@@ -1131,6 +1172,8 @@ impl Cagents {
                             descriptor.action,
                             Box::new(action),
                         ))
+                    } else if palette_command_uses_origin(descriptor.action, &context) {
+                        Message::Palette(Action::RunOriginCommand(descriptor.action, origin.clone()))
                     } else {
                         Message::RunCommand(descriptor.action)
                     };
@@ -1244,10 +1287,10 @@ impl Cagents {
                     .iter()
                     .position(|key| key == &entry_key(message))
                     .unwrap_or(usize::MAX);
-                let common = match message {
-                    Message::RunCommand(Command::NewThread) => 0,
-                    Message::RunCommand(Command::NewTerminal) => 1,
-                    Message::RunCommand(Command::OpenSettings) => 2,
+                let common = match entry_command(message) {
+                    Some(Command::NewThread) => 0,
+                    Some(Command::NewTerminal) => 1,
+                    Some(Command::OpenSettings) => 2,
                     _ => 3,
                 };
                 (
@@ -1260,7 +1303,7 @@ impl Cagents {
                                 Message::FocusAttention(_) => 1,
                                 Message::RunCommand(_)
                                 | Message::Palette(
-                                    Action::RunDiffMutation(_, _) | Action::RunChatUser(_),
+                                    Action::RunDiffMutation(_, _) | Action::RunChatUser(_) | Action::RunOriginCommand(_, _),
                                 ) => 2,
                                 Message::Palette(Action::FocusPane(_)) => 3,
                                 _ => 4,
@@ -1727,6 +1770,25 @@ impl Cagents {
             flags |= 32;
         }
         flags
+    }
+
+    fn palette_origin(&self) -> PaletteOrigin {
+        let card = self.workspace.focused();
+        let state = card.and_then(|card| self.card_state(card));
+        let repository = card.and_then(|card| match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => Some(runtime.command_target(card)),
+            Some(CardRuntime::PullRequests(pane)) => Some(pane.runtime.command_target(card)), _ => None,
+        });
+        PaletteOrigin {
+            pane: state.map(|state| (state.id, state.generation)),
+            session: state.and_then(|state| match &state.kind { CardKind::Terminal(session) => Some(session.id), CardKind::Chat(session) => Some(session.id), _ => None }),
+            chat: card.and_then(|card| match self.cards.get(&card) { Some(CardRuntime::Chat(runtime)) => Some(runtime.target), _ => None }),
+            browser: state.and_then(|state| match &state.kind { CardKind::Browser(session) => Some((session.id, session.history_index, *blake3::hash(session.current_url.as_str().as_bytes()).as_bytes())), _ => None }),
+            repository,
+            directory: state.and_then(super::worktree_ui::card_directory).map(Path::to_path_buf),
+            workspace: self.active_workspace.clone(), channel: self.durable.active_channel,
+            worktree: self.sidebar_state.active_worktree().cloned(),
+        }
     }
 
     /// Availability is shared by palette listing and execution. A stale menu
@@ -3501,7 +3563,7 @@ mod tests {
         for command in blocked {
             assert!(!app.command_available(command), "saving {command:?}");
             assert!(!app.palette_entries().iter().any(
-                |entry| matches!(entry.2, Message::RunCommand(candidate) if candidate == command)
+                |entry| entry_command(&entry.2) == Some(command)
             ));
             drop(app.update(Message::RunCommand(command)));
             assert_eq!(app.workspace.focused(), Some(card));
@@ -3605,10 +3667,7 @@ mod tests {
             entries[0].2,
             Message::RunCommand(Command::OpenSettings)
         ));
-        assert!(matches!(
-            entries[1].2,
-            Message::RunCommand(Command::NewTerminal)
-        ));
+        assert_eq!(entry_command(&entries[1].2), Some(Command::NewTerminal));
         for prefix in ['>', '@', '#'] {
             app.palette.query = Some(prefix.to_string());
             assert!(
@@ -3771,6 +3830,60 @@ mod tests {
                     .as_ref()
                     .is_some_and(|notice| notice.message.contains("selected result"))
             );
+        }
+    }
+
+    #[test]
+    fn pane_relative_results_refuse_replacement_focus_for_click_and_enter() {
+        for click in [false, true] {
+            let mut app = settings_focus_fixture();
+            let cards: Vec<_> = (0..2).map(|_| super::super::tests::terminal_card_state()).collect();
+            let first = cards[0].id;
+            let second = cards[1].id;
+            Arc::make_mut(&mut app.durable).cards = cards;
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.workspace.resize_viewport(900.0);
+            app.workspace.focus(first).unwrap();
+            drop(app.update_palette(Action::Open));
+            drop(app.update_palette(Action::Query(">close pane".into())));
+            let shown = app.palette_entries();
+            let index = shown.iter().position(|entry| entry_command(&entry.2) == Some(Command::CloseFocusedCard)).unwrap();
+            let captured = shown[index].2.clone();
+            app.select_palette_entry(index, &shown);
+            app.workspace.focus(second).unwrap();
+            assert!(app.command_available(Command::CloseFocusedCard));
+            assert!(app.palette_selection_index(&app.palette_entries()).is_none());
+            let recents = app.settings.palette_recents.clone();
+            drop(app.update_palette(if click { Action::Run(MessageBox(Box::new(captured))) } else { Action::Submit }));
+            assert_eq!(app.workspace.focused(), Some(second));
+            assert!(app.card_state(first).unwrap().existence.is_open());
+            assert!(app.card_state(second).unwrap().existence.is_open());
+            assert!(app.palette.query.is_some());
+            assert_eq!(app.settings.palette_recents, recents);
+        }
+    }
+
+    #[test]
+    fn destructive_surface_result_refuses_a_new_selected_file_under_the_same_card() {
+        for click in [false, true] {
+            let mut app = settings_focus_fixture();
+            let card = app.workspace.focused().unwrap();
+            let runtime = RepositoryRuntime::dirty_fixture_at(card, "first.md".into());
+            app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+            app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+            drop(app.update_palette(Action::Open));
+            let shown = app.palette_entries();
+            let index = shown.iter().position(|entry| entry_command(&entry.2) == Some(Command::EditorDiscardEdits)).unwrap();
+            let captured = shown[index].2.clone();
+            app.select_palette_entry(index, &shown);
+            let replacement = RepositoryRuntime::dirty_fixture_at(card, "second.md".into());
+            app.cards.insert(card, CardRuntime::Repository(Box::new(replacement)));
+            assert!(app.command_available(Command::EditorDiscardEdits));
+            drop(app.update_palette(if click { Action::Run(MessageBox(Box::new(captured))) } else { Action::Submit }));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("repository retained") };
+            assert_eq!(runtime.selected_path(), Some(Path::new("second.md")));
+            assert!(runtime.is_dirty(), "obsolete discard never changes the replacement buffer");
+            assert!(app.palette.query.is_some());
         }
     }
 

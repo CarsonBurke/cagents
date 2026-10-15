@@ -292,6 +292,36 @@ pub struct AsyncIdentity {
     pub generation: u64,
 }
 
+/// A palette action names the displayed document and native selection. Shared
+/// model ownership prevents pointer reuse from accepting a replacement source;
+/// equality compares the Arc identity without traversing diff text or rows.
+#[derive(Clone)]
+pub struct RepositoryCommandTarget {
+    identity: AsyncIdentity,
+    editor_revision: Option<u64>,
+    cursor: Option<(usize, usize, Option<(usize, usize)>)>,
+    surface: SourceSurface,
+    basis: DiffBasis,
+    mode: DiffMode,
+    layout_revision: u64,
+    selection: Option<crate::diff_interaction::Selection>,
+    model: Option<Arc<DiffModel>>,
+}
+
+impl std::fmt::Debug for RepositoryCommandTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepositoryCommandTarget").field("identity", &self.identity).field("editor_revision", &self.editor_revision).field("layout_revision", &self.layout_revision).finish_non_exhaustive()
+    }
+}
+impl PartialEq for RepositoryCommandTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
+        }
+    }
+}
+impl Eq for RepositoryCommandTarget {}
+
 /// One thing the language server must be told about the open document.
 ///
 /// The runtime records these; the application drains them with
@@ -3087,6 +3117,15 @@ impl RepositoryRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn dirty_fixture_at(card: CardId, path: PathBuf) -> Self {
+        let mut runtime = Self::dirty_fixture(card);
+        runtime.selected.as_mut().expect("selected fixture file").path = path.clone();
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        document.source = path;
+        runtime
+    }
+
+    #[cfg(test)]
     pub(crate) fn durable_active_save_completion(&self) -> RepositoryAction {
         let DocumentState::Editable(document) = &self.document else {
             panic!("test fixture requires an editable document");
@@ -4288,6 +4327,23 @@ impl RepositoryRuntime {
     pub fn selected_path(&self) -> Option<&Path> {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
+
+    pub fn command_target(&self, card: CardId) -> RepositoryCommandTarget {
+        let (editor_revision, cursor) = match &self.document {
+            DocumentState::Editable(document) => {
+                let cursor = document.content.cursor();
+                (Some(document.revision), Some((cursor.position.line, cursor.position.column, cursor.selection.map(|position| (position.line, position.column)))))
+            }
+            _ => (None, None),
+        };
+        RepositoryCommandTarget {
+            identity: self.current_identity(card, self.selected_path().unwrap_or(Path::new("")).to_owned()),
+            editor_revision, cursor, surface: self.source_surface, basis: self.diff_basis.clone(), mode: self.diff_mode,
+            layout_revision: self.diff_layout_revision, selection: self.diff_interaction.selection,
+            model: if self.shows_diff() { self.current_diff_model_snapshot() } else { None },
+        }
+    }
+
 
     /// The file the open buffer really is, when the selected path is a
     /// symbolic link to it; `None` for a buffer that is its own file.
