@@ -1209,9 +1209,9 @@ impl Store {
         let mut reused = std::collections::HashSet::new();
         let records = {
             let query = if self.forward.is_some() {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,(SELECT epoch FROM source_epochs WHERE source_epochs.id=items.id) FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
             } else {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,(SELECT epoch FROM source_epochs WHERE source_epochs.id=items.id) FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
             };
             let mut statement = self.db.prepare(query).map_err(|e| e.to_string())?;
             let rows = statement
@@ -1229,6 +1229,7 @@ impl Store {
                             row.get::<_, i64>(4)? as usize,
                             row.get::<_, i64>(5)? as usize,
                             row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, u64>(7)?,
                         ))
                     },
                 )
@@ -1241,7 +1242,7 @@ impl Store {
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
-        'records: for (id, ordinal, metadata, len0, len1, len2, spans) in records {
+        'records: for (id, ordinal, metadata, len0, len1, len2, spans, source_epoch) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
             let patch = matches!(base.content, ItemContent::Changes { .. });
@@ -1309,7 +1310,7 @@ impl Store {
                     break 'records;
                 }
                 if kind=="text" {
-                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
+                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,epoch:source_epoch,metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
                 }
                 if self
                     .changed
