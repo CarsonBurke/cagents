@@ -6,7 +6,7 @@ use cagents::repository::{CommitSummary, DiffEntry, HistoryRequest, HistoryRevis
 pub(super) struct Origin {
     card: CardId,
     key: ActiveWorktreeKey,
-    authority: WorktreeAuthority,
+    authority: Option<WorktreeAuthority>,
 }
 
 #[derive(Default)]
@@ -50,6 +50,22 @@ pub(super) enum Action {
 }
 
 
+
+// Portable read-only Git remains available where retained-descriptor mutations
+// are unsupported. On supported platforms, a missing captured authority is an
+// error rather than permission to recapture a possibly replaced pathname.
+macro_rules! read_git {
+    ($authority:expr, $method:ident($($argument:expr),* $(,)?)) => {{
+        let service = RepositoryService::system("git");
+        match $authority {
+            Some(authority) => service.with_worktree_authority(authority).map_err(|error| error.to_string())?
+                .$method($($argument),*).map_err(|error| error.to_string()),
+            None if !WorktreeAuthority::supported() => service.$method($($argument),*).map_err(|error| error.to_string()),
+            None => Err("The original worktree could not be retained. Reopen it before reading Git history.".to_owned()),
+        }
+    }};
+}
+
 impl Editor {
     fn git_review_bound(&self, card: CardId, key: &ActiveWorktreeKey) -> bool {
         self.tab(card).is_some_and(|tab| tab.git
@@ -60,7 +76,7 @@ impl Editor {
 
     fn git_review_origin(&self, card: CardId, key: &ActiveWorktreeKey) -> Option<Origin> {
         self.git_review_bound(card, key).then_some(())?;
-        Some(Origin { card, key: key.clone(), authority: self.tab(card)?.worktree_authority.clone()? })
+        Some(Origin { card, key: key.clone(), authority: self.tab(card)?.worktree_authority.clone() })
     }
 
     /// Returns Some only for actions owned by this adapter. Operations still
@@ -111,6 +127,13 @@ impl Editor {
         if let SidebarAction::CreateHistoryBranch { oid, name, .. } = action {
             if !self.tab(card)?.navigation.history_branch_matches(oid, name) { return Some(Task::none()); }
         }
+        let mutation_requested = matches!(action,
+            SidebarAction::Commit { .. } | SidebarAction::CreateHistoryBranch { .. }
+            | SidebarAction::HistoryCommand { command: HistoryCommand::NewWorktree | HistoryCommand::CreateBranch | HistoryCommand::Revert | HistoryCommand::CherryPick, .. });
+        if mutation_requested && (origin.as_ref().is_some_and(|origin| origin.authority.is_none())
+            || !self.tab(card).and_then(|tab| tab.sidebar.source_control.as_ref()).is_some_and(SourceControlModel::mutations_available)) {
+            return Some(self.refuse_git_mutation(card));
+        }
         self.tab_mut(card)?.navigation.apply(action);
         let Some(origin) = origin else { return Some(Task::none()); };
         Some(match action {
@@ -127,7 +150,7 @@ impl Editor {
                 match command {
                     HistoryCommand::CopySha => iced::clipboard::write(oid.to_string()).map(cosmic::Action::App),
                     HistoryCommand::CopyMessage => iced::clipboard::write(message.to_string()).map(cosmic::Action::App),
-                    HistoryCommand::NewWorktree => { self.begin_commit_checkout(origin.authority, oid.clone()); Task::none() },
+                    HistoryCommand::NewWorktree => { self.begin_commit_checkout(origin.authority.expect("mutation admission requires retained authority"), oid.clone()); Task::none() },
                     HistoryCommand::CreateBranch => Task::none(),
                     HistoryCommand::Revert | HistoryCommand::CherryPick => {
                         let operation = if *command == HistoryCommand::Revert {
@@ -180,7 +203,7 @@ impl Editor {
         cosmic::task::future(async move {
             let root = origin.key.canonical_path.clone(); let target = head.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.commit_message(&root, &target, &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { read_git!(authority.authority, commit_message(&root, &target, &cancel)) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::AmendLoaded { origin, revision, head, result })
         })
@@ -209,7 +232,7 @@ impl Editor {
             let request = HistoryRequest { worktree: origin.key.canonical_path.clone(), revision: HistoryRevision::Object { oid: head.clone() }, page, path: None };
             let filter = query.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.filtered_history(&request, &filter, &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { read_git!(authority.authority, filtered_history(&request, &filter, &cancel)) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::HistoryLoaded { origin, generation, head, page, query, result })
         })
@@ -225,7 +248,7 @@ impl Editor {
         cosmic::task::future(async move {
             let root = origin.key.canonical_path.clone(); let target = oid.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.commit_diff_entries(&root, &target, parent.as_ref(), &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { read_git!(authority.authority, commit_diff_entries(&root, &target, parent.as_ref(), &cancel)) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::CommitLoaded { origin, generation, oid, result })
         })
@@ -256,35 +279,23 @@ impl Editor {
         }
         let Some(worktree) = self.begin_mutation(origin.card, MutationKind::Commit) else { return Task::none(); };
         self.tab_mut(origin.card).unwrap().git_review.submitted_revision = Some(revision);
+        let cancel = self.mutation_cancellation(origin.card).expect("admitted commit has cancellation");
         cosmic::task::future(async move {
             let request = CommitRequest { worktree, message };
             let authority = origin.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?; let cancel = CancellationToken::new();
+                let service = RepositoryService::system("git").with_worktree_authority(authority.authority.expect("mutation admission requires retained authority")).map_err(|error| error.to_string())?;
                 match expected { Some(head) if amend => service.commit_amend_at(&request, &head, &cancel), _ => service.commit_with_amend(&request, amend, &cancel) }.map_err(|error| error.to_string())
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::Committed { origin, revision, result })
         })
     }
 
-    pub(super) fn git_review_action(&mut self, mut action: Action) -> Task<Message> {
+    pub(super) fn git_review_action(&mut self, action: Action) -> Task<Message> {
         let origin = match &action { Action::AmendLoaded { origin, .. } | Action::HistoryLoaded { origin, .. } | Action::CommitLoaded { origin, .. } | Action::Committed { origin, .. } => origin };
         // Physical disappearance refuses effects, but must still settle the
         // exact logical request that reserved this tab's mutation/read slot.
         if !self.git_review_bound(origin.card, &origin.key) { return Task::none(); }
-        let root_unavailable = origin.authority.validate().is_err();
-        if root_unavailable {
-            let error = "The original worktree directory is unavailable or was replaced; reopen it before retrying.".to_owned();
-            match &mut action {
-                Action::AmendLoaded { result, .. } => *result = Err(error),
-                Action::HistoryLoaded { result, .. } => *result = Err(error),
-                Action::CommitLoaded { result, .. } => *result = Err(error),
-                // A settled commit result is a fact about its captured worker.
-                // Losing the displayed path afterward cannot turn Created into
-                // failure or discard its known outcome.
-                Action::Committed { .. } => {},
-            }
-        }
         match action {
             Action::AmendLoaded { origin, revision, head, result } => {
                 let tab = self.tab_mut(origin.card).unwrap();
@@ -322,8 +333,7 @@ impl Editor {
                 let tab = self.tab_mut(origin.card).unwrap();
                 if tab.git_review.submitted_revision != Some(revision) { return Task::none(); }
                 tab.git_review.submitted_revision = None;
-                let created = matches!(&result, Ok(CommitOutcome::Created { .. }));
-                let mut notice = match result {
+                let notice = match result {
                     Ok(CommitOutcome::Created { warnings, .. }) => {
                         self.tab_mut(origin.card).unwrap().navigation.clear_submitted_commit(&origin.key, revision);
                         (!warnings.is_empty()).then(|| warnings.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
@@ -332,15 +342,11 @@ impl Editor {
                     Ok(CommitOutcome::OutcomeUnknown { failure, .. }) => Some(format!("Commit outcome is uncertain: {failure}")),
                     Err(error) => Some(error),
                 };
-                if root_unavailable {
-                    let warning = if created { "Commit created in the captured worktree; its original directory is now unavailable. Reopen the worktree to inspect it." }
-                        else { "The original worktree directory is now unavailable. Reopen it before retrying." };
-                    notice = Some(notice.map_or_else(|| warning.to_owned(), |notice| format!("{notice}\n{warning}")));
-                }
                 for tab in &mut self.tabs { if tab.runtime.descriptor.worktree == origin.key.canonical_path { if let Some(source) = tab.sidebar.source_control.as_mut() { source.set_error(notice.clone()); } } }
                 let prior = self.notice.clone();
+                let foreground_owns_root = self.current().is_some_and(|tab| tab.runtime.descriptor.worktree == origin.key.canonical_path);
                 let task = self.finish_mutation(origin.card, notice);
-                if self.active != Some(origin.card) { self.notice = prior; }
+                if !foreground_owns_root { self.notice = prior; }
                 task
             }
         }
@@ -355,6 +361,34 @@ mod tests {
     fn bound(app: &Editor, card: CardId) -> Origin {
         let key = app.tab(card).unwrap().navigation.active_worktree().unwrap();
         app.git_review_origin(card, key).unwrap()
+    }
+
+    #[test]
+    fn standalone_missing_authority_never_silently_admits_mutation_or_recaptures_linux_history() {
+        let directory = git_fixture(); let root = directory.path();
+        let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: origin.key.clone(), tab: sidebar::ChangesTab::History });
+        let row = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
+        app.tab_mut(card).unwrap().worktree_authority = None;
+        let original_head = git(root, &["rev-parse", "HEAD"]);
+        for command in [sidebar::HistoryCommand::CreateBranch, sidebar::HistoryCommand::Revert, sidebar::HistoryCommand::CherryPick, sidebar::HistoryCommand::NewWorktree] {
+            sidebar_action(&mut app, SidebarAction::HistoryCommand { key: origin.key.clone(), oid: row.oid.clone(), mainline: row.mainline, message: row.message.clone(), command });
+            assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("unavailable") || notice.contains("supported")));
+            assert!(app.checkout_dialog.is_none());
+            assert_eq!(git(root, &["rev-parse", "HEAD"]), original_head);
+        }
+        sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: "Keep unsupported draft".into() });
+        sidebar_action(&mut app, SidebarAction::Commit { key: origin.key.clone(), message: "Keep unsupported draft".into(), amend: false });
+        assert!(app.tab(card).unwrap().mutation.is_none());
+        assert_eq!(app.tab(card).unwrap().navigation.commit_message(), "Keep unsupported draft");
+        sidebar_action(&mut app, SidebarAction::SearchHistory { key: origin.key, query: "Initial".into() });
+        let source = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap();
+        if WorktreeAuthority::supported() {
+            assert!(source.history_error.as_deref().is_some_and(|error| error.contains("retained")));
+        } else {
+            assert_eq!(source.history.len(), 1);
+            assert!(source.history_error.is_none());
+        }
     }
 
     #[test]
@@ -604,6 +638,31 @@ mod tests {
     }
 
     #[test]
+    fn standalone_commit_refuses_replaced_git_metadata_with_unchanged_worktree_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = git_fixture(); let root = directory.path(); let foreign = git_fixture(); let parked = tempfile::tempdir().unwrap();
+        std::fs::write(root.join("tracked.txt"), "original staged content\n").unwrap(); git(root, &["add", "tracked.txt"]);
+        git(foreign.path(), &["commit", "--allow-empty", "-m", "Foreign repository baseline"]);
+        std::fs::write(foreign.path().join("tracked.txt"), "foreign staged content\n").unwrap(); git(foreign.path(), &["add", "tracked.txt"]);
+        let foreign_head = git(foreign.path(), &["rev-parse", "HEAD"]);
+        let original_head = git(root, &["rev-parse", "HEAD"]);
+        let metadata = std::fs::metadata(root).unwrap(); let identity = (metadata.dev(), metadata.ino());
+        let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: "Must belong to original repository".into() });
+        let saved_git = parked.path().join("original-git");
+        std::fs::rename(root.join(".git"), &saved_git).unwrap();
+        std::fs::rename(foreign.path().join(".git"), root.join(".git")).unwrap();
+        let metadata = std::fs::metadata(root).unwrap(); assert_eq!((metadata.dev(), metadata.ino()), identity);
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), foreign_head);
+        sidebar_action(&mut app, SidebarAction::Commit { key: origin.key, message: "Must belong to original repository".into(), amend: false });
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), foreign_head, "stale displayed repository must not commit into replacement metadata");
+        assert_eq!(git(root, &["--git-dir", saved_git.to_str().unwrap(), "rev-parse", "HEAD"]), original_head);
+        assert_eq!(app.tab(card).unwrap().navigation.commit_message(), "Must belong to original repository");
+        assert!(app.tab(card).unwrap().mutation.is_none());
+        assert!(app.notice.is_some());
+    }
+
+    #[test]
     fn standalone_moved_root_without_replacement_settles_commit_and_read_slots() {
         for commit in [false, true] {
             let directory = git_fixture(); let root = directory.path();
@@ -648,11 +707,68 @@ mod tests {
         git(root, &["commit", "--allow-empty", "-m", "Captured successful commit"]);
         let oid = Oid::parse_object(git(root, &["rev-parse", "HEAD"])).unwrap();
         let destination = parked.path().join("original"); std::fs::rename(root, &destination).unwrap();
-        drop(app.update(Message::GitReview(Action::Committed { origin, revision, result: Ok(CommitOutcome::Created { oid, warnings: Vec::new() }) })));
+        let task = app.update(Message::GitReview(Action::Committed { origin, revision, result: Ok(CommitOutcome::Created { oid, warnings: Vec::new() }) }));
         assert!(app.tab(card).unwrap().mutation.is_none());
         assert!(app.tab(card).unwrap().navigation.commit_message().is_empty());
-        assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("Commit created") && notice.contains("unavailable")), "{:?}", app.notice);
+        // The ordinary asynchronous refresh reports the missing binding; UI
+        // delivery itself performs no filesystem validation or outcome rewrite.
+        run_tasks(&mut app, task);
+        assert!(app.notice.as_deref().is_some_and(|notice| !notice.contains("Commit failed") && (notice.contains("available") || notice.contains("No such file"))), "{:?}", app.notice);
         assert_eq!(git(&destination, &["log", "-1", "--format=%s"]), "Captured successful commit");
+    }
+
+    #[test]
+    fn standalone_commit_cancel_uses_admitted_token_and_preserves_known_worker_outcome() {
+        use cosmic::iced::futures::StreamExt;
+        for after_worker in [false, true] {
+            let directory = git_fixture(); let root = directory.path();
+            std::fs::write(root.join("tracked.txt"), "staged cancellation fixture\n").unwrap();
+            git(root, &["add", "tracked.txt"]);
+            let original_head = git(root, &["rev-parse", "HEAD"]);
+            let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+            let sibling = open_real_git(&mut app, root, Some("tracked.txt"));
+            assert_ne!(sibling, card);
+            let select = app.update(Message::Select(card)); run_tasks(&mut app, select);
+            let message = "Commit with cancellation";
+            sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: message.into() });
+            let task = app.update(Message::Sidebar(SidebarAction::Commit { key: origin.key.clone(), message: message.into(), amend: false }));
+            let cancellation = app.mutation_cancellation(card).expect("Commit admitted");
+            let mut messages = Vec::new();
+            let task = if after_worker {
+                messages = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    let mut messages = Vec::new();
+                    let mut stream = iced::runtime::task::into_stream(task).expect("Commit worker");
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action { messages.push(message); }
+                    }
+                    messages
+                });
+                assert!(messages.iter().any(|message| matches!(message, Message::GitReview(Action::Committed { result: Ok(CommitOutcome::Created { .. }), .. }))));
+                Task::none()
+            } else { task };
+            let select = app.update(Message::Select(sibling)); run_tasks(&mut app, select);
+            let sibling_key = app.tab(sibling).unwrap().navigation.active_worktree().unwrap().clone();
+            sidebar_action(&mut app, SidebarAction::CancelGitMutation { key: sibling_key });
+            assert!(cancellation.is_cancelled());
+            assert_eq!(app.tab(card).unwrap().mutation, Some(MutationKind::Commit), "Cancel waits for the owned result");
+            if after_worker {
+                for message in messages { let result = app.update(message); run_tasks(&mut app, result); }
+                assert_ne!(git(root, &["rev-parse", "HEAD"]), original_head);
+                assert_eq!(git(root, &["log", "-1", "--format=%s"]), message);
+                assert!(app.tab(card).unwrap().navigation.commit_message().is_empty(), "known Created remains successful after Cancel");
+            } else {
+                run_tasks(&mut app, task);
+                assert_eq!(git(root, &["rev-parse", "HEAD"]), original_head);
+                assert_eq!(app.tab(card).unwrap().navigation.commit_message(), message);
+                assert!(!git(root, &["diff", "--cached", "--name-only"]).is_empty());
+            }
+            assert!(app.tab(card).unwrap().mutation.is_none());
+            assert!(app.tab(card).unwrap().git_review.submitted_revision.is_none());
+            assert!(app.mutation_cancellation(card).is_none());
+            assert!(app.tab(sibling).unwrap().mutation.is_none());
+            assert_eq!(app.active, Some(sibling));
+            assert!(!app.notice.as_deref().is_some_and(|notice| notice.contains("waiting for the operation")), "same-worktree completion must replace the cancelling notice: {:?}", app.notice);
+        }
     }
 
     #[test]
