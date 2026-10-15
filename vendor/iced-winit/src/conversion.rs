@@ -432,7 +432,7 @@ pub fn window_event(
             Ime::DeleteSurrounding { .. } => None,
         }
         .map(Event::InputMethod),
-        WindowEvent::Occluded(occluded) => Some(Event::Window(window::Event::Occluded(*occluded))),
+        WindowEvent::Occluded(occluded) => Some(Event::Window(window::Event::Occluded(occluded))),
         WindowEvent::Focused(focused) => Some(Event::Window(if focused {
             window::Event::Focused
         } else {
