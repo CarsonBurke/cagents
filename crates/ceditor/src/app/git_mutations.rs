@@ -2,7 +2,7 @@
 
 use super::*;
 use cagents::repository::{ChangeArea, DiscardRequest};
-use std::{collections::VecDeque, os::unix::fs::MetadataExt};
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]
 pub struct GroupOrigin {
@@ -10,7 +10,7 @@ pub struct GroupOrigin {
     key: ActiveWorktreeKey,
     source_revision: u64,
     selection_revision: u64,
-    root_identity: (u64, u64),
+    authority: WorktreeAuthority,
     operation: u64,
 }
 
@@ -47,17 +47,13 @@ fn allowed(area: ChangeArea, command: sidebar::ChangeGroupCommand) -> bool {
     }
 }
 
-fn root_identity(root: &Path) -> Option<(u64, u64)> {
-    let metadata = std::fs::symlink_metadata(root).ok()?;
-    metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
-}
 
 impl Editor {
     fn group_origin_current(&self, request: &GroupRequest) -> bool {
         let origin = &request.origin;
         !self.exiting && self.tab(origin.card).is_some_and(|tab| {
             tab.git && tab.runtime.descriptor.worktree == origin.key.canonical_path
-                && root_identity(&origin.key.canonical_path) == Some(origin.root_identity)
+                && origin.authority.validate().is_ok()
                 && tab.change_source_revision == origin.source_revision
                 && tab.navigation.active_worktree() == Some(&origin.key)
                 && tab.navigation.change_selection_revision() == origin.selection_revision
@@ -102,13 +98,13 @@ impl Editor {
             };
             Some(Arc::new(selection))
         } else { None };
-        let Some(identity) = root_identity(&key.canonical_path) else { return Task::none(); };
+        let Some(authority) = tab.worktree_authority.clone().filter(|authority| authority.validate().is_ok()) else { return Task::none(); };
         let origin = GroupOrigin {
             card: tab.id,
             key: key.clone(),
             source_revision: tab.change_source_revision,
             selection_revision: tab.navigation.change_selection_revision(),
-            root_identity: identity,
+            authority,
             operation: self.next_group_operation,
         };
         self.next_group_operation = self.next_group_operation.wrapping_add(1);
@@ -117,7 +113,7 @@ impl Editor {
     }
 
     pub(super) fn start_next_change_group(&mut self, root: &Path) -> Option<Task<Message>> {
-        if self.modal_open() || self.exiting || self.tabs.iter().any(|tab| tab.runtime.descriptor.worktree == root && tab.mutation.is_some()) {
+        if self.modal_open() || self.exiting || self.tabs.iter().any(|tab| tab.runtime.descriptor.worktree == root && (tab.mutation.is_some() || tab.sidebar.source_control.as_ref().is_some_and(|source| source.pending_marker_stage.is_some()))) {
             return None;
         }
         loop {
@@ -136,7 +132,7 @@ impl Editor {
             return Some(cosmic::task::future(async move {
                 let captured = request.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let service = RepositoryService::system("git");
+                    let service = RepositoryService::system("git").with_worktree_authority(captured.origin.authority.clone()).map_err(|error| error.to_string())?;
                     // This is intentionally uncapped, unlike every display snapshot.
                     let status = service.status(&captured.origin.key.canonical_path, &CancellationToken::default())
                         .map_err(|error| error.to_string())?;

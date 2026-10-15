@@ -11,7 +11,7 @@ use cagents::{
     repository::{
         CancellationToken, CommitOutcome, CommitRequest, DiffBasis, MutationOutcome, PathSelection,
         PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryService, RepositorySnapshot,
-        StageRequest, UnstageRequest,
+        StageRequest, UnstageRequest, WorktreeAuthority,
     },
     repository_widget::{
         self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryFile,
@@ -68,6 +68,7 @@ pub struct Opened {
     root: PathBuf,
     file: Option<PathBuf>,
     snapshot: Option<RepositorySnapshot>,
+    authority: Option<WorktreeAuthority>,
 }
 
 struct PendingFile {
@@ -101,6 +102,10 @@ struct Tab {
     snapshot_loading: bool,
     snapshot_refresh_pending: bool,
     change_source_revision: u64,
+    worktree_authority: Option<WorktreeAuthority>,
+    discard_authority: Option<WorktreeAuthority>,
+    marker_authority: Option<WorktreeAuthority>,
+    mutation_operation: u64,
     /// The pull request review behind the sidebar's Pull requests panel. It
     /// lists the GitHub repository the worktree's remotes name and drives
     /// `runtime` through the files of whichever pull request is open.
@@ -180,6 +185,8 @@ pub enum Message {
     },
     StageMarkers {
         card: CardId,
+        operation: u64,
+        authority: WorktreeAuthority,
         selection: Vec<PathSelection>,
         markers: BTreeMap<RepoPath, cagents::repository::ConflictMarkerVersion>,
     },
@@ -1274,11 +1281,12 @@ impl Editor {
         // Discovery failure does not prevent editing an ordinary folder.
         let repository = service.discover(&directory, &token).ok();
         let repository_root = repository.and_then(|info| info.worktree_root);
+        let authority = repository_root.as_deref().map(WorktreeAuthority::capture).transpose().map_err(|error| error.to_string())?;
         let snapshot = repository_root
             .as_ref()
             .map(|root| {
-                service
-                    .snapshot_with_options(root, display_snapshot_options(status_limit), &token)
+                service.with_worktree_authority(authority.clone().expect("discovered repository has retained authority"))
+                    .and_then(|service| service.snapshot_with_options(root, display_snapshot_options(status_limit), &token))
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
@@ -1291,6 +1299,7 @@ impl Editor {
             root,
             file,
             snapshot,
+            authority,
         })
     }
 
@@ -1423,6 +1432,12 @@ impl Editor {
     }
 
     fn add(&mut self, opened: Opened, focus: bool) -> Task<Message> {
+        if let Some(authority) = &opened.authority
+            && let Err(error) = authority.validate()
+        {
+            self.notice = Some(error.to_string());
+            return Task::none();
+        }
         if let Some(file) = &opened.file {
             if let Some(owner) = self.file_owner(&opened.root.join(file)) {
                 if focus && !self.modal_open() {
@@ -1557,6 +1572,10 @@ impl Editor {
             snapshot_loading: false,
             snapshot_refresh_pending: false,
             change_source_revision: 1,
+            worktree_authority: opened.authority,
+            discard_authority: None,
+            marker_authority: None,
+            mutation_operation: 0,
             review,
         });
         if self.active.is_none() || (focus && !self.modal_open()) {
@@ -1646,6 +1665,7 @@ impl Editor {
                 root: directory,
                 file: Some(file),
                 snapshot: None,
+                authority: None,
             },
             true,
         )
@@ -2338,9 +2358,12 @@ impl Editor {
         let key = tab.navigation.active_worktree().cloned();
         let requested = tab.navigation.files_reveal_demand().cloned();
         let worker_path = requested.clone();
+        let authority = tab.worktree_authority.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                let authority = authority.ok_or("The original worktree authority is unavailable")?;
                 let mut snapshot = RepositoryService::system("git")
+                    .with_worktree_authority(authority).map_err(|error| error.to_string())?
                     .snapshot_with_options(&root, display_snapshot_options(status_limit), &CancellationToken::default())
                     .map_err(|error| error.to_string())?;
                 let target = worker_path
@@ -2709,13 +2732,17 @@ impl Editor {
         let root = tab.runtime.descriptor.worktree.clone();
         if self.tabs.iter().any(|tab| {
             tab.runtime.descriptor.worktree == root
-                && (tab.mutation.is_some() || tab.runtime.blocks_navigation())
+                && (tab.mutation.is_some() || tab.runtime.blocks_navigation()
+                    || tab.sidebar.source_control.as_ref().is_some_and(|source| source.pending_marker_stage.is_some()))
         }) {
             self.notice = Some("Save open files and wait for pending Git operations before changing this worktree.".into());
             return None;
         }
+        let operation = self.next_group_operation;
+        self.next_group_operation = self.next_group_operation.wrapping_add(1);
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
+                tab.mutation_operation = operation;
                 tab.mutation = Some(kind);
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(Some(kind));
@@ -2734,19 +2761,24 @@ impl Editor {
     }
 
     fn finish_mutation_root(&mut self, root: PathBuf, notice: Option<String>) -> Task<Message> {
-        self.notice = notice;
+        self.notice = notice.clone();
         let mut affected = Vec::new();
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation = None;
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(None);
+                    source.set_error(notice.clone());
                 }
                 affected.push(tab.id);
             }
         }
         if let Some(next) = self.start_next_change_group(&root) {
             return next;
+        }
+        if self.tabs.iter().any(|tab| tab.runtime.descriptor.worktree == root
+            && tab.sidebar.source_control.as_ref().is_some_and(|source| source.pending_marker_stage.is_some())) {
+            return Task::none();
         }
         let mut tasks = affected
             .into_iter()
@@ -2781,6 +2813,10 @@ impl Editor {
         if selection.is_empty() {
             return Task::none();
         }
+        let Some(authority) = self.tab(id).and_then(|tab| tab.worktree_authority.clone()) else {
+            self.notice = Some("The original worktree authority is unavailable.".into());
+            return Task::none();
+        };
         let kind = if stage {
             MutationKind::Stage
         } else {
@@ -2789,9 +2825,11 @@ impl Editor {
         let Some(root) = self.begin_mutation(id, kind) else {
             return Task::none();
         };
+        let operation = self.tab(id).unwrap().mutation_operation;
+        let marker_authority = authority.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git");
+                let service = RepositoryService::system("git").with_worktree_authority(authority)?;
                 let token = CancellationToken::default();
                 if stage {
                     let request = StageRequest { worktree: root, selection };
@@ -2807,7 +2845,7 @@ impl Editor {
             .map_err(|error| error.to_string())
             .and_then(|result| result.map_err(|error| error.to_string()));
             match result {
-                Ok(Err((selection, markers))) => Message::StageMarkers { card: id, selection, markers },
+                Ok(Err((selection, markers))) => Message::StageMarkers { card: id, operation, authority: marker_authority, selection, markers },
                 Ok(Ok(outcome)) => Message::Mutation(id, Ok(outcome)),
                 Err(error) => Message::Mutation(id, Err(error)),
             }
@@ -3554,6 +3592,7 @@ impl Application for Editor {
                                             if directory != opened.root {
                                                 opened.root = directory;
                                                 opened.snapshot = None;
+                                                opened.authority = None;
                                             }
                                         }
                                         Ok(opened)
@@ -3955,16 +3994,26 @@ impl Application for Editor {
                             let Some(source) = tab.sidebar.source_control.as_mut() else { return Task::none(); };
                             let selection = source.pending_marker_stage.take();
                             let approved = std::mem::take(&mut source.pending_marker_approval);
-                            if !confirmed { return Task::none(); }
+                            let authority = tab.marker_authority.take();
+                            if !confirmed { return self.resume_change_groups(); }
+                            if !authority.is_some_and(|authority| authority.validate().is_ok()) {
+                                self.notice = Some("The original worktree was replaced; staging was refused.".into());
+                                return self.resume_change_groups();
+                            }
                             let Some(selection) = selection else { return Task::none(); };
                             self.stage_selection_with_approval(id, true, selection, approved)
                         }
                         SidebarAction::RequestDiscard { .. } => {
+                            tab.discard_authority = tab.worktree_authority.clone();
                             widget::text_input::focus(sidebar::discard_cancel_id())
                                 .map(cosmic::Action::App)
                         }
-                        SidebarAction::CancelDiscard => Task::batch([self.resume_change_groups(), self.resume_pending_files()]),
+                        SidebarAction::CancelDiscard => {
+                            tab.discard_authority = None;
+                            Task::batch([self.resume_change_groups(), self.resume_pending_files()])
+                        },
                         SidebarAction::ConfirmDiscard { request, .. } => {
+                            let Some(authority) = tab.discard_authority.take() else { return Task::none(); };
                             if self.begin_mutation(id, MutationKind::Discard).is_none() {
                                 return Task::none();
                             }
@@ -3974,6 +4023,7 @@ impl Application for Editor {
                                 paths.extend(request.untracked.iter().cloned());
                                 let result = tokio::task::spawn_blocking(move || {
                                     RepositoryService::system("git")
+                                        .with_worktree_authority(authority)?
                                         .discard(&request, &CancellationToken::default())
                                 })
                                 .await
@@ -4282,6 +4332,10 @@ impl Application for Editor {
                     {
                         return Task::none();
                     }
+                    let result = result.and_then(|result| {
+                        tab.worktree_authority.as_ref().ok_or_else(|| "The original worktree authority is unavailable".to_string())?.validate().map_err(|error| error.to_string())?;
+                        Ok(result)
+                    });
                     match result {
                         Ok((snapshot, target)) => {
                             let mut source = SourceControlModel::ready(key, &snapshot);
@@ -4332,6 +4386,10 @@ impl Application for Editor {
                             // stale result and run exactly one fresh snapshot.
                             return self.refresh_snapshot(id, false);
                         }
+                        let result = result.and_then(|snapshot| {
+                            tab.worktree_authority.as_ref().ok_or_else(|| "The original worktree authority is unavailable".to_string())?.validate().map_err(|error| error.to_string())?;
+                            Ok(snapshot)
+                        });
                         match result {
                             Ok(snapshot) => {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
@@ -4387,8 +4445,12 @@ impl Application for Editor {
                     }
                     Task::batch(tasks)
                 }
-                Message::StageMarkers { card, selection, markers } => {
-                    if let Some(source) = self.tab_mut(card).and_then(|tab| tab.sidebar.source_control.as_mut()) {
+                Message::StageMarkers { card, operation, authority, selection, markers } => {
+                    let Some(tab) = self.tab_mut(card).filter(|tab| tab.mutation_operation == operation && tab.mutation == Some(MutationKind::Stage)) else { return Task::none(); };
+                    if authority.validate().is_err() { return self.finish_mutation(card, Some("The original worktree was replaced; staging was refused.".into())); }
+                    tab.marker_authority = Some(authority);
+                    if let Some(source) = tab.sidebar.source_control.as_mut() {
+                        if source.pending_marker_stage.is_some() { return self.finish_mutation(card, Some("An earlier marker confirmation is still pending.".into())); }
                         source.pending_marker_stage = Some(selection);
                         source.pending_marker_approval = markers;
                     }
@@ -5902,6 +5964,7 @@ mod tests {
                 root: root.to_path_buf(),
                 file: file.map(PathBuf::from),
                 snapshot: Some(snapshot),
+                authority: WorktreeAuthority::capture(root).ok(),
             },
             true,
         );
@@ -7368,6 +7431,7 @@ mod tests {
                 root: "/workspace".into(),
                 file: Some(file.into()),
                 snapshot: None,
+                authority: None,
             })
         };
         drop(app.update(Message::SessionOpened(
@@ -7506,6 +7570,7 @@ mod tests {
                 root: root.into(),
                 file: file.map(PathBuf::from),
                 snapshot: None,
+                authority: None,
             },
             true,
         ));
@@ -7828,6 +7893,103 @@ mod tests {
         assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
         assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "original work\n");
         assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+    }
+
+    fn task_messages(task: Task<Message>) -> Vec<Message> {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut messages = Vec::new();
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        messages.push(message);
+                    }
+                }
+            }
+            messages
+        })
+    }
+
+    #[test]
+    fn standalone_marker_confirmation_holds_the_next_queued_group_turn() {
+        let directory = git_fixture();
+        let root = directory.path();
+        git(root, &["checkout", "-b", "other"]);
+        std::fs::write(root.join("tracked.txt"), "other\n").unwrap();
+        git(root, &["commit", "-am", "Other"]);
+        git(root, &["checkout", "main"]);
+        std::fs::write(root.join("tracked.txt"), "main\n").unwrap();
+        git(root, &["commit", "-am", "Main"]);
+        let merged = std::process::Command::new("git").current_dir(root).args(["merge", "other"]).output().unwrap();
+        assert!(!merged.status.success());
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        let action = || Message::Sidebar(SidebarAction::ChangeGroup {
+            key: key.clone(), area: cagents::repository::ChangeArea::Conflict, command: sidebar::ChangeGroupCommand::Stage,
+        });
+        let first = app.update(action());
+        drop(app.update(action()));
+        assert_eq!(app.git_groups.get(root).unwrap().pending_len(), 1);
+        run_tasks(&mut app, first);
+        let first_approval = app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().pending_marker_approval.clone();
+        assert!(!first_approval.is_empty());
+        assert_eq!(app.git_groups.get(root).unwrap().pending_len(), 1, "pending warning must hold the queue");
+        assert!(task_messages(app.resume_change_groups()).is_empty());
+        assert_eq!(app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().pending_marker_approval, first_approval);
+        assert!(!git(root, &["ls-files", "--unmerged"]).is_empty());
+        sidebar_action(&mut app, SidebarAction::ConfirmStageMarkers { key, confirmed: false });
+        assert_eq!(app.git_groups.get(root).unwrap().pending_len(), 0, "cancel releases the next read turn");
+        assert!(app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().pending_marker_stage.is_some(), "second warning is a new confirmation");
+        assert!(!git(root, &["ls-files", "--unmerged"]).is_empty());
+    }
+
+    #[test]
+    fn standalone_group_stage_retains_root_authority_after_read_before_mutation_worker() {
+        let directory = git_fixture();
+        let replacement = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("new.txt"), "original work\n").unwrap();
+        std::fs::write(replacement.path().join("new.txt"), "replacement work\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        let read = app.update(Message::Sidebar(SidebarAction::ChangeGroup {
+            key, area: cagents::repository::ChangeArea::Untracked, command: sidebar::ChangeGroupCommand::Stage,
+        }));
+        let resolved = task_messages(read).into_iter().find(|message| matches!(message, Message::ChangeGroupResolved { .. })).unwrap();
+        let delayed_mutation = app.update(resolved);
+        let parked = root.with_extension("delayed-original");
+        std::fs::rename(root, &parked).unwrap();
+        std::fs::rename(replacement.path(), root).unwrap();
+        run_tasks(&mut app, delayed_mutation);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "replacement work\n");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::rename(parked, root).unwrap();
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[test]
+    fn standalone_group_discard_confirmation_keeps_original_root_authority() {
+        let directory = git_fixture();
+        let replacement = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("new.txt"), "original work\n").unwrap();
+        std::fs::write(replacement.path().join("new.txt"), "replacement work\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        sidebar_action(&mut app, SidebarAction::ChangeGroup { key, area: cagents::repository::ChangeArea::Untracked, command: sidebar::ChangeGroupCommand::Discard });
+        let confirm = app.pending_discard().unwrap().confirm_action();
+        let parked = root.with_extension("confirmed-original");
+        std::fs::rename(root, &parked).unwrap();
+        std::fs::rename(replacement.path(), root).unwrap();
+        sidebar_action(&mut app, confirm);
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "replacement work\n");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::rename(parked, root).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "original work\n");
     }
 
     #[test]
@@ -8272,6 +8434,7 @@ mod tests {
                     root: "/new".into(),
                     file: Some("b.rs".into()),
                     snapshot: None,
+                    authority: None,
                 },
                 true,
             ));
@@ -8324,6 +8487,7 @@ mod tests {
                 root: "/late".into(),
                 file: Some("arrival.rs".into()),
                 snapshot: None,
+                authority: None,
             }),
         )));
         assert_eq!(app.active, Some(id));
@@ -8697,6 +8861,7 @@ mod tests {
                 root: root.to_path_buf(),
                 file: file.map(PathBuf::from),
                 snapshot: Some(changes_snapshot(entries)),
+                authority: WorktreeAuthority::capture(root).ok(),
             },
             true,
         ));

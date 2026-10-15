@@ -121,3 +121,50 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         fs_safety::Root::open(path).map_err(|error| ValidationError::Io(error.to_string()).into())
     }
 }
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingExecutor(Mutex<Vec<CommandSpec>>);
+    impl ProcessExecutor for RecordingExecutor {
+        fn execute(&self, command: &CommandSpec, _: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+            self.0.lock().unwrap().push(command.clone());
+            Ok(ProcessOutput { exit_code: Some(0), signal: None, success: true, stdout: vec![], stdout_truncated: false, stderr: vec![] })
+        }
+    }
+
+    #[test]
+    fn captured_authority_rewrites_only_global_worktree_scope_and_preserves_literal_c_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = WorktreeAuthority::capture(directory.path()).unwrap();
+        let inner = Arc::new(RecordingExecutor::default());
+        let executor = WorktreeExecutor { inner: inner.clone(), authority: authority.clone() };
+        for tail in [vec!["diff", "--", "-C"], vec!["log", "--grep", "-C", "--", "file"], vec!["-c", "example.value=-C", "log", "--grep=-C"]] {
+            let command = CommandSpec::new("git").args([std::ffi::OsStr::new("-C"), directory.path().as_os_str()]).args(&tail);
+            executor.execute(&command, &CancellationToken::default()).unwrap();
+            let commands = inner.0.lock().unwrap();
+            let scoped = commands.last().unwrap();
+            assert_eq!(scoped.arguments[0], "-C");
+            assert_eq!(Path::new(&scoped.arguments[1]), authority.anchored_path());
+            assert_eq!(&scoped.arguments[2..], &command.arguments[2..]);
+        }
+    }
+
+    #[test]
+    fn captured_authority_refuses_replacement_before_invoking_git() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("worktree");
+        std::fs::create_dir(&root).unwrap();
+        let authority = WorktreeAuthority::capture(&root).unwrap();
+        let inner = Arc::new(RecordingExecutor::default());
+        let executor = WorktreeExecutor { inner: inner.clone(), authority };
+        std::fs::rename(&root, parent.path().join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let command = CommandSpec::new("git").args([std::ffi::OsStr::new("-C"), root.as_os_str(), std::ffi::OsStr::new("add"), std::ffi::OsStr::new("--all")]);
+        assert!(executor.execute(&command, &CancellationToken::default()).is_err());
+        assert!(inner.0.lock().unwrap().is_empty());
+    }
+}
