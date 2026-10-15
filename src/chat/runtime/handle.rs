@@ -464,6 +464,14 @@ impl Handle {
         &self,
         command: &Command,
     ) -> Result<Option<chat::FileChangeReply>, String> {
+        // Ordinary controls probe this method before provider admission. A
+        // cache failure or full reader queue must not consume those controls.
+        if !matches!(
+            command,
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+        ) {
+            return Ok(None);
+        }
         match &self.0 {
             Owner::Local(local) => local.file_query(command),
             Owner::Remote(remote) => remote.call("file_query", serde_json::json!([command])),
@@ -711,6 +719,24 @@ impl Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unrelated_controls_do_not_require_a_remote_cache_connection() {
+        let handle = Handle(Owner::Remote(RemoteActor::fixture()));
+        // This fixture has no live helper socket. Returning None proves these
+        // probes do not enter the remote cache service before actor admission.
+        for command in [
+            Command::Interrupt,
+            Command::Refresh,
+            Command::Answer {
+                request_id: "pending-approval".into(),
+                action: "deny".into(),
+                answers: Vec::new(),
+            },
+        ] {
+            assert!(matches!(handle.file_query(&command), Ok(None)));
+        }
+    }
+
     #[test]
     fn remote_ownership_is_authoritative_even_when_completion_is_cached() {
         let remote = RemoteActor::completed_failure_fixture();
