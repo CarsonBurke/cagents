@@ -83,6 +83,9 @@ impl Server {
         if !matches!(spec.transport,TransportSpec::JsonLines) {return Err("Restart requires the same Claude stream-json transport".into());}
         spec.program=request.program;spec.arguments=request.arguments;spec.environment=request.environment;spec.unset_environment.clear();spec.working_directory=request.working_directory;spec.execution=Some(context.clone());spec.messages=self.mailbox_seal.clone();
         adapter.relocate_directory(&spec.working_directory)?;
+        // This is the positively prepared Claude incarnation, with the same
+        // verified physical context used for its adapter and process launch.
+        context.observe_provider_directory(&spec.working_directory)?;
         let mut initial=adapter.initialize()?;
         let validation=super::super::preflight_with_previous(&spec,&mut initial,&self.actor,false)?;
         let old=self.actor.close_observation();let old_generation=self.actor.0.state.lock().unwrap_or_else(|p|p.into_inner()).generation;
