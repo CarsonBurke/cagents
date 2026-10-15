@@ -36,6 +36,22 @@ impl History {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    /// Manual tab/file focus is an origin too; do not overwrite the previous
+    /// completed destination when navigating from another mounted source.
+    pub fn observe_origin(&mut self, from: &Location) {
+        if let Some(current) = self.entries.get(self.current)
+            && (current.card != from.card || current.source != from.source) {
+            self.entries.truncate(self.current + 1);
+            self.entries.push(from.clone()); self.current += 1;
+            while self.entries.len() > 128 { self.entries.remove(0); self.current -= 1; }
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    pub fn is_current_target(&self, target: &Target) -> bool {
+        target.revision == self.revision && self.entries.get(target.index) == Some(&target.location)
+    }
+
     pub fn peek(&self, forward: bool, mut available: impl FnMut(&Location) -> bool) -> Option<Target> {
         let index = if forward {
             (self.current + 1..self.entries.len()).find(|index| available(&self.entries[*index]))
@@ -94,6 +110,18 @@ mod tests {
         let b_target = history.peek(false, |_| true).unwrap();
         assert_eq!(b_target.location.card, b);
         assert!(history.navigate(location(c, "c", 3), &b_target));
+        assert_eq!(history.peek(false, |_| true).unwrap().location.card, a);
+    }
+
+    #[test]
+    fn manual_focus_before_back_keeps_the_completed_destination() {
+        let a = CardId::new(); let b = CardId::new(); let c = CardId::new();
+        let mut history = History::default();
+        history.record_jump(location(a, "a", 1), location(b, "b", 2));
+        history.observe_origin(&location(c, "c", 3));
+        let target = history.peek(false, |_| true).unwrap();
+        assert_eq!(target.location.card, b);
+        assert!(history.navigate(location(c, "c", 3), &target));
         assert_eq!(history.peek(false, |_| true).unwrap().location.card, a);
     }
 

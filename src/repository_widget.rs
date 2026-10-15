@@ -17754,6 +17754,44 @@ mod tests {
     }
 
     #[test]
+    fn keep_mine_external_baseline_does_not_alias_pre_edit_undo_identity() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", "A");
+        runtime.set_auto_save(false);
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('B')) }));
+        simulate_disk_version(&mut runtime, card, "A", "C");
+        drop(runtime.update(RepositoryAction::KeepMine { card }));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("A"));
+        assert!(runtime.is_dirty(), "old native revision zero is not the new disk C baseline");
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editable"); };
+        assert_eq!(document.saved_text, "C");
+        assert_eq!(document.saved_snapshot.text().as_ref(), "C");
+        assert_ne!(document.saved_history_revision, document.history.revision());
+    }
+
+    #[test]
+    fn frozen_workspace_edits_reject_configured_loads_and_external_observation() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", "A");
+        let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
+        let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "file.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
+        runtime.disk_poll = Some((77, Instant::now()));
+        runtime.begin_workspace_edit(1, &plan).unwrap();
+        assert!(!runtime.observes_open_sources());
+        assert!(runtime.disk_poll.is_none());
+        let identity = runtime.current_identity(card, "file.rs".into());
+        drop(runtime.update(RepositoryAction::ConfiguredFileLoaded { identity, result: Err(FileIoError::Io("old read".into())), indentation: crate::editor_indent::Overrides::default() }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("A"));
+        assert!(runtime.workspace_edit_pending());
+        runtime.cancel_workspace_edit(1);
+        assert!(runtime.observes_open_sources());
+        runtime.set_external_source("/dependencies/std.rs".into());
+        assert!(!runtime.observes_open_sources());
+        assert!(cosmic::iced::runtime::task::into_stream(runtime.refresh_open_sources(card)).is_none());
+    }
+
+    #[test]
     fn typing_without_an_attached_server_never_serializes_content() {
         let card = CardId::new();
         let source = "let value = 1;\n".repeat(50_000);

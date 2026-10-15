@@ -2048,6 +2048,7 @@ impl Editor {
         }
         let navigation = self.finish_navigation_jump(id);
         self.collect_location_jump(id);
+        self.finish_editor_history_restore(id);
         Task::batch([autosave, working_diff, navigation])
     }
 

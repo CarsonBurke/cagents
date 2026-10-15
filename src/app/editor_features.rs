@@ -539,6 +539,7 @@ pub(super) struct State {
     publication: Option<Publication>,
     pub(super) location_history: crate::editor_locations::History,
     pub(super) jump_origins: HashMap<CardId, crate::editor_locations::Location>,
+    pub(super) history_restores: HashMap<CardId, (crate::editor_locations::Location, crate::editor_locations::Target)>,
 }
 
 impl State {

@@ -55,11 +55,12 @@ pub(super) struct State {
     next_resolution: u64,
     history: cagents::editor_locations::History,
     history_origins: HashMap<CardId, cagents::editor_locations::Location>,
+    history_restores: HashMap<CardId, (cagents::editor_locations::Location, cagents::editor_locations::Target)>,
 }
 
 impl State {
     pub(super) fn remove_tab(&mut self, card: CardId) {
-        self.requests.remove(&card); self.results.remove(&card); self.jumps.remove(&card); self.resolving.remove(&card); self.history_origins.remove(&card);
+        self.requests.remove(&card); self.results.remove(&card); self.jumps.remove(&card); self.resolving.remove(&card); self.history_origins.remove(&card); self.history_restores.remove(&card);
     }
 }
 
@@ -211,7 +212,7 @@ impl Editor {
         if let Some(tab) = self.tab_mut(card) && let Some(origin) = tab.runtime.take_location_jump_origin(card) {
             self.lsp_navigation.history_origins.entry(card).or_insert(origin);
         }
-        if self.active != Some(card) || self.lsp_navigation.jumps.contains_key(&card) { return; }
+        if self.active != Some(card) || self.lsp_navigation.jumps.contains_key(&card) || self.lsp_navigation.history_restores.contains_key(&card) { return; }
         if let Some(target) = self.capture_editor_location(card)
             && let Some(origin) = self.lsp_navigation.history_origins.remove(&card) {
             self.lsp_navigation.history.record_jump(origin, target);
@@ -226,10 +227,23 @@ impl Editor {
     pub(super) fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
         if self.modal_open() || self.exiting || self.active != Some(card) { return None; }
         let from = self.capture_editor_location(card)?;
+        self.lsp_navigation.history.observe_origin(&from);
         let target = self.lsp_navigation.history.peek(forward, |entry| {
-            self.tab(entry.card).is_some_and(|tab| tab.runtime.source_tab_path().as_ref() == Some(&entry.source)
-                && tab.runtime.editor_navigation_anchor().is_some() && !tab.runtime.is_saving())
+            self.tab(entry.card).is_some_and(|tab| !tab.runtime.is_saving())
         })?;
+        let same_source = self.tab(target.location.card).is_some_and(|tab| tab.runtime.source_tab_path().as_ref() == Some(&target.location.source) && tab.runtime.editor_navigation_anchor().is_some());
+        if !same_source {
+            let root = self.tab(target.location.card)?.runtime.descriptor.worktree.clone();
+            let relative = target.location.source.strip_prefix(&root).ok().map(Path::to_path_buf);
+            let external = relative.is_none().then(|| target.location.source.clone());
+            let task = self.add_with_source(Opened { root, file: relative, snapshot: None }, true, external);
+            let opened = self.active?;
+            if !self.tab(opened).is_some_and(|tab| tab.runtime.source_tab_path().as_ref() == Some(&target.location.source)) { return Some(task); }
+            self.selection_epoch = self.selection_epoch.wrapping_add(1);
+            self.lsp_navigation.history_restores.insert(opened, (from, target));
+            self.finish_editor_history_restore(opened);
+            return Some(task);
+        }
         let previous = {
             let tab = self.tab_mut(target.location.card)?;
             let previous = tab.runtime.editor_navigation_anchor()?;
@@ -244,6 +258,22 @@ impl Editor {
         self.active = Some(target.location.card);
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         Some(focus)
+    }
+
+    pub(super) fn finish_editor_history_restore(&mut self, card: CardId) {
+        let Some((_, target)) = self.lsp_navigation.history_restores.get(&card) else { return; };
+        if self.active != Some(card) || !self.lsp_navigation.history.is_current_target(target) {
+            self.lsp_navigation.history_restores.remove(&card); return;
+        }
+        let Some(loaded) = self.capture_editor_location(card) else { return; };
+        if loaded.source != target.location.source { self.lsp_navigation.history_restores.remove(&card); return; }
+        let (from, target) = self.lsp_navigation.history_restores.remove(&card).unwrap();
+        if let Some(tab) = self.tab_mut(card) && tab.runtime.restore_editor_navigation_anchor(target.location.anchor) {
+            tab.runtime.take_location_jump_origin(card);
+            if self.lsp_navigation.history.navigate(from, &target)
+                && let Some(current) = self.capture_editor_location(card) { self.lsp_navigation.history.replace_current(current); }
+        }
+        self.lsp_navigation.history_origins.remove(&card);
     }
 
     pub(super) fn navigation_results_view(&self, card: CardId) -> Option<Element<'_, Message>> {

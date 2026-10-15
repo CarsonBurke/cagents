@@ -10295,6 +10295,7 @@ impl Cagents {
         }
         self.complete_cross_card_jump(card);
         if intents.is_empty() {
+            self.finish_editor_history_restore(card);
             return auto_save;
         }
         let mut tasks = vec![auto_save];
@@ -10347,6 +10348,7 @@ impl Cagents {
                 LspIntent::Close => self.close_lsp_document(card),
             }
         }
+        self.finish_editor_history_restore(card);
         Task::batch(tasks)
     }
 
@@ -10362,6 +10364,7 @@ impl Cagents {
         self.lsp_contexts.remove(&card);
         self.lsp_pending_jumps.remove(&card);
         self.editor_features.jump_origins.remove(&card);
+        self.editor_features.history_restores.remove(&card);
     }
 
     fn lsp_document(&self, card: CardId) -> Option<LspDocumentId> {
@@ -10762,7 +10765,7 @@ impl Cagents {
     }
 
     fn complete_cross_card_jump(&mut self, card: CardId) {
-        if self.workspace.focused() != Some(card) || self.lsp_pending_jumps.contains_key(&card) { return; }
+        if self.workspace.focused() != Some(card) || self.lsp_pending_jumps.contains_key(&card) || self.editor_features.history_restores.contains_key(&card) { return; }
         let Some(target) = self.capture_editor_location(card) else { return; };
         let Some(origin) = self.editor_features.jump_origins.remove(&card) else { return; };
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.take_location_jump_origin(card); }
@@ -10772,12 +10775,28 @@ impl Cagents {
     fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
         if self.workspace.focused() != Some(card) { return None; }
         let from = self.capture_editor_location(card)?;
+        self.editor_features.location_history.observe_origin(&from);
         let target = self.editor_features.location_history.peek(forward, |entry| {
             self.workspace.card(entry.card).is_some()
                 && self.workspace.pending_close().is_none_or(|closing| closing.unmounting != entry.card)
-                && matches!(self.cards.get(&entry.card), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&entry.source)
-                && runtime.editor_navigation_anchor().is_some() && !runtime.is_saving())
+                && matches!(self.cards.get(&entry.card), Some(CardRuntime::Repository(runtime)) if !runtime.is_saving())
         })?;
+        let same_source = matches!(self.cards.get(&target.location.card), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&target.location.source) && runtime.editor_navigation_anchor().is_some());
+        if !same_source {
+            let (view, external) = match self.cards.get(&target.location.card)? {
+                CardRuntime::Repository(runtime) => (runtime.descriptor.clone(), !target.location.source.starts_with(&runtime.descriptor.worktree)),
+                _ => return None,
+            };
+            // Reopen as a dedicated source tab: an unrelated dirty buffer in
+            // the old card is never replaced in order to satisfy history.
+            let task = self.open_lsp_source_tab(view, target.location.source.clone(), LspPosition::new(0, 0), LspCoordinates::Scalar, external, None);
+            let opened = self.workspace.focused()?;
+            if !matches!(self.cards.get(&opened), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&target.location.source)) { return Some(task); }
+            self.editor_features.jump_origins.remove(&opened);
+            self.editor_features.history_restores.insert(opened, (from, target));
+            self.finish_editor_history_restore(opened);
+            return Some(task);
+        }
         let previous = match self.cards.get_mut(&target.location.card)? {
             CardRuntime::Repository(runtime) => {
                 let previous = runtime.editor_navigation_anchor()?;
@@ -10799,6 +10818,26 @@ impl Cagents {
         let CardRuntime::Repository(runtime) = self.cards.get(&target.location.card)? else { return None; };
         let focus = repository_task(runtime.focus_editor(target.location.card));
         Some(Task::batch([focus, self.apply_viewport(update, true, false)]))
+    }
+
+    fn finish_editor_history_restore(&mut self, card: CardId) {
+        let Some((_, target)) = self.editor_features.history_restores.get(&card) else { return; };
+        if self.workspace.focused() != Some(card) || !self.editor_features.location_history.is_current_target(target) {
+            self.editor_features.history_restores.remove(&card); return;
+        }
+        if self.lsp_pending_jumps.contains_key(&card) { return; }
+        let Some(loaded) = self.capture_editor_location(card) else { return; };
+        if loaded.source != target.location.source { self.editor_features.history_restores.remove(&card); return; }
+        let (from, target) = self.editor_features.history_restores.remove(&card).unwrap();
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+            && runtime.restore_editor_navigation_anchor(target.location.anchor) {
+            runtime.take_location_jump_origin(card);
+            if self.editor_features.location_history.navigate(from, &target)
+                && let Some(current) = self.capture_editor_location(card) {
+                self.editor_features.location_history.replace_current(current);
+            }
+        }
+        self.editor_features.jump_origins.remove(&card);
     }
 
     fn jump_to_lsp_location(
