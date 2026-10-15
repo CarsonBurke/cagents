@@ -84,7 +84,7 @@ mod tests {
     }
     #[test]
     fn live_codex_replay_after_approval_eviction_and_cold_reconstruction_stays_denied(){
-        let root=tempfile::tempdir().unwrap();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
         let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
         let annotations=root.path().join("annotations");
         let mut durable=annotations::storage::Store::for_test(&annotations,&scope,"thread-exact").unwrap();
@@ -113,7 +113,7 @@ mod tests {
     }
     #[test]
     fn first_claude_control_request_confirms_scope_before_awaiting_and_denied_capture(){
-        let root=tempfile::tempdir().unwrap();let home=root.path().join("claude-home");std::fs::create_dir(&home).unwrap();
+        let root=annotations::storage::test_directory();let home=root.path().join("claude-home");std::fs::create_dir(&home).unwrap();
         let scope=LaunchAccountScope::resolve(crate::agent::Provider::Claude,root.path(),|key|(key=="CLAUDE_CONFIG_DIR").then(||home.as_os_str().to_owned())).unwrap();
         let mut authority=Authority::new(Ok(scope.clone()));authority.root=Some(root.path().join("annotations"));
         let mut adapter=protocol::claude::annotation_test_adapter();
@@ -132,7 +132,7 @@ mod tests {
     }
     #[test]
     fn transient_open_failure_retries_same_qualified_session_after_backoff(){
-        let root=tempfile::tempdir().unwrap();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
         let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
         let storage=root.path().join("annotations");std::fs::write(&storage,b"not a directory").unwrap();let mut authority=Authority::new(Ok(scope));authority.root=Some(storage.clone());
         let confirmed=Some("confirmed-session".to_owned());assert!(authority.apply(Some(&confirmed),vec![],&mut vec![]).is_some());assert!(authority.store.is_none());
@@ -154,7 +154,7 @@ mod tests {
                 Ok(Step{events:vec![Event::Session{id:"confirmed-session".into(),title:None},execution(ProviderEvent::Started{key:"request".into()}),execution(ProviderEvent::Scope),Event::Error{message:"Provider overloaded: 529".into(),fatal:false},execution(ProviderEvent::Settled),execution(ProviderEvent::Finished{outcome:crate::notifications::Kind::Failed})],..Step::default()})
             }
         }
-        let root=tempfile::tempdir().unwrap();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
         let spec=protocol::ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:protocol::TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:vec![],working_directory:root.path().to_owned(),environment:Default::default()};
         let mut initial=Step::default();let cache=super::super::preflight(&spec,&mut initial).unwrap();let (send,receive)=crossbeam_channel::bounded(1);
         let handle=Handle::start_inner(spec,Box::new(ProviderFailure(crate::model::RunId::new())),initial,cache,None,None,Ok(scope),move|update|{if let Update::Execution{update:crate::agent_execution::Update::Finished{result,..},..}=update{let _=send.try_send(result);}}).unwrap();

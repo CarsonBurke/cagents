@@ -287,6 +287,12 @@ impl Store {
 fn storage_error(error:rusqlite::Error)->OriginalError{OriginalError::Unavailable(error.to_string())}
 
 #[cfg(test)]
+pub(crate) fn test_directory()->tempfile::TempDir{
+    let base=std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).or_else(||std::env::var_os("HOME").map(|home|PathBuf::from(home).join(".cache"))).expect("annotation tests require a disk-backed artifact directory").join("annotation-contract-tests");
+    crate::secure_file::prepare_private_directory(&base).unwrap();
+    tempfile::tempdir_in(base).unwrap()
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{ffi::OsString,os::unix::fs::PermissionsExt};
@@ -300,7 +306,7 @@ mod tests {
     }
     #[test]
     fn originals_are_immutable_paged_exact_and_isolated_across_cold_open() {
-        let root=tempfile::tempdir().unwrap();let account=scope(root.path(),crate::agent::Provider::Claude);
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);
         let text="original /operator-command 🐙".repeat(20000);let original=prompt("provider-user-a",&text);
         {
             let mut store=Store::at(&root.path().join("annotations"),&account,"confirmed-session").unwrap();
@@ -326,7 +332,7 @@ mod tests {
     }
     #[test]
     fn denied_survives_more_than_256_actions_cold_reopen_and_stale_replay() {
-        let root=tempfile::tempdir().unwrap();let account=scope(root.path(),crate::agent::Provider::Codex);
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Codex);
         let key=ApprovalKey{agent_id:None,item_id:"turn:tool".into()};
         {
             let mut store=Store::at(&root.path().join("annotations"),&account,"confirmed-session").unwrap();
@@ -349,7 +355,7 @@ mod tests {
     }
     #[test]
     fn unknown_settings_replacement_and_explicit_account_purge_are_checked() {
-        let root=tempfile::tempdir().unwrap();let account=scope(root.path(),crate::agent::Provider::Claude);
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);
         let annotations=root.path().join("annotations");
         let mut store=Store::at(&annotations,&account,"session").unwrap();let mut original=prompt("user","text");
         original.settings.fast=Setting::Unknown;
@@ -364,7 +370,7 @@ mod tests {
     }
     #[test]
     fn attachment_snapshot_keeps_original_bytes_and_registered_purge_works_after_home_loss(){
-        let root=tempfile::tempdir().unwrap();let mut account=scope(root.path(),crate::agent::Provider::Claude);
+        let root=test_directory();let mut account=scope(root.path(),crate::agent::Provider::Claude);
         account.registered_id=Some(format!("claude/{}",uuid::Uuid::new_v4()).parse().unwrap());
         let annotations=root.path().join("annotations");let store=Store::at(&annotations,&account,"session").unwrap();
         let path=root.path().join("picked.png");fs::write(&path,b"original image bytes").unwrap();
@@ -380,7 +386,7 @@ mod tests {
 
     #[test]
     fn pending_captures_abort_cleanly_accepted_bytes_survive_and_cold_orphans_are_recovered(){
-        let root=tempfile::tempdir().unwrap();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
         let mut store=Store::at(&annotations,&account,"session").unwrap();let path=root.path().join("picked.png");fs::write(&path,b"image").unwrap();
         let abandoned=store.retain_attachment(&path).unwrap();let abandoned_path=abandoned.attachment.path.clone();drop(abandoned);assert!(!abandoned_path.exists());
         let mut captures=vec![store.retain_attachment(&path).unwrap()];let accepted_path=captures[0].attachment.path.clone();let mut original=prompt("accepted","text");original.attachments=vec![captures[0].attachment.clone()];
@@ -396,7 +402,7 @@ mod tests {
 
     #[test]
     fn tiny_multi_image_prompt_fits_but_actual_aggregate_pending_bytes_are_bounded(){
-        let root=tempfile::tempdir().unwrap();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
         let mut store=Store::at(&annotations,&account,"session").unwrap();let path=root.path().join("tiny.png");fs::write(&path,b"tiny image").unwrap();
         let mut captures=(0..4).map(|_|store.retain_attachment(&path).unwrap()).collect::<Vec<_>>();let mut original=prompt("four-images","text");original.attachments=captures.iter().map(|capture|capture.attachment.clone()).collect();
         store.accept(&original,"text",&[],&mut captures).unwrap();drop(captures);
@@ -408,7 +414,7 @@ mod tests {
 
     #[test]
     fn cold_recovery_handles_each_interrupted_publication_cut_without_unindexed_files(){
-        let root=tempfile::tempdir().unwrap();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
         let store=Store::at(&annotations,&account,"session").unwrap();
         // Durable row committed, process died before file creation.
         store.db.execute("INSERT INTO retained_attachments VALUES('capture-before-file',0,4)",[]).unwrap();
