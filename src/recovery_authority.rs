@@ -104,7 +104,7 @@ pub struct RecoveryAuthority(Arc<RecoveryInner>);
 impl RecoveryAuthority {
     /// Join existing bounded payloads without reserving a new slot after an
     /// effect. Nested cleanup errors must not discard an earlier authority.
-    pub(crate) fn combine(self, other: Self) -> Self {
+    pub fn combine(self, other: Self) -> Self {
         if self == other { return self; }
         let mut leaves = Vec::new();
         for authority in [&self, &other] {
