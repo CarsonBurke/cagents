@@ -7,10 +7,15 @@ use crate::chat::cache::{SourceError, SourcePage, SourceQuery,changes::{Manifest
 use std::sync::atomic::AtomicU64;
 
 const QUEUED_READS:usize=4;
-enum Query {Text(SourceQuery),Manifest(ManifestQuery),Patch(PatchQuery)}
+enum Query {
+    Text(SourceQuery),Manifest(ManifestQuery),Patch(PatchQuery),
+    Snapshot(Option<u64>),
+    Presentation(crate::model::TerminalId,Option<u64>),
+    Files(Command),ExitOutput(String,u64),
+}
 struct Job {
     actor:LocalHandle,query:Query,control:UnixStream,proof:HostSessionProof,
-    generation:u64,deadline:Instant,
+    generation:u64,deadline:Instant,journal:Arc<Mutex<Journal>>,
 }
 pub(super) struct Service {
     send:crossbeam_channel::Sender<Job>,generation:Arc<AtomicU64>,
@@ -31,6 +36,18 @@ impl Service {
                         Query::Text(query)=>serde_json::to_value(job.actor.source_query(query)),
                         Query::Manifest(query)=>serde_json::to_value(job.actor.changes_manifest(query)),
                         Query::Patch(query)=>serde_json::to_value(job.actor.change_patch(query)),
+                        Query::Snapshot(after)=>{
+                            let mut snapshot=job.actor.snapshot(after);
+                            if let Some(snapshot)=&mut snapshot
+                                && let Some(loss)=job.journal.lock().unwrap_or_else(|p|p.into_inner()).continuity_loss()? {
+                                snapshot.error=Some(loss.reason.clone());
+                                snapshot.outcome=Some(crate::agent::ActivityOutcome::Interrupted {reason:loss.reason});
+                            }
+                            serde_json::to_value(snapshot)
+                        },
+                        Query::Presentation(id,after)=>serde_json::to_value(job.actor.presentation(id,after)),
+                        Query::Files(command)=>serde_json::to_value(job.actor.file_query(&command)?),
+                        Query::ExitOutput(id,offset)=>serde_json::to_value(job.actor.provider_exit_output(&id,offset)?),
                     }.map_err(|error|error.to_string())?;
                     if current.load(Ordering::Acquire)!=job.generation {return Err("Source reader attachment changed".into());}
                     authorize(&job.control,&job.proof)?;
@@ -46,7 +63,9 @@ impl Service {
         let _=self.generation.fetch_update(Ordering::AcqRel,Ordering::Acquire,|old|Some(if old==0 {0}else{old.checked_add(1).unwrap_or(0)}));
     }
 }
-pub(super) fn is_read(method:&str)->bool {matches!(method,"source_query"|"changes_manifest"|"change_patch")}
+pub(super) fn is_read(method:&str)->bool {
+    matches!(method,"source_query"|"changes_manifest"|"change_patch"|"snapshot"|"presentation"|"file_query"|"exit_output")
+}
 impl Server {
     pub(super) fn dispatch_source_read(&mut self,control:UnixStream,request:Invocation)->Result<(),(UnixStream,String)> {
         let prepared=(|| {
@@ -55,6 +74,23 @@ impl Server {
                 "source_query"=>Query::Text(serde_json::from_value(request.args).map_err(|error|error.to_string())?),
                 "changes_manifest"=>Query::Manifest(serde_json::from_value(request.args).map_err(|error|error.to_string())?),
                 "change_patch"=>Query::Patch(serde_json::from_value(request.args).map_err(|error|error.to_string())?),
+                "snapshot"=>{
+                    let (after,)=serde_json::from_value(request.args).map_err(|error|error.to_string())?;
+                    Query::Snapshot(after)
+                },
+                "presentation"=>{
+                    let (id,after)=serde_json::from_value(request.args).map_err(|error|error.to_string())?;
+                    if id!=self.source.id {return Err("Retained presentation names another chat".into());}
+                    Query::Presentation(id,after)
+                },
+                "file_query"=>{
+                    let (command,)=serde_json::from_value(request.args).map_err(|error|error.to_string())?;
+                    Query::Files(command)
+                },
+                "exit_output"=>{
+                    let (id,offset)=serde_json::from_value(request.args).map_err(|error|error.to_string())?;
+                    Query::ExitOutput(id,offset)
+                },
                 _=>return Err("Unknown source reader method".into()),
             };
             if self.source_reads.is_none() {self.source_reads=Some(Service::new()?);}
@@ -63,7 +99,7 @@ impl Server {
         let query=match prepared {Ok(query)=>query,Err(error)=>return Err((control,error))};
         let reads=self.source_reads.as_ref().unwrap();let generation=reads.generation.load(Ordering::Acquire);
         if generation==0 {return Err((control,"Source reader attachment capacity exhausted".into()));}
-        let job=Job {actor:self.actor.clone(),query,control,proof:self.proof.clone(),generation,deadline:Instant::now()+TIMEOUT};
+        let job=Job {actor:self.actor.clone(),query,control,proof:self.proof.clone(),generation,deadline:Instant::now()+TIMEOUT,journal:self.journal.clone()};
         reads.send.try_send(job).map_err(|error| {
             let message=match &error {crossbeam_channel::TrySendError::Full(_)=>"Original-source reader capacity reached",crossbeam_channel::TrySendError::Disconnected(_)=>"Original-source reader is unavailable"};
             (error.into_inner().control,message.into())
@@ -94,6 +130,73 @@ impl RemoteActor {
 mod tests {
     use super::*;
     use crate::chat::cache::{SourceEpoch,SourceKey,SourceMetadata};
+    #[test]
+    fn transcript_reads_wait_off_loop_and_old_attachment_results_are_refused() {
+        const CHILD:&str="CAGENTS_TRANSCRIPT_READER_CONTROL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root=tempfile::tempdir_in("/var/tmp").unwrap();
+            let test=thread::current().name().unwrap().to_owned();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",&test,"--nocapture"])
+                .env(CHILD,"1").env("XDG_RUNTIME_DIR",root.path()).env("XDG_DATA_HOME",root.path().join("data"))
+                .env("XDG_CONFIG_HOME",root.path().join("config")).env("XDG_CACHE_HOME",root.path().join("cache"))
+                .env("HOME",root.path().join("home")).env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
+            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        for method in ["snapshot","presentation","file_query"] {
+            for reattach in [false,true] {
+                let mut fixture=super::super::tests::resident_fixture();let server=&mut fixture.server;
+                server.proof.boot_id=crate::daemon::read_boot_id().unwrap();server.source.proof=Some(server.proof.clone());
+                let paths=crate::daemon::RuntimePaths::discover().unwrap();
+                let _lease=crate::daemon::HostLease::acquire(&paths,&server.proof).unwrap();
+                let store=server.actor.0.store.clone();let mut held=store.lock().unwrap();
+                held.apply(chat::Event::Item(chat::Item {id:"source".into(),role:chat::Role::Assistant,at:None,started_at:None,
+                    content:chat::ItemContent::Text {text:"exact retained transcript".into(),thinking:false,phase:chat::Phase::Final}})).unwrap();
+                let args=match method {
+                    "snapshot"=>json!([null]),
+                    "presentation"=>json!([server.source.id,null]),
+                    "file_query"=>json!([Command::LoadFileChanges {request_id:42,after:None}]),
+                    _=>unreachable!(),
+                };
+                let request=Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args};
+                let (client,control)=UnixStream::pair().unwrap();
+                assert!(server.dispatch_source_read(control,request).is_ok(),"{method} must use the single bounded reader");
+                let started=Instant::now();
+                let state=server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"state".into(),args:json!([0])}).unwrap();
+                assert!(!state.is_null());assert!(started.elapsed()<Duration::from_secs(1));
+                if reattach {
+                    let source=server.source.clone();
+                    server.invoke(Invocation {proof:server.proof.clone(),epoch:None,method:"attach".into(),args:json!([source])}).unwrap();
+                } else {
+                    let actor=server.identity.instance;
+                    server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"fence_session_stop".into(),args:json!([actor,500])}).unwrap();
+                    assert!(server.actor.0.stop.load(Ordering::Acquire),"blocked {method} must not delay explicit stop admission");
+                }
+                drop(held);
+                let response:Result<Value,String>=receive(&client,TIMEOUT).unwrap();
+                if reattach {assert!(response.unwrap_err().contains("attachment changed"));}
+                else {
+                    let response=response.unwrap();
+                    match method {
+                        "snapshot"=>{let snapshot:Option<Snapshot>=serde_json::from_value(response).unwrap();assert!(snapshot.is_some());},
+                        "presentation"=>{let response:Option<crate::terminal_ipc::ServerResponse>=serde_json::from_value(response).unwrap();assert!(response.is_some());},
+                        "file_query"=>{let response:Option<chat::FileChangeReply>=serde_json::from_value(response).unwrap();assert!(response.is_some());},
+                        _=>unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_and_output_methods_cannot_fall_back_to_synchronous_control_reads() {
+        let mut fixture=super::super::tests::resident_fixture();let server=&mut fixture.server;
+        for method in ["snapshot","presentation","file_query","exit_output"] {
+            assert!(is_read(method));
+            let error=server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args:Value::Null}).unwrap_err();
+            assert!(error.contains("off-loop reader"),"{method}: {error}");
+        }
+    }
+
     fn query()->SourceQuery {
         SourceQuery {source:SourceKey {agent_id:Some("child".into()),source_id:"opaque:native-part:real-id".into()},
             offset:4,limit:16,expected_epoch:Some(SourceEpoch {incarnation:uuid::Uuid::new_v4(),revision:7}),until:Some(8)}

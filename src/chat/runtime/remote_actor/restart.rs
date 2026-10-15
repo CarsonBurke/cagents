@@ -277,6 +277,7 @@ impl Server {
         self.environment = crate::terminal_ipc::ChatExecutionEnvironment(spec.environment);
         self.source = request.source;
         self._directory = context.directory_descriptor();
+        if let Some(reads)=&self.source_reads {reads.invalidate();}
         self.actor = actor;
         self.changed.fetch_add(1, Ordering::Release);
         self.actor.provider_process().ok_or("The restarted provider has no verified process identity; inspect its retained failure before another restart".into())

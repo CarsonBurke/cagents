@@ -1886,8 +1886,8 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
-            "source_query" | "changes_manifest" | "change_patch" => {
-                Err("Original-source reads require the owned off-loop reader".into())
+            "source_query" | "changes_manifest" | "change_patch" | "snapshot" | "presentation" | "file_query" | "exit_output" => {
+                Err("Cache reads require the owned off-loop reader".into())
             }
             "execution_environment" => value!(self.environment.clone()),
             "restart" => {
@@ -2052,38 +2052,6 @@ impl Server {
                     }
                 }
                 value!(receipt)
-            }
-            "snapshot" => {
-                let (after,) = decode!((Option<u64>,));
-                let mut snapshot = self.actor.snapshot(after);
-                if let Some(snapshot) = &mut snapshot
-                    && let Some(loss) = self
-                        .journal
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .continuity_loss()?
-                {
-                    snapshot.error = Some(loss.reason.clone());
-                    snapshot.outcome = Some(crate::agent::ActivityOutcome::Interrupted {
-                        reason: loss.reason,
-                    });
-                }
-                value!(snapshot)
-            }
-            "presentation" => {
-                let (id, after) = decode!((crate::model::TerminalId, Option<u64>));
-                if id != self.source.id {
-                    return Err("Retained presentation names another chat".into());
-                }
-                value!(self.actor.presentation(id, after))
-            }
-            "file_query" => {
-                let (command,) = decode!((Command,));
-                value!(self.actor.file_query(&command)?)
-            }
-            "exit_output" => {
-                let (id, offset) = decode!((String, u64));
-                value!(self.actor.provider_exit_output(&id, offset)?)
             }
             "visible" => {
                 let (visible,) = decode!((bool,));
