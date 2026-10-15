@@ -212,10 +212,12 @@ impl Monitor {
                             .any(|record| !record.handle.is_completed())
                             || state.terminals.values().any(|record| {
                                 !record.handle.is_completed()
-                                    && crate::agent::Provider::from_program(
+                                    && (crate::agent::Provider::from_program(
                                         &record.session.launch.program,
-                                    )
-                                    .is_some()
+                                    ).is_some()
+                                        || record.session.launch.environment.contains_key(crate::account::SELECTION_MARKER)
+                                        || record.session.launch.environment.contains_key(crate::account::routing::AUTOMATIC_MARKER)
+                                        || crate::account::is_sign_in(&record.session.launch))
                             })
                     };
                     drop(host);
@@ -471,6 +473,59 @@ mod tests {
         assert!(logins.is_empty());
         assert_eq!(entries[&account.cache_key().unwrap()].snapshot.status, UsageStatus::Ok,
             "the old actor's report must not exhaust a replacement home at the same path");
+    }
+
+    #[test]
+    fn legacy_recipe_usage_is_attributed_only_to_the_actual_startup_home() {
+        use crate::{agent::Provider, account::{LiveReport, UsageSnapshot, UsageStatus,
+            cache::Entry, registry::{Registered, Registry}}, chat::{self, protocol::{Adapter, ProcessSpec, Step}}};
+        struct Quiet;
+        impl Adapter for Quiet {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn command(&mut self, _: chat::Command) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let cache = Cache::at(directory.path().join("cache"));
+        let mut registry = Registry::default();
+        let mut accounts = Vec::new();
+        for email in ["a@fixture.invalid", "b@fixture.invalid"] {
+            let (key, home) = homes.create(Provider::Claude, None).unwrap();
+            let account = Account::managed(Provider::Claude, key, home);
+            registry.register(Registered { key, provider: Provider::Claude, linked_home: None,
+                label: None, email: Some(email.into()), organization: None, added_at: 0 }, &[]).unwrap();
+            cache.store(&account.cache_key().unwrap(), Entry { identity: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "verified login", 1) }).unwrap();
+            accounts.push(account);
+        }
+        let source = chat::Session {
+            id: crate::model::TerminalId::new(), proof: None, terminal: None,
+            native_continuity: Default::default(), owned_codex_listener: None,
+            launch: chat::Launch { provider: Provider::Claude, session_id: None,
+                recipe: crate::model::LaunchRecipe { program: "/bin/cat".into(), arguments: Vec::new(),
+                    working_directory: directory.path().into(), environment: BTreeMap::new(),
+                    unset_environment: Default::default() } },
+        };
+        let mut spec = ProcessSpec::from(&source.launch.recipe);
+        spec.environment.insert("HOME".into(), directory.path().display().to_string());
+        spec.environment.insert("CLAUDE_CONFIG_DIR".into(), accounts[1].resolved_home().unwrap().display().to_string());
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = chat::runtime::Handle::start_owned(spec, Box::new(Quiet), initial, store,
+            source.clone(), Default::default(), |_| {}).unwrap();
+        assert!(source.launch.recipe.environment.is_empty(), "the issued legacy descriptor stays immutable");
+        let scope = handle.launch_account_scope().unwrap();
+        assert_eq!(scope.canonical_home, accounts[1].resolved_home().unwrap().canonicalize().unwrap());
+        let signal = Signal::new(Arc::new((Mutex::new(false), Condvar::new())));
+        signal.record(scope, LiveReport::Claude(crate::account::claude::LiveUpdate {
+            windows: Vec::new(), status: Some(UsageStatus::Limited),
+        }), 5_000_000);
+        let (entries, exhausted, _) = apply_reports(&registry, Some(&homes), &cache, signal.drain(), 5_000_000);
+        assert_eq!(exhausted, [accounts[1].clone()]);
+        assert_eq!(entries[&accounts[0].cache_key().unwrap()].snapshot.status, UsageStatus::Ok);
+        assert_eq!(entries[&accounts[1].cache_key().unwrap()].snapshot.status, UsageStatus::Limited);
+        handle.close().unwrap();
     }
 
     #[test]
