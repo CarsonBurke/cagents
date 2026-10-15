@@ -1,6 +1,8 @@
 //! Clone-local ignore policy for managed worktree directories.
 use super::*;
 
+const MAX_EXCLUDE_BYTES: u64 = 4 * 1024 * 1024;
+
 impl<E: ProcessExecutor> RepositoryService<E> {
     /// Ignore an in-checkout managed root without editing tracked .gitignore.
     /// External roots need no exclusion; ignore entries are anchored and escaped.
@@ -29,10 +31,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         crate::secure_file::reject_symlink_components(&exclude).map_err(|error| ValidationError::Io(error.to_string()))?;
         let mut lock = GitFileLock::acquire(&exclude).map_err(ValidationError::Io)?;
         let mut bytes = match fs_safety::open_beneath(&lock.parent, Path::new("exclude")) {
-            Ok(mut file) => fs_safety::read_bounded(&mut file, 4 * 1024 * 1024).map_err(|error| ValidationError::Io(error.to_string()))?,
+            Ok(mut file) => fs_safety::read_bounded(&mut file, MAX_EXCLUDE_BYTES).map_err(|error| ValidationError::Io(error.to_string()))?,
             Err(error) if error.is_not_found() => Vec::new(),
             Err(error) => return Err(ValidationError::Io(error.to_string()).into()),
         };
+        if bytes.len() as u64 > MAX_EXCLUDE_BYTES {
+            return Err(ValidationError::Io("Existing Git exclude file is too large to update safely; no ignore rules were changed".into()).into());
+        }
         let mut pattern = vec![b'/'];
         for byte in relative.as_os_str().as_bytes() {
             if matches!(byte, b'\\' | b'!' | b'#' | b'*' | b'?' | b'[' | b']' | b' ') { pattern.push(b'\\'); }
@@ -107,5 +112,11 @@ mod tests {
         service.ensure_managed_directory_ignored(&root, &root.join("other-managed"), &cancel).unwrap();
         let contents = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
         assert!(contents.lines().any(|line| line == "/other-managed/"));
+        let mut oversized = vec![b'#'; MAX_EXCLUDE_BYTES as usize + 1];
+        oversized.extend_from_slice(b"\n/tail-rule/\n");
+        fs::write(root.join(".git/info/exclude"), &oversized).unwrap();
+        assert!(service.ensure_managed_directory_ignored(&root, &root.join("oversized-managed"), &cancel).is_err());
+        assert_eq!(fs::read(root.join(".git/info/exclude")).unwrap(), oversized);
+        assert!(!root.join(".git/info/exclude.lock").exists());
     }
 }
