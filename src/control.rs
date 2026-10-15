@@ -4613,6 +4613,58 @@ mod tests {
     }
 
     #[test]
+    fn account_allowance_device_request_preserves_exact_session_and_pinned_host_and_refuses_old_protocol() {
+        use crate::account::reset::{Allowance, ProviderAccount, ResetCredit, ResetCredits, request::{Action, Report, Request, Source}};
+        for case in 0..3 {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            server_stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            server_stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let session = TerminalId::new();
+            let expected = proof("private-device", "private-boot", "private-incarnation");
+            let peer_proof = expected.clone();
+            let peer = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(connect.request, ClientRequest::Connect {..}));
+                let mut connected = connected_envelope(connect.request_id, peer_proof.clone(), peer_proof.clone());
+                if case == 2 {connected.version=56;}
+                write_frame(&mut server_stream,&connected).unwrap();
+                if case == 2 {
+                    let after: Option<ClientEnvelope> = read_frame(&mut server_stream).unwrap();
+                    assert!(after.is_none(), "incompatible host must receive no allowance or redemption request");
+                    return;
+                }
+                let request: ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(request.proof.as_ref(),Some(&peer_proof));
+                assert_eq!(request.request,ClientRequest::DeviceOperation {operation:crate::device_service::Operation::AccountAllowance {request:Request {session,action:Action::Inspect}}});
+                let report=Report {session,provider:crate::agent::Provider::Codex,source:Source::CodexAppServer,
+                    allowance:Allowance {observed_at_ms:1234,account:Some(ProviderAccount {account_id:"private-provider-account".into(),backend_origin:"https://chatgpt.com".into()}),account_binding_detail:None,windows:vec![],
+                        reset_credits:Some(ResetCredits {available_count:1,details:Some(vec![ResetCredit {id:"private-fixture-credit".into(),supported_type:true,available:true,expires_at_ms:None}])})},
+                    outcome:None,reconciled:false};
+                write_frame(&mut server_stream,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(request.request_id),
+                    proof:if case==1 {proof("different-device", "private-boot", "private-incarnation")} else {peer_proof},
+                    message:ServerMessage::Response {response:ServerResponse::DeviceOperation {reply:crate::device_service::Reply::AccountAllowance(report)}}}).unwrap();
+            });
+            let connected=ControlClient::from_stream(client_stream);
+            if case==2 {
+                assert!(matches!(connected,Err(ControlError::UnsupportedVersion {actual:56})));
+            } else {
+                let mut client=connected.unwrap();
+                assert_eq!(client.proof(),&expected);
+                let result=client.device_operation(crate::device_service::Operation::AccountAllowance {request:Request {session,action:Action::Inspect}});
+                if case==1 {assert!(matches!(result,Err(ControlError::ProofMismatch)));}
+                else {
+                    let crate::device_service::Reply::AccountAllowance(report)=result.unwrap() else {panic!()};
+                    assert_eq!(report.session,session);
+                    assert_eq!(report.allowance.account.unwrap().account_id,"private-provider-account");
+                    assert_eq!(report.allowance.reset_credits.unwrap().details.unwrap()[0].id,"private-fixture-credit");
+                }
+                drop(client);
+            }
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
     fn handshake_pins_complete_matching_proof_and_correlates_requests() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let expected = proof("session", "boot", "incarnation");
