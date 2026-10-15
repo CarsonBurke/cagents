@@ -1095,3 +1095,46 @@ fn same_terminal_id_and_host_proof_after_real_reconnect_cannot_receive_old_clean
     assert!(!barrier.take_key_cleanup_failures().is_empty());
     assert!(!peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })), "old cleanup cannot be replayed into the new same-ID socket attachment");
 }
+
+
+#[test]
+fn fresh_owned_input_waits_for_all_prior_cleanup_responses_and_refuses_after_unknown() {
+    for accepted in [true, false] {
+        let peer = Peer::new();
+        peer.release_ready.store(false, Ordering::Release);
+        peer.release_accept.store(accepted, Ordering::Release);
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut terminal = widget(&peer, "cleanup-fence", barrier.clone(), true, false);
+        terminal.on_shortcut = None;
+        let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+        native_focus(&mut terminal, &mut tree, &renderer);
+        dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()));
+        assert!(peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)));
+        dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyA, "a", false, keyboard::Modifiers::empty()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let request = peer.requests.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("gated cleanup frame");
+            if matches!(request, ClientRequest::Key { input, .. } if input.action == KeyAction::Release) { break; }
+        }
+        // This is genuinely accepted to the UI queue while the old up has no
+        // response. Its frame may not overtake or presume that response.
+        dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyB, "b", true, keyboard::Modifiers::empty()));
+        assert!(barrier.owns_raw_key(keyboard::key::Physical::Code(keyboard::key::Code::KeyB), &terminal.handle));
+        peer.release_ready.store(true, Ordering::Release);
+        let requests = peer.fence();
+        let new_downs: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some(input) } else { None }).collect();
+        if accepted {
+            assert_eq!(new_downs.len(), 1, "{requests:?}");
+            assert_eq!(new_downs[0].key, TerminalKey::Character('b'));
+            assert_eq!(new_downs[0].action, KeyAction::Press);
+        } else { assert!(new_downs.is_empty(), "failed cleanup cannot authorize a fresh raw down: {requests:?}"); }
+        dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyB, "b", false, keyboard::Modifiers::empty()));
+        let requests = peer.fence();
+        let new_ups: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some(input) } else { None }).collect();
+        assert_eq!(new_ups.len(), usize::from(accepted), "{requests:?}");
+        if accepted { assert_eq!(new_ups[0].action, KeyAction::Release); }
+        settle_cleanup(&barrier);
+        assert_eq!(barrier.take_key_cleanup_failures().is_empty(), accepted);
+    }
+}

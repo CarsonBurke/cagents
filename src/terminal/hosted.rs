@@ -1909,6 +1909,7 @@ fn serve_connection(
     let mut pending = BTreeMap::new();
     let mut snapshot_pending = false;
     let mut last_acknowledgement = 0;
+    let mut owned_cleanup_failed = false;
 
     if stop.is_requested() {
         connection.close();
@@ -2022,6 +2023,21 @@ fn serve_connection(
                 return ConnectionEnd::Stop;
             }
             if let ClientCommand::BoundKey { proof: original, epoch, predecessor, admitted, completed, .. } = &command {
+                if completed.is_none() && owned_cleanup_failed {
+                    if let Some(admitted) = admitted { admitted.0.store(2, Ordering::Release); }
+                    publish_event(events, published, TerminalEvent::Error {
+                        operation: "admit original terminal key",
+                        message: "earlier key cleanup is unconfirmed; new input was not sent on this attachment".into(),
+                    });
+                    continue;
+                }
+                if admitted.is_some() && pending.values().any(|kind| matches!(kind, PendingRequest::CleanupKey(_))) {
+                    // A queued up is not yet a completed up. Keep this fresh
+                    // physical cycle in FIFO until every earlier cleanup ACK.
+                    *carried = Some(command);
+                    waiting_for_owned_press = true;
+                    break;
+                }
                 let attachment = published.attachment.lock().unwrap_or_else(|e| e.into_inner());
                 let stale = original != &proof || !attachment.connection_live || attachment.connection_epoch != *epoch;
                 drop(attachment);
@@ -2212,7 +2228,9 @@ fn serve_connection(
                         admitted.0.0.store(if matches!(response, ServerResponse::Accepted) { 1 } else { 2 }, Ordering::Release);
                     }
                     (PendingRequest::CleanupKey(completed), response) => {
-                        let _ = completed.try_send(matches!(response, ServerResponse::Accepted));
+                        let accepted = matches!(response, ServerResponse::Accepted);
+                        owned_cleanup_failed |= !accepted;
+                        let _ = completed.try_send(accepted);
                     }
                     (PendingRequest::Shutdown(completed), ServerResponse::Accepted) => {
                         let _ = completed.try_send(());
@@ -2276,6 +2294,7 @@ fn serve_connection(
                     Some(PendingRequest::Hibernate) => "hibernate terminal",
                     Some(PendingRequest::OwnedPress(_)) => "admit original terminal press",
                     Some(PendingRequest::CleanupKey(completed)) => {
+                        owned_cleanup_failed = true;
                         let _ = completed.try_send(false);
                         "complete original terminal key cleanup"
                     }
