@@ -2336,7 +2336,10 @@ mod tests {
                 .contains("incoming session update could not be verified")
         }));
         let unexpected = rx.try_recv();
-        assert!(unexpected.is_err(), "unexpected publication: {unexpected:?}");
+        assert!(
+            unexpected.is_err(),
+            "unexpected publication: {unexpected:?}"
+        );
     }
 
     #[test]
