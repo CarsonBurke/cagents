@@ -1,4 +1,5 @@
 //! Hiding a view and ending the conversation are separate operations.
+use crate::ui_controls::field::EditorContent;
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -377,7 +378,7 @@ mod tests {
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             panic!("chat");
         };
-        runtime.replace_draft(text_editor::Content::with_text(text));
+        runtime.replace_draft(EditorContent::with_text(text));
         Arc::make_mut(&mut runtime.snapshot).busy = busy;
     }
     #[test]

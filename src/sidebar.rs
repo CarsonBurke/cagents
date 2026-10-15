@@ -3417,11 +3417,11 @@ impl AttentionState {
 /// what is selected. Nothing that a Git or GitHub call produced lives here -
 /// those are immutable snapshots on [`SidebarModel`].
 #[derive(Debug, Default)]
-struct CommitComposer(cosmic::iced::widget::text_editor::Content<cosmic::Renderer>);
+struct CommitComposer(crate::ui_controls::field::EditorContent);
 
 impl Clone for CommitComposer {
     fn clone(&self) -> Self {
-        Self(cosmic::iced::widget::text_editor::Content::with_text(
+        Self(crate::ui_controls::field::EditorContent::with_text(
             &self.0.text(),
         ))
     }
@@ -3462,9 +3462,9 @@ impl CommitDraft {
         let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
         self.subject = subject.to_owned();
         self.subject_composer = CommitComposer(
-            cosmic::iced::widget::text_editor::Content::with_text(subject),
+            crate::ui_controls::field::EditorContent::with_text(subject),
         );
-        self.composer = CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
+        self.composer = CommitComposer(crate::ui_controls::field::EditorContent::with_text(
             description.trim_start_matches('\n'),
         ));
     }
@@ -4434,10 +4434,7 @@ impl SidebarState {
                     self.commit_draft.subject = text.lines().collect::<Vec<_>>().join(" ");
                     if text.trim_end_matches('\n').contains('\n') {
                         // A pasted message stays a single subject line.
-                        self.commit_draft.subject_composer =
-                            CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
-                                &self.commit_draft.subject,
-                            ));
+                        self.commit_draft.subject_composer.0.normalize_text(&self.commit_draft.subject);
                     }
                     self.commit_draft.message = compose_commit_message(
                         &self.commit_draft.subject,
@@ -4448,6 +4445,34 @@ impl SidebarState {
             SidebarAction::CommitEditorAction { action, .. } => {
                 self.commit_draft.composer.0.perform(action.clone());
                 if action.is_edit() {
+                    self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_edited = true;
+                    self.revise_commit_draft();
+                    self.commit_draft.message = compose_commit_message(
+                        &self.commit_draft.subject,
+                        &self.commit_draft.composer.0.text(),
+                    );
+                }
+            }
+            SidebarAction::CommitSubjectEditorHistory { command, .. } => {
+                if command.apply(&mut self.commit_draft.subject_composer.0) {
+                    self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_edited = true;
+                    self.revise_commit_draft();
+                    let text = self.commit_draft.subject_composer.0.text();
+                    self.commit_draft.subject = text.lines().collect::<Vec<_>>().join(" ");
+                    if text.trim_end_matches('\n').contains('\n') {
+                        // A pasted message stays a single subject line.
+                        self.commit_draft.subject_composer.0.normalize_text(&self.commit_draft.subject);
+                    }
+                    self.commit_draft.message = compose_commit_message(
+                        &self.commit_draft.subject,
+                        &self.commit_draft.composer.0.text(),
+                    );
+                }
+            }
+            SidebarAction::CommitEditorHistory { command, .. } => {
+                if command.apply(&mut self.commit_draft.composer.0) {
                     self.commit_draft.amend_loading = false;
                     self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
@@ -4922,6 +4947,8 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         message: String,
     },
+    CommitSubjectEditorHistory { key: ActiveWorktreeKey, command: crate::ui_controls::field::EditorHistoryCommand },
+    CommitEditorHistory { key: ActiveWorktreeKey, command: crate::ui_controls::field::EditorHistoryCommand },
     CommitSubjectEditorCursor {
         key: ActiveWorktreeKey,
         cursor: cosmic::iced::widget::text_editor::Cursor,
@@ -11119,7 +11146,9 @@ fn changes_footer<'a>(
     if !modal_open {
         let key = key.clone();
         let cursor_key = key.clone();
+        let history_key = key.clone();
         subject_input = subject_input
+            .on_history(move |command| SidebarAction::CommitSubjectEditorHistory { key: history_key.clone(), command })
             .on_action(move |action| SidebarAction::CommitSubjectEditorAction {
                 key: key.clone(),
                 action,
@@ -11171,7 +11200,9 @@ fn changes_footer<'a>(
             });
     if !modal_open {
         let cursor_key = input_key.clone();
+        let history_key = input_key.clone();
         commit_input = commit_input
+            .on_history(move |command| SidebarAction::CommitEditorHistory { key: history_key.clone(), command })
             .on_action(move |action| SidebarAction::CommitEditorAction {
                 key: input_key.clone(),
                 action,

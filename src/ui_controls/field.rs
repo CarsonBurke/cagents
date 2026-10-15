@@ -4,7 +4,7 @@
 //! A field here is one dense row high with the same corner as the buttons
 //! beside it and a hairline edge, so a form reads as one column of controls.
 
-pub use super::editable::{TextEditor, TextInput};
+pub use super::editable::{TextEditor, TextInput, EditorContent, EditorHistoryCommand};
 use std::borrow::Cow;
 
 use cosmic::{
@@ -192,7 +192,7 @@ mod tests {
 /// A named multiline form field with the native editor's ordinary behavior.
 pub fn editor<'a, Message: Clone + 'static>(
     name: impl Into<Cow<'a, str>>,
-    content: &'a cosmic::iced::widget::text_editor::Content<cosmic::Renderer>,
+    content: &'a EditorContent,
 ) -> TextEditor<'a, Message> {
     TextEditor::new(name, content)
 }

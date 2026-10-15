@@ -1,6 +1,7 @@
 //! Window-local drafts and paged views of daemon-owned automations. Every
 //! mutation carries the revision shown to the reader; confirmation retains an
 //! immutable launch description, never a reference to a changing editor.
+use crate::ui_controls::field::EditorContent;
 use crate::{
     account::AccountId,
     agent::Provider,
@@ -98,8 +99,10 @@ pub enum Action {
     ToggleAdvanced,
     Prompt(text_editor::Action),
     PromptCursor(text_editor::Cursor),
+    PromptHistory(crate::ui_controls::field::EditorHistoryCommand),
     Shell(text_editor::Action),
     ShellCursor(text_editor::Cursor),
+    ShellHistory(crate::ui_controls::field::EditorHistoryCommand),
     Enable,
     Pause,
     RunNow,
@@ -224,8 +227,8 @@ pub struct Draft {
     reuse: bool,
     precheck: bool,
     advanced: bool,
-    prompt: text_editor::Content<cosmic::Renderer>,
-    shell: text_editor::Content<cosmic::Renderer>,
+    prompt: EditorContent,
+    shell: EditorContent,
     // Indices are frozen against the options with which this draft opened.
     targets: Vec<TargetChoice>,
     accounts: Vec<AccountChoice>,
@@ -262,8 +265,8 @@ impl Draft {
             reuse: false,
             precheck: false,
             advanced: false,
-            prompt: text_editor::Content::new(),
-            shell: text_editor::Content::new(),
+            prompt: EditorContent::new(),
+            shell: EditorContent::new(),
             targets: targets.to_vec(),
             accounts: accounts.to_vec(),
         };
@@ -302,10 +305,10 @@ impl Draft {
                 });
             }
             value.reuse = definition.session_mode == SessionMode::Reuse;
-            value.prompt = text_editor::Content::with_text(&definition.prompt);
+            value.prompt = EditorContent::with_text(&definition.prompt);
             if let Some(precheck) = &definition.precheck {
                 value.precheck = true;
-                value.shell = text_editor::Content::with_text(&precheck.command);
+                value.shell = EditorContent::with_text(&precheck.command);
                 value.timeout = precheck.timeout_seconds.to_string();
             }
             match &definition.schedule.pattern {
@@ -1215,6 +1218,12 @@ impl State {
                     draft.shell.move_to(cursor);
                 }
             }
+            Action::PromptHistory(command) => {
+                if let Some(draft) = &mut self.draft { if command.apply(&mut draft.prompt) { self.error = None; } }
+            }
+            Action::ShellHistory(command) => {
+                if let Some(draft) = &mut self.draft { if command.apply(&mut draft.shell) { self.error = None; } }
+            }
             Action::Prompt(action) => {
                 if let Some(draft) = &mut self.draft {
                     draft.prompt.perform(action);
@@ -1749,6 +1758,7 @@ impl Draft {
             crate::design::caption("Instructions").into(),
             crate::ui_controls::field::editor("Automation instructions", &self.prompt)
                 .on_action(Action::Prompt)
+                .on_history(Action::PromptHistory)
                 .on_cursor(Action::PromptCursor)
                 .height(220)
                 .into(),
@@ -1848,6 +1858,7 @@ impl Draft {
                     .push(
                         crate::ui_controls::field::editor("Precheck shell command", &self.shell)
                             .on_action(Action::Shell)
+                            .on_history(Action::ShellHistory)
                             .on_cursor(Action::ShellCursor)
                             .height(120),
                     )

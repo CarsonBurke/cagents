@@ -2115,11 +2115,11 @@ pub struct Startup {
 }
 
 #[derive(Debug, Clone, Default)]
-struct PullRequestDescription(iced::widget::text_editor::Content);
+struct PullRequestDescription(crate::ui_controls::field::EditorContent);
 
 impl From<String> for PullRequestDescription {
     fn from(value: String) -> Self {
-        Self(iced::widget::text_editor::Content::with_text(&value))
+        Self(crate::ui_controls::field::EditorContent::with_text(&value))
     }
 }
 
@@ -2697,6 +2697,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::PullRequestTitleChanged(_)
                 | Message::PullRequestBodyChanged(_)
                 | Message::PullRequestBodyCursor(_)
+                | Message::PullRequestBodyHistory(_)
                 | Message::PullRequestDraftChanged(_)
                 | Message::PullRequestRetryConfirmed(_)
                 | Message::SubmitPullRequest
@@ -7045,6 +7046,7 @@ pub enum Message {
     PullRequestTitleChanged(String),
     PullRequestBodyChanged(iced::widget::text_editor::Action),
     PullRequestBodyCursor(iced::widget::text_editor::Cursor),
+    PullRequestBodyHistory(crate::ui_controls::field::EditorHistoryCommand),
     PullRequestDraftChanged(bool),
     PullRequestRetryConfirmed(bool),
     SubmitPullRequest,
@@ -18700,6 +18702,8 @@ impl Application for Cagents {
                     | SidebarAction::CommitMessageChanged { key, .. }
                     | SidebarAction::CommitSubjectEditorCursor { key, .. }
                     | SidebarAction::CommitEditorCursor { key, .. }
+                    | SidebarAction::CommitSubjectEditorHistory { key, .. }
+                    | SidebarAction::CommitEditorHistory { key, .. }
                     | SidebarAction::CommitSubjectEditorAction { key, .. }
                     | SidebarAction::CommitEditorAction { key, .. }
                     | SidebarAction::AmendChanged { key, .. }
@@ -19143,6 +19147,8 @@ impl Application for Cagents {
                     | SidebarAction::CommitMessageChanged { .. }
                     | SidebarAction::CommitSubjectEditorCursor { .. }
                     | SidebarAction::CommitEditorCursor { .. }
+                    | SidebarAction::CommitSubjectEditorHistory { .. }
+                    | SidebarAction::CommitEditorHistory { .. }
                     | SidebarAction::CommitSubjectEditorAction { .. }
                     | SidebarAction::CommitEditorAction { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
@@ -20379,6 +20385,10 @@ impl Application for Cagents {
                 if let Some(dialog) = &mut self.pull_request_dialog {
                     dialog.body.0.move_to(cursor);
                 }
+                Task::none()
+            }
+            Message::PullRequestBodyHistory(command) => {
+                if let Some(dialog) = &mut self.pull_request_dialog { command.apply(&mut dialog.body.0); }
                 Task::none()
             }
             Message::PullRequestBodyChanged(action) => {
@@ -22383,6 +22393,7 @@ impl Application for Cagents {
                     .placeholder("Describe the change (Markdown supported)")
                     .height(160)
                     .on_action(Message::PullRequestBodyChanged)
+                    .on_history(Message::PullRequestBodyHistory)
                     .on_cursor(Message::PullRequestBodyCursor)
                     .into(),
             ])

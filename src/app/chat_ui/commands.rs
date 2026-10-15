@@ -1,4 +1,5 @@
 //! Registered conversation controls share the native toolbar's live guards.
+use crate::ui_controls::field::EditorContent;
 use super::*;
 use crate::workspace_widget::GlobalShortcut as RegisteredAction;
 
@@ -258,7 +259,7 @@ mod tests {
                 .is_none()
         );
         let runtime = app.chat_card_runtime_mut(target).unwrap();
-        runtime.replace_draft(text_editor::Content::with_text("hello"));
+        runtime.replace_draft(EditorContent::with_text("hello"));
         assert!(
             app.registered_chat_request(card, RegisteredAction::ChatSend)
                 .is_some()
@@ -314,7 +315,7 @@ mod tests {
         let (mut app, card, target) = app();
         app.chat_card_runtime_mut(target)
             .unwrap()
-            .replace_draft(text_editor::Content::with_text("first request"));
+            .replace_draft(EditorContent::with_text("first request"));
         drop(app.start_chat_draft(target));
         let request = app
             .registered_chat_request(card, RegisteredAction::ChatCancelQueued)
@@ -327,7 +328,7 @@ mod tests {
         drop(app.cancel_queued(target));
         app.chat_card_runtime_mut(target)
             .unwrap()
-            .replace_draft(text_editor::Content::with_text("replacement request"));
+            .replace_draft(EditorContent::with_text("replacement request"));
         drop(app.start_chat_draft(target));
         let current = app
             .registered_chat_request(card, RegisteredAction::ChatCancelQueued)
