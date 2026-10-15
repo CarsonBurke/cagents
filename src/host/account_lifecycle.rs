@@ -410,9 +410,10 @@ impl Reservation {
         if provider != planned_provider || !self.accounts.iter().any(|account| account.provider == provider && account.registry_key() == Some(key) && account.resolved_home().as_ref() == Some(&path)) {
             return Err(std::io::Error::other("Account creation does not match its planned home"));
         }
-        let original_system = self.accounts.iter().find(|account| account.provider == provider && account.is_system())
-            .and_then(Account::resolved_home);
-        if system != original_system.as_deref() {
+        let current = self.current().map_err(std::io::Error::other)?;
+        let original_system = self.accounts.iter().position(|account| account.provider == provider && account.is_system())
+            .and_then(|index| current.homes.get(index)).map(|home| home.path.as_path());
+        if system != original_system {
             return Err(std::io::Error::other("Account seeding does not match its reserved System home"));
         }
         homes.create_planned_with_config_initialized(provider, key, system, config, |created| {
