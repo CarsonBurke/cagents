@@ -72,8 +72,9 @@ impl RecoveryContext {
 pub(crate) struct RecoverySlot {
     budget: Arc<Budget>,
     context: Option<RecoveryContext>,
-    // NO-FD, no-I/O Drop bookkeeping for the exact domain creation admission.
-    // Native endpoint/root/lease ownership remains in the charged context.
+    // Exact creation admission, with no filesystem mutation or IPC in Drop.
+    // The actual issuer uses FD-free counter bookkeeping. Any native owners
+    // supplied by another lease must already be charged in this context.
     creation_guard: Option<Arc<dyn Send + Sync>>,
 }
 impl RecoverySlot {
