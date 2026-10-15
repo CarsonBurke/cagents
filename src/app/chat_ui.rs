@@ -453,8 +453,8 @@ impl Phase {
 struct ReconnectBatch {
     pending: HashMap<CardId, bool>,
     reconnected: usize,
-    interrupted: usize,
-    failed: usize,
+    interrupted: Vec<CardId>,
+    failed: Vec<CardId>,
 }
 
 pub(super) struct State {
@@ -4659,6 +4659,8 @@ impl Cagents {
     pub(super) fn chat_discard(&mut self, card: CardId) {
         self.notices.resolve(&format!("chat-resume:{card}"));
         self.notices.resolve_target("daemon-interrupted-turns", card);
+        self.notices.resolve_target("daemon-chat-reconnect", card);
+        self.cancel_chat_reconnect(card);
         self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
@@ -5175,7 +5177,7 @@ impl Cagents {
                 let CardRuntime::Chat(runtime) = runtime else {
                     return None;
                 };
-                (runtime.disconnected && !runtime.is_draft() && !self.chat_start_pending(*card))
+                (runtime.disconnected && runtime.reconnect_attempts < 4 && !runtime.is_draft() && !self.chat_start_pending(*card))
                     .then(|| (!runtime.visible.load(Ordering::Relaxed), runtime.target))
             })
             .collect();
@@ -5216,24 +5218,57 @@ impl Cagents {
             return;
         };
         if succeeded {
+            self.notices.resolve_target("daemon-chat-reconnect", card);
             batch.reconnected += 1;
-            batch.interrupted += usize::from(was_working && !still_working && !held);
+            if was_working && !still_working && !held {
+                batch.interrupted.push(card);
+            }
         } else {
-            batch.failed += 1;
+            batch.failed.push(card);
         }
-        if !batch.pending.is_empty() {
+        self.report_chat_reconnect_batch();
+    }
+
+    fn cancel_chat_reconnect(&mut self, card: CardId) {
+        if let Some(batch) = self.chat_ui.reconnecting.as_mut() {
+            batch.pending.remove(&card);
+            batch.interrupted.retain(|target| *target != card);
+            batch.failed.retain(|target| *target != card);
+        }
+        self.report_chat_reconnect_batch();
+    }
+
+    fn report_chat_reconnect_batch(&mut self) {
+        if !self.chat_ui.reconnecting.as_ref().is_some_and(|batch| batch.pending.is_empty()) {
             return;
         }
         let batch = self.chat_ui.reconnecting.take().unwrap();
-        let message = format!(
-            "Daemon reconnected {} chats; {} turns were interrupted; {} chats need attention.",
-            batch.reconnected, batch.interrupted, batch.failed
-        );
-        self.status = Some(if batch.failed == 0 && batch.interrupted == 0 {
-            TransientNotice::success(message)
+        if !batch.interrupted.is_empty() {
+            let key = "daemon-interrupted-turns";
+            // A second transport loss must retain earlier chats that have not
+            // received a successful user command or been dismissed yet.
+            let mut targets = self.notices.entries.iter()
+                .filter(|entry| entry.notice.key.as_deref() == Some(key))
+                .flat_map(|entry| entry.notice.targets.iter().copied())
+                .chain(batch.interrupted).collect::<Vec<_>>();
+            targets.sort();
+            targets.dedup();
+            self.notices.record(TransientNotice::warning(format!(
+                "{} previously active turns may need restarting after the daemon reconnected.", targets.len()
+            )).key(key).targets(targets));
+        }
+        if !batch.failed.is_empty() {
+            self.notices.record(TransientNotice::warning(format!(
+                "{} chats could not reconnect automatically. Open an affected chat to retry.", batch.failed.len()
+            )).key("daemon-chat-reconnect").targets(batch.failed));
         } else {
-            TransientNotice::warning(message)
-        });
+            self.notices.resolve("daemon-chat-reconnect");
+        }
+        if batch.reconnected > 0 {
+            self.status = Some(TransientNotice::success(format!(
+                "Daemon reconnected {} chats.", batch.reconnected
+            )).key("daemon-connectivity"));
+        }
     }
 
     fn retry_chat_reconnect(&mut self, card: CardId, retryable: bool) -> Task<Message> {
@@ -5269,6 +5304,7 @@ impl Cagents {
         terminate_source: bool,
     ) -> Task<Message> {
         let selection = None;
+        if matches!(intent, chat::Intent::Start) { self.cancel_chat_reconnect(card); }
         if self.chat_start_pending(card) {
             return Task::none();
         }
@@ -6809,12 +6845,19 @@ impl Cagents {
                 return self.resume_after_sign_in(target);
             }
             Action::RestoreDisconnected(target) => {
-                if self.daemon_health_ui.health.unavailable()
-                    || self.chat_start_pending(target.card)
-                    || self
-                        .chat_runtime_mut(target)
-                        .is_none_or(|runtime| !runtime.disconnected || runtime.is_draft())
-                {
+                if self.daemon_health_ui.health.unavailable() || self.chat_start_pending(target.card) {
+                    return Task::none();
+                }
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    self.cancel_chat_reconnect(target.card);
+                    return Task::none();
+                };
+                if !runtime.disconnected || runtime.is_draft() {
+                    self.cancel_chat_reconnect(target.card);
+                    return Task::none();
+                }
+                if runtime.reconnect_attempts >= 4 {
+                    self.finish_chat_reconnect(target.card, false, false);
                     return Task::none();
                 }
                 self.begin_chat_reconnect(target);
@@ -6831,7 +6874,7 @@ impl Cagents {
                     runtime.error = Some(
                         "Finish or cancel the file chooser before reconnecting the chat.".into(),
                     );
-                    return Task::none();
+                    return self.retry_chat_reconnect(target.card, true);
                 }
                 let session = runtime.session.clone();
                 return self.start_chat(target.card, session, chat::Intent::Restore, None, false);
@@ -12805,6 +12848,71 @@ mod tests {
         idle.busy = false;
         show_chat_snapshot_for_test(&mut app, card, idle);
         assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+    }
+
+    #[test]
+    fn reconnect_batches_retain_unresolved_interruption_targets_across_later_failures() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = live_chat(&mut app, Some(KNOWN_THREAD));
+        let second = live_chat(&mut app, Some(KNOWN_THREAD));
+        let failed = live_chat(&mut app, Some(KNOWN_THREAD));
+        for card in [first, second, failed] {
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.disconnected = true;
+            Arc::make_mut(&mut runtime.snapshot).busy = true;
+        }
+        app.begin_chat_reconnect(chat_runtime(&app, first).target);
+        app.finish_chat_reconnect(first, true, false);
+        let key = "daemon-interrupted-turns";
+        assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![first]);
+        app.begin_chat_reconnect(chat_runtime(&app, second).target);
+        app.begin_chat_reconnect(chat_runtime(&app, failed).target);
+        app.finish_chat_reconnect(second, true, false);
+        assert!(app.chat_ui.reconnecting.is_some(), "wait for every affected chat");
+        app.finish_chat_reconnect(failed, false, false);
+        let warning = app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap();
+        assert_eq!(warning.notice.targets.len(), 2);
+        assert!(warning.notice.targets.contains(&first));
+        assert!(warning.notice.targets.contains(&second));
+        assert!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("daemon-chat-reconnect") && entry.notice.targets == vec![failed]));
+        app.notices.resolve_target(key, first);
+        assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![second]);
+    }
+
+    #[test]
+    fn closing_a_reconnecting_chat_does_not_hold_the_aggregate_batch_open() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target).unwrap().disconnected = true;
+        app.begin_chat_reconnect(target);
+        assert!(app.chat_ui.reconnecting.is_some());
+        app.chat_discard(card);
+        assert!(app.chat_ui.reconnecting.is_none());
+        assert!(!app.notices.entries.iter().any(|entry| entry.notice.targets.contains(&card)));
+    }
+
+    #[test]
+    fn replacing_a_reconnect_target_or_exhausting_automatic_retries_retires_its_batch_member() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target).unwrap().disconnected = true;
+        app.begin_chat_reconnect(target);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.handle_chat_ui(Action::RestoreDisconnected(target)));
+        assert!(app.chat_ui.reconnecting.is_none(), "stale target cannot pin the batch");
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.disconnected = true;
+        runtime.reconnect_attempts = 4;
+        app.begin_chat_reconnect(target);
+        drop(app.handle_chat_ui(Action::RestoreDisconnected(target)));
+        assert!(app.chat_ui.reconnecting.is_none());
+        drop(app.restore_disconnected_chats());
+        assert!(app.chat_ui.reconnecting.is_none(), "healthy polling must not reset exhausted attempts");
     }
 
     #[test]
