@@ -154,6 +154,63 @@ pub struct HostedTerminalBinding {
     pub execution_instance: uuid::Uuid,
 }
 
+/// Resolves after the exact authenticated worker admits the key, or reports
+/// an explicit refusal/unconfirmed delivery. This does not prove child input
+/// consumption. Dropping the receiver never cancels an admitted key.
+#[derive(Clone)]
+pub struct HostedKeyReceipt {
+    source:std::sync::Weak<HostedPublishedState>,
+    state:Arc<KeyReceiptState>,
+}
+struct KeyReceiptState {
+    outcome:OnceLock<Result<HostedTerminalBinding,String>>,
+    gate:Mutex<()>,
+    changed:Condvar,
+}
+impl std::fmt::Debug for HostedKeyReceipt {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("HostedKeyReceipt").field("outcome",&self.state.outcome.get()).finish_non_exhaustive()
+    }
+}
+impl KeyReceiptState {
+    fn complete(&self,result:Result<HostedTerminalBinding,String>) {
+        let _gate=self.gate.lock().unwrap_or_else(|e|e.into_inner());
+        let _=self.outcome.set(result);
+        self.changed.notify_all();
+    }
+}
+impl HostedKeyReceipt {
+    /// A clone observes the same immutable completion; reading one clone never
+    /// consumes another clone's ownership evidence.
+    pub fn try_recv(&self)->Result<Result<HostedTerminalBinding,String>,TryRecvError> {
+        self.state.outcome.get().cloned().ok_or(TryRecvError::Empty)
+    }
+    pub fn recv_timeout(&self,timeout:Duration)->Result<Result<HostedTerminalBinding,String>,crossbeam_channel::RecvTimeoutError> {
+        if let Some(outcome)=self.state.outcome.get() {return Ok(outcome.clone());}
+        let deadline=Instant::now()+timeout;
+        let mut gate=self.state.gate.lock().unwrap_or_else(|e|e.into_inner());
+        loop {
+            if let Some(outcome)=self.state.outcome.get() {return Ok(outcome.clone());}
+            let remaining=deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {return Err(crossbeam_channel::RecvTimeoutError::Timeout);}
+            gate=self.state.changed.wait_timeout(gate,remaining).unwrap_or_else(|e|e.into_inner()).0;
+        }
+    }
+}
+
+struct KeyDelivery {
+    _owner: Arc<HostedHandleInner>,
+    completed: Arc<KeyReceiptState>,
+    after:Option<HostedKeyReceipt>,
+    deadline: Instant,
+    in_flight: bool,
+}
+#[derive(Default)]
+struct KeyDeliveries {
+    next_ticket:u64,
+    pending:BTreeMap<u64,KeyDelivery>,
+}
+
 struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     /// The last grid a hibernated view showed.
@@ -191,6 +248,8 @@ struct HostedPublishedState {
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
     worker_binding: OnceLock<HostedTerminalBinding>,
+    key_deliveries: Mutex<KeyDeliveries>,
+    delivery_changed: tokio::sync::Notify,
     attachment: Mutex<AttachmentState>,
     attachment_changed: Condvar,
     wake: Arc<WakeCallback>,
@@ -225,10 +284,41 @@ impl HostedPublishedState {
             })),
             proof: Mutex::new(expected_host),
             worker_binding: OnceLock::new(),
+            key_deliveries: Mutex::new(KeyDeliveries::default()),
+            delivery_changed: tokio::sync::Notify::new(),
             attachment: Mutex::new(AttachmentState::default()),
             attachment_changed: Condvar::new(),
             wake,
         }
+    }
+
+    fn complete_key(&self,ticket:u64,result:Result<HostedTerminalBinding,String>) {
+        let delivery=self.key_deliveries.lock().unwrap_or_else(|e|e.into_inner()).pending.remove(&ticket);
+        if let Some(delivery)=delivery {
+            delivery.completed.complete(result);
+            // Receipt completion must wake even a hidden/evicted card, whose
+            // semantic wake flag may never be drained again.
+            let _=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                (self.wake)(TerminalWake {generation:self.generation.load(Ordering::Acquire)})));
+            drop(delivery);
+        }
+        self.delivery_changed.notify_one();
+    }
+    fn fail_keys(&self,reason:&str) {
+        let deliveries=std::mem::take(&mut self.key_deliveries.lock().unwrap_or_else(|e|e.into_inner()).pending);
+        for (_,delivery) in deliveries {
+            delivery.completed.complete(Err(reason.to_owned()));
+            drop(delivery);
+        }
+        let _=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            (self.wake)(TerminalWake {generation:self.generation.load(Ordering::Acquire)})));
+        self.delivery_changed.notify_one();
+    }
+    fn key_deadline(&self)->Option<Instant> {
+        self.key_deliveries.lock().unwrap_or_else(|e|e.into_inner()).pending.values().map(|d|d.deadline).min()
+    }
+    fn has_in_flight_key(&self)->bool {
+        self.key_deliveries.lock().unwrap_or_else(|e|e.into_inner()).pending.values().any(|d|d.in_flight)
     }
 
     fn publish(&self, snapshot: RenderSnapshot) {
@@ -665,6 +755,7 @@ enum ClientCommand {
     Input(Vec<u8>),
     Paste(String, PasteOrigin),
     Key(KeyInput),
+    TrackedKey {ticket:u64,input:KeyInput},
     Mouse(MouseInput),
     Focus(bool),
     Resize(TerminalSize),
@@ -695,7 +786,7 @@ impl ClientCommand {
         match self {
             Self::Input(_) => "write terminal input",
             Self::Paste(..) => "paste into terminal",
-            Self::Key(_) => "send terminal key",
+            Self::Key(_) | Self::TrackedKey {..} => "send terminal key",
             Self::Mouse(_) => "send terminal mouse input",
             Self::Focus(_) => "set terminal focus",
             Self::Resize(_) => "resize terminal",
@@ -721,7 +812,7 @@ impl ClientCommand {
                 text,
                 origin,
             },
-            Self::Key(input) => ClientRequest::Key { terminal_id, input },
+            Self::Key(input) | Self::TrackedKey {input,..} => ClientRequest::Key { terminal_id, input },
             Self::Mouse(input) => ClientRequest::Mouse { terminal_id, input },
             Self::Focus(focused) => ClientRequest::Focus {
                 terminal_id,
@@ -894,7 +985,7 @@ impl HostedTerminalHandle {
         let runtime = super::transport::runtime()
             .map_err(|error| HostedTerminalStartError::Worker(io::Error::other(error)))?;
         let worker = runtime.spawn(async move {
-            client_loop(
+            run_with_key_deadlines(
                 &socket,
                 terminal_id,
                 intent,
@@ -1025,6 +1116,40 @@ impl HostedTerminalHandle {
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Key(key))
+    }
+
+    /// Queues a key with an exact-worker admission receipt. Initial keys may
+    /// wait for this actor's first authenticated binding. At most 256 tracked
+    /// keys are retained, each for five seconds including handshake time.
+    pub fn key_with_receipt(&self,input:KeyInput)->Result<HostedKeyReceipt,TerminalSendError> {
+        self.tracked_key(input,None)
+    }
+
+    /// Orders a paired release behind its original press, and skips it if
+    /// that press was refused. A different actor's receipt grants no authority.
+    pub fn key_after_receipt(&self,input:KeyInput,after:&HostedKeyReceipt)->Result<HostedKeyReceipt,TerminalSendError> {
+        if !std::sync::Weak::ptr_eq(&after.source,&Arc::downgrade(&self.inner.published)) {return Err(TerminalSendError::Closed);}
+        self.tracked_key(input,Some(after.clone()))
+    }
+
+    fn tracked_key(&self,input:KeyInput,after:Option<HostedKeyReceipt>)->Result<HostedKeyReceipt,TerminalSendError> {
+        if self.inner.stop.is_requested() {return Err(TerminalSendError::Closed);}
+        let state=Arc::new(KeyReceiptState {outcome:OnceLock::new(),gate:Mutex::new(()),changed:Condvar::new()});
+        let receipt=HostedKeyReceipt {source:Arc::downgrade(&self.inner.published),state:Arc::clone(&state)};
+        let ticket={
+            let mut deliveries=self.inner.published.key_deliveries.lock().unwrap_or_else(|e|e.into_inner());
+            if deliveries.pending.len()>=COMMAND_CAPACITY {return Err(TerminalSendError::Full);}
+            let Some(ticket)=deliveries.next_ticket.checked_add(1) else {return Err(TerminalSendError::Closed);};
+            deliveries.next_ticket=ticket;
+            deliveries.pending.insert(ticket,KeyDelivery {_owner:Arc::clone(&self.inner),completed:state,after,deadline:Instant::now()+DAEMON_READY_TIMEOUT,in_flight:false});
+            ticket
+        };
+        if let Err(error)=self.try_command(ClientCommand::TrackedKey {ticket,input}) {
+            self.inner.published.complete_key(ticket,Err(error.to_string()));
+            return Err(error);
+        }
+        self.inner.published.delivery_changed.notify_one();
+        Ok(receipt)
     }
 
     pub fn mouse(&self, mouse: MouseInput) -> Result<(), TerminalSendError> {
@@ -1169,6 +1294,7 @@ struct SpawnIntent {
 
 #[derive(Debug)]
 enum PendingRequest {
+    KeyDelivery(u64),
     Attach,
     Spawn,
     Snapshot,
@@ -1387,6 +1513,42 @@ struct ConnectionContext<'a> {
     stop: &'a WorkerStop,
 }
 
+struct KeyReceiptGuard(Arc<HostedPublishedState>);
+impl Drop for KeyReceiptGuard {
+    fn drop(&mut self) {self.0.fail_keys("terminal key delivery ended without an authenticated admission receipt");}
+}
+async fn run_with_key_deadlines(
+    socket:&Path,terminal_id:TerminalId,intent:ConnectionIntent,
+    commands:Receiver<ClientCommand>,events:Sender<TerminalEvent>,
+    published:Arc<HostedPublishedState>,stop:Arc<WorkerStop>,
+) {
+    let _receipts=KeyReceiptGuard(Arc::clone(&published));
+    let run=client_loop(socket,terminal_id,intent,commands,events,Arc::clone(&published),Arc::clone(&stop));
+    tokio::pin!(run);
+    loop {
+        let changed=published.delivery_changed.notified();
+        tokio::pin!(changed);changed.as_mut().enable();
+        let deadline=published.key_deadline();
+        let expired=async {
+            match deadline {
+                Some(deadline)=>tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+                None=>std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {biased;
+            _=&mut run=>break,
+            _=changed=>{},
+            _=expired=>{
+                // An unanswered write is not replayable: the old worker may
+                // already have admitted it. Fence this actor and fail queued
+                // later keys rather than replaying an old release out of order.
+                stop.request();
+                published.fail_keys("terminal key admission was not confirmed before its five-second deadline");
+            },
+        }
+    }
+}
+
 async fn client_loop(
     socket: &Path,
     terminal_id: TerminalId,
@@ -1418,6 +1580,10 @@ async fn client_loop(
             reconnect_delay = INITIAL_RECONNECT_DELAY;
         })
         .await;
+        if published.has_in_flight_key() {
+            stop.request();
+            published.fail_keys("terminal connection ended before key admission was confirmed; delivery is unknown");
+        }
         published.invalidate_activity();
         let _ = published.observe_agent_activity(&events, None);
         match end {
@@ -1837,7 +2003,7 @@ async fn serve_connection(
 
             presentation_restored=true;
         }
-        while attached && pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        while attached && pending.len() < MAX_IN_FLIGHT_REQUESTS && !pending.values().any(|kind|matches!(kind,PendingRequest::KeyDelivery(_))) {
             if stop.is_requested() {
                 connection.close();
                 return ConnectionEnd::Stop;
@@ -1861,8 +2027,26 @@ async fn serve_connection(
                 connection.close();
                 return ConnectionEnd::Stop;
             }
+            if let ClientCommand::TrackedKey {ticket,..}=&command {
+                let prerequisite=published.key_deliveries.lock().unwrap_or_else(|e|e.into_inner()).pending.get(ticket)
+                    .and_then(|delivery|delivery.after.as_ref()).map(HostedKeyReceipt::try_recv);
+                match prerequisite {
+                    Some(Ok(Err(reason)))=>{
+                        published.complete_key(*ticket,Err(format!("paired press was not admitted: {reason}")));
+                        continue;
+                    },
+                    Some(Err(_))=>{*carried=Some(command);break;},
+                    _=>{},
+                }
+            }
             let operation = command.operation();
             let pending_kind = match &command {
+                ClientCommand::TrackedKey {ticket,..}=>{
+                    let mut deliveries=published.key_deliveries.lock().unwrap_or_else(|e|e.into_inner());
+                    let Some(delivery)=deliveries.pending.get_mut(ticket) else {continue;};
+                    delivery.in_flight=true;
+                    PendingRequest::KeyDelivery(*ticket)
+                },
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
@@ -1909,7 +2093,7 @@ async fn serve_connection(
 
         let work = wait_for_work_async(
             stop,
-            (attached && pending.len() < MAX_IN_FLIGHT_REQUESTS).then_some(*commands),
+            (attached && pending.len() < MAX_IN_FLIGHT_REQUESTS && !pending.values().any(|kind|matches!(kind,PendingRequest::KeyDelivery(_)))).then_some(*commands),
             connection.incoming(),
             published,
             &connection.credit,
@@ -1954,6 +2138,14 @@ async fn serve_connection(
                     return ConnectionEnd::Retry;
                 };
                 match (kind, response) {
+                    (PendingRequest::KeyDelivery(ticket),ServerResponse::Accepted)=>{
+                        let result=published.worker_binding.get().cloned().ok_or_else(||"key accepted without authenticated worker identity".to_owned());
+                        published.complete_key(ticket,result);
+                    },
+                    (PendingRequest::KeyDelivery(ticket),unexpected)=>{
+                        published.complete_key(ticket,Err(format!("unexpected key admission response: {unexpected:?}")));
+                        return ConnectionEnd::Stop;
+                    },
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
                     {
@@ -2083,6 +2275,17 @@ async fn serve_connection(
                         ConnectionEnd::Stop
                     };
                 };
+                if let Some(PendingRequest::KeyDelivery(ticket))=pending.get(&request_id) {
+                    let ticket=*ticket;pending.remove(&request_id);
+                    // A typed refusal is final for this key. Never retry an old
+                    // release behind a newer press. Later queued keys retain
+                    // their order; the consumer receives explicit failure.
+                    published.complete_key(ticket,Err(format!("key admission refused: {}",error.message)));
+                    let fatal=error.code==ProtocolErrorCode::ProofMismatch;
+                    publish_protocol_error(events,published,"send terminal key",error);
+                    if fatal {return ConnectionEnd::Stop;}
+                    continue;
+                }
                 let mut attachment_failed = false;
                 let operation = match pending.remove(&request_id) {
                     Some(PendingRequest::Attach) => {
@@ -2103,6 +2306,7 @@ async fn serve_connection(
                     Some(PendingRequest::Hibernate) => "hibernate terminal",
                     Some(PendingRequest::Shutdown(_)) => "shutdown terminal",
                     Some(PendingRequest::Command(operation)) => operation,
+                    Some(PendingRequest::KeyDelivery(_)) => unreachable!("handled above"),
                     None => return ConnectionEnd::Retry,
                 };
                 let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
@@ -3279,6 +3483,99 @@ mod tests {
                 None
             );
         }
+    }
+
+    fn receipt_key(action:super::super::KeyAction)->KeyInput {
+        KeyInput {action,key:super::super::TerminalKey::Character('a'),modifiers:Default::default(),text:Some("a".into()),unshifted_codepoint:Some('a')}
+    }
+    fn receipt_response(stream:&mut UnixStream,proof:&HostSessionProof,id:u64,response:ServerResponse) {
+        write_frame(stream,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(id),proof:proof.clone(),message:ServerMessage::Response {response}}).unwrap();
+    }
+    fn receipt_connect(stream:&mut UnixStream,proof:&HostSessionProof,source:TerminalSession)->HostedTerminalBinding {
+        let request:ClientEnvelope=read_frame(stream).unwrap().unwrap();
+        assert!(matches!(request.request,ClientRequest::Connect {..}));
+        let mut terminal=TerminalDescriptor::relaunchable(source.id,source.launch.clone(),None);
+        terminal.execution_instance=uuid::Uuid::new_v4();terminal.session=source.clone();terminal.attached=true;
+        let binding=HostedTerminalBinding {source,execution_instance:terminal.execution_instance};
+        receipt_response(stream,proof,request.request_id,ServerResponse::Connected {proof:proof.clone(),resumed:vec![terminal]});
+        let visibility:ClientEnvelope=read_frame(stream).unwrap().unwrap();
+        assert!(matches!(visibility.request,ClientRequest::SetVisibility {..}));
+        receipt_response(stream,proof,visibility.request_id,ServerResponse::Accepted);
+        binding
+    }
+
+    #[test]
+    fn tracked_key_retains_last_actor_until_exact_worker_acknowledges() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();let socket=directory.path().join("key.sock");
+        let listener=UnixListener::bind(&socket).unwrap();let proof=proof("tracked-last-owner");let source=session();
+        let wakes=Arc::new(AtomicUsize::new(0));let wake_count=Arc::clone(&wakes);
+        let handle=HostedTerminalHandle::connect_at(socket,source.id,Some(proof.clone()),move |_|{wake_count.fetch_add(1,Ordering::Relaxed);}).unwrap();
+        let mut stream=accept_connection(&listener);let binding=receipt_connect(&mut stream,&proof,source);
+        handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+        let receipt=handle.key_with_receipt(receipt_key(super::super::KeyAction::Release)).unwrap();
+        let observer=receipt.clone();let weak=Arc::downgrade(&handle.inner);drop(handle);
+        let request:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(request.request,ClientRequest::Key {input:KeyInput {action:super::super::KeyAction::Release,..},..}));
+        assert!(weak.upgrade().is_some(),"tracked admission retains the final actor");
+        assert_eq!(receipt.try_recv(),Err(TryRecvError::Empty));
+        let before=wakes.load(Ordering::Relaxed);
+        receipt_response(&mut stream,&proof,request.request_id,ServerResponse::Accepted);
+        assert_eq!(receipt.recv_timeout(Duration::from_secs(2)).unwrap(),Ok(binding.clone()));
+        assert_eq!(observer.try_recv().unwrap(),Ok(binding),"clones cannot consume one another's ownership proof");
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while weak.upgrade().is_some() {assert!(Instant::now()<deadline);thread::yield_now();}
+        assert!(wakes.load(Ordering::Relaxed)>before,"receipt completion wakes an evicted owner");
+        assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_press_release_dependencies_preserve_fifo_and_skip_refused_press() {
+        for refuse in [false,true] {
+            let directory=tempfile::tempdir_in("/var/tmp").unwrap();let socket=directory.path().join("key.sock");
+            let listener=UnixListener::bind(&socket).unwrap();let proof=proof("tracked-order");let source=session();
+            let handle=HostedTerminalHandle::connect_at(socket,source.id,Some(proof.clone()),|_|{}).unwrap();
+            assert!(handle.worker_binding().is_none());
+            let press=handle.key_with_receipt(receipt_key(super::super::KeyAction::Press)).unwrap();
+            let release=handle.key_after_receipt(receipt_key(super::super::KeyAction::Release),&press).unwrap();
+            let later=handle.key_with_receipt(receipt_key(super::super::KeyAction::Press)).unwrap();
+            let mut stream=accept_connection(&listener);let binding=receipt_connect(&mut stream,&proof,source);
+            let first:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(first.request,ClientRequest::Key {input:KeyInput {action:super::super::KeyAction::Press,..},..}));
+            stream.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+            assert!(matches!(read_frame::<ClientEnvelope>(&mut stream),Err(FrameError::Io(error)) if is_timeout(&error)),"release/new press cannot overtake unanswered press");
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            if refuse {
+                write_frame(&mut stream,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(first.request_id),proof:proof.clone(),message:ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::QueueFull,"fixture full",true))}).unwrap();
+                assert!(press.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+                assert!(release.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err().contains("paired press"));
+            } else {
+                receipt_response(&mut stream,&proof,first.request_id,ServerResponse::Accepted);
+                assert_eq!(press.recv_timeout(Duration::from_secs(2)).unwrap(),Ok(binding.clone()));
+                let next:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(next.request,ClientRequest::Key {input:KeyInput {action:super::super::KeyAction::Release,..},..}));
+                write_frame(&mut stream,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(next.request_id),proof:proof.clone(),message:ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::QueueFull,"fixture full",true))}).unwrap();
+                assert!(release.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+            }
+            let next:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(next.request,ClientRequest::Key {input:KeyInput {action:super::super::KeyAction::Press,..},..}),"no refused/old release may replay behind a new press");
+            receipt_response(&mut stream,&proof,next.request_id,ServerResponse::Accepted);
+            assert_eq!(later.recv_timeout(Duration::from_secs(2)).unwrap(),Ok(binding));
+        }
+    }
+
+    #[test]
+    fn unacknowledged_last_owner_key_expires_without_a_ui_timer() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();let socket=directory.path().join("key.sock");
+        let listener=UnixListener::bind(&socket).unwrap();let proof=proof("tracked-expiry");let source=session();
+        let handle=HostedTerminalHandle::connect_at(socket,source.id,Some(proof.clone()),|_|{}).unwrap();
+        let mut stream=accept_connection(&listener);receipt_connect(&mut stream,&proof,source);
+        let receipt=handle.key_with_receipt(receipt_key(super::super::KeyAction::Release)).unwrap();
+        let weak=Arc::downgrade(&handle.inner);drop(handle);
+        let key:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();assert!(matches!(key.request,ClientRequest::Key {..}));
+        assert!(receipt.recv_timeout(Duration::from_secs(6)).unwrap().unwrap_err().contains("deadline"));
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while weak.upgrade().is_some() {assert!(Instant::now()<deadline);thread::yield_now();}
+        assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
     }
 
     #[test]
