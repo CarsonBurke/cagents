@@ -34,7 +34,7 @@ pub struct Options {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
     pub path: PathBuf,
-    /// Zero-based line and UTF-8 byte offsets, shared with editor locations.
+    /// Zero-based native editor line and UTF-8 byte offsets.
     pub line: usize,
     pub column: usize,
     pub length: usize,
@@ -221,23 +221,51 @@ pub fn search(
             };
             bytes.truncate(read);
             let mut invalid_file = false;
-            let tail_start = memchr::memrchr(b'\n', &bytes).map_or(0, |index| index + 1);
+            let tail_start =
+                memchr::memrchr2(b'\r', b'\n', &bytes).map_or(0, |index| index + 1);
             if tail_start != bytes.len() {
-                let remaining = MAX_LINE_BYTES + 1 - (bytes.len() - tail_start);
-                match Read::take(&mut reader, remaining as u64).read_until(b'\n', &mut bytes) {
-                    Ok(0) => finished = true,
-                    Ok(_) => {}
+                match complete_native_line(&mut reader, &mut bytes, tail_start, cancellation) {
+                    Ok(eof) => finished = eof,
                     Err(_) => {
                         bytes.truncate(tail_start);
                         invalid_file = true;
                         finished = true;
                     }
                 }
-                if bytes.len() - tail_start > MAX_LINE_BYTES {
-                    bytes.truncate(tail_start);
-                    invalid_file = true;
-                    finished = true;
+            }
+            // CRLF and LFCR are one native editor line ending, including when
+            // their two bytes straddle this block. Consume only the paired
+            // second byte; a repeated terminator starts another empty line.
+            if !finished
+                && let Some(ending) = unpaired_ending(&bytes)
+            {
+                loop {
+                    if cancellation.is_cancelled() {
+                        return;
+                    }
+                    match reader.fill_buf() {
+                        Ok(next) => {
+                            if next.first().is_some_and(|&byte| {
+                                matches!(byte, b'\r' | b'\n') && byte != ending
+                            }) {
+                                bytes.push(next[0]);
+                                reader.consume(1);
+                            }
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            invalid_file = true;
+                            finished = true;
+                            break;
+                        }
+                    }
                 }
+            }
+            if bytes.len() - tail_start > MAX_LINE_BYTES {
+                bytes.truncate(tail_start);
+                invalid_file = true;
+                finished = true;
             }
             // Invalid data skips its line and the suffix, retaining all valid
             // complete lines before it just as the per-line reader did.
@@ -250,7 +278,8 @@ pub fn search(
                 )
                 .min();
             if let Some(invalid) = invalid {
-                let valid = memchr::memrchr(b'\n', &bytes[..invalid]).map_or(0, |index| index + 1);
+                let valid =
+                    memchr::memrchr2(b'\r', b'\n', &bytes[..invalid]).map_or(0, |index| index + 1);
                 bytes.truncate(valid);
                 invalid_file = true;
                 finished = true;
@@ -261,13 +290,10 @@ pub fn search(
             if cancellation.is_cancelled() {
                 return;
             }
-            let block_lines = memchr::memchr_iter(b'\n', &bytes).count()
-                + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
             let text =
                 std::str::from_utf8(&bytes).expect("only validated complete lines enter the block");
             if options.regex || regex.is_match(text) {
-                for text in text.split_inclusive('\n') {
-                    let text = text.trim_end_matches(['\r', '\n']);
+                for text in native_lines(text) {
                     for matched in regex.find_iter(text) {
                         if cancellation.is_cancelled() {
                             return;
@@ -310,7 +336,7 @@ pub fn search(
                     line += 1;
                 }
             } else {
-                line += block_lines;
+                line += native_lines(text).count();
             }
             if !batch.is_empty() && last_batch.elapsed() >= BATCH_DELAY {
                 if !publish(Progress::Batch(std::mem::take(&mut batch))) {
@@ -340,6 +366,79 @@ pub fn search(
         capped: false,
         skipped,
     });
+}
+
+/// Complete the trailing native line without reading or allocating beyond
+/// its existing cap. BufRead supplies bulk slices for both CR and LF endings.
+fn complete_native_line(
+    reader: &mut impl BufRead,
+    bytes: &mut Vec<u8>,
+    start: usize,
+    cancellation: &CancellationToken,
+) -> std::io::Result<bool> {
+    while bytes.len() - start <= MAX_LINE_BYTES {
+        if cancellation.is_cancelled() {
+            return Ok(true);
+        }
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Ok(true);
+        }
+        let take = memchr::memchr2(b'\r', b'\n', available)
+            .map_or(available.len(), |index| index + 1)
+            .min(MAX_LINE_BYTES + 1 - (bytes.len() - start));
+        let ended = matches!(available[take - 1], b'\r' | b'\n');
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if ended {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+/// A block may already end in a paired terminator. Alternating runs pair
+/// from their first byte, so only an odd suffix can pair with the next block.
+fn unpaired_ending(bytes: &[u8]) -> Option<u8> {
+    let ending = *bytes.last()?;
+    if !matches!(ending, b'\r' | b'\n') {
+        return None;
+    }
+    let mut previous = ending;
+    let mut count = 1;
+    for &byte in bytes[..bytes.len() - 1].iter().rev() {
+        if !matches!(byte, b'\r' | b'\n') || byte == previous {
+            break;
+        }
+        count += 1;
+        previous = byte;
+    }
+    (count % 2 == 1).then_some(ending)
+}
+
+/// Match the editor's LineIter: CR, LF, CRLF and LFCR, with byte columns
+/// measured from the start of each line's content.
+fn native_lines(mut text: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if text.is_empty() {
+            return None;
+        }
+        let end = memchr::memchr2(b'\r', b'\n', text.as_bytes()).unwrap_or(text.len());
+        let mut next = (end + 1).min(text.len());
+        if next < text.len()
+            && matches!(text.as_bytes()[next], b'\r' | b'\n')
+            && text.as_bytes()[next] != text.as_bytes()[end]
+        {
+            next += 1;
+        }
+        let line = &text[..end];
+        text = &text[next..];
+        Some(line)
+    })
 }
 
 fn snippet(text: &str, range: std::ops::Range<usize>) -> (String, std::ops::Range<usize>) {
@@ -635,6 +734,42 @@ mod tests {
             events.last(),
             Some(Progress::Finished { skipped: 1, .. })
         ));
+    }
+
+    #[test]
+    fn search_locations_select_native_editor_matches_for_every_line_ending() {
+        use crate::{model::CardId, repository_widget::RepositoryRuntime};
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("notes.txt");
+        let padding = "x".repeat(SEARCH_BLOCK_BYTES - 1);
+        let cases = [
+            "first\rneedle".to_owned(),
+            "first\n\rneedle".to_owned(),
+            "first\r\nneedle".to_owned(),
+            "first\nneedle".to_owned(),
+            "no hit\rno hit\n\ré needle\rneedle".to_owned(),
+            format!("{padding}\r\nneedle"),
+            format!("{padding}\n\rneedle"),
+            format!("{padding}\r\n\rneedle"),
+            format!("{}\r\nneedle", "no hit\r".repeat(12_000)),
+        ];
+        for text in cases {
+            std::fs::write(&path, &text).unwrap();
+            let found = matches(run(fixture.path(), options("needle")));
+            assert_eq!(found.len(), text.matches("needle").count());
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &text);
+            for matched in found {
+                drop(runtime.open_file_location(
+                    card,
+                    matched.path,
+                    matched.line,
+                    matched.column,
+                    matched.length,
+                ));
+                assert_eq!(runtime.selected_text().as_deref(), Some("needle"));
+            }
+        }
     }
 
     #[test]
