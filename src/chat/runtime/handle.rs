@@ -42,7 +42,7 @@ impl Handle {
     pub(crate) fn inspect_remote(record:&crate::daemon::holder_registry::Record,proof:crate::model::HostSessionProof)->Result<super::remote_actor::ActorInspection,String> {RemoteActor::inspect(record,proof)}
     pub(crate) fn is_remote_record(record:&crate::daemon::holder_registry::Record)->bool {RemoteActor::is_record(record)}
     pub(crate) fn wake_retained_outcomes(&self) {if let Owner::Remote(remote)=&self.0 {remote.wake_outcomes();}}
-    pub(crate) fn uncommitted_outcomes(&self)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("outbox_unacked",serde_json::Value::Null),_=>Err("This actor has no retained outcome outbox".into())}}
+    pub(crate) fn uncommitted_outcomes(&self)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>{remote.refresh_state()?;remote.call("outbox_unacked",serde_json::Value::Null)},_=>Err("This actor has no retained outcome outbox".into())}}
     pub(crate) fn actor_identity(&self)->Option<ActorIdentity> {match &self.0 {Owner::Remote(remote)=>Some(remote.identity()),_=>None}}
     pub(crate) fn retained_outcomes(&self,after:u64)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("outbox",serde_json::json!([after])),_=>Err("This actor has no remote outbox".into())}}
     pub(crate) fn commit_retained_outcomes(&self,through:u64)->Result<(),String> {match &self.0 {Owner::Remote(remote)=>remote.call("ack_outbox",serde_json::json!([through])),_=>Err("This actor has no remote outbox".into())}}
@@ -71,6 +71,7 @@ impl Handle {
     pub(crate) fn file_query(&self,command:&Command)->Result<Option<chat::FileChangeReply>,String> {match &self.0 {Owner::Local(local)=>local.file_query(command),Owner::Remote(remote)=>remote.call("file_query",serde_json::json!([command]))}}
     pub(crate) fn provider_exit_output(&self,log_id:&str,offset:u64)->Result<(Vec<u8>,Option<u64>,u64),String> {match &self.0 {Owner::Local(local)=>local.provider_exit_output(log_id,offset),Owner::Remote(remote)=>remote.call("exit_output",serde_json::json!([log_id,offset]))}}
     pub(crate) fn usage(&self)->chat::Usage {match &self.0 {Owner::Local(local)=>local.usage(),Owner::Remote(remote)=>remote.state().usage.clone()}}
+    pub(crate) fn refresh_retained_state(&self)->Result<(),String> {match &self.0 {Owner::Local(_)=>Ok(()),Owner::Remote(remote)=>remote.refresh_state()}}
     pub(crate) fn continuity_loss(&self)->Option<super::remote_actor::ContinuityLoss> {match &self.0 {Owner::Local(_)=>None,Owner::Remote(remote)=>remote.state().continuity_loss.clone()}}
     pub(crate) fn ack_continuity_loss(&self,id:uuid::Uuid)->Result<(),String> {match &self.0 {Owner::Local(_)=>Err("This local actor has no retained continuity loss receipt".into()),Owner::Remote(remote)=>remote.call("ack_loss",serde_json::json!([id]))}}
     pub(crate) fn retained_runs(&self)->Vec<crate::model::RunId> {match &self.0 {Owner::Local(_)=>Vec::new(),Owner::Remote(remote)=>remote.state().retained_runs.clone()}}
