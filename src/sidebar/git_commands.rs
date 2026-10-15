@@ -71,6 +71,9 @@ impl GitTarget {
         if command == Command::GitOutput && source.git_output().is_some() {
             return Some(SidebarAction::ToggleGitOutput { key });
         }
+        if command == Command::GitAmend && !source.busy() && source.head_oid.is_some() {
+            return Some(SidebarAction::AmendChanged { key, amend: !state.commit_draft.amend });
+        }
         if !source.mutations_available() || source.busy() {
             return None;
         }
@@ -117,12 +120,6 @@ impl GitTarget {
                     key,
                     branch: source.branch.clone()?,
                     remotes: source.remotes.clone(),
-                });
-            }
-            Command::GitAmend if source.head_oid.is_some() => {
-                return Some(SidebarAction::AmendChanged {
-                    key,
-                    amend: !state.commit_draft.amend,
                 });
             }
             Command::GitCommit
@@ -233,7 +230,7 @@ mod tests {
         }
         model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from("Read-only Git host")));
         for descriptor in crate::workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter(|descriptor| crate::workspace_widget::git_command_bit(descriptor.action).is_some()) {
-            let read = matches!(descriptor.action, Command::GitRefresh | Command::GitStashes | Command::GitOutput);
+            let read = matches!(descriptor.action, Command::GitRefresh | Command::GitStashes | Command::GitOutput | Command::GitAmend);
             assert_eq!(target.available(&model, &state, descriptor.action), read, "capability must match actual operation: {:?}", descriptor.action);
         }
         for command in [Command::GitApplyStash, Command::GitPopStash, Command::GitDropStash] {

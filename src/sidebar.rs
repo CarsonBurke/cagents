@@ -10933,7 +10933,7 @@ fn changes_footer<'a>(
         .text_size(design::TEXT_CAPTION)
         .spacing(6)
         .on_toggle_maybe(
-            (!modal_open && source.mutations_available() && !source.busy() && source.head_oid.is_some()).then(|| {
+            (!modal_open && !source.busy() && source.head_oid.is_some()).then(|| {
                 let key = key.clone();
                 move |amend| SidebarAction::AmendChanged {
                     key: key.clone(),
@@ -20628,7 +20628,6 @@ pub(crate) mod tests {
             | SidebarAction::RunChangeGroup { .. } | SidebarAction::RequestDiscard { .. }
             | SidebarAction::Commit { .. } | SidebarAction::Push { .. }
             | SidebarAction::OpenPublish { .. } | SidebarAction::GitOperation { .. }
-            | SidebarAction::AmendChanged { .. }
             | SidebarAction::RunChangeCommand { command: Command::StageSelectedChanges | Command::UnstageSelectedChanges | Command::DiscardSelectedChanges | Command::GitAcceptOurs | Command::GitAcceptTheirs | Command::IgnoreChangePath, .. });
         let live = frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
         assert!(live.iter().any(mutates), "the actual native controls start usable");
@@ -20648,6 +20647,7 @@ pub(crate) mod tests {
         let disabled = frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
         assert!(!disabled.iter().any(mutates), "mounted native mutation controls must not emit actions");
         assert!(disabled.iter().any(|action| matches!(action, SidebarAction::OpenChange { .. } | SidebarAction::RefreshWorktree { .. })), "read navigation remains mounted and usable");
+        assert!(disabled.iter().any(|action| matches!(action, SidebarAction::AmendChanged { .. })), "Amend draft toggle/HEAD read remains usable; committing it does not");
         let mut retained = SourceControlModel::ready(main_key(), &snapshot());
         retained.upstream = None;
         retained.tracking = TrackingState::NoUpstream;
