@@ -309,6 +309,7 @@ pub(crate) struct HostState {
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_transition_gates: BTreeMap<TerminalId, std::sync::Weak<Mutex<()>>>,
     pub(super) chat_restarts: BTreeMap<TerminalId, super::chat::restart::Restart>,
+    pub(super) local_chat_retirements: BTreeMap<TerminalId, Arc<super::chat::local_retirement::Pending>>,
     /// A daemon proof plus native UUID must identify at most one fresh actor.
     /// Retain successful/explicitly closed IDs after removing their records.
     pub(super) issued_chat_ids: BTreeSet<TerminalId>,
@@ -493,6 +494,7 @@ impl HostState {
             chats: BTreeMap::new(),
             chat_transition_gates: BTreeMap::new(),
             chat_restarts: BTreeMap::new(),
+            local_chat_retirements: BTreeMap::new(),
             issued_chat_ids: BTreeSet::new(),
             directory_thread_retry: None,
             chat_observer_stamps: BTreeMap::new(),
@@ -1438,6 +1440,7 @@ impl HostState {
                 true,
             ));
         }
+        super::chat::local_retirement::require_open(self,terminal_id).map_err(model_unavailable)?;
         if self.chat_spawning.contains_key(&terminal_id)
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()

@@ -85,6 +85,7 @@ pub(super) fn restore(
     client: ClientId,
     source: &Session,
 ) -> Result<ServerResponse, String> {
+    super::local_retirement::require_open(&host.lock().unwrap_or_else(|p|p.into_inner()),source.id)?;
     super::super::session_locations::observer_registry(host)?;
     let (proof, publication) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -420,7 +421,7 @@ fn restore_authenticated(
         }
         _ => false,
     };
-    if state.shutting_down || !pair_unchanged {
+    if state.shutting_down || state.local_chat_retirements.contains_key(&source.id) || !pair_unchanged {
         drop(state);
         if let Err(error) = execution_registry
             .lock()

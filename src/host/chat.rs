@@ -4,6 +4,7 @@ mod account_isolation_tests;
 mod bound_close;
 mod execution_directory;
 mod handoff_budget;
+pub(in crate::host) mod local_retirement;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -989,6 +990,7 @@ fn start_with_execution(
     retained_sources: &[crate::agent_execution::HostedSession],
     execution_directory: Option<&std::path::Path>,
 ) -> Result<ServerResponse, ProtocolError> {
+    local_retirement::require_open(&host.lock().unwrap_or_else(|p|p.into_inner()),session.id).map_err(unavailable)?;
     super::session_locations::observer_registry(host).map_err(unavailable)?;
     let requested_source = session.clone();
     retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
@@ -1405,6 +1407,7 @@ fn start_with_execution(
                 "This chat already returned to terminal; reattach and complete that handoff instead of starting another writer",
             ));
         }
+        local_retirement::require_open(&state,session.id).map_err(unavailable)?;
         let recovering = if let Some(record) = state.chats.get(&session.id) {
             if record.returning_terminal {
                 return Err(error(
@@ -1846,7 +1849,7 @@ fn start_with_execution(
             None
         };
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down {
+        if state.shutting_down || state.local_chat_retirements.contains_key(&session.id) {
             drop(state);
             if let (Some(registry), Some(registration)) =
                 (&observer_registry, &observer_registration)
@@ -4161,6 +4164,14 @@ fn close_chat_source(
         (handle, source)
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+    let local_custody = (handle.actor_identity().is_none()
+        && !source.native_continuity.retains_provider() && !source.owns_codex_listener())
+        .then(|| local_retirement::begin(host,chat_id,&handle)).transpose()?;
+    if let Some(pending)=&local_custody && pending.chat_sealed() {
+        let snapshot=pending.snapshot().ok_or_else(|| unavailable("The exact closed owner has no final transcript; retry its original terminal close"))?;
+        local_retirement::commit(host,pending)?;
+        return Ok(ServerResponse::ChatClosed {chat_id,snapshot});
+    }
     if bound_close::close_unattempted(host, &source)
         .map_err(unavailable)?
         .is_some()
@@ -4168,16 +4179,21 @@ fn close_chat_source(
         let snapshot = handle.snapshot(None).ok_or_else(|| {
             unavailable("The exact original owner closed, but its final transcript is unavailable")
         })?;
+        if let Some(pending)=&local_custody {local_retirement::finished_elsewhere(host,pending);}
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
-    if let Some(deadline) = deadline {
-        handle
-            .close_for_resume_until(deadline)
-            .map_err(unavailable)?;
+    let snapshot = if let Some(pending)=&local_custody && pending.sealed() {
+        // A successful terminal-actor close may have failed its SQL commit.
+        // Continue from that exact proof, then also close this chat's pair.
+        pending.snapshot().ok_or_else(|| unavailable("The exact closed owner has no final transcript; retry its original terminal close"))?
     } else {
-        handle.close_for_resume().map_err(unavailable)?;
-    }
-    let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The provider stopped but its exact final transcript could not be read; retry the retained close receipt"))?;
+        if let Some(deadline) = deadline {
+            handle.close_for_resume_until(deadline).map_err(unavailable)?;
+        } else {
+            handle.close_for_resume().map_err(unavailable)?;
+        }
+        handle.snapshot(None).ok_or_else(|| unavailable("The provider stopped but its exact final transcript could not be read; retry the retained close receipt"))?
+    };
     let (retained, pending_cleanup) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let retained = state
@@ -4218,6 +4234,7 @@ fn close_chat_source(
         // gone. A server preserved by an earlier failed adoption must
         // also acknowledge exact cleanup before this close can succeed.
         native_cleanup::close_retained_under_transition(host, &retained).map_err(unavailable)?;
+        if let Some(pending)=&local_custody {local_retirement::finished_elsewhere(host,pending);}
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
     let terminal = {
@@ -4259,42 +4276,12 @@ fn close_chat_source(
             .shutdown()
             .map_err(|error| unavailable(error.to_string()))?;
     }
-    let record = {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state
-            .chats
-            .get(&chat_id)
-            .is_some_and(|record| record.handle.same_actor(&handle))
-        {
-            return Err(unavailable(
-                "The thread changed while its previous actor was closing.",
-            ));
-        }
-        if let Some((source, handle)) = &terminal
-            && state.terminals.get(&source.id).is_none_or(|record| {
-                !matches_paired_terminal(&record.session, source, state.proof())
-                    || !record.handle.same_worker(handle)
-            })
-        {
-            return Err(unavailable(
-                "The paired terminal changed while its previous worker was closing.",
-            ));
-        }
-        state.inventory_generation += 1;
-        let record = state.chats.remove(&chat_id);
-        state.chat_restarts.remove(&chat_id);
-        if let Some(notifications) = &state.notifications {
-            notifications.retire(chat_id);
-        }
-        if let Some((source, _)) = terminal {
-            state.retire_terminal(source.id);
-        }
-        record
+    let pending=match local_custody {
+        Some(pending)=>pending,
+        None=>local_retirement::begin(host,chat_id,&handle)?,
     };
-    if let Some(record) = &record {
-        super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
-    }
-    drop(record);
+    pending.seal(Some(snapshot.clone()),terminal,true);
+    local_retirement::commit(host,&pending)?;
     Ok(ServerResponse::ChatClosed { chat_id, snapshot })
 }
 
@@ -4778,9 +4765,14 @@ pub(super) fn close_terminal_actor_under_transition(
     if let Some(source) = &source {
         super::agent_execution::preflight_retirement(host, source).map_err(unavailable)?;
     }
-    match deadline {
-        Some(deadline) => handle.close_until(deadline).map_err(unavailable)?,
-        None => handle.close().map_err(unavailable)?,
+    let custody=source.as_ref().filter(|_|handle.actor_identity().is_none())
+        .map(|_|local_retirement::begin(host,terminal_id,handle)).transpose()?;
+    if custody.as_ref().is_none_or(|pending|!pending.sealed()) {
+        match deadline {
+            Some(deadline) => handle.close_until(deadline).map_err(unavailable)?,
+            None => handle.close().map_err(unavailable)?,
+        }
+        if let Some(pending)=&custody {pending.seal(handle.snapshot(None),None,false);}
     }
     retire_terminal_actor(host, terminal_id, handle)
 }
@@ -4800,6 +4792,10 @@ fn retire_terminal_actor(
     };
     if let Some(source) = &source {
         retained_actor::finish_close(host, handle, source).map_err(unavailable)?;
+    }
+    if handle.actor_identity().is_none() && source.is_some() {
+        let pending=local_retirement::begin(host,terminal_id,handle)?;
+        return local_retirement::commit(host,&pending);
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let removed = if state

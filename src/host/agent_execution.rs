@@ -1357,6 +1357,8 @@ fn create_console_from_recipe(
     restart: Option<(&Agent, &chat::Session)>,
     recipe: crate::model::LaunchRecipe,
 ) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
+    super::chat::local_retirement::require_open(&host.lock().unwrap_or_else(|p|p.into_inner()),session.id)
+        .map_err(ConsoleError::Known)?;
     // Initial console creation shares the lifecycle fence used by public
     // terminal close. Restart publication already owns that same claim.
     let transition = restart.is_none().then(|| super::chat::presentation_close::transition_gate(host, session.id));
@@ -1369,6 +1371,7 @@ fn create_console_from_recipe(
     };
     let admitted_identity = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        super::chat::local_retirement::require_open(&state,session.id).map_err(ConsoleError::Known)?;
         let record = state
             .chats
             .get_mut(&session.id)

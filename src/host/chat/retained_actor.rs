@@ -312,6 +312,7 @@ pub(super) fn restore(
     owner: crate::daemon::holder_registry::Record,
     publication: &super::source_binding::Reservation,
 ) -> Result<ServerResponse, String> {
+    super::local_retirement::require_open(&host.lock().unwrap_or_else(|p|p.into_inner()),requested.id)?;
     super::super::session_locations::observer_registry(host)?;
     let inspection = Handle::inspect_remote(&owner, proof.clone())?;
     if inspection.identity.record != owner
@@ -442,7 +443,7 @@ pub(super) fn restore(
         }
         _ => false,
     };
-    if state.shutting_down || state.proof() != proof || !pair_unchanged {
+    if state.shutting_down || state.local_chat_retirements.contains_key(&requested.id) || state.proof() != proof || !pair_unchanged {
         drop(state);
         if let Err(error) = registry
             .lock()

@@ -70,6 +70,7 @@ pub(super) fn run(
     let (plan, actor, aliases) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(source.proof.as_ref(), state.proof())?;
+        super::local_retirement::require_open(&state,source.id).map_err(unavailable)?;
         if let Some(restart) = state.chat_restarts.get(&source.id) {
             if restart.busy {
                 return Err(unavailable(
