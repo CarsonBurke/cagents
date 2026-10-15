@@ -5,6 +5,7 @@ Run under the campaign/development build lock. No provider credentials or real
 agents are used. Every signal targets a child process this fixture started.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -60,8 +61,13 @@ class Instance:
         self.log = open(self.root / "daemon.log", "wb")
         self.process = subprocess.Popen([str(binaries / "cagentsd")], env=self.env,
                                         stdout=self.log, stderr=subprocess.STDOUT)
-        wait_until(lambda: self.socket.is_socket(), description="development listener")
-        assert self.process.poll() is None, "daemon exited during startup"
+        try:
+            wait_until(lambda: self.socket.is_socket(), description="development listener")
+            assert self.process.poll() is None, "daemon exited during startup"
+        except BaseException:
+            # Construction can fail before the caller has an Instance to close.
+            self.close()
+            raise
 
     def cli(self, *args):
         result = subprocess.run([str(self.binaries / "cagents"), "--json", *args],
@@ -97,14 +103,18 @@ def main():
     parser.add_argument("--evidence", required=True, type=Path)
     args = parser.parse_args()
     binaries = args.bin_directory.resolve()
+    products = {}
     for product in ("cagents", "cagentsd"):
         assert (binaries / product).is_file(), f"Missing matched {product}"
+        with (binaries / product).open("rb") as executable:
+            products[product] = hashlib.file_digest(executable, "sha256").hexdigest()
     args.evidence.mkdir(parents=True, exist_ok=False)
     checks = []
     with tempfile.TemporaryDirectory(prefix="cagents-lifecycle-", dir="/var/tmp") as temporary:
         root = Path(temporary)
         try:
-            instance = Instance(root / "retention", binaries)
+            # Leave time to capture the retained holder even on a loaded host.
+            instance = Instance(root / "retention", binaries, retention=3)
             try:
                 terminal = instance.spawn("/bin/true")
                 holder_paths = list(instance.socket.parent.joinpath("holders").glob("*.json"))
@@ -164,7 +174,7 @@ def main():
             # Preserve failure evidence before TemporaryDirectory removes the
             # isolated state; no fixture binary copies are retained.
             shutil.copytree(root, args.evidence / "instances", ignore=shutil.ignore_patterns("*.sock", "cagents", "cagentsd"))
-            (args.evidence / "result.json").write_text(json.dumps({"checks": checks, "completed": len(checks) == 5}, indent=2) + "\n")
+            (args.evidence / "result.json").write_text(json.dumps({"products": products, "checks": checks, "completed": len(checks) == 5}, indent=2) + "\n")
     print(json.dumps({"passed": len(checks), "evidence": str(args.evidence)}))
 
 
