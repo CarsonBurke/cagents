@@ -58,6 +58,7 @@ pub(crate) struct Store {
     applied_files: usize,
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) turn_session: Option<String>,
+    pub(super) turn_account: Option<crate::chat::turn_outcomes::HistoryAccountOrigin>,
     history_origins: std::collections::HashMap<String,Option<super::turn_outcomes::HistoryProof>>,
     pub(super) visible_turn_origins: Vec<super::turn_outcomes::ScopedOrigin>,
     pub(super) presented_turn_outcomes: Option<std::sync::Arc<crate::chat::turn_outcomes::TurnOutcomeProjection>>,
@@ -87,6 +88,29 @@ impl Store {
     /// are never a license to qualify a preexisting unknown row later.
     pub(super) fn stage_history_origins(&mut self, events:&[Event]) {
         self.history_origins=super::turn_outcomes::history_origins(events);
+    }
+    /// The native producer already proved this parent thread/turn and emitted
+    /// these aliases. Qualify only this step under the same captured account
+    /// and confirmed session, never by upgrading a previous unknown row.
+    pub(super) fn stage_native_turn_origins(&mut self, update:&crate::chat::turn_outcomes::TurnUpdate) {
+        use crate::chat::turn_outcomes::{TurnUpdate,TurnIdentityKind};
+        let TurnUpdate::Bind{identity,item_ids}=update else {return;};
+        if identity.kind!=TurnIdentityKind::NativeTurn || update.validate().is_err()
+            || self.turn_session.as_deref()!=Some(identity.session_id.as_str()) {return;}
+        let Some(account)=self.turn_account.as_ref() else {return;};
+        if account.provider!=crate::agent::Provider::Codex {return;}
+        if super::turn_outcomes::physical_scope(account).is_err() {return;}
+        let proof=super::turn_outcomes::HistoryProof{session_id:identity.session_id.clone(),account:account.clone()};
+        let mut bytes:usize=self.history_origins.iter().map(|(id,proof)|id.len()+128+proof.as_ref().map_or(0,|proof|proof.session_id.len()+proof.account.canonical_home.as_os_str().len())).sum();
+        for id in item_ids {
+            if let Some(previous)=self.history_origins.get_mut(id) {
+                if previous.as_ref()!=Some(&proof) {*previous=None;}
+                continue;
+            }
+            let additional=id.len()+proof.session_id.len()+proof.account.canonical_home.as_os_str().len()+128;
+            if bytes.saturating_add(additional)>256*1024 {continue;}
+            bytes+=additional;self.history_origins.insert(id.clone(),Some(proof.clone()));
+        }
     }
     pub(super) fn clear_history_origins(&mut self) { self.history_origins.clear(); }
     /// Decode once at ingestion. Snapshots carry a small path, never megabytes
@@ -163,6 +187,7 @@ impl Store {
                 applied_files: 0,
                 file_cwd: None,
                 turn_session: None,
+                turn_account:None,
                 history_origins:Default::default(),
                 visible_turn_origins: Vec::new(),
                 presented_turn_outcomes: None,
@@ -369,7 +394,8 @@ impl Store {
         };
         let history_proof=if older { self.history_origins.get(&item.id).and_then(|proof|proof.as_ref()) } else {None};
         let native_session=if older {history_proof.map(|proof|&proof.session_id)} else {self.turn_session.as_ref().filter(|id|!id.is_empty()&&id.len()<=crate::chat::turn_outcomes::MAX_TURN_ID_BYTES)};
-        let history_account=history_proof.map(|proof|postcard::to_stdvec(&proof.account)).transpose().map_err(|error|error.to_string())?;
+        let account=if older {history_proof.map(|proof|&proof.account)} else {native_session.and(self.turn_account.as_ref())};
+        let history_account=account.map(postcard::to_stdvec).transpose().map_err(|error|error.to_string())?;
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
@@ -1516,6 +1542,32 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn exact_native_turn_bindings_qualify_only_new_history_in_the_same_account_and_session() {
+        use crate::{agent::Provider,account::scope::LaunchAccountScope,chat::turn_outcomes::{TurnIdentity,TurnIdentityKind,TurnUpdate}};
+        let root=crate::chat::annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
+        let scope=LaunchAccountScope::resolve(Provider::Codex,root.path(),|name|(name=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let account=super::super::turn_outcomes::account_origin(&scope);
+        let source=|id:&str|Item {id:id.into(),role:Role::User,at:None,started_at:None,content:ItemContent::Text {text:"exact native source".into(),thinking:false,phase:Default::default()}};
+        let binding=|session:&str,id:&str|TurnUpdate::Bind {identity:TurnIdentity {session_id:session.into(),kind:TurnIdentityKind::NativeTurn,id:"native-turn".into()},item_ids:vec![id.into()]};
+        let mut store=Store::new().unwrap();store.turn_session=Some("thread-A".into());store.turn_account=Some(account.clone());
+        store.stage_history_origins(&[]);
+        store.stage_native_turn_origins(&binding("thread-A","known"));
+        store.stage_native_turn_origins(&binding("wrong-thread","foreign"));
+        store.apply(Event::History {items:vec![source("known"),source("unknown"),source("foreign")],has_earlier:false}).unwrap();
+        store.clear_history_origins();store.window().unwrap();
+        let known=store.visible_turn_origins.iter().find(|origin|origin.origin.item_id=="known").unwrap();
+        assert_eq!(known.session_id.as_deref(),Some("thread-A"));assert_eq!(known.account.as_ref(),Some(&account));
+        assert!(store.visible_turn_origins.iter().filter(|origin|origin.origin.item_id!="known").all(|origin|origin.session_id.is_none()));
+        // A late identity-only binding cannot promote an already unknown row.
+        store.stage_history_origins(&[]);store.stage_native_turn_origins(&binding("thread-A","unknown"));
+        store.apply(Event::History {items:vec![source("unknown")],has_earlier:false}).unwrap();store.clear_history_origins();store.window().unwrap();
+        assert!(store.visible_turn_origins.iter().find(|origin|origin.origin.item_id=="unknown").unwrap().session_id.is_none());
+        store.turn_session=Some("thread-B".into());store.stage_history_origins(&[]);store.stage_native_turn_origins(&binding("thread-A","late-A"));
+        store.apply(Event::History {items:vec![source("late-A")],has_earlier:false}).unwrap();store.clear_history_origins();store.window().unwrap();
+        assert!(store.visible_turn_origins.iter().find(|origin|origin.origin.item_id=="late-A").unwrap().session_id.is_none());
+    }
+
     #[test]
     fn native_part_origins_keep_ingestion_scope_across_session_rotation_and_resident_reuse() {
         let mut store=Store::new().unwrap();

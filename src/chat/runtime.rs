@@ -2444,12 +2444,17 @@ impl Actor {
             // diagnostics so it cannot replace the turn's actual root cause.
             tracing::warn!(%message,"conversation annotation storage unavailable");
         }
-        let turn_session=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).session()
-            .filter(|id|!id.is_empty()&&id.len()<=crate::chat::turn_outcomes::MAX_TURN_ID_BYTES).map(str::to_owned);
+        let (turn_session,turn_account)={
+            let authority=self.annotations.lock().unwrap_or_else(|p|p.into_inner());
+            (authority.session().filter(|id|!id.is_empty()&&id.len()<=crate::chat::turn_outcomes::MAX_TURN_ID_BYTES).map(str::to_owned),authority.physical_account_origin())
+        };
         {
             let mut store=self.store.lock().unwrap_or_else(|p|p.into_inner());
             store.turn_session=turn_session;
+            store.turn_account=turn_account;
             store.stage_history_origins(&step.events);
+            // The composed native producer stages its validated TurnUpdate
+            // Bind events here, before any History rows enter this Store.
         }
         let originals = self.adapter.take_original_updates();
         if let Some(message) = self
@@ -4851,6 +4856,7 @@ mod tests {
         *handle.0.annotations.lock().unwrap()=annotations::Authority::for_turn_outcomes_test(scope.clone(),path.clone(),"session-A");
         {
             let mut store=handle.0.store.lock().unwrap(); store.turn_session=Some("session-A".into());
+            store.turn_account=Some(turn_outcomes::account_origin(&scope));
             store.apply(Event::Item(text("input-A","first input"))).unwrap();
             store.apply(Event::Item(text("input-B","queued next input"))).unwrap();
             let mut state=handle.0.state.lock().unwrap();state.session_id=Some("session-A".into());state.busy=true;state.turn_generation=2;

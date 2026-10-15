@@ -256,6 +256,11 @@ impl Authority {
         }
         warning
     }
+    pub(super) fn physical_account_origin(&self) -> Option<crate::chat::turn_outcomes::HistoryAccountOrigin> {
+        let scope=self.scope.as_ref().ok()?;
+        scope.revalidate().ok()?;
+        Some(super::turn_outcomes::account_origin(scope))
+    }
     pub(super) fn session(&self) -> Option<&str> {
         self.session.as_deref()
     }
