@@ -2,6 +2,7 @@
 //! Wire reference: anthropics/claude-agent-sdk-python, _internal/query.py,
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
+mod turn_outcomes;
 use super::{Adapter, ProcessSpec, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
@@ -303,6 +304,7 @@ enum ReportTask {
 
 #[derive(Default)]
 struct Claude {
+    turn_inputs: turn_outcomes::Inputs,
     session_id: Option<String>,
     /// Whether this process was launched to resume `session_id`, as opposed
     /// to being handed a new one that names nothing until its first prompt.
@@ -753,6 +755,7 @@ impl Claude {
         self.suggestion_turn = None;
         step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
+        self.turn_inputs.submit(&id,&step.events);
         if self.async_input {
             let mut preview = chat::QueuedMessage::new(id.clone(), text);
             preview.attachments = attachments;
@@ -2619,6 +2622,7 @@ impl Adapter for Claude {
                 *message = super::preview(message.as_bytes(), 1024);
             }
         }
+        self.turn_inputs.observe(&frame,&mut step);
         Ok(step)
     }
 }
