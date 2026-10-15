@@ -752,8 +752,12 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
+            PaneMenuCommand::Fork(target) => {
+                return Message::ChatUi(chat_ui::Action::BranchPicker(target, true));
+            }
+            PaneMenuCommand::ReviewChanges(target) => {
+                return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
         })
     }
 }
@@ -2181,7 +2185,12 @@ impl Cagents {
         .spacing(space::XXS)
         .align_y(Alignment::Center)
         .into();
-        let heading = self.native_header(self.sidebar_toggle(), Some(end), true, "workspace.inspector-header-controls");
+        let heading = self.native_header(
+            self.sidebar_toggle(),
+            Some(end),
+            true,
+            "workspace.inspector-header-controls",
+        );
         let tabs = widget::container(tabs)
             .padding([0.0, space::S])
             .center_y(design::HEADER_CONTENT_HEIGHT)

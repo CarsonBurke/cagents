@@ -110,14 +110,33 @@ impl TerminalSurface {
         self.handle.key(key)
     }
 
-    pub(crate) fn cleanup_epoch(&self) -> Option<u64> { self.handle.cleanup_epoch() }
-    pub(crate) fn tracked_key(&self, input: KeyInput, proof: HostSessionProof, epoch: u64) -> Result<super::hosted::KeyAdmission, TerminalSendError> {
+    pub(crate) fn cleanup_epoch(&self) -> Option<u64> {
+        self.handle.cleanup_epoch()
+    }
+    pub(crate) fn tracked_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+    ) -> Result<super::hosted::KeyAdmission, TerminalSendError> {
         self.handle.tracked_key(input, proof, epoch)
     }
-    pub(crate) fn repeat_key(&self, input: KeyInput, proof: HostSessionProof, epoch: u64, predecessor: super::hosted::KeyAdmission) -> Result<(), TerminalSendError> {
+    pub(crate) fn repeat_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+        predecessor: super::hosted::KeyAdmission,
+    ) -> Result<(), TerminalSendError> {
         self.handle.repeat_key(input, proof, epoch, predecessor)
     }
-    pub(crate) fn cleanup_key(&self, input: KeyInput, proof: HostSessionProof, epoch: u64, predecessor: super::hosted::KeyAdmission) -> Result<Receiver<bool>, TerminalSendError> {
+    pub(crate) fn cleanup_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+        predecessor: super::hosted::KeyAdmission,
+    ) -> Result<Receiver<bool>, TerminalSendError> {
         self.handle.cleanup_key(input, proof, epoch, predecessor)
     }
 

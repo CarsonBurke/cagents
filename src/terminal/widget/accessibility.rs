@@ -153,7 +153,11 @@ impl ReviewInputBarrier {
     /// native control consumed them and no terminal was mounted for delivery.
     pub(crate) fn finish_key_event(&self, event: &Event) {
         if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) = event {
-            self.0.lock().unwrap_or_else(|e| e.into_inner()).keys.retain(|key| key != physical_key);
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .retain(|key| key != physical_key);
         }
     }
     pub fn owns_mouse_release(&self, event: &Event) -> bool {

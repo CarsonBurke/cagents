@@ -22,6 +22,8 @@ mod browser_host;
 mod file_ui;
 mod git_ui;
 mod history_ui;
+#[cfg(test)]
+mod keyboard_focus_tests;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
@@ -33,8 +35,6 @@ mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
-#[cfg(test)]
-mod keyboard_focus_tests;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
@@ -2574,7 +2574,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SettingsSearchChanged(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
-        | Message::ShortcutTerminalPassthrough { .. }
+                | Message::ShortcutTerminalPassthrough { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -4285,7 +4285,10 @@ pub enum Message {
         result: Result<PullRequestCreationOutcome, String>,
     },
     CancelDialog,
-    ShortcutTerminalPassthrough { action: String, enabled: bool },
+    ShortcutTerminalPassthrough {
+        action: String,
+        enabled: bool,
+    },
     RoutedKeyEvent {
         event: keyboard::Event,
         captured: bool,
@@ -5009,7 +5012,8 @@ impl Cagents {
             _ => None,
         });
         self.terminal_review_revision = self.terminal_review_revision.wrapping_add(1);
-        self.terminal_review_input.confirm_review(previous, self.terminal_review_identity);
+        self.terminal_review_input
+            .confirm_review(previous, self.terminal_review_identity);
     }
 
     fn reconcile_terminal_review_owner(&mut self) {
@@ -6449,7 +6453,13 @@ impl Cagents {
     /// A terminal that has ended, or is closing, is read-only and forwards
     /// nothing, so it counts as any other pane.
     fn focused_pane(&self) -> workspace_widget::FocusedPane {
-        self.input_trace.keyboard_focus().unwrap_or_else(|| self.workspace.focused().map_or(workspace_widget::FocusedPane::Other, |card| self.pane_kind(card)))
+        self.input_trace.keyboard_focus().unwrap_or_else(|| {
+            self.workspace
+                .focused()
+                .map_or(workspace_widget::FocusedPane::Other, |card| {
+                    self.pane_kind(card)
+                })
+        })
     }
 
     fn pane_kind(&self, card: CardId) -> workspace_widget::FocusedPane {
@@ -8101,7 +8111,9 @@ impl Cagents {
         #[cfg(feature = "integrated-browser")]
         if focus_changed {
             // Parked trees cannot observe the native focus operation.
-            if let Some(CardRuntime::Browser(browser)) = self.durable.focused.and_then(|id| self.cards.get(&id)) {
+            if let Some(CardRuntime::Browser(browser)) =
+                self.durable.focused.and_then(|id| self.cards.get(&id))
+            {
                 let _ = browser.handle.set_focused(false);
             }
         }
@@ -13216,17 +13228,26 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let message = match message {
-            Message::RoutedKeyEvent { event, captured, region, widget } => {
+            Message::RoutedKeyEvent {
+                event,
+                captured,
+                region,
+                widget,
+            } => {
                 let _focus = self.input_trace.scoped_keyboard_focus(region, widget);
                 if let Some(card) = region.card
                     && !self.workspace.order().any(|candidate| candidate == card)
-                { return Task::none(); }
+                {
+                    return Task::none();
+                }
                 let focus = if !self.workspace_inputs_blocked()
                     && matches!(event, keyboard::Event::KeyPressed { .. })
                     && let Some(card) = region.card
                     && self.workspace.focused() != Some(card)
                 {
-                    if self.focused_repository_is_saving() { return Task::none(); }
+                    if self.focused_repository_is_saving() {
+                        return Task::none();
+                    }
                     match self.workspace.focus(card) {
                         Ok(update) => {
                             // The event's native child already owns focus.
@@ -13237,7 +13258,9 @@ impl Application for Cagents {
                         }
                         Err(_) => return Task::none(),
                     }
-                } else { Task::none() };
+                } else {
+                    Task::none()
+                };
                 return Task::batch([focus, self.update(Message::KeyEvent { event, captured })]);
             }
             message => message,
@@ -15795,29 +15818,67 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::ShortcutTerminalPassthrough { action, enabled } => {
-                if !workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().any(|descriptor| descriptor.action.id() == action && descriptor.scope.applies_to(workspace_widget::FocusedPane::Terminal))
-                    && !workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().any(|descriptor| descriptor.action.id() == action && descriptor.scope == workspace_widget::ShortcutScope::OutsideTerminal)
-                { return Task::none(); }
-                let actions = &mut self.settings.keyboard_shortcuts.terminal_passthrough_actions;
+                if !workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
+                    .iter()
+                    .any(|descriptor| {
+                        descriptor.action.id() == action
+                            && descriptor
+                                .scope
+                                .applies_to(workspace_widget::FocusedPane::Terminal)
+                    })
+                    && !workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
+                        .iter()
+                        .any(|descriptor| {
+                            descriptor.action.id() == action
+                                && descriptor.scope
+                                    == workspace_widget::ShortcutScope::OutsideTerminal
+                        })
+                {
+                    return Task::none();
+                }
+                let actions = &mut self
+                    .settings
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions;
                 actions.retain(|name| name != &action);
-                if enabled { actions.push(action); }
-                self.settings_draft.keyboard_shortcuts.terminal_passthrough_actions = actions.clone();
+                if enabled {
+                    actions.push(action);
+                }
+                self.settings_draft
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions = actions.clone();
                 self.save_settings_task(false)
             }
-            Message::RoutedKeyEvent { .. } => unreachable!("native keyboard event normalized before dispatch"),
+            Message::RoutedKeyEvent { .. } => {
+                unreachable!("native keyboard event normalized before dispatch")
+            }
             Message::KeyEvent { event, captured } => {
                 let native_region = self.input_trace.keyboard_focus();
-                let native_targets_pane = native_region.is_none() || self.input_trace.keyboard_card().is_some();
-                let repository_keys = native_region.is_none() || matches!(native_region, Some(workspace_widget::FocusedPane::Editor | workspace_widget::FocusedPane::Review));
+                let native_targets_pane =
+                    native_region.is_none() || self.input_trace.keyboard_card().is_some();
+                let repository_keys = native_region.is_none()
+                    || matches!(
+                        native_region,
+                        Some(
+                            workspace_widget::FocusedPane::Editor
+                                | workspace_widget::FocusedPane::Review
+                        )
+                    );
                 // Ordinary Save also belongs to this repository's own
                 // nontext controls, without granting a sidebar/field access
                 // to the buffer behind it. Staging keeps its narrower scope.
                 let repository_save_keys = repository_keys
                     || (native_region == Some(workspace_widget::FocusedPane::Other)
-                        && self.input_trace.keyboard_card().is_some_and(|card|
-                            matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))));
+                        && self.input_trace.keyboard_card().is_some_and(|card| {
+                            matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
+                        }));
                 let native_widget = self.input_trace.keyboard_widget_id();
-                let chat_find_keys = native_region.is_none() || native_widget == self.workspace.focused().map(|card| card_control_id(card, "chat-find"));
+                let chat_find_keys = native_region.is_none()
+                    || native_widget
+                        == self
+                            .workspace
+                            .focused()
+                            .map(|card| card_control_id(card, "chat-find"));
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
@@ -15922,7 +15983,9 @@ impl Application for Cagents {
                 if let Some(task) = self.account_key_event(&event) {
                     return task;
                 }
-                if chat_find_keys && native_targets_pane && !self.workspace_inputs_blocked()
+                if chat_find_keys
+                    && native_targets_pane
+                    && !self.workspace_inputs_blocked()
                     && let Some(task) = self.chat_find_key(&event)
                 {
                     return task;
@@ -16014,7 +16077,9 @@ impl Application for Cagents {
                     // Ahead of the inspector and the sidebar because the find
                     // bar is the innermost thing the user is looking at, and
                     // behind the confirmations above because those are modal.
-                    if native_targets_pane && let Some(card) = self.focused_repository_card_with_find() {
+                    if native_targets_pane
+                        && let Some(card) = self.focused_repository_card_with_find()
+                    {
                         return cosmic::task::message(Message::Repository(
                             RepositoryAction::CloseFind { card },
                         ));
@@ -16052,7 +16117,8 @@ impl Application for Cagents {
                 if let Some(task) = self.chat_picker_key(&event) {
                     return task;
                 }
-                if native_targets_pane && let Some(card) = self.workspace.focused()
+                if native_targets_pane
+                    && let Some(card) = self.workspace.focused()
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
                     && let keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(key),
@@ -16064,7 +16130,8 @@ impl Application for Cagents {
                         return self.handle_terminal_find(terminal_ui::Action::Close(card));
                     }
                     if *key == keyboard::key::Named::Enter
-                        && (native_region.is_none() || native_widget == Some(terminal_ui::input_id(card)))
+                        && (native_region.is_none()
+                            || native_widget == Some(terminal_ui::input_id(card)))
                         && self
                             .terminal_find
                             .get(&card)
@@ -16086,7 +16153,8 @@ impl Application for Cagents {
                     && !modifiers.alt()
                     && !modifiers.logo()
                     && let Some(card) = self.workspace.focused()
-                    && (native_region.is_none() || native_widget == Some(repository_widget::find_focus_id(card)))
+                    && (native_region.is_none()
+                        || native_widget == Some(repository_widget::find_focus_id(card)))
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
                 {
                     return cosmic::task::message(Message::Repository(if modifiers.shift() {
@@ -16096,17 +16164,23 @@ impl Application for Cagents {
                     }));
                 }
                 #[cfg(feature = "integrated-browser")]
-                if !captured && (native_region.is_none() || native_region == Some(workspace_widget::FocusedPane::Browser))
+                if !captured
+                    && (native_region.is_none()
+                        || native_region == Some(workspace_widget::FocusedPane::Browser))
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
                     && let Some(message) = browser_shortcut(card, &event)
                 {
                     return cosmic::task::message(message);
                 }
-                if native_targets_pane && !captured && let Some(task) = self.chat_scroll_key(&event) {
+                if native_targets_pane
+                    && !captured
+                    && let Some(task) = self.chat_scroll_key(&event)
+                {
                     return task;
                 }
-                if repository_save_keys && is_save_press(&event)
+                if repository_save_keys
+                    && is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
                 {
@@ -16124,9 +16198,14 @@ impl Application for Cagents {
                         // A mounted nontext sidebar/inspector control has no
                         // pane find target. Keep find in project navigation
                         // instead of borrowing the logical pane behind it.
-                        let command = if native_region.is_some() && !native_targets_pane
+                        let command = if native_region.is_some()
+                            && !native_targets_pane
                             && command == workspace_widget::GlobalShortcut::FindInPane
-                        { workspace_widget::GlobalShortcut::FocusProjectSearch } else { command };
+                        {
+                            workspace_widget::GlobalShortcut::FocusProjectSearch
+                        } else {
+                            command
+                        };
                         let modifiers = match event {
                             keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
                             _ => keyboard::Modifiers::empty(),
@@ -16722,7 +16801,10 @@ impl Application for Cagents {
         ];
         if self.workspace_inputs_blocked() {
             subscriptions.push(event::listen_with(|event, status, _| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent { event, captured: matches!(status, event::Status::Captured) }),
+                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
+                    event,
+                    captured: matches!(status, event::Status::Captured),
+                }),
                 _ => None,
             }));
         }
@@ -16770,160 +16852,161 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
-        self.input_trace.bind_terminal_keys(self.terminal_review_input.clone());
+        self.input_trace
+            .bind_terminal_keys(self.terminal_review_input.clone());
         let surface = (|| -> Option<Element<'_, Message>> {
-        if let Some(dialog) = self.automation_approval_dialog() {
-            return Some(dialog);
-        }
-        if self.transient_work_close.is_some() {
-            let mut controls: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::button::secondary("Cancel close")
-                    .id(widget::Id::new("dialog.transient-close.cancel"))
-                    .on_press(Message::CancelTransientWorkClose)
-                    .into(),
-            ];
-            if self.device_ui.dirty() {
-                controls.push(
-                    crate::ui_controls::button::primary("Return to file")
-                        .on_press(Message::ReturnToDeviceBeforeClose)
-                        .into(),
-                );
+            if let Some(dialog) = self.automation_approval_dialog() {
+                return Some(dialog);
             }
-            if self.automation_ui.draft_close_blocker().is_some() {
-                controls.push(
-                    crate::ui_controls::button::primary("Keep editing automation")
-                        .on_press(Message::ReturnToAutomationBeforeClose)
+            if self.transient_work_close.is_some() {
+                let mut controls: Vec<Element<'_, Message>> = vec![
+                    crate::ui_controls::button::secondary("Cancel close")
+                        .id(widget::Id::new("dialog.transient-close.cancel"))
+                        .on_press(Message::CancelTransientWorkClose)
                         .into(),
-                );
-                if self.automation_ui.draft_dirty() && self.automation_ui.can_discard_draft() {
+                ];
+                if self.device_ui.dirty() {
                     controls.push(
-                        crate::ui_controls::button::destructive("Discard automation changes")
-                            .on_press(Message::DiscardAutomationAndClose(
-                                self.automation_close_generation,
-                            ))
+                        crate::ui_controls::button::primary("Return to file")
+                            .on_press(Message::ReturnToDeviceBeforeClose)
                             .into(),
                     );
                 }
-            }
-            return Some(dialog_ui::overlay(
-                dialog_ui::surface(
-                    widget::column::with_children(vec![
-                        design::title("Keep unsaved work before closing").into(),
-                        notice_detail(self.window_close_transient_blocker().unwrap_or(
-                            "The pending work is complete. Cancel this dialog and close again.",
-                        )),
-                        widget::row::with_children(controls)
-                            .spacing(space::S)
-                            .wrap()
+                if self.automation_ui.draft_close_blocker().is_some() {
+                    controls.push(
+                        crate::ui_controls::button::primary("Keep editing automation")
+                            .on_press(Message::ReturnToAutomationBeforeClose)
                             .into(),
-                    ])
-                    .spacing(space::M),
-                    480.0,
-                ),
-                Some(Message::CancelTransientWorkClose),
-                1.0,
-            ));
-        }
-        if let Some(dialog) = self.automation_ui.draft_dialog() {
-            return Some(dialog_ui::overlay(
-                dialog.map(Message::AutomationUi),
-                self.automation_ui
-                    .keep_draft_action()
-                    .map(Message::AutomationUi),
-                1.0,
-            ));
-        }
-        if self.device_ui.open {
-            return Some(dialog_ui::overlay(
-                self.device_dialog(),
-                (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
-                1.0,
-            ));
-        }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
-            return Some(gallery.view());
-        }
-        if let Some(dialog) = self.terminal_paste_dialog() {
-            return Some(dialog);
-        }
-        #[cfg(feature = "integrated-browser")]
-        if let Some(dialog) = self.browser_import_dialog() {
-            return Some(dialog);
-        }
-        if let Some(dialog) = self.session_recovery_dialog() {
-            return Some(dialog);
-        }
-        if let Some(dialog) = self.daemon_health_dialog() {
-            return Some(dialog);
-        }
-        if let Some(dialog) = self.update_dialog() {
-            return Some(dialog);
-        }
-        if let Some(intent) = &self.terminal_close
-            && self.terminal_close_dialog_visible()
-        {
-            return self.terminal_close_dialog().map(|surface| {
-                dialog_ui::overlay(
-                    surface,
-                    (!intent.pending).then_some(Message::CancelTerminalClose),
-                    1.0,
-                )
-            });
-        }
-        // Above the settings surface it is raised from, because it is about to
-        // discard every shortcut, font, theme and language-server entry the
-        // user configured, with no undo.
-        if self.settings_reset_confirm {
-            return Some(dialog_ui::overlay(
-                dialog_ui::surface(
-                    widget::column::with_children(vec![
-                        design::title("Reset all settings?").into(),
-                        notice_body(
-                            "Every customization returns to its default: keyboard shortcuts, \
-                             terminal font and theme, editor syntax theme, interface scale, \
-                             pane widths, and the configured language servers.",
-                        ),
-                        notice_detail("This cannot be undone."),
-                        widget::row::with_children(vec![
-                            iced::widget::Space::new().width(Length::Fill).into(),
-                            crate::ui_controls::button::secondary("Cancel")
-                                .id(widget::Id::new("dialog.reset-settings.cancel"))
-                                .on_press(Message::CancelResetSettings)
+                    );
+                    if self.automation_ui.draft_dirty() && self.automation_ui.can_discard_draft() {
+                        controls.push(
+                            crate::ui_controls::button::destructive("Discard automation changes")
+                                .on_press(Message::DiscardAutomationAndClose(
+                                    self.automation_close_generation,
+                                ))
                                 .into(),
-                            crate::ui_controls::button::destructive("Reset settings")
-                                .id(widget::Id::new("dialog.reset-settings.confirm"))
-                                .on_press(Message::ConfirmResetSettings)
+                        );
+                    }
+                }
+                return Some(dialog_ui::overlay(
+                    dialog_ui::surface(
+                        widget::column::with_children(vec![
+                            design::title("Keep unsaved work before closing").into(),
+                            notice_detail(self.window_close_transient_blocker().unwrap_or(
+                                "The pending work is complete. Cancel this dialog and close again.",
+                            )),
+                            widget::row::with_children(controls)
+                                .spacing(space::S)
+                                .wrap()
                                 .into(),
                         ])
-                        .spacing(space::S)
-                        .into(),
-                    ])
-                    .spacing(space::M),
-                    480.0,
-                ),
-                Some(Message::CancelResetSettings),
-                1.0,
-            ));
-        }
-        // First, because a discard is the one dialog on screen precisely
-        // because it is about to destroy work that exists nowhere else.
-        if let Some(pending) = self.sidebar_state.pending_discard() {
-            return Some(dialog_ui::overlay(
-                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
-                Some(Message::Sidebar(SidebarAction::CancelDiscard)),
-                1.0,
-            ));
-        }
-        if let Some(close) = self.dirty_repository_close.as_ref() {
-            let card = close.card;
-            let runtime = match self.cards.get(&card) {
-                Some(CardRuntime::Repository(runtime)) => runtime,
-                _ => return None,
-            };
-            let title = self
-                .card_state(card)
-                .map_or("Repository".into(), |state| state.title.clone());
-            let mut rows: Vec<Element<'_, Message>> = vec![
+                        .spacing(space::M),
+                        480.0,
+                    ),
+                    Some(Message::CancelTransientWorkClose),
+                    1.0,
+                ));
+            }
+            if let Some(dialog) = self.automation_ui.draft_dialog() {
+                return Some(dialog_ui::overlay(
+                    dialog.map(Message::AutomationUi),
+                    self.automation_ui
+                        .keep_draft_action()
+                        .map(Message::AutomationUi),
+                    1.0,
+                ));
+            }
+            if self.device_ui.open {
+                return Some(dialog_ui::overlay(
+                    self.device_dialog(),
+                    (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
+                    1.0,
+                ));
+            }
+            if let Some(gallery) = &self.chat_ui.image_viewer {
+                return Some(gallery.view());
+            }
+            if let Some(dialog) = self.terminal_paste_dialog() {
+                return Some(dialog);
+            }
+            #[cfg(feature = "integrated-browser")]
+            if let Some(dialog) = self.browser_import_dialog() {
+                return Some(dialog);
+            }
+            if let Some(dialog) = self.session_recovery_dialog() {
+                return Some(dialog);
+            }
+            if let Some(dialog) = self.daemon_health_dialog() {
+                return Some(dialog);
+            }
+            if let Some(dialog) = self.update_dialog() {
+                return Some(dialog);
+            }
+            if let Some(intent) = &self.terminal_close
+                && self.terminal_close_dialog_visible()
+            {
+                return self.terminal_close_dialog().map(|surface| {
+                    dialog_ui::overlay(
+                        surface,
+                        (!intent.pending).then_some(Message::CancelTerminalClose),
+                        1.0,
+                    )
+                });
+            }
+            // Above the settings surface it is raised from, because it is about to
+            // discard every shortcut, font, theme and language-server entry the
+            // user configured, with no undo.
+            if self.settings_reset_confirm {
+                return Some(dialog_ui::overlay(
+                    dialog_ui::surface(
+                        widget::column::with_children(vec![
+                            design::title("Reset all settings?").into(),
+                            notice_body(
+                                "Every customization returns to its default: keyboard shortcuts, \
+                             terminal font and theme, editor syntax theme, interface scale, \
+                             pane widths, and the configured language servers.",
+                            ),
+                            notice_detail("This cannot be undone."),
+                            widget::row::with_children(vec![
+                                iced::widget::Space::new().width(Length::Fill).into(),
+                                crate::ui_controls::button::secondary("Cancel")
+                                    .id(widget::Id::new("dialog.reset-settings.cancel"))
+                                    .on_press(Message::CancelResetSettings)
+                                    .into(),
+                                crate::ui_controls::button::destructive("Reset settings")
+                                    .id(widget::Id::new("dialog.reset-settings.confirm"))
+                                    .on_press(Message::ConfirmResetSettings)
+                                    .into(),
+                            ])
+                            .spacing(space::S)
+                            .into(),
+                        ])
+                        .spacing(space::M),
+                        480.0,
+                    ),
+                    Some(Message::CancelResetSettings),
+                    1.0,
+                ));
+            }
+            // First, because a discard is the one dialog on screen precisely
+            // because it is about to destroy work that exists nowhere else.
+            if let Some(pending) = self.sidebar_state.pending_discard() {
+                return Some(dialog_ui::overlay(
+                    sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
+                    Some(Message::Sidebar(SidebarAction::CancelDiscard)),
+                    1.0,
+                ));
+            }
+            if let Some(close) = self.dirty_repository_close.as_ref() {
+                let card = close.card;
+                let runtime = match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime,
+                    _ => return None,
+                };
+                let title = self
+                    .card_state(card)
+                    .map_or("Repository".into(), |state| state.title.clone());
+                let mut rows: Vec<Element<'_, Message>> = vec![
                 design::title(if runtime.has_durability_warning() {
                     format!("Confirm the save to {title} before closing")
                 } else {
@@ -16938,200 +17021,201 @@ impl Application for Cagents {
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
             ];
-            if let Some(error) = runtime.save_error() {
+                if let Some(error) = runtime.save_error() {
+                    rows.push(
+                        design::body(error.to_owned())
+                            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                            .into(),
+                    );
+                }
+                let save_message = runtime
+                    .can_save()
+                    .then_some(if runtime.has_save_conflict() {
+                        Message::OverwriteAndCloseRepository(card)
+                    } else {
+                        Message::SaveAndCloseRepository(card)
+                    });
+                let mut controls: Vec<Element<'_, Message>> = vec![
+                    crate::ui_controls::button::secondary("Cancel")
+                        .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
+                        .on_press_maybe(
+                            (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
+                        )
+                        .into(),
+                ];
+                if runtime.can_abandon_unsaved_changes() {
+                    controls.push(
+                        crate::ui_controls::button::destructive("Discard")
+                            .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
+                            .on_press(Message::DiscardAndCloseRepository(card))
+                            .into(),
+                    );
+                }
+                controls.push(
+                    crate::ui_controls::button::primary(if runtime.has_save_conflict() {
+                        "Overwrite and close"
+                    } else if runtime.has_durability_warning() {
+                        "Retry save and close"
+                    } else {
+                        "Save and close"
+                    })
+                    .id(dirty_close_control_id(card, DirtyCloseControl::Save))
+                    .on_press_maybe(save_message)
+                    .into(),
+                );
                 rows.push(
-                    design::body(error.to_owned())
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                    widget::row::with_children(controls)
+                        .spacing(space::S)
                         .into(),
                 );
+                return Some(dialog_ui::overlay(
+                    dialog_ui::surface(
+                        widget::container(widget::column::with_children(rows).spacing(space::M))
+                            .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                        560.0,
+                    ),
+                    (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
+                    1.0,
+                ));
             }
-            let save_message = runtime
-                .can_save()
-                .then_some(if runtime.has_save_conflict() {
-                    Message::OverwriteAndCloseRepository(card)
-                } else {
-                    Message::SaveAndCloseRepository(card)
-                });
-            let mut controls: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
-                    .on_press_maybe(
-                        (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
-                    )
+            if let Some(surface) = self.sidebar_selection_dialog() {
+                return Some(dialog_ui::overlay(
+                    surface,
+                    Some(Message::SidebarSelection(
+                        sidebar_selection_ui::Action::Dismiss,
+                    )),
+                    1.0,
+                ));
+            }
+            if let Some(surface) = self.project_dialog_view() {
+                return Some(dialog_ui::overlay(
+                    surface,
+                    Some(Message::ProjectUi(project_ui::Action::Dismiss)),
+                    1.0,
+                ));
+            }
+            if let Some(surface) = self.channel_dialog_view() {
+                return Some(dialog_ui::overlay(
+                    surface,
+                    Some(Message::ChannelUi(channel_ui::Action::Dismiss)),
+                    1.0,
+                ));
+            }
+            if let Some((surface, dismiss)) = self.worktree_dialog_view() {
+                return Some(dialog_ui::overlay(surface, dismiss, 1.0));
+            }
+
+            if let Some(dialog) = self.resume_dialog() {
+                return Some(dialog);
+            }
+
+            let dialog = self.pull_request_dialog.as_ref()?;
+            let head = dialog.head.trim();
+            let base = dialog.base.trim();
+            let draft = if dialog.draft { ", draft" } else { "" };
+            let route = if head.is_empty() || base.is_empty() {
+                "Choose a head and a base".to_owned()
+            } else {
+                format!("{head} → {base}{draft}")
+            };
+            let context = match &dialog.worktree {
+                Some(path) => format!("{} · {route}", path.display()),
+                None => route,
+            };
+            let mut rows: Vec<Element<'_, Message>> = vec![
+                design::title("Create pull request").into(),
+                design::caption(format!("{} · {context}", dialog.repository.gh_selector())).into(),
+                widget::column::with_children(vec![
+                    design::caption("Title").into(),
+                    crate::ui_controls::field::text("Title", &dialog.title)
+                        .id(pull_request_dialog_focus_id())
+                        .on_input(Message::PullRequestTitleChanged)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .into(),
+                widget::column::with_children(vec![
+                    design::caption("Head branch").into(),
+                    crate::ui_controls::field::text("Head branch", &dialog.head)
+                        .id(widget::Id::new("dialog.pull-request.head"))
+                        .on_input(Message::PullRequestHeadChanged)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .into(),
+                widget::column::with_children(vec![
+                    design::caption("Base branch").into(),
+                    crate::ui_controls::field::text("Base branch", &dialog.base)
+                        .id(widget::Id::new("dialog.pull-request.base"))
+                        .on_input(Message::PullRequestBaseChanged)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .into(),
+                widget::column::with_children(vec![
+                    design::caption("Description").into(),
+                    crate::ui_controls::field::editor("Pull request description", &dialog.body.0)
+                        .placeholder("Describe the change (Markdown supported)")
+                        .height(160)
+                        .on_action(Message::PullRequestBodyChanged)
+                        .on_cursor(Message::PullRequestBodyCursor)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .into(),
+                crate::ui_controls::field::checkbox(dialog.draft)
+                    .label("Create as draft")
+                    .on_toggle(Message::PullRequestDraftChanged)
                     .into(),
             ];
-            if runtime.can_abandon_unsaved_changes() {
-                controls.push(
-                    crate::ui_controls::button::destructive("Discard")
-                        .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
-                        .on_press(Message::DiscardAndCloseRepository(card))
-                        .into(),
-                );
-            }
-            controls.push(
-                crate::ui_controls::button::primary(if runtime.has_save_conflict() {
-                    "Overwrite and close"
-                } else if runtime.has_durability_warning() {
-                    "Retry save and close"
-                } else {
-                    "Save and close"
-                })
-                .id(dirty_close_control_id(card, DirtyCloseControl::Save))
-                .on_press_maybe(save_message)
-                .into(),
-            );
-            rows.push(
-                widget::row::with_children(controls)
-                    .spacing(space::S)
-                    .into(),
-            );
-            return Some(dialog_ui::overlay(
-                dialog_ui::surface(
-                    widget::container(widget::column::with_children(rows).spacing(space::M))
-                        .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
-                    560.0,
-                ),
-                (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
-                1.0,
-            ));
-        }
-        if let Some(surface) = self.sidebar_selection_dialog() {
-            return Some(dialog_ui::overlay(
-                surface,
-                Some(Message::SidebarSelection(
-                    sidebar_selection_ui::Action::Dismiss,
-                )),
-                1.0,
-            ));
-        }
-        if let Some(surface) = self.project_dialog_view() {
-            return Some(dialog_ui::overlay(
-                surface,
-                Some(Message::ProjectUi(project_ui::Action::Dismiss)),
-                1.0,
-            ));
-        }
-        if let Some(surface) = self.channel_dialog_view() {
-            return Some(dialog_ui::overlay(
-                surface,
-                Some(Message::ChannelUi(channel_ui::Action::Dismiss)),
-                1.0,
-            ));
-        }
-        if let Some((surface, dismiss)) = self.worktree_dialog_view() {
-            return Some(dialog_ui::overlay(surface, dismiss, 1.0));
-        }
-
-        if let Some(dialog) = self.resume_dialog() {
-            return Some(dialog);
-        }
-
-        let dialog = self.pull_request_dialog.as_ref()?;
-        let head = dialog.head.trim();
-        let base = dialog.base.trim();
-        let draft = if dialog.draft { ", draft" } else { "" };
-        let route = if head.is_empty() || base.is_empty() {
-            "Choose a head and a base".to_owned()
-        } else {
-            format!("{head} → {base}{draft}")
-        };
-        let context = match &dialog.worktree {
-            Some(path) => format!("{} · {route}", path.display()),
-            None => route,
-        };
-        let mut rows: Vec<Element<'_, Message>> = vec![
-            design::title("Create pull request").into(),
-            design::caption(format!("{} · {context}", dialog.repository.gh_selector())).into(),
-            widget::column::with_children(vec![
-                design::caption("Title").into(),
-                crate::ui_controls::field::text("Title", &dialog.title)
-                    .id(pull_request_dialog_focus_id())
-                    .on_input(Message::PullRequestTitleChanged)
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            widget::column::with_children(vec![
-                design::caption("Head branch").into(),
-                crate::ui_controls::field::text("Head branch", &dialog.head)
-                    .id(widget::Id::new("dialog.pull-request.head"))
-                    .on_input(Message::PullRequestHeadChanged)
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            widget::column::with_children(vec![
-                design::caption("Base branch").into(),
-                crate::ui_controls::field::text("Base branch", &dialog.base)
-                    .id(widget::Id::new("dialog.pull-request.base"))
-                    .on_input(Message::PullRequestBaseChanged)
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            widget::column::with_children(vec![
-                design::caption("Description").into(),
-                crate::ui_controls::field::editor("Pull request description", &dialog.body.0)
-                    .placeholder("Describe the change (Markdown supported)")
-                    .height(160)
-                    .on_action(Message::PullRequestBodyChanged)
-                    .on_cursor(Message::PullRequestBodyCursor)
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            crate::ui_controls::field::checkbox(dialog.draft)
-                .label("Create as draft")
-                .on_toggle(Message::PullRequestDraftChanged)
-                .into(),
-        ];
-        if let Some(confirmed) = dialog.retry_confirmation {
-            rows.push(
+            if let Some(confirmed) = dialog.retry_confirmation {
+                rows.push(
                 design::body(
                     "GitHub may have created this pull request. Check GitHub before retrying to avoid creating a duplicate.",
                 )
                 .into(),
             );
+                rows.push(
+                    crate::ui_controls::field::checkbox(confirmed)
+                        .label("I checked GitHub; no pull request was created")
+                        .on_toggle(Message::PullRequestRetryConfirmed)
+                        .into(),
+                );
+            }
             rows.push(
-                crate::ui_controls::field::checkbox(confirmed)
-                    .label("I checked GitHub; no pull request was created")
-                    .on_toggle(Message::PullRequestRetryConfirmed)
-                    .into(),
+                widget::row::with_children(vec![
+                    crate::ui_controls::button::secondary("Cancel")
+                        .on_press(Message::CancelDialog)
+                        .into(),
+                    crate::ui_controls::button::primary("Create")
+                        .on_press_maybe(
+                            (!head.is_empty()
+                                && !base.is_empty()
+                                && !dialog.title.trim().is_empty()
+                                && dialog.retry_confirmation != Some(false)
+                                && self
+                                    .github_availability
+                                    .get(&dialog.project_id)
+                                    .and_then(GitHubAvailability::repository_key)
+                                    == Some(&dialog.repository))
+                            .then_some(Message::SubmitPullRequest),
+                        )
+                        .into(),
+                ])
+                .spacing(space::S)
+                .into(),
             );
-        }
-        rows.push(
-            widget::row::with_children(vec![
-                crate::ui_controls::button::secondary("Cancel")
-                    .on_press(Message::CancelDialog)
-                    .into(),
-                crate::ui_controls::button::primary("Create")
-                    .on_press_maybe(
-                        (!head.is_empty()
-                            && !base.is_empty()
-                            && !dialog.title.trim().is_empty()
-                            && dialog.retry_confirmation != Some(false)
-                            && self
-                                .github_availability
-                                .get(&dialog.project_id)
-                                .and_then(GitHubAvailability::repository_key)
-                                == Some(&dialog.repository))
-                        .then_some(Message::SubmitPullRequest),
-                    )
-                    .into(),
-            ])
-            .spacing(space::S)
-            .into(),
-        );
-        Some(dialog_ui::overlay(
-            dialog_ui::surface(
-                widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(
-                    Length::Fixed((self.window_height - 112.0).clamp(120.0, 620.0)),
+            Some(dialog_ui::overlay(
+                dialog_ui::surface(
+                    widget::scrollable(widget::column::with_children(rows).spacing(space::M))
+                        .height(Length::Fixed(
+                            (self.window_height - 112.0).clamp(120.0, 620.0),
+                        )),
+                    620.0,
                 ),
-                620.0,
-            ),
-            Some(Message::CancelDialog),
-            1.0,
-        ))
+                Some(Message::CancelDialog),
+                1.0,
+            ))
         })();
         surface.map(|surface| crate::input_trace::observe(surface, &self.input_trace))
     }
@@ -17291,7 +17375,10 @@ impl Application for Cagents {
                                     crate::ui_controls::provider_icon(provider),
                                     format!("{} · {status} · Manage accounts", provider.label()),
                                 )
-                                .id(widget::Id::new(format!("empty.provider.{}", provider.label())))
+                                .id(widget::Id::new(format!(
+                                    "empty.provider.{}",
+                                    provider.label()
+                                )))
                                 .on_press(Message::AccountUi(account_ui::Action::OpenPane));
                                 Element::from(if status == "Account available" {
                                     control.tone(design::Tone::Themed(design::success_color))
@@ -17509,44 +17596,128 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
-        self.input_trace.bind_terminal_keys(self.terminal_review_input.clone());
+        self.input_trace
+            .bind_terminal_keys(self.terminal_review_input.clone());
         let surface = if self.workspace_inputs_blocked() {
             // The existing modal subscription owns keys in this tree. Do not
             // let a previous workspace snapshot leak into its fallback route.
             self.input_trace.clear_keyboard_focus();
             crate::input_trace::observe(surface, &self.input_trace)
         } else {
-            let mut regions: Vec<_> = ["workspace.sidebar-controls", "workspace.header-controls", "workspace.inspector-controls", "workspace.inspector-header-controls"].into_iter().map(|id| (widget::Id::new(id), workspace_widget::FocusedPane::Other.into())).collect();
-            for mounted in &self.workspace.projection(self.workspace.viewport_width()).mounted {
+            let mut regions: Vec<_> = [
+                "workspace.sidebar-controls",
+                "workspace.header-controls",
+                "workspace.inspector-controls",
+                "workspace.inspector-header-controls",
+            ]
+            .into_iter()
+            .map(|id| {
+                (
+                    widget::Id::new(id),
+                    workspace_widget::FocusedPane::Other.into(),
+                )
+            })
+            .collect();
+            for mounted in &self
+                .workspace
+                .projection(self.workspace.viewport_width())
+                .mounted
+            {
                 let card = mounted.id;
                 let kind = self.pane_kind(card);
-                let region = |pane| crate::input_trace::KeyboardRegion { pane, card: Some(card) };
-                regions.push((workspace_widget::card_widget_id(card), region(if matches!(kind, workspace_widget::FocusedPane::Chat | workspace_widget::FocusedPane::Review) { kind } else { workspace_widget::FocusedPane::Other })));
-                regions.push((self.card_header_widget_id(card), region(workspace_widget::FocusedPane::Other)));
+                let region = |pane| crate::input_trace::KeyboardRegion {
+                    pane,
+                    card: Some(card),
+                };
+                regions.push((
+                    workspace_widget::card_widget_id(card),
+                    region(
+                        if matches!(
+                            kind,
+                            workspace_widget::FocusedPane::Chat
+                                | workspace_widget::FocusedPane::Review
+                        ) {
+                            kind
+                        } else {
+                            workspace_widget::FocusedPane::Other
+                        },
+                    ),
+                ));
+                regions.push((
+                    self.card_header_widget_id(card),
+                    region(workspace_widget::FocusedPane::Other),
+                ));
                 if let Some(chrome) = self.card_chrome.get(&card) {
-                    regions.push((chrome.close_id.clone(), region(workspace_widget::FocusedPane::Other)));
-                    regions.push((chrome.resize_id.clone(), region(workspace_widget::FocusedPane::Other)));
-                    regions.push((chrome.browser_address_id.clone(), region(workspace_widget::FocusedPane::TextInput)));
+                    regions.push((
+                        chrome.close_id.clone(),
+                        region(workspace_widget::FocusedPane::Other),
+                    ));
+                    regions.push((
+                        chrome.resize_id.clone(),
+                        region(workspace_widget::FocusedPane::Other),
+                    ));
+                    regions.push((
+                        chrome.browser_address_id.clone(),
+                        region(workspace_widget::FocusedPane::TextInput),
+                    ));
                 }
                 if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_))) {
                     regions.push((self.card_keyboard_focus(card), region(kind)));
                 }
                 #[cfg(feature = "integrated-browser")]
                 if matches!(self.cards.get(&card), Some(CardRuntime::Browser(_))) {
-                    regions.push((self.card_keyboard_focus(card), region(workspace_widget::FocusedPane::Browser)));
+                    regions.push((
+                        self.card_keyboard_focus(card),
+                        region(workspace_widget::FocusedPane::Browser),
+                    ));
                 }
                 if matches!(self.cards.get(&card), Some(CardRuntime::Repository(_))) {
-                    regions.push((repository_widget::editor_focus_id(card), region(workspace_widget::FocusedPane::Editor)));
+                    regions.push((
+                        repository_widget::editor_focus_id(card),
+                        region(workspace_widget::FocusedPane::Editor),
+                    ));
                 }
                 if matches!(self.cards.get(&card), Some(CardRuntime::Chat(_))) {
-                    regions.push((card_control_id(card, "chat-composer"), region(workspace_widget::FocusedPane::Chat)));
+                    regions.push((
+                        card_control_id(card, "chat-composer"),
+                        region(workspace_widget::FocusedPane::Chat),
+                    ));
                 }
             }
-            for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list", "command.previous-column", "command.next-column", "chrome.notices", "empty.new-conversation", "empty.resume-conversation", "empty.new-terminal", "empty.new-browser", "empty.accounts"] {
-                regions.push((widget::Id::new(id), workspace_widget::FocusedPane::Other.into()));
+            for id in [
+                TOOLBAR_FOCUS_ID,
+                "workspace.pane-list",
+                "command.previous-column",
+                "command.next-column",
+                "chrome.notices",
+                "empty.new-conversation",
+                "empty.resume-conversation",
+                "empty.new-terminal",
+                "empty.new-browser",
+                "empty.accounts",
+            ] {
+                regions.push((
+                    widget::Id::new(id),
+                    workspace_widget::FocusedPane::Other.into(),
+                ));
             }
-            regions.extend(crate::agent::Provider::ALL.into_iter().map(|provider| (widget::Id::new(format!("empty.provider.{}", provider.label())), workspace_widget::FocusedPane::Other.into())));
-            crate::input_trace::observe_keyboard_events(surface, &self.input_trace, regions, |event, captured, region, widget| Message::RoutedKeyEvent { event, captured, region, widget })
+            regions.extend(crate::agent::Provider::ALL.into_iter().map(|provider| {
+                (
+                    widget::Id::new(format!("empty.provider.{}", provider.label())),
+                    workspace_widget::FocusedPane::Other.into(),
+                )
+            }));
+            crate::input_trace::observe_keyboard_events(
+                surface,
+                &self.input_trace,
+                regions,
+                |event, captured, region, widget| Message::RoutedKeyEvent {
+                    event,
+                    captured,
+                    region,
+                    widget,
+                },
+            )
         };
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]

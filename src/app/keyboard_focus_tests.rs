@@ -1,19 +1,47 @@
 //! Actual App view/native keyboard routing, not a direct KeyEvent substitute.
 use super::*;
-use cosmic::iced::{advanced::{clipboard, mouse, widget::operation::focusable}, runtime::{UserInterface, user_interface::Cache}, Size};
+use cosmic::iced::{
+    Size,
+    advanced::{clipboard, mouse, widget::operation::focusable},
+    runtime::{UserInterface, user_interface::Cache},
+};
 
-fn key(character: &str, code: keyboard::key::Code, modifiers: keyboard::Modifiers, text: Option<&str>) -> iced::Event {
+fn key(
+    character: &str,
+    code: keyboard::key::Code,
+    modifiers: keyboard::Modifiers,
+    text: Option<&str>,
+) -> iced::Event {
     let key = keyboard::Key::Character(character.to_owned().into());
     iced::Event::Keyboard(keyboard::Event::KeyPressed {
-        key: key.clone(), modified_key: key, physical_key: keyboard::key::Physical::Code(code), location: keyboard::Location::Standard,
-        modifiers, text: text.map(Into::into), repeat: false,
+        key: key.clone(),
+        modified_key: key,
+        physical_key: keyboard::key::Physical::Code(code),
+        location: keyboard::Location::Standard,
+        modifiers,
+        text: text.map(Into::into),
+        repeat: false,
     })
 }
-fn native(app: &Cagents, renderer: &mut cosmic::Renderer, cache: Cache, focus: Option<widget::Id>, events: &[iced::Event]) -> (Cache, Vec<Message>) {
+fn native(
+    app: &Cagents,
+    renderer: &mut cosmic::Renderer,
+    cache: Cache,
+    focus: Option<widget::Id>,
+    events: &[iced::Event],
+) -> (Cache, Vec<Message>) {
     let mut ui = UserInterface::build(app.view(), Size::new(1600.0, 1000.0), cache, renderer);
-    if let Some(focus) = focus { ui.operate(renderer, &mut focusable::focus::<()>(focus)); }
+    if let Some(focus) = focus {
+        ui.operate(renderer, &mut focusable::focus::<()>(focus));
+    }
     let mut messages = Vec::new();
-    let _ = ui.update(events, mouse::Cursor::Unavailable, renderer, &mut clipboard::Null, &mut messages);
+    let _ = ui.update(
+        events,
+        mouse::Cursor::Unavailable,
+        renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
     (ui.into_cache(), messages)
 }
 fn prepare(app: &mut Cagents) {
@@ -26,17 +54,22 @@ fn prepare(app: &mut Cagents) {
     assert!(!app.workspace_inputs_blocked());
 }
 fn text(app: &Cagents, card: CardId) -> String {
-    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("editable repository") };
+    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+        panic!("editable repository")
+    };
     runtime.editor_text().unwrap()
 }
 fn dispatch(app: &mut Cagents, messages: Vec<Message>) {
-    for message in messages { drop(app.update(message)); }
+    for message in messages {
+        drop(app.update(message));
+    }
 }
 fn seed_reopen(app: &mut Cagents, source: CardId) {
     let mut closed = app.card_state(source).unwrap().clone();
     closed.id = CardId::new();
     closed.kind = CardKind::Settings;
-    app.recently_closed.push((closed, app.active_workspace_destination()));
+    app.recently_closed
+        .push((closed, app.active_workspace_destination()));
 }
 
 #[test]
@@ -47,18 +80,57 @@ fn actual_app_editor_undo_and_shift_redo_keep_exact_text_without_reopening_a_pan
     seed_reopen(&mut app, card);
     let before = text(&app, card);
     let mut renderer = super::tests::headless_renderer();
-    let (cache, messages) = native(&app, &mut renderer, Cache::new(), Some(repository_widget::editor_focus_id(card)), &[key("x", Code::KeyX, keyboard::Modifiers::empty(), Some("x"))]);
+    let (cache, messages) = native(
+        &app,
+        &mut renderer,
+        Cache::new(),
+        Some(repository_widget::editor_focus_id(card)),
+        &[key(
+            "x",
+            Code::KeyX,
+            keyboard::Modifiers::empty(),
+            Some("x"),
+        )],
+    );
     assert!(messages.iter().any(|m| matches!(m, Message::RoutedKeyEvent { region, widget: Some(id), .. } if region.pane == workspace_widget::FocusedPane::Editor && region.card == Some(card) && id == &repository_widget::editor_focus_id(card))));
     dispatch(&mut app, messages);
     let edited = text(&app, card);
-    assert_ne!(edited, before, "the actual native editor must positively edit");
-    let (cache, messages) = native(&app, &mut renderer, cache, None, &[key("z", Code::KeyZ, keyboard::Modifiers::CTRL, None)]);
+    assert_ne!(
+        edited, before,
+        "the actual native editor must positively edit"
+    );
+    let (cache, messages) = native(
+        &app,
+        &mut renderer,
+        cache,
+        None,
+        &[key("z", Code::KeyZ, keyboard::Modifiers::CTRL, None)],
+    );
     dispatch(&mut app, messages);
     assert_eq!(text(&app, card), before);
-    let (_cache, messages) = native(&app, &mut renderer, cache, None, &[key("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None)]);
+    let (_cache, messages) = native(
+        &app,
+        &mut renderer,
+        cache,
+        None,
+        &[key(
+            "z",
+            Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            None,
+        )],
+    );
     dispatch(&mut app, messages);
-    assert_eq!(text(&app, card), edited, "redo must restore the exact edited value");
-    assert_eq!(app.recently_closed.len(), 1, "a real reopen candidate must remain untouched");
+    assert_eq!(
+        text(&app, card),
+        edited,
+        "redo must restore the exact edited value"
+    );
+    assert_eq!(
+        app.recently_closed.len(),
+        1,
+        "a real reopen candidate must remain untouched"
+    );
     assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![card]);
 }
 
@@ -66,35 +138,85 @@ fn actual_app_editor_undo_and_shift_redo_keep_exact_text_without_reopening_a_pan
 fn actual_sidebar_field_owns_find_new_tab_redo_and_save_while_the_editor_is_behind_it() {
     use keyboard::key::Code;
     let (mut app, card) = super::tests::editing_repository_app();
-    app.sidebar_model.projects.push(sidebar::SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Keyboard fixture".into(), "/keyboard-fixture".into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder));
+    app.sidebar_model.projects.push(
+        sidebar::SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Keyboard fixture".into(),
+            "/keyboard-fixture".into(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_kind(ProjectKind::Folder),
+    );
     app.sidebar_state.apply(&SidebarAction::ToggleControls);
     prepare(&mut app);
-    assert!(sidebar::search_is_reachable(&app.sidebar_model, app.projects_sidebar_mode()));
+    assert!(sidebar::search_is_reachable(
+        &app.sidebar_model,
+        app.projects_sidebar_mode()
+    ));
     seed_reopen(&mut app, card);
     let before = text(&app, card);
     let mut renderer = super::tests::headless_renderer();
     let events = [
         key("f", Code::KeyF, keyboard::Modifiers::CTRL, None),
         key("t", Code::KeyT, keyboard::Modifiers::CTRL, None),
-        key("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None),
+        key(
+            "z",
+            Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            None,
+        ),
         key("s", Code::KeyS, keyboard::Modifiers::CTRL, None),
-        key("s", Code::KeyS, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None),
-        iced::Event::InputMethod(iced::advanced::input_method::Event::Commit("native-query".into())),
+        key(
+            "s",
+            Code::KeyS,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            None,
+        ),
+        iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(
+            "native-query".into(),
+        )),
     ];
-    let (_cache, messages) = native(&app, &mut renderer, Cache::new(), Some(sidebar::search_focus_id()), &events);
-    let routed: Vec<_> = messages.iter().filter_map(|m| if let Message::RoutedKeyEvent { region, widget, .. } = m { Some((region, widget)) } else { None }).collect();
-    assert_eq!(routed.len(), 5, "each actual keyboard event is published once");
+    let (_cache, messages) = native(
+        &app,
+        &mut renderer,
+        Cache::new(),
+        Some(sidebar::search_focus_id()),
+        &events,
+    );
+    let routed: Vec<_> = messages
+        .iter()
+        .filter_map(|m| {
+            if let Message::RoutedKeyEvent { region, widget, .. } = m {
+                Some((region, widget))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        routed.len(),
+        5,
+        "each actual keyboard event is published once"
+    );
     for (region, id) in routed {
         assert_eq!(region.pane, workspace_widget::FocusedPane::TextInput);
         assert_eq!(region.card, None);
         assert_eq!(id.as_ref(), Some(&sidebar::search_focus_id()));
     }
     dispatch(&mut app, messages);
-    assert_eq!(app.sidebar_state.query(), "native-query", "the intended field must positively accept IME");
+    assert_eq!(
+        app.sidebar_state.query(),
+        "native-query",
+        "the intended field must positively accept IME"
+    );
     assert_eq!(text(&app, card), before);
     assert_eq!(app.recently_closed.len(), 1);
     assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![card]);
-    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { unreachable!() };
+    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+        unreachable!()
+    };
     assert!(!runtime.find_is_open());
     assert!(!runtime.is_saving());
 }
@@ -105,20 +227,59 @@ fn actual_empty_workspace_actions_are_nontext_controls_with_no_background_pane_o
     let mut app = super::tests::context_inspector_test_app(false);
     prepare(&mut app);
     let mut renderer = super::tests::headless_renderer();
-    let mut ids: Vec<_> = ["empty.new-conversation", "empty.resume-conversation", "empty.new-terminal", "empty.new-browser"].into_iter().map(widget::Id::new).collect();
-    ids.extend(crate::agent::Provider::ALL.into_iter().map(|provider| widget::Id::new(format!("empty.provider.{}", provider.label()))));
+    let mut ids: Vec<_> = [
+        "empty.new-conversation",
+        "empty.resume-conversation",
+        "empty.new-terminal",
+        "empty.new-browser",
+    ]
+    .into_iter()
+    .map(widget::Id::new)
+    .collect();
+    ids.extend(
+        crate::agent::Provider::ALL
+            .into_iter()
+            .map(|provider| widget::Id::new(format!("empty.provider.{}", provider.label()))),
+    );
     for id in ids {
-        let (_cache, messages) = native(&app, &mut renderer, Cache::new(), Some(id.clone()), &[key("t", Code::KeyT, keyboard::Modifiers::CTRL, None)]);
-        let routed: Vec<_> = messages.iter().filter_map(|m| if let Message::RoutedKeyEvent { event, region, widget, .. } = m { Some((event, region, widget)) } else { None }).collect();
+        let (_cache, messages) = native(
+            &app,
+            &mut renderer,
+            Cache::new(),
+            Some(id.clone()),
+            &[key("t", Code::KeyT, keyboard::Modifiers::CTRL, None)],
+        );
+        let routed: Vec<_> = messages
+            .iter()
+            .filter_map(|m| {
+                if let Message::RoutedKeyEvent {
+                    event,
+                    region,
+                    widget,
+                    ..
+                } = m
+                {
+                    Some((event, region, widget))
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(routed.len(), 1, "{id:?}");
         let (event, region, actual) = routed[0];
-        assert_eq!(actual.as_ref(), Some(&id), "the actual control must be mounted and focusable");
+        assert_eq!(
+            actual.as_ref(),
+            Some(&id),
+            "the actual control must be mounted and focusable"
+        );
         assert_eq!(region.pane, workspace_widget::FocusedPane::Other);
         assert_eq!(region.card, None);
-        assert_eq!(workspace_widget::global_shortcut(event, &app.settings.keyboard_shortcuts, region.pane), Some(workspace_widget::GlobalShortcut::NewThread));
+        assert_eq!(
+            workspace_widget::global_shortcut(event, &app.settings.keyboard_shortcuts, region.pane),
+            Some(workspace_widget::GlobalShortcut::NewThread)
+        );
     }
 }
-
 
 #[test]
 fn routed_owner_is_immutable_across_a_newer_sample_and_a_closed_owner_is_refused() {
@@ -127,24 +288,56 @@ fn routed_owner_is_immutable_across_a_newer_sample_and_a_closed_owner_is_refused
     prepare(&mut app);
     seed_reopen(&mut app, card);
     let other_id = widget::Id::unique();
-    let sample = crate::input_trace::KeyboardRegion { pane: workspace_widget::FocusedPane::Other, card: None };
-    let current = app.input_trace.scoped_keyboard_focus(sample, Some(other_id.clone()));
-    let iced::Event::Keyboard(event) = key("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None) else { unreachable!() };
+    let sample = crate::input_trace::KeyboardRegion {
+        pane: workspace_widget::FocusedPane::Other,
+        card: None,
+    };
+    let current = app
+        .input_trace
+        .scoped_keyboard_focus(sample, Some(other_id.clone()));
+    let iced::Event::Keyboard(event) = key(
+        "z",
+        Code::KeyZ,
+        keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        None,
+    ) else {
+        unreachable!()
+    };
     drop(app.update(Message::RoutedKeyEvent {
-        event: event.clone(), captured: false,
-        region: crate::input_trace::KeyboardRegion { pane: workspace_widget::FocusedPane::TextInput, card: None }, widget: Some(sidebar::search_focus_id()),
+        event: event.clone(),
+        captured: false,
+        region: crate::input_trace::KeyboardRegion {
+            pane: workspace_widget::FocusedPane::TextInput,
+            card: None,
+        },
+        widget: Some(sidebar::search_focus_id()),
     }));
-    assert_eq!(app.recently_closed.len(), 1, "the older immutable field event cannot borrow the newer nontext context");
+    assert_eq!(
+        app.recently_closed.len(),
+        1,
+        "the older immutable field event cannot borrow the newer nontext context"
+    );
     assert_eq!(app.input_trace.keyboard_widget_id(), Some(other_id));
-    assert_eq!(app.input_trace.keyboard_focus(), Some(workspace_widget::FocusedPane::Other));
+    assert_eq!(
+        app.input_trace.keyboard_focus(),
+        Some(workspace_widget::FocusedPane::Other)
+    );
     drop(app.update(Message::RoutedKeyEvent {
-        event, captured: false,
-        region: crate::input_trace::KeyboardRegion { pane: workspace_widget::FocusedPane::Other, card: Some(CardId::new()) }, widget: None,
+        event,
+        captured: false,
+        region: crate::input_trace::KeyboardRegion {
+            pane: workspace_widget::FocusedPane::Other,
+            card: Some(CardId::new()),
+        },
+        widget: None,
     }));
-    assert_eq!(app.recently_closed.len(), 1, "an already-closed native owner cannot target the currently selected pane");
+    assert_eq!(
+        app.recently_closed.len(),
+        1,
+        "an already-closed native owner cannot target the currently selected pane"
+    );
     drop(current);
 }
-
 
 #[test]
 fn actual_nonselected_pane_header_keeps_native_focus_through_all_ready_update_operations() {
@@ -157,31 +350,58 @@ fn actual_nonselected_pane_header_keeps_native_focus_through_all_ready_update_op
     let selected = other.id;
     Arc::make_mut(&mut app.durable).cards.push(other);
     app.cards.insert(selected, CardRuntime::Settings);
-    app.workspace.add_card(
-        crate::workspace::WorkspaceCard::new(selected, "Other pane", crate::workspace::CardWidth::Fraction(0.4)).unwrap(),
-        1, true,
-    ).unwrap();
+    app.workspace
+        .add_card(
+            crate::workspace::WorkspaceCard::new(
+                selected,
+                "Other pane",
+                crate::workspace::CardWidth::Fraction(0.4),
+            )
+            .unwrap(),
+            1,
+            true,
+        )
+        .unwrap();
     prepare(&mut app);
     let header = app.card_header_widget_id(owner);
-    assert_ne!(header, app.card_keyboard_focus(owner), "the retained native owner must differ from the pane's default editor target");
+    assert_ne!(
+        header,
+        app.card_keyboard_focus(owner),
+        "the retained native owner must differ from the pane's default editor target"
+    );
     assert_eq!(app.workspace.focused(), Some(selected));
     let mut renderer = super::tests::headless_renderer();
-    let (cache, messages) = native(&app, &mut renderer, Cache::new(), Some(header.clone()), &[key("q", Code::KeyQ, keyboard::Modifiers::empty(), None)]);
+    let (cache, messages) = native(
+        &app,
+        &mut renderer,
+        Cache::new(),
+        Some(header.clone()),
+        &[key("q", Code::KeyQ, keyboard::Modifiers::empty(), None)],
+    );
     let routed = messages.into_iter().find(|m| matches!(m, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &header && region.card == Some(owner))).expect("actual mounted nonselected header owns the event");
     let task = app.update(routed);
     assert_eq!(app.workspace.focused(), Some(owner));
     let mut ui = UserInterface::build(app.view(), Size::new(1600.0, 1000.0), cache, &mut renderer);
-    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     executor.block_on(async {
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
             // Exercise the actual ready effects, including any erroneous
             // default-focus operation. Maintenance timers are unrelated.
-            while let Ok(Some(action)) = tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(100), stream.next()).await
+            {
                 if let iced::runtime::Action::Widget(operation) = action {
                     let mut next = Some(operation);
                     while let Some(mut operation) = next.take() {
                         ui.operate(&renderer, operation.as_mut());
-                        if let iced::advanced::widget::operation::Outcome::Chain(chained) = operation.finish() { next = Some(chained); }
+                        if let iced::advanced::widget::operation::Outcome::Chain(chained) =
+                            operation.finish()
+                        {
+                            next = Some(chained);
+                        }
                     }
                 }
             }
@@ -189,79 +409,173 @@ fn actual_nonselected_pane_header_keeps_native_focus_through_all_ready_update_op
     });
     executor.shutdown_background();
     let mut messages = Vec::new();
-    let _ = ui.update(&[key("q", Code::KeyQ, keyboard::Modifiers::empty(), None)], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+    let _ = ui.update(
+        &[key("q", Code::KeyQ, keyboard::Modifiers::empty(), None)],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
     assert!(messages.iter().any(|m| matches!(m, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &header && region.card == Some(owner))), "logical reconciliation and its actual widget operations must preserve the nondefault native owner");
     let cache = ui.into_cache();
-    let (_, messages) = native(&app, &mut renderer, cache, None, &[key("s", Code::KeyS, keyboard::Modifiers::CTRL, None)]);
+    let (_, messages) = native(
+        &app,
+        &mut renderer,
+        cache,
+        None,
+        &[key("s", Code::KeyS, keyboard::Modifiers::CTRL, None)],
+    );
     let routed = messages.into_iter().find(|message| matches!(message, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &header && region.card == Some(owner))).unwrap();
     let task = app.update(routed);
-    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut save = None;
     executor.block_on(async {
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-            while let Ok(Some(action)) = tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
-                if let iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(RepositoryAction::Save { card, overwrite: false }))) = action { save = Some(card); }
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(100), stream.next()).await
+            {
+                if let iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(
+                    RepositoryAction::Save {
+                        card,
+                        overwrite: false,
+                    },
+                ))) = action
+                {
+                    save = Some(card);
+                }
             }
         }
     });
     executor.shutdown_background();
-    assert_eq!(save, Some(owner), "ordinary Save must keep targeting the exact repository that owns this nontext control");
+    assert_eq!(
+        save,
+        Some(owner),
+        "ordinary Save must keep targeting the exact repository that owns this nontext control"
+    );
 }
-
 
 #[test]
 fn actual_workspace_buttons_reopen_a_pane_while_the_native_search_field_keeps_redo() {
     use keyboard::key::Code;
-    for (button, inspector_open) in [(widget::Id::new("sidebar.settings"), false), (widget::Id::new("sidebar.automations"), false), (sidebar::search_toggle_focus_id(), false), (context_inspector_toggle_id(), false), (context_inspector_toggle_id(), true)] {
+    for (button, inspector_open) in [
+        (widget::Id::new("sidebar.settings"), false),
+        (widget::Id::new("sidebar.automations"), false),
+        (sidebar::search_toggle_focus_id(), false),
+        (context_inspector_toggle_id(), false),
+        (context_inspector_toggle_id(), true),
+    ] {
         let (mut app, card) = super::tests::editing_repository_app();
-        app.sidebar_model.projects.push(sidebar::SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Keyboard fixture".into(), "/keyboard-fixture".into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder));
+        app.sidebar_model.projects.push(
+            sidebar::SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                "Keyboard fixture".into(),
+                "/keyboard-fixture".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
         app.sidebar_state.apply(&SidebarAction::ToggleControls);
         prepare(&mut app);
         app.context_inspector_open = inspector_open;
         seed_reopen(&mut app, card);
         let mut renderer = super::tests::headless_renderer();
-        let redo = key("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None);
-        let (cache, field_messages) = native(&app, &mut renderer, Cache::new(), Some(sidebar::search_focus_id()), &[redo.clone()]);
+        let redo = key(
+            "z",
+            Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            None,
+        );
+        let (cache, field_messages) = native(
+            &app,
+            &mut renderer,
+            Cache::new(),
+            Some(sidebar::search_focus_id()),
+            &[redo.clone()],
+        );
         assert!(field_messages.iter().any(|message| matches!(message, Message::RoutedKeyEvent { region, widget: Some(id), .. } if region.pane == workspace_widget::FocusedPane::TextInput && region.card.is_none() && id == &sidebar::search_focus_id())));
         dispatch(&mut app, field_messages);
-        assert_eq!(app.recently_closed.len(), 1, "sidebar text editing must keep redo");
+        assert_eq!(
+            app.recently_closed.len(),
+            1,
+            "sidebar text editing must keep redo"
+        );
         let (_cache, messages) = native(&app, &mut renderer, cache, Some(button.clone()), &[redo]);
         assert!(messages.iter().any(|message| matches!(message, Message::RoutedKeyEvent { event, region, widget: Some(id), .. } if region.pane == workspace_widget::FocusedPane::Other && region.card.is_none() && id == &button && workspace_widget::global_shortcut(event, &app.settings.keyboard_shortcuts, region.pane) == Some(workspace_widget::GlobalShortcut::ReopenPane))), "actual mounted button {button:?} must positively own nontext redo");
         dispatch(&mut app, messages);
-        assert!(app.recently_closed.is_empty(), "the actual nontext route must consume the real reopen candidate");
+        assert!(
+            app.recently_closed.is_empty(),
+            "the actual nontext route must consume the real reopen candidate"
+        );
         assert_eq!(app.workspace.order().len(), 2);
-        assert_eq!(app.utility_card(&CardKind::Settings), app.workspace.focused());
+        assert_eq!(
+            app.utility_card(&CardKind::Settings),
+            app.workspace.focused()
+        );
     }
 }
-
 
 #[test]
 fn actual_nontext_sidebar_find_focuses_project_search_instead_of_the_background_editor() {
     use iced::futures::StreamExt;
     use keyboard::key::Code;
     let (mut app, card) = super::tests::editing_repository_app();
-    app.sidebar_model.projects.push(sidebar::SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Keyboard fixture".into(), "/keyboard-fixture".into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder));
+    app.sidebar_model.projects.push(
+        sidebar::SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Keyboard fixture".into(),
+            "/keyboard-fixture".into(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_kind(ProjectKind::Folder),
+    );
     prepare(&mut app);
     assert!(!app.sidebar_state.controls_expanded());
     let mut renderer = super::tests::headless_renderer();
-    let (cache, messages) = native(&app, &mut renderer, Cache::new(), Some(widget::Id::new("sidebar.settings")), &[key("f", Code::KeyF, keyboard::Modifiers::CTRL, None)]);
+    let (cache, messages) = native(
+        &app,
+        &mut renderer,
+        Cache::new(),
+        Some(widget::Id::new("sidebar.settings")),
+        &[key("f", Code::KeyF, keyboard::Modifiers::CTRL, None)],
+    );
     let routed = messages.into_iter().find(|message| matches!(message, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &widget::Id::new("sidebar.settings") && region.pane == workspace_widget::FocusedPane::Other && region.card.is_none())).expect("actual sidebar nontext owner");
     let task = app.update(routed);
-    assert!(app.sidebar_state.controls_expanded(), "find must positively open the existing project filter");
+    assert!(
+        app.sidebar_state.controls_expanded(),
+        "find must positively open the existing project filter"
+    );
     let mut ui = UserInterface::build(app.view(), Size::new(1600.0, 1000.0), cache, &mut renderer);
-    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     executor.block_on(async {
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-            while let Ok(Some(action)) = tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(100), stream.next()).await
+            {
                 match action {
                     iced::runtime::Action::Widget(operation) => {
                         let mut next = Some(operation);
                         while let Some(mut operation) = next.take() {
                             ui.operate(&renderer, operation.as_mut());
-                            if let iced::advanced::widget::operation::Outcome::Chain(chained) = operation.finish() { next = Some(chained); }
+                            if let iced::advanced::widget::operation::Outcome::Chain(chained) =
+                                operation.finish()
+                            {
+                                next = Some(chained);
+                            }
                         }
                     }
-                    iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(_))) => panic!("sidebar find cannot schedule a background repository action"),
+                    iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(_))) => {
+                        panic!("sidebar find cannot schedule a background repository action")
+                    }
                     _ => {}
                 }
             }
@@ -269,8 +583,16 @@ fn actual_nontext_sidebar_find_focuses_project_search_instead_of_the_background_
     });
     executor.shutdown_background();
     let mut messages = Vec::new();
-    let _ = ui.update(&[key("q", Code::KeyQ, keyboard::Modifiers::CTRL, None)], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+    let _ = ui.update(
+        &[key("q", Code::KeyQ, keyboard::Modifiers::CTRL, None)],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
     assert!(messages.iter().any(|message| matches!(message, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &sidebar::search_focus_id() && region.pane == workspace_widget::FocusedPane::TextInput && region.card.is_none())), "the actual returned focus operation must land in the mounted project search field");
-    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { unreachable!() };
+    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+        unreachable!()
+    };
     assert!(!runtime.find_is_open());
 }

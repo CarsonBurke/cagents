@@ -686,8 +686,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 modifiers,
                 ..
             }) => {
-                let shortcut = state.shortcut_keys.iter().position(|key| key == physical_key);
-                if let Some(index) = shortcut { state.shortcut_keys.swap_remove(index); }
+                let shortcut = state
+                    .shortcut_keys
+                    .iter()
+                    .position(|key| key == physical_key);
+                if let Some(index) = shortcut {
+                    state.shortcut_keys.swap_remove(index);
+                }
                 let release = iced_key(
                     ButtonState::Released,
                     key,
@@ -864,24 +869,47 @@ mod tests {
                 .id(content.clone())
                 .model_focused(true)
                 .window_focused(view_focused);
-            let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.),
-                Cache::new(), &mut renderer);
+            let mut ui = UserInterface::build(
+                browser.into(),
+                Size::new(400., 240.),
+                Cache::new(),
+                &mut renderer,
+            );
             ui.operate(&renderer, &mut focusable::focus::<()>(content));
             // UserInterface processes this whole native batch before the
             // queued application focus message can build a fresh view.
-            let (_, statuses) = ui.update(&[
-                Event::Window(if view_focused { window::Event::Unfocused } else { window::Event::Focused }),
-                press("a", Code::KeyA, keyboard::Modifiers::empty()),
-            ], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+            let (_, statuses) = ui.update(
+                &[
+                    Event::Window(if view_focused {
+                        window::Event::Unfocused
+                    } else {
+                        window::Event::Focused
+                    }),
+                    press("a", Code::KeyA, keyboard::Modifiers::empty()),
+                ],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
             let input = queued_input(&handle);
             if view_focused {
-                assert!(input.is_empty(), "native blur overrides the stale active view");
+                assert!(
+                    input.is_empty(),
+                    "native blur overrides the stale active view"
+                );
                 assert_eq!(statuses.last(), Some(&cosmic::iced::event::Status::Ignored));
             } else {
-                assert!(matches!(input.as_slice(), [BrowserInput::Key {
+                assert!(
+                    matches!(input.as_slice(), [BrowserInput::Key {
                     state: ButtonState::Pressed, code, ..
-                }] if code == "KeyA"), "first key after native return must be delivered");
-                assert_eq!(statuses.last(), Some(&cosmic::iced::event::Status::Captured));
+                }] if code == "KeyA"),
+                    "first key after native return must be delivered"
+                );
+                assert_eq!(
+                    statuses.last(),
+                    Some(&cosmic::iced::event::Status::Captured)
+                );
             }
         }
     }
@@ -895,27 +923,59 @@ mod tests {
         let handle = BrowserHandle::fixture();
         let content = Id::unique();
         let browser = BrowserWidget::<()>::new(&handle)
-            .id(content.clone()).model_focused(true).window_focused(true);
-        let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.),
-            Cache::new(), &mut renderer);
+            .id(content.clone())
+            .model_focused(true)
+            .window_focused(true);
+        let mut ui = UserInterface::build(
+            browser.into(),
+            Size::new(400., 240.),
+            Cache::new(),
+            &mut renderer,
+        );
         ui.operate(&renderer, &mut focusable::focus::<()>(content.clone()));
-        let _ = ui.update(&[Event::Window(window::Event::Focused)],
-            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        let _ = ui.update(
+            &[Event::Window(window::Event::Focused)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
         // Preserve the native tree and exact attachment, but deliver no blur
         // to it while parked. The remounted view has the newer app snapshot.
         let cache = ui.into_cache();
         let browser = BrowserWidget::<()>::new(&handle)
-            .id(content).model_focused(true).window_focused(false);
-        let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.), cache, &mut renderer);
-        let _ = ui.update(&[press("b", Code::KeyB, keyboard::Modifiers::empty())],
-            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
-        assert!(queued_input(&handle).is_empty(), "old native true cannot outlive a fresh inactive view");
-        let _ = ui.update(&[Event::Window(window::Event::Focused),
-            press("c", Code::KeyC, keyboard::Modifiers::empty())],
-            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
-        assert!(matches!(queued_input(&handle).as_slice(), [BrowserInput::Key {
+            .id(content)
+            .model_focused(true)
+            .window_focused(false);
+        let mut ui =
+            UserInterface::build(browser.into(), Size::new(400., 240.), cache, &mut renderer);
+        let _ = ui.update(
+            &[press("b", Code::KeyB, keyboard::Modifiers::empty())],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
+        assert!(
+            queued_input(&handle).is_empty(),
+            "old native true cannot outlive a fresh inactive view"
+        );
+        let _ = ui.update(
+            &[
+                Event::Window(window::Event::Focused),
+                press("c", Code::KeyC, keyboard::Modifiers::empty()),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(queued_input(&handle).as_slice(), [BrowserInput::Key {
             state: ButtonState::Pressed, code, ..
-        }] if code == "KeyC"), "remount retains native content focus for the next window return");
+        }] if code == "KeyC"),
+            "remount retains native content focus for the next window return"
+        );
     }
 
     #[test]
@@ -1451,30 +1511,66 @@ mod tests {
             let content = Id::unique();
             let mut shortcuts = crate::settings::KeyboardShortcuts::default();
             shortcuts.new_native_thread = vec!["Ctrl+R".into()];
-            let browser = BrowserWidget::<()>::new(&handle).id(content.clone()).model_focused(true);
-            let parent = crate::workspace_widget::browser_keyboard_reservation_fixture(browser.into(), &shortcuts);
-            let mut ui = UserInterface::build(parent, Size::new(400.0, 240.0), Cache::new(), &mut renderer);
+            let browser = BrowserWidget::<()>::new(&handle)
+                .id(content.clone())
+                .model_focused(true);
+            let parent = crate::workspace_widget::browser_keyboard_reservation_fixture(
+                browser.into(),
+                &shortcuts,
+            );
+            let mut ui =
+                UserInterface::build(parent, Size::new(400.0, 240.0), Cache::new(), &mut renderer);
             ui.operate(&renderer, &mut focusable::focus::<()>(content));
-            let first_modifiers = if initial_shortcut { keyboard::Modifiers::CTRL } else { keyboard::Modifiers::empty() };
-            let final_modifiers = if initial_shortcut { keyboard::Modifiers::empty() } else { keyboard::Modifiers::CTRL };
-            let mut events = vec![press("r", Code::KeyR, first_modifiers), Event::Keyboard(keyboard::Event::ModifiersChanged(final_modifiers))];
+            let first_modifiers = if initial_shortcut {
+                keyboard::Modifiers::CTRL
+            } else {
+                keyboard::Modifiers::empty()
+            };
+            let final_modifiers = if initial_shortcut {
+                keyboard::Modifiers::empty()
+            } else {
+                keyboard::Modifiers::CTRL
+            };
+            let mut events = vec![
+                press("r", Code::KeyR, first_modifiers),
+                Event::Keyboard(keyboard::Event::ModifiersChanged(final_modifiers)),
+            ];
             if raw_repeat {
                 let mut event = press("r", Code::KeyR, final_modifiers);
-                if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut event { *repeat = true; }
+                if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut event {
+                    *repeat = true;
+                }
                 events.push(event);
             }
             events.push(Event::Keyboard(keyboard::Event::KeyReleased {
-                key: keyboard::Key::Character("r".into()), modified_key: keyboard::Key::Character("r".into()),
-                physical_key: keyboard::key::Physical::Code(Code::KeyR), location: keyboard::Location::Standard, modifiers: final_modifiers,
+                key: keyboard::Key::Character("r".into()),
+                modified_key: keyboard::Key::Character("r".into()),
+                physical_key: keyboard::key::Physical::Code(Code::KeyR),
+                location: keyboard::Location::Standard,
+                modifiers: final_modifiers,
             }));
             let mut messages = Vec::new();
-            let _ = ui.update(&events, mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+            let _ = ui.update(
+                &events,
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
             // Inspect before TreeDrop can synthesize a missing up. A globally
             // intercepted down alone must never generate an unmatched raw up.
             let input = queued_input(&handle);
             if !initial_shortcut || raw_repeat {
-                assert!(matches!(input.as_slice(), [BrowserInput::Key { state: ButtonState::Pressed, code: down, .. }, BrowserInput::Key { state: ButtonState::Released, code: up, .. }] if down == "KeyR" && up == "KeyR"), "{input:?}");
-            } else { assert!(input.is_empty(), "global-only down cannot produce phantom up: {input:?}"); }
+                assert!(
+                    matches!(input.as_slice(), [BrowserInput::Key { state: ButtonState::Pressed, code: down, .. }, BrowserInput::Key { state: ButtonState::Released, code: up, .. }] if down == "KeyR" && up == "KeyR"),
+                    "{input:?}"
+                );
+            } else {
+                assert!(
+                    input.is_empty(),
+                    "global-only down cannot produce phantom up: {input:?}"
+                );
+            }
         }
     }
 
@@ -1487,28 +1583,64 @@ mod tests {
             let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
             let handle = BrowserHandle::fixture();
             let content = Id::unique();
-            let browser = BrowserWidget::<()>::new(&handle).id(content.clone()).model_focused(true)
-                .on_shortcut(|event| crate::app::browser_shortcut(crate::model::CardId::new(), &event).map(|_| ()));
-            let mut ui = UserInterface::build(browser.into(), Size::new(400.0, 240.0), Cache::new(), &mut renderer);
+            let browser = BrowserWidget::<()>::new(&handle)
+                .id(content.clone())
+                .model_focused(true)
+                .on_shortcut(|event| {
+                    crate::app::browser_shortcut(crate::model::CardId::new(), &event).map(|_| ())
+                });
+            let mut ui = UserInterface::build(
+                browser.into(),
+                Size::new(400.0, 240.0),
+                Cache::new(),
+                &mut renderer,
+            );
             ui.operate(&renderer, &mut focusable::focus::<()>(content));
-            let mut events = vec![press("r", Code::KeyR, keyboard::Modifiers::CTRL), Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()))];
+            let mut events = vec![
+                press("r", Code::KeyR, keyboard::Modifiers::CTRL),
+                Event::Keyboard(keyboard::Event::ModifiersChanged(
+                    keyboard::Modifiers::empty(),
+                )),
+            ];
             if raw_repeat {
                 let mut repeat = press("r", Code::KeyR, keyboard::Modifiers::empty());
-                if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut repeat { *repeat = true; }
+                if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut repeat {
+                    *repeat = true;
+                }
                 events.push(repeat);
             }
             events.push(Event::Keyboard(keyboard::Event::KeyReleased {
-                key: keyboard::Key::Character("r".into()), modified_key: keyboard::Key::Character("r".into()),
-                physical_key: keyboard::key::Physical::Code(Code::KeyR), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(),
+                key: keyboard::Key::Character("r".into()),
+                modified_key: keyboard::Key::Character("r".into()),
+                physical_key: keyboard::key::Physical::Code(Code::KeyR),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
             }));
             let mut messages = Vec::new();
-            let _ = ui.update(&events, mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
-            assert_eq!(messages.len(), 1, "the actual browser reload callback owns only the initial CtrlR");
+            let _ = ui.update(
+                &events,
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(
+                messages.len(),
+                1,
+                "the actual browser reload callback owns only the initial CtrlR"
+            );
             let input = queued_input(&handle);
             if raw_repeat {
-                assert!(matches!(input.as_slice(), [BrowserInput::Key { state: ButtonState::Pressed, code: down, .. }, BrowserInput::Key { state: ButtonState::Released, code: up, .. }] if down == "KeyR" && up == "KeyR"), "{input:?}");
-            } else { assert!(input.is_empty(), "a shortcut-only down cannot generate a raw up: {input:?}"); }
+                assert!(
+                    matches!(input.as_slice(), [BrowserInput::Key { state: ButtonState::Pressed, code: down, .. }, BrowserInput::Key { state: ButtonState::Released, code: up, .. }] if down == "KeyR" && up == "KeyR"),
+                    "{input:?}"
+                );
+            } else {
+                assert!(
+                    input.is_empty(),
+                    "a shortcut-only down cannot generate a raw up: {input:?}"
+                );
+            }
         }
     }
-
 }

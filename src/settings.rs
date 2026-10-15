@@ -325,10 +325,23 @@ impl Default for KeyboardShortcuts {
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
             terminal_passthrough_actions: [
-                "rename_pane", "new_native_thread", "find_in_pane", "cycle_pane_width",
-                "focus_pane_1", "focus_pane_2", "focus_pane_3", "focus_pane_4", "focus_pane_5",
-                "focus_pane_6", "focus_pane_7", "focus_pane_8", "focus_pane_9",
-            ].into_iter().map(str::to_owned).collect(),
+                "rename_pane",
+                "new_native_thread",
+                "find_in_pane",
+                "cycle_pane_width",
+                "focus_pane_1",
+                "focus_pane_2",
+                "focus_pane_3",
+                "focus_pane_4",
+                "focus_pane_5",
+                "focus_pane_6",
+                "focus_pane_7",
+                "focus_pane_8",
+                "focus_pane_9",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }
     }
 }
@@ -337,7 +350,9 @@ impl Default for KeyboardShortcuts {
 pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
-    pub fn action_names() -> &'static [&'static str] { &SHORTCUT_ACTIONS }
+    pub fn action_names() -> &'static [&'static str] {
+        &SHORTCUT_ACTIONS
+    }
     /// Every action's chord list, in the order the dialog presents them.
     pub fn actions(&self) -> [&Vec<String>; 38] {
         [
@@ -596,13 +611,31 @@ pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> 
 
 /// A configured workspace chord may remain useful outside text controls,
 /// while a focused editor keeps its native history and word movement keys.
-pub fn native_text_editing_advisory(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
-    let arrow = matches!(binding.key, ShortcutKey::ArrowLeft | ShortcutKey::ArrowRight);
-    let character = match binding.key { ShortcutKey::Character(ch) => Some(ch), _ => None };
-    if !binding.logo && !binding.alt && binding.control
-        && (arrow || character == Some('z') || (action != "find_in_pane" && character == Some('f') && !binding.shift) || (!binding.shift && matches!(character, Some('a' | 'c' | 'v' | 'x' | 'y'))))
+pub fn native_text_editing_advisory(
+    action: &str,
+    binding: ShortcutBinding,
+) -> Option<&'static str> {
+    let arrow = matches!(
+        binding.key,
+        ShortcutKey::ArrowLeft | ShortcutKey::ArrowRight
+    );
+    let character = match binding.key {
+        ShortcutKey::Character(ch) => Some(ch),
+        _ => None,
+    };
+    if !binding.logo
+        && !binding.alt
+        && binding.control
+        && (arrow
+            || character == Some('z')
+            || (action != "find_in_pane" && character == Some('f') && !binding.shift)
+            || (!binding.shift && matches!(character, Some('a' | 'c' | 'v' | 'x' | 'y'))))
         || (!binding.logo && !binding.control && binding.alt && arrow)
-    { Some("Reserved while editing text") } else { None }
+    {
+        Some("Reserved while editing text")
+    } else {
+        None
+    }
 }
 
 /// Legacy actions that must retain a route back to the workspace.
@@ -1446,7 +1479,10 @@ fn parsed_chords(value: &toml::Value) -> Option<Vec<ShortcutBinding>> {
 fn bound_chords(shortcuts: &toml::Table, excluded: &[&str]) -> Vec<ShortcutBinding> {
     shortcuts
         .iter()
-        .filter(|(action, _)| action.as_str() != "terminal_passthrough_actions" && !excluded.contains(&action.as_str()))
+        .filter(|(action, _)| {
+            action.as_str() != "terminal_passthrough_actions"
+                && !excluded.contains(&action.as_str())
+        })
         .filter_map(|(_, chords)| chords.as_array())
         .flatten()
         .filter_map(toml::Value::as_str)
@@ -2481,7 +2517,10 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         foreign.extend(
             shortcuts
                 .keys()
-                .filter(|key| key.as_str() != "terminal_passthrough_actions" && !SHORTCUT_ACTIONS.contains(&key.as_str()))
+                .filter(|key| {
+                    key.as_str() != "terminal_passthrough_actions"
+                        && !SHORTCUT_ACTIONS.contains(&key.as_str())
+                })
                 .map(|key| Foreign {
                     path: vec![
                         Segment::Key("keyboard_shortcuts".into()),
@@ -2730,8 +2769,7 @@ fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
     // chord is not kept, so the file binds this build's chords for it instead,
     // which other kept actions must then give up in turn.
     let shortcuts = Segment::Key("keyboard_shortcuts".into());
-    let is_action =
-        |target: &[Segment]| matches!(target, [table, Segment::Key(action)] if *table == shortcuts && action != "terminal_passthrough_actions");
+    let is_action = |target: &[Segment]| matches!(target, [table, Segment::Key(action)] if *table == shortcuts && action != "terminal_passthrough_actions");
     let mut unkept: Vec<&[Segment]> = Vec::new();
     let bound = loop {
         let bound: Vec<ShortcutBinding> = document
@@ -2740,10 +2778,11 @@ fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
             .into_iter()
             .flatten()
             .filter(|(action, _)| {
-                action.as_str() != "terminal_passthrough_actions" && !kept.iter().any(|(target, _)| {
-                    !unkept.contains(&target.as_slice())
-                        && *target == [shortcuts.clone(), Segment::Key((*action).clone())]
-                })
+                action.as_str() != "terminal_passthrough_actions"
+                    && !kept.iter().any(|(target, _)| {
+                        !unkept.contains(&target.as_slice())
+                            && *target == [shortcuts.clone(), Segment::Key((*action).clone())]
+                    })
             })
             .filter_map(|(_, chords)| chords.as_array())
             .flatten()
@@ -4739,8 +4778,17 @@ new_thread = "Alt+Shift+G"
     #[test]
     fn shortcut_action_names_are_the_serialized_ones() {
         let table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
-        assert!(table.keys().filter(|key| key.as_str() != "terminal_passthrough_actions").eq(SHORTCUT_ACTIONS.iter()));
-        assert_eq!(table["terminal_passthrough_actions"], toml::Value::try_from(KeyboardShortcuts::default().terminal_passthrough_actions).unwrap());
+        assert!(
+            table
+                .keys()
+                .filter(|key| key.as_str() != "terminal_passthrough_actions")
+                .eq(SHORTCUT_ACTIONS.iter())
+        );
+        assert_eq!(
+            table["terminal_passthrough_actions"],
+            toml::Value::try_from(KeyboardShortcuts::default().terminal_passthrough_actions)
+                .unwrap()
+        );
     }
 
     /// Each shortcut action this build cannot use falls back alone, however
@@ -5203,18 +5251,28 @@ new_thread = "Alt+Shift+G"
     }
     #[test]
     fn revision_six_migrates_only_unchanged_close_and_preserves_explicit_terminal_policy() {
-        for (close, expected) in [(vec!["Ctrl+W"], vec!["Ctrl+Shift+W"]), (vec!["Ctrl+Alt+W"], vec!["Ctrl+Alt+W"]), (vec!["Ctrl+W", "Alt+W"], vec!["Ctrl+W", "Alt+W"])] {
+        for (close, expected) in [
+            (vec!["Ctrl+W"], vec!["Ctrl+Shift+W"]),
+            (vec!["Ctrl+Alt+W"], vec!["Ctrl+Alt+W"]),
+            (vec!["Ctrl+W", "Alt+W"], vec!["Ctrl+W", "Alt+W"]),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let path = path_in(&directory);
             let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
             document.insert("shortcut_defaults_revision".into(), 5.into());
             let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
             shortcuts.insert("close_focused_column".into(), close.into());
-            shortcuts.insert("terminal_passthrough_actions".into(), vec!["rename_pane", "close_focused_column"].into());
+            shortcuts.insert(
+                "terminal_passthrough_actions".into(),
+                vec!["rename_pane", "close_focused_column"].into(),
+            );
             fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
             let loaded = load(&path).unwrap();
             assert_eq!(loaded.keyboard_shortcuts.close_focused_column, expected);
-            assert_eq!(loaded.keyboard_shortcuts.terminal_passthrough_actions, ["rename_pane", "close_focused_column"]);
+            assert_eq!(
+                loaded.keyboard_shortcuts.terminal_passthrough_actions,
+                ["rename_pane", "close_focused_column"]
+            );
             save(&path, &loaded).unwrap();
             assert_eq!(load(&path).unwrap(), loaded);
         }
@@ -5222,9 +5280,17 @@ new_thread = "Alt+Shift+G"
         let path = path_in(&directory);
         let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
         document.insert("shortcut_defaults_revision".into(), 5.into());
-        document["keyboard_shortcuts"].as_table_mut().unwrap().remove("terminal_passthrough_actions");
+        document["keyboard_shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("terminal_passthrough_actions");
         fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
-        assert_eq!(load(&path).unwrap().keyboard_shortcuts.terminal_passthrough_actions, KeyboardShortcuts::default().terminal_passthrough_actions);
+        assert_eq!(
+            load(&path)
+                .unwrap()
+                .keyboard_shortcuts
+                .terminal_passthrough_actions,
+            KeyboardShortcuts::default().terminal_passthrough_actions
+        );
     }
-
 }

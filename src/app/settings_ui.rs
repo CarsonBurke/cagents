@@ -1412,22 +1412,43 @@ fn shortcut_input<'a>(
         design::caption(source).width(64).into(),
         {
             let scope = workspace_widget::shortcut_descriptor(action).scope;
-            if scope.applies_to(workspace_widget::FocusedPane::Terminal) || scope == workspace_widget::ShortcutScope::OutsideTerminal {
+            if scope.applies_to(workspace_widget::FocusedPane::Terminal)
+                || scope == workspace_widget::ShortcutScope::OutsideTerminal
+            {
                 crate::interaction::tooltip(
-                    crate::ui_controls::field::checkbox(draft.terminal_passthrough_actions.iter().any(|id| id == action.id()))
-                        .label("Terminal")
-                        .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough { action: action.id().to_owned(), enabled }),
+                    crate::ui_controls::field::checkbox(
+                        draft
+                            .terminal_passthrough_actions
+                            .iter()
+                            .any(|id| id == action.id()),
+                    )
+                    .label("Terminal")
+                    .on_toggle(move |enabled| {
+                        Message::ShortcutTerminalPassthrough {
+                            action: action.id().to_owned(),
+                            enabled,
+                        }
+                    }),
                     "Send these keys to the terminal instead of running this workspace action",
-                ).into()
+                )
+                .into()
             } else {
-                crate::interaction::tooltip(design::caption("Scoped"), "Applies in its own pane; terminals keep these keys").into()
+                crate::interaction::tooltip(
+                    design::caption("Scoped"),
+                    "Applies in its own pane; terminals keep these keys",
+                )
+                .into()
             }
         },
     ])
     .spacing(space::S)
     .align_y(Alignment::Center);
     let mut children = vec![row.into()];
-    if chords.iter().any(|chord| settings::parse_shortcut(chord).is_ok_and(|binding| settings::native_text_editing_advisory(action.id(), binding).is_some())) {
+    if chords.iter().any(|chord| {
+        settings::parse_shortcut(chord).is_ok_and(|binding| {
+            settings::native_text_editing_advisory(action.id(), binding).is_some()
+        })
+    }) {
         children.push(design::caption("Reserved while editing text").into());
     }
     if let Some(reason) = &error {
@@ -1458,28 +1479,68 @@ mod keyboard_table_tests {
     use super::*;
 
     fn click_actual_terminal_policy(app: &Cagents, field: SettingsField) -> Option<Message> {
-        use iced::{Event, Rectangle, Size, advanced::{clipboard, mouse, widget::Operation}, runtime::{UserInterface, user_interface::Cache}};
+        use iced::{
+            Event, Rectangle, Size,
+            advanced::{clipboard, mouse, widget::Operation},
+            runtime::{UserInterface, user_interface::Cache},
+        };
         #[derive(Default)]
         struct TerminalCheckbox(Option<Rectangle>);
         impl Operation for TerminalCheckbox {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
             fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
-                if text == "Terminal" { self.0 = Some(bounds); }
+                if text == "Terminal" {
+                    self.0 = Some(bounds);
+                }
             }
         }
         let action = field.shortcut_action().unwrap();
-        let value = app.settings_draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).unwrap().1;
-        let row = shortcut_input(field.label(), value, field, &app.settings_draft.keyboard_shortcuts, &app.settings_invalid);
-        let element = settings_group("Keyboard", "", vec![row]).compact().view("Keyboard", "").unwrap();
+        let value = app
+            .settings_draft
+            .keyboard_shortcuts
+            .shortcut_values()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == action)
+            .unwrap()
+            .1;
+        let row = shortcut_input(
+            field.label(),
+            value,
+            field,
+            &app.settings_draft.keyboard_shortcuts,
+            &app.settings_invalid,
+        );
+        let element = settings_group("Keyboard", "", vec![row])
+            .compact()
+            .view("Keyboard", "")
+            .unwrap();
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut ui = UserInterface::build(element, Size::new(960.0, 200.0), Cache::new(), &mut renderer);
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(960.0, 200.0),
+            Cache::new(),
+            &mut renderer,
+        );
         let mut checkbox = TerminalCheckbox::default();
         ui.operate(&renderer, &mut checkbox);
         let bounds = checkbox.0?;
         let mut messages = Vec::new();
-        let _ = ui.update(&[Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))], mouse::Cursor::Available(bounds.center()), &mut renderer, &mut clipboard::Null, &mut messages);
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(bounds.center()),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
         // Select the actual checkbox message, never synthesize its callback.
-        messages.into_iter().find(|message| matches!(message, Message::ShortcutTerminalPassthrough { .. }))
+        messages
+            .into_iter()
+            .find(|message| matches!(message, Message::ShortcutTerminalPassthrough { .. }))
     }
 
     #[test]
@@ -1490,21 +1551,48 @@ mod keyboard_table_tests {
         app.settings_path = Some(path.clone());
         app.settings_write_blocked = false;
         let f2 = keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(keyboard::key::Named::F2), modified_key: keyboard::Key::Named(keyboard::key::Named::F2),
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F2), location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+            key: keyboard::Key::Named(keyboard::key::Named::F2),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::F2),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F2),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
         };
-        for (enabled, expected) in [(false, Some(workspace_widget::GlobalShortcut::RenamePane)), (true, None)] {
-            let message = click_actual_terminal_policy(&app, SettingsField::ShortcutRenamePane).expect("actual rendered terminal checkbox must emit its message");
-            assert!(matches!(&message, Message::ShortcutTerminalPassthrough { action, enabled: actual } if action == "rename_pane" && *actual == enabled));
+        for (enabled, expected) in [
+            (false, Some(workspace_widget::GlobalShortcut::RenamePane)),
+            (true, None),
+        ] {
+            let message = click_actual_terminal_policy(&app, SettingsField::ShortcutRenamePane)
+                .expect("actual rendered terminal checkbox must emit its message");
+            assert!(
+                matches!(&message, Message::ShortcutTerminalPassthrough { action, enabled: actual } if action == "rename_pane" && *actual == enabled)
+            );
             let task = app.update(message);
             super::super::tests::settle_settings_task(&mut app, task);
             let saved = settings::load(&path).unwrap();
-            assert_eq!(saved.keyboard_shortcuts.terminal_passthrough_actions.iter().any(|action| action == "rename_pane"), enabled);
+            assert_eq!(
+                saved
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions
+                    .iter()
+                    .any(|action| action == "rename_pane"),
+                enabled
+            );
             assert_eq!(saved.keyboard_shortcuts, app.settings.keyboard_shortcuts);
-            assert_eq!(workspace_widget::global_shortcut(&f2, &saved.keyboard_shortcuts, workspace_widget::FocusedPane::Terminal), expected);
+            assert_eq!(
+                workspace_widget::global_shortcut(
+                    &f2,
+                    &saved.keyboard_shortcuts,
+                    workspace_widget::FocusedPane::Terminal
+                ),
+                expected
+            );
         }
-        assert!(click_actual_terminal_policy(&app, SettingsField::ShortcutChatModel).is_none(), "a scoped chat action must not offer a misleading terminal toggle");
+        assert!(
+            click_actual_terminal_policy(&app, SettingsField::ShortcutChatModel).is_none(),
+            "a scoped chat action must not offer a misleading terminal toggle"
+        );
     }
 
     #[test]
