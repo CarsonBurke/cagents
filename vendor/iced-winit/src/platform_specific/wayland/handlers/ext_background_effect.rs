@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use cctk::sctk;
-use iced_futures::futures::SinkExt;
 use iced_runtime::core::Rectangle;
 use iced_runtime::platform_specific::wayland::Action;
 use sctk::globals::GlobalData;
@@ -14,7 +13,7 @@ use wayland_protocols::ext::background_effect::v1::client::ext_background_effect
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
 
 use crate::event_loop::state::SctkState;
-use crate::{platform_specific, window};
+use crate::window;
 
 #[derive(Debug, Clone)]
 pub struct ExtBackgroundEffectManager {

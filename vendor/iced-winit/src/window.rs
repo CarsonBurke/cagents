@@ -14,7 +14,7 @@ use crate::core::text;
 use crate::core::theme::{self, Base};
 use crate::core::time::Instant;
 use crate::core::{
-    Color, Element, InputMethod, Padding, Point, Rectangle, Size, Text, Vector,
+    Color, InputMethod, Padding, Point, Rectangle, Size, Text, Vector,
 };
 use crate::graphics::Compositor;
 use crate::program::{self, Program};
@@ -25,10 +25,6 @@ use winit::monitor::MonitorHandle;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-
-pub(crate) type ViewFn<M, T, R> = Arc<
-    Box<dyn Fn() -> Option<Element<'static, M, T, R>> + Send + Sync + 'static>,
->;
 
 pub struct WindowManager<P, C>
 where
@@ -325,6 +321,10 @@ where
         }
     }
 
+    // Wrapped Wayland surfaces implement the legacy IME dispatch methods;
+    // their modern request_ime_update/ime_capabilities adapter is not available.
+    // Preserve working input until that adapter supports the new protocol.
+    #[expect(deprecated, reason = "The wrapped Wayland backend requires the legacy IME shim")]
     fn enable_ime(
         &mut self,
         cursor: Rectangle,
@@ -345,6 +345,7 @@ where
         }
     }
 
+    #[expect(deprecated, reason = "The wrapped Wayland backend requires the legacy IME shim")]
     fn disable_ime(&mut self) {
         if self.ime_state.is_some() {
             self.raw.set_ime_allowed(false);

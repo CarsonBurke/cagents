@@ -16,12 +16,11 @@ use cctk::sctk::reexports::client::protocol::wl_surface::WlSurface;
 use cctk::sctk::seat::keyboard::Modifiers;
 use cursor_icon::CursorIcon;
 use iced_futures::futures::channel::mpsc;
-use iced_graphics::{Compositor, compositor};
+use iced_graphics::compositor;
 use iced_runtime::core::{Vector, window};
-use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle};
-use raw_window_handle::{HasRawDisplayHandle, RawWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::RawWindowHandle;
 use sctk_event::SctkEvent;
-use std::sync::OnceLock;
 use std::{collections::HashMap, sync::Arc};
 use subsurface_widget::{SubsurfaceInstance, SubsurfaceState};
 use wayland_backend::client::ObjectId;
@@ -107,7 +106,7 @@ impl PlatformSpecific {
         display: OwnedDisplayHandle,
     ) -> Self {
         self.wayland.winit_event_sender = Some(tx);
-        self.wayland.conn = match display.raw_display_handle() {
+        self.wayland.conn = match display.display_handle().map(|handle| handle.as_raw()) {
             Ok(raw_window_handle::RawDisplayHandle::Wayland(
                 wayland_display_handle,
             )) => {
@@ -189,12 +188,12 @@ impl WaylandSpecific {
             winit_event_sender,
             proxy,
             sender,
-            display_handle,
-            conn,
+            display_handle: _display_handle,
+            conn: _conn,
             surface_ids,
             modifiers,
             subsurface_state,
-            surface_subsurfaces,
+            surface_subsurfaces: _surface_subsurfaces,
         } = self;
 
         match e {
@@ -237,7 +236,7 @@ impl WaylandSpecific {
         &mut self,
         keep: F,
     ) {
-        self.surface_subsurfaces.retain(|k, v| keep(*k))
+        self.surface_subsurfaces.retain(|k, _v| keep(*k))
     }
 
     pub(crate) fn clear_subsurface_list(&mut self) {
@@ -250,7 +249,7 @@ impl WaylandSpecific {
         wl_surface: &WlSurface,
     ) {
         let subsurfaces = crate::subsurface_widget::take_subsurfaces();
-        let mut entry = self.surface_subsurfaces.entry(id);
+        let entry = self.surface_subsurfaces.entry(id);
         let surface_subsurfaces = entry.or_default();
         let Some(subsurface_state) = self.subsurface_state.as_mut() else {
             return;

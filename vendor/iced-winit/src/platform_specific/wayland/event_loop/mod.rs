@@ -1,9 +1,5 @@
-pub mod control_flow;
-pub mod proxy;
 pub mod state;
 
-#[cfg(feature = "a11y")]
-use crate::platform_specific::SurfaceIdWrapper;
 use crate::{
     Control,
     futures::futures::channel::mpsc,
@@ -79,6 +75,17 @@ pub enum Error {
     NoWaylandDisplay,
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Calloop(error) => write!(f, "Wayland event loop: {error}"),
+            Self::Global(error) => write!(f, "Wayland globals: {error}"),
+            Self::NoDisplayHandle => f.write_str("No display handle"),
+            Self::NoWaylandDisplay => f.write_str("Display is not Wayland"),
+        }
+    }
+}
+
 impl SctkEventLoop {
     pub(crate) fn new(
         winit_event_sender: mpsc::UnboundedSender<Control>,
@@ -129,7 +136,7 @@ impl SctkEventLoop {
                             crate::platform_specific::Action::ResizeWindow(id) => {
                                 if let Some((_, v)) = state.windows.iter()
                                     .find(|w| w.id == id)
-                                    .map(|w| state.corner_radii.get(&id))
+                                    .map(|_w| state.corner_radii.get(&id))
                                     .unwrap_or_default() {
                                     _ = state.handle_action(iced_runtime::platform_specific::wayland::Action::RoundedCorners(id, *v));
                                 }

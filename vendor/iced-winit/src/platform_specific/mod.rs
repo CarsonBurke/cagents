@@ -149,9 +149,12 @@ impl PlatformSpecific {
     ) -> Option<Box<dyn HasWindowHandle + Send + Sync + 'static>> {
         #[cfg(wayland_platform)]
         {
-            return self.wayland.create_surface();
+            self.wayland.create_surface()
         }
-        None
+        #[cfg(not(wayland_platform))]
+        {
+            None
+        }
     }
 
     pub(crate) fn update_surface_shm(

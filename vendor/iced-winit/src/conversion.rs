@@ -3,9 +3,6 @@
 //! [`winit`]: https://github.com/rust-windowing/winit
 //! [`iced_runtime`]: https://github.com/iced-rs/iced/tree/0.14/runtime
 use crate::core::input_method;
-use std::hash::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
 
 use crate::core::keyboard;
 use crate::core::mouse;
@@ -13,7 +10,6 @@ use crate::core::theme;
 use crate::core::touch;
 use crate::core::window;
 use crate::core::{Event, Point, Size};
-use iced_futures::core::event::PlatformSpecific;
 use winit::dpi::PhysicalPosition;
 use winit::event::ButtonSource;
 use winit::event::ElementState;
@@ -52,7 +48,7 @@ fn take_activation_token() -> Option<winit::window::ActivationToken> {
 pub fn window_attributes(
     settings: window::Settings,
     title: &str,
-    scale_factor: f64,
+    _scale_factor: f64,
     primary_monitor: Option<winit::monitor::MonitorHandle>,
     _id: Option<String>,
 ) -> winit::window::WindowAttributes {
@@ -443,7 +439,7 @@ pub fn window_event(
         WindowEvent::DragDropped { paths, .. } => {
             Some(Event::Window(window::Event::FileDropped(paths.clone())))
         }
-        WindowEvent::DragLeft { position } => {
+        WindowEvent::DragLeft { .. } => {
             Some(Event::Window(window::Event::FilesHoveredLeft))
         }
 
@@ -680,10 +676,6 @@ pub fn mouse_interaction(
         Interaction::AllScroll => winit_core::cursor::CursorIcon::AllScroll,
         Interaction::ZoomIn => winit_core::cursor::CursorIcon::ZoomIn,
         Interaction::ZoomOut => winit_core::cursor::CursorIcon::ZoomOut,
-        Interaction::Cell => winit_core::cursor::CursorIcon::Cell,
-        Interaction::Move => winit_core::cursor::CursorIcon::Move,
-        Interaction::Copy => winit_core::cursor::CursorIcon::Copy,
-        Interaction::Help => winit_core::cursor::CursorIcon::Help,
         Interaction::Hidden => {
             return None;
         }
@@ -742,10 +734,10 @@ enum TouchInternal {
 ///
 /// [`winit`]: https://github.com/rust-windowing/winit
 /// [`iced`]: https://github.com/iced-rs/iced/tree/0.12
-pub fn touch_event(
+fn touch_event(
     finger: FingerId,
     state: TouchInternal,
-    force: Option<Force>,
+    _force: Option<Force>,
     position: Option<PhysicalPosition<f64>>,
     scale_factor: f64,
 ) -> touch::Event {
@@ -1269,6 +1261,9 @@ pub fn key_code(
         KeyCode::AudioVolumeMute => keyboard::key::Code::AudioVolumeMute,
         KeyCode::AudioVolumeUp => keyboard::key::Code::AudioVolumeUp,
         KeyCode::WakeUp => keyboard::key::Code::WakeUp,
+        // Preserve legacy physical key codes; there is no unhanded Meta
+        // replacement in the pinned winit keyboard-types version.
+        #[expect(deprecated, reason = "Preserve the legacy physical-key conversion")]
         KeyCode::Super => keyboard::key::Code::Meta,
         KeyCode::Abort => keyboard::key::Code::Abort,
         KeyCode::Resume => keyboard::key::Code::Resume,
@@ -1473,8 +1468,17 @@ pub fn winit_key_code(
         keyboard::key::Code::AudioVolumeMute => KeyCode::AudioVolumeMute,
         keyboard::key::Code::AudioVolumeUp => KeyCode::AudioVolumeUp,
         keyboard::key::Code::WakeUp => KeyCode::WakeUp,
+        // Preserve legacy physical key codes; there is no unhanded Meta
+        // replacement in the pinned winit keyboard-types version.
+        #[expect(deprecated, reason = "Preserve the legacy physical-key conversion")]
         keyboard::key::Code::Meta => KeyCode::Super,
+        // Preserve legacy physical key codes; there is no unhanded Meta
+        // replacement in the pinned winit keyboard-types version.
+        #[expect(deprecated, reason = "Preserve the legacy physical-key conversion")]
         keyboard::key::Code::Hyper => KeyCode::Hyper,
+        // Preserve legacy physical key codes; there is no unhanded Meta
+        // replacement in the pinned winit keyboard-types version.
+        #[expect(deprecated, reason = "Preserve the legacy physical-key conversion")]
         keyboard::key::Code::Turbo => KeyCode::Turbo,
         keyboard::key::Code::Abort => KeyCode::Abort,
         keyboard::key::Code::Resume => KeyCode::Resume,

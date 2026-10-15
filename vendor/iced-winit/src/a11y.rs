@@ -8,7 +8,7 @@ use iced_runtime::core;
 
 pub struct WinitActivationHandler {
     pub event_loop: winit::event_loop::EventLoopProxy,
-    pub proxy: mpsc::UnboundedSender<Control>,
+    pub(crate) proxy: mpsc::UnboundedSender<Control>,
     pub title: String,
     pub id: core::window::Id,
     pub node_id: u64,
@@ -30,7 +30,7 @@ impl ActivationHandler for WinitActivationHandler {
 pub struct WinitActionHandler {
     pub event_loop: winit::event_loop::EventLoopProxy,
     pub id: core::window::Id,
-    pub proxy: mpsc::UnboundedSender<Control>,
+    pub(crate) proxy: mpsc::UnboundedSender<Control>,
 }
 
 impl iced_accessibility::accesskit::ActionHandler for WinitActionHandler {
@@ -49,7 +49,7 @@ impl iced_accessibility::accesskit::ActionHandler for WinitActionHandler {
 pub struct WinitDeactivationHandler {
     pub event_loop: winit::event_loop::EventLoopProxy,
     pub id: core::window::Id,
-    pub proxy: mpsc::UnboundedSender<Control>,
+    pub(crate) proxy: mpsc::UnboundedSender<Control>,
 }
 
 impl iced_accessibility::accesskit::DeactivationHandler

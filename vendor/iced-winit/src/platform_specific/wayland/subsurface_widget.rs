@@ -58,7 +58,7 @@ use wayland_protocols::wp::{
 use winit::window::WindowId;
 
 use crate::platform_specific::{
-    SurfaceIdWrapper, event_loop::state::SctkState,
+    event_loop::state::SctkState,
 };
 
 #[derive(Debug)]
@@ -409,7 +409,11 @@ impl SubsurfaceState {
             .unwrap();
         canvas[0..width as usize * height as usize * 4].copy_from_slice(data);
         surface.damage_buffer(0, 0, width as i32, height as i32);
-        buffer.attach_to(&surface);
+        if let Err(error) = buffer.attach_to(&surface) {
+            log::warn!("Could not attach the Wayland shared-memory buffer: {error}");
+            wp_viewport.destroy();
+            return;
+        }
         surface.offset(offset.x as i32, offset.y as i32);
         wp_viewport.set_destination(
             (width as f64 / scale) as i32,
@@ -622,7 +626,7 @@ impl Drop for SubsurfaceState {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SubsurfaceInstance {
+pub struct SubsurfaceInstance {
     pub(crate) wl_surface: WlSurface,
     pub(crate) wl_subsurface: WlSubsurface,
     pub(crate) wp_viewport: WpViewport,

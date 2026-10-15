@@ -4,7 +4,7 @@ use crate::{
         SurfaceIdWrapper, UserInterfaces,
         wayland::{
             conversion::{
-                modifiers_to_native, pointer_axis_to_native,
+                modifiers_to_native,
                 pointer_button_to_native,
             },
             keymap::{self, keysym_to_key},
@@ -25,10 +25,9 @@ use iced_futures::{
             },
         },
     },
-    event,
     futures::{SinkExt, channel::mpsc},
 };
-use iced_graphics::{Compositor, compositor};
+use iced_graphics::compositor;
 use iced_runtime::{
     core::{
         Point,
@@ -41,7 +40,6 @@ use iced_runtime::{
 };
 
 use cctk::{
-    cosmic_protocols::overlap_notify::v1::client::zcosmic_overlap_notification_v1,
     sctk::{
         output::OutputInfo,
         reexports::{
@@ -503,7 +501,7 @@ impl SctkEvent {
                                         ),
                                     ),
                                 ),
-                                SurfaceIdWrapper::Window(id) => {
+                                SurfaceIdWrapper::Window(_id) => {
                                     Some(iced_runtime::core::Event::Window(
                                         window::Event::Unfocused,
                                     ))
@@ -531,7 +529,7 @@ impl SctkEvent {
                                         ),
                                     ),
                                 ),
-                                SurfaceIdWrapper::Subsurface(id) => None,
+                                SurfaceIdWrapper::Subsurface(_id) => None,
                             })
                         {
                             events.push((
@@ -566,7 +564,7 @@ impl SctkEvent {
                                     )),
                                 ))
                             }
-                            SurfaceIdWrapper::Window(id) => {
+                            SurfaceIdWrapper::Window(_id) => {
                                 Some(iced_runtime::core::Event::Window(window::Event::Focused))
                             }
                             SurfaceIdWrapper::Popup(_id) => {

@@ -184,10 +184,10 @@ where
         context: task::Context<'static>,
         id: Option<String>,
         boot: Option<BootConfig>,
-        sender: mpsc::UnboundedSender<Event<Message>>,
+        sender: mpsc::UnboundedSender<RuntimeEvent<Message>>,
         receiver: mpsc::UnboundedReceiver<Control>,
         error: Option<Error>,
-        system_theme: Option<oneshot::Sender<theme::Mode>>,
+        _system_theme: Option<oneshot::Sender<theme::Mode>>,
         control_sender: mpsc::UnboundedSender<Control>,
         #[cfg(feature = "a11y")]
         accessibility_proxy: winit::event_loop::EventLoopProxy,
@@ -224,7 +224,7 @@ where
         #[cfg(feature = "a11y")]
         accessibility_proxy: proxy.raw.clone(),
         error: None,
-        system_theme: Some(system_theme_sender),
+        _system_theme: Some(system_theme_sender),
 
         #[cfg(feature = "a11y")]
         adapters: Default::default(),
@@ -254,7 +254,7 @@ where
             if self.boot.is_some() {
                 return;
             }
-            self.process_event(event_loop, Some(Event::NewEvents(cause)));
+            self.process_event(event_loop, Some(RuntimeEvent::NewEvents(cause)));
         }
 
         fn window_event(
@@ -284,7 +284,7 @@ where
                     for id in
                         crate::subsurface_widget::subsurface_ids(window_id)
                     {
-                        _ = self.sender.start_send(Event::Winit(
+                        _ = self.sender.start_send(RuntimeEvent::Winit(
                             id,
                             WindowEvent::RedrawRequested,
                         ));
@@ -293,7 +293,7 @@ where
                     for id in
                         crate::subsurface_widget::subsurface_ids(window_id)
                     {
-                        _ = self.sender.start_send(Event::Winit(
+                        _ = self.sender.start_send(RuntimeEvent::Winit(
                             id,
                             WindowEvent::CloseRequested,
                         ));
@@ -303,7 +303,7 @@ where
 
             self.process_event(
                 event_loop,
-                Some(Event::Winit(window_id, event)),
+                Some(RuntimeEvent::Winit(window_id, event)),
             );
 
             // TODO: Remove when unnecessary
@@ -315,7 +315,7 @@ where
                 if is_move_or_resize {
                     // self.process_event(
                     //     event_loop,
-                    //     Some(Event::EventLoopAwakened(
+                    //     Some(RuntimeEvent::EventLoopAwakened(
                     //         winit::Event::AboutToWait,
                     //     )),
                     // );
@@ -327,7 +327,7 @@ where
             &mut self,
             event_loop: &dyn winit::event_loop::ActiveEventLoop,
         ) {
-            self.process_event(event_loop, Some(Event::AboutToWait));
+            self.process_event(event_loop, Some(RuntimeEvent::AboutToWait));
         }
 
         fn can_create_surfaces(
@@ -337,9 +337,9 @@ where
             // create initial window
             let Some(BootConfig {
                 sender,
-                fonts,
-                graphics_settings,
-                is_wayland,
+                fonts: _fonts,
+                graphics_settings: _graphics_settings,
+                is_wayland: _is_wayland,
             }) = self.boot.take()
             else {
                 return;
@@ -381,7 +381,7 @@ where
         fn process_event(
             &mut self,
             event_loop: &dyn winit::event_loop::ActiveEventLoop,
-            event: Option<Event<Message>>,
+            event: Option<RuntimeEvent<Message>>,
         ) {
             if event_loop.exiting() {
                 return;
@@ -394,8 +394,8 @@ where
                 let poll = self.instance.as_mut().poll(&mut self.context);
 
                 match poll {
-                    task::Poll::Pending => match self.receiver.try_next() {
-                        Ok(Some(control)) => match control {
+                    task::Poll::Pending => match self.receiver.try_recv() {
+                        Ok(control) => match control {
                             Control::ChangeFlow(flow) => {
                                 use winit::event_loop::ControlFlow;
 
@@ -526,7 +526,7 @@ where
 
                                 self.process_event(
                                     event_loop,
-                                    Some(Event::WindowCreated {
+                                    Some(RuntimeEvent::WindowCreated {
                                         id,
                                         window,
                                         exit_on_close_request,
@@ -538,7 +538,7 @@ where
                                 #[cfg(feature = "a11y")]
                                 self.process_event(
                                     event_loop,
-                                    Some(Event::A11yAdapter(
+                                    Some(RuntimeEvent::A11yAdapter(
                                         id,
                                         self.adapters[&id].0,
                                     )),
@@ -547,7 +547,7 @@ where
                             Control::Exit => {
                                 self.process_event(
                                     event_loop,
-                                    Some(Event::Exit),
+                                    Some(RuntimeEvent::Exit),
                                 );
                                 event_loop.exit();
                                 break;
@@ -567,32 +567,32 @@ where
                                 }
                             }
                             Control::Dnd(e) => {
-                                self.sender.start_send(Event::Dnd(e)).unwrap();
+                                self.sender.start_send(RuntimeEvent::Dnd(e)).unwrap();
                             }
                             #[cfg(feature = "a11y")]
                             Control::Accessibility(id, event) => {
                                 self.process_event(
                                     event_loop,
-                                    Some(Event::Accessibility(id, event)),
+                                    Some(RuntimeEvent::Accessibility(id, event)),
                                 );
                             }
                             #[cfg(feature = "a11y")]
                             Control::AccessibilityEnabled(id, event) => {
                                 self.process_event(
                                     event_loop,
-                                    Some(Event::AccessibilityEnabled(
+                                    Some(RuntimeEvent::AccessibilityEnabled(
                                         id, event,
                                     )),
                                 );
                             }
                             Control::PlatformSpecific(e) => {
                                 self.sender
-                                    .start_send(Event::PlatformSpecific(e))
+                                    .start_send(RuntimeEvent::PlatformSpecific(e))
                                     .unwrap();
                             }
                             Control::AboutToWait => {
                                 self.sender
-                                    .start_send(Event::AboutToWait)
+                                    .start_send(RuntimeEvent::AboutToWait)
                                     .expect("Send event");
                             }
                             Control::Winit(id, e) => {
@@ -601,7 +601,7 @@ where
                                     if matches!(e, WindowEvent::RedrawRequested)
                                     {
                                         for id in crate::subsurface_widget::subsurface_ids(id) {
-                                            _ = self.sender.unbounded_send(Event::Winit(
+                                            _ = self.sender.unbounded_send(RuntimeEvent::Winit(
                                                 id,
                                                 WindowEvent::RedrawRequested,
                                             ));
@@ -611,7 +611,7 @@ where
                                         WindowEvent::CloseRequested
                                     ) {
                                         for id in crate::subsurface_widget::subsurface_ids(id) {
-                                            _ = self.sender.start_send(Event::Winit(
+                                            _ = self.sender.start_send(RuntimeEvent::Winit(
                                                 id,
                                                 WindowEvent::CloseRequested,
                                             ));
@@ -620,12 +620,12 @@ where
                                 }
 
                                 self.sender
-                                    .start_send(Event::Winit(id, e))
+                                    .start_send(RuntimeEvent::Winit(id, e))
                                     .expect("Send event");
                             }
                             Control::StartDnd => {
                                 self.sender
-                                    .start_send(Event::StartDnd)
+                                    .start_send(RuntimeEvent::StartDnd)
                                     .expect("Send event");
                             }
                             #[cfg(feature = "a11y")]
@@ -634,7 +634,7 @@ where
 
                                 self.process_event(
                                     event_loop,
-                                    Some(Event::A11yAdapter(
+                                    Some(RuntimeEvent::A11yAdapter(
                                         id,
                                         self.adapters[&id].0,
                                     )),
@@ -653,7 +653,7 @@ where
                                 _ = self.adapters.remove(&id);
                                 let _ = self
                                     .sender
-                                    .unbounded_send(Event::A11yClosed(id));
+                                    .unbounded_send(RuntimeEvent::A11yClosed(id));
                             }
                         },
                         _ => {
@@ -676,9 +676,6 @@ where
             window: Arc<dyn winit::window::Window + 'static>,
         ) {
             use crate::a11y::*;
-            use iced_accessibility::accesskit::{
-                ActivationHandler, Node, NodeId, Role, Tree, TreeUpdate,
-            };
             use iced_accessibility::accesskit_winit::Adapter;
 
             let node_id = iced_runtime::core::id::window_node_id();
@@ -734,7 +731,7 @@ where
     }
 }
 
-enum Event<Message: 'static> {
+enum RuntimeEvent<Message: 'static> {
     WindowCreated {
         id: window::Id,
         window: Arc<dyn winit::window::Window>,
@@ -796,7 +793,7 @@ async fn run_instance<P>(
     mut runtime: Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
     mut proxy: Proxy<P::Message>,
     boot: oneshot::Receiver<()>,
-    mut event_receiver: mpsc::UnboundedReceiver<Event<P::Message>>,
+    mut event_receiver: mpsc::UnboundedReceiver<RuntimeEvent<P::Message>>,
     mut control_sender: mpsc::UnboundedSender<Control>,
     display_handle: winit::event_loop::OwnedDisplayHandle,
     is_daemon: bool,
@@ -922,7 +919,7 @@ async fn run_instance<P>(
         };
 
         match event {
-            Event::WindowCreated {
+            RuntimeEvent::WindowCreated {
                 id,
                 window,
                 exit_on_close_request,
@@ -1041,12 +1038,12 @@ async fn run_instance<P>(
                 let _ = on_open.send(id);
                 is_window_opening = false;
             }
-            Event::NewEvents(event::StartCause::Init) => {
+            RuntimeEvent::NewEvents(event::StartCause::Init) => {
                 for (_id, window) in window_manager.iter_mut() {
                     window.raw.request_redraw();
                 }
             }
-            Event::NewEvents(event::StartCause::ResumeTimeReached {
+            RuntimeEvent::NewEvents(event::StartCause::ResumeTimeReached {
                 ..
             }) => {
                 let now = Instant::now();
@@ -1069,14 +1066,14 @@ async fn run_instance<P>(
                         .start_send(Control::ChangeFlow(ControlFlow::Wait));
                 }
             }
-            Event::UserEvent(action) => {
+            RuntimeEvent::UserEvent(action) => {
                 let exited = run_action!(action);
                 if exited {
                     runtime.track(None.into_iter());
                 }
                 actions += 1;
             }
-            Event::Winit(window_id, event::WindowEvent::RedrawRequested) => {
+            RuntimeEvent::Winit(window_id, event::WindowEvent::RedrawRequested) => {
                 let Some(mut current_compositor) = compositor.as_mut() else {
                     continue;
                 };
@@ -1364,7 +1361,7 @@ async fn run_instance<P>(
                     },
                 }
             }
-            Event::Winit(window_id, event) => {
+            RuntimeEvent::Winit(window_id, event) => {
                 if !is_daemon
                     && matches!(event, winit::event::WindowEvent::Destroyed)
                     && !is_window_opening
@@ -1426,7 +1423,7 @@ async fn run_instance<P>(
                     }
                 }
             }
-            Event::AboutToWait => {
+            RuntimeEvent::AboutToWait => {
                 if actions > 0 {
                     proxy.free_slots(actions);
                     actions = 0;
@@ -1438,7 +1435,6 @@ async fn run_instance<P>(
                 }
 
                 let mut uis_stale = false;
-                let mut resized = false;
                 for (id, window) in window_manager.iter_mut() {
                     if skip && !window.resize_enabled {
                         continue;
@@ -1489,7 +1485,6 @@ async fn run_instance<P>(
                             // FIXME what to do when we are stuck in a configure event/resize request loop
                             // We don't have control over how winit handles this.
                             window.resize_enabled = true;
-                            resized = true;
                             needs_redraw = true;
                             let s = winit::dpi::Size::Logical(
                                 requested_size.cast(),
@@ -1630,10 +1625,10 @@ async fn run_instance<P>(
                         .start_send(Control::ChangeFlow(ControlFlow::Wait));
                 }
             }
-            Event::Exit => {
+            RuntimeEvent::Exit => {
                 break;
             }
-            Event::Dnd(e) => {
+            RuntimeEvent::Dnd(e) => {
                 use winit::raw_window_handle::HasWindowHandle;
 
                 log::trace!(target: "iced::winit::program", "Dnd event {:?}", e);
@@ -1688,7 +1683,7 @@ async fn run_instance<P>(
                 };
             }
             #[cfg(feature = "a11y")]
-            Event::Accessibility(id, action_request) => {
+            RuntimeEvent::Accessibility(id, action_request) => {
                 match action_request.action {
                     iced_accessibility::accesskit::Action::Focus => {
                         if let (Some(interface), Some(window)) = (
@@ -1717,7 +1712,7 @@ async fn run_instance<P>(
                 events.push((Some(id), conversion::a11y(action_request)));
             }
             #[cfg(feature = "a11y")]
-            Event::AccessibilityEnabled(id, enabled) => {
+            RuntimeEvent::AccessibilityEnabled(id, enabled) => {
                 if enabled {
                     a11y_enabled.insert(id);
                     if let Some(window) = window_manager.get_mut(id) {
@@ -1727,7 +1722,7 @@ async fn run_instance<P>(
                     a11y_enabled.remove(&id);
                 }
             }
-            Event::PlatformSpecific(e) => {
+            RuntimeEvent::PlatformSpecific(e) => {
                 crate::platform_specific::handle_event(
                     e,
                     &mut events,
@@ -1747,7 +1742,7 @@ async fn run_instance<P>(
                 )
                 .await;
             }
-            Event::StartDnd => {
+            RuntimeEvent::StartDnd => {
                 let compositor = match compositor.as_mut() {
                     Some(c) => c,
                     None => {
@@ -1951,12 +1946,12 @@ async fn run_instance<P>(
                 }
             }
             #[cfg(feature = "a11y")]
-            Event::A11yClosed(window_id) => {
+            RuntimeEvent::A11yClosed(window_id) => {
                 a11y_enabled.remove(&window_id);
                 a11y_roots.remove(&window_id);
             }
             #[cfg(feature = "a11y")]
-            Event::A11yAdapter(window_id, root) => {
+            RuntimeEvent::A11yAdapter(window_id, root) => {
                 a11y_roots.insert(window_id, root);
                 if let Some(window) = window_manager.get_mut(window_id) {
                     window.state.set_a11y_ready(true);

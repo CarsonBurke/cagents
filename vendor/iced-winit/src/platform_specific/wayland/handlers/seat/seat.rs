@@ -17,7 +17,7 @@ impl SeatHandler for SctkState {
     fn new_seat(
         &mut self,
         _conn: &cctk::sctk::reexports::client::Connection,
-        qh: &cctk::sctk::reexports::client::QueueHandle<Self>,
+        _qh: &cctk::sctk::reexports::client::QueueHandle<Self>,
         seat: cctk::sctk::reexports::client::protocol::wl_seat::WlSeat,
     ) {
         self.sctk_events.push(SctkEvent::SeatEvent {

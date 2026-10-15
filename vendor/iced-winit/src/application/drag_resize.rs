@@ -25,7 +25,7 @@ const DRAG_RESIZE_SUPPORTED: bool = false;
 
 /// If supported by winit, returns a closure that implements cursor resize support.
 pub fn event_func(
-    window: &dyn winit::window::Window,
+    _window: &dyn winit::window::Window,
     border_size: f64,
 ) -> Option<
     Box<

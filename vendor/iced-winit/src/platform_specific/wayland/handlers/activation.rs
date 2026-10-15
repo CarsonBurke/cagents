@@ -3,7 +3,6 @@ use cctk::sctk::{
     delegate_activation,
     reexports::client::protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
 };
-use iced_futures::futures::channel::oneshot::Sender;
 use std::time::Instant;
 
 use crate::platform_specific::wayland::event_loop::state::SctkState;

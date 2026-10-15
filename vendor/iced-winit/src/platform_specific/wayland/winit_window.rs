@@ -1,9 +1,9 @@
 use crate::platform_specific::wayland::Action;
 use cctk::sctk::reexports::{
-    calloop::{LoopHandle, channel},
+    calloop::channel,
     client::{
         Proxy, QueueHandle,
-        protocol::{wl_display::WlDisplay, wl_surface::WlSurface},
+        protocol::wl_display::WlDisplay,
     },
 };
 use raw_window_handle::HandleError;
@@ -91,7 +91,7 @@ impl winit::window::Window for SctkWinitWindow {
         }
     }
 
-    fn set_cursor_visible(&self, visible: bool) {
+    fn set_cursor_visible(&self, _visible: bool) {
         // TODO
     }
 
@@ -203,35 +203,35 @@ impl winit::window::Window for SctkWinitWindow {
         // TODO refer to winit for implementation
     }
 
-    fn set_outer_position(&self, position: winit::dpi::Position) {}
+    fn set_outer_position(&self, _position: winit::dpi::Position) {}
 
     fn outer_size(&self) -> winit::dpi::PhysicalSize<u32> {
         // XXX not applicable to wrapped surfaces
         Default::default()
     }
 
-    fn set_min_surface_size(&self, min_size: Option<winit::dpi::Size>) {
+    fn set_min_surface_size(&self, _min_size: Option<winit::dpi::Size>) {
         // XXX not applicable to wrapped surfaces
     }
 
-    fn set_max_surface_size(&self, max_size: Option<winit::dpi::Size>) {
+    fn set_max_surface_size(&self, _max_size: Option<winit::dpi::Size>) {
         // XXX not applicable to wrapped surfaces
     }
 
     fn set_surface_resize_increments(
         &self,
-        increments: Option<winit::dpi::Size>,
+        _increments: Option<winit::dpi::Size>,
     ) {
         log::warn!(
             "`set_surface_resize_increments` is not implemented for Wayland"
         )
     }
 
-    fn set_title(&self, title: &str) {
+    fn set_title(&self, _title: &str) {
         // XXX not applicable to wrapped surfaces
     }
 
-    fn set_transparent(&self, transparent: bool) {
+    fn set_transparent(&self, _transparent: bool) {
         todo!()
     }
 
@@ -304,19 +304,19 @@ impl winit::window::Window for SctkWinitWindow {
         ));
     }
 
-    fn set_visible(&self, visible: bool) {}
+    fn set_visible(&self, _visible: bool) {}
 
     fn is_visible(&self) -> Option<bool> {
         None
     }
 
-    fn set_resizable(&self, resizable: bool) {}
+    fn set_resizable(&self, _resizable: bool) {}
 
     fn is_resizable(&self) -> bool {
         false
     }
 
-    fn set_enabled_buttons(&self, buttons: winit::window::WindowButtons) {
+    fn set_enabled_buttons(&self, _buttons: winit::window::WindowButtons) {
         // TODO v5 of xdg_shell.
     }
 
@@ -324,7 +324,7 @@ impl winit::window::Window for SctkWinitWindow {
         WindowButtons::all()
     }
 
-    fn set_minimized(&self, minimized: bool) {
+    fn set_minimized(&self, _minimized: bool) {
         // XXX not applicable to the wrapped surfaces
     }
 
@@ -333,7 +333,7 @@ impl winit::window::Window for SctkWinitWindow {
         None
     }
 
-    fn set_maximized(&self, maximized: bool) {
+    fn set_maximized(&self, _maximized: bool) {
         // XXX can't minimize the wrapped surfaces
     }
 
@@ -344,7 +344,7 @@ impl winit::window::Window for SctkWinitWindow {
 
     fn set_fullscreen(
         &self,
-        fullscreen: Option<winit_core::monitor::Fullscreen>,
+        _fullscreen: Option<winit_core::monitor::Fullscreen>,
     ) {
         // XXX can't fullscreen the wrapped surfaces
     }
@@ -354,7 +354,7 @@ impl winit::window::Window for SctkWinitWindow {
         None
     }
 
-    fn set_decorations(&self, decorations: bool) {
+    fn set_decorations(&self, _decorations: bool) {
         // XXX no decorations supported for the wrapped surfaces
     }
 
@@ -362,26 +362,26 @@ impl winit::window::Window for SctkWinitWindow {
         false
     }
 
-    fn set_window_level(&self, level: winit::window::WindowLevel) {}
+    fn set_window_level(&self, _level: winit::window::WindowLevel) {}
 
-    fn set_window_icon(&self, window_icon: Option<winit_core::icon::Icon>) {}
+    fn set_window_icon(&self, _window_icon: Option<winit_core::icon::Icon>) {}
 
     fn focus_window(&self) {}
 
     fn request_user_attention(
         &self,
-        request_type: Option<winit::window::UserAttentionType>,
+        _request_type: Option<winit::window::UserAttentionType>,
     ) {
         // XXX can't request attention on wrapped surfaces
     }
 
-    fn set_theme(&self, theme: Option<winit::window::Theme>) {}
+    fn set_theme(&self, _theme: Option<winit::window::Theme>) {}
 
     fn theme(&self) -> Option<winit::window::Theme> {
         None
     }
 
-    fn set_content_protected(&self, protected: bool) {}
+    fn set_content_protected(&self, _protected: bool) {}
 
     fn title(&self) -> String {
         String::new()
@@ -434,14 +434,14 @@ impl winit::window::Window for SctkWinitWindow {
 
     fn set_cursor_position(
         &self,
-        position: winit::dpi::Position,
+        _position: winit::dpi::Position,
     ) -> Result<(), winit::error::RequestError> {
         todo!()
     }
 
     fn set_cursor_grab(
         &self,
-        mode: winit::window::CursorGrabMode,
+        _mode: winit::window::CursorGrabMode,
     ) -> Result<(), winit::error::RequestError> {
         todo!()
     }
@@ -452,7 +452,7 @@ impl winit::window::Window for SctkWinitWindow {
 
     fn request_ime_update(
         &self,
-        request: winit::window::ImeRequest,
+        _request: winit::window::ImeRequest,
     ) -> Result<(), winit::window::ImeRequestError> {
         todo!()
     }

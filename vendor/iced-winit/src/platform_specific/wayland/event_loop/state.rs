@@ -109,7 +109,6 @@ use iced_runtime::{
 };
 use wayland_protocols::{
     ext::background_effect::v1::client::{
-        ext_background_effect_manager_v1,
         ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
     },
     wp::{
@@ -236,9 +235,6 @@ impl CommonSurface {
 #[derive(Debug, Clone)]
 pub struct Common {
     pub(crate) fractional_scale: Option<f64>,
-    pub(crate) has_focus: bool,
-    pub(crate) ime_pos: LogicalPosition<u32>,
-    pub(crate) ime_size: LogicalSize<u32>,
     pub(crate) size: LogicalSize<u32>,
     pub(crate) requested_size: (Option<u32>, Option<u32>),
     pub(crate) wp_viewport: Option<WpViewport>,
@@ -248,9 +244,6 @@ impl Default for Common {
     fn default() -> Self {
         Self {
             fractional_scale: Default::default(),
-            has_focus: Default::default(),
-            ime_pos: Default::default(),
-            ime_size: Default::default(),
             size: LogicalSize::new(1, 1),
             requested_size: (None, None),
             wp_viewport: None,
@@ -343,7 +336,6 @@ pub struct SctkPopupData {
     pub(crate) parent: PopupParent,
     pub(crate) toplevel: WlSurface,
     pub(crate) positioner: Arc<XdgPositioner>,
-    pub(crate) grab: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -911,7 +903,6 @@ impl SctkState {
                 parent: parent.clone(),
                 toplevel: toplevel.clone(),
                 positioner: positioner.clone(),
-                grab: settings.grab,
             },
             last_configure: None,
             _pending_requests: Default::default(),
@@ -1425,7 +1416,7 @@ impl SctkState {
                             );
                             let queue_handle = self.queue_handle.clone();
                             _ = self.loop_handle.insert_source(timer, move |_, _, state| {
-                                let Some((mut popup, attempt)) = state.pending_popup.take() else {
+                                let Some((popup, attempt)) = state.pending_popup.take() else {
                                     return TimeoutAction::Drop;
                                 };
 

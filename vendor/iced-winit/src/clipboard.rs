@@ -1,7 +1,7 @@
 //! Access the clipboard.
 
 use std::sync::Mutex;
-use std::{any::Any, borrow::Cow};
+use std::borrow::Cow;
 
 use crate::Control;
 

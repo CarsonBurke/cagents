@@ -39,7 +39,7 @@ impl Dispatch<CosmicCornerRadiusManagerV1, ()> for SctkState {
 
 impl Dispatch<CosmicCornerRadiusToplevelV1, ()> for SctkState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _proxy: &CosmicCornerRadiusToplevelV1,
         event: <CosmicCornerRadiusToplevelV1 as Proxy>::Event,
         _data: &(),
@@ -54,7 +54,7 @@ impl Dispatch<CosmicCornerRadiusToplevelV1, ()> for SctkState {
 
 impl Dispatch<CosmicCornerRadiusLayerV1, ()> for SctkState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _proxy: &CosmicCornerRadiusLayerV1,
         event: <CosmicCornerRadiusLayerV1 as Proxy>::Event,
         _data: &(),
