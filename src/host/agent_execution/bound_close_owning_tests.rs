@@ -490,7 +490,7 @@ fn combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_co
         return;
     }
     let (host, mut request, path) = fixture();
-    let cleanup = BoundCloseCleanup::reserve(&host);
+    let mut cleanup = BoundCloseCleanup::reserve(&host);
     let root = path.parent().unwrap();
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
