@@ -308,7 +308,8 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
     })
 }
 
-/// The daemon's key for sealing frames. It never leaves the daemon.
+/// The daemon's key for sealing frames. Only its trusted native actor helper
+/// receives a copy, over the private inherited startup channel.
 #[cfg(feature = "host")]
 pub(crate) struct Seal([u8; 32]);
 
@@ -324,6 +325,10 @@ impl Seal {
     pub(crate) fn new(key: [u8; 32]) -> Self {
         Self(key)
     }
+
+    /// Transfer only over the private inherited actor startup channel. Never
+    /// put this key in discovery records, environment variables, or diagnostics.
+    pub(crate) fn export_private_key(&self) -> [u8; 32] { self.0 }
 
     /// A truncated HMAC-SHA-256: 128 bits are far beyond what forging one
     /// displayed message could be worth, and keep the frame short.
@@ -445,6 +450,18 @@ mod tests {
         let long = title(&"x".repeat(200));
         assert_eq!(long.chars().count(), TITLE_CHARS + 1);
         assert!(long.ends_with('…'));
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn trusted_actor_copy_recognizes_only_the_daemons_sealed_mail() {
+        let daemon = Seal::new([19; 32]);
+        let actor = Seal::new(daemon.export_private_key());
+        let message = message();
+        let sealed = daemon.seal(&message, 0);
+        assert_eq!(actor.open(&sealed).unwrap().body, message.body);
+        assert!(actor.open(&sealed.replace("Hold off", "Go ahead")).is_none());
+        assert_eq!(format!("{actor:?}"), "Seal(<redacted>)");
     }
 
     #[cfg(feature = "host")]

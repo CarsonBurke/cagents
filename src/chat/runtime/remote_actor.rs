@@ -72,6 +72,7 @@ struct Startup {
     working_directory:PathBuf,
     directory_fd:Option<RawFd>,
     directory_identity:Option<crate::agent_execution::DirectoryIdentity>,
+    mailbox_key:Option<[u8;32]>,
     recovery_environment:BTreeMap<String,String>,
 }
 #[derive(Serialize,Deserialize)]
@@ -89,6 +90,8 @@ struct Remote {
     state:Mutex<Arc<Resident>>,
     environment:crate::terminal_ipc::ChatExecutionEnvironment,
     recovery_environment:BTreeMap<String,String>,
+    desired_visible:Mutex<Option<bool>>,
+    desired_observe:AtomicBool,
     input_sequence:Mutex<u64>,
     uncertain_input:Mutex<Option<InputIdentity>>,
     pending:Mutex<Vec<Pending>>,
@@ -135,7 +138,7 @@ impl RemoteActor {
         let process=Process::read(std::process::id() as i32).unwrap();
         let boot=BootId::new("fixture-boot");
         let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,close:super::CloseObservation {actor_id:uuid::Uuid::new_v4(),close_revision:0,turn_generation:0,activity:crate::agent::ActivityState::Idle,ready:true,exited:false,completed:false,closing:false,owns_work:true,working_directory:PathBuf::from("/var/tmp")},idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,outbox_ack:0,outbox_latest:0,changed:1};
-        Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:Default::default(),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
+        Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:Default::default(),desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
     }
     #[cfg(test)]
     pub(super) fn completed_failure_fixture()->Self {
@@ -147,6 +150,16 @@ impl RemoteActor {
     pub fn wake_outcomes(&self) {let state=self.state();if state.outbox_latest>state.outbox_ack {(self.0.notify)(Update::RetainedOutcomes);}}
     pub fn identity(&self)->ActorIdentity {self.0.identity.clone()}
     pub fn state(&self)->Arc<Resident> {self.0.state.lock().unwrap_or_else(|p|p.into_inner()).clone()}
+    pub fn set_visible(&self,visible:bool) {*self.0.desired_visible.lock().unwrap_or_else(|p|p.into_inner())=Some(visible);}
+    pub fn observe_next_update(&self)->u64 {self.0.desired_observe.store(true,Ordering::Release);self.state().generation}
+    pub fn attachment_snapshot(&self)->Snapshot {
+        let state=self.state();
+        Snapshot {generation:state.generation,turn_generation:state.close.turn_generation,
+            session_id:state.session_id.clone(),title:state.title.clone(),ready:state.ready,
+            busy:state.busy,waiting:state.waiting,usage:state.usage.clone(),requests:state.requests.clone(),
+            native_continuity:state.native_continuity.clone(),outcome:state.outcome.clone(),
+            error:state.failure.clone(),exited:state.completed,..Snapshot::default()}
+    }
     pub fn execution_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {self.0.environment.clone()}
     pub fn restart_environment(&self)->BTreeMap<String,String> {self.0.recovery_environment.clone()}
     pub fn recovery_environment_matches(&self,value:&BTreeMap<String,String>)->bool {&self.0.recovery_environment==value}
@@ -159,7 +172,7 @@ impl RemoteActor {
         let proof=source.proof.clone().ok_or("Retained actor launch lacks daemon ownership proof")?;
         let directory=spec.execution.as_ref().and_then(|context|context.directory.clone());
         let directory_fd=directory.as_ref().map(|file|file.as_raw_fd());
-        let request=Startup {protocol:PROTOCOL,source:source.clone(),program:spec.program,arguments:spec.arguments,environment:spec.environment,working_directory:spec.working_directory,directory_fd,directory_identity:spec.execution.as_ref().map(|context|context.directory_identity()).transpose()?.flatten(),recovery_environment};
+        let request=Startup {protocol:PROTOCOL,source:source.clone(),program:spec.program,arguments:spec.arguments,environment:spec.environment,working_directory:spec.working_directory,directory_fd,directory_identity:spec.execution.as_ref().map(|context|context.directory_identity()).transpose()?.flatten(),mailbox_key:spec.messages.as_ref().map(|seal|seal.export_private_key()),recovery_environment};
         let (control,remote)=UnixStream::pair().map_err(|error|error.to_string())?;
         let fd=remote.as_raw_fd();
         let mut command=ChildCommand::new("/proc/self/exe");
@@ -222,13 +235,18 @@ impl RemoteActor {
         if attached.protocol!=PROTOCOL {return Err("Retained Claude actor protocol is incompatible; no prompt was replayed".into());}
         validate_record(&attached.identity.record)?;
         let socket=registry::socket(&registry::directory(Kind::Native)?,attached.identity.record.terminal);
-        let remote=Self(Arc::new(Remote {identity:attached.identity,epoch:attached.epoch,proof,socket,input_sequence:Mutex::new(attached.resident.next_input),uncertain_input:Mutex::new(None),state:Mutex::new(Arc::new(attached.resident)),environment:attached.execution_environment,recovery_environment:attached.recovery_environment,pending:Mutex::new(Vec::new()),notify:Arc::new(notify),stop:AtomicBool::new(false),installed:AtomicBool::new(false),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(startup)}));
+        let remote=Self(Arc::new(Remote {identity:attached.identity,epoch:attached.epoch,proof,socket,desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(attached.resident.next_input),uncertain_input:Mutex::new(None),state:Mutex::new(Arc::new(attached.resident)),environment:attached.execution_environment,recovery_environment:attached.recovery_environment,pending:Mutex::new(Vec::new()),notify:Arc::new(notify),stop:AtomicBool::new(false),installed:AtomicBool::new(false),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(startup)}));
         let weak=Arc::downgrade(&remote.0);
         let worker=thread::Builder::new().name("cagents-actor-proxy".into()).spawn(move||{
             loop {
                 let Some(inner)=weak.upgrade() else {break;};
                 if inner.stop.load(Ordering::Acquire) {break;}
                 let actor=Self(inner);
+                let desired=actor.0.desired_visible.lock().unwrap_or_else(|p|p.into_inner()).take();
+                if let Some(visible)=desired && actor.call::<()>("visible",json!([visible])).is_err() {
+                    actor.0.desired_visible.lock().unwrap_or_else(|p|p.into_inner()).get_or_insert(visible);
+                }
+                if actor.0.desired_observe.swap(false,Ordering::AcqRel) && actor.call::<()>("observe",Value::Null).is_err() {actor.0.desired_observe.store(true,Ordering::Release);}
                 let old=actor.state();
                 let response=actor.call::<Option<Resident>>("state",json!([old.changed]));
                 if let Err(error)=&response && actor.endpoint_failed(error) {actor.publish_unavailable(error);break;}
@@ -413,7 +431,7 @@ impl Server {
         let mut execution=match startup.directory_identity {Some(identity)=>ExecutionContext::restored(identity),None=>ExecutionContext::new(None)};
         execution.directory=directory.clone();
         let spec=&mut spec_and_adapter.0;
-        spec.program=startup.program;spec.arguments=startup.arguments;spec.environment=startup.environment;spec.working_directory=startup.working_directory;spec.unset_environment.clear();spec.execution=Some(Arc::new(execution));
+        spec.program=startup.program;spec.arguments=startup.arguments;spec.environment=startup.environment;spec.working_directory=startup.working_directory;spec.unset_environment.clear();spec.execution=Some(Arc::new(execution));spec.messages=startup.mailbox_key.map(|key|Arc::new(crate::agent_execution::mailbox::Seal::new(key)));
         let environment=crate::terminal_ipc::ChatExecutionEnvironment(spec.environment.clone());
         let initial=spec_and_adapter.1.initialize()?;
         let mut initial=initial;
@@ -648,6 +666,16 @@ fn terminal_endpoint_error(error:&str,holder_current:bool)->bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachment_metadata_and_observation_are_local_and_body_free() {
+        let actor=RemoteActor::fixture();
+        actor.set_visible(false);actor.set_visible(true);
+        assert_eq!(actor.observe_next_update(),1);
+        assert_eq!(*actor.0.desired_visible.lock().unwrap(),Some(true));
+        assert!(actor.0.desired_observe.load(Ordering::Acquire));
+        let snapshot=actor.attachment_snapshot();
+        assert_eq!(snapshot.generation,1);assert!(snapshot.ready);assert!(snapshot.items.is_empty());
+    }
     #[test]
     fn confirmed_install_updates_full_publication_once_and_is_idempotent() {
         let mut snapshot=Snapshot::default();
