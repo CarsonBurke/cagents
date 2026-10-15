@@ -756,7 +756,8 @@ fn start_with_execution(
         &session.launch.recipe.environment, &crate::account::launch_credential_overrides(&session.launch.recipe), true)?;
     // Main has no immutable captured-home authority for legacy/native
     // reattachment. Refuse that path during mutation rather than infer it.
-    if source.is_some() || session.terminal.is_some() || !matches!(session.native_continuity, chat::NativeContinuity::ReconnectOnly) {
+    let already_hosted = host.lock().unwrap_or_else(|p|p.into_inner()).chats.contains_key(&session.id);
+    if already_hosted || source.is_some() || session.terminal.is_some() || !matches!(session.native_continuity, chat::NativeContinuity::ReconnectOnly) {
         super::account_lifecycle::ensure_idle(host)?;
     }
     // A managed CLI is a second view of the thread that this daemon owns.
