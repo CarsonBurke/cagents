@@ -480,6 +480,10 @@ mod preparation_contracts {
                 output.status.success(),
                 "isolated setup authority contract failed: {output:?}"
             );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated child did not execute the exact contract: {output:?}"
+            );
             return;
         }
 
