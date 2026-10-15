@@ -371,7 +371,7 @@ impl Cagents {
         let Some(card) = self.repository_card_for(&key.canonical_path) else {
             return overlay.chain(prepare);
         };
-        let open = cosmic::task::message(self.repository_open_message(open(card)));
+        let open = self.dispatch_repository_open(open(card));
         Task::batch([overlay, prepare, open])
     }
 }
