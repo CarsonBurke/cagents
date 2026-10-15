@@ -141,12 +141,11 @@ impl FailedHolding {
                 .retry_cleanup()
                 .map_err(|error| error.to_string())?,
             FailedHoldingDirectory::Publication(publication) => {
-                publication
-                    .resolve_recovery()
-                    .map_err(|error| error.to_string())?;
-                publication
-                    .cleanup_empty()
-                    .map_err(|error| error.to_string())?;
+                if !publication.is_removed() {
+                    self.context.placement().validate_payload_root(publication.directory()).map_err(|error|error.to_string())?;
+                    publication.resolve_recovery().map_err(|error| error.to_string())?;
+                    publication.cleanup_empty().map_err(|error| error.to_string())?;
+                }
             }
             FailedHoldingDirectory::Unverified(directory) => {
                 if directory
@@ -245,6 +244,7 @@ impl Holding {
             if let Some(error) = publication.publication_error() {
                 return Err(FileIoError::Io(error.into()));
             }
+            context.placement().validate_payload_root(publication.directory()).map_err(io_error)?;
             fs_safety::set_directory_permissions(publication.directory(), 0o700)
                 .map_err(io_error)?;
             let metadata = publication.directory().metadata().map_err(io_error)?;
@@ -300,8 +300,12 @@ impl Holding {
         }
     }
     fn remove_empty(&mut self, _parent: &Root) -> Result<(), FileIoError> {
-        self.context.placement().validate().map_err(io_error)?;
-        self.publication.cleanup_empty().map_err(resolve_error)?;
+        if !self.publication.is_removed() {
+            self.context.placement().validate_payload_root(&self.root).map_err(io_error)?;
+            self.publication.cleanup_empty().map_err(resolve_error)?;
+        } else {
+            self.context.placement().validate().map_err(io_error)?;
+        }
         fs_safety::sync_directory(self.context.placement().directory()).map_err(io_error)
     }
     fn retain(mut self) -> RecoveryAuthority {
@@ -315,18 +319,19 @@ impl Holding {
         slot.retain(description, move || self.retry_cleanup())
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
-        self.context.placement().validate().map_err(|error|error.to_string())?;
-        self.publication
-            .resolve_recovery()
-            .map_err(|e| e.to_string())?;
-        // Unknown/nonempty contents are preserved. A retry may clean up only
-        // an empty exact original; it never deletes an arbitrary leaf or
-        // overwrites a newer destination in pursuit of cleanup.
-        self.publication
-            .cleanup_empty()
-            .map_err(|e| e.to_string())?;
+        if !self.publication.is_removed() {
+            self.context.placement().validate_payload_root(&self.root).map_err(|error|error.to_string())?;
+            self.publication.resolve_recovery().map_err(|error|error.to_string())?;
+            // Unknown private contents remain retained for explicit resolution.
+            self.publication.cleanup_empty().map_err(|error|error.to_string())?;
+        } else {
+            // A completed removal may have been followed by failed fsync.
+            // Its unlinked inode has no ancestry to walk; retry only the held
+            // outside/source parent sync, never any reconstructed path.
+            self.context.placement().validate().map_err(|error|error.to_string())?;
+        }
         fs_safety::sync_directory(self.context.placement().directory()).map_err(|e|e.to_string())?;
-        fs_safety::sync_directory(&self.parent).map_err(|e| e.to_string())
+        fs_safety::sync_directory(&self.parent).map_err(|e|e.to_string())
     }
     fn location(&self) -> String {
         format!(
@@ -440,7 +445,7 @@ fn publish_in_holding(
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
-    holding.context.placement().validate().map_err(io_error)?;
+    holding.context.placement().validate_payload_root(&holding.root).map_err(io_error)?;
     let (temporary, temporary_name) = match fs_safety::create_temporary_in(&holding.root, 0o600) {
         Ok(value) => value,
         Err(error) => {
@@ -496,7 +501,7 @@ fn publish_in_holding(
         }
     };
     let previous = OsStr::new("previous");
-    if let Err(error) = holding.context.placement().validate() {
+    if let Err(error) = holding.context.placement().validate_payload_root(&holding.root) {
         return Err(clean_before_acquire(parent, holding, &temporary_name,
             readable_temporary.as_ref().unwrap_or(&temporary), temporary_baseline.as_ref(), io_error(error)));
     }
@@ -530,7 +535,7 @@ fn publish_in_holding(
             readable_temporary.as_ref().unwrap_or(&temporary),
             temporary_baseline.as_ref(),
         )?;
-        holding.context.placement().validate().map_err(io_error)?;
+        holding.context.placement().validate_payload_root(&holding.root).map_err(io_error)?;
         fs_safety::rename_new_between(&holding.root, &temporary_name, parent, name.as_os_str())
             .map_err(resolve_error)?;
         Ok((acquired, acquired_version))
@@ -552,7 +557,7 @@ fn publish_in_holding(
                         "The acquired entry was replaced; unknown recovery entry retained.".into(),
                     ));
                 }
-                holding.context.placement().validate().map_err(io_error)?;
+                holding.context.placement().validate_payload_root(&holding.root).map_err(io_error)?;
                 fs_safety::rename_new_between(&holding.root, previous, parent, name.as_os_str())
                     .map_err(resolve_error)
             })();
@@ -596,7 +601,7 @@ fn publish_in_holding(
             ));
         }
         baseline.verify(&acquired, true)?;
-        holding.context.placement().validate().map_err(io_error)?;
+        holding.context.placement().validate_payload_root(&holding.root).map_err(io_error)?;
         fs_safety::unlink_within(&holding.root, previous).map_err(resolve_error)?;
         holding.remove_empty(parent)
     })();
@@ -652,7 +657,7 @@ fn remove_temporary(
     file: &File,
     baseline: Option<&SaveBaseline>,
 ) -> Result<(), FileIoError> {
-    holding.context.placement().validate().map_err(io_error)?;
+    holding.context.placement().validate_payload_root(&holding.root).map_err(io_error)?;
     verify_temporary(holding, name, file, baseline)?;
     fs_safety::unlink_within(&holding.root, name).map_err(resolve_error)
 }
