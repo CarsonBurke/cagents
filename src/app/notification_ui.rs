@@ -481,20 +481,16 @@ impl Cagents {
                         .iter()
                         .any(|notice| notice.id == *id && !notice.acknowledged)
                 });
+                // Project once per snapshot, before mutating local unread.
+                // Managed aliases cannot acquire canonical attention by row order.
+                let cards = self.notification_attention_cards();
                 for notice in &snapshot.notices {
                     if !notice.acknowledged
                         && !self.notification_ui.acknowledged.contains(&notice.id)
                         && let Some(session) = notice.event.source_session()
-                        && let Some(card) = self
-                            .durable
-                            .cards
-                            .iter()
-                            .find(|card| {
-                                card.existence.is_open() && card_session(card) == Some(session)
-                            })
-                            .map(|card| card.id)
+                        && let Some(Some(card)) = cards.get(&session)
                     {
-                        self.observe_agent_update_for_card(card);
+                        self.observe_agent_update_for_card(*card);
                     }
                 }
                 self.notification_ui.preview_generation =
@@ -826,8 +822,43 @@ impl Cagents {
         Task::batch([adopted, focus])
     }
 
+    /// Attribution grants no adoption, focus, startup, persistence or read.
+    /// Local inventory-only sessions must be unique. Any raw managed member
+    /// fences that fallback, including rejected/ambiguous canonical ownership.
+    fn notification_attention_cards(&self) -> HashMap<TerminalId, Option<CardId>> {
+        let mut cards = HashMap::new();
+        for card in self.durable.cards.iter().filter(|card| card.existence.is_open()) {
+            if let Some(session) = card_session(card) {
+                cards.entry(session).and_modify(|entry| *entry = None).or_insert(Some(card.id));
+            }
+        }
+        let mut owners = HashMap::new();
+        for agent in self.workspace_model.agents.iter().filter(|agent| !agent.closed) {
+            let primary = agent.session.as_ref().map(|session| session.id());
+            let console = agent.console.as_ref().map(|session| session.id);
+            for session in primary.into_iter().chain(console.filter(|session| Some(*session) != primary)) {
+                owners.entry(session).and_modify(|entry| *entry = None).or_insert(Some(agent));
+            }
+        }
+        let index = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model);
+        for (session, owner) in owners {
+            let canonical = owner.and_then(|agent| {
+                let resolved = self.resolved_agent_display(agent, session, &index)?;
+                let canonical = CardId::from_uuid(agent.id.as_uuid());
+                let card = self.card_state(canonical).filter(|card| card.existence.is_open())?;
+                let local = match &card.kind {
+                    CardKind::Chat(session) => crate::agent_execution::HostedSession::Chat(session.clone()),
+                    CardKind::Terminal(session) => crate::agent_execution::HostedSession::Terminal(session.clone()),
+                    _ => return None,
+                };
+                resolved.session.same_process(&local).then_some(canonical)
+            });
+            cards.insert(session, canonical);
+        }
+        cards
+    }
+
     fn resolved_activation_agent(&self, session: TerminalId) -> Option<ManagedActivation> {
-        use crate::agent_execution::Placement;
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return None;
         }
@@ -848,9 +879,21 @@ impl Cagents {
         if owners.next().is_some() {
             return None;
         }
-        let resolved =
-            crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model)
-                .activation_display(agent, session)?;
+        let index = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model);
+        self.resolved_agent_display(agent, session, &index)
+    }
+
+    fn resolved_agent_display(
+        &self,
+        agent: &crate::agent_execution::Agent,
+        session: TerminalId,
+        index: &crate::workspace_model::views::ManagedDisplayIndex<'_>,
+    ) -> Option<ManagedActivation> {
+        use crate::agent_execution::Placement;
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return None;
+        }
+        let resolved = index.activation_display(agent, session)?;
         let display = resolved.display;
         let owner = resolved.session;
         let repository = match &display.scope {
@@ -2297,6 +2340,86 @@ mod tests {
         assert_eq!(app.durable.cards.len(), 1);
     }
 
+    fn attention_snapshot(session: TerminalId) -> Snapshot {
+        Snapshot {
+            diagnostic: None,
+            notices: vec![crate::notifications::Notice {
+                id: uuid::Uuid::new_v4(),
+                event: crate::notifications::Event::session(session, Provider::Claude, "/tmp".into(),
+                    crate::notifications::Evidence {key: "canonical-unread".into(), kind: crate::notifications::Kind::Waiting}),
+                delivered: true,
+                acknowledged: false,
+                window: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn notification_snapshot_rejects_invalid_managed_membership_without_alias_fallback() {
+        for scenario in 0..4 {
+            let (mut app, agent) = scheduled_attention_fixture();
+            let session = activation_session(&agent).unwrap().id();
+            let canonical = CardId::from_uuid(agent.id.as_uuid());
+            app.workspace_model.agents.push(agent.clone());
+            drop(app.adopt_execution_agent(&agent).unwrap());
+            let mut alias = app.card_state(canonical).unwrap().clone();
+            alias.id = CardId::new();
+            let alias_id = alias.id;
+            Arc::make_mut(&mut app.durable).cards.insert(0, alias);
+            match scenario {
+                0 => {
+                    let mut duplicate = agent.clone();
+                    duplicate.id = crate::model::AgentId::new();
+                    app.workspace_model.agents.push(duplicate);
+                }
+                1 => {
+                    let CardKind::Terminal(session) = &mut app.card_state_mut(canonical).unwrap().kind else {unreachable!()};
+                    if let TerminalContinuity::Live {host_incarnation, ..} = &mut session.continuity {
+                        *host_incarnation = crate::model::HostIncarnation::new("replacement-host");
+                    }
+                }
+                2 => {
+                    app.card_state_mut(canonical).unwrap().existence =
+                        super::super::project_ui::removed_existence("explicit canonical close");
+                }
+                3 => app.workspace_model.identity = crate::workspace_model::NO_REGISTRY,
+                _ => unreachable!(),
+            }
+            let before = app.durable.clone();
+            let model = app.workspace_model.clone();
+            let focused = app.workspace.focused();
+            let count = app.cards.len();
+            drop(app.update_notifications(Action::Snapshot(attention_snapshot(session))));
+            assert!(!app.sidebar_state.has_card_update(alias_id), "scenario{scenario}");
+            assert!(!app.sidebar_state.has_card_update(canonical), "scenario{scenario}");
+            assert!(Arc::ptr_eq(&before, &app.durable), "attribution cannot adopt or persist");
+            assert_eq!(app.workspace_model, model);
+            assert_eq!(app.workspace.focused(), focused);
+            assert_eq!(app.cards.len(), count);
+            assert!(app.notification_ui.session_activation.is_none());
+        }
+    }
+
+    #[test]
+    fn notification_snapshot_marks_unique_unmanaged_session_without_first_alias_routing() {
+        for duplicate_open in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            app.refresh_ui.focused = false;
+            let current = app.durable.cards[0].clone();
+            let session = card_session(&current).unwrap();
+            let mut alias = current.clone();
+            alias.id = CardId::new();
+            if !duplicate_open {
+                alias.existence = super::super::project_ui::removed_existence("older closed alias");
+            }
+            let alias_id = alias.id;
+            Arc::make_mut(&mut app.durable).cards.insert(0, alias);
+            drop(app.update_notifications(Action::Snapshot(attention_snapshot(session))));
+            assert_eq!(app.sidebar_state.has_card_update(current.id), !duplicate_open);
+            assert!(!app.sidebar_state.has_card_update(alias_id));
+        }
+    }
+
     #[test]
     fn attention_managed_activation_uses_canonical_identity_ahead_of_open_or_closed_aliases() {
         use crate::agent_execution::Origin;
@@ -2344,7 +2467,32 @@ mod tests {
                 app.workspace_model.channels.push(shared);
                 drop(app.select_channel(other));
                 assert_ne!(app.workspace.focused(), Some(canonical));
+                if alias_open {
+                    // Drive the real alias blocker: both drafts must survive,
+                    // so shared reconciliation cannot establish uniqueness by
+                    // removing the earlier inventory alias.
+                    app.chat_ui = crate::app::chat_ui::State::with_drafts(HashMap::from([
+                        (alias_id, "Preserved alias draft".into()),
+                        (canonical, "Preserved canonical draft".into()),
+                    ]));
+                    app.acknowledge_view_edit(agent.placement.clone(), None);
+                    drop(app.reconcile_shared_views());
+                    assert!(app.shared_views.blocked.contains(&agent.placement));
+                    assert!(app.card_state(alias_id).unwrap().existence.is_open());
+                }
+                let snapshot = attention_snapshot(session);
+                let notice = snapshot.notices[0].id;
+                drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+                assert!(app.sidebar_state.has_card_update(canonical));
+                assert!(!app.sidebar_state.has_card_update(alias_id));
+                assert!(!app.notification_ui.acknowledged_for_test(notice));
                 drop(app.update_notifications(Action::Activated(Target::Session(session))));
+                assert!(!app.sidebar_state.has_card_update(canonical));
+                assert!(!app.sidebar_state.has_card_update(alias_id));
+                assert!(app.notification_ui.acknowledged_for_test(notice));
+                drop(app.update_notifications(Action::Snapshot(snapshot)));
+                assert!(!app.sidebar_state.has_card_update(canonical));
+                assert!(!app.sidebar_state.has_card_update(alias_id));
                 assert_eq!(
                     app.workspace.focused(),
                     Some(canonical),
