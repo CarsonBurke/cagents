@@ -8,6 +8,12 @@ use super::*;
 use crate::sidebar::conversation::{ConversationEndTarget, Entry};
 use crate::workspace_model::views::Scope;
 
+#[cfg(test)]
+thread_local! { static PREPARATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+fn preparation_count() -> u64 { PREPARATIONS.with(std::cell::Cell::get) }
+
+
 /// Repeated identity is ambiguous even if its two values happen to compare
 /// equal. An old menu must not borrow authority from a duplicated owner.
 fn unique<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, Option<V>>, key: K, value: V) {
@@ -22,6 +28,8 @@ impl Cagents {
     /// once. workspace.order intentionally does not participate: Hide removes
     /// a view from the strip while the conversation and its draft survive.
     pub(super) fn capture_conversation_end_targets(&self) -> Vec<Entry> {
+        #[cfg(test)]
+        PREPARATIONS.with(|count| count.set(count.get().wrapping_add(1)));
         let mut channels = HashMap::new();
         for channel in &self.durable.channels {
             for card in &channel.cards { unique(&mut channels, *card, (channel.id, channel.project_id)); }
@@ -133,8 +141,10 @@ mod tests {
         let card = app.workspace.focused().unwrap();
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("native chat fixture"); };
         runtime.session.launch.session_id = Some("retained-sidebar-thread".into());
-        runtime.replace_draft(widget::text_editor::Content::with_text("retain this draft"));
+        let target = runtime.target;
         Arc::make_mut(&mut runtime.snapshot).busy = true;
+        drop(app.update(Message::ChatUi(chat_ui::Action::Composer(target,
+            widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(Arc::new("retain this draft".into())))))));
         let CardKind::Chat(issued) = &mut app.card_state_mut(card).unwrap().kind else { panic!("issued descriptor"); };
         issued.launch.session_id = Some("retained-sidebar-thread".into());
         let project = ProjectId::new();
@@ -208,6 +218,34 @@ mod tests {
             assert!(app.chat_ui.close_dialog.is_none());
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(!app.workspace.order().any(|id| id == card));
+        }
+    }
+
+    #[test]
+    fn sidebar_end_unrelated_typing_and_noop_wakes_do_not_prepare_conversation_catalog() {
+        for keep_channel in [true, false] {
+            let (mut app, card, _channel, _directory) = fixture();
+            if !keep_channel { Arc::make_mut(&mut app.durable).channels.clear(); }
+            drop(app.update(Message::Sidebar(SidebarAction::SearchChanged(String::new()))));
+            let before = preparation_count();
+            let runs = app.update_tail.runs;
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("composer"); };
+            let target = runtime.target;
+            for _ in 0..10 {
+                drop(app.update(Message::ChatUi(chat_ui::Action::Composer(target,
+                    widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(Arc::new("typed".into())))))));
+                drop(app.update(Message::ChatUi(chat_ui::Action::ComposerCursor(target,
+                    widget::text_editor::Cursor { position: widget::text_editor::Position { line: 0, column: 0 }, selection: None }))));
+                drop(app.update(Message::TerminalWake { card: CardId::new(), generation: 0 }));
+            }
+            assert_eq!(preparation_count(), before, "zero catalog preparation includes the no-channel case");
+            assert_eq!(app.update_tail.runs, runs);
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("same composer"); };
+            assert!(runtime.unsent_text().ends_with(&"typed".repeat(10)));
+            // Actual incoming registry identity remains a semantic invalidation.
+            let mut model = app.workspace_model.clone(); model.identity = uuid::Uuid::new_v4(); model.sequence += 1;
+            drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(model))));
+            assert!(preparation_count() > before);
         }
     }
 
