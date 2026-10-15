@@ -1220,17 +1220,19 @@ impl Registry {
     /// Observation/CAS consent alone cannot prove any provider generation ended.
     pub(crate) fn retire_agent_process_with_presentation(&mut self,
         origin: &Origin, source: &HostedSession, now_ms: u64,
-        observed: &crate::agent_execution::PresentationCloseObservation) -> Result<bool, String> {
-        self.retire_agent_process_inner(source, now_ms, Some((origin, observed)))
+        observed: &crate::agent_execution::PresentationCloseObservation,
+        verified_sources: &[HostedSession]) -> Result<bool, String> {
+        self.retire_agent_process_inner(source, now_ms, Some((origin, observed, verified_sources)))
     }
 
     fn retire_agent_process_inner(&mut self, source: &HostedSession, now_ms: u64,
-        observed: Option<(&Origin, &crate::agent_execution::PresentationCloseObservation)>) -> Result<bool, String> {
+        observed: Option<(&Origin, &crate::agent_execution::PresentationCloseObservation, &[HostedSession])>) -> Result<bool, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        if let Some((origin, observed)) = observed {
+        if let Some((origin, observed, verified)) = observed {
+            if !verified.contains(source) { return Err("The exact agent source has no confirmed cleanup receipt".into()); }
             super::views::validate_open_close(&tx, origin, observed, source)?;
         }
         let authority: Option<String> = tx
@@ -1241,14 +1243,20 @@ impl Registry {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if let Some(authority) = authority
-            && source.same_process(&decode::<HostedSession>(&authority)?)
-        {
-            tx.execute(
-                "DELETE FROM agent_authorities WHERE session_id = ?1",
-                [source.id().to_string()],
-            )
-            .map_err(|e| e.to_string())?;
+        if let Some(authority) = authority {
+            let authority = decode::<HostedSession>(&authority)?;
+            let retire = if let Some((_, _, verified)) = observed {
+                if !verified.contains(&authority) {
+                    return Err("Delegated authority changed after exact cleanup verification; no combined retirement was committed".into());
+                }
+                true
+            } else {
+                source.same_process(&authority)
+            };
+            if retire {
+                tx.execute("DELETE FROM agent_authorities WHERE session_id=?1", [source.id().to_string()])
+                    .map_err(|error| error.to_string())?;
+            }
         }
         let record: Option<String> = tx
             .query_row(
@@ -1299,7 +1307,7 @@ impl Registry {
                 // the execution service can reach close_agent. Commit the pane
                 // tombstone here too, so a crash cannot publish a closed agent
                 // while leaving its exact retained presentation behind.
-                if let Some((origin, observed)) = observed {
+                if let Some((origin, observed, _)) = observed {
                     super::views::remove_open_close(&tx, origin, observed, source)?;
                 } else {
                     super::views::retire_agent(&tx, &agent)?;

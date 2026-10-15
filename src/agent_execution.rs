@@ -491,12 +491,21 @@ pub struct PresentationCloseOwner {
     pub provider_start: u64,
 }
 
+/// A live/completed backend's exact observed incarnation, or a distinct
+/// authenticated receipt proving the entire original native owner retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PresentationCloseBackend {
+    Process {pid: i32, start: u64},
+    RetiredOwner,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PresentationCloseTarget {
     pub observation: PresentationCloseObservation,
     pub host: crate::model::HostSessionProof,
     pub owner: PresentationCloseOwner,
     pub actor_instance: Option<uuid::Uuid>,
+    pub backend: PresentationCloseBackend,
     pub paired_owner: Option<PresentationCloseOwner>,
 }
 impl std::fmt::Debug for PresentationCloseTarget {
