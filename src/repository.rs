@@ -6,7 +6,7 @@
 //! straightforward to test with a fake executor.
 
 mod authority;
-pub use authority::WorktreeAuthority;
+pub use authority::{WorktreeAuthority, WorktreeExecutor};
 
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
@@ -3336,6 +3336,9 @@ pub enum RepositoryError {
 pub struct RepositoryService<E = SystemProcessExecutor> {
     git: PathBuf,
     executor: Arc<E>,
+    authority: Option<WorktreeAuthority>,
+    // Original executor stays private when a scoped service materializes a blob.
+    creation_executor: Arc<dyn ProcessExecutor>,
 }
 
 impl RepositoryService<SystemProcessExecutor> {
@@ -3345,10 +3348,15 @@ impl RepositoryService<SystemProcessExecutor> {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
-    pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self {
+    pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self
+    where
+        E: 'static,
+    {
         Self {
             git: git.into(),
+            creation_executor: executor.clone(),
             executor,
+            authority: None,
         }
     }
 
