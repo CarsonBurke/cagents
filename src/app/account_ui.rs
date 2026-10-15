@@ -1564,9 +1564,20 @@ pub(super) struct ChatAccounts {
     /// What the picker's button says: the chosen account's name.
     pub current: String,
     pub choices: Vec<ChatAccount>,
+    pub manage_available: bool,
+    pub manage_label: String,
 }
 
 impl Cagents {
+    pub(super) fn agent_accounts_command_available(&self) -> bool {
+        workspace_widget::shortcut_descriptor(workspace_widget::GlobalShortcut::OpenAgentAccounts)
+            .available(&workspace_widget::CommandContext {
+                save_in_flight: self.focused_repository_is_saving(),
+                remote_device: crate::device::is_remote(),
+                ..Default::default()
+            })
+    }
+
     pub(super) fn resume_catalog_accounts(&self) -> Vec<Account> {
         let mut accounts = self
             .account_ui
@@ -4367,6 +4378,8 @@ impl Cagents {
         Some(ChatAccounts {
             current: current_label,
             choices,
+            manage_available: self.agent_accounts_command_available(),
+            manage_label: workspace_widget::shortcut_tooltip(workspace_widget::GlobalShortcut::OpenAgentAccounts, &self.settings.keyboard_shortcuts),
         })
     }
 
@@ -4729,7 +4742,7 @@ impl Cagents {
             }
             rows.push(
                 crate::ui_controls::button::secondary("Open Accounts")
-                    .on_press(Message::AccountUi(Action::OpenPane))
+                    .on_press_maybe(self.agent_accounts_command_available().then_some(Message::AccountUi(Action::OpenPane)))
                     .into(),
             );
         }
@@ -4940,9 +4953,10 @@ impl Cagents {
         }
         if placement == Placement::Popover {
             items.push(
-                crate::ui_controls::icon_button(Icon::PopOut, "Open in the Accounts pane")
+                crate::ui_controls::icon_button(Icon::PopOut,
+                    workspace_widget::shortcut_tooltip(workspace_widget::GlobalShortcut::OpenAgentAccounts, &self.settings.keyboard_shortcuts))
                     .compact()
-                    .on_press(Message::AccountUi(Action::OpenPane))
+                    .on_press_maybe(self.agent_accounts_command_available().then_some(Message::AccountUi(Action::OpenPane)))
                     .into(),
             );
         }

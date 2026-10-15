@@ -318,6 +318,8 @@ pub(super) struct SettingsContext<'a> {
     pub invalid: &'a HashMap<SettingsField, String>,
     pub fonts: &'a FontChoices,
     pub terminal_font_size: f32,
+    pub shortcuts: &'a settings::KeyboardShortcuts,
+    pub utility_context: workspace_widget::CommandContext,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
@@ -494,8 +496,12 @@ fn settings_category_controls<'a>(
             settings.push(setting_field(
                 "Manage accounts",
                 "Add, rename, sign in to or remove accounts, and compare what each has left.",
-                crate::ui_controls::button::secondary("Open Accounts")
-                    .on_press(Message::RunCommand(workspace_widget::GlobalShortcut::OpenAgentAccounts))
+                crate::ui_controls::button::secondary({
+                    let chords = workspace_widget::shortcut_chords(workspace_widget::GlobalShortcut::OpenAgentAccounts, context.shortcuts);
+                    if chords.is_empty() { "Open Accounts".to_owned() } else { format!("Open Accounts · {chords}") }
+                })
+                    .on_press_maybe(workspace_widget::shortcut_descriptor(workspace_widget::GlobalShortcut::OpenAgentAccounts).available(&context.utility_context).then_some(Message::RunCommand(workspace_widget::GlobalShortcut::OpenAgentAccounts)))
+                    .id(widget::Id::new("settings.open-accounts"))
                     .into(),
             ));
             vec![settings_group(
@@ -1900,6 +1906,51 @@ impl Cagents {
 mod search_tests {
     use super::*;
     #[test]
+    fn native_accounts_button_shares_registered_availability() {
+        use iced::advanced::{clipboard, mouse, widget::operation::focusable};
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let app = super::super::tests::context_inspector_test_app(false);
+        let invalid = HashMap::new();
+        let mut renderer = super::super::tests::headless_renderer();
+        for saving in [false, true] {
+            for remote in [false, true] {
+                let command_context = workspace_widget::CommandContext {
+                    save_in_flight: saving, remote_device: remote, ..Default::default()
+                };
+                let context = SettingsContext {
+                    feedback: None, reload_error: None, can_undo: false, invalid: &invalid,
+                    fonts: &app.settings_font_choices,
+                    terminal_font_size: app.settings.terminal_font_size,
+                    shortcuts: &app.settings.keyboard_shortcuts,
+                    utility_context: command_context,
+                    accounts: vec![], updates: app.update_summary(), testing_notification: false,
+                };
+                let content = widget::column::with_children(
+                    settings_category_controls(SettingsCategory::Accounts, &app.settings_draft, &context)
+                        .into_iter().filter_map(|group| group.view("Accounts", "")));
+                let mut ui = UserInterface::build(content.into(), iced::Size::new(1200., 1000.),
+                    Cache::new(), &mut renderer);
+                ui.operate(&renderer, &mut focusable::focus::<()>(widget::Id::new("settings.open-accounts")));
+                let enter = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+                let event = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: enter.clone(), modified_key: enter,
+                    physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::empty(), text: None, repeat: false,
+                });
+                let mut messages = Vec::new();
+                let _ = ui.update(&[event], mouse::Cursor::Unavailable, &mut renderer,
+                    &mut clipboard::Null, &mut messages);
+                assert_eq!(messages.iter().filter(|message| matches!(message,
+                    Message::RunCommand(workspace_widget::GlobalShortcut::OpenAgentAccounts))).count(),
+                    usize::from(workspace_widget::shortcut_descriptor(workspace_widget::GlobalShortcut::OpenAgentAccounts)
+                        .available(&context.utility_context)),
+                    "saving={saving} remote={remote}");
+            }
+        }
+    }
+
+    #[test]
     fn settings_search_finds_real_controls_by_key_choice_caption_and_chord() {
         let app = super::super::tests::context_inspector_test_app(false);
         let invalid = HashMap::new();
@@ -1910,6 +1961,8 @@ mod search_tests {
             invalid: &invalid,
             fonts: &app.settings_font_choices,
             terminal_font_size: app.settings.terminal_font_size,
+            shortcuts: &app.settings.keyboard_shortcuts,
+            utility_context: Default::default(),
             accounts: vec![],
             updates: app.update_summary(),
             testing_notification: false,

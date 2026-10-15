@@ -12760,6 +12760,8 @@ impl Cagents {
                     invalid: &self.settings_invalid,
                     fonts: &self.settings_font_choices,
                     terminal_font_size: self.settings.terminal_font_size,
+                    shortcuts: &self.settings.keyboard_shortcuts,
+                    utility_context: workspace_widget::CommandContext { save_in_flight: self.focused_repository_is_saving(), remote_device: crate::device::is_remote(), ..Default::default() },
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
@@ -22603,7 +22605,12 @@ impl Application for Cagents {
         );
         let window_width = self.window_width;
         let sidebar_mode = self.projects_sidebar_mode();
-        let sidebar = sidebar::view_cached(
+        let utility_context = workspace_widget::CommandContext {
+            save_in_flight: self.focused_repository_is_saving(),
+            remote_device: crate::device::is_remote(),
+            ..Default::default()
+        };
+        let sidebar = sidebar::view_cached_with_utility_context(
             &self.sidebar_model,
             &self.sidebar_state,
             sidebar_mode,
@@ -22611,6 +22618,7 @@ impl Application for Cagents {
             self.modal_is_open(),
             &self.navigation_cache,
             &self.settings.keyboard_shortcuts,
+            &utility_context,
         )
         .map(Message::Sidebar);
 

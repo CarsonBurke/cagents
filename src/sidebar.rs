@@ -5094,6 +5094,7 @@ pub fn view<'a>(
         modal_open,
         None,
         &DEFAULT_SHORTCUTS,
+        None,
     )
 }
 
@@ -5214,7 +5215,19 @@ pub fn view_cached<'a>(
         modal_open,
         Some(cache),
         shortcuts,
+        None,
     )
+}
+
+/// ADE passes live workspace capability only to the global utility controls;
+/// row editing and focus remain independently available during a pane save.
+pub fn view_cached_with_utility_context<'a>(
+    model: &'a SidebarModel, state: &'a SidebarState, mode: SidebarMode,
+    persisted_width: f32, modal_open: bool, cache: &'a NavigationCache,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+    utility_context: &crate::workspace_widget::CommandContext,
+) -> Element<'a, SidebarAction> {
+    view_inner(model, state, mode, persisted_width, modal_open, Some(cache), shortcuts, Some(utility_context))
 }
 
 fn view_inner<'a>(
@@ -5225,6 +5238,7 @@ fn view_inner<'a>(
     modal_open: bool,
     cache: Option<&'a NavigationCache>,
     shortcuts: &crate::settings::KeyboardShortcuts,
+    utility_context: Option<&crate::workspace_widget::CommandContext>,
 ) -> Element<'a, SidebarAction> {
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
@@ -5232,7 +5246,7 @@ fn view_inner<'a>(
     let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(7)
         .push(
-            widget::container(utilities(compact, modal_open, shortcuts)).padding([0.0, space::XS]),
+            widget::container(utilities(compact, modal_open, shortcuts, utility_context)).padding([0.0, space::XS]),
         )
         .push(design::horizontal_rule())
         .push(
@@ -5519,6 +5533,7 @@ fn utilities<'a>(
     compact: bool,
     modal_open: bool,
     shortcuts: &crate::settings::KeyboardShortcuts,
+    utility_context: Option<&crate::workspace_widget::CommandContext>,
 ) -> Element<'a, SidebarAction> {
     let toggle = crate::ui_controls::icon_button(
         Icon::Sidebar,
@@ -5530,7 +5545,7 @@ fn utilities<'a>(
     .on_press_maybe(gated(SidebarAction::ToggleProjects, modal_open))
     .id(Id::new("command.toggle-projects"))
     .into();
-    let [settings, automations] = utility_controls(modal_open, Some(shortcuts));
+    let [settings, automations] = utility_controls(modal_open, Some(shortcuts), utility_context);
     if compact {
         let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations];
         return widget::column::with_children(children)
@@ -5560,6 +5575,7 @@ fn utilities<'a>(
 fn utility_controls<'a>(
     modal_open: bool,
     shortcuts: Option<&crate::settings::KeyboardShortcuts>,
+    utility_context: Option<&crate::workspace_widget::CommandContext>,
 ) -> [Element<'a, SidebarAction>; 2] {
     let label = shortcuts.map_or_else(
         || "Settings".to_owned(),
@@ -5572,12 +5588,14 @@ fn utility_controls<'a>(
     );
     let settings: Element<'a, SidebarAction> =
         crate::ui_controls::icon_button(Icon::Settings, label)
-            .on_press_maybe(gated(SidebarAction::OpenSettings, modal_open))
+            .on_press_maybe(gated(SidebarAction::OpenSettings, modal_open || utility_context.is_some_and(|context| !crate::workspace_widget::shortcut_descriptor(crate::workspace_widget::GlobalShortcut::OpenSettings).available(context))))
             .id(stable_id("settings"))
             .into();
     let command = crate::workspace_widget::GlobalShortcut::OpenAutomations;
     let label = shortcuts.map_or_else(|| "Automations are available in ADE".to_owned(), |shortcuts| crate::workspace_widget::shortcut_tooltip(command, shortcuts));
-    let available = shortcuts.is_some() && crate::workspace_widget::shortcut_descriptor(command).available_on_device(crate::device::is_remote());
+    let available = shortcuts.is_some() && utility_context.map_or_else(
+        || crate::workspace_widget::shortcut_descriptor(command).available_on_device(crate::device::is_remote()),
+        |context| crate::workspace_widget::shortcut_descriptor(command).available(context));
     let automations = crate::ui_controls::icon_button(Icon::Alarm, label)
         .on_press_maybe((available && !modal_open).then_some(SidebarAction::RunUtilityCommand(command)))
         .id(stable_id("automations"))
@@ -5587,7 +5605,7 @@ fn utility_controls<'a>(
 
 // The standalone editor still mounts its utility controls below its file pane.
 fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
-    let [settings, automations] = utility_controls(modal_open, None);
+    let [settings, automations] = utility_controls(modal_open, None, None);
     if compact {
         widget::column::with_children(vec![automations, settings])
             .align_x(Alignment::Center)
@@ -18149,7 +18167,7 @@ pub(crate) mod tests {
                 assert!(child.bounds().x + child.bounds().width <= width);
             }
             assert!(
-                accessible_names(&renderer, utilities(false, false, &shortcuts))
+                accessible_names(&renderer, utilities(false, false, &shortcuts, None))
                     .contains(&"Toggle Projects sidebar — Alt+B".to_owned())
             );
         }
@@ -20038,6 +20056,34 @@ pub(crate) mod tests {
             fired.extend(published);
         }
         fired
+    }
+
+    #[test]
+    fn native_workspace_utilities_share_registry_save_and_device_availability() {
+        use crate::workspace_widget::{CommandContext, GlobalShortcut, shortcut_descriptor};
+        let renderer = headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for compact in [false, true] {
+            for saving in [false, true] {
+                for remote in [false, true] {
+                    let context = CommandContext {
+                        save_in_flight: saving,
+                        remote_device: remote,
+                        ..Default::default()
+                    };
+                    let actions = frame_enter_presses(&renderer,
+                        utilities(compact, false, &shortcuts, Some(&context)));
+                    assert_eq!(actions.iter().any(|action| matches!(action,
+                        SidebarAction::RunUtilityCommand(GlobalShortcut::OpenAutomations))),
+                        shortcut_descriptor(GlobalShortcut::OpenAutomations).available(&context),
+                        "compact={compact} saving={saving} remote={remote}: {actions:?}");
+                    assert_eq!(actions.contains(&SidebarAction::OpenSettings),
+                        shortcut_descriptor(GlobalShortcut::OpenSettings).available(&context));
+                    assert!(actions.contains(&SidebarAction::ToggleProjects),
+                        "saving must leave the sidebar toggle usable");
+                }
+            }
+        }
     }
 
     #[test]

@@ -2934,12 +2934,12 @@ impl Runtime {
                         .into()
                     })
                     .chain(std::iter::once(
-                        widget::button::custom(design::caption("Manage accounts…"))
+                        widget::button::custom(design::caption(accounts.manage_label.clone()))
                             .id(card_control_id(target.card, "chat-manage-accounts"))
                             .class(crate::ui_controls::control_style(false, None))
                             .padding([step::GAP_XS, step::GAP_S])
                             .width(Length::Fill)
-                            .on_press(Message::AccountUi(crate::app::account_ui::Action::OpenPane))
+                            .on_press_maybe(accounts.manage_available.then_some(Message::AccountUi(crate::app::account_ui::Action::OpenPane)))
                             .into(),
                     ))
                     .collect::<Vec<_>>(),
