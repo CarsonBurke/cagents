@@ -11853,8 +11853,9 @@ pub(crate) mod tests {
     #[test]
     fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
         let renderer = headless_renderer();
-        let mut worktree = worktree(3, "feature", false);
-        worktree.chrome.dirty_badge = Some("3 changed files".into());
+        let worktree = worktree(3, "feature", true);
+        let expected_name = worktree_accessible_name(&worktree, false, None, false);
+        assert!(expected_name.contains("1 changes"));
         fn badge_count(node: &layout::Node) -> usize {
             usize::from(
                 node.children().is_empty()
@@ -11897,11 +11898,14 @@ pub(crate) mod tests {
                 counts[1] + 1,
                 "only the changes badge is removed"
             );
-            assert_eq!(
-                accessible_names(&renderer, row(true)),
-                accessible_names(&renderer, row(false)),
-                "dirty status remains available to assistive technology"
-            );
+            for show in [true, false] {
+                let names = accessible_names(&renderer, row(show));
+                assert_eq!(
+                    names.first().map(String::as_str),
+                    Some(expected_name.as_ref()),
+                    "the row keeps its full dirty-status description, compact={compact}, show={show}"
+                );
+            }
             assert!(worktree_indicator(&worktree, true, None, compact, false).is_some());
         }
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);

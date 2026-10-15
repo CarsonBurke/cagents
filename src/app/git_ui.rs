@@ -1681,6 +1681,10 @@ mod tests {
 
     #[test]
     fn failed_worktree_status_is_last_known_and_sibling_reads_cannot_replay_it_after_recovery() {
+        const TEST: &str = "app::git_ui::tests::failed_worktree_status_is_last_known_and_sibling_reads_cannot_replay_it_after_recovery";
+        if !crate::git_watch::tests::fixture_isolated(TEST) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let primary = directory.path().join("primary");
         let mut snapshot = fixture(&primary);
@@ -1743,8 +1747,16 @@ mod tests {
             untracked: true,
             ..Default::default()
         };
+        let expected_failure = service
+            .status_projection(&linked, true, sidebar::STATUS_DISPLAY_LIMIT, &cancel)
+            .unwrap_err();
+        let crate::repository::RepositoryError::Process(process) = &expected_failure else {
+            panic!("expected corrupt-index process failure, got {expected_failure:?}");
+        };
+        assert_eq!(process.kind, crate::process::ProcessFailureKind::Exit);
+        assert!(process.stderr_line().unwrap().contains("index"));
         let (failed, _) = read_local(project.id, snapshot, change(), cancel.clone()).unwrap();
-        assert!(failed.status_errors[&linked_id].contains("index"));
+        assert_eq!(failed.status_errors[&linked_id], expected_failure.to_string());
         apply_local(&mut project, &failed);
         let row = project
             .worktrees
