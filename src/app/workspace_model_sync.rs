@@ -21,24 +21,6 @@ use crate::workspace_model::{
 /// cannot miss anything by being late.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
-/// Success metadata from the immutable published request, not a local view
-/// lookup. The private server receipt remains the only archive authority.
-#[derive(Debug,Clone)]
-pub struct ArchivedRemovalAck {
-    pub(in crate::app) operation:uuid::Uuid,
-    pub(in crate::app) registry:uuid::Uuid,
-    pub(in crate::app) repository:PathBuf,
-    pub(in crate::app) scope:crate::workspace_model::views::Scope,
-    pub(in crate::app) before:crate::workspace_model::views::Pane,
-}
-impl ArchivedRemovalAck {
-    fn from_applied_request(request:&ModelEdit,model:&WorkspaceModel)->Option<Self> {
-        let ModelEdit::ChangeView {scope,operation,change:crate::workspace_model::views::Change::RemoveArchivedAutomationSource {registry,repository,before},..}=request else {return None;};
-        if operation.is_nil() || *registry==NO_REGISTRY || *registry!=model.identity || before.pending_terminal_start {return None;}
-        Some(Self {operation:*operation,registry:*registry,repository:repository.clone(),scope:scope.clone(),before:before.clone()})
-    }
-}
-
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
@@ -73,7 +55,6 @@ pub enum ModelUpdate {
     /// marks it shared: from here on, the registry's silence about that channel
     /// means it was deleted somewhere rather than never known.
     ViewApplied {
-        archived_removal:Option<ArchivedRemovalAck>,
         scope: crate::workspace_model::views::Scope,
         operation: Option<uuid::Uuid>,
         model: WorkspaceModel,
@@ -345,7 +326,6 @@ fn send(
     };
     if let Some((scope, operation)) = view_edit {
         let _ = updates.send_blocking(ModelUpdate::ViewApplied {
-            archived_removal:ArchivedRemovalAck::from_applied_request(&request,&model),
             scope,
             operation,
             model: model.clone(),
@@ -552,7 +532,6 @@ impl Cagents {
             ModelUpdate::ViewApplied {
                 scope,
                 operation,
-                archived_removal,
                 model,
             } => {
                 if self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
@@ -560,15 +539,11 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                let archive_ack=match archived_removal {
-                    Some(ack) if ack.registry==model.identity && operation==Some(ack.operation) && ack.scope==scope => self.acknowledge_archive_membership_removal(ack),
-                    _=>Task::none(),
-                };
                 self.acknowledge_view_edit(scope, operation);
                 if model.sequence >= self.workspace_model.sequence {
                     self.workspace_model = model;
                 }
-                Task::batch([archive_ack,self.reconcile_workspace_model()])
+                self.reconcile_workspace_model()
             }
             ModelUpdate::Connected(model) => {
                 if model.identity == self.workspace_model.identity
@@ -2746,13 +2721,11 @@ mod tests {
         send(&mut reconnected, edit, &updates).unwrap();
         drop(reconnected);
         server.join().unwrap();
-        let ModelUpdate::ViewApplied {operation:Some(id),archived_removal,..}=rx.try_recv().unwrap() else {panic!("expected successful original operation");};
+        let ModelUpdate::ViewApplied {operation:Some(id),model:acknowledged,..}=rx.try_recv().unwrap() else {panic!("expected successful original operation");};
         assert_eq!(id,operation);
-        if archived {
-            let ack=archived_removal.expect("only successful archive edits carry readonly report lookup metadata");
-            assert_eq!(ack.operation,operation);assert_eq!(ack.registry,model.identity);
-            assert_eq!(ack.repository,PathBuf::from("/repo"));assert_eq!(ack.scope,scope);assert_eq!(ack.before,before);
-        } else {assert!(archived_removal.is_none());}
+        assert!(acknowledged.views[0].panes.is_empty());
+        // Ordinary view acknowledgment/projection is sufficient. Durable report
+        // provenance comes from the Registry receipt, including after lost ACK.
         assert!(rx.is_empty());
         }
     }
