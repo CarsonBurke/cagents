@@ -646,6 +646,35 @@ mod managed_display_tests {
     }
 
     #[test]
+    fn attention_managed_aliases_defer_adoption_without_blocking_exact_shared_reconciliation() {
+        let (agent, pane, _) = fixture();
+        let mut alias = pane.clone();
+        alias.id = CardId::new();
+        let model = super::super::WorkspaceModel { views: vec![View { scope: Scope::Channel(ChannelId::new()), revision: 1, panes: vec![pane.clone(), alias], retired: vec![] }], ..Default::default() };
+        let index = ManagedDisplayIndex::new(&model);
+        assert!(index.resolve(&agent).is_none(), "an existing actor alias cannot produce another canonical adoption");
+        assert!(index.permits_projection(&agent, &pane), "existing shared alias migration must still be able to adopt the exact canonical descriptor");
+    }
+
+    #[test]
+    fn attention_managed_display_requires_complete_native_proof_even_when_both_descriptors_match() {
+        let (mut agent, mut pane, _) = fixture();
+        let crate::agent_execution::HostedSession::Chat(expected) = agent.session.as_mut().unwrap() else { unreachable!() };
+        expected.proof = None;
+        let CardKind::Chat(current) = &mut pane.kind else { unreachable!() };
+        current.proof = None;
+        let mut model = super::super::WorkspaceModel { views: vec![View { scope: Scope::Channel(ChannelId::new()), revision: 1, panes: vec![pane], retired: vec![] }], ..Default::default() };
+        assert!(managed_display(&model, &agent).is_none());
+        let mut proof = agent.console.as_ref().unwrap().continuity.live_proof().unwrap();
+        proof.host_incarnation = HostIncarnation::new("");
+        let crate::agent_execution::HostedSession::Chat(expected) = agent.session.as_mut().unwrap() else { unreachable!() };
+        expected.proof = Some(proof.clone());
+        let CardKind::Chat(current) = &mut model.views[0].panes[0].kind else { unreachable!() };
+        current.proof = Some(proof);
+        assert!(managed_display(&model, &agent).is_none());
+    }
+
+    #[test]
     fn attention_archived_console_display_tolerates_only_its_observed_end_state() {
         let (mut agent, _, mut pane) = fixture();
         agent.closed = true;

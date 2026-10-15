@@ -1819,6 +1819,7 @@ mod tests {
             drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
             assert!(app.card_state(pane.id).is_none(), "{state} canonical evidence cannot fall back to the original placement");
             assert!(!app.durable.channels.iter().any(|channel| channel.cards.contains(&pane.id)));
+            if state != "removed" { assert!(!app.shared_views.blocked.is_empty(), "ordinary projection must not bypass the managed replacement/ambiguity fence"); }
         }
     }
 
