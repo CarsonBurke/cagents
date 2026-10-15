@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod execution;
+mod metadata;
 mod store;
 mod websocket;
 use store::Store;
@@ -362,6 +363,7 @@ impl Handle {
                     stderr: VecDeque::new(),
                     indices: BTreeMap::new(),
                     retained: 0,
+                    metadata_budget: Default::default(),
                     history_error: None,
                     login_recovery: None,
                     dirty: false,
@@ -550,7 +552,9 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+            Command::LoadFileChanges { .. }
+                | Command::LoadFileChangePatches { .. }
+                | Command::LoadSource { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -723,6 +727,17 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .file_query(command)
     }
+    /// Read only the ingestion cache, including after the actor exits.
+    pub(crate) fn source_query(
+        &self,
+        query: super::cache::SourceQuery,
+    ) -> Result<super::cache::SourcePage, super::cache::SourceError> {
+        self.0
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .source_page(query)
+    }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
         self.0
@@ -746,6 +761,10 @@ impl Handle {
         if store.dirty {
             match store.window_reusing(&mut state.items) {
                 Ok(window) => {
+                    state
+                        .source_parts
+                        .retain(|part| part.source.agent_id.is_some());
+                    state.source_parts.extend(window.source_parts);
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
@@ -755,8 +774,12 @@ impl Handle {
                 }
             }
         }
+        if let Err(error) = store.publish_source_parts(&mut state) {
+            state.error = Some(format!("Cannot identify original prose: {error}"));
+        }
         if refresh_publication {
             store.presented_generation = Some(state.generation);
+            store.presented_catalogs = Some(crate::chat::presentation::Catalogs::of(&state));
             store.presented_file_changes = Some((
                 state.file_changes.revision,
                 state.file_changes.coverage.clone(),
@@ -792,6 +815,10 @@ impl Handle {
             let changes = if store.dirty {
                 match store.window_reusing(&mut state.items) {
                     Ok(window) => {
+                        state
+                            .source_parts
+                            .retain(|part| part.source.agent_id.is_some());
+                        state.source_parts.extend(window.source_parts);
                         state.items = window.items;
                         state.has_earlier = window.has_earlier;
                         state.has_later = window.has_later;
@@ -805,6 +832,9 @@ impl Handle {
             } else {
                 Vec::new()
             };
+            if let Err(error) = store.publish_source_parts(&mut state) {
+                state.error = Some(format!("Cannot identify original prose: {error}"));
+            }
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {
@@ -857,7 +887,12 @@ impl Handle {
                     } else {
                         None
                     };
-                    let metadata = state.clone();
+                    let mut metadata = state.clone();
+                    let retained_catalogs = store
+                        .presented_catalogs
+                        .as_ref()
+                        .map(|catalogs| catalogs.retain(&mut metadata))
+                        .unwrap_or_default();
                     if let Some(files) = retained_files {
                         state.file_changes = files;
                     }
@@ -867,6 +902,7 @@ impl Handle {
                     }
                     crate::chat::presentation::Presentation {
                         file_changes_unchanged,
+                        retained_catalogs,
                         base_generation,
                         metadata,
                         order: state.items.iter().map(|item| item.id.clone()).collect(),
@@ -875,6 +911,7 @@ impl Handle {
                     }
                 });
             store.presented_generation = Some(state.generation);
+            store.presented_catalogs = Some(crate::chat::presentation::Catalogs::of(&state));
             store.presented_file_changes = Some((
                 state.file_changes.revision,
                 state.file_changes.coverage.clone(),
@@ -1532,6 +1569,7 @@ struct Actor {
     stderr: VecDeque<u8>,
     indices: BTreeMap<String, usize>,
     retained: usize,
+    metadata_budget: metadata::Budget,
     /// Only the active error published by the most recent history failure.
     /// Recovery must not erase an unrelated provider/cache error.
     history_error: Option<String>,
@@ -2325,14 +2363,13 @@ impl Actor {
         // Owned edit summaries have their own item/byte budgets; they do not
         // count toward the provider's request/model identity budget.
         let file_changes = std::mem::take(&mut state.file_changes);
-        let mut counter = ByteCounter(0);
-        let _ = serde_json::to_writer(&mut counter, &*state);
+        let retained = self.metadata_budget.count(&mut state);
         state.file_changes = file_changes;
         state.items = items;
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
         }
-        self.retained = counter.0;
+        self.retained = retained;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
     }
@@ -2631,7 +2668,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             reasoning,
         } => {
             if !models.is_empty() {
-                state.models = models;
+                state.models = models.into();
             }
             if selected.is_some() {
                 state.selected_model = selected;
@@ -2641,8 +2678,8 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             }
         }
         Event::FastMode(value) => state.fast_mode = Some(value),
-        Event::Commands(value) => state.commands = value,
-        Event::Skills(value) => state.skills = value,
+        Event::Commands(value) => state.commands = value.into(),
+        Event::Skills(value) => state.skills = value.into(),
         Event::Item(mut item) => {
             // The adapters do not know wall-clock time, so the item is stamped
             // here, where the daemon actually observes the change.

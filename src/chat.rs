@@ -3,6 +3,7 @@
 use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
+pub mod cache;
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;
@@ -885,7 +886,9 @@ pub struct Snapshot {
     pub items: Vec<std::sync::Arc<Item>>,
     pub requests: Vec<Request>,
     pub capabilities: Capabilities,
-    pub models: Vec<Model>,
+    /// Provider catalogs are immutable between explicit catalog events.
+    /// Snapshot cloning and revision-fenced publications retain their payloads.
+    pub models: std::sync::Arc<Vec<Model>>,
     pub selected_model: Option<String>,
     pub reasoning: Option<String>,
     #[serde(default)]
@@ -896,8 +899,8 @@ pub struct Snapshot {
     pub permissions: Option<PermissionSettings>,
     #[serde(default)]
     pub permission_denials: Vec<PermissionDenial>,
-    pub commands: Vec<SlashCommand>,
-    pub skills: Vec<Skill>,
+    pub commands: std::sync::Arc<Vec<SlashCommand>>,
+    pub skills: std::sync::Arc<Vec<Skill>>,
     pub usage: Usage,
     pub busy: bool,
     pub detail: String,
@@ -950,6 +953,11 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Original prose mutation boundary, independent of status/presentation updates.
+    #[serde(default)]
+    pub source_revision: u64,
+    #[serde(default)]
+    pub source_parts: Vec<cache::SourcePart>,
 }
 
 /// When a provider takes a message it is holding.
@@ -1216,6 +1224,10 @@ pub enum Command {
         key: FileChangeKey,
         cursor: Option<FilePatchCursor>,
         revision: u64,
+    },
+    /// Read original prose without hydrating or changing the presentation window.
+    LoadSource {
+        query: cache::SourceQuery,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
