@@ -3247,7 +3247,22 @@ fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart()
             .unwrap();
     }
     std::fs::write(root.join("release-background"), b"continue").unwrap();
-    assert_eq!(pending_requests(&host, agent.id)[0].id, "late-background");
+    // This fixture belongs to the scheduler, so the generic user-management
+    // helper must not impersonate its Automation owner. Observe the exact
+    // authenticated actor that the attachment below will read instead.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = handle.snapshot(None).unwrap();
+        if !snapshot.requests.is_empty() {
+            assert_eq!(snapshot.requests[0].id, "late-background");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the exact scheduled provider never asked: {snapshot:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let current = store.lock().unwrap().agent(agent.id).unwrap();
     assert!(
         store

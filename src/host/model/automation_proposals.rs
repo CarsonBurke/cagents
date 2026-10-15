@@ -796,7 +796,7 @@ mod tests {
                 .db
                 .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
-            13
+            super::super::SCHEMA_VERSION
         );
         registry
             .apply(&ModelEdit::OpenProject {
