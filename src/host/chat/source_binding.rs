@@ -888,9 +888,9 @@ impl PendingClose {
 pub(in crate::host) fn capture_pending_close(host: &SharedHost, source: &Session) -> Result<Option<PendingClose>, ProtocolError> {
     let captured = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        validate_proof(source.proof.as_ref(), state.proof())?;
         let Some(entry) = state.native_sources.entries.get(&source.id) else { return Ok(None); };
         let Some(pending) = &entry.pending_handoff else { return Ok(None); };
+        validate_proof(source.proof.as_ref(), state.proof())?;
         if pending.original_pair.is_some() || pending.created_pair.is_some()
             || pending.returned.as_ref().is_some_and(|target| target.attempted || target.published.is_some()) {
             return Err(unavailable("This handoff retains attempted or paired terminal ownership; exact cleanup disposition is still required"));
@@ -920,15 +920,15 @@ pub(in crate::host) fn release_pending_close(
         return Err(unavailable("The source changed before exact pending close retirement"));
     }
     let entry = state.native_sources.entries.get_mut(&id).expect("reserved exact slot");
-    let current = entry.pending_handoff.as_ref().filter(|current| {
+    let matches = entry.pending_handoff.as_ref().is_some_and(|current| {
         entry.instance == pending.admitted.execution_instance
             && current.intent == pending.intent && current.admitted == pending.admitted
             && current.witness == *pending.witness() && current.owner.same_actor(pending.owner())
             && current.token == pending.claim_token() && current.backend_closed
             && current.original_pair.is_none() && current.created_pair.is_none()
             && current.returned.as_ref().is_none_or(|target| !target.attempted && target.published.is_none())
-    }).ok_or_else(|| unavailable("The exact pending phase changed; cleanup authority was retained"))?;
-    let _ = current;
+    });
+    if !matches { return Err(unavailable("The exact pending phase changed; cleanup authority was retained")); }
     entry.pending_handoff = None;
     entry.known = None;
     entry.learned_from = None;
