@@ -55,23 +55,50 @@ fn selected_worktree(repository: &Path, path: &Path) -> Result<PathBuf, String> 
     }
     Ok(path)
 }
-fn inside(directory: &Path, path: &Path) -> bool {
-    // Prefer the resolved directory: a path beneath the checkout can itself
-    // be a symlink leading outside it. A missing former launch directory is
-    // still attributable, but lexical `..` must not widen that attribution.
-    let directory = directory.canonicalize().unwrap_or_else(|_| {
-        let mut normalized = PathBuf::new();
-        for component in directory.components() {
+fn scope_directory(directory: &Path) -> Result<PathBuf, String> {
+    if !directory.is_absolute() {
+        return Err("A session has no absolute attributable working directory".into());
+    }
+    // A removed suffix does not erase physical symlinks in its existing
+    // ancestors. Resolve those ancestors first, then traverse each suffix
+    // component so `..` can reveal another existing symlink correctly.
+    for ancestor in directory.ancestors() {
+        let mut resolved = match ancestor.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("A session directory cannot be attributed safely: {error}")),
+        };
+        let suffix = directory.strip_prefix(ancestor).expect("directory ancestor");
+        for component in suffix.components() {
             match component {
                 std::path::Component::CurDir => {},
-                std::path::Component::ParentDir => { normalized.pop(); },
-                component => normalized.push(component.as_os_str()),
+                std::path::Component::ParentDir => { resolved.pop(); },
+                std::path::Component::Normal(part) => {
+                    let next = resolved.join(part);
+                    match next.canonicalize() {
+                        Ok(path) => resolved = path,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            match std::fs::symlink_metadata(&next) {
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => resolved = next,
+                                // A dangling alias, permission failure or a
+                                // concurrent replacement has no safe scope.
+                                _ => return Err("A session directory alias is unresolved; settle it before closing the worktree".into()),
+                            }
+                        }
+                        Err(error) => return Err(format!("A session directory cannot be attributed safely: {error}")),
+                    }
+                }
+                _ => return Err("A session directory has an invalid relative suffix".into()),
             }
         }
-        normalized
-    });
-    directory.starts_with(path)
+        return Ok(resolved);
+    }
+    Err("A session directory has no resolvable ancestor".into())
 }
+fn inside(directory: &Path, path: &Path) -> Result<bool, String> {
+    Ok(scope_directory(directory)?.starts_with(path))
+}
+
 fn candidates(host: &SharedHost) -> Result<Candidates, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down || state.has_unscoped_spawn() {
@@ -106,14 +133,14 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
     let candidates = candidates(host)?;
     let mut actors = BTreeMap::new();
     for (instance, session, handle, directory) in candidates.terminals {
-        if !inside(&session.launch.working_directory, path) && !inside(&directory, path) { continue; }
+        if !inside(&session.launch.working_directory, path)? && !inside(&directory, path)? { continue; }
         let (revision, busy) = handle.close_observation()?;
         let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None };
         actors.insert(session.id, Actor { token, busy, terminal: Some(Terminal { instance, session, handle, revision }), native: None, starting: false });
     }
     for (execution_instance, session, handle, pair_valid) in candidates.natives {
         let observation = handle.close_observation();
-        if !actors.contains_key(&session.id) && !inside(&session.launch.recipe.working_directory, path) && !inside(&observation.working_directory, path) { continue; }
+        if !actors.contains_key(&session.id) && !inside(&session.launch.recipe.working_directory, path)? && !inside(&observation.working_directory, path)? { continue; }
         if !pair_valid { return Err("A native actor has an unverified paired terminal; settle its ownership before closing this worktree".into()); }
         let mut digest = Sha256::new();
         digest.update(observation.actor_id.as_bytes()); digest.update(execution_instance.as_bytes());
@@ -136,7 +163,7 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         actor.native = Some(Native { execution_instance, session, handle, observation });
     }
     for (id, instance, directory) in candidates.starting {
-        if !inside(&directory, path) { continue; }
+        if !inside(&directory, path)? { continue; }
         let actor = actors.entry(id).or_insert_with(|| Actor {
             token: BusyAgent { session: id, instance, close_revision: None, turn_generation: None },
             busy: true, terminal: None, native: None, starting: true,
@@ -295,15 +322,22 @@ mod tests {
         let selected = root.path().join("worktree");
         std::fs::create_dir_all(selected.join("nested")).unwrap();
         std::os::unix::fs::symlink(&selected, root.path().join("alias")).unwrap();
-        assert!(inside(&selected.join("nested"), &selected));
-        assert!(inside(&root.path().join("alias/nested"), &selected));
-        assert!(!inside(&root.path().join("other"), &selected));
-        assert!(!inside(&root.path().join("worktree-sibling"), &selected));
+        assert!(inside(&selected.join("nested"), &selected).unwrap());
+        assert!(inside(&root.path().join("alias/nested"), &selected).unwrap());
+        assert!(!inside(&root.path().join("other"), &selected).unwrap());
+        assert!(!inside(&root.path().join("worktree-sibling"), &selected).unwrap());
         let outside = root.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, selected.join("escape")).unwrap();
-        assert!(!inside(&selected.join("escape"), &selected));
-        assert!(!inside(&selected.join("../outside"), &selected));
-        assert!(!inside(&selected.join("missing/../../outside"), &selected));
+        assert!(!inside(&selected.join("escape"), &selected).unwrap());
+        assert!(!inside(&selected.join("../outside"), &selected).unwrap());
+        assert!(!inside(&selected.join("missing/../../outside"), &selected).unwrap());
+        // The final component no longer exists; its existing symlink ancestor
+        // still determines which worktree actually owns the old directory.
+        assert!(!inside(&selected.join("escape/gone"), &selected).unwrap());
+        assert!(inside(&root.path().join("alias/gone"), &selected).unwrap());
+        assert!(!inside(&selected.join("missing/../escape/gone"), &selected).unwrap());
+        std::os::unix::fs::symlink(outside.join("missing"), selected.join("dangling")).unwrap();
+        assert!(inside(&selected.join("dangling/child"), &selected).is_err());
     }
 }
