@@ -66,6 +66,7 @@ pub(super) fn close_project(
     repository: &str,
     now_ms: u64,
 ) -> Result<(), String> {
+    super::schema::require_current_write(tx)?;
     let records = tx
         .prepare("SELECT record FROM automations WHERE repository=?1 AND deleted_ms IS NULL")
         .map_err(|e| e.to_string())?
@@ -264,7 +265,11 @@ impl Registry {
         expected: &crate::agent_execution::Agent,
         mut snapshot: crate::chat::Snapshot,
     ) -> Result<(), String> {
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let firing = read_firing(&tx, firing)?;
         if firing.agent != Some(expected.id)
             || expected.origin
@@ -454,7 +459,11 @@ impl Registry {
         &mut self,
         receipts: &std::collections::BTreeSet<String>,
     ) -> Result<(), String> {
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         for key in receipts {
             tx.execute("DELETE FROM automation_notifications WHERE key=?1", [key])
                 .map_err(|error| error.to_string())?;
@@ -463,7 +472,11 @@ impl Registry {
     }
 
     pub(crate) fn prune_automation_history(&mut self, now_ms: u64) -> Result<bool, String> {
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let before: u64 = tx
             .query_row(
                 "SELECT automation_archive_sequence FROM metadata WHERE key=0",
@@ -558,6 +571,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let record: Option<String> = tx
             .query_row(
                 "SELECT record FROM automation_firings WHERE id=?1",
@@ -666,6 +680,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let automation = read_automation(&tx, automation_id)?;
         let mut firing = read_firing(&tx, firing_id)?;
         if automation.active_firing != Some(firing_id)
@@ -748,6 +763,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut firing = read_firing(&tx, firing_id)?;
         let mut automation = read_automation(&tx, firing.automation)?;
         if automation.active_firing != Some(firing_id)
@@ -916,6 +932,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut firing = read_firing(&tx, firing_id)?;
         let mut automation = read_automation(&tx, firing.automation)?;
         if automation.active_firing != Some(firing.id)
@@ -955,6 +972,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut firing = read_firing(&tx, firing_id)?;
         let mut automation = read_automation(&tx, firing.automation)?;
         let agent: crate::agent_execution::Agent = decode(
@@ -1026,6 +1044,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let firing = read_firing(&tx, firing_id)?;
         let mut automation = read_automation(&tx, firing.automation)?;
         if automation.active_firing != Some(firing.id) || !firing.release_pending {
@@ -1058,6 +1077,7 @@ impl Registry {
         let crate::agent_execution::Origin::Automation { id } = &accepted.agent.origin else {
             return Ok(true);
         };
+        super::schema::require_current_write(tx)?;
         let record = tx
             .query_row(
                 "SELECT record FROM automation_firings WHERE run_id=?1",
@@ -1171,6 +1191,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut automation = read_automation(&tx, id)?;
         if !automation.enabled
             || automation.execution_revision != revision
@@ -1245,6 +1266,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let record = tx
             .query_row(
                 "SELECT record FROM automation_firings WHERE run_id=?1",
@@ -1316,6 +1338,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let automation = create_automation_in(&tx, definition, now_ms, target_identity, None)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(automation)
@@ -1388,6 +1411,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut automation = read_automation(&tx, id)?;
         require_revision(&automation, expected_revision)?;
         require_project(&tx, &definition)?;
@@ -1456,6 +1480,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut automation = read_automation(&tx, id)?;
         require_revision(&automation, expected_revision)?;
         if next.is_some() {
@@ -1490,6 +1515,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let automation = read_automation(&tx, id)?;
         require_revision(&automation, expected_revision)?;
         if automation.active_firing.is_some() || automation.blocked.is_some() {
@@ -1787,6 +1813,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut automation = read_automation(&tx, id)?;
         let key = occurrence_key(expected_execution_revision, &trigger);
         if let Some(firing) = read_firing_key(&tx, id, &key)? {
@@ -1948,6 +1975,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut firing = read_firing(&tx, firing_id)?;
         if !matches!(
             firing.state,
@@ -4996,6 +5024,52 @@ mod tests {
             })
             .unwrap();
         (registry, directory, pane, scope, agent)
+    }
+
+    #[test]
+    fn retained_automation_writers_refuse_a_changed_checkpoint_before_any_mutation() {
+        for alteration in [
+            "PRAGMA user_version=20",
+            "DROP INDEX global_pending_automation_proposals",
+        ] {
+            let (mut registry, directory, pane, scope, agent) = archived_membership_fixture();
+            let snapshot = registry.archived_automation_conversation(agent.id).unwrap().snapshot;
+            let firing: String = registry.db.query_row(
+                "SELECT firing FROM automation_snapshots WHERE agent=?1",
+                [agent.id.to_string()], |row| row.get(0),
+            ).unwrap();
+            let firing = firing.parse::<Uuid>().unwrap();
+            let model = registry.model().unwrap();
+            let revision = model.views.iter().find(|view| view.scope == scope).unwrap().revision;
+            let remove = ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::RemoveArchivedAutomationSource {
+                    registry: model.identity,
+                    repository: agent.spec.target.repository.clone(),
+                    before: pane,
+                },
+            };
+            // The retained handle already performed successful archive/model
+            // writes. A different connection now changes its admission basis.
+            let other = Connection::open(directory.path().join("model.sqlite3")).unwrap();
+            other.execute_batch(alteration).unwrap();
+            let changes: u64 = registry.db.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+            let refuses = [
+                registry.archive_automation_conversation(firing, &agent, snapshot).is_err(),
+                registry.acknowledge_automation_notifications(&Default::default()).is_err(),
+                registry.prune_automation_history(HISTORY_TTL_MS + 1000).is_err(),
+                registry.apply(&remove).is_err(),
+            ];
+            assert!(refuses.into_iter().all(|refused| refused), "{alteration}");
+            assert_eq!(registry.db.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0)).unwrap(), changes,
+                "admission must precede even a rolled-back mutation: {alteration}");
+            assert_eq!(registry.agent(agent.id).unwrap(), agent);
+            assert!(registry.archived_automation_conversation(agent.id).is_ok());
+            assert_eq!(registry.db.query_row("SELECT count(*) FROM automation_report_sources", [], |row| row.get::<_, u64>(0)).unwrap(), 0);
+            assert_eq!(registry.db.query_row("SELECT count(*) FROM shared_view_panes WHERE id=?1", [crate::model::CardId::from_uuid(agent.id.as_uuid()).to_string()], |row| row.get::<_, u64>(0)).unwrap(), 1);
+        }
     }
 
     #[test]

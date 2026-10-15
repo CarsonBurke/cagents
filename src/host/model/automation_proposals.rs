@@ -156,6 +156,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         if let Some(previous) = read(&tx, id, Some(&owner))? {
             if previous.requested != requested {
                 return Err(
@@ -272,6 +273,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current_write(&tx)?;
         let mut current = read(&tx, expected.id, None)?
             .ok_or("The automation proposal is no longer available")?;
         if current.revision != expected.revision {
@@ -395,6 +397,36 @@ mod tests {
         Occurrence {
             due_ms: 1000,
             local: "2026-10-12T09:30".into(),
+        }
+    }
+
+    #[test]
+    fn retained_proposal_writers_refuse_a_changed_checkpoint_without_deciding_or_queuing() {
+        for alteration in [
+            "PRAGMA user_version=20",
+            "DROP INDEX global_pending_automation_proposals",
+        ] {
+            let (root, mut registry, proposal) = fixture();
+            let before = registry.model().unwrap();
+            let notices = registry.automation_notifications().unwrap();
+            let other = Connection::open(root.path().join("registry.sqlite3")).unwrap();
+            other.execute_batch(alteration).unwrap();
+            let changes: u64 = registry.db.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+            assert!(registry.propose_automation(
+                Uuid::new_v4(), proposal.owner.clone(), proposal.requested.clone(),
+                proposal.definition.clone(), proposal.target_identity.clone(),
+                proposal.channel_title.clone(), 200,
+            ).is_err(), "{alteration}");
+            assert!(registry.resolve_automation_proposal(&proposal, Some(next()), 300).is_err(), "{alteration}");
+            assert!(registry.resolve_automation_proposal(&proposal, None, 300).is_err(), "{alteration}");
+            let receipts = notices.iter().map(|event| event.evidence.key.clone()).collect();
+            assert!(registry.acknowledge_automation_notifications(&receipts).is_err(), "{alteration}");
+            assert_eq!(registry.db.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0)).unwrap(), changes,
+                "admission must precede even a rolled-back mutation: {alteration}");
+            assert_eq!(registry.automation_proposal(proposal.id, None).unwrap(), Some(proposal));
+            assert!(registry.automations(None, 100).unwrap().is_empty());
+            assert_eq!(registry.execution_sequence().unwrap(), before.sequence);
+            assert_eq!(serde_json::to_value(registry.automation_notifications().unwrap()).unwrap(), serde_json::to_value(notices).unwrap());
         }
     }
 

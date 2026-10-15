@@ -608,6 +608,7 @@ pub(super) fn apply(
         ..
     } = edit
     {
+        super::schema::require_current_write(transaction)?;
         let identity: String = transaction
             .query_row("SELECT identity FROM metadata WHERE key=0", [], |row| {
                 row.get(0)

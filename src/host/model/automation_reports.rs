@@ -32,12 +32,13 @@ fn descriptor_key(agent: AgentId, encoded: &str) -> String {
 /// across repeated new-card presentations of the same retained closed owner.
 /// Both bodies and receipts have transactional aggregate admission budgets.
 pub(super) fn capture_removal(
-    db: &Connection,
+    db: &rusqlite::Transaction<'_>,
     operation: Uuid,
     scope: &Scope,
     revision: u64,
     pane: &Pane,
 ) -> Result<(), String> {
+    super::schema::require_current_write(db)?;
     if operation.is_nil() {
         return Err("The archive removal operation is missing".into());
     }
