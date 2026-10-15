@@ -23,6 +23,11 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[cfg(all(target_os = "linux", feature = "host"))]
+mod ui_journal;
+#[cfg(all(target_os = "linux", feature = "host"))]
+pub(crate) use ui_journal::OriginalUiJournalPeer;
+
 mod daemon_admission;
 pub(crate) use daemon_admission::{
     DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, has_inherited_daemon_fence,
