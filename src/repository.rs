@@ -6,7 +6,7 @@
 //! straightforward to test with a fake executor.
 
 mod worktree_setup_intent;
-pub use worktree_setup_intent::{WorktreeSetupCreationIdentity, WorktreeSetupIntent, WorktreeSetupPlan, worktree_setup_marker_matches};
+pub use worktree_setup_intent::{WorktreeSetupCreationIdentity, WorktreeSetupIntent, WorktreeSetupPlan, WorktreeSetupGuard, worktree_setup_marker_matches};
 
 use std::{
     borrow::Cow,

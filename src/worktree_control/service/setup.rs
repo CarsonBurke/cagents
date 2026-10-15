@@ -131,6 +131,13 @@ pub(super) fn prepare(service:&Service,store:&crate::persistence::StateStore,req
     plan:&crate::worktree_setup::SetupPlan,warnings:&mut Vec<String>,cancel:&CancellationToken,
 )->Option<Setup> {
     let run_id=request.setup_intent.as_ref().and_then(|intent|intent.run_id);
+    let guard=match service.worktree_setup_guard(store,request.operation_id,request.setup_intent.as_ref()) {
+        Ok(guard)=>guard,
+        Err(error)=> {
+            let error=format!("Setup was retained without preparation because its current intent could not be verified: {error}");
+            warnings.push(error.clone());return Some(Setup {command:String::new(),run_id,terminal:None,error:Some(error)});
+        }
+    };
     let generation=(||->Result<(),String> {
         let admin=service.git_dir(destination,cancel).map_err(|error|error.to_string())?;
         if !crate::repository::worktree_setup_marker_matches(&admin,request.operation_id).map_err(|error|error.to_string())? {
@@ -148,7 +155,7 @@ pub(super) fn prepare(service:&Service,store:&crate::persistence::StateStore,req
             for skipped in prepared.skipped_paths {warnings.push(format!("Skipped copying {}: {}",skipped.path.display(),skipped.reason));}
             let mut copied=match request.setup_intent.clone() {Some(intent)=>intent,None=>return Some(Setup {command:String::new(),run_id,error:Some("Setup has no retained intent; no command was started".into()),terminal:None})};
             copied.copy_done=true;
-            match service.update_worktree_setup_intent_guarded(store,request.operation_id,request.setup_intent.as_ref(),copied) {
+            match service.update_worktree_setup_intent_with_guard(store,request.operation_id,request.setup_intent.as_ref(),copied,&guard) {
                 Ok(_)=>prepared.command.map(|command|Setup {command,run_id,terminal:None,error:None}),
                 Err(error)=> {
                     let error=format!("Setup copied files, but its progress could not be retained; no command was started: {error}");
@@ -160,5 +167,33 @@ pub(super) fn prepare(service:&Service,store:&crate::persistence::StateStore,req
             let error=error.to_string();warnings.push(format!("Worktree was retained, but setup failed: {error}"));
             Some(Setup {command:String::new(),run_id,terminal:None,error:Some(error)})
         }
+    }
+}
+
+
+#[cfg(test)]
+mod preparation_contracts {
+    use super::*;
+    #[test]
+    fn superseded_skip_refuses_old_preparation_before_copying_files() {
+        let root=tempfile::tempdir().unwrap();let primary=root.path().join("project");std::fs::create_dir(&primary).unwrap();
+        let cancel=CancellationToken::new();
+        let git=|arguments:&[&str]| {
+            let command=crate::worktree_control::git_command(&primary).args(arguments).env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null");
+            SystemProcessExecutor.execute(&command,&cancel).and_then(|output|output.require_success(&command.program)).unwrap();
+        };
+        git(&["init","--quiet","-b","main"]);std::fs::write(primary.join("tracked"),"initial").unwrap();git(&["add","tracked"]);
+        git(&["-c","user.name=Setup Contract","-c","user.email=setup@example.invalid","commit","-qm","initial"]);
+        std::fs::create_dir(primary.join(".cagents")).unwrap();std::fs::write(primary.join(".cagents/worktree.toml"),"copy = [\".env\"]\n").unwrap();std::fs::write(primary.join(".env"),"preserve").unwrap();
+        let service=RepositoryService::system("git");let plan=crate::worktree_setup::load(&primary).unwrap().unwrap();
+        let mut request=service.resolve_worktree_request(&WorktreeInput {repository:primary.clone(),input:"topic".into(),base:"main".into(),managed_directory:".worktrees/".into(),destination:String::new(),operation_id:OperationId::new()},&cancel).unwrap();
+        let old=WorktreeSetupIntent {primary:Some(primary.clone()),plan:Some(plan.clone()),skip:false,run_id:Some(OperationId::new()),copy_done:false};request.setup_intent=Some(old.clone());
+        let store=crate::persistence::StateStore::open(root.path().join("journal.sqlite3"),crate::model::BootId::new("prepare-test")).unwrap();
+        let report=service.create_worktree_journaled_sync(&store,&request,0,&cancel,|_|{});assert_eq!(report.state,crate::repository::WorktreeOperationState::Created,"{}",report.detail);
+        let skipped=WorktreeSetupIntent {primary:Some(primary.clone()),skip:true,copy_done:true,run_id:Some(OperationId::new()),plan:None};
+        service.update_worktree_setup_intent_guarded(&store,request.operation_id,Some(&old),skipped.clone()).unwrap();
+        let mut warnings=Vec::new();let result=prepare(&service,&store,&request,&primary,&request.destination,&plan,&mut warnings,&cancel).unwrap();
+        assert!(result.error.is_some());assert!(!request.destination.join(".env").exists(),"the old run must not copy after a newer skip");
+        assert_eq!(service.worktree_setup_creation(&store,request.operation_id).unwrap().unwrap().request.unwrap().setup_intent,Some(skipped));
     }
 }

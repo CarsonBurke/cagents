@@ -537,6 +537,7 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    pub(crate) fn database_path(&self)->&Path {&self.path}
     /// Copies a live store through SQLite's transactionally consistent VACUUM
     /// snapshot. The source is never startup-reconciled or checkpointed here.
     pub fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {

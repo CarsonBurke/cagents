@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// An exact receipt's execution lease. Retain across file preparation and its
+/// progress CAS, then drop before requesting host terminal startup.
+pub struct WorktreeSetupGuard<'a> {store:&'a StateStore,creation_id:OperationId,entity_id:String,generation:u64,lease:fs::File}
+
 /// Exact configuration reviewed for one creation. Execution still reloads and
 /// verifies this snapshot through `worktree_setup` before preparing commands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,8 +230,38 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,store:&StateStore,creation_id:OperationId,
         expected:Option<&WorktreeSetupIntent>,updated:WorktreeSetupIntent,
     )->Result<WorktreeOperationReport,StoreError> {
-        let operation=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation receipt is missing".into()))?;
-        let _lease=self.worktree_setup_execution_lease(&operation)?;
+        let guard=self.worktree_setup_guard(store,creation_id,expected)?;
+        self.update_worktree_setup_intent_with_guard(store,creation_id,expected,updated,&guard)
+    }
+
+    pub fn worktree_setup_guard<'a>(&self,store:&'a StateStore,creation_id:OperationId,expected:Option<&WorktreeSetupIntent>)->Result<WorktreeSetupGuard<'a>,StoreError> {
+        let initial=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation receipt is missing".into()))?;
+        let lease=self.worktree_setup_execution_lease(&initial)?;
+        // Copies of a known creator journal are not independent authority.
+        // Refuse ambiguous owners rather than preparing from divergent intent.
+        let mut paths=crate::instance::window_database_paths()?;
+        if let Some(directories)=crate::instance::project_dirs() {paths.push(directories.data_dir().join("worktree-operations.sqlite3"));}
+        paths.sort();paths.dedup();let mut owners=Vec::new();
+        for path in paths {
+            if path.try_exists()?&&crate::persistence::read_worktree_operation_at(&path,creation_id)?.is_some() {owners.push(path);}
+        }
+        if owners.len()>1||(owners.len()==1&&owners[0].canonicalize()?!=store.database_path().canonicalize()?) {
+            return Err(StoreError::InvalidState("Multiple window journals retain this setup creation; its unique original authority is unavailable".into()));
+        }
+        let current=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation disappeared".into()))?;
+        let journal=settled_setup_journal(&current)?;
+        if current.entity_id!=initial.entity_id||current.base_generation!=initial.base_generation {return Err(StoreError::InvalidState("Setup receipt identity changed".into()));}
+        if journal.request.setup_intent.as_ref()!=expected {return Err(StoreError::InvalidState("Setup intent was superseded before preparation".into()));}
+        if journal.lease_identity!=Some(lease_file_identity(&lease)?) {return Err(StoreError::InvalidState("Setup creation lease identity changed".into()));}
+        Ok(WorktreeSetupGuard {store,creation_id,entity_id:current.entity_id,generation:current.base_generation,lease})
+    }
+
+    pub fn update_worktree_setup_intent_with_guard(&self,store:&StateStore,creation_id:OperationId,expected:Option<&WorktreeSetupIntent>,updated:WorktreeSetupIntent,guard:&WorktreeSetupGuard<'_>)->Result<WorktreeOperationReport,StoreError> {
+        if guard.creation_id!=creation_id||!std::ptr::eq(guard.store,store) {return Err(StoreError::InvalidState("Setup preparation guard belongs to another receipt or store".into()));}
+        let row=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation disappeared".into()))?;
+        if row.entity_id!=guard.entity_id||row.base_generation!=guard.generation {return Err(StoreError::InvalidState("Setup preparation receipt identity changed".into()));}
+        let journal=settled_setup_journal(&row)?;
+        if journal.lease_identity!=Some(lease_file_identity(&guard.lease)?) {return Err(StoreError::InvalidState("Setup preparation lease identity changed".into()));}
         self.update_worktree_setup_intent(store,creation_id,expected,updated)
     }
 
@@ -380,11 +414,15 @@ mod tests {
         let copied=StateStore::open(root.path().join("copied.sqlite3"),crate::model::BootId::new("lease-test")).unwrap();
         seed(&first,&journal,PendingOperationStatus::Applied);seed(&copied,&journal,PendingOperationStatus::Applied);
         let service=RepositoryService::system("git");let id=journal.request.operation_id;
-        let row=first.journaled_worktree_operation(id).unwrap().unwrap();let running=service.worktree_setup_execution_lease(&row).unwrap();
+        let row=first.journaled_worktree_operation(id).unwrap().unwrap();let running=service.worktree_setup_guard(&first,id,Some(&original)).unwrap();
         let mut updated=original.clone();updated.skip=true;updated.run_id=Some(OperationId::new());
         assert!(service.update_worktree_setup_intent_guarded(&copied,id,Some(&original),updated.clone()).is_err(),"a copied store must not bypass a starting or live execution");
         assert_eq!(service.worktree_setup_creation(&copied,id).unwrap().unwrap().request.unwrap().setup_intent,Some(original.clone()));
+        assert!(service.update_worktree_setup_intent_with_guard(&copied,id,Some(&original),updated.clone(),&running).is_err(),"a preparation guard is bound to its exact store");
+        let mut prepared=original.clone();prepared.copy_done=true;
+        service.update_worktree_setup_intent_with_guard(&first,id,Some(&original),prepared,&running).unwrap();
         drop(running);
+        assert!(service.worktree_setup_guard(&first,id,Some(&original)).is_err(),"stale preparation must fail before filesystem effects");
         service.update_worktree_setup_intent_guarded(&copied,id,Some(&original),updated).unwrap();
         let old=fs::File::open(&journal.lease_path).unwrap();fs::rename(&journal.lease_path,journal.lease_path.with_extension("retained")).unwrap();
         drop(worktree_lease(&journal.lease_path,true).unwrap());
