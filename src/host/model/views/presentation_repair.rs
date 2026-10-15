@@ -2,7 +2,7 @@
 use super::*;
 use crate::{agent_execution::{Agent, Origin, PresentationRepairTarget}, model::{AgentId, CardId, CardKind}};
 
-fn registry_identity(db: &Connection) -> Result<Uuid, String> {
+pub(super) fn registry_identity(db: &Connection) -> Result<Uuid, String> {
     let identity: String = db.query_row("SELECT identity FROM metadata WHERE key=0", [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
     identity.parse().map_err(|error| format!("Registry identity is invalid: {error}"))
@@ -19,7 +19,7 @@ fn closed_owner(db: &Connection, origin: &Origin, id: AgentId) -> Result<Agent, 
     Ok(agent)
 }
 
-fn candidate(db: &Connection, agent: &Agent, pane: &crate::workspace_model::views::Pane) -> Result<(), String> {
+pub(super) fn candidate(db: &Connection, agent: &Agent, pane: &crate::workspace_model::views::Pane) -> Result<(), String> {
     let CardKind::Terminal(ended) = &pane.kind else {
         return Err("Only an ended managed terminal presentation can require this consent".into());
     };
@@ -31,7 +31,7 @@ fn candidate(db: &Connection, agent: &Agent, pane: &crate::workspace_model::view
     let identified = agent.session.iter().filter_map(|source| match source {
         crate::agent_execution::HostedSession::Terminal(session) => Some(session), _ => None,
     }).chain(agent.console.iter()).any(|source| source.id == ended.id && source.launch == ended.launch);
-    if !identified { return Err("The current pane is not identified by this closed agent".into()); }
+    if !identified { return Err("The current pane is not identified by this agent".into()); }
     if terminal_source(db, pane.id)?.is_some() {
         return Err("Recorded terminal provenance exists; presentation-only repair cannot override it".into());
     }
@@ -88,3 +88,4 @@ impl Registry {
         Ok(true)
     }
 }
+

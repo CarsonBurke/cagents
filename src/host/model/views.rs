@@ -2,6 +2,8 @@ use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
 mod presentation_repair;
+mod presentation_close;
+pub(super) use presentation_close::{remove_open_close, validate_open_close};
 
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)

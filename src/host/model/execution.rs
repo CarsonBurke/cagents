@@ -1088,10 +1088,27 @@ impl Registry {
         source: &HostedSession,
         now_ms: u64,
     ) -> Result<bool, String> {
+        self.retire_agent_process_inner(source, now_ms, None)
+    }
+
+    /// The host calls this ONLY after its exact retained native owner and
+    /// paired terminal produced their normal confirmed cleanup receipts.
+    /// Observation/CAS consent alone cannot prove any provider generation ended.
+    pub(crate) fn retire_agent_process_with_presentation(&mut self,
+        origin: &Origin, source: &HostedSession, now_ms: u64,
+        observed: &crate::agent_execution::PresentationCloseObservation) -> Result<bool, String> {
+        self.retire_agent_process_inner(source, now_ms, Some((origin, observed)))
+    }
+
+    fn retire_agent_process_inner(&mut self, source: &HostedSession, now_ms: u64,
+        observed: Option<(&Origin, &crate::agent_execution::PresentationCloseObservation)>) -> Result<bool, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        if let Some((origin, observed)) = observed {
+            super::views::validate_open_close(&tx, origin, observed, source)?;
+        }
         let authority: Option<String> = tx
             .query_row(
                 "SELECT source FROM agent_authorities WHERE session_id = ?1",
@@ -1158,7 +1175,11 @@ impl Registry {
                 // the execution service can reach close_agent. Commit the pane
                 // tombstone here too, so a crash cannot publish a closed agent
                 // while leaving its exact retained presentation behind.
-                super::views::retire_agent(&tx, &agent)?;
+                if let Some((origin, observed)) = observed {
+                    super::views::remove_open_close(&tx, origin, observed, source)?;
+                } else {
+                    super::views::retire_agent(&tx, &agent)?;
+                }
                 agent.closed = true;
                 tx.execute(
                     "DELETE FROM agent_launches WHERE agent = ?1",
@@ -1177,6 +1198,9 @@ impl Registry {
                 .map_err(|e| e.to_string())?;
                 changed = true;
             }
+        }
+        if observed.is_some() && !changed {
+            return Err("The exact open agent was not retired; combined close consent was not applied".into());
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(changed)

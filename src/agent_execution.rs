@@ -454,6 +454,27 @@ impl std::fmt::Debug for PresentationRepairTarget {
     }
 }
 
+/// Current-presentation consent for an OPEN agent. This observation grants
+/// no teardown authority: the host must additionally bind its exact live or
+/// retained native owner and confirm normal provider/paired cleanup.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresentationCloseObservation {
+    pub registry: uuid::Uuid,
+    pub agent: Agent,
+    pub scope: Placement,
+    pub view_revision: u64,
+    pub pane: crate::workspace_model::views::Pane,
+    pub source: HostedSession,
+}
+
+impl std::fmt::Debug for PresentationCloseObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PresentationCloseObservation")
+            .field("agent", &self.agent.id).field("pane", &self.pane.id)
+            .field("view_revision", &self.view_revision).finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Submit(Submit),
