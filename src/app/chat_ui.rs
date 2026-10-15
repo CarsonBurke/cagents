@@ -2396,8 +2396,20 @@ impl Runtime {
             return;
         }
         self.syntax_theme = theme;
+        self.preparation.clear();
         for cached in self.cache.values_mut() {
-            cached.rehighlight(theme);
+            if cached.item.as_ref().is_some_and(|item| CachedItem::prose(&item.content).is_some()) && cached.coordination.is_none() {
+                // Keep logical text/selection while the new palette is
+                // prepared, without highlighting all historical fences here.
+                cached.blocks.clear();
+                cached.open=None;
+                cached.preparing=true;
+                cached.revision=CachedItem::next_revision();
+            } else {cached.rehighlight(theme);}
+        }
+        if self.visible.load(Ordering::Relaxed) {
+            let snapshot=self.snapshot.clone();
+            self.prepare_transcript_cache(&snapshot);
         }
     }
     fn source_now_ms(&self) -> Option<u64> {
@@ -2473,8 +2485,8 @@ impl Runtime {
                 let small_append = proven_from_cache && current.is_some_and(|cached| !cached.preparing)
                     && CachedItem::prose(&item.content).is_some_and(|body|body.len()<=64*1024);
                 if pending || (!exact && !small_append) {
-                    let replaced=self.preparation.stage(item,growing,|old,new|handle.as_ref().is_some_and(|handle|handle.known_append(old,new)));
-                    if replaced && !proven_from_cache {
+                    let replaced=self.preparation.stage(item,growing,self.syntax_theme,|old,new|handle.as_ref().is_some_and(|handle|handle.known_append(old,new)));
+                    if replaced && !exact && !proven_from_cache {
                         self.cache.insert(item.id.clone(),CachedItem::preparing(item,self.syntax_theme));
                         presentation_changed=true;
                     }
@@ -2565,7 +2577,7 @@ impl Runtime {
         let Some(prepared)=self.preparation.accept(target,id,run,ready) else { return; };
         let managed=self.preparation.contains(id);
         let Some(cached)=self.cache.get_mut(id) else { return; };
-        prepared.install(cached,self.syntax_theme,managed);
+        prepared.install(cached,managed);
         self.presentation_revision=self.presentation_revision.wrapping_add(1);
         self.refresh_find();
     }

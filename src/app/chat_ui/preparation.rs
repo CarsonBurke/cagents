@@ -4,7 +4,6 @@ use std::sync::atomic::AtomicUsize;
 
 const SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const QUEUED_BYTES: usize = 72 * 1024 * 1024;
-const CHUNK_BYTES: usize = 64 * 1024;
 const QUEUED_ITEMS: usize = 128;
 static RESERVED: AtomicUsize = AtomicUsize::new(0);
 static ATTEMPT: AtomicU64 = AtomicU64::new(1);
@@ -16,6 +15,7 @@ struct Request {
     item: Arc<chat::Item>,
     growing: bool,
     version: u64,
+    theme: crate::settings::EditorSyntaxTheme,
 }
 
 #[derive(Clone, Default)]
@@ -29,12 +29,11 @@ pub(super) struct Parsed {
 const _: fn() = || {
     fn send<T: Send>() {}
     send::<Parsed>();
+    send::<prose::CodeBlock>();
 };
 
 struct Canonical {
-    request: Request,
     parsed: Parsed,
-    seen: usize,
 }
 
 #[derive(Default)]
@@ -125,7 +124,7 @@ impl State {
     /// `append` is proof from the immutable source publication, not a tail
     /// digest or a guessed matching item ID. An unproven replacement starts a
     /// new lineage and cancels both queued and currently parsing old input.
-    pub(super) fn stage(&mut self, item: &Arc<chat::Item>, growing: bool,
+    pub(super) fn stage(&mut self, item: &Arc<chat::Item>, growing: bool, theme: crate::settings::EditorSyntaxTheme,
         append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool) -> bool {
         let Some(body) = CachedItem::prose(&item.content) else { return false; };
         if self.errors.get(&item.id).is_some_and(|(old, _)| old.as_ptr() == Arc::as_ptr(item)) { return false; }
@@ -138,10 +137,10 @@ impl State {
         if let Some(entry) = self.entries.get_mut(&item.id) {
             let mut latest = entry.shared.latest.lock().unwrap_or_else(|e| e.into_inner());
             let same = Arc::ptr_eq(&latest.item, item);
-            if same && latest.growing == growing { return false; }
-            if same || (same_kind(&latest.item, item) && append(&latest.item, item)) {
+            if same && latest.growing == growing && latest.theme == theme { return false; }
+            if latest.theme == theme && (same || (same_kind(&latest.item, item) && append(&latest.item, item))) {
                 if entry.shared.lease.resize(body.len()) {
-                    *latest = Request { item: item.clone(), growing, version: latest.version.wrapping_add(1) };
+                    *latest = Request { item: item.clone(), growing, version: latest.version.wrapping_add(1), theme };
                     if !entry.running { entry.run = next_attempt(); entry.running = true; }
                     return false;
                 }
@@ -155,7 +154,7 @@ impl State {
             return true;
         }
         self.entries.insert(item.id.clone(), Entry { run: next_attempt(), running: true,
-            shared: Arc::new(Shared { latest: Mutex::new(Request { item: item.clone(), growing, version: 1 }),
+            shared: Arc::new(Shared { latest: Mutex::new(Request { item: item.clone(), growing, version: 1, theme }),
                 canonical: Mutex::new(None), cancelled: AtomicBool::new(false), lease }) });
         true
     }
@@ -195,6 +194,7 @@ impl State {
 pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
+    blocks: HashMap<u64, prose::CodeBlock>,
     // Hold admission through UI consumption: completed outputs cannot build
     // an unbounded queue while a busy UI has not handled their messages yet.
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -202,15 +202,17 @@ pub(super) struct Prepared {
 impl Prepared {
     pub(super) fn item(&self) -> &Arc<chat::Item> { &self.request.item }
     pub(super) fn growing(&self) -> bool { self.request.growing }
-    pub(super) fn install(self, cached: &mut CachedItem, theme: crate::settings::EditorSyntaxTheme, managed: bool) {
+    pub(super) fn install(self, cached: &mut CachedItem, managed: bool) {
         cached.source = self.parsed.source;
         cached.markdown = self.parsed.markdown;
         cached.token = ChangeToken::of(&self.request.item.content);
         cached.item = Some(self.request.item);
         cached.preparing = self.request.growing || managed;
         cached.placeholder = false;
-        cached.highlight(theme);
-        if !cached.preparing { cached.settle_blocks(); }
+        // Syntax was prepared on the worker; installation never traverses
+        // every fence or constructs a highlighter on the event thread.
+        cached.blocks = self.blocks;
+        cached.open = None;
         cached.revision = CachedItem::next_revision();
     }
 }
@@ -254,12 +256,10 @@ async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
 fn execute(shared: Arc<Shared>,permit:tokio::sync::OwnedSemaphorePermit) -> Result<Prepared,String> {
         let request = shared.latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut canonical = shared.canonical.lock().unwrap_or_else(|e| e.into_inner()).take()
-            .unwrap_or_else(|| Canonical { request: request.clone(), parsed: Parsed::default(), seen: 0 });
+            .unwrap_or_else(|| Canonical { parsed: Parsed::default() });
         let body = CachedItem::prose(&request.item.content).ok_or("The source is not Markdown.")?;
-        parse_chunks(&mut canonical.parsed, body, canonical.seen, request.growing, &shared.cancelled)?;
+        parse_publication(&mut canonical.parsed, body, request.growing, &shared.cancelled)?;
         if shared.cancelled.load(Ordering::Relaxed) { return Err("Message loading was cancelled.".into()); }
-        canonical.request = request.clone();
-        canonical.seen = body.len();
         let parsed = if request.growing {
             // The clone is deliberately on the worker. Shared inline spans
             // are cheap; code/continuation copies remain a measured residual.
@@ -268,7 +268,14 @@ fn execute(shared: Arc<Shared>,permit:tokio::sync::OwnedSemaphorePermit) -> Resu
             *shared.canonical.lock().unwrap_or_else(|e| e.into_inner()) = Some(canonical);
             parsed
         } else { canonical.parsed };
-        Ok(Prepared { request, parsed, _permit: permit })
+        let mut blocks=HashMap::new();
+        for_each_fence(parsed.markdown.items(),&mut |language,code| {
+            if shared.cancelled.load(Ordering::Relaxed) || code.len()>CachedItem::HIGHLIGHT_LIMIT {return;}
+            let key=fence_key(language.unwrap_or_default(),code);
+            blocks.entry(key).or_insert_with(||prose::CodeBlock::new(language.and_then(prose::fence_language),code,request.theme));
+        });
+        if shared.cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
+        Ok(Prepared { request, parsed, blocks, _permit: permit })
 }
 
 /// Rendering fixtures explicitly complete the production engine before
@@ -286,19 +293,18 @@ pub(super) fn drain_fixture(runtime:&mut Runtime) {
     panic!("fixture preparation did not quiesce");
 }
 
-fn parse_chunks(parsed: &mut Parsed, body: &str, previous: usize, growing: bool, cancelled: &AtomicBool) -> Result<(), String> {
-    let mut end = previous.min(body.len());
-    loop {
-        if cancelled.load(Ordering::Relaxed) { return Err("Message loading was cancelled.".into()); }
-        end = end.saturating_add(CHUNK_BYTES).min(body.len());
-        while !body.is_char_boundary(end) { end -= 1; }
-        let open = end < body.len() || growing;
-        match parsed.source.advance_append(&body[..end], open) {
-            markdown_source::Step::Append(text) => parsed.markdown.push_str(&text),
-            markdown_source::Step::Restart(text) => parsed.markdown = markdown::Content::parse(&text),
-        }
-        if end == body.len() { return Ok(()); }
+/// Parse one coalesced publication once. The parser can reparse an unfinished
+/// rich block on append; feeding a cold body in artificial chunks amplifies
+/// that cost. Cancellation fences ownership before and after the parser call;
+/// it does not preempt pulldown-cmark inside a single rich block.
+fn parse_publication(parsed: &mut Parsed, body: &str, growing: bool, cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
+    match parsed.source.advance_append(body,growing) {
+        markdown_source::Step::Append(text)=>parsed.markdown.push_str(&text),
+        markdown_source::Step::Restart(text)=>parsed.markdown=markdown::Content::parse(&text),
     }
+    if cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
+    Ok(())
 }
 
 #[cfg(test)]
@@ -325,19 +331,52 @@ mod tests {
         let expected={let mut source=markdown_source::Source::default();match source.advance(&body,false) {
             markdown_source::Step::Append(text)|markdown_source::Step::Restart(text)=>markdown::Content::parse(&text)}};
         let parsed=std::thread::spawn(move|| {
-            let mut parsed=Parsed::default();parse_chunks(&mut parsed,&body,0,false,&AtomicBool::new(false)).unwrap();parsed
+            let mut parsed=Parsed::default();parse_publication(&mut parsed,&body,false,&AtomicBool::new(false)).unwrap();parsed
         }).join().unwrap();
         assert_eq!(format!("{:?}",parsed.markdown.items()),format!("{:?}",expected.items()));
     }
     #[test]
+    fn cold_rich_paragraph_is_parsed_once_and_syntax_is_ready_before_install() {
+        let body=format!("A *rich* [link](https://example.com) paragraph {} tail.","emphasis *word* and `code` ".repeat(40_000));
+        let mut parsed=Parsed::default();parse_publication(&mut parsed,&body,false,&AtomicBool::new(false)).unwrap();
+        assert_eq!(parsed.markdown.parsed_work_bytes(),body.len(),"cold input must not repeatedly reparse artificial prefixes");
+        let body=(0..4_000).map(|index|format!("```rust\nlet value_{index} = {index};\n```\n\n")).collect::<String>();
+        let source=item(&body);let target=target();let mut state=configured(target,&source);
+        state.stage(&source,false,crate::settings::EditorSyntaxTheme::Mocha,|_,_|false);
+        let (_,shared)=job(&state);
+        let output=std::thread::spawn(move||execute(shared,permit()).unwrap()).join().unwrap();
+        assert_eq!(output.blocks.len(),4_000);
+        let key=fence_key("rust","let value_123 = 123;\n");
+        let expected=prose::CodeBlock::new(Some("rust"),"let value_123 = 123;\n",crate::settings::EditorSyntaxTheme::Mocha);
+        let dark=output.blocks[&key].spans(true).clone();let light=output.blocks[&key].spans(false).clone();
+        assert_eq!(format!("{dark:?}"),format!("{:?}",expected.spans(true)));
+        assert_eq!(format!("{light:?}"),format!("{:?}",expected.spans(false)));
+        let mut cached=CachedItem::preparing(&source,crate::settings::EditorSyntaxTheme::Mocha);
+        output.install(&mut cached,false);
+        assert!(Arc::ptr_eq(&dark,cached.blocks[&key].spans(true)),"installation moves the worker's spans without re-highlighting");
+        assert!(Arc::ptr_eq(&light,cached.blocks[&key].spans(false)));
+        assert!(!cached.placeholder);
+    }
+    #[test]
+    fn syntax_theme_change_rejects_old_worker_palette_without_losing_input() {
+        let source=item("```rust\nlet value = 42;\n```\n");let target=target();let mut state=configured(target,&source);
+        state.stage(&source,false,crate::settings::EditorSyntaxTheme::Mocha,|_,_|false);
+        let (old,shared)=job(&state);let output=ready(execute(shared,permit()));
+        state.stage(&source,false,crate::settings::EditorSyntaxTheme::Ocean,|_,_|false);
+        assert!(state.accept(target,"message",old,output).is_none());
+        let (run,shared)=job(&state);let output=execute(shared,permit()).unwrap();
+        assert_eq!(output.request.theme,crate::settings::EditorSyntaxTheme::Ocean);
+        assert!(state.accept(target,"message",run,ready(Ok(output))).is_some());
+    }
+    #[test]
     fn queued_inputs_coalesce_and_progressive_append_results_do_not_starve() {
         let target=target();let first=item("First prefix");let latest=item("First prefix and newer suffix");
-        let mut state=configured(target,&first);state.stage(&first,true,|_,_|false);
+        let mut state=configured(target,&first);state.stage(&first,true,crate::settings::EditorSyntaxTheme::default(),|_,_|false);
         let (run,shared)=job(&state);
-        state.stage(&latest,true,|old,new|Arc::ptr_eq(old,&first)&&Arc::ptr_eq(new,&latest));
+        state.stage(&latest,true,crate::settings::EditorSyntaxTheme::default(),|old,new|Arc::ptr_eq(old,&first)&&Arc::ptr_eq(new,&latest));
         let output=execute(shared,permit()).unwrap();assert!(Arc::ptr_eq(output.item(),&latest));
         let newest=item("First prefix and newer suffix plus another append");
-        state.stage(&newest,true,|old,new|Arc::ptr_eq(old,&latest)&&Arc::ptr_eq(new,&newest));
+        state.stage(&newest,true,crate::settings::EditorSyntaxTheme::default(),|old,new|Arc::ptr_eq(old,&latest)&&Arc::ptr_eq(new,&newest));
         let accepted=state.accept(target,"message",run,ready(Ok(output))).unwrap();
         assert!(Arc::ptr_eq(accepted.item(),&latest),"a useful older proven prefix can be displayed");drop(accepted);
         let (next,shared)=job(&state);assert_ne!(run,next);
@@ -349,10 +388,10 @@ mod tests {
     fn replacements_and_context_changes_reject_completed_old_outputs() {
         let target=target();let original=item("old text");let replacement=item("new text");
         for change_context in [false,true] {
-            let mut state=configured(target,&original);state.stage(&original,false,|_,_|false);
+            let mut state=configured(target,&original);state.stage(&original,false,crate::settings::EditorSyntaxTheme::default(),|_,_|false);
             let (run,shared)=job(&state);let output=ready(execute(shared.clone(),permit()));
             if change_context {state.context(target,Some("other-session"),Some("child"),std::slice::from_ref(&replacement));}
-            state.stage(&replacement,false,|_,_|false);
+            state.stage(&replacement,false,crate::settings::EditorSyntaxTheme::default(),|_,_|false);
             assert!(shared.cancelled.load(Ordering::Relaxed));
             assert!(state.accept(target,"message",run,output).is_none());
             let (run,shared)=job(&state);let output=execute(shared,permit()).unwrap();
@@ -363,7 +402,7 @@ mod tests {
     #[test]
     fn output_backpressure_and_hidden_eviction_release_actual_owners() {
         let target=target();let original=item("a retained body");let weak=Arc::downgrade(&original);
-        let mut state=configured(target,&original);state.stage(&original,true,|_,_|false);
+        let mut state=configured(target,&original);state.stage(&original,true,crate::settings::EditorSyntaxTheme::default(),|_,_|false);
         let (run,shared)=job(&state);let permits=Arc::new(tokio::sync::Semaphore::new(1));
         let output=ready(execute(shared.clone(),permits.clone().try_acquire_owned().unwrap()));
         assert_eq!(permits.available_permits(),0,"queued output retains worker admission");
@@ -373,7 +412,7 @@ mod tests {
         drop(shared);drop(original);assert!(weak.upgrade().is_none());
         assert_eq!(state.queued_bytes(),0);
         let mut parsed=Parsed::default();
-        assert!(parse_chunks(&mut parsed,"must not parse",0,false,&AtomicBool::new(true)).is_err());
+        assert!(parse_publication(&mut parsed,"must not parse",false,&AtomicBool::new(true)).is_err());
         assert!(parsed.markdown.items().is_empty());
     }
     #[test]
