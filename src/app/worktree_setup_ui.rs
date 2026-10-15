@@ -164,15 +164,15 @@ impl Cagents {
             if session.launch.environment.get("CAGENTS_WORKTREE_SETUP").map(String::as_str) != Some("1") { continue; }
             let path = &session.launch.working_directory;
             if self.setup_ui.pending.contains_key(path) { continue; }
-            let started_at = session.launch.environment.get("CAGENTS_WORKTREE_SETUP_STARTED_AT").and_then(|value| value.parse::<u64>().ok()).unwrap_or_default();
-            if self.setup_ui.terminals.get(path).is_some_and(|(known_at, known)| *known_at > started_at || (*known_at == started_at && *known != session.id)) { continue; }
-            self.setup_ui.terminals.insert(path.clone(), (started_at, session.id));
-            let status = terminal_status(session, card.existence.is_open(), self.terminal_start_in_flight(card.id));
             // A stale retained terminal from a previous run cannot stand in
             // for the run referenced by the durable creation intent.
             if let Some((_, intent)) = self.setup_ui.recovered.get(path)
                 && let Some(run) = intent.run_id
                 && session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID").is_none_or(|value| value != &run.to_string()) { continue; }
+            let started_at = session.launch.environment.get("CAGENTS_WORKTREE_SETUP_STARTED_AT").and_then(|value| value.parse::<u64>().ok()).unwrap_or_default();
+            if self.setup_ui.terminals.get(path).is_some_and(|(known_at, known)| *known_at > started_at || (*known_at == started_at && *known != session.id)) { continue; }
+            self.setup_ui.terminals.insert(path.clone(), (started_at, session.id));
+            let status = terminal_status(session, card.existence.is_open(), self.terminal_start_in_flight(card.id));
             self.setup_ui.statuses.insert(path.clone(), status);
         }
         let roots = self.sidebar_model.projects.iter().flat_map(|project| project.worktrees.iter().map(|worktree| worktree.path.clone())).collect::<HashSet<_>>();
@@ -185,6 +185,18 @@ impl Cagents {
 }
 
 impl Cagents {
+    pub(super) fn setup_review_on_top(&self) -> bool {
+        #[cfg(feature = "integrated-browser")]
+        if self.browser_import.open() { return false; }
+        self.project_ui.setup_review.is_some() && !self.update_prepared
+            && self.update_ui.confirmation.is_none() && !self.session_recovery.open()
+            && !self.daemon_health_ui.confirmation && !self.automation_approval_open()
+            && self.transient_work_close.is_none() && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open && self.chat_ui.image_viewer.is_none()
+            && self.terminal_paste.is_none() && !self.terminal_close_dialog_visible()
+            && !self.settings_reset_confirm && self.sidebar_state.pending_discard().is_none()
+            && self.dirty_repository_close.is_none() && self.sidebar_selection_ui.dialog.is_none()
+    }
     pub(super) fn forget_worktree_setup(&mut self, path: &Path) {
         self.setup_ui.recovered.remove(path); self.setup_ui.statuses.remove(path); self.setup_ui.terminals.remove(path);
     }
@@ -227,6 +239,7 @@ impl Cagents {
     }
 
     pub(super) fn confirm_setup_review(&mut self, skip: bool) -> Task<Message> {
+        if !self.setup_review_on_top() { return Task::none(); }
         let Some(review) = self.project_ui.setup_review.as_mut() else { return Task::none(); };
         if review.loading || (!skip && (review.error.is_some() || (!review.trusted && !review.approved))) { return Task::none(); }
         let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store) else { review.error = Some("The setup journal is unavailable".into()); return Task::none(); };
@@ -265,6 +278,16 @@ impl Cagents {
         }
         match result {
             Ok((creation, path, intent)) => {
+                if !self.setup_review_on_top() {
+                    // A higher-priority dialog or update freeze took over
+                    // while metadata was saved. Preserve the reviewed intent
+                    // but require a new deliberate resume when it is exposed.
+                    self.recover_worktree_setup(creation, path, intent.clone());
+                    if let Some(review) = &mut self.project_ui.setup_review {
+                        review.expected = intent.clone(); review.current = intent; review.loading = false;
+                    }
+                    return Task::none();
+                }
                 self.project_ui.setup_review = None;
                 self.start_worktree_setup(creation, path, intent)
             }
@@ -348,6 +371,28 @@ mod tests {
         let mut skipped = intent; skipped.skip = true;
         app.recover_worktree_setup(creation, path.clone(), skipped);
         assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Skipped);
+    }
+
+    #[test]
+    fn setup_review_user_actions_require_the_exposed_modal_and_no_update_freeze() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = OperationId::new();
+        app.project_ui.setup_review = Some(Review { request: id, creation: id, path: "/repo".into(),
+            expected: SetupIntent::default(), current: SetupIntent::default(), loading: false,
+            trusted: true, approved: false, error: None, token: CancellationToken::new() });
+        assert!(app.setup_review_on_top());
+        for frozen in [false, true] {
+            app.update_prepared = frozen; app.settings_reset_confirm = !frozen;
+            assert!(!app.setup_review_on_top());
+            drop(app.handle_project_action(project_ui::Action::SetupReviewTrust(true)));
+            assert!(!app.project_ui.setup_review.as_ref().unwrap().approved);
+            let task = app.confirm_setup_review(true);
+            assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+            assert!(!app.project_ui.setup_review.as_ref().unwrap().loading);
+        }
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(project_ui::Action::SetupReviewTrust(true))));
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(project_ui::Action::ConfirmSetupReview { skip: false })));
+        assert!(!user_message_blocked_during_update(&Message::ProjectUi(project_ui::Action::SetupReviewLoaded { request: id, result: Err("fixture".into()) })));
     }
 
     #[test]

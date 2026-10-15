@@ -1182,7 +1182,7 @@ impl Cagents {
                 }
             }
             Action::SetupReviewLoaded { request, result } => self.setup_review_loaded(request, result),
-            Action::SetupReviewTrust(value) => { if let Some(review) = &mut self.project_ui.setup_review { review.approved = value; } },
+            Action::SetupReviewTrust(value) => { if self.setup_review_on_top() && let Some(review) = &mut self.project_ui.setup_review { review.approved = value; } },
             Action::ConfirmSetupReview { skip } => return self.confirm_setup_review(skip),
             Action::SetupReviewReady { request, result } => return self.setup_review_ready(request, result),
             Action::Dismiss => {
