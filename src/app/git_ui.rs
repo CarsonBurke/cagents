@@ -278,6 +278,13 @@ impl State {
             }
             let previous = reload.previous;
             if let Some(previous) = &previous {
+                for (record, status) in &mut snapshot.worktrees {
+                    if status.is_none() && snapshot.status_errors.contains_key(&record.id) {
+                        *status = previous.worktrees.iter().find(|(old, _)|
+                            old.id == record.id && old.path == record.path)
+                            .and_then(|(_, status)| status.clone());
+                    }
+                }
                 for (record, _) in &previous.worktrees {
                     snapshot.status_reads.entry(record.id).or_insert(loaded.status_order.listing);
                 }
@@ -295,7 +302,17 @@ impl State {
                 }
             }
             for (id, update) in reload.bound {
-                if snapshot.status_reads.get(&id).is_some_and(|read| *read > update.read) { continue; }
+                if snapshot.status_reads.get(&id).is_some_and(|read| *read > update.read) {
+                    // A newer failed attempt owns the unavailable marker, but
+                    // an earlier accepted success is still useful last-known
+                    // display data, including during initial Entry absence.
+                    if snapshot.status_errors.contains_key(&id)
+                        && let Some((_, status)) = snapshot.worktrees.iter_mut()
+                            .find(|(record, _)| record.id == id && record.path == update.path)
+                        && status.is_none()
+                    { *status = update.status; }
+                    continue;
+                }
                 // A successful bound read also proves a previously listed row
                 // survived an older omission. Preserve its original record.
                 if !snapshot.worktrees.iter().any(|(record, _)| record.id == id)
