@@ -285,6 +285,85 @@ mod tests {
     }
 
     #[test]
+    fn anchored_new_tab_press_cannot_activate_a_replacement_opening() {
+        use iced::advanced::{clipboard, widget::{Operation, operation}};
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        struct ButtonBounds(Option<iced::Rectangle>);
+        impl Operation for ButtonBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle,
+                _state: &mut dyn operation::Focusable) {
+                if id == Some(&widget::Id::new("chrome.new-tab.browser")) {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        for replace in [false, true] {
+            let mut app = tab_fixture(1, 900.0);
+            drop(app.update_chrome(Action::ToggleNewTab));
+            let original = app.chrome_ui.new_tab_target.as_ref().unwrap().request;
+            let mut renderer = super::super::tests::headless_renderer();
+            let size = iced::Size::new(900.0, 800.0);
+            let mut messages = Vec::new();
+            let (cache, point) = {
+                let mut ui = UserInterface::build(app.new_tab_control(), size,
+                    Cache::new(), &mut renderer);
+                let mut bounds = ButtonBounds(None);
+                ui.operate(&renderer, &mut bounds);
+                let point = bounds.0.expect("actual anchored Browser row").center();
+                let (_, status) = ui.update(
+                    &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))],
+                    iced::mouse::Cursor::Available(point), &mut renderer,
+                    &mut clipboard::Null, &mut messages);
+                assert_eq!(status, vec![iced::event::Status::Captured]);
+                assert!(messages.is_empty(), "a button authorizes on release");
+                (ui.into_cache(), point)
+            };
+            if replace {
+                // No unmounted frame: preserve the actual named widget cache
+                // containing A's press while the reducer closes and opens B.
+                drop(app.update_chrome(Action::Close));
+                drop(app.update_chrome(Action::ToggleNewTab));
+            } else {
+                app.notices.record(TransientNotice::warning("Unrelated chrome change"));
+            }
+            let current = app.chrome_ui.new_tab_target.as_ref().unwrap().request;
+            assert_eq!(current == original, !replace);
+            let mut ui = UserInterface::build(app.new_tab_control(), size, cache, &mut renderer);
+            // Apply the popup's normal initial focus. Native unfocus alone
+            // does not clear a previously pressed button's pointer state.
+            ui.operate(&renderer, &mut operation::focusable::focus::<()>(
+                widget::Id::new("chrome.new-tab.thread")));
+            ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))],
+                iced::mouse::Cursor::Available(point), &mut renderer,
+                &mut clipboard::Null, &mut messages);
+            let requests: Vec<_> = messages.iter().filter_map(|message| match message {
+                Message::ChromeUi(Action::RunNewTab(request)) => Some(request), _ => None,
+            }).collect();
+            assert_eq!(requests.len(), usize::from(!replace),
+                "only an unchanged opening may finish its prior native press");
+            if !replace {
+                assert_eq!(requests[0].target.request, current);
+                continue;
+            }
+            messages.clear();
+            ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))],
+                iced::mouse::Cursor::Available(point), &mut renderer,
+                &mut clipboard::Null, &mut messages);
+            assert!(messages.iter().any(|message| matches!(message,
+                Message::ChromeUi(Action::RunNewTab(request))
+                    if request.target.request == current
+                        && request.command == workspace_widget::GlobalShortcut::NewBrowser)),
+                "a fresh click must still activate B's current registered row");
+        }
+    }
+
+    #[test]
     fn mounted_workspace_controls_keep_global_keys_without_borrowing_pane_focus() {
         use iced::Size;
         use iced::advanced::{clipboard, widget::operation::focusable};
@@ -2141,7 +2220,7 @@ impl Cagents {
                 workspace_widget::shortcut_tooltip(command, &self.settings.keyboard_shortcuts),
             ).into())
         });
-        widget::column::with_children(vec![
+        let content: Element<'_, Message> = widget::column::with_children(vec![
             widget::container(design::heading("New tab"))
                 .padding([6.0, space::S])
                 .into(),
@@ -2150,7 +2229,14 @@ impl Cagents {
         ])
         .spacing(6)
         .width(design::COMMAND_POPOVER_WIDTH)
-        .into()
+        .into();
+        match &self.chrome_ui.new_tab_target {
+            // The popup is anchored outside the global modal surface. Bind
+            // its named native button state to this opening too: an earlier
+            // press must not become the replacement opening's release.
+            Some(target) => crate::interaction::owned_surface(content, target.request),
+            None => content,
+        }
     }
 
     fn has_chrome_notices(&self) -> bool {
