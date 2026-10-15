@@ -137,7 +137,9 @@ pub(super) fn perform(
                     .daemon
                     .as_ref()
                     .map(|daemon| daemon.capability.proof.clone()),
-            )
+            )?;
+            let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy)).map_err(io::Error::other)?;
+            validate_before_close(&confirmed, &latest).map_err(io::Error::other)
         })?;
     let mut startup_pending = false;
     let result = (|| {

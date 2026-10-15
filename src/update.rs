@@ -1013,7 +1013,12 @@ fn perform_update(
                     .daemon
                     .as_ref()
                     .map(|daemon| daemon.capability.proof.clone()),
-            )
+            )?;
+            let latest = observe_impact(
+                &staged.identity,
+                confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+            ).map_err(io::Error::other)?;
+            validate_before_close(&confirmed, &latest).map_err(io::Error::other)
         })?;
     let install_result = (|| {
         Installation::detect()?;
