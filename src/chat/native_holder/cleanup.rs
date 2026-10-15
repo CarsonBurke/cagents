@@ -145,7 +145,7 @@ pub(super) struct Startup {
 impl Startup {
     pub fn consume(&self) -> Result<bool, String> {
         consume(self.terminal, &self.holder, false, |receipt| {
-            receipt.record.version == 3
+            matches!(receipt.record.version, 3 | 4)
                 && receipt.record.terminal == self.terminal
                 && receipt.record.holder == self.holder
                 && receipt.record.kind == Kind::Native
@@ -263,7 +263,7 @@ fn find_source(
         let holder = Process { pid, start };
         let mut matched = None;
         let complete = consume(source.id, &holder, true, |receipt| {
-            if receipt.record.version == 3
+            if matches!(receipt.record.version, 3 | 4)
                 && receipt.record.terminal == source.id
                 && receipt.record.holder == holder
                 && receipt.record.kind == Kind::Native

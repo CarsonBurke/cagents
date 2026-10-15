@@ -393,6 +393,7 @@ mod tests {
     fn terminal_holder(source: &super::super::Session) -> crate::terminal::holder::Record {
         crate::terminal::holder::Record {
             version: 4,
+            build: Some(crate::daemon::holder_registry::BuildIdentity::current(crate::daemon::holder_registry::Kind::Terminal)),
             kind: crate::daemon::holder_registry::Kind::Terminal,
             application: crate::instance::APPLICATION_ID.into(),
             boot: source.proof.as_ref().unwrap().boot_id.clone(),
