@@ -184,6 +184,9 @@ struct Resolution {
 
 #[derive(Debug, Clone)]
 pub struct WorktreeDialog {
+    /// Per-open consent identity. The modal surface captures this before
+    /// emitting user messages, independently of asynchronous lookup IDs.
+    request: OperationId,
     project_id: ProjectId,
     repository: PathBuf,
     draft: WorktreeDraft,
@@ -196,8 +199,13 @@ pub struct WorktreeDialog {
 }
 
 impl WorktreeDialog {
+    pub(super) fn request(&self) -> OperationId {
+        self.request
+    }
+
     pub fn new(project_id: ProjectId, repository: PathBuf, draft: WorktreeDraft) -> Self {
         Self {
+            request: OperationId::new(),
             project_id,
             repository,
             advanced: draft.uses_options(),
