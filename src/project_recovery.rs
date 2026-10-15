@@ -122,6 +122,21 @@ pub fn root_missing(root: &Path) -> bool { missing_reason(root).is_some() }
 mod tests {
     use super::*;
     #[test]
+    fn guarded_project_wire_roundtrip_preserves_registry_rank_worker_and_provider_fences() {
+        use crate::terminal_ipc::{ClientRequest, ServerResponse};
+        let project = ProjectInstance { registry: uuid::Uuid::new_v4(), repository: "/project/.git".into(), ordinal: 7 };
+        let source = crate::chat::Session { id: crate::model::TerminalId::new(), launch: crate::chat::Launch { provider: crate::agent::Provider::Claude, session_id: Some("exact-thread".into()), recipe: crate::model::LaunchRecipe { program: "claude".into(), arguments: vec!["--resume".into(),"exact-thread".into()], working_directory: "/project".into(), environment: Default::default(), unset_environment: Default::default() } }, proof: None, terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
+        let sessions = vec![SessionClose { source: crate::agent_execution::HostedSession::Chat(source), execution_instance: Some(uuid::Uuid::new_v4()), provider: Some(ProviderIncarnation { pid: 1234, start: 987654321 }) }];
+        for request in [ClientRequest::ProjectCloseInventory { project: project.clone() }, ClientRequest::CloseProjectGuarded { project: project.clone(), sessions: sessions.clone() }, ClientRequest::EditWorkspaceModel { edit: crate::workspace_model::ModelEdit::CloseProjectInstance { project } }] {
+            let bytes = postcard::to_allocvec(&request).unwrap();
+            assert_eq!(postcard::from_bytes::<ClientRequest>(&bytes).unwrap(),request);
+        }
+        let response = ServerResponse::ProjectCloseInventory { sessions };
+        let bytes = postcard::to_allocvec(&response).unwrap();
+        assert_eq!(postcard::from_bytes::<ServerResponse>(&bytes).unwrap(),response);
+    }
+
+    #[test]
     fn missing_directory_recovers_when_it_reappears() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("project");
