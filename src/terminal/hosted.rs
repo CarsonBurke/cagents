@@ -164,6 +164,7 @@ pub struct HostedKeyReceipt {
 }
 struct KeyReceiptState {
     outcome: OnceLock<Result<HostedTerminalBinding, String>>,
+    admission_proof: OnceLock<HostSessionProof>,
     gate: Mutex<()>,
     changed: Condvar,
 }
@@ -182,6 +183,16 @@ impl KeyReceiptState {
     }
 }
 impl HostedKeyReceipt {
+    /// Historical authority from this key's authenticated Accepted frame.
+    /// It remains available after detach, and never reads a later connection
+    /// or live attachment getter. Pending/refused keys grant no authority.
+    pub fn admission_host_proof(&self) -> Option<HostSessionProof> {
+        if !matches!(self.state.outcome.get(), Some(Ok(_))) {
+            return None;
+        }
+        self.state.admission_proof.get().cloned()
+    }
+
     /// A clone observes the same immutable completion; reading one clone never
     /// consumes another clone's ownership evidence.
     pub fn try_recv(&self) -> Result<Result<HostedTerminalBinding, String>, TryRecvError> {
@@ -306,6 +317,26 @@ impl HostedPublishedState {
             attachment_changed: Condvar::new(),
             wake,
         }
+    }
+
+    fn admit_key(
+        &self,
+        ticket: u64,
+        result: Result<HostedTerminalBinding, String>,
+        proof: &HostSessionProof,
+    ) {
+        if result.is_ok() {
+            let deliveries = self
+                .key_deliveries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(delivery) = deliveries.pending.get(&ticket) {
+                // Publish the exact matching frame's proof before its Ok
+                // outcome, so delayed UI reaping needs no current attachment.
+                let _ = delivery.completed.admission_proof.set(proof.clone());
+            }
+        }
+        self.complete_key(ticket, result);
     }
 
     fn complete_key(&self, ticket: u64, result: Result<HostedTerminalBinding, String>) {
@@ -735,6 +766,7 @@ impl HostedPublishedState {
             .attachment
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attachment.confirmed = false;
         if attachment.failure.is_none() {
             attachment.failure = Some(message);
         }
@@ -1207,6 +1239,7 @@ impl HostedTerminalHandle {
         }
         let state = Arc::new(KeyReceiptState {
             outcome: OnceLock::new(),
+            admission_proof: OnceLock::new(),
             gate: Mutex::new(()),
             changed: Condvar::new(),
         });
@@ -1696,6 +1729,11 @@ async fn client_loop(
             reconnect_delay = INITIAL_RECONNECT_DELAY;
         })
         .await;
+        published
+            .attachment
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .confirmed = false;
         if published.has_in_flight_key() {
             stop.request();
             published.fail_keys(
@@ -2337,7 +2375,7 @@ async fn serve_connection(
                         let result = published.worker_binding.get().cloned().ok_or_else(|| {
                             "key accepted without authenticated worker identity".to_owned()
                         });
-                        published.complete_key(ticket, result);
+                        published.admit_key(ticket, result, &proof);
                     }
                     (PendingRequest::KeyDelivery(ticket), unexpected) => {
                         published.complete_key(
@@ -3815,6 +3853,7 @@ mod tests {
             "tracked admission retains the final actor"
         );
         assert_eq!(receipt.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(receipt.admission_host_proof(), None);
         let before = wakes.load(Ordering::Relaxed);
         receipt_response(
             &mut stream,
@@ -3840,6 +3879,8 @@ mod tests {
             wakes.load(Ordering::Relaxed) > before,
             "receipt completion wakes an evicted owner"
         );
+        assert_eq!(receipt.admission_host_proof(), Some(proof.clone()));
+        assert_eq!(observer.admission_host_proof(), Some(proof.clone()));
         assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
     }
 
