@@ -881,13 +881,20 @@ impl Cagents {
                 .push(channel);
         }
         for project in &mut self.sidebar_model.projects {
+            let primary_branch = project.worktrees.iter()
+                .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+                .and_then(|worktree| worktree.branch.as_deref());
             let mut index = 0;
             // Built in the durable vector's own order, which is the registry's
             // ascending creation ranks. Display order is not decided here:
             // `sidebar::channels_in_display_order` owns it, one named ordering
             // helper per row kind beside the one the worktree rows use.
             for channel in channels.get(&project.id).into_iter().flatten().copied() {
-                let title = channel_display_title(channel);
+                let title = if channel.title.is_empty() {
+                    new_channel_title(primary_branch)
+                } else {
+                    channel_display_title(channel).to_owned()
+                };
                 let selected = durable.active_channel == Some(channel.id);
                 let deletion = channel_ui.row_deletion(channel.id);
                 let mut activity = None;
@@ -961,6 +968,16 @@ fn channel_title_from_prompt(prompt: &str) -> Option<String> {
     crate::workspace_model::channel_title_from_prompt(prompt)
 }
 
+fn new_channel_title(branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!(
+            "New channel · {}",
+            branch.strip_prefix("refs/heads/").unwrap_or(branch)
+        ),
+        None => "New channel".into(),
+    }
+}
+
 /// A channel still waiting for its first accepted prompt has to be nameable
 /// anyway: a row has to label it, and a dialog about to destroy it has to say
 /// which one it means.
@@ -976,6 +993,13 @@ pub(super) fn channel_display_title(channel: &ProjectChannel) -> &str {
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn new_channel_titles_name_the_branch() {
+        assert_eq!(new_channel_title(Some("feature/login")), "New channel · feature/login");
+        assert_eq!(new_channel_title(Some("refs/heads/main")), "New channel · main");
+        assert_eq!(new_channel_title(None), "New channel");
+    }
 
     #[test]
     fn missing_daemon_is_not_close_proof_for_a_retained_native_card() {
@@ -1066,6 +1090,9 @@ mod tests {
 
         let _ = app.handle_channel_ui(Action::Create(project));
         let first = app.durable.active_channel.expect("the first channel opens");
+        assert_eq!(app.active_workspace.as_deref(), Some(Path::new("/repo")));
+        app.refresh_sidebar_channels();
+        assert_eq!(app.sidebar_model.projects[0].channels[0].title, "New channel · main");
         let _ = app.handle_channel_ui(Action::Create(project));
         let second = app
             .durable
