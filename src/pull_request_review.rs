@@ -105,6 +105,7 @@ pub enum ViewedSync {
 pub struct ReviewFile {
     pub entry: DiffEntry,
     pub viewed: bool,
+    pub changed_since_viewed: bool,
     pub sync: ViewedSync,
 }
 
@@ -205,6 +206,7 @@ pub enum Action {
     PreviousChange,
     SetFileListMode(FileListMode),
     ToggleHideViewed,
+    ToggleChangedSinceViewed,
     ToggleViewed(RepoPath),
     SetDirectoryViewed {
         directory: RepoPath,
@@ -431,6 +433,7 @@ pub struct State {
     rows: Vec<Row>,
     file_list_mode: FileListMode,
     hide_viewed: bool,
+    only_changed_since_viewed: bool,
     collapsed_directories: BTreeSet<RepoPath>,
     selected: Option<RepoPath>,
     notice: Option<String>,
@@ -491,6 +494,7 @@ impl State {
             .map(|file| ReviewFile {
                 entry: file.entry.clone(),
                 viewed: file.viewed,
+                changed_since_viewed: file.changed_since_viewed,
                 sync: if snapshot.unknown_paths.contains(&file.entry.path) {
                     ViewedSync::Unknown
                 } else if file.unverified {
@@ -543,6 +547,7 @@ impl State {
                 .map(|file| cache::File {
                     entry: file.entry.clone(),
                     viewed: file.viewed,
+                    changed_since_viewed: file.changed_since_viewed,
                     unverified: file.sync != ViewedSync::Settled,
                 })
                 .collect(),
@@ -627,6 +632,7 @@ impl State {
             rows: Vec::new(),
             file_list_mode: FileListMode::Tree,
             hide_viewed: false,
+            only_changed_since_viewed: false,
             collapsed_directories: BTreeSet::new(),
             selected: None,
             notice: None,
@@ -1021,6 +1027,11 @@ impl State {
                 self.rebuild_rows();
                 ActionTask::none()
             }
+            Action::ToggleChangedSinceViewed => {
+                self.only_changed_since_viewed = !self.only_changed_since_viewed;
+                self.pages.offset = 0.0;
+                ActionTask::none()
+            }
             Action::ToggleHideViewed => {
                 self.hide_viewed = !self.hide_viewed;
                 ActionTask::none()
@@ -1072,6 +1083,7 @@ impl State {
                     let file = &mut self.files[index];
                     match outcome {
                         ViewedOutcome::Applied => {
+                            file.changed_since_viewed = false;
                             file.sync = ViewedSync::Settled;
                         }
                         ViewedOutcome::NotApplied(message) => {
@@ -1409,10 +1421,10 @@ impl State {
         self.cached_viewer = None;
         self.notice = None;
         self.cache_dirty = true;
-        let previous: HashMap<RepoPath, (bool, ViewedSync)> = self
+        let previous: HashMap<RepoPath, (bool, ViewedSync, bool)> = self
             .files
             .drain(..)
-            .map(|file| (file.entry.path, (file.viewed, file.sync)))
+            .map(|file| (file.entry.path, (file.viewed, file.sync, file.changed_since_viewed)))
             .collect();
         // The open file compares against the whole basis, which the base
         // moving under the pull request changes as surely as a new head.
@@ -1448,9 +1460,10 @@ impl State {
         }
         for file in &mut self.files {
             if !authority_changed
-                && let Some((viewed, ViewedSync::Pending)) = previous.get(&file.entry.path)
+                && let Some((viewed, ViewedSync::Pending, changed)) = previous.get(&file.entry.path)
             {
                 file.viewed = *viewed;
+                file.changed_since_viewed = *changed;
                 file.sync = ViewedSync::Pending;
             }
         }
@@ -1976,6 +1989,10 @@ impl State {
             .selected(self.hide_viewed)
             .on_press_maybe((!modal_open).then_some(Action::ToggleHideViewed))
             .into(),
+            icon_button(Icon::History, "Only files changed since you viewed")
+                .selected(self.only_changed_since_viewed)
+                .on_press_maybe((!modal_open).then_some(Action::ToggleChangedSinceViewed))
+                .into(),
             icon_button(Icon::ChevronRight, "Next unviewed file")
                 .on_press_maybe(
                     (!modal_open && self.files.iter().any(|file| !file.viewed))
@@ -1984,8 +2001,9 @@ impl State {
                 .into(),
         ]);
         let viewed = self.files.iter().filter(|file| file.viewed).count();
+        let changed = self.files.iter().filter(|file| file.changed_since_viewed).count();
         let toolbar = widget::row::with_children(vec![
-            design::caption(format!("{viewed}/{} viewed", self.files.len()))
+            design::caption(format!("{viewed}/{} viewed · {changed} changed since viewed", self.files.len()))
                 .width(Length::Fill)
                 .into(),
             controls,
@@ -2033,13 +2051,18 @@ impl State {
     }
 
     fn displayed_file_rows(&self, tallies: &[(usize, usize, usize)]) -> Vec<usize> {
+        let changed_paths: BTreeSet<PathBuf> = if self.only_changed_since_viewed {
+            self.files.iter().filter(|file| file.changed_since_viewed)
+                .flat_map(|file| file.entry.path.as_path().ancestors().map(Path::to_path_buf))
+                .collect()
+        } else { BTreeSet::new() };
         visible_review_rows(&self.rows, &self.collapsed_directories)
             .filter(|(index, row)| {
-                !self.hide_viewed
+                (!self.only_changed_since_viewed || changed_paths.contains(row.path.as_path())) && (!self.hide_viewed
                     || match row.file {
                         Some(file) => !self.files[file].viewed,
                         None => tallies[*index].0 != tallies[*index].1,
-                    }
+                    })
             })
             .map(|(index, _)| index)
             .collect()
@@ -2093,6 +2116,7 @@ impl State {
         if rows.is_empty() {
             let message = match &self.load {
                 LoadState::Loading => "",
+                LoadState::Ready if self.only_changed_since_viewed => "No files changed since you viewed them.",
                 LoadState::Ready if self.hide_viewed && !self.files.is_empty() => {
                     "All files viewed."
                 }
@@ -2167,6 +2191,12 @@ impl State {
                 )
                 .into(),
             );
+        }
+        if file.changed_since_viewed {
+            trailing.push(crate::interaction::tooltip(
+                widget::icon(Icon::History.handle()).size(design::COMPACT_ICON_SIZE),
+                "Changed since you viewed",
+            ));
         }
         trailing.push(viewed_control(
             Mark::from_file(file),
@@ -2776,12 +2806,13 @@ fn join_files(entries: &[DiffEntry], files: &PullRequestFiles) -> Vec<ReviewFile
     let mut joined: Vec<ReviewFile> = entries
         .iter()
         .map(|entry| {
-            let viewed = remote
-                .remove(entry.path.display().as_ref())
-                .is_some_and(|file| file.viewer_viewed_state == FileViewedState::Viewed);
+            let mark = remote.remove(entry.path.display().as_ref()).map(|file| &file.viewer_viewed_state);
+            let viewed = mark == Some(&FileViewedState::Viewed);
+            let changed_since_viewed = mark == Some(&FileViewedState::Dismissed);
             ReviewFile {
                 entry: entry.clone(),
                 viewed,
+                changed_since_viewed,
                 sync: ViewedSync::Settled,
             }
         })
@@ -2801,6 +2832,7 @@ fn join_files(entries: &[DiffEntry], files: &PullRequestFiles) -> Vec<ReviewFile
                 removed_lines: Some(file.deletions),
             },
             viewed: file.viewer_viewed_state == FileViewedState::Viewed,
+            changed_since_viewed: file.viewer_viewed_state == FileViewedState::Dismissed,
             sync: ViewedSync::Settled,
         });
     }
@@ -3375,6 +3407,7 @@ pub(crate) mod tests {
         snapshot.files.push(cache::File {
             entry: entry("z.rs", ChangeKind::Modified),
             viewed: false,
+            changed_since_viewed: false,
             unverified: false,
         });
         state.adopt_cache(snapshot);

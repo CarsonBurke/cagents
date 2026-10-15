@@ -117,6 +117,7 @@ impl State {
                         && let Some(remote) = marks.get(file.entry.path.display().as_ref())
                     {
                         file.viewed = remote.viewer_viewed_state == FileViewedState::Viewed;
+                        file.changed_since_viewed = remote.viewer_viewed_state == FileViewedState::Dismissed;
                         file.sync = ViewedSync::Settled;
                     }
                 }
@@ -343,6 +344,7 @@ mod tests {
                     ChangeKind::Modified,
                 ),
                 viewed: false,
+                changed_since_viewed: false,
                 sync: ViewedSync::Unknown,
             })
             .collect();

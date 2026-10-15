@@ -86,6 +86,8 @@ impl WriteOrder {
 pub struct File {
     pub entry: DiffEntry,
     pub viewed: bool,
+    #[serde(default)]
+    pub changed_since_viewed: bool,
     /// An optimistic mark whose acknowledgement was not saved before exit.
     pub unverified: bool,
 }
@@ -155,6 +157,7 @@ pub(crate) fn fixture() -> Snapshot {
         files: vec![File {
             entry,
             viewed: true,
+            changed_since_viewed: false,
             unverified: true,
         }],
         saved_ms: 1,
