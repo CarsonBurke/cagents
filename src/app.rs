@@ -500,7 +500,7 @@ impl NoticeLog {
             return;
         }
         self.record_at(notice, now);
-        if let Some(entry) = self.entries.back_mut() {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.notice.key.as_deref() == Some(KEY)) {
             entry.expires_at = expires_at;
         }
     }
@@ -13338,7 +13338,7 @@ impl Application for Cagents {
         let retry_workspace_visibility = matches!(&message,
             Message::TerminalStarted { .. } | Message::RetainedTerminalAttached { .. }
             | Message::RestoredAgentAttached { .. } | Message::ChatUi(chat_ui::Action::Ready(..))
-            | Message::LifecycleSweep)
+            | Message::LifecycleSweep | Message::Viewport { .. })
             || matches!(&message, Message::DaemonHealth(health) if !health.unavailable());
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
@@ -16672,7 +16672,8 @@ impl Application for Cagents {
         self.sync_worktree_protections();
         self.sync_popup_keyboard_nav();
         if retry_workspace_visibility
-            && self.notices.condition("workspace-session-visibility").is_some()
+            && (self.notices.condition("workspace-session-visibility").is_some()
+                || self.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility")))
         {
             // Transport health and attachment completion are reasons to retry,
             // not proof that this particular view accepted its update.
@@ -20242,6 +20243,21 @@ mod tests {
     }
 
     #[test]
+    fn evicted_recovery_success_never_expires_an_unrelated_error() {
+        let mut log = NoticeLog::default();
+        let now = Instant::now();
+        for index in 0..NOTICE_LOG_CAPACITY {
+            log.record_at(TransientNotice::error(format!("Unresolved error {index}")), now);
+        }
+        log.record_at(TransientNotice::success("Daemon reconnected 1 chat.")
+            .key("daemon-connectivity"), now);
+        assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
+        assert!(log.entries.iter().all(|entry| entry.notice.severity == NoticeSeverity::Error && entry.expires_at.is_none()));
+        log.expire(now + Duration::from_secs(7));
+        assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
+    }
+
+    #[test]
     fn successes_expire_and_errors_remain() {
         let mut log = NoticeLog::default();
         let now = Instant::now();
@@ -20312,8 +20328,8 @@ mod tests {
             log.record(TransientNotice::warning(format!("failure {index}")));
         }
         assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
-        // The surviving error was evicted, so the header must stop claiming one.
-        assert_eq!(log.severity(), Some(NoticeSeverity::Warning));
+        // Lower-severity traffic cannot evict the unresolved error.
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
 
         log.clear();
         assert!(log.is_empty());
