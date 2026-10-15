@@ -314,7 +314,11 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
         id,
         directory,
         named: titles.named.is_some() || titles.generated.is_some() || titles.summary.is_some(),
-        title: titles.named.or(titles.generated).or(titles.summary).or(prompt),
+        title: titles
+            .named
+            .or(titles.generated)
+            .or(titles.summary)
+            .or(prompt),
     };
     // Codex keeps a conversation's name apart from it, in [`names`].
     if provider == Provider::Codex {
@@ -697,19 +701,29 @@ mod tests {
 
     #[test]
     fn claude_resume_uses_custom_then_generated_name_then_content_fallback() {
-        let directory = tempfile::tempdir().unwrap(); let path = directory.path().join("session.jsonl");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
         let id = "12345678-1234-4234-8234-123456789abc";
         let prompt = json!({"type":"user","sessionId":id,"cwd":"/project","message":{"content":"\"\n> Quoted old context\nReview bundle encryption and performance"}});
         let ai = json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated encryption audit"});
         std::fs::write(&path, format!("{prompt}\n{ai}\n")).unwrap();
         let found = header(Provider::Claude, &path).unwrap();
-        assert_eq!(found.title.as_deref(), Some("Generated encryption audit")); assert!(found.named);
-        let custom = json!({"type":"custom-title","sessionId":id,"customTitle":"My bundle project"});
+        assert_eq!(found.title.as_deref(), Some("Generated encryption audit"));
+        assert!(found.named);
+        let custom =
+            json!({"type":"custom-title","sessionId":id,"customTitle":"My bundle project"});
         std::fs::write(&path, format!("{prompt}\n{custom}\n{ai}\n")).unwrap();
-        assert_eq!(header(Provider::Claude, &path).unwrap().title.as_deref(), Some("My bundle project"));
+        assert_eq!(
+            header(Provider::Claude, &path).unwrap().title.as_deref(),
+            Some("My bundle project")
+        );
         std::fs::write(&path, format!("{prompt}\n")).unwrap();
         let found = header(Provider::Claude, &path).unwrap();
-        assert_eq!(found.title.as_deref(), Some("Review bundle encryption and performance")); assert!(!found.named);
+        assert_eq!(
+            found.title.as_deref(),
+            Some("Review bundle encryption and performance")
+        );
+        assert!(!found.named);
     }
 
     #[test]

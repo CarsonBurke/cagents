@@ -260,8 +260,11 @@ fn send(
     let model = loop {
         match client.edit_workspace_model(request.clone()) {
             Ok(model) => break model,
-            Err(ControlError::Remote { code: crate::terminal::ipc::ProtocolErrorCode::QueueFull, retryable: true, .. })
-                if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) => {
+            Err(ControlError::Remote {
+                code: crate::terminal::ipc::ProtocolErrorCode::QueueFull,
+                retryable: true,
+                ..
+            }) if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) => {
                 title_busy += 1;
                 if title_busy < 3 {
                     std::thread::sleep(Duration::from_millis(20 * title_busy));
@@ -1214,44 +1217,123 @@ mod tests {
 
     #[test]
     fn busy_title_publication_yields_after_three_original_attempts_to_the_next_edit() {
-        use crate::terminal::ipc::{ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
-            ProtocolError, ProtocolErrorCode, PROTOCOL_VERSION, read_frame, write_frame};
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+        };
         let id = ChannelId::new();
-        let title = ModelEdit::SuggestConversationTitle { id, card: crate::model::CardId::new(), expected_revision: 17,
-            title: "Encryption review".into(), source: crate::model::ChannelTitleSource::Provider };
-        let manual = ModelEdit::RetitleChannel { id, title: "My project".into() };
-        let expected_title = title.clone(); let expected_manual = manual.clone();
+        let title = ModelEdit::SuggestConversationTitle {
+            id,
+            card: crate::model::CardId::new(),
+            expected_revision: 17,
+            title: "Encryption review".into(),
+            source: crate::model::ChannelTitleSource::Provider,
+        };
+        let manual = ModelEdit::RetitleChannel {
+            id,
+            title: "My project".into(),
+        };
+        let expected_title = title.clone();
+        let expected_manual = manual.clone();
         let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let server = std::thread::spawn(move || {
-            let proof = crate::model::HostSessionProof { host_session_id: "title-publisher".into(),
-                boot_id: "fixture-boot".into(), host_incarnation: "fixture-incarnation".into() };
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "title-publisher".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "fixture-incarnation".into(),
+            };
             let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-            write_frame(&mut peer, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(hello.request_id), proof: proof.clone(),
-                message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: vec![] } } }).unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![],
+                        },
+                    },
+                },
+            )
+            .unwrap();
             for _ in 0..3 {
                 let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-                assert_eq!(request.request, ClientRequest::EditWorkspaceModel { edit: expected_title.clone() });
-                write_frame(&mut peer, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: proof.clone(),
-                    message: ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::QueueFull, "Resident metadata is busy", true)) }).unwrap();
+                assert_eq!(
+                    request.request,
+                    ClientRequest::EditWorkspaceModel {
+                        edit: expected_title.clone()
+                    }
+                );
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::QueueFull,
+                            "Resident metadata is busy",
+                            true,
+                        )),
+                    },
+                )
+                .unwrap();
             }
             let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
             assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
-            write_frame(&mut peer, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(read.request_id), proof: proof.clone(),
-                message: ServerMessage::Response { response: ServerResponse::WorkspaceModel { model: WorkspaceModel::default() } } }).unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(read.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: WorkspaceModel::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
             let next: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-            assert_eq!(next.request, ClientRequest::EditWorkspaceModel { edit: expected_manual });
-            write_frame(&mut peer, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(next.request_id), proof: proof.clone(),
-                message: ServerMessage::Response { response: ServerResponse::WorkspaceModel { model: WorkspaceModel::default() } } }).unwrap();
-            assert!(read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(), "No title replay after yielding");
+            assert_eq!(
+                next.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: expected_manual
+                }
+            );
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(next.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: WorkspaceModel::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            assert!(
+                read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                "No title replay after yielding"
+            );
         });
         let mut client = ControlClient::from_stream(client).unwrap();
         let (sender, updates) = async_channel::unbounded();
         send(&mut client, title.clone(), &sender).unwrap();
         assert!(matches!(updates.try_recv().unwrap(), ModelUpdate::Read(_)));
-        assert!(matches!(updates.try_recv().unwrap(), ModelUpdate::TitleDeferred(edit) if edit == title));
+        assert!(
+            matches!(updates.try_recv().unwrap(), ModelUpdate::TitleDeferred(edit) if edit == title)
+        );
         send(&mut client, manual, &sender).unwrap();
-        drop(client); server.join().unwrap();
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]

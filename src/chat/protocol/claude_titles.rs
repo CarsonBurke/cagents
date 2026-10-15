@@ -172,8 +172,14 @@ mod tests {
             Some("Bundle encryption review")
         );
         file.seek(SeekFrom::End(0)).unwrap();
-        append(&mut file, json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated bundle audit"}));
-        assert_eq!(named_title(&mut file, &id, cwd).as_deref(), Some("Generated bundle audit"));
+        append(
+            &mut file,
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated bundle audit"}),
+        );
+        assert_eq!(
+            named_title(&mut file, &id, cwd).as_deref(),
+            Some("Generated bundle audit")
+        );
         file.seek(SeekFrom::End(0)).unwrap();
         append(
             &mut file,

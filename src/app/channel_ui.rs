@@ -1191,30 +1191,85 @@ mod tests {
         use crate::workspace_model::views::{Pane, Scope, View};
         let mut app = super::super::tests::context_inspector_test_app(true);
         let utility = app.durable.cards[0].id;
-        let mut a = app.durable.cards[0].clone(); a.id = CardId::new(); a.kind = CardKind::Chat(chat_session());
-        let mut b = a.clone(); b.id = CardId::new(); b.kind = CardKind::Chat(chat_session());
-        let id = ChannelId::new(); let project = ProjectId::new();
+        let mut a = app.durable.cards[0].clone();
+        a.id = CardId::new();
+        a.kind = CardKind::Chat(chat_session());
+        let mut b = a.clone();
+        b.id = CardId::new();
+        b.kind = CardKind::Chat(chat_session());
+        let id = ChannelId::new();
+        let project = ProjectId::new();
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards.extend([a.clone(), b.clone()]);
-        durable.channels.push(ProjectChannel { id, project_id: project, title: String::new(), title_source: ChannelTitleSource::Prompt,
-            ordinal: 0, shared: true, cards: vec![utility, a.id, b.id], focused: Some(a.id) });
-        app.workspace_model.views.push(View { scope: Scope::Channel(id), revision: 1,
-            panes: vec![Pane::from_card(&a, Some("/repo".into())).unwrap(), Pane::from_card(&b, Some("/repo".into())).unwrap()], retired: Vec::new() });
-        assert_eq!(app.channel_primary_chat(&app.durable.channels[0]), Some(a.id));
-        assert!(!app.suggest_channel_title(b.id, "Sibling conversation".into(), ChannelTitleSource::Provider));
-        assert!(app.suggest_channel_title(a.id, "Encryption review".into(), ChannelTitleSource::Provider));
-        assert!(app.suggest_channel_title(a.id, "Encryption and throughput review".into(), ChannelTitleSource::Provider));
-        assert!(!app.suggest_channel_title(a.id, "Encryption and throughput review".into(), ChannelTitleSource::Provider));
+        durable.channels.push(ProjectChannel {
+            id,
+            project_id: project,
+            title: String::new(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 0,
+            shared: true,
+            cards: vec![utility, a.id, b.id],
+            focused: Some(a.id),
+        });
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(id),
+            revision: 1,
+            panes: vec![
+                Pane::from_card(&a, Some("/repo".into())).unwrap(),
+                Pane::from_card(&b, Some("/repo".into())).unwrap(),
+            ],
+            retired: Vec::new(),
+        });
+        assert_eq!(
+            app.channel_primary_chat(&app.durable.channels[0]),
+            Some(a.id)
+        );
+        assert!(!app.suggest_channel_title(
+            b.id,
+            "Sibling conversation".into(),
+            ChannelTitleSource::Provider
+        ));
+        assert!(app.suggest_channel_title(
+            a.id,
+            "Encryption review".into(),
+            ChannelTitleSource::Provider
+        ));
+        assert!(app.suggest_channel_title(
+            a.id,
+            "Encryption and throughput review".into(),
+            ChannelTitleSource::Provider
+        ));
+        assert!(!app.suggest_channel_title(
+            a.id,
+            "Encryption and throughput review".into(),
+            ChannelTitleSource::Provider
+        ));
         // A watcher can update the authoritative view before the local cards
         // are projected. Local stale primary membership alone grants nothing.
-        app.workspace_model.views[0].panes.swap(0, 1); app.workspace_model.views[0].revision += 1;
-        assert!(!app.suggest_channel_title(a.id, "Delayed old owner".into(), ChannelTitleSource::Provider));
+        app.workspace_model.views[0].panes.swap(0, 1);
+        app.workspace_model.views[0].revision += 1;
+        assert!(!app.suggest_channel_title(
+            a.id,
+            "Delayed old owner".into(),
+            ChannelTitleSource::Provider
+        ));
         let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
-        channel.cards = vec![utility, b.id, a.id]; channel.title.clear(); channel.title_source = ChannelTitleSource::Prompt;
-        assert!(app.suggest_channel_title(b.id, "Review the next task".into(), ChannelTitleSource::Prompt));
+        channel.cards = vec![utility, b.id, a.id];
+        channel.title.clear();
+        channel.title_source = ChannelTitleSource::Prompt;
+        assert!(app.suggest_channel_title(
+            b.id,
+            "Review the next task".into(),
+            ChannelTitleSource::Prompt
+        ));
         let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
-        channel.title = "My project name".into(); channel.title_source = ChannelTitleSource::Manual;
-        assert!(!app.suggest_channel_title(b.id, "Late generated name".into(), ChannelTitleSource::Provider));
+        channel.title = "My project name".into();
+        channel.title_source = ChannelTitleSource::Manual;
+        assert!(!app.suggest_channel_title(
+            b.id,
+            "Late generated name".into(),
+            ChannelTitleSource::Provider
+        ));
         assert_eq!(app.durable.channels[0].title, "My project name");
     }
 

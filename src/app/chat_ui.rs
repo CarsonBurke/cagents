@@ -5333,10 +5333,18 @@ impl Cagents {
         title: String,
         source: crate::model::ChannelTitleSource,
     ) {
-        let proof = self.workspace_model.views.iter().find_map(|view| match view.scope {
-            crate::workspace_model::views::Scope::Channel(id) if view.primary_chat() == Some(target.card) => Some((id, view.revision)),
-            _ => None,
-        });
+        let proof = self
+            .workspace_model
+            .views
+            .iter()
+            .find_map(|view| match view.scope {
+                crate::workspace_model::views::Scope::Channel(id)
+                    if view.primary_chat() == Some(target.card) =>
+                {
+                    Some((id, view.revision))
+                }
+                _ => None,
+            });
         let settled = self.durable.channels.iter().any(|channel| {
             channel.cards.contains(&target.card)
                 && (channel.title_source == crate::model::ChannelTitleSource::Manual
@@ -5351,11 +5359,28 @@ impl Cagents {
         }
     }
 
-    pub(super) fn defer_channel_title_suggestion(&mut self, edit: &crate::workspace_model::ModelEdit) {
-        let crate::workspace_model::ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } = edit else { return; };
+    pub(super) fn defer_channel_title_suggestion(
+        &mut self,
+        edit: &crate::workspace_model::ModelEdit,
+    ) {
+        let crate::workspace_model::ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        } = edit
+        else {
+            return;
+        };
         for (target, observation) in &mut self.chat_ui.channel_names {
-            if target.card == *card && observation.last_view == Some((*id, *expected_revision))
-                && observation.title.as_ref().is_some_and(|(current, kind)| current == title && kind == source) {
+            if target.card == *card
+                && observation.last_view == Some((*id, *expected_revision))
+                && observation
+                    .title
+                    .as_ref()
+                    .is_some_and(|(current, kind)| current == title && kind == source)
+            {
                 observation.pending = true;
             }
         }
@@ -5377,28 +5402,46 @@ impl Cagents {
                 self.chat_ui.channel_names.remove(&target);
             }
         }
-        let proofs = self.workspace_model.views.iter().filter_map(|view| match view.scope {
-            crate::workspace_model::views::Scope::Channel(id) => view.primary_chat().map(|card| (card, (id, view.revision))),
-            _ => None,
-        }).collect::<HashMap<_, _>>();
+        let proofs = self
+            .workspace_model
+            .views
+            .iter()
+            .filter_map(|view| match view.scope {
+                crate::workspace_model::views::Scope::Channel(id) => {
+                    view.primary_chat().map(|card| (card, (id, view.revision)))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         // A refused original revision is never rewritten in the publisher.
         // A newly accepted projection can make a fresh suggestion from the
         // current runtime; unchanged proofs do not create a retry loop.
         for (card, proof) in &proofs {
-            if !self.channel_needs_name(*card) { continue; }
+            if !self.channel_needs_name(*card) {
+                continue;
+            }
             let runtime = match self.cards.get(card) {
                 Some(CardRuntime::Chat(runtime)) => Some(runtime),
                 _ => self.chat_ui.parked.get(card).map(Box::as_ref),
             };
-            let Some(runtime) = runtime else { continue; };
+            let Some(runtime) = runtime else {
+                continue;
+            };
             let target = runtime.target;
-            if self.chat_ui.channel_names.get(&target).is_some_and(|observation| observation.last_view == Some(*proof)) {
+            if self
+                .chat_ui
+                .channel_names
+                .get(&target)
+                .is_some_and(|observation| observation.last_view == Some(*proof))
+            {
                 continue;
             }
             // A secondary conversation may have received its name while no
             // channel was eligible. Sample the current cached client snapshot
             // once at this new proof; do not wait for another provider wake.
-            let Some(snapshot) = runtime.handle().map(|handle| handle.snapshot()) else { continue; };
+            let Some(snapshot) = runtime.handle().map(|handle| handle.snapshot()) else {
+                continue;
+            };
             self.observe_channel_name(target, &snapshot);
             if let Some(observation) = self.chat_ui.channel_names.get_mut(&target) {
                 observation.pending = observation.title.is_some();
@@ -10043,32 +10086,74 @@ mod tests {
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let id = ChannelId::new();
-        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel { id, project_id: ProjectId::new(),
-            title: "Review original encryption task".into(), title_source: ChannelTitleSource::Prompt,
-            ordinal: 0, shared: true, cards: vec![card], focused: Some(card) }];
-        app.workspace_model.views = vec![View { scope: Scope::Channel(id), revision: 1, retired: Vec::new(),
-            panes: vec![Pane::from_card(app.card_state(card).unwrap(), Some(FIXTURE_DIRECTORY.into())).unwrap()] }];
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id,
+            project_id: ProjectId::new(),
+            title: "Review original encryption task".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 0,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        }];
+        app.workspace_model.views = vec![View {
+            scope: Scope::Channel(id),
+            revision: 1,
+            retired: Vec::new(),
+            panes: vec![
+                Pane::from_card(
+                    app.card_state(card).unwrap(),
+                    Some(FIXTURE_DIRECTORY.into()),
+                )
+                .unwrap(),
+            ],
+        }];
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         let mut snapshot = (*handle.snapshot()).clone();
-        snapshot.generation += 1; snapshot.title = None; snapshot.has_earlier = true;
-        snapshot.items = vec![Arc::new(chat::Item { id: "visible-window-edge".into(), role: chat::Role::User,
-            content: text("Fix a later unrelated task"), started_at: None, at: None })];
+        snapshot.generation += 1;
+        snapshot.title = None;
+        snapshot.has_earlier = true;
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "visible-window-edge".into(),
+            role: chat::Role::User,
+            content: text("Fix a later unrelated task"),
+            started_at: None,
+            at: None,
+        })];
         handle.publish_snapshot_for_test(snapshot.clone());
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
-        assert_eq!(app.durable.channels[0].title, "Review original encryption task");
+        assert_eq!(
+            app.durable.channels[0].title,
+            "Review original encryption task"
+        );
         assert!(app.chat_ui.channel_names[&target].title.is_none());
         // A confirmed provider name does not require the first history page.
-        let mut provider = snapshot.clone(); provider.title = Some("Provider encryption audit".into());
-        assert_eq!(snapshot_channel_name(&provider).unwrap(), ("Provider encryption audit".into(), ChannelTitleSource::Provider));
+        let mut provider = snapshot.clone();
+        provider.title = Some("Provider encryption audit".into());
+        assert_eq!(
+            snapshot_channel_name(&provider).unwrap(),
+            (
+                "Provider encryption audit".into(),
+                ChannelTitleSource::Provider
+            )
+        );
         // The same edge can become a complete head after a provider/history
         // observation; neither a new turn nor another item identity is needed.
         snapshot.has_earlier = false;
         let observed = app.observe_channel_name(target, &snapshot).unwrap();
-        assert_eq!(observed, ("Fix a later unrelated task".into(), ChannelTitleSource::Prompt));
+        assert_eq!(
+            observed,
+            (
+                "Fix a later unrelated task".into(),
+                ChannelTitleSource::Prompt
+            )
+        );
         // Unavailable content is also never an instruction to erase a manual name.
         let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
-        channel.title = "My manual channel".into(); channel.title_source = ChannelTitleSource::Manual;
-        snapshot.has_earlier = true; snapshot.generation += 1;
+        channel.title = "My manual channel".into();
+        channel.title_source = ChannelTitleSource::Manual;
+        snapshot.has_earlier = true;
+        snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
         assert_eq!(app.durable.channels[0].title, "My manual channel");
@@ -12807,17 +12892,38 @@ mod tests {
     #[test]
     fn deferred_title_marker_only_rearms_the_exact_current_candidate_without_an_eager_task() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, Some(KNOWN_THREAD)); let target = chat_runtime(&app, card).target;
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
         let id = crate::model::ChannelId::new();
-        app.chat_ui.channel_names.insert(target, ChannelNameObservation { session: Some(KNOWN_THREAD.into()),
-            title: Some(("Encryption review".into(), crate::model::ChannelTitleSource::Provider)),
-            last_view: Some((id, 17)), ..Default::default() });
-        let candidate = |revision, name: &str| crate::workspace_model::ModelEdit::SuggestConversationTitle { id, card,
-            expected_revision: revision, title: name.into(), source: crate::model::ChannelTitleSource::Provider };
+        app.chat_ui.channel_names.insert(
+            target,
+            ChannelNameObservation {
+                session: Some(KNOWN_THREAD.into()),
+                title: Some((
+                    "Encryption review".into(),
+                    crate::model::ChannelTitleSource::Provider,
+                )),
+                last_view: Some((id, 17)),
+                ..Default::default()
+            },
+        );
+        let candidate =
+            |revision, name: &str| crate::workspace_model::ModelEdit::SuggestConversationTitle {
+                id,
+                card,
+                expected_revision: revision,
+                title: name.into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            };
         app.defer_channel_title_suggestion(&candidate(16, "Encryption review"));
         app.defer_channel_title_suggestion(&candidate(17, "Older name"));
         assert!(!app.chat_ui.channel_names[&target].pending);
-        let task = app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::TitleDeferred(candidate(17, "Encryption review")));
+        let task = app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::TitleDeferred(candidate(
+                17,
+                "Encryption review",
+            )),
+        );
         assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
         assert!(app.chat_ui.channel_names[&target].pending);
     }
@@ -12832,28 +12938,64 @@ mod tests {
         let target = chat_runtime(&app, b).target;
         let original = app.card_state(b).unwrap().kind.clone();
         let id = ChannelId::new();
-        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel { id, project_id: ProjectId::new(),
-            title: "First conversation".into(), title_source: ChannelTitleSource::Provider, ordinal: 0,
-            shared: true, cards: vec![a, b], focused: Some(b) }];
-        app.workspace_model.views = vec![View { scope: Scope::Channel(id), revision: 1, retired: Vec::new(),
-            panes: [a,b].into_iter().map(|card| Pane::from_card(app.card_state(card).unwrap(), Some(FIXTURE_DIRECTORY.into())).unwrap()).collect() }];
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id,
+            project_id: ProjectId::new(),
+            title: "First conversation".into(),
+            title_source: ChannelTitleSource::Provider,
+            ordinal: 0,
+            shared: true,
+            cards: vec![a, b],
+            focused: Some(b),
+        }];
+        app.workspace_model.views = vec![View {
+            scope: Scope::Channel(id),
+            revision: 1,
+            retired: Vec::new(),
+            panes: [a, b]
+                .into_iter()
+                .map(|card| {
+                    Pane::from_card(
+                        app.card_state(card).unwrap(),
+                        Some(FIXTURE_DIRECTORY.into()),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        }];
         let handle = chat_runtime(&app, b).handle().unwrap().clone();
-        let mut snapshot = (*handle.snapshot()).clone(); snapshot.generation += 1;
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
         snapshot.title = Some("Secondary encryption review".into());
         handle.publish_snapshot_for_test(snapshot);
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
         assert_eq!(app.durable.channels[0].title, "First conversation");
-        assert!(app.chat_ui.channel_names.get(&target).is_none_or(|observation| observation.title.is_none()),
-            "the secondary wake deliberately did not cache a channel candidate");
+        assert!(
+            app.chat_ui
+                .channel_names
+                .get(&target)
+                .is_none_or(|observation| observation.title.is_none()),
+            "the secondary wake deliberately did not cache a channel candidate"
+        );
         // These are the accepted host projection values after its primary
         // changed and its automatic old name was cleared in the same TX.
-        app.workspace_model.views[0].panes.swap(0, 1); app.workspace_model.views[0].revision += 1;
+        app.workspace_model.views[0].panes.swap(0, 1);
+        app.workspace_model.views[0].revision += 1;
         let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
-        channel.cards = vec![b, a]; channel.title.clear(); channel.title_source = ChannelTitleSource::Prompt;
+        channel.cards = vec![b, a];
+        channel.title.clear();
+        channel.title_source = ChannelTitleSource::Prompt;
         app.refresh_channel_title_suggestions();
         assert_eq!(app.durable.channels[0].title, "Secondary encryption review");
-        assert_eq!(app.durable.channels[0].title_source, ChannelTitleSource::Provider);
-        assert_eq!(app.card_state(b).unwrap().kind, original, "naming does not change launch or conversation identity");
+        assert_eq!(
+            app.durable.channels[0].title_source,
+            ChannelTitleSource::Provider
+        );
+        assert_eq!(
+            app.card_state(b).unwrap().kind,
+            original,
+            "naming does not change launch or conversation identity"
+        );
     }
 
     #[test]

@@ -127,7 +127,10 @@ impl Handle {
     }
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TitleUnavailable { Busy, Poisoned }
+pub(crate) enum TitleUnavailable {
+    Busy,
+    Poisoned,
+}
 
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
@@ -1021,7 +1024,9 @@ impl Handle {
     }
     /// A coherent resident naming projection. Never opens the transcript Store,
     /// pages history or touches the filesystem; safe at host admission points.
-    pub(crate) fn conversation_title(&self) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
+    pub(crate) fn conversation_title(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
         let state = self.0.state.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => TitleUnavailable::Busy,
             std::sync::TryLockError::Poisoned(_) => TitleUnavailable::Poisoned,
@@ -3031,36 +3036,88 @@ mod tests {
     fn resident_title_admission_refuses_without_waiting_for_the_state_owner() {
         struct Idle;
         impl Adapter for Idle {
-            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
-            fn command(&mut self, _: Command) -> Result<Step, String> { Ok(Step::default()) }
-            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
         let directory = tempfile::tempdir().unwrap();
-        let spec = ProcessSpec { execution: None, messages: None, transport: TransportSpec::History,
-            program: "unused-history-reader".into(), arguments: Vec::new(), working_directory: directory.path().into(),
-            environment: Default::default(), unset_environment: Default::default() };
-        let mut initial = Step::default(); let store = preflight(&spec, &mut initial).unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::History,
+            program: "unused-history-reader".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
         let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
         let state = handle.0.state.lock().unwrap();
-        let probe = handle.clone(); let (sender, receiver) = std::sync::mpsc::channel();
+        let probe = handle.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || sender.send(probe.conversation_title()).unwrap());
         let outcome = receiver.recv_timeout(Duration::from_millis(250));
         // Release before joining/asserting: the old blocking implementation
         // fails the test without stranding its thread or the runtime worker.
-        drop(state); worker.join().unwrap(); handle.close().unwrap();
+        drop(state);
+        worker.join().unwrap();
+        handle.close().unwrap();
         assert_eq!(outcome.unwrap(), Err(TitleUnavailable::Busy));
     }
 
     #[test]
     fn identity_only_frames_preserve_a_name_until_actual_session_change_or_reset() {
-        let mut state = Snapshot::default(); let mut indices = BTreeMap::new();
-        apply_event(&mut state, &mut indices, Event::Session { id: "a".into(), title: Some("Bundle review".into()) });
-        apply_event(&mut state, &mut indices, Event::Session { id: "a".into(), title: None });
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "a".into(),
+                title: Some("Bundle review".into()),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "a".into(),
+                title: None,
+            },
+        );
         assert_eq!(state.title.as_deref(), Some("Bundle review"));
-        apply_event(&mut state, &mut indices, Event::Session { id: "b".into(), title: None });
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "b".into(),
+                title: None,
+            },
+        );
         assert!(state.title.is_none());
-        apply_event(&mut state, &mut indices, Event::Session { id: "b".into(), title: Some("New task".into()) });
-        apply_event(&mut state, &mut indices, Event::Reset { reason: "Reset".into() });
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "b".into(),
+                title: Some("New task".into()),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Reset {
+                reason: "Reset".into(),
+            },
+        );
         assert!(state.title.is_none());
     }
 

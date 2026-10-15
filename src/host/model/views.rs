@@ -270,15 +270,23 @@ pub(super) fn apply(
 }
 
 impl Registry {
-    pub(crate) fn title_conversation(&self, id: crate::model::ChannelId,
-        card: crate::model::CardId, revision: u64) -> Result<crate::chat::Session, String> {
+    pub(crate) fn title_conversation(
+        &self,
+        id: crate::model::ChannelId,
+        card: crate::model::CardId,
+        revision: u64,
+    ) -> Result<crate::chat::Session, String> {
         let view = read(&self.db, &Scope::Channel(id))?;
         if view.revision != revision || view.primary_chat() != Some(card) {
             return Err("The channel's primary conversation changed".into());
         }
-        view.panes.into_iter().find_map(|pane| match pane.kind {
-            crate::model::CardKind::Chat(session) if pane.id == card => Some(session), _ => None,
-        }).ok_or_else(|| "The primary chat is unavailable".into())
+        view.panes
+            .into_iter()
+            .find_map(|pane| match pane.kind {
+                crate::model::CardKind::Chat(session) if pane.id == card => Some(session),
+                _ => None,
+            })
+            .ok_or_else(|| "The primary chat is unavailable".into())
     }
 
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
@@ -316,15 +324,25 @@ fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, Str
 }
 fn write(db: &Connection, view: &View) -> Result<(), String> {
     if let Scope::Channel(id) = &view.scope {
-        let primary = |view: &View| view.panes.iter().find_map(|pane| match &pane.kind {
-            crate::model::CardKind::Chat(session) => Some((pane.id, session.id,
-                session.launch.provider, session.launch.session_id.clone())), _ => None,
-        });
+        let primary = |view: &View| {
+            view.panes.iter().find_map(|pane| match &pane.kind {
+                crate::model::CardKind::Chat(session) => Some((
+                    pane.id,
+                    session.id,
+                    session.launch.provider,
+                    session.launch.session_id.clone(),
+                )),
+                _ => None,
+            })
+        };
         if primary(&read(db, &view.scope)?) != primary(view) {
             // A new primary conversation starts a new automatic naming choice.
             // Manual/legacy names describe the channel and survive all moves.
-            db.execute("UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2",
-                [id.to_string()]).map_err(|error| error.to_string())?;
+            db.execute(
+                "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2",
+                [id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
         }
     }
     db.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
