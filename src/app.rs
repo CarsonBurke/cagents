@@ -4169,6 +4169,7 @@ pub enum Message {
     WindowResized(f32, f32),
     ActivateProject(PathBuf),
     ResumeProjectActivation,
+    NativeWindowFocused(window::Id, Option<instance::FocusedWindowHint>),
     ActivateUi {
         token: Option<String>,
     },
@@ -15265,6 +15266,17 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::ResumeProjectActivation => Task::none(),
+            Message::NativeWindowFocused(window, hint) => {
+                let publish: Task<Message> = if self.core.main_window_id() == Some(window) {
+                    hint.map_or_else(Task::none, |hint| iced::Task::future(async move {
+                        match tokio::task::spawn_blocking(move || hint.publish()).await {
+                            Ok(Ok(())) => {},
+                            result => tracing::warn!(?result, "could not publish focused-window hint"),
+                        }
+                    }).discard())
+                } else { Task::none() };
+                Task::batch([self.update(Message::RefreshUi(refresh_ui::Action::Focused(window, true))), publish])
+            }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
                 let activation = match token {
@@ -16580,8 +16592,8 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Closed) => {
                     Some(Message::WindowClosed(event_window))
                 }
-                iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, true),
+                iced::Event::Window(window::Event::Focused) => Some(Message::NativeWindowFocused(
+                    event_window, instance::capture_focused_window(),
                 )),
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, false),

@@ -1350,29 +1350,75 @@ impl Drop for UiActivationListener {
     }
 }
 
-/// Keep one small, locked hint so shell activations go to the last focused
-/// window even when the shell currently owns desktop focus.
+/// A view-routing hint captured without filesystem work on the event thread.
+/// Publishing runs on a worker; it grants no project or mutation authority.
 #[cfg(feature = "ui")]
-pub(crate) fn record_focused_window() -> io::Result<()> {
-    // Project-open selection currently targets local windows. A device window
-    // must not overwrite the last local window's focus hint.
-    if crate::device::is_remote() {
-        return Ok(());
-    }
-    let runtime = runtime_directory()?;
-    require_owned_runtime_directory(&runtime)?;
-    record_focused_window_in(&runtime, window_slot())
+#[derive(Debug, Clone)]
+pub(crate) struct FocusedWindowHint {
+    runtime: PathBuf,
+    slot: String,
+    observed: u128,
 }
 
 #[cfg(feature = "ui")]
-fn record_focused_window_in(runtime: &Path, slot: &str) -> io::Result<()> {
+pub(crate) fn capture_focused_window() -> Option<FocusedWindowHint> {
+    if crate::device::is_remote() { return None; }
+    let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|path| path.is_absolute())?;
+    Some(FocusedWindowHint {
+        runtime,
+        slot: window_slot().to_owned(),
+        observed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos(),
+    })
+}
+
+#[cfg(feature = "ui")]
+impl FocusedWindowHint {
+    pub(crate) fn publish(self) -> io::Result<()> {
+        require_owned_runtime_directory(&self.runtime)?;
+        record_focused_window_at(&self.runtime, &self.slot, self.observed)
+    }
+}
+
+fn focus_hint_lock(runtime: &Path, write: bool) -> io::Result<OwnedLock> {
+    let file = OpenOptions::new().read(true).write(write).create(write)
+        .mode(PRIVATE_FILE_MODE).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(runtime.join(format!("{APPLICATION_LOCK_FILE}-focus")))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != current_uid() || metadata.nlink() != 1 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "focus hint is not a private owned regular file"));
+    }
+    if write { file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?; }
+    // SAFETY: the returned owner keeps the descriptor live until unlock.
+    if unsafe { libc::flock(file.as_raw_fd(), if write { libc::LOCK_EX } else { libc::LOCK_SH }) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedLock(file))
+}
+
+fn parse_focus_hint(text: &str) -> Option<(u128, &str)> {
+    let (observed, slot) = match text.split_once('\n') {
+        Some((stamp, slot)) if stamp.parse::<u128>().is_ok() => (stamp.parse().ok()?, slot.trim()),
+        _ => (0, text.trim()), // Existing versions stored the slot alone.
+    };
+    validate_window_slot(slot).ok()?;
+    Some((observed, slot))
+}
+
+#[cfg(feature = "ui")]
+fn record_focused_window_at(runtime: &Path, slot: &str, observed: u128) -> io::Result<()> {
     validate_window_slot(slot)?;
-    let lock = owned_lock(
-        &runtime.join(format!("{APPLICATION_LOCK_FILE}-focus")),
-        libc::LOCK_EX,
-    )?;
+    let lock = focus_hint_lock(runtime, true)?;
+    let mut previous = String::new();
+    (&*lock).take(1024).read_to_string(&mut previous)?;
+    if parse_focus_hint(&previous).is_some_and(|(stamp, _)| stamp > observed) { return Ok(()); }
     lock.set_len(0)?;
-    writeln!(&*lock, "{slot}")
+    std::io::Seek::rewind(&mut &*lock)?;
+    writeln!(&*lock, "{observed}\n{slot}")
+}
+
+#[cfg(all(feature = "ui", test))]
+fn record_focused_window_in(runtime: &Path, slot: &str) -> io::Result<()> {
+    record_focused_window_at(runtime, slot, 1)
 }
 
 /// Select a project in one running window, without starting the UI or a terminal.
@@ -1400,13 +1446,12 @@ fn activate_project_in(runtime: &Path, repository: &Path) -> io::Result<bool> {
     }
     require_owned_runtime_directory(runtime)?;
     let mut slots = Vec::new();
-    let hint = runtime.join(format!("{APPLICATION_LOCK_FILE}-focus"));
-    if hint.exists() {
-        let lock = owned_lock(&hint, libc::LOCK_SH)?;
-        let mut slot = String::new();
-        (&*lock).take(1024).read_to_string(&mut slot)?;
-        if validate_window_slot(slot.trim()).is_ok() {
-            slots.push(slot.trim().to_owned());
+    if let Ok(lock) = focus_hint_lock(runtime, false) {
+        let mut hint = String::new();
+        if (&*lock).take(1024).read_to_string(&mut hint).is_ok()
+            && let Some((_, slot)) = parse_focus_hint(&hint)
+        {
+            slots.push(slot.to_owned());
         }
     }
     slots.push(PRIMARY_WINDOW.to_owned());
@@ -2738,6 +2783,24 @@ mod tests {
             first_rx.recv_blocking().unwrap().project.as_deref(),
             Some(repository)
         );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn delayed_focus_worker_cannot_replace_a_newer_hint_or_modify_a_hardlink() {
+        let runtime = tempdir().unwrap();
+        record_focused_window_at(runtime.path(), "newer", 2).unwrap();
+        record_focused_window_at(runtime.path(), "older", 1).unwrap();
+        let hint = fs::read_to_string(runtime.path().join(format!("{APPLICATION_LOCK_FILE}-focus"))).unwrap();
+        assert_eq!(parse_focus_hint(&hint), Some((2, "newer")));
+        let outside = runtime.path().join("outside");
+        fs::write(&outside, "keep contents").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_file(runtime.path().join(format!("{APPLICATION_LOCK_FILE}-focus"))).unwrap();
+        fs::hard_link(&outside, runtime.path().join(format!("{APPLICATION_LOCK_FILE}-focus"))).unwrap();
+        assert!(record_focused_window_at(runtime.path(), "newer", 3).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep contents");
+        assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o777, 0o644);
     }
 
     #[cfg(feature = "ui")]
