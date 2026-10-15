@@ -5627,6 +5627,38 @@ fn cancelling_sync_after_pull_reports_the_completed_local_step() {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+#[test]
+fn recoverable_discard_restores_blob_under_restrictive_umask() {
+    const NAME: &str = "recoverable_discard_restores_blob_under_restrictive_umask";
+    if recovery_context::run_isolated_case(NAME) { return; }
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new().expect("the isolated recovery contract requires Git");
+    fixture.write("tracked.txt", b"base\n");
+    fixture.git_in_work(&["add", "--", "tracked.txt"]);
+    fixture.commit("base");
+    fixture.write("tracked.txt", b"uncommitted exact\n");
+    fs::set_permissions(fixture.work().join("tracked.txt"), fs::Permissions::from_mode(0o751)).unwrap();
+    let cancellation = CancellationToken::new();
+    let service = fixture.recovery_service();
+    let discarded = service.discard_recoverable(&DiscardRequest {
+        worktree: fixture.work(), tracked: vec![PathSelection::new(path("tracked.txt"))],
+        untracked: vec![], confirmed: true,
+    }, &cancellation).unwrap();
+    assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
+    assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"base\n");
+    // Only this exact single-test child changes umask, AFTER real Git/context
+    // setup. Restore it before fixture teardown even when the assertion fails.
+    struct Umask(libc::mode_t);
+    impl Drop for Umask { fn drop(&mut self) { unsafe { libc::umask(self.0); } } }
+    let _restore = Umask(unsafe { libc::umask(0o777) });
+    let outcome = service.undo_discard(&discarded.recovery, &cancellation).unwrap();
+    assert!(matches!(outcome, MutationOutcome::Applied { .. }), "{outcome:?}");
+    assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"uncommitted exact\n");
+    assert_eq!(fs::metadata(fixture.work().join("tracked.txt")).unwrap().permissions().mode() & 0o7777, 0o751);
+    assert!(!discarded.recovery.live_recovery.needs_resolution());
+}
+
 #[test]
 fn recoverable_discard_restores_contents_modes_and_deleted_paths() {
     if recovery_context::run_isolated_case(

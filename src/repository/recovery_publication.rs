@@ -90,6 +90,28 @@ impl Holding {
     fn root(&self) -> &fs_safety::Root {
         self.publication.directory()
     }
+    fn create_private_blob(&mut self) -> Result<Arc<fs::File>, String> {
+        let file = create_blob_file(self.root())?;
+        // Preserve the actual creator before chmod or metadata observation can
+        // fail. mkdir/open mode arguments alone do not override a strict umask.
+        self.files.push(file.clone());
+        let created = file.metadata().map_err(|error| error.to_string())?;
+        if !created.is_file() || created.uid() != unsafe { libc::geteuid() } {
+            return Err("The recovery blob creator is not an owned regular file".into());
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600)).map_err(|error| error.to_string())?;
+        let ready = file.metadata().map_err(|error| error.to_string())?;
+        if (ready.dev(), ready.ino(), ready.uid(), ready.gid(), ready.len())
+            != (created.dev(), created.ino(), created.uid(), created.gid(), 0)
+            || ready.mode() & 0o7777 != 0o600 {
+            return Err("The recovery blob creator changed while establishing private read access".into());
+        }
+        // The fixed hash-object operation reopens this SAME inherited FD via
+        // procfs. Establish readable owner access before that native reopen;
+        // later archived-mode restoration retains its original OID/digest proof.
+        Ok(file)
+    }
+
     fn validate(&self) -> Result<(), String> {
         self.context
             .validate_payload_root(self.root())
@@ -417,10 +439,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             SavedEntry::Blob { oid, mode, bytes } => {
                 let generated = PathBuf::from("restored-blob");
-                let file = create_blob_file(holding.root())?;
+                let file = holding.create_private_blob()?;
                 // The creator's exact FD survives every error, including a
                 // failed/partial cat-file write. No returned Git name is trusted.
-                holding.files.push(file.clone());
                 holding.validate()?;
                 self.stream_recovery_object(
                     source,
