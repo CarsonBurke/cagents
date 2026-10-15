@@ -73,6 +73,12 @@ impl WorktreeSetupCreationIdentity {
     }
 }
 
+pub(super) fn named_directory_matches(root: &crate::fs_safety::Root) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    root.metadata().ok().zip(fs::symlink_metadata(root.path()).ok()).is_some_and(|(held, named)|
+        named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino())
+}
+
 /// Publish through the already-held original admin descriptor, only while
 /// the operation's Git lock and exclusive lease prove creation ownership.
 /// Never initialize or repair a marker from a setup resume callback.
