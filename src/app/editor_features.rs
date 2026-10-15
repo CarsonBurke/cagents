@@ -444,7 +444,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_opaque_command_revalidates_actual_peer_context_on_choice() {
-        for change in 0..4 {
+        for change in 0..5 {
             let root = tempfile::tempdir().unwrap();
             let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
             let item = app.lsp.fixture_code_action(a_doc).await;
@@ -453,6 +453,14 @@ mod tests {
             if change == 1 || change == 2 { app.lsp.close(b_doc); }
             if change == 2 { app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn outside() {}\n").await; }
             if change == 3 { app.lsp.fixture_open_format_on_save_document(LspDocumentId(46), &root.path().join("unopened.rs"), root.path(), "fn old() {}\n").await; }
+            if change == 4 {
+                let pending = buffer(&mut app, root.path(), "unopened.rs", "fn pending_unsaved() {}\n");
+                let doc = LspDocumentId(46); let path = root.path().join("unopened.rs");
+                app.lsp_documents.insert(doc, pending); app.lsp_contexts.entry(pending).or_default().document = Some(doc);
+                let language = app.lsp.language_for(&path).unwrap();
+                app.lsp.open(doc, &path, root.path(), language, 1, "fn pending_unsaved() {}\n");
+                assert!(app.lsp.document_incarnation(doc).is_none());
+            }
             drop(app.update_editor_features(Action::ChooseCodeAction(a, 0)));
             if change == 0 {
                 assert_eq!(app.editor_features.requests.len(), 1);
