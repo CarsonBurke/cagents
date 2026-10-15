@@ -55,6 +55,19 @@ class OwnerCensus(unittest.TestCase):
             with self.subTest(log=text), self.assertRaisesRegex(SystemExit, "no complete owner"):
                 self.parse(text)
 
+    def test_offline_pending_file_and_release_are_complete_separate_owners(self):
+        prefix = 'cagents::memory: process_id=42 owner="chat_offline" offline_id=8 '
+        owners, _, coverage = self.parse(prefix + 'pending_bytes=4096 in_flight_bytes=0 io_buffer_capacity=0 disk_bytes=0\n'
+            + prefix + 'pending_bytes=0 in_flight_bytes=0 io_buffer_capacity=0 disk_bytes=8192\n'
+            + prefix + 'pending_bytes=0 in_flight_bytes=0 disk_bytes=0\n')
+        self.assertEqual(CENSUS["owner_totals"](owners)["chat_offline"], {
+            "owners": 1, "pending_bytes": 0, "in_flight_bytes": 0,
+            "io_buffer_capacity": 0, "disk_bytes": 8192})
+        self.assertEqual(coverage["incomplete_owner_events"], 1)
+        owners, _, _ = self.parse(prefix + 'pending_bytes=1 in_flight_bytes=2 io_buffer_capacity=3 disk_bytes=4\n'
+            + prefix + 'released=true pending_bytes=0 in_flight_bytes=0 io_buffer_capacity=0 disk_bytes=0\n')
+        self.assertEqual(CENSUS["owner_totals"](owners)["chat_offline"]["owners"], 0)
+
     def test_mapping_intersections_do_not_prorate_partial_vmas(self):
         result = CENSUS["stack_totals"]([(4096, 8192), (8192, 4096)], [
             {"start": 4096, "end": 8192, "Rss": 8, "Pss": 7},

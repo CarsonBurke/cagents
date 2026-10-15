@@ -19,12 +19,13 @@ METRICS = ("Rss", "Pss", "Anonymous", "Swap")
 OWNER_COUNTERS = {
     "chat_runtime": ("resident_bytes", "cache_entries", "exposed_presentation_bytes"),
     "chat_client": ("resident_bytes",),
+    "chat_offline": ("pending_bytes", "in_flight_bytes", "io_buffer_capacity", "disk_bytes"),
     "ipc": ("read_capacity", "write_capacity"),
 }
 
 
 def trace_owners(log, pid=None):
-    owners = {"chat_runtime": {}, "chat_client": {}, "ipc": {}}
+    owners = {owner: {} for owner in OWNER_COUNTERS}
     stacks = {}
     coverage = {"matched_lines": 0, "missing_process_id_lines": 0,
                 "complete_owner_events": 0, "incomplete_owner_events": 0,
@@ -56,11 +57,11 @@ def trace_owners(log, pid=None):
                 except (KeyError, ValueError):
                     coverage["incomplete_stack_events"] += 1
                     continue
-                if role in ("chat_reader", "chat_visibility"):
+                if role in ("chat_reader", "chat_visibility", "chat_offline_cache"):
                     stacks.pop((thread, base), None)
                     stacks[(thread, base)] = (size, guard, role)
             elif owner in owners:
-                identity = fields.get("codec" if owner == "ipc" else "chat_id")
+                identity = fields.get({"ipc": "codec", "chat_offline": "offline_id"}.get(owner, "chat_id"))
                 try:
                     if not identity or not line.endswith("\n"):
                         raise ValueError("unfinished owner event")
@@ -143,7 +144,7 @@ def live_stacks(pid, root, stacks):
     latest = {}
     for (thread, base), value in stacks.items():
         latest[thread] = (base, *value)
-    active, retired, roles = [], [], {"chat_reader": 0, "chat_visibility": 0}
+    active, retired, roles = [], [], {"chat_reader": 0, "chat_visibility": 0, "chat_offline_cache": 0}
     active_bases = set()
     active_guard_bytes = 0
     for thread, (base, size, guard, role) in latest.items():
@@ -151,7 +152,7 @@ def live_stacks(pid, root, stacks):
             name = (process / "task" / str(thread) / "comm").read_text().strip()
         except FileNotFoundError:
             continue
-        prefix = "chat-client" if role == "chat_reader" else "chat-visibility"
+        prefix = {"chat_reader": "chat-client", "chat_visibility": "chat-visibility", "chat_offline_cache": "chat-view-cache"}[role]
         if name.startswith(prefix):
             active.append((base, size))
             active_bases.add(base)
@@ -177,11 +178,14 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     owners, stacks, coverage = trace_owners(args.log, args.pid)
-    report = {"schema_version": 2, "owner_totals": owner_totals(owners),
+    report = {"schema_version": 3, "owner_totals": owner_totals(owners),
               "trace_coverage": coverage,
               "incomplete_events_preserve_last_complete_owner_sample": True,
               "body_bytes_are_arc_references_not_unique_heap": True,
-              "exposed_presentation_bytes_omit_opaque_parser_and_renderer": True}
+              "exposed_presentation_bytes_omit_opaque_parser_and_renderer": True,
+              "offline_pending_bytes_are_shared_arc_references": True,
+              "offline_partial_deserializer_allocations_are_opaque": True,
+              "offline_disk_bytes_are_unlinked_files_not_ui_heap": True}
     if args.pid:
         if not args.root or not (args.root / ".chat-memory-fixture-v1").is_file():
             parser.error("live stack attribution needs --root from measure-chat-memory prepare")
