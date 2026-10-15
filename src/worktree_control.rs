@@ -22,6 +22,7 @@ pub enum Operation {
         expected_fingerprint: Option<String>,
     },
     Inspect { repository:PathBuf, path:PathBuf },
+    BusySessions { repository:PathBuf, path:PathBuf },
     StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },
     SetDisposableIgnoredDirectories { repository:PathBuf, path:PathBuf, directories:Vec<String> },
     DeleteBranch { repository:PathBuf, branch:String, force:bool, expected_oid:Option<String> },
@@ -34,13 +35,23 @@ impl Operation {
             Self::Create { repository, .. }
             | Self::List { repository }
             | Self::Remove { repository, .. }
+            | Self::BusySessions { repository, .. }
             | Self::Inspect { repository, .. }
             | Self::StaleLock { repository, .. }
             | Self::SetDisposableIgnoredDirectories { repository, .. }
             | Self::DeleteBranch {repository,..} => Some(repository),
         }
     }
-    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..}) }
+    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::BusySessions { .. } | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..}) }
+}
+
+/// A daemon-observed active agent, including detached and hidden sessions.
+/// Native turn identity prevents consent for an earlier turn authorizing a
+/// different observed turn in the same session.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BusyAgent {
+    pub session: crate::model::TerminalId,
+    pub turn_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +76,7 @@ pub enum Reply {
     Listed { worktrees: Vec<Entry> },
     Removed { path: PathBuf, branch_deleted: Option<String>, warnings:Vec<String>, branch_error:Option<String> },
     StaleLock {unlocked:bool},
+    BusySessions { agents:Vec<BusyAgent> },
     /// Repository snapshots keep their byte-exact path schema without pulling
     /// the daemon's Git/SQLite implementation into the control CLI.
     Inspected { snapshot:String, disposable_ignored_directories:Vec<String> },
