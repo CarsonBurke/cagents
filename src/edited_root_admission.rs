@@ -513,6 +513,58 @@ impl Drop for PlacementRetirementWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scripted_client_active_pair_survives_retirement_until_actual_owners_drain() {
+        use super::test_peer::{Event, ScriptedEditedRootPeer};
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let root = Arc::new(Root::open(directory.path()).unwrap());
+        let original = Arc::downgrade(&root);
+        let peer = ScriptedEditedRootPeer::start(&root);
+        let deadline = || Instant::now() + Duration::from_secs(3);
+        let client = crate::recovery_domain::RecoveryPlacementClient::connect_local_until(peer.endpoint(), deadline()).unwrap();
+        let mut admissions = EditedRootAdmissions::default();
+        let ticket = admissions.reserve().unwrap();
+        let work = ticket.begin_preparation().unwrap();
+        let owner = client.prepare_edited_root_owner(root.clone()).unwrap();
+        assert!(peer.events().is_empty(), "owner preparation must not register the root");
+        let queued = work.prepared(owner);
+        let admitted = queued.begin_enrollment().unwrap().run(&CancellationToken::new(), deadline()).unwrap();
+        assert_eq!(ticket.phase(), AdmissionPhase::Active);
+        admitted.validate_for_root(&root, deadline()).unwrap();
+        let foreign_directory = tempfile::tempdir().unwrap();
+        let foreign = Root::open(foreign_directory.path()).unwrap();
+        assert!(admitted.validate_for_root(&foreign, deadline()).is_err());
+        let undo = admitted.clone();
+        let queued_save = admitted.clone();
+        ticket.request_retirement();
+        assert!(ticket.admitted().is_none(), "retirement cannot mint new publication owners");
+        assert!(ticket.admitted_lease().is_none());
+        admitted.validate_for_root(&root, deadline()).unwrap();
+        assert!(admissions.next_retirement().unwrap().is_none(), "mounted original owners keep the negative lease");
+        drop(admitted);
+        drop(undo);
+        assert!(admissions.next_retirement().unwrap().is_none(), "queued original worker still owns its whole pair");
+        drop(queued_save);
+        drop(root);
+        let lost_retirement = admissions.next_retirement().unwrap().unwrap();
+        drop(lost_retirement);
+        assert!(original.upgrade().is_some(), "lost task keeps the sealed original receipt");
+        assert!(admissions.next_retirement().unwrap().is_none(), "uncertain cleanup requires explicit retry");
+        ticket.retry_retirement();
+        admissions.next_retirement().unwrap().unwrap().run(deadline()).unwrap();
+        assert!(admissions.is_settled());
+        assert!(original.upgrade().is_none());
+        drop(client);
+        let events = peer.finish();
+        assert_eq!(events.iter().filter(|event| **event == Event::Prepared).count(), 1);
+        assert_eq!(events.iter().filter(|event| **event == Event::Attached).count(), 1);
+        assert_eq!(events.iter().filter(|event| **event == Event::Activated).count(), 1);
+        assert_eq!(events.iter().filter(|event| **event == Event::Released).count(), 1);
+        assert!(events.iter().filter(|event| **event == Event::Validated).count() >= 2);
+    }
+
     #[test]
     fn root_admission_slots_are_bounded_before_any_worker_or_rpc() {
         let mut custody = EditedRootAdmissions::default();
@@ -776,3 +828,8 @@ mod tests {
     }
 
 }
+
+/// Scripted peer for actual client/Root/custody lifetime tests only. This is not
+/// the daemon Registry19 issuer and cannot qualify catalog/adoption admission.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_peer;
