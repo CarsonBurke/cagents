@@ -22,9 +22,9 @@ use std::{
 };
 mod execution;
 mod native_reconcile;
-mod worker_join;
 mod store;
 mod websocket;
+mod worker_join;
 use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
@@ -146,8 +146,8 @@ struct Inner {
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    worker_joining:AtomicBool,
-    worker_join_failed:AtomicBool,
+    worker_joining: AtomicBool,
+    worker_join_failed: AtomicBool,
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
@@ -157,8 +157,8 @@ struct Inner {
     retain_cleanup_receipt: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
-    native_reconciling:AtomicBool,
-    native_reconcile_error:Mutex<Option<String>>,
+    native_reconciling: AtomicBool,
+    native_reconcile_error: Mutex<Option<String>>,
     native_installed: Arc<AtomicBool>,
     history_only: bool,
     stderr_lease: Arc<Mutex<Option<super::stderr_log::Lease>>>,
@@ -329,8 +329,8 @@ impl Handle {
             draining: draining.clone(),
             failure: failure.clone(),
             worker: Mutex::new(None),
-            worker_joining:AtomicBool::new(false),
-            worker_join_failed:AtomicBool::new(false),
+            worker_joining: AtomicBool::new(false),
+            worker_join_failed: AtomicBool::new(false),
             store: store.clone(),
             notify: notify.clone(),
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
@@ -342,8 +342,8 @@ impl Handle {
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
-            native_reconciling:AtomicBool::new(false),
-            native_reconcile_error:Mutex::new(None),
+            native_reconciling: AtomicBool::new(false),
+            native_reconcile_error: Mutex::new(None),
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
             stderr_lease: stderr_lease.clone(),
@@ -1222,7 +1222,7 @@ impl Handle {
             return Err("Native provider has already been explicitly closed".into());
         }
         self.0.preserve_native.store(true, Ordering::Release);
-        self.close_inner(true,None)
+        self.close_inner(true, None)
     }
 
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {
@@ -1239,124 +1239,187 @@ impl Handle {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
         }
-        self.close_inner(false,None)
+        self.close_inner(false, None)
     }
 
     /// A caller-owned teardown budget. An unfinished worker or retained native
     /// reconciliation remains owned and retryable; timeout is never cleanup.
-    pub(crate) fn close_until(&self,deadline:Instant)->Result<(),String> {
+    pub(crate) fn close_until(&self, deadline: Instant) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
-            self.0.release_native.store(true,Ordering::Release);
+            self.0.release_native.store(true, Ordering::Release);
         }
-        self.close_inner(false,Some(deadline))
+        self.close_inner(false, Some(deadline))
     }
 
-    fn join_worker_until(&self,deadline:Instant)->Result<(),String> {
+    fn join_worker_until(&self, deadline: Instant) -> Result<(), String> {
         loop {
             if !self.0.worker_joining.load(Ordering::Acquire) {
-                let ready=match self.0.worker.try_lock() {
-                    Ok(mut worker)=> {
-                        if self.0.worker_joining.load(Ordering::Acquire) {false}
-                        else if worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {worker_join::request(self,&mut worker)?;false}
-                        else {worker.is_none()}
+                let ready = match self.0.worker.try_lock() {
+                    Ok(mut worker) => {
+                        if self.0.worker_joining.load(Ordering::Acquire) {
+                            false
+                        } else if worker
+                            .as_ref()
+                            .is_some_and(std::thread::JoinHandle::is_finished)
+                        {
+                            worker_join::request(self, &mut worker)?;
+                            false
+                        } else {
+                            worker.is_none()
+                        }
                     }
-                    Err(std::sync::TryLockError::Poisoned(poisoned))=> {
-                        let mut worker=poisoned.into_inner();
-                        if self.0.worker_joining.load(Ordering::Acquire) {false}
-                        else if worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {worker_join::request(self,&mut worker)?;false}
-                        else {worker.is_none()}
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        let mut worker = poisoned.into_inner();
+                        if self.0.worker_joining.load(Ordering::Acquire) {
+                            false
+                        } else if worker
+                            .as_ref()
+                            .is_some_and(std::thread::JoinHandle::is_finished)
+                        {
+                            worker_join::request(self, &mut worker)?;
+                            false
+                        } else {
+                            worker.is_none()
+                        }
                     }
-                    Err(std::sync::TryLockError::WouldBlock)=>false,
+                    Err(std::sync::TryLockError::WouldBlock) => false,
                 };
                 if ready {
                     return if self.0.worker_join_failed.load(Ordering::Acquire) {
                         Err("Native chat worker did not shut down cleanly; provider state is unconfirmed".into())
-                    } else {Ok(())};
+                    } else {
+                        Ok(())
+                    };
                 }
             }
-            let Some(remaining)=deadline.checked_duration_since(Instant::now()) else {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err("Native chat close is still pending; its exact provider cleanup owner is retained".into());
             };
             thread::sleep(remaining.min(Duration::from_millis(5)));
         }
     }
 
-    fn close_inner(&self, preserving: bool, deadline:Option<Instant>) -> Result<(), String> {
+    fn close_inner(&self, preserving: bool, deadline: Option<Instant>) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
         // Close intent is atomic even when another caller owns wake metadata.
         // A full/nonavailable wake stream already has a pending notification;
         // periodic actor polls also observe stop without extending this budget.
         match self.0.wake.try_lock() {
-            Ok(mut wake)=> {let _=wake.write(&[1]);},
-            Err(std::sync::TryLockError::Poisoned(poisoned))=> {let _=poisoned.into_inner().write(&[1]);},
-            Err(std::sync::TryLockError::WouldBlock)=> {},
+            Ok(mut wake) => {
+                let _ = wake.write(&[1]);
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let _ = poisoned.into_inner().write(&[1]);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
         // is_finished may precede blocking TLS destruction. Actual joins run
         // in a bounded owner service, never on this deadline-bearing caller.
-        self.join_worker_until(deadline.unwrap_or_else(||Instant::now()+IO_TIMEOUT+super::TERMINATE_GRACE))?;
-        if let Some(deadline)=deadline {return self.reconcile_native_until(deadline);}
+        self.join_worker_until(
+            deadline.unwrap_or_else(|| Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE),
+        )?;
+        if let Some(deadline) = deadline {
+            return self.reconcile_native_until(deadline);
+        }
         {
-            let mut retained=self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner());
-            if let Some(holder)=retained.as_mut() {
+            let mut retained = self
+                .0
+                .retained_native
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(holder) = retained.as_mut() {
                 holder.close_inner(self.0.retain_cleanup_receipt.load(Ordering::Acquire))?;
                 retained.take();
-                self.0.completed.store(true,Ordering::Release);
+                self.0.completed.store(true, Ordering::Release);
             }
         }
         if !preserving && self.0.native_installed.load(Ordering::Acquire) {
-            let mut detached=self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner());
-            if let Some(owner)=detached.as_ref() {
-                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {owner.close_retaining_receipt()?;} else {owner.close()?;}
+            let mut detached = self
+                .0
+                .detached_native
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(owner) = detached.as_ref() {
+                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {
+                    owner.close_retaining_receipt()?;
+                } else {
+                    owner.close()?;
+                }
                 detached.take();
             }
         }
         self.close_result()
     }
 
-    fn reconcile_native_until(&self,deadline:Instant)->Result<(),String> {
-        let mut attempted=false;
+    fn reconcile_native_until(&self, deadline: Instant) -> Result<(), String> {
+        let mut attempted = false;
         loop {
-            let retained=match self.0.retained_native.try_lock() {
-                Ok(owner)=>Some(owner.is_some()),
-                Err(std::sync::TryLockError::Poisoned(poisoned))=>Some(poisoned.into_inner().is_some()),
-                Err(std::sync::TryLockError::WouldBlock)=>None,
-            };
-            let detached=if self.0.native_installed.load(Ordering::Acquire) {
-                match self.0.detached_native.try_lock() {
-                    Ok(owner)=>Some(owner.is_some()),
-                    Err(std::sync::TryLockError::Poisoned(poisoned))=>Some(poisoned.into_inner().is_some()),
-                    Err(std::sync::TryLockError::WouldBlock)=>None,
+            let retained = match self.0.retained_native.try_lock() {
+                Ok(owner) => Some(owner.is_some()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().is_some())
                 }
-            } else {Some(false)};
-            if retained==Some(false) && detached==Some(false) && !self.0.native_reconciling.load(Ordering::Acquire) {
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            let detached = if self.0.native_installed.load(Ordering::Acquire) {
+                match self.0.detached_native.try_lock() {
+                    Ok(owner) => Some(owner.is_some()),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        Some(poisoned.into_inner().is_some())
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                }
+            } else {
+                Some(false)
+            };
+            if retained == Some(false)
+                && detached == Some(false)
+                && !self.0.native_reconciling.load(Ordering::Acquire)
+            {
                 return self.close_result();
             }
-            if retained==Some(true) || detached==Some(true) {
+            if retained == Some(true) || detached == Some(true) {
                 if !attempted {
                     native_reconcile::request(self)?;
-                    attempted=true;
+                    attempted = true;
                 } else if !self.0.native_reconciling.load(Ordering::Acquire) {
-                    let reason=self.0.native_reconcile_error.try_lock().ok().and_then(|error|error.clone());
-                    return Err(format!("Retained native cleanup is unconfirmed; its exact owner is retained for retry{}",reason.map(|reason|format!(": {reason}")).unwrap_or_default()));
+                    let reason = self
+                        .0
+                        .native_reconcile_error
+                        .try_lock()
+                        .ok()
+                        .and_then(|error| error.clone());
+                    return Err(format!(
+                        "Retained native cleanup is unconfirmed; its exact owner is retained for retry{}",
+                        reason
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default()
+                    ));
                 }
             }
-            let Some(remaining)=deadline.checked_duration_since(Instant::now()) else {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err("Native cleanup is still pending; its exact owner and bounded reconciliation task are retained for retry".into());
             };
             thread::sleep(remaining.min(Duration::from_millis(5)));
         }
     }
 
-    fn close_result(&self)->Result<(),String> {
+    fn close_result(&self) -> Result<(), String> {
         if self.is_completed() {
             return Ok(());
         }
-        let failure=match self.0.failure.try_lock() {
-            Ok(failure)=>failure.clone(),
-            Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner().clone(),
-            Err(std::sync::TryLockError::WouldBlock)=>return Err("Native teardown diagnostic is updating; cleanup remains unconfirmed".into()),
+        let failure = match self.0.failure.try_lock() {
+            Ok(failure) => failure.clone(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(
+                    "Native teardown diagnostic is updating; cleanup remains unconfirmed".into(),
+                );
+            }
         };
-        Err(failure.unwrap_or_else(||"Native chat teardown did not complete; provider state is unconfirmed".into()))
+        Err(failure.unwrap_or_else(|| {
+            "Native chat teardown did not complete; provider state is unconfirmed".into()
+        }))
     }
 }
 
@@ -1470,7 +1533,12 @@ fn preflight_inner(
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(holder)=self.retained_native.get_mut().unwrap_or_else(|p|p.into_inner()).take() {
+        if let Some(holder) = self
+            .retained_native
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             native_reconcile::retire_final(holder);
         }
         let _ = self
@@ -1487,7 +1555,9 @@ impl Drop for Inner {
             // Dropping a JoinHandle detaches it. No last-handle destruction
             // may join a TLS destructor, even if is_finished already says true.
             drop(worker);
-            tracing::warn!("Final chat handle dropped without an OS-thread cleanup receipt; cleanup is unconfirmed");
+            tracing::warn!(
+                "Final chat handle dropped without an OS-thread cleanup receipt; cleanup is unconfirmed"
+            );
         }
     }
 }
@@ -1811,7 +1881,7 @@ impl TurnAttention {
             }
             Event::Reset { .. } => *self = Self::default(),
             Event::TurnSettled => self.settled = true,
-            Event::TurnFinished { key, outcome } | Event::PastTurnFinished {key,outcome} => {
+            Event::TurnFinished { key, outcome } | Event::PastTurnFinished { key, outcome } => {
                 return Some(crate::notifications::Evidence {
                     key: key.clone().unwrap_or_else(|| self.key.clone()),
                     kind: *outcome,
@@ -2618,8 +2688,10 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
-        if matches!(&event,Event::PastTurnFinished {..}) {
-            if let Some(evidence)=self.attention.apply(&event) {(self.notify)(Update::PastAttention(evidence));}
+        if matches!(&event, Event::PastTurnFinished { .. }) {
+            if let Some(evidence) = self.attention.apply(&event) {
+                (self.notify)(Update::PastAttention(evidence));
+            }
             return;
         }
         if matches!(
@@ -2808,8 +2880,8 @@ fn provider_exit_diagnostic(
     let lines: Vec<_> = output
         .lines()
         .filter(|line| {
-            let line=line.trim();
-            let lower=line.to_lowercase();
+            let line = line.trim();
+            let lower = line.to_lowercase();
             !line.is_empty() && !lower.contains("tungstenite") && !lower.contains("inspect")
         })
         .rev()
@@ -3002,17 +3074,17 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             match outcome {
                 Kind::Cancelled => {
                     state.requests.clear();
-                    state.waiting=false;
-                    state.busy=false;
+                    state.waiting = false;
+                    state.busy = false;
                     let all = state.capabilities.interrupt_stops_background;
                     finish_snapshot_work(state, ToolStatus::Stopped, all);
                 }
                 Kind::Failed => {
                     state.requests.clear();
-                    state.waiting=false;
-                    state.busy=false;
+                    state.waiting = false;
+                    state.busy = false;
                     finish_snapshot_work(state, ToolStatus::Failed, false);
-                },
+                }
                 _ => {}
             }
             state.outcome = match outcome {
@@ -3027,7 +3099,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 _ => state.outcome.take(),
             };
         }
-        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished {..} => {}
+        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished { .. } => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -3442,7 +3514,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             if fatal {
                 state.prompt_suggestion = None;
                 state.busy = false;
-                state.waiting=false;
+                state.waiting = false;
                 state.requests.clear();
                 state.history_loading = false;
             }
@@ -3940,73 +4012,179 @@ mod tests {
     #[test]
     fn compact_provider_notice_omits_transport_jargon_from_stderr_but_preserves_saved_details() {
         use std::os::unix::process::ExitStatusExt;
-        let stderr="Authentication failed\ntungstenite: connection closed\ninspect the exact thread for raw output\n";
-        let diagnostic=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(3<<8)),"socket closed",stderr);
+        let stderr = "Authentication failed\ntungstenite: connection closed\ninspect the exact thread for raw output\n";
+        let diagnostic = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(3 << 8)),
+            "socket closed",
+            stderr,
+        );
         assert!(diagnostic.summary.contains("Authentication failed"));
         assert!(!diagnostic.summary.to_lowercase().contains("tungstenite"));
         assert!(!diagnostic.summary.to_lowercase().contains("inspect"));
-        assert_eq!(diagnostic.output,stderr,"saved readable output must remain faithful to provider diagnostics");
+        assert_eq!(
+            diagnostic.output, stderr,
+            "saved readable output must remain faithful to provider diagnostics"
+        );
     }
 
     #[test]
     fn terminal_failure_and_cancel_do_not_retain_live_approval_waiting() {
-        let waiting=||Snapshot {ready:true,busy:true,waiting:true,requests:vec![super::super::Request {kind:super::super::RequestKind::Approval,id:"pending".into(),title:"Approve tool".into(),description:String::new(),fields:Vec::new(),actions:Vec::new()}],..Default::default()};
-        for outcome in [crate::notifications::Kind::Cancelled,crate::notifications::Kind::Failed] {
-            let mut state=waiting();
-            let mut indices=BTreeMap::new();
-            assert_eq!(state.activity(),ActivityState::Waiting);
-            apply_event(&mut state,&mut indices,Event::TurnFinished {key:None,outcome});
+        let waiting = || Snapshot {
+            ready: true,
+            busy: true,
+            waiting: true,
+            requests: vec![super::super::Request {
+                kind: super::super::RequestKind::Approval,
+                id: "pending".into(),
+                title: "Approve tool".into(),
+                description: String::new(),
+                fields: Vec::new(),
+                actions: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        for outcome in [
+            crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed,
+        ] {
+            let mut state = waiting();
+            let mut indices = BTreeMap::new();
+            assert_eq!(state.activity(), ActivityState::Waiting);
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::TurnFinished { key: None, outcome },
+            );
             assert!(state.requests.is_empty());
             assert!(!state.waiting);
-            assert_eq!(state.activity(),ActivityState::Idle);
+            assert_eq!(state.activity(), ActivityState::Idle);
             assert!(state.outcome.is_some());
-            apply_event(&mut state,&mut indices,Event::TurnStarted);
-            assert_eq!(state.activity(),ActivityState::Idle,"an old approval must not revive when a later prompt clears its terminal outcome");
+            apply_event(&mut state, &mut indices, Event::TurnStarted);
+            assert_eq!(
+                state.activity(),
+                ActivityState::Idle,
+                "an old approval must not revive when a later prompt clears its terminal outcome"
+            );
         }
-        let mut state=waiting();
-        apply_event(&mut state,&mut BTreeMap::new(),Event::Error {message:"Provider failed".into(),fatal:true});
-        assert!(state.requests.is_empty()); assert!(!state.waiting);
-        let mut state=waiting();
-        apply_event(&mut state,&mut BTreeMap::new(),Event::Exited {code:Some(3)});
-        assert!(state.requests.is_empty()); assert!(!state.waiting);
-        assert_eq!(state.activity(),ActivityState::Unknown);
+        let mut state = waiting();
+        apply_event(
+            &mut state,
+            &mut BTreeMap::new(),
+            Event::Error {
+                message: "Provider failed".into(),
+                fatal: true,
+            },
+        );
+        assert!(state.requests.is_empty());
+        assert!(!state.waiting);
+        let mut state = waiting();
+        apply_event(
+            &mut state,
+            &mut BTreeMap::new(),
+            Event::Exited { code: Some(3) },
+        );
+        assert!(state.requests.is_empty());
+        assert!(!state.waiting);
+        assert_eq!(state.activity(), ActivityState::Unknown);
     }
 
     #[test]
     fn delayed_old_turn_outcome_notifies_without_mutating_current_turn_metadata() {
         struct LateResult;
         impl Adapter for LateResult {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
-            fn command(&mut self,command:Command)->Result<Step,String> {
-                let events=match command {
-                    Command::SetFastMode{..}=>vec![Event::TurnStarted,Event::Status {busy:true,detail:"Working".into()},Event::Request(super::super::Request {kind:super::super::RequestKind::Approval,id:"new-approval".into(),title:"New tool".into(),description:String::new(),fields:Vec::new(),actions:Vec::new()})],
-                    Command::Interrupt=>vec![Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Cancelled},Event::Status {busy:false,detail:"Stopped".into()}],
-                    Command::Compact=>vec![Event::PastTurnFinished {key:Some("old-result".into()),outcome:crate::notifications::Kind::Cancelled}],
-                    _=>return Err("Unexpected late-result fixture command".into()),
-                };
-                Ok(Step {events,..Default::default()})
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
             }
-            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let events = match command {
+                    Command::SetFastMode { .. } => vec![
+                        Event::TurnStarted,
+                        Event::Status {
+                            busy: true,
+                            detail: "Working".into(),
+                        },
+                        Event::Request(super::super::Request {
+                            kind: super::super::RequestKind::Approval,
+                            id: "new-approval".into(),
+                            title: "New tool".into(),
+                            description: String::new(),
+                            fields: Vec::new(),
+                            actions: Vec::new(),
+                        }),
+                    ],
+                    Command::Interrupt => vec![
+                        Event::TurnFinished {
+                            key: None,
+                            outcome: crate::notifications::Kind::Cancelled,
+                        },
+                        Event::Status {
+                            busy: false,
+                            detail: "Stopped".into(),
+                        },
+                    ],
+                    Command::Compact => vec![Event::PastTurnFinished {
+                        key: Some("old-result".into()),
+                        outcome: crate::notifications::Kind::Cancelled,
+                    }],
+                    _ => return Err("Unexpected late-result fixture command".into()),
+                };
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
-        let store=preflight(&spec,&mut initial).unwrap();
-        let (send,receive)=crossbeam_channel::unbounded();
-        let handle=Handle::start(spec,Box::new(LateResult),initial,store,None,move|update|{let _=send.send(update);}).unwrap();
-        until(&handle,|state|state.ready);
-        handle.command(Command::SetFastMode {enabled:true}).unwrap();
-        let before=handle.snapshot(None).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = Handle::start(
+            spec,
+            Box::new(LateResult),
+            initial,
+            store,
+            None,
+            move |update| {
+                let _ = send.send(update);
+            },
+        )
+        .unwrap();
+        until(&handle, |state| state.ready);
+        handle
+            .command(Command::SetFastMode { enabled: true })
+            .unwrap();
+        let before = handle.snapshot(None).unwrap();
         handle.command(Command::Compact).unwrap();
-        let after=handle.snapshot(None).unwrap();
-        assert_eq!(after.turn_generation,before.turn_generation);
-        assert_eq!(after.requests,before.requests);
-        assert_eq!(after.outcome,before.outcome);
-        assert_eq!(after.finished_at,before.finished_at);
-        assert_eq!(after.activity(),ActivityState::Waiting);
-        let updates=receive.try_iter().collect::<Vec<_>>();
+        let after = handle.snapshot(None).unwrap();
+        assert_eq!(after.turn_generation, before.turn_generation);
+        assert_eq!(after.requests, before.requests);
+        assert_eq!(after.outcome, before.outcome);
+        assert_eq!(after.finished_at, before.finished_at);
+        assert_eq!(after.activity(), ActivityState::Waiting);
+        let updates = receive.try_iter().collect::<Vec<_>>();
         assert!(updates.iter().any(|update|matches!(update,Update::PastAttention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
-        assert!(!updates.iter().any(|update|matches!(update,Update::Attention(evidence) if evidence.key=="old-result")),"old evidence must not enter current-session attention coalescing or sample current rich context");
+        assert!(
+            !updates.iter().any(
+                |update| matches!(update,Update::Attention(evidence) if evidence.key=="old-result")
+            ),
+            "old evidence must not enter current-session attention coalescing or sample current rich context"
+        );
         handle.close().unwrap();
     }
 
@@ -6386,40 +6564,96 @@ mod tests {
 
     #[test]
     fn bounded_close_preserves_a_stuck_worker_and_does_not_hold_the_join_mutex() {
-        struct Blocked {entered:crossbeam_channel::Sender<()>,release:crossbeam_channel::Receiver<()>}
+        struct Blocked {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+        }
         impl Adapter for Blocked {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
-            fn command(&mut self,_:Command)->Result<Step,String> {
-                self.entered.send(()).unwrap();
-                self.release.recv_timeout(Duration::from_secs(5)).map_err(|error|error.to_string())?;
+            fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step::default())
             }
-            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();
-        let store=preflight(&spec,&mut initial).unwrap();
-        let (entered,entered_command)=crossbeam_channel::bounded(1);
-        let (release,released)=crossbeam_channel::bounded(1);
-        let handle=Handle::start(spec,Box::new(Blocked {entered,release:released}),initial,store,None,|_|{}).unwrap();
-        let command_handle=handle.clone();
-        let command=thread::spawn(move||command_handle.command(Command::SetFastMode {enabled:true}));
-        entered_command.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started=Instant::now();
-        assert!(handle.close_until(Instant::now()+Duration::from_millis(40)).unwrap_err().contains("retained"));
-        assert!(started.elapsed()<Duration::from_secs(1));
-        assert!(!handle.is_completed()); assert!(handle.owns_work());
-        assert!(handle.0.worker.try_lock().unwrap().as_ref().is_some_and(|worker|!worker.is_finished()),"the exact join handle is retained without a held mutex");
-        let held=handle.0.worker.lock().unwrap();
-        let wake_held=handle.0.wake.lock().unwrap();
-        let failure_held=handle.0.failure.lock().unwrap();
-        assert!(handle.close_until(Instant::now()+Duration::from_millis(20)).is_err(),"even another caller holding worker/wake/diagnostic metadata cannot block this deadline");
-        drop(failure_held);drop(wake_held);
-        assert!(held.is_some());drop(held);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (entered, entered_command) = crossbeam_channel::bounded(1);
+        let (release, released) = crossbeam_channel::bounded(1);
+        let handle = Handle::start(
+            spec,
+            Box::new(Blocked {
+                entered,
+                release: released,
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let command_handle = handle.clone();
+        let command =
+            thread::spawn(move || command_handle.command(Command::SetFastMode { enabled: true }));
+        entered_command
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let started = Instant::now();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(40))
+                .unwrap_err()
+                .contains("retained")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!handle.is_completed());
+        assert!(handle.owns_work());
+        assert!(
+            handle
+                .0
+                .worker
+                .try_lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished()),
+            "the exact join handle is retained without a held mutex"
+        );
+        let held = handle.0.worker.lock().unwrap();
+        let wake_held = handle.0.wake.lock().unwrap();
+        let failure_held = handle.0.failure.lock().unwrap();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(20))
+                .is_err(),
+            "even another caller holding worker/wake/diagnostic metadata cannot block this deadline"
+        );
+        drop(failure_held);
+        drop(wake_held);
+        assert!(held.is_some());
+        drop(held);
         release.send(()).unwrap();
-        let _=command.join().unwrap();
-        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+        let _ = command.join().unwrap();
+        handle
+            .close_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
         assert!(handle.is_completed());
         assert!(handle.0.worker.lock().unwrap().is_none());
     }
@@ -6427,126 +6661,280 @@ mod tests {
     #[test]
     fn bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure() {
         use std::os::unix::fs::OpenOptionsExt;
-        const CHILD:&str="CAGENTS_RETAINED_CLOSE_RETRY_TEST";
+        const CHILD: &str = "CAGENTS_RETAINED_CLOSE_RETRY_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let output=Process::new(std::env::current_exe().unwrap()).args(["--exact","chat::runtime::tests::bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure","--nocapture"])
                 .env(CHILD,"1").env("XDG_RUNTIME_DIR",directory.path()).env("XDG_DATA_HOME",directory.path().join("data"))
                 .env("XDG_CONFIG_HOME",directory.path().join("config")).env("XDG_CACHE_HOME",directory.path().join("cache"))
                 .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
-            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         for scenario in 0..3 {
-        let broken_control=scenario==1;
-        let mut source=super::super::native_holder::fixture_source();
-        let boot=crate::daemon::read_boot_id().unwrap();
-        source.proof.as_mut().unwrap().boot_id=boot.clone();
-        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id=boot;
-        let paths=crate::daemon::RuntimePaths::discover().unwrap();
-        let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::OwnedUnixWebSocket {socket:source.owned_codex_listener.as_ref().unwrap().socket.clone()},program:"/bin/sleep".into(),arguments:vec!["60".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut holder=super::super::native_holder::spawn(spec,source.clone()).unwrap();
-        let root=crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
-        let record=crate::daemon::holder_registry::evidence(&crate::daemon::holder_registry::socket(&root,source.id),crate::daemon::holder_registry::Kind::Native).unwrap().unwrap();
-        assert!(record.root.is_current());
-        let receipt=root.join(format!("{}-{}-{}.closed",source.id,record.holder.pid,record.holder.start));
-        if scenario!=0 {
-            holder.confirm(uuid::Uuid::new_v4().to_string(),super::super::native_holder::fixture_identity(),record.root.clone()).unwrap();
-            if broken_control {holder.disconnect_control_for_test();}
-        } else {
-            let mut invalid=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
-            invalid.write_all(b"transient invalid cleanup receipt").unwrap();drop(invalid);
-        }
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
-        handle.close().unwrap();
-        if scenario==2 {
-            let (stalled,peer)=UnixStream::pair().unwrap();
-            let identity=holder.replace_control_for_test(stalled);
-            *handle.0.retained_native.lock().unwrap()=Some(holder);
-            let started=Instant::now();drop(handle);
-            assert!(started.elapsed()<Duration::from_secs(1),"final Inner field destruction must not perform retained Holder RPC");
-            assert!(record.root.is_current(),"returning from Drop is not a cleanup receipt");
-            drop(peer);
-            let deadline=Instant::now()+Duration::from_secs(5);
-            loop {
-                if identity.close().is_ok() {break;}
-                assert!(Instant::now()<deadline,"the exact preserved registry owner must remain cleanable");
+            let broken_control = scenario == 1;
+            let mut source = super::super::native_holder::fixture_source();
+            let boot = crate::daemon::read_boot_id().unwrap();
+            source.proof.as_mut().unwrap().boot_id = boot.clone();
+            source
+                .owned_codex_listener
+                .as_mut()
+                .unwrap()
+                .allocator
+                .boot_id = boot;
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let _lease =
+                crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::OwnedUnixWebSocket {
+                    socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+                },
+                program: "/bin/sleep".into(),
+                arguments: vec!["60".into()],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut holder = super::super::native_holder::spawn(spec, source.clone()).unwrap();
+            let root = crate::daemon::holder_registry::directory(
+                crate::daemon::holder_registry::Kind::Native,
+            )
+            .unwrap();
+            let record = crate::daemon::holder_registry::evidence(
+                &crate::daemon::holder_registry::socket(&root, source.id),
+                crate::daemon::holder_registry::Kind::Native,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(record.root.is_current());
+            let receipt = root.join(format!(
+                "{}-{}-{}.closed",
+                source.id, record.holder.pid, record.holder.start
+            ));
+            if scenario != 0 {
+                holder
+                    .confirm(
+                        uuid::Uuid::new_v4().to_string(),
+                        super::super::native_holder::fixture_identity(),
+                        record.root.clone(),
+                    )
+                    .unwrap();
+                if broken_control {
+                    holder.disconnect_control_for_test();
+                }
+            } else {
+                let mut invalid = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&receipt)
+                    .unwrap();
+                invalid
+                    .write_all(b"transient invalid cleanup receipt")
+                    .unwrap();
+                drop(invalid);
+            }
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut initial = Step::default();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+            handle.close().unwrap();
+            if scenario == 2 {
+                let (stalled, peer) = UnixStream::pair().unwrap();
+                let identity = holder.replace_control_for_test(stalled);
+                *handle.0.retained_native.lock().unwrap() = Some(holder);
+                let started = Instant::now();
+                drop(handle);
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "final Inner field destruction must not perform retained Holder RPC"
+                );
+                assert!(
+                    record.root.is_current(),
+                    "returning from Drop is not a cleanup receipt"
+                );
+                drop(peer);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if identity.close().is_ok() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the exact preserved registry owner must remain cleanable"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(!record.root.is_current());
+                continue;
+            }
+            *handle.0.retained_native.lock().unwrap() = Some(holder);
+            handle.0.completed.store(false, Ordering::Release);
+            *handle.0.failure.lock().unwrap() = Some("Native teardown remains unconfirmed".into());
+            assert!(
+                handle
+                    .close_until(Instant::now() + Duration::from_secs(2))
+                    .is_err()
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while handle.0.native_reconciling.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline);
                 thread::sleep(Duration::from_millis(5));
             }
-            assert!(!record.root.is_current());
-            continue;
-        }
-        *handle.0.retained_native.lock().unwrap()=Some(holder);
-        handle.0.completed.store(false,Ordering::Release);
-        *handle.0.failure.lock().unwrap()=Some("Native teardown remains unconfirmed".into());
-        assert!(handle.close_until(Instant::now()+Duration::from_secs(2)).is_err());
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while handle.0.native_reconciling.load(Ordering::Acquire) {
-            assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));
-        }
-        assert!(handle.0.retained_native.lock().unwrap().is_some());
-        assert!(record.root.is_current(),"the failed attempt must retain the same actual provider owner");
-        assert!(!handle.is_completed());assert!(handle.owns_work());
-        if !broken_control {std::fs::remove_file(&receipt).unwrap();}
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
-        assert!(handle.0.retained_native.lock().unwrap().is_none());assert!(handle.is_completed());
-        assert!(!record.root.is_current(),"the later same close API must progress through exact native cleanup");
+            assert!(handle.0.retained_native.lock().unwrap().is_some());
+            assert!(
+                record.root.is_current(),
+                "the failed attempt must retain the same actual provider owner"
+            );
+            assert!(!handle.is_completed());
+            assert!(handle.owns_work());
+            if !broken_control {
+                std::fs::remove_file(&receipt).unwrap();
+            }
+            handle
+                .close_until(Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            assert!(handle.0.retained_native.lock().unwrap().is_none());
+            assert!(handle.is_completed());
+            assert!(
+                !record.root.is_current(),
+                "the later same close API must progress through exact native cleanup"
+            );
         }
     }
 
-    fn worker_blocked_in_tls_destruction()->(JoinHandle<()>,crossbeam_channel::Sender<()>,crossbeam_channel::Receiver<()>) {
-        struct TlsCleanup {entered:crossbeam_channel::Sender<()>,release:crossbeam_channel::Receiver<()>,finished:crossbeam_channel::Sender<()>}
+    fn worker_blocked_in_tls_destruction() -> (
+        JoinHandle<()>,
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    ) {
+        struct TlsCleanup {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+            finished: crossbeam_channel::Sender<()>,
+        }
         impl Drop for TlsCleanup {
-            fn drop(&mut self) {let _=self.entered.send(());let _=self.release.recv_timeout(Duration::from_secs(5));let _=self.finished.send(());}
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                let _ = self.finished.send(());
+            }
         }
         thread_local! {static CLEANUP:std::cell::RefCell<Option<TlsCleanup>>=const {std::cell::RefCell::new(None)};}
-        let (entered,entered_cleanup)=crossbeam_channel::bounded(1);
-        let (release,released)=crossbeam_channel::bounded(1);
-        let (finished,finished_cleanup)=crossbeam_channel::bounded(1);
-        let worker=thread::spawn(move||CLEANUP.with(|cleanup|*cleanup.borrow_mut()=Some(TlsCleanup {entered,release:released,finished})));
-        entered_cleanup.recv_timeout(Duration::from_secs(1)).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(1);
-        while !worker.is_finished() {assert!(Instant::now()<deadline,"fixture must reach the post-packet TLS destructor boundary");thread::yield_now();}
+        let (entered, entered_cleanup) = crossbeam_channel::bounded(1);
+        let (release, released) = crossbeam_channel::bounded(1);
+        let (finished, finished_cleanup) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            CLEANUP.with(|cleanup| {
+                *cleanup.borrow_mut() = Some(TlsCleanup {
+                    entered,
+                    release: released,
+                    finished,
+                })
+            })
+        });
+        entered_cleanup
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture must reach the post-packet TLS destructor boundary"
+            );
+            thread::yield_now();
+        }
         assert!(finished_cleanup.try_recv().is_err());
-        (worker,release,finished_cleanup)
+        (worker, release, finished_cleanup)
     }
 
     #[test]
     fn bounded_close_does_not_join_a_latched_tls_destructor_on_its_caller() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         handle.close().unwrap();
-        let (worker,release,finished)=worker_blocked_in_tls_destruction();
-        *handle.0.worker.lock().unwrap()=Some(worker);
-        let started=Instant::now();
-        assert!(handle.close_until(Instant::now()+Duration::from_millis(40)).is_err());
-        assert!(started.elapsed()<Duration::from_secs(1));
-        assert!(handle.0.worker_joining.load(Ordering::Acquire),"bounded owner service retains the actual unreturned OS thread");
+        let (worker, release, finished) = worker_blocked_in_tls_destruction();
+        *handle.0.worker.lock().unwrap() = Some(worker);
+        let started = Instant::now();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(40))
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            handle.0.worker_joining.load(Ordering::Acquire),
+            "bounded owner service retains the actual unreturned OS thread"
+        );
         assert!(finished.try_recv().is_err());
-        release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
-        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle
+            .close_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
         assert!(!handle.0.worker_joining.load(Ordering::Acquire));
     }
 
     #[test]
     fn final_handle_drop_does_not_join_even_after_finished_packet_precedes_tls_cleanup() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         handle.close().unwrap();
-        let (worker,release,finished)=worker_blocked_in_tls_destruction();
-        *handle.0.worker.lock().unwrap()=Some(worker);
-        let started=Instant::now();drop(handle);
-        assert!(started.elapsed()<Duration::from_secs(1),"destruction must not join a TLS destructor even if is_finished returned true");
-        assert!(finished.try_recv().is_err(),"dropping the frontend is not proof that cleanup finished");
-        release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (worker, release, finished) = worker_blocked_in_tls_destruction();
+        *handle.0.worker.lock().unwrap() = Some(worker);
+        let started = Instant::now();
+        drop(handle);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "destruction must not join a TLS destructor even if is_finished returned true"
+        );
+        assert!(
+            finished.try_recv().is_err(),
+            "dropping the frontend is not proof that cleanup finished"
+        );
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]

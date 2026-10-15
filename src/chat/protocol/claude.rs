@@ -330,7 +330,7 @@ struct Claude {
     >,
     execution: Option<crate::model::RunId>,
     pending: HashMap<String, Value>,
-    decision_generations: HashMap<String,u64>,
+    decision_generations: HashMap<String, u64>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
     control_deadlines: HashMap<String, std::time::Instant>,
@@ -430,14 +430,14 @@ impl Claude {
             self.control_deadlines.remove(&id);
             if let Some(request) = self.controls.remove(&id) {
                 if string(&request, "subtype") == "interrupt" {
-                    if request["_cagents_turn"].as_u64()==Some(self.attention_generation) {
+                    if request["_cagents_turn"].as_u64() == Some(self.attention_generation) {
                         self.interruption = None;
                     }
                     if let Some(generation) = request["_cagents_turn"].as_u64()
                         && let Some((key, outcome, run)) =
                             self.deferred_attention.remove(&generation)
                     {
-                        self.publish_deferred_finish(generation,key,outcome,&mut step);
+                        self.publish_deferred_finish(generation, key, outcome, &mut step);
                         if let Some(run) = run {
                             step.events.push(Event::Execution {
                                 run,
@@ -601,24 +601,40 @@ impl Claude {
             self.retired.pop_front();
         }
     }
-    fn remember_decision(&mut self,id:String,raw:Value) {
-        self.decision_generations.insert(id.clone(),self.attention_generation);
-        self.pending.insert(id,raw);
+    fn remember_decision(&mut self, id: String, raw: Value) {
+        self.decision_generations
+            .insert(id.clone(), self.attention_generation);
+        self.pending.insert(id, raw);
     }
-    fn retire_turn_decisions(&mut self,generation:u64,step:&mut Step) {
-        let ids=self.decision_generations.iter().filter(|(_,owner)|**owner==generation).map(|(id,_)|id.clone()).collect::<Vec<_>>();
-        for id in ids {self.retire(id,step);}
+    fn retire_turn_decisions(&mut self, generation: u64, step: &mut Step) {
+        let ids = self
+            .decision_generations
+            .iter()
+            .filter(|(_, owner)| **owner == generation)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.retire(id, step);
+        }
     }
-    fn publish_deferred_finish(&mut self,generation:u64,key:Option<String>,outcome:crate::notifications::Kind,step:&mut Step) {
+    fn publish_deferred_finish(
+        &mut self,
+        generation: u64,
+        key: Option<String>,
+        outcome: crate::notifications::Kind,
+        step: &mut Step,
+    ) {
         use crate::notifications::Kind;
-        if matches!(outcome,Kind::Cancelled|Kind::Failed) {self.retire_turn_decisions(generation,step);}
-        let current=generation.wrapping_add(1)==self.attention_generation
-            && self.started_generation!=Some(self.attention_generation);
+        if matches!(outcome, Kind::Cancelled | Kind::Failed) {
+            self.retire_turn_decisions(generation, step);
+        }
+        let current = generation.wrapping_add(1) == self.attention_generation
+            && self.started_generation != Some(self.attention_generation);
         if current {
-            self.status(!self.pending.is_empty(),"Claude turn complete",step);
-            step.events.push(Event::TurnFinished {key,outcome});
+            self.status(!self.pending.is_empty(), "Claude turn complete", step);
+            step.events.push(Event::TurnFinished { key, outcome });
         } else {
-            step.events.push(Event::PastTurnFinished {key,outcome});
+            step.events.push(Event::PastTurnFinished { key, outcome });
         }
     }
     fn tool(&mut self, item: Item) {
@@ -2142,7 +2158,7 @@ impl Adapter for Claude {
                         } else {
                             outcome
                         };
-                        self.publish_deferred_finish(generation,key,outcome,&mut step);
+                        self.publish_deferred_finish(generation, key, outcome, &mut step);
                         if let Some(run) = execution {
                             step.events.push(Event::Execution {
                                 run,
@@ -2392,8 +2408,8 @@ impl Adapter for Claude {
                     } else {
                         Kind::Succeeded
                     };
-                    if matches!(outcome,Kind::Cancelled|Kind::Failed) {
-                        self.retire_turn_decisions(self.attention_generation,&mut step);
+                    if matches!(outcome, Kind::Cancelled | Kind::Failed) {
+                        self.retire_turn_decisions(self.attention_generation, &mut step);
                     }
                     let execution = self.execution.take();
                     if let Some(run) = execution {
@@ -5382,50 +5398,134 @@ mod tests {
 
     #[test]
     fn failed_turn_retires_pending_decisions_before_reporting_idle() {
-        let mut adapter=Claude {ready:true,busy:true,..Default::default()};
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            ..Default::default()
+        };
         adapter.receive(json!({"type":"control_request","request_id":"old","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-old","input":{"command":"true"}}})).unwrap();
-        let failed=adapter.receive(json!({"type":"result","subtype":"error_during_execution","is_error":true})).unwrap();
-        assert!(adapter.pending.is_empty()); assert!(adapter.decision_generations.is_empty()); assert!(!adapter.busy);
-        assert!(failed.events.contains(&Event::RequestResolved {id:"old".into()}));
-        assert!(!failed.events.iter().any(|event|matches!(event,Event::Status {busy:true,..})));
-        assert!(adapter.command(Command::Prompt {text:"new prompt".into(),attachments:Vec::new(),mode:PromptMode::Send}).is_ok());
+        let failed = adapter
+            .receive(json!({"type":"result","subtype":"error_during_execution","is_error":true}))
+            .unwrap();
+        assert!(adapter.pending.is_empty());
+        assert!(adapter.decision_generations.is_empty());
+        assert!(!adapter.busy);
+        assert!(
+            failed
+                .events
+                .contains(&Event::RequestResolved { id: "old".into() })
+        );
+        assert!(
+            !failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Status { busy: true, .. }))
+        );
+        assert!(
+            adapter
+                .command(Command::Prompt {
+                    text: "new prompt".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send
+                })
+                .is_ok()
+        );
     }
 
     #[test]
     fn late_interrupt_result_retires_only_its_original_decisions_and_not_the_new_turn() {
-        let mut adapter=Claude {ready:true,busy:true,..Default::default()};
-        let request=|id:&str|json!({"type":"control_request","request_id":id,"request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":format!("tool-{id}"),"input":{"command":"true"}}});
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            ..Default::default()
+        };
+        let request = |id: &str| json!({"type":"control_request","request_id":id,"request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":format!("tool-{id}"),"input":{"command":"true"}}});
         adapter.receive(request("old")).unwrap();
-        let interrupt=adapter.command(Command::Interrupt).unwrap();
-        let id=interrupt.writes[0]["request_id"].clone();
-        adapter.receive(json!({"type":"result","uuid":"old-result","subtype":"success","is_error":false})).unwrap();
-        let mut start=Step::default(); adapter.start_turn(&mut start);
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let id = interrupt.writes[0]["request_id"].clone();
+        adapter
+            .receive(
+                json!({"type":"result","uuid":"old-result","subtype":"success","is_error":false}),
+            )
+            .unwrap();
+        let mut start = Step::default();
+        adapter.start_turn(&mut start);
         adapter.receive(request("new")).unwrap();
         let reply=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{}}})).unwrap();
-        assert!(!adapter.pending.contains_key("old")); assert!(adapter.pending.contains_key("new")); assert!(adapter.busy);
-        assert!(reply.events.contains(&Event::RequestResolved {id:"old".into()}));
-        assert!(!reply.events.contains(&Event::RequestResolved {id:"new".into()}));
-        assert!(reply.events.iter().any(|event|matches!(event,Event::PastTurnFinished {outcome:crate::notifications::Kind::Cancelled,..})));
-        assert!(!reply.events.iter().any(|event|matches!(event,Event::TurnFinished{..}|Event::Status {busy:false,..})));
+        assert!(!adapter.pending.contains_key("old"));
+        assert!(adapter.pending.contains_key("new"));
+        assert!(adapter.busy);
+        assert!(
+            reply
+                .events
+                .contains(&Event::RequestResolved { id: "old".into() })
+        );
+        assert!(
+            !reply
+                .events
+                .contains(&Event::RequestResolved { id: "new".into() })
+        );
+        assert!(reply.events.iter().any(|event| matches!(
+            event,
+            Event::PastTurnFinished {
+                outcome: crate::notifications::Kind::Cancelled,
+                ..
+            }
+        )));
+        assert!(!reply.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished { .. } | Event::Status { busy: false, .. }
+        )));
     }
 
     #[test]
     fn expiring_an_old_interrupt_cannot_clear_a_newer_turns_pending_interrupt() {
-        let mut adapter=Claude {busy:true,..Default::default()};
-        let old=adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"].as_str().unwrap().to_owned();
-        adapter.receive(json!({"type":"result","uuid":"old","subtype":"success","is_error":false})).unwrap();
-        let mut started=Step::default();adapter.start_turn(&mut started);adapter.busy=true;
-        let current=adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"].as_str().unwrap().to_owned();
-        let now=std::time::Instant::now();
-        adapter.control_deadlines.insert(old,now-std::time::Duration::from_millis(1));
-        adapter.control_deadlines.insert(current.clone(),now+std::time::Duration::from_secs(10));
-        let expired=adapter.expire_controls(now);
-        assert_eq!(adapter.interruption,Some(false));
-        assert!(expired.events.iter().any(|event|matches!(event,Event::PastTurnFinished {outcome:crate::notifications::Kind::Succeeded,..})));
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let old = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        adapter
+            .receive(json!({"type":"result","uuid":"old","subtype":"success","is_error":false}))
+            .unwrap();
+        let mut started = Step::default();
+        adapter.start_turn(&mut started);
+        adapter.busy = true;
+        let current = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let now = std::time::Instant::now();
+        adapter
+            .control_deadlines
+            .insert(old, now - std::time::Duration::from_millis(1));
+        adapter
+            .control_deadlines
+            .insert(current.clone(), now + std::time::Duration::from_secs(10));
+        let expired = adapter.expire_controls(now);
+        assert_eq!(adapter.interruption, Some(false));
+        assert!(expired.events.iter().any(|event| matches!(
+            event,
+            Event::PastTurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
         assert!(adapter.controls.contains_key(&current));
-        adapter.receive(json!({"type":"result","uuid":"new","subtype":"success","is_error":false})).unwrap();
+        adapter
+            .receive(json!({"type":"result","uuid":"new","subtype":"success","is_error":false}))
+            .unwrap();
         let acknowledged=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":current,"response":{}}})).unwrap();
-        assert!(acknowledged.events.iter().any(|event|matches!(event,Event::TurnFinished {outcome:crate::notifications::Kind::Cancelled,..})));
+        assert!(acknowledged.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Cancelled,
+                ..
+            }
+        )));
     }
 
     #[test]

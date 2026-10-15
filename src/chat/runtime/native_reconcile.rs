@@ -3,26 +3,38 @@
 use super::Handle;
 use std::sync::{OnceLock, atomic::Ordering};
 
-const CAPACITY:usize=64;
-const WORKERS:usize=2;
+const CAPACITY: usize = 64;
+const WORKERS: usize = 2;
 enum Task {
     Retained(Handle),
     FinalHolder(crate::chat::native_holder::Holder),
 }
-static SERVICE:OnceLock<Result<crossbeam_channel::Sender<Task>,String>>=OnceLock::new();
+static SERVICE: OnceLock<Result<crossbeam_channel::Sender<Task>, String>> = OnceLock::new();
 
-pub(super) fn request(handle:&Handle)->Result<(),String> {
-    if handle.0.native_reconciling.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
+pub(super) fn request(handle: &Handle) -> Result<(), String> {
+    if handle
+        .0
+        .native_reconciling
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return Ok(());
     }
-    let service=service();
-    let queued=service.as_ref().map_err(Clone::clone).and_then(|service|service.try_send(Task::Retained(handle.clone()))
-        .map_err(|_|"Native cleanup capacity is busy; its exact owner is retained for retry".to_owned()));
-    if queued.is_err() {handle.0.native_reconciling.store(false,Ordering::Release);}
+    let service = service();
+    let queued = service.as_ref().map_err(Clone::clone).and_then(|service| {
+        service
+            .try_send(Task::Retained(handle.clone()))
+            .map_err(|_| {
+                "Native cleanup capacity is busy; its exact owner is retained for retry".to_owned()
+            })
+    });
+    if queued.is_err() {
+        handle.0.native_reconciling.store(false, Ordering::Release);
+    }
     queued
 }
 
-fn service()->&'static Result<crossbeam_channel::Sender<Task>,String> {
+fn service() -> &'static Result<crossbeam_channel::Sender<Task>, String> {
     SERVICE.get_or_init(|| {
         let (sender,receiver)=crossbeam_channel::bounded::<Task>(CAPACITY);
         for index in 0..WORKERS {
@@ -59,13 +71,18 @@ fn service()->&'static Result<crossbeam_channel::Sender<Task>,String> {
 /// Final Handle destruction has no caller that can retain/retry it. Transfer
 /// its exact holder without waiting; if capacity is unavailable, keep its
 /// durable registry identity and let the helper's orphan policy own shutdown.
-pub(super) fn retire_final(holder:crate::chat::native_holder::Holder) {
-    let retained=match service() {
-        Ok(service)=>service.try_send(Task::FinalHolder(holder)).err().map(|error|error.into_inner()),
-        Err(_)=>Some(Task::FinalHolder(holder)),
+pub(super) fn retire_final(holder: crate::chat::native_holder::Holder) {
+    let retained = match service() {
+        Ok(service) => service
+            .try_send(Task::FinalHolder(holder))
+            .err()
+            .map(|error| error.into_inner()),
+        Err(_) => Some(Task::FinalHolder(holder)),
     };
-    if let Some(Task::FinalHolder(holder))=retained {
+    if let Some(Task::FinalHolder(holder)) = retained {
         holder.preserve();
-        tracing::warn!("Final native cleanup capacity unavailable; exact registry identity retained without cleanup receipt");
+        tracing::warn!(
+            "Final native cleanup capacity unavailable; exact registry identity retained without cleanup receipt"
+        );
     }
 }
