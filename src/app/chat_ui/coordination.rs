@@ -477,7 +477,9 @@ impl BackgroundState {
 
     fn tool_status(self) -> ToolStatus {
         match self {
-            Self::Working | Self::Waiting | Self::LastReported | Self::LastReportedWaiting => ToolStatus::Running,
+            Self::Working | Self::Waiting | Self::LastReported | Self::LastReportedWaiting => {
+                ToolStatus::Running
+            }
             Self::Failed => ToolStatus::Failed,
             Self::Stopped => ToolStatus::Stopped,
             Self::Finished => ToolStatus::Succeeded,
@@ -678,7 +680,12 @@ impl Runtime {
         let replies = &reading.outcome.messages;
         let line = match (status, receipt) {
             (ToolStatus::Running, _) if !self.observes_live_work() => Some((
-                if message.waits { "Last reported waiting for an answer" } else { "Last reported sending" }.to_owned(),
+                if message.waits {
+                    "Last reported waiting for an answer"
+                } else {
+                    "Last reported sending"
+                }
+                .to_owned(),
                 Tone::Plain,
             )),
             (ToolStatus::Running, _) if message.waits => {
@@ -717,7 +724,11 @@ impl Runtime {
                 Some((arrival(receipt.arrival).to_owned(), Tone::Plain))
             }
             // A prompt to an agent starts a run of it.
-            _ => reading.outcome.run.as_ref().and_then(|run| run_line(run, self.observes_live_work())),
+            _ => reading
+                .outcome
+                .run
+                .as_ref()
+                .and_then(|run| run_line(run, self.observes_live_work())),
         };
         if let Some((text, tone)) = line {
             rows.push(status_caption(text, tone));
@@ -857,7 +868,9 @@ impl Runtime {
         let run = reading.outcome.run.as_ref();
         let line = match status {
             ToolStatus::Running if background.is_some() => None,
-            ToolStatus::Running if !self.observes_live_work() => Some(("Last reported running".to_owned(), Tone::Plain)),
+            ToolStatus::Running if !self.observes_live_work() => {
+                Some(("Last reported running".to_owned(), Tone::Plain))
+            }
             ToolStatus::Running if spawn.waits => Some(("Working…".to_owned(), Tone::Plain)),
             ToolStatus::Running => Some(("Starting…".to_owned(), Tone::Plain)),
             ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped => {
@@ -899,11 +912,16 @@ impl Runtime {
         if agents.is_empty() {
             None
         } else if any(ToolStatus::Running) && !self.observes_live_work() {
-            Some(if agents.iter().any(|agent| agent.status == ToolStatus::Running && agent.waiting) {
-                BackgroundState::LastReportedWaiting
-            } else {
-                BackgroundState::LastReported
-            })
+            Some(
+                if agents
+                    .iter()
+                    .any(|agent| agent.status == ToolStatus::Running && agent.waiting)
+                {
+                    BackgroundState::LastReportedWaiting
+                } else {
+                    BackgroundState::LastReported
+                },
+            )
         } else if agents
             .iter()
             .any(|agent| agent.status == ToolStatus::Running && agent.waiting)
@@ -1124,7 +1142,9 @@ impl Runtime {
             // session. Report its observed state, or only the accepted launch.
             Some(
                 match coordinated.reading.outcome.run.as_ref() {
-                    Some(run) => run.state.map_or("Launch accepted", |state| observed_state_phrase(state, self.observes_live_work())),
+                    Some(run) => run.state.map_or("Launch accepted", |state| {
+                        observed_state_phrase(state, self.observes_live_work())
+                    }),
                     None => "Launch command finished",
                 }
                 .to_owned(),
@@ -1168,13 +1188,29 @@ mod identity_tests {
             (State::Running, "Last reported running"),
             (State::Waiting, "Last reported waiting for an answer"),
         ] {
-            let run = Run { agent: "worker".into(), state: Some(state), ..Default::default() };
-            assert_eq!(run_line(&run, false).unwrap().0, format!("{expected} as agent worker"));
+            let run = Run {
+                agent: "worker".into(),
+                state: Some(state),
+                ..Default::default()
+            };
+            assert_eq!(
+                run_line(&run, false).unwrap().0,
+                format!("{expected} as agent worker")
+            );
             assert_eq!(observed_state_phrase(state, false), expected);
-            assert_eq!(run_line(&run, true).unwrap().0, format!("{} as agent worker", state_phrase(state)));
+            assert_eq!(
+                run_line(&run, true).unwrap().0,
+                format!("{} as agent worker", state_phrase(state))
+            );
             assert_eq!(run.state, Some(state));
         }
-        for state in [State::Accepted, State::Succeeded, State::Failed, State::Cancelled, State::Interrupted] {
+        for state in [
+            State::Accepted,
+            State::Succeeded,
+            State::Failed,
+            State::Cancelled,
+            State::Interrupted,
+        ] {
             assert_eq!(observed_state_phrase(state, false), state_phrase(state));
         }
     }

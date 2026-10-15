@@ -255,9 +255,11 @@ impl<'a> ManagedDisplayIndex<'a> {
                     HostedSession::Chat(session) => (0, session.id),
                     HostedSession::Terminal(session) => (1, session.id),
                 };
-                if self.resources.get(&resource).is_some_and(|cards| {
-                    cards.iter().any(|card| *card != canonical)
-                }) {
+                if self
+                    .resources
+                    .get(&resource)
+                    .is_some_and(|cards| cards.iter().any(|card| *card != canonical))
+                {
                     return None;
                 }
             }

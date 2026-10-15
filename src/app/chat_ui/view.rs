@@ -1035,7 +1035,11 @@ impl Runtime {
 
     fn observed_native_child_status(&self, agent: &chat::Subagent) -> &'static str {
         if agent.status == chat::ToolStatus::Running && !self.observes_live_work() {
-            if agent.waiting { "Last reported waiting" } else { "Last reported running" }
+            if agent.waiting {
+                "Last reported waiting"
+            } else {
+                "Last reported running"
+            }
         } else {
             Self::native_child_status(agent)
         }
@@ -1633,7 +1637,9 @@ impl Runtime {
             )];
             for agent in snapshot.subagents.iter().rev() {
                 let label = Self::native_child_name(agent);
-                let marker = if agent.status == chat::ToolStatus::Running && !self.observes_live_work() {
+                let marker = if agent.status == chat::ToolStatus::Running
+                    && !self.observes_live_work()
+                {
                     crate::ui_controls::passive_icon(Icon::Info, design::COMPACT_ICON_SIZE)
                 } else if agent.status == chat::ToolStatus::Running && agent.waiting {
                     crate::ui_controls::passive_icon(Icon::AgentWaiting, design::COMPACT_ICON_SIZE)
@@ -2418,18 +2424,28 @@ impl Runtime {
             .filter(|entry| entry.status == chat::PlanState::Done)
             .count();
         let mut rows: Vec<Element<'_, Message>> = vec![
-            design::caption(format!("{} · {done} of {} done", if self.observes_live_work() { "Plan" } else { "Last reported plan" }, plan.len()))
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
+            design::caption(format!(
+                "{} · {done} of {} done",
+                if self.observes_live_work() {
+                    "Plan"
+                } else {
+                    "Last reported plan"
+                },
+                plan.len()
+            ))
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .into(),
         ];
         rows.extend(plan.iter().map(|entry| -> Element<'_, Message> {
             // The step in hand carries the same live indicator the rest of the
             // shell uses for work in flight, so a reader can tell where the
             // agent is without reading the plan at all.
             let marker: Element<'_, Message> = match entry.status {
-                chat::PlanState::Active if !self.observes_live_work() => widget::icon(Icon::Info.handle())
-                    .size(design::COMPACT_ICON_SIZE)
-                    .into(),
+                chat::PlanState::Active if !self.observes_live_work() => {
+                    widget::icon(Icon::Info.handle())
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into()
+                }
                 chat::PlanState::Active => crate::ui_controls::activity_spinner(
                     f32::from(design::COMPACT_ICON_SIZE),
                     design::accent_color,
@@ -3112,7 +3128,8 @@ impl Runtime {
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
-            self.observed_turn_time(turn, now).and_then(|now| turn.working_for(now))
+            self.observed_turn_time(turn, now)
+                .and_then(|now| turn.working_for(now))
                 .map(|millis| if turn.running { millis / 1_000 } else { millis })
                 .hash(&mut hasher);
         }
@@ -5498,7 +5515,11 @@ mod tests {
             handle.replace_snapshot_for_test(snapshot.clone());
             runtime.refresh();
             let live = runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(5000));
-            assert!(runtime.observed_turn_summary(&runtime.turns[0]).ends_with(" · working"));
+            assert!(
+                runtime
+                    .observed_turn_summary(&runtime.turns[0])
+                    .ends_with(" · working")
+            );
             assert_ne!(
                 runtime.observed_turn_duration(&runtime.turns[0], Some(5000)),
                 runtime.observed_turn_duration(&runtime.turns[0], Some(9000))
@@ -5510,22 +5531,50 @@ mod tests {
             runtime.refresh();
             runtime.disconnected = !exited;
             let turn = &runtime.turns[0];
-            assert!(turn.running, "presentation must not overwrite native item status");
-            assert_eq!(runtime.snapshot.items[0].content.status(), Some(chat::ToolStatus::Running));
-            assert_eq!(runtime.snapshot.subagents[0].status, chat::ToolStatus::Running);
+            assert!(
+                turn.running,
+                "presentation must not overwrite native item status"
+            );
+            assert_eq!(
+                runtime.snapshot.items[0].content.status(),
+                Some(chat::ToolStatus::Running)
+            );
+            assert_eq!(
+                runtime.snapshot.subagents[0].status,
+                chat::ToolStatus::Running
+            );
             assert!(!runtime.observes_live_work());
             assert_eq!(runtime.conversation_status(false).1, "Cancelled");
-            assert!(runtime.observed_turn_summary(turn).ends_with(" · last reported running"));
-            assert_eq!(runtime.observed_turn_duration(turn, Some(5000)).as_deref(), Some("observed 1s"));
+            assert!(
+                runtime
+                    .observed_turn_summary(turn)
+                    .ends_with(" · last reported running")
+            );
+            assert_eq!(
+                runtime.observed_turn_duration(turn, Some(5000)).as_deref(),
+                Some("observed 1s")
+            );
             assert_eq!(
                 runtime.observed_turn_duration(turn, Some(5000)),
                 runtime.observed_turn_duration(turn, Some(90000))
             );
             let unknown = runtime.turn_fingerprint_at(turn, true, Some(5000));
-            assert_ne!(unknown, live, "observation loss invalidates the retained live strip");
-            assert_eq!(unknown, runtime.turn_fingerprint_at(turn, true, Some(90000)));
-            assert_eq!(runtime.observed_native_child_status(&runtime.snapshot.subagents[0]), "Last reported waiting");
-            assert_eq!(runtime.native_child_empty_message(&runtime.snapshot.subagents[0]), "No recent subagent activity is available here.");
+            assert_ne!(
+                unknown, live,
+                "observation loss invalidates the retained live strip"
+            );
+            assert_eq!(
+                unknown,
+                runtime.turn_fingerprint_at(turn, true, Some(90000))
+            );
+            assert_eq!(
+                runtime.observed_native_child_status(&runtime.snapshot.subagents[0]),
+                "Last reported waiting"
+            );
+            assert_eq!(
+                runtime.native_child_empty_message(&runtime.snapshot.subagents[0]),
+                "No recent subagent activity is available here."
+            );
             // Publication time is not fresh native evidence. Repeated reads
             // of retained items cannot advance the last-observed duration.
             for sampled_at in [15000, 90000] {
@@ -5534,8 +5583,16 @@ mod tests {
                 handle.replace_snapshot_for_test(snapshot.clone());
                 runtime.refresh();
                 runtime.disconnected = !exited;
-                assert_eq!(runtime.observed_turn_duration(&runtime.turns[0], Some(sampled_at)).as_deref(), Some("observed 1s"));
-                assert_eq!(runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(sampled_at)), unknown);
+                assert_eq!(
+                    runtime
+                        .observed_turn_duration(&runtime.turns[0], Some(sampled_at))
+                        .as_deref(),
+                    Some("observed 1s")
+                );
+                assert_eq!(
+                    runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(sampled_at)),
+                    unknown
+                );
             }
             // A fresh native item observation can legitimately renew evidence
             // even while the observer remains unavailable.
@@ -5544,8 +5601,16 @@ mod tests {
             handle.replace_snapshot_for_test(snapshot.clone());
             runtime.refresh();
             runtime.disconnected = !exited;
-            assert_eq!(runtime.observed_turn_duration(&runtime.turns[0], Some(90000)).as_deref(), Some("observed 5s"));
-            assert_ne!(runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(90000)), unknown);
+            assert_eq!(
+                runtime
+                    .observed_turn_duration(&runtime.turns[0], Some(90000))
+                    .as_deref(),
+                Some("observed 5s")
+            );
+            assert_ne!(
+                runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(90000)),
+                unknown
+            );
             // A fresh observed snapshot can report the same still-running
             // external work. This is a presentation fixture, not rehosting.
             snapshot.exited = false;
@@ -5561,7 +5626,10 @@ mod tests {
                 runtime.turn_fingerprint_at(turn, true, Some(5000)),
                 runtime.turn_fingerprint_at(turn, true, Some(90000))
             );
-            assert_eq!(runtime.observed_native_child_status(&runtime.snapshot.subagents[0]), "Waiting for you");
+            assert_eq!(
+                runtime.observed_native_child_status(&runtime.snapshot.subagents[0]),
+                "Waiting for you"
+            );
         }
     }
 
@@ -5586,14 +5654,24 @@ mod tests {
         runtime.refresh();
         let turn = &runtime.turns[0];
         assert!(!turn.running);
-        assert!(turn.prose.iter().any(|placed| placed.slot == turn::Slot::Thinking));
+        assert!(
+            turn.prose
+                .iter()
+                .any(|placed| placed.slot == turn::Slot::Thinking)
+        );
         let live = runtime.turn_fingerprint_at(turn, true, Some(3000));
         runtime.disconnected = true;
         let turn = &runtime.turns[0];
         let unknown = runtime.turn_fingerprint_at(turn, true, Some(3000));
         assert_ne!(live, unknown);
-        assert_eq!(unknown, runtime.turn_fingerprint_at(turn, true, Some(90000)));
-        assert!(matches!(runtime.snapshot.items[0].content, ItemContent::Text { thinking: true, .. }));
+        assert_eq!(
+            unknown,
+            runtime.turn_fingerprint_at(turn, true, Some(90000))
+        );
+        assert!(matches!(
+            runtime.snapshot.items[0].content,
+            ItemContent::Text { thinking: true, .. }
+        ));
     }
 
     #[test]

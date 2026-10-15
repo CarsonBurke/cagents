@@ -45,7 +45,10 @@ const THREAD_RAIL_OFFSET: f32 =
 /// a static glyph for work in flight says only that something was running
 /// when the frame was drawn, so it is the animated indicator the rest of the
 /// shell uses for the same state.
-fn status_indicator<'a>(status: ToolStatus, observed: bool) -> (Element<'a, Message>, Option<design::Tone>) {
+fn status_indicator<'a>(
+    status: ToolStatus,
+    observed: bool,
+) -> (Element<'a, Message>, Option<design::Tone>) {
     let glyph = |name: Icon, tone: Option<design::Tone>| {
         (
             widget::icon(name.handle())
@@ -277,9 +280,15 @@ impl Runtime {
         !self.disconnected && !self.snapshot.exited
     }
 
-    pub(super) fn observed_turn_summary<'a>(&self, turn: &'a turn::Turn) -> std::borrow::Cow<'a, str> {
+    pub(super) fn observed_turn_summary<'a>(
+        &self,
+        turn: &'a turn::Turn,
+    ) -> std::borrow::Cow<'a, str> {
         if turn.running && !self.observes_live_work() {
-            let summary = turn.summary.strip_suffix(" · working").unwrap_or(&turn.summary);
+            let summary = turn
+                .summary
+                .strip_suffix(" · working")
+                .unwrap_or(&turn.summary);
             format!("{summary} · last reported running").into()
         } else {
             turn.summary.as_str().into()
@@ -294,7 +303,11 @@ impl Runtime {
         }
     }
 
-    pub(super) fn observed_turn_duration(&self, turn: &turn::Turn, now: Option<u64>) -> Option<String> {
+    pub(super) fn observed_turn_duration(
+        &self,
+        turn: &turn::Turn,
+        now: Option<u64>,
+    ) -> Option<String> {
         let label = turn.duration_label(self.observed_turn_time(turn, now)?)?;
         Some(if turn.running && !self.observes_live_work() {
             format!("observed {label}")
@@ -381,7 +394,10 @@ impl Runtime {
             .size(design::COMPACT_ICON_SIZE)
             .into(),
         ];
-        let tone = match turn.glyph().map(|status| status_indicator(status, self.observes_live_work())) {
+        let tone = match turn
+            .glyph()
+            .map(|status| status_indicator(status, self.observes_live_work()))
+        {
             Some((indicator, tone)) => {
                 line.push(indicator);
                 tone
@@ -389,11 +405,7 @@ impl Runtime {
             None => None,
         };
         let summary = self.observed_turn_summary(turn).into_owned();
-        line.push(
-            design::heading(summary.clone())
-                .width(Length::Fill)
-                .into(),
-        );
+        line.push(design::heading(summary.clone()).width(Length::Fill).into());
         // The one-second chat tick advances running timers even while a tool
         // is quiet. The label shares its cadence with the retained-turn cache.
         let elapsed = self.observed_turn_duration(turn, self.source_now_ms());
@@ -559,7 +571,9 @@ impl Runtime {
                 .into(),
         );
         if let Some(detail) = &cached.detail {
-            let detail = if item.content.status() == Some(ToolStatus::Running) && !self.observes_live_work() {
+            let detail = if item.content.status() == Some(ToolStatus::Running)
+                && !self.observes_live_work()
+            {
                 format!("Last reported: {detail}")
             } else {
                 detail.clone()
