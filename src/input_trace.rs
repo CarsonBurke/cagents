@@ -336,12 +336,13 @@ impl KeyboardFocus {
         regions: &[(cosmic::iced::widget::Id, KeyboardRegion)],
         inherited: Option<KeyboardRegion>,
     ) -> KeyboardRegion {
-        if let Some((_, region)) = regions
-            .iter()
-            .find(|(candidate, _)| Some(candidate) == id.as_ref())
-        {
-            return *region;
-        }
+        let direct = if self.known_regions.is_empty() {
+            // Direct operation fixtures may supply regions after traversal.
+            regions.iter().find(|(candidate, _)| Some(candidate) == id.as_ref()).map(|(_, region)| *region)
+        } else {
+            id.as_ref().and_then(|id| self.known_regions.get(id)).copied()
+        };
+        if let Some(region) = direct { return region; }
         let container = inherited.unwrap_or_else(|| FocusedPane::OutsideWorkspace.into());
         if self
             .inputs
