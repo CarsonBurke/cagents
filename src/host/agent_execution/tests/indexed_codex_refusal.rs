@@ -16,6 +16,9 @@ fn approval(id: u64) -> Value {
 }
 
 pub(super) fn body() {
+    // This test-worker WebSocket exercises admission, not holder ancestry or
+    // durable continuity. Never advertise a verified holder-owned app-server.
+    assert!(chat::native_holder::verified_codex_version("codex/0.0.0").is_none());
     let (host, mut request, path) = fixture();
     let root = path.parent().unwrap().to_owned();
     let program = root.join("bin/codex");
@@ -74,7 +77,7 @@ pub(super) fn body() {
                 continue;
             };
             let result = match method {
-                "initialize" => json!({"userAgent":"codex/0.157.1","codexHome":server_root.join("home/.codex")}),
+                "initialize" => json!({"userAgent":"codex/0.0.0","codexHome":server_root.join("home/.codex")}),
                 "thread/start" => json!({"thread":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"}),
                 "model/list" | "skills/list" | "thread/queue/list" | "thread/list" => json!({"data":[],"nextCursor":null}),
                 "thread/read" => json!({"thread":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","turns":[]}}),
@@ -114,6 +117,8 @@ pub(super) fn body() {
     assert!(control(&owner, answer("91", "decline")).unwrap_err().contains("accepts the actions"));
     assert!(control(&owner, answer("missing", "decision-1")).unwrap_err().contains("No pending request"));
     let (current, _) = status(&host, &owner, agent).unwrap();
+    let Some(HostedSession::Chat(source)) = &current.session else { panic!("expected live Codex") };
+    assert_eq!(source.native_continuity, chat::NativeContinuity::ReconnectOnly);
     let inherited = registry(&host).unwrap().lock().unwrap().retained_agent_authority(current.session.as_ref().unwrap().id()).unwrap();
     assert!(control(&inherited, answer("91", "decision-1")).is_err(), "seeing the request does not confer ownership");
     control(&owner, answer("91", "decision-1")).unwrap();
