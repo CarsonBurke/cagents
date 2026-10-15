@@ -15,6 +15,7 @@ use std::{
 
 pub(crate) struct ReservedProject {
     project: ProjectInstance,
+    destination: Option<PathBuf>,
     roots: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     channels: HashSet<ChannelId>,
@@ -76,7 +77,7 @@ impl ReservedProject {
         match scope {
             Scope::Channel(channel) => self.channels.contains(channel),
             Scope::Worktree { repository, path } => {
-                *repository == self.project.repository || self.directory(path)
+                *repository == self.project.repository || self.destination.as_ref()==Some(repository) || self.directory(path)
             }
         }
     }
@@ -126,14 +127,16 @@ impl ReservedProject {
             | ModelEdit::ResetNavigation { repository }
             | ModelEdit::ReorderNavigation { repository, .. }
             | ModelEdit::CreateChannel { repository, .. } => {
-                *repository == self.project.repository || self.directory(repository)
+                *repository == self.project.repository || self.destination.as_ref()==Some(repository) || self.directory(repository)
             }
             ModelEdit::CloseProjectInstance { project } => {
                 project.registry == self.project.registry && project.ordinal == self.project.ordinal
             }
-            ModelEdit::RelocateProject { relocation } => {
+            ModelEdit::RelocateProject { relocation, .. } => {
                 relocation.repository == self.project.repository
+                    || self.destination.as_ref()==Some(&relocation.repository)
                     || relocation.destination == self.project.repository
+                    || self.destination.as_ref()==Some(&relocation.destination)
                     || self.directory(&relocation.old_root)
                     || self.directory(&relocation.new_root)
             }
@@ -177,7 +180,7 @@ fn scopes(host: &SharedHost) -> Vec<Arc<ReservedProject>> {
 fn busy() -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::InvalidRequest,
-        "This project is being removed. Wait for its removal to finish, or retry after resolving its failure.",
+        "This project is being removed or its location is being verified. Wait for that operation to finish, or retry after resolving its failure.",
         true,
     )
 }
@@ -188,15 +191,25 @@ pub(crate) fn reserve(
     project: &ProjectInstance,
     selected: &[SessionClose],
 ) -> Result<Reservation, ProtocolError> {
+    reserve_inner(host, project, selected, None)
+}
+
+pub(crate) fn reserve_relocation(host: &SharedHost, project: &ProjectInstance, relocation: &crate::project_recovery::Relocation) -> Result<Reservation, ProtocolError> {
+    reserve_inner(host, project, &[], Some(relocation))
+}
+
+fn reserve_inner(host:&SharedHost, project:&ProjectInstance, selected:&[SessionClose], relocation:Option<&crate::project_recovery::Relocation>) -> Result<Reservation,ProtocolError> {
     let registry = super::super::agent_execution::registry(host).map_err(error)?;
     let model = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         registry.require_project_instance(project).map_err(error)?;
+        if let Some(relocation)=relocation { registry.require_project_relocation(project,relocation).map_err(error)?; }
         registry.model().map_err(error)?
     };
     let mut reserved = ReservedProject {
         project: project.clone(),
-        roots: Vec::new(),
+        destination: relocation.map(|relocation|relocation.destination.clone()),
+        roots: relocation.map(|relocation|vec![relocation.old_root.clone(),relocation.new_root.clone(),relocation.destination.clone()]).unwrap_or_default(),
         protected: Vec::new(),
         channels: model
             .channels
@@ -324,7 +337,7 @@ pub(crate) fn reserve(
     // Fail the entire roster before the first close; leave its saved pane and
     // project reachable for explicit recovery/cleanup. Foreign pending owners
     // remain outside this project's reservation.
-    {
+    if relocation.is_none() {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         for id in &reserved.sessions {
             if state.native_adoption_failures.contains_id(*id)
@@ -343,7 +356,12 @@ pub(crate) fn reserve(
     let token = uuid::Uuid::new_v4();
     {
         let mut entries = entries.lock().unwrap_or_else(|p| p.into_inner());
-        if entries.values().any(|active| active.project == *project) {
+        if entries.values().any(|active| active.project == *project
+            || active.destination.as_ref()==Some(&project.repository)
+            || reserved.destination.as_ref()==Some(&active.project.repository)
+            || reserved.destination.as_ref().is_some_and(|destination|active.destination.as_ref()==Some(destination))
+            || reserved.roots.iter().any(|root|active.directory(root))
+            || active.roots.iter().any(|root|reserved.directory(root))) {
             return Err(busy());
         }
         entries.insert(token, Arc::new(reserved));
@@ -365,7 +383,7 @@ pub(crate) fn ensure_available(
     }
     let directory = directory.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_owned()));
     if scopes.iter().any(|scope| {
-        repository.is_some_and(|repository| repository == scope.project.repository)
+        repository.is_some_and(|repository| repository == scope.project.repository || scope.destination.as_deref()==Some(repository))
             || directory
                 .as_deref()
                 .is_some_and(|directory| scope.directory(directory))

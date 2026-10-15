@@ -390,7 +390,7 @@ mod tests {
             new_root: moved.clone(),
         };
         registry
-            .apply(&ModelEdit::RelocateProject { relocation })
+            .apply(&registry.relocation_edit(relocation))
             .unwrap();
         assert_eq!(
             registry.agent(accepted.agent.id).unwrap().spec,
@@ -475,14 +475,12 @@ mod tests {
         let moved = fixture.path().join("moved");
         std::fs::rename(&old, &moved).unwrap();
         registry
-            .apply(&ModelEdit::RelocateProject {
-                relocation: Relocation {
+            .apply(&registry.relocation_edit(Relocation {
                     repository: old.clone(),
                     destination: moved.clone(),
                     old_root: old.clone(),
                     new_root: moved.clone(),
-                },
-            })
+                }))
             .unwrap();
         std::fs::create_dir(&old).unwrap();
         let replacement = accepted(&mut registry, &old, "replacement");
@@ -563,7 +561,7 @@ mod tests {
         std::fs::rename(&moved, fixture.path().join("actual-approved-inode")).unwrap();
         std::fs::create_dir(&moved).unwrap();
         registry
-            .apply_with_location_moves(&ModelEdit::RelocateProject { relocation }, &[], &evidence)
+            .apply_with_location_moves(&registry.relocation_edit(relocation), &[], &evidence)
             .unwrap();
         assert!(
             registry
@@ -589,14 +587,12 @@ mod tests {
         let replacement = fixture.path().join("replacement");
         std::fs::create_dir(&replacement).unwrap();
         registry
-            .apply(&ModelEdit::RelocateProject {
-                relocation: Relocation {
+            .apply(&registry.relocation_edit(Relocation {
                     repository: old.clone(),
                     destination: replacement.clone(),
                     old_root: old.clone(),
                     new_root: replacement.clone(),
-                },
-            })
+                }))
             .unwrap();
         let location = registry.agent_location(accepted.agent.id).unwrap();
         assert_eq!(location.repository, replacement);

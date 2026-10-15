@@ -19,7 +19,7 @@ mod reservation;
 mod census;
 use reservation::Reservation;
 pub(super) use reservation::{
-    Reservations, admit, ensure_agent_available, ensure_available, reserve,
+    Reservations, admit, ensure_agent_available, ensure_available, reserve, reserve_relocation,
 };
 
 const MAX_SESSIONS: usize = 4096;

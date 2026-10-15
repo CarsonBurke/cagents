@@ -124,7 +124,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             continue;
         }
-        if let ModelEdit::RelocateProject { relocation } = edit {
+        if let ModelEdit::RelocateProject { relocation, .. } = edit {
             let model = client
                 .read_workspace_model()
                 .map_err(|error| error.to_string())?;
@@ -522,7 +522,7 @@ impl Cagents {
                     _ => None,
                 };
                 self.workspace_model.fold(sequence, &edit);
-                let relocation = if let ModelEdit::RelocateProject { relocation } = &edit {
+                let relocation = if let ModelEdit::RelocateProject { relocation, .. } = &edit {
                     self.apply_project_relocation(relocation)
                 } else {
                     Task::none()

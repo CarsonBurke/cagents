@@ -2,7 +2,7 @@
 //! filesystem probe until restored; no Git/GitHub polling is scheduled for them.
 use super::*;
 use crate::{
-    project_recovery::{self, Relocation},
+    project_recovery::{self, ProjectInstance, Relocation},
     sidebar::ProjectRecoveryAction,
 };
 
@@ -10,6 +10,7 @@ use crate::{
 pub(super) struct State {
     checking: bool,
     locating: HashSet<ProjectId>,
+    location_generations: HashMap<ProjectId,uuid::Uuid>,
     pub(super) closing_panes: bool,
     details: HashSet<CardId>,
 }
@@ -21,10 +22,12 @@ pub enum Action {
     Command(ProjectId, ProjectRecoveryAction),
     VerifyProject(ProjectId),
     SessionDetails(CardId),
-    Located(ProjectId, Result<PathBuf, String>),
-    Prepared(ProjectId, Result<Relocation, String>),
+    Located(ProjectId, ProjectInstance, PathBuf, uuid::Uuid, Result<PathBuf, String>),
+    Prepared(ProjectId, ProjectInstance, uuid::Uuid, Result<Relocation, String>),
     Applied(
         ProjectId,
+        ProjectInstance,
+        uuid::Uuid,
         Relocation,
         Result<crate::workspace_model::WorkspaceModel, String>,
     ),
@@ -45,107 +48,6 @@ fn root(project: &SidebarProject) -> PathBuf {
     } else {
         project.repository.clone()
     }
-}
-
-// A Locate choice must not attach unrelated linked checkouts to this repo.
-// Verify both the old marker and the moved admin directory's backlink before
-// handing an explicit linked path to `git worktree repair`.
-fn belongs_to_relocated_worktree(path: &Path, relocation: &Relocation) -> bool {
-    let marker = match std::fs::read_to_string(path.join(".git")) {
-        Ok(marker) => marker,
-        Err(_) => return false,
-    };
-    let Some(admin) = marker.trim().strip_prefix("gitdir: ") else {
-        return false;
-    };
-    let admin = Path::new(admin);
-    let admin = if admin.is_absolute() {
-        admin.to_path_buf()
-    } else {
-        path.join(admin)
-    };
-    if !admin.starts_with(&relocation.repository) {
-        return false;
-    }
-    let admin = relocation.mapped(&admin);
-    let backlink = match std::fs::read_to_string(admin.join("gitdir")) {
-        Ok(backlink) => backlink,
-        Err(_) => return false,
-    };
-    relocation.mapped(Path::new(backlink.trim())) == path.join(".git")
-}
-
-// `git worktree repair` does not update an external Git directory's
-// core.worktree. Change only the exact previous checkout chosen by Locate.
-fn repair_checkout_config(relocation: &Relocation) -> Result<(), String> {
-    use crate::repository::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
-    let (admin, common) = crate::project_location::checkout_identity(&relocation.new_root)
-        .ok_or("The selected checkout no longer has readable Git metadata")?;
-    if common != relocation.destination {
-        return Err("The selected checkout changed repositories while locating it".into());
-    }
-    if admin != common {
-        return Ok(());
-    }
-    let command = || {
-        CommandSpec::new("git")
-            .arg("--git-dir")
-            .arg(&relocation.destination)
-            .cwd(&relocation.new_root)
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
-            .timeout(Duration::from_secs(15))
-            .output_limits(64 * 1024, 64 * 1024)
-    };
-    let read = command().args(["config", "--local", "--null", "--get", "core.worktree"]);
-    let output = SystemProcessExecutor
-        .execute(&read, &CancellationToken::default())
-        .map_err(|error| error.to_string())?;
-    if output.exit_code == Some(1) {
-        return Ok(());
-    }
-    let output = output
-        .require_success(&read.program)
-        .map_err(|error| error.to_string())?;
-    let bytes = output
-        .stdout
-        .strip_suffix(&[0])
-        .ok_or("Git returned an invalid checkout setting")?;
-    let configured = PathBuf::from(
-        String::from_utf8(bytes.to_vec()).map_err(|_| "Git checkout setting is not valid UTF-8")?,
-    );
-    let absolute = if configured.is_absolute() {
-        configured
-    } else {
-        relocation.destination.join(configured)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            component => normalized.push(component.as_os_str()),
-        }
-    }
-    if normalized == relocation.new_root {
-        return Ok(());
-    }
-    if normalized != relocation.old_root {
-        return Err(format!(
-            "This Git directory names another checkout: {}. Its setting was preserved.",
-            normalized.display()
-        ));
-    }
-    let write = command()
-        .args(["config", "--local", "core.worktree"])
-        .arg(&relocation.new_root);
-    SystemProcessExecutor
-        .execute(&write, &CancellationToken::default())
-        .and_then(|output| output.require_success(&write.program))
-        .map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 impl Cagents {
@@ -445,14 +347,18 @@ impl Cagents {
                     self.finish_project_location(id);
                     return Task::none();
                 };
+                let Some(expected)=self.project_instance(id) else { self.finish_project_location(id); self.status=Some(TransientNotice::warning("Refresh Projects before verifying its location.")); return Task::none(); };
                 let root = self.project_root(project);
+                let repository=project.repository.clone();
+                let generation=uuid::Uuid::new_v4();
+                self.project_recovery_ui.location_generations.insert(id,generation);
                 let relocation = Relocation {
-                    repository: project.repository.clone(),
-                    destination: project.repository.clone(),
+                    repository: repository.clone(),
+                    destination: repository,
                     old_root: root.clone(),
                     new_root: root,
                 };
-                self.update_project_recovery(Action::Prepared(id, Ok(relocation)))
+                self.update_project_recovery(Action::Prepared(id, expected, generation, Ok(relocation)))
             }
             Action::SessionDetails(card) => {
                 if !self.project_recovery_ui.details.insert(card) {
@@ -493,14 +399,11 @@ impl Cagents {
                 if !self.project_recovery_ui.locating.insert(id) {
                     return Task::none();
                 }
-                if let Some(project) = self
-                    .sidebar_model
-                    .projects
-                    .iter_mut()
-                    .find(|project| project.id == id)
-                {
-                    project.reloading = true;
-                }
+                let Some(expected)=self.project_instance(id) else { self.finish_project_location(id); self.status=Some(TransientNotice::warning("Refresh Projects before locating its folder.")); return Task::none(); };
+                let original_root=self.project_root(self.sidebar_model.project(id).unwrap());
+                let generation=uuid::Uuid::new_v4();
+                self.project_recovery_ui.location_generations.insert(id,generation);
+                if let Some(project)=self.sidebar_model.projects.iter_mut().find(|project|project.id==id) { project.reloading=true; }
                 cosmic::task::future(async move {
                     let result = file_chooser::open::Dialog::new()
                         .title("Locate project folder")
@@ -513,10 +416,16 @@ impl Cagents {
                                 .to_file_path()
                                 .map_err(|()| "Select a local folder".into())
                         });
-                    Message::ProjectRecovery(Action::Located(id, result))
+                    Message::ProjectRecovery(Action::Located(id, expected, original_root, generation, result))
                 })
             }
-            Action::Located(id, result) => {
+            Action::Located(id, expected, original_root, generation, result) => {
+                if self.project_recovery_ui.location_generations.get(&id)!=Some(&generation) { return Task::none(); }
+                if self.project_instance(id).as_ref()!=Some(&expected) || self.sidebar_model.project(id).is_none_or(|project|self.project_root(project)!=original_root) {
+                    self.finish_project_location(id);
+                    self.status=Some(TransientNotice::warning("The original project changed while its folder chooser was open. Refresh Projects and locate it again."));
+                    return Task::none();
+                }
                 let path = match result {
                     Ok(path) => path,
                     Err(error) => {
@@ -534,11 +443,6 @@ impl Cagents {
                 let old_root = self.project_root(project);
                 let repository = project.repository.clone();
                 let kind = project.kind;
-                let worktrees = project
-                    .worktrees
-                    .iter()
-                    .map(|worktree| worktree.path.clone())
-                    .collect::<Vec<_>>();
                 let open_repositories = self
                     .sidebar_model
                     .projects
@@ -555,27 +459,18 @@ impl Cagents {
                         if open_repositories.contains(&destination) { return Err("That folder is already open as another project".into()); }
                         let relocation = Relocation { repository, destination, old_root, new_root };
                         relocation.validate()?;
-                        if kind == ProjectKind::Git {
-                            repair_checkout_config(&relocation)?;
-                            use crate::repository::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
-                            let mut repair = CommandSpec::new("git").cwd(&relocation.new_root).args(["worktree", "repair"]).timeout(Duration::from_secs(15)).output_limits(64 * 1024, 64 * 1024);
-                            for path in worktrees {
-                                let path = relocation.mapped(&path);
-                                if path != relocation.new_root && belongs_to_relocated_worktree(&path, &relocation) { repair = repair.arg(path); }
-                            }
-                            if let Err(error) = SystemProcessExecutor.execute(&repair, &CancellationToken::default()).and_then(|output| output.require_success(&repair.program)) {
-                                // One separately missing linked folder must not
-                                // prevent locating the primary checkout. Git
-                                // reports that folder on the subsequent load.
-                                tracing::warn!(%error, "some linked worktrees could not be repaired after locating project");
-                            }
-                        }
                         Ok(relocation)
                     }).await.map_err(|error| error.to_string()).and_then(|result| result);
-                    Message::ProjectRecovery(Action::Prepared(id, result))
+                    Message::ProjectRecovery(Action::Prepared(id, expected, generation, result))
                 })
             }
-            Action::Prepared(id, result) => {
+            Action::Prepared(id, expected, generation, result) => {
+                if self.project_recovery_ui.location_generations.get(&id)!=Some(&generation) { return Task::none(); }
+                if self.project_instance(id).as_ref()!=Some(&expected) {
+                    self.finish_project_location(id);
+                    self.status=Some(TransientNotice::warning("The original project was replaced while locating it. Refresh Projects and try again."));
+                    return Task::none();
+                }
                 let relocation = match result {
                     Ok(relocation) => relocation,
                     Err(error) => {
@@ -588,7 +483,7 @@ impl Cagents {
                     .sidebar_model
                     .projects
                     .iter()
-                    .any(|project| project.id == id && project.repository == relocation.repository)
+                    .any(|project| project.id == id && project.repository == relocation.repository && self.project_root(project)==relocation.old_root)
                 {
                     self.finish_project_location(id);
                     return Task::none();
@@ -620,6 +515,7 @@ impl Cagents {
                     return Task::none();
                 }
                 let edit = crate::workspace_model::ModelEdit::RelocateProject {
+                    project: expected.clone(),
                     relocation: relocation.clone(),
                 };
                 cosmic::task::future(async move {
@@ -634,11 +530,13 @@ impl Cagents {
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
-                    Message::ProjectRecovery(Action::Applied(id, relocation, result))
+                    Message::ProjectRecovery(Action::Applied(id, expected, generation, relocation, result))
                 })
             }
-            Action::Applied(id, relocation, result) => {
+            Action::Applied(id, expected, generation, relocation, result) => {
+                if self.project_recovery_ui.location_generations.get(&id)!=Some(&generation) { return Task::none(); }
                 self.finish_project_location(id);
+                if self.project_instance(id).as_ref()!=Some(&expected) { return Task::none(); }
                 match result {
                     Ok(model) => {
                         if model.project(&relocation.destination).is_none() {
@@ -689,6 +587,7 @@ impl Cagents {
 
     fn finish_project_location(&mut self, id: ProjectId) {
         self.project_recovery_ui.locating.remove(&id);
+        self.project_recovery_ui.location_generations.remove(&id);
         if let Some(project) = self
             .sidebar_model
             .projects
@@ -1058,6 +957,12 @@ mod tests {
             )
             .with_kind(ProjectKind::Folder),
         );
+        let identity=uuid::Uuid::new_v4();
+        let durable=Arc::make_mut(&mut app.durable);
+        durable.workspace_model_identity=Some(identity);
+        durable.shared_project_bindings.insert(id,crate::model::SharedProjectBinding{ordinal:1,root:Some(root.to_owned())});
+        app.workspace_model.identity=identity;
+        app.workspace_model.projects.push(crate::workspace_model::ModelProject{repository:root.to_owned(),checkout:None,primary_checkout:None,name:"Fixture".into(),kind:ProjectKind::Folder,ordinal:1});
         (app, id)
     }
     #[test]
@@ -1271,16 +1176,21 @@ mod tests {
             old
         );
         assert!(project_recovery::root_missing(&old));
+        let generation=uuid::Uuid::new_v4();
+        app.project_recovery_ui.location_generations.insert(id,generation);
         let message = super::super::tests::task_app_message(
-            app.update_project_recovery(Action::Located(id, Ok(new.clone()))),
+            app.update_project_recovery(Action::Located(id, app.project_instance(id).unwrap(), old.clone(), generation, Ok(new.clone()))),
         );
-        let Message::ProjectRecovery(Action::Prepared(_, result)) = message else {
+        let Message::ProjectRecovery(Action::Prepared(_, _, _, result)) = message else {
             panic!()
         };
         let relocation = result.unwrap();
         assert_eq!(relocation.repository, metadata);
         assert_eq!(relocation.destination, metadata);
         assert!(!relocation.verification_only());
+        let unchanged=git(&["--git-dir".as_ref(),metadata.as_os_str(),"config".as_ref(),"--get".as_ref(),"core.worktree".as_ref()]);
+        assert_eq!(String::from_utf8(unchanged.stdout).unwrap().trim(),"../old checkout","Chooser preparation must not mutate Git configuration before host instance admission");
+        crate::project_recovery::git_repair::repair(&relocation,&[]).unwrap();
         let output = std::process::Command::new("git")
             .current_dir(&new)
             .args(["rev-parse", "--show-toplevel"])
@@ -1299,7 +1209,7 @@ mod tests {
             "/unrelated/checkout".as_ref(),
         ]);
         assert!(
-            repair_checkout_config(&relocation)
+            crate::project_recovery::git_repair::repair_checkout_config(&relocation)
                 .unwrap_err()
                 .contains("another checkout")
         );
@@ -1373,17 +1283,22 @@ mod tests {
             old_root: old.clone(),
             new_root: located.clone(),
         };
-        assert!(belongs_to_relocated_worktree(
+        assert!(crate::project_recovery::git_repair::belongs_to_relocated_worktree(
             &located.join("linked"),
             &relocation
         ));
-        let task = app.update_project_recovery(Action::Located(id, Ok(located.clone())));
+        let generation=uuid::Uuid::new_v4();
+        app.project_recovery_ui.location_generations.insert(id,generation);
+        // The fixture's Git primary is the parent of its metadata directory.
+        Arc::make_mut(&mut app.durable).shared_project_bindings.get_mut(&id).unwrap().root=Some(old.clone());
+        let task = app.update_project_recovery(Action::Located(id, app.project_instance(id).unwrap(), old.clone(), generation, Ok(located.clone())));
         let result = super::super::tests::task_app_message(task);
-        let Message::ProjectRecovery(Action::Prepared(_, result)) = result else {
+        let Message::ProjectRecovery(Action::Prepared(_, _, _, result)) = result else {
             panic!()
         };
         let relocation = result.unwrap();
         assert_eq!(relocation.destination, located.join(".git"));
+        crate::project_recovery::git_repair::repair(&relocation,&[old.join("linked")]).unwrap();
         git(&located.join("linked"), &["status", "--porcelain"]);
     }
 
@@ -1412,7 +1327,7 @@ mod tests {
             old_root: old,
             new_root: new,
         };
-        assert!(!belongs_to_relocated_worktree(&linked, &relocation));
+        assert!(!crate::project_recovery::git_repair::belongs_to_relocated_worktree(&linked, &relocation));
     }
 
     #[test]
@@ -1675,4 +1590,49 @@ mod tests {
             "locate schedules a fresh project/Git load"
         );
     }
+    #[test]
+    fn stale_locate_chooser_and_preparation_preserve_reopened_project_and_newer_intent() {
+        let directory=tempfile::tempdir().unwrap();
+        let old=directory.path().join("old");std::fs::create_dir(&old).unwrap();
+        let selected=directory.path().join("selected");std::fs::create_dir(&selected).unwrap();
+        let (mut app,id)=app(&old);
+        let expected=app.project_instance(id).unwrap();
+        let generation=uuid::Uuid::new_v4();
+        app.project_recovery_ui.locating.insert(id);
+        app.project_recovery_ui.location_generations.insert(id,generation);
+        // A fresh project occupies the same persisted key and local ID.
+        app.workspace_model.projects[0].ordinal+=1;
+        Arc::make_mut(&mut app.durable).shared_project_bindings.get_mut(&id).unwrap().ordinal+=1;
+        let before=app.workspace_model.clone();
+        drop(app.update_project_recovery(Action::Located(id,expected.clone(),old.clone(),generation,Ok(selected.clone()))));
+        assert_eq!(app.workspace_model,before);
+        assert!(!app.project_recovery_ui.locating.contains(&id));
+        let newer=uuid::Uuid::new_v4();
+        app.project_recovery_ui.locating.insert(id);
+        app.project_recovery_ui.location_generations.insert(id,newer);
+        let relocation=Relocation{repository:old.clone(),destination:selected.clone(),old_root:old,new_root:selected};
+        drop(app.update_project_recovery(Action::Prepared(id,expected,generation,Ok(relocation))));
+        assert_eq!(app.project_recovery_ui.location_generations.get(&id),Some(&newer));
+        assert!(app.project_recovery_ui.locating.contains(&id));
+        assert_eq!(app.workspace_model,before);
+    }
+
+    #[test]
+    fn stale_locate_from_recreated_registry_never_uses_same_rank_replacement() {
+        let directory=tempfile::tempdir().unwrap();
+        let (mut app,id)=app(directory.path());
+        let expected=app.project_instance(id).unwrap();
+        let generation=uuid::Uuid::new_v4();
+        app.project_recovery_ui.locating.insert(id);
+        app.project_recovery_ui.location_generations.insert(id,generation);
+        let replacement=uuid::Uuid::new_v4();
+        app.workspace_model.identity=replacement;
+        Arc::make_mut(&mut app.durable).workspace_model_identity=Some(replacement);
+        let before=app.workspace_model.clone();
+        drop(app.update_project_recovery(Action::Located(id,expected,directory.path().to_owned(),generation,Ok(directory.path().to_owned()))));
+        assert_eq!(app.workspace_model,before);
+        assert_eq!(app.project_instance(id).unwrap().registry,replacement);
+        assert!(!app.project_recovery_ui.locating.contains(&id));
+    }
+
 }

@@ -288,7 +288,8 @@ impl WorkspaceModel {
                     }),
                 }
             }
-            ModelEdit::RelocateProject { relocation } => {
+            ModelEdit::RelocateProject { project:expected, relocation } => {
+                if self.identity!=expected.registry || self.project(&expected.repository).is_none_or(|project|project.ordinal!=expected.ordinal) { return; }
                 if relocation.verification_only()
                     || (relocation.repository != relocation.destination
                         && self
@@ -491,6 +492,7 @@ pub enum ModelEdit {
     CloseProject { repository: PathBuf },
     /// Atomically preserve project/channel/pane identity at a located path.
     RelocateProject {
+        project: crate::project_recovery::ProjectInstance,
         relocation: crate::project_recovery::Relocation,
     },
     /// Idempotent by id. The id is minted by the client, the rank by the
@@ -620,16 +622,17 @@ impl ModelEdit {
                 before,
                 fallback,
             },
-            Self::RelocateProject { relocation } => {
+            Self::RelocateProject { project, relocation } => {
+                project.validate()?;
                 relocation.validate()?;
-                Self::RelocateProject {
-                    relocation: crate::project_recovery::Relocation {
-                        repository: canonical_repository(&relocation.repository)?,
-                        destination: canonical_repository(&relocation.destination)?,
-                        old_root: canonical_repository(&relocation.old_root)?,
-                        new_root: canonical_repository(&relocation.new_root)?,
-                    },
+                if project.repository != relocation.repository {
+                    return Err("The located paths do not name the original project instance".into());
                 }
+                // Source keys and roots are captured project identity. Looking
+                // them up on disk now could follow an old path reused by a
+                // replacement project. Candidate directories are verified by
+                // the host's pinned identity protocol outside admission.
+                Self::RelocateProject { project, relocation }
             }
             Self::CloseProjectInstance { project } => {
                 project.validate()?;

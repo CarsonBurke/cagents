@@ -240,7 +240,8 @@ impl Registry {
     ) -> Result<Applied, String> {
         // Direct registry users own no HostState lock. The live host route uses
         // apply_with_location_moves with evidence prepared outside every lock.
-        let agent_moves = if let ModelEdit::RelocateProject { relocation } = edit {
+        let agent_moves = if let ModelEdit::RelocateProject { project, relocation } = edit {
+            self.require_project_relocation(project,relocation)?;
             self.agent_relocation_inputs(relocation)?
                 .into_iter()
                 .map(|input| input.verify())
@@ -262,7 +263,7 @@ impl Registry {
                 "Session directory proofs may only accompany their project relocation".into(),
             );
         }
-        if let ModelEdit::RelocateProject { relocation } = edit
+        if let ModelEdit::RelocateProject { relocation, .. } = edit
             && moves
                 .iter()
                 .any(|movement| movement.repository != relocation.destination)
@@ -270,11 +271,15 @@ impl Registry {
             return Err("Session proofs do not belong to the requested destination project".into());
         }
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        if let ModelEdit::RelocateProject { project, relocation } = edit {
+            if project.repository != relocation.repository { return Err("The located paths do not name the original project instance".into()); }
+            project_instances::require_relocation(&transaction, project, relocation)?;
+        }
         session_locations::pin_owned_agents(&transaction, moves)?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
-            ModelEdit::RelocateProject { relocation } => relocation::apply(&transaction, relocation, agent_moves)?,
+            ModelEdit::RelocateProject { relocation, .. } => relocation::apply(&transaction, relocation, agent_moves)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
@@ -462,7 +467,7 @@ impl Registry {
             }
         };
         if !moves.is_empty() {
-            if let ModelEdit::RelocateProject { relocation } = edit {
+            if let ModelEdit::RelocateProject { relocation, .. } = edit {
                 let open: bool = transaction
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)",

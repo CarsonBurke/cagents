@@ -202,9 +202,7 @@ mod tests {
             .unwrap();
         let before = registry.model().unwrap();
         let after = registry
-            .apply(&ModelEdit::RelocateProject {
-                relocation: relocation.clone(),
-            })
+            .apply(&registry.relocation_edit(relocation.clone()))
             .unwrap()
             .model;
         assert_eq!(after.projects[0].repository, before.projects[0].repository);
@@ -304,9 +302,7 @@ mod tests {
             .unwrap();
         let before = registry.model().unwrap();
         let applied = registry
-            .apply(&ModelEdit::RelocateProject {
-                relocation: relocation.clone(),
-            })
+            .apply(&registry.relocation_edit(relocation.clone()))
             .unwrap();
         assert!(applied.changed);
         let after = &applied.model;
@@ -340,12 +336,9 @@ mod tests {
             view.selected_file.as_deref(),
             Some(Path::new("src/main.rs"))
         );
-        assert!(
-            !registry
-                .apply(&ModelEdit::RelocateProject { relocation })
-                .unwrap()
-                .changed
-        );
+        // A replay of the old chooser must not retarget a different project
+        // that may later occupy the previous path.
+        assert!(registry.project_instance(&relocation.repository).is_err());
         drop(registry);
         let reopened = Registry::at(&directory.path().join("registry.sqlite3"))
             .unwrap()

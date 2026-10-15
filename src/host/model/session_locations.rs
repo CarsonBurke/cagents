@@ -632,14 +632,12 @@ mod tests {
             candidate: moved.clone(),
             proof: Err("Unproved provider".into()),
         };
-        let edit = ModelEdit::RelocateProject {
-            relocation: Relocation {
+        let edit = registry.relocation_edit(Relocation {
                 repository: old.clone(),
                 destination: moved.clone(),
                 old_root: old.clone(),
                 new_root: moved,
-            },
-        };
+            });
         assert!(
             registry
                 .apply_with_session_moves(&edit, &[movement])
@@ -995,14 +993,12 @@ mod tests {
         };
         registry
             .apply_with_session_moves(
-                &ModelEdit::RelocateProject {
-                    relocation: Relocation {
+                &registry.relocation_edit(Relocation {
                         repository: old.clone(),
                         destination: moved.clone(),
                         old_root: old,
                         new_root: moved.clone(),
-                    },
-                },
+                    }),
                 &[movement],
             )
             .unwrap();

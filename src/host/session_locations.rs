@@ -1,5 +1,5 @@
 //! Prepare process evidence outside HostState, then atomically relocate logical
-//! ownership and its exact sessions. Caller holds exclusive control admission.
+//! ownership and its exact sessions. Caller retains a scoped project-location reservation.
 use super::{
     model::SessionMove,
     state::{ClientId, SharedHost},
@@ -141,15 +141,25 @@ pub(super) fn verified_chat_directory(
 pub(super) fn relocate(
     host: &SharedHost,
     origin: ClientId,
+    project: crate::project_recovery::ProjectInstance,
     relocation: Relocation,
 ) -> Result<WorkspaceModel, ProtocolError> {
-    let edit = ModelEdit::RelocateProject { relocation }
+    let edit = ModelEdit::RelocateProject { project:project.clone(), relocation }
         .canonicalized()
         .map_err(error)?;
-    let ModelEdit::RelocateProject { relocation } = &edit else {
+    let ModelEdit::RelocateProject { relocation, .. } = &edit else {
         unreachable!()
     };
     let registry = super::agent_execution::registry(host).map_err(error)?;
+    let (kind,worktrees)={
+        let registry=registry.lock().unwrap_or_else(|p|p.into_inner());
+        registry.require_project_relocation(&project,relocation).map_err(error)?;
+        let model=registry.model().map_err(error)?;
+        let current=model.project(&project.repository).ok_or_else(||error("The original project is no longer open"))?;
+        let worktrees=model.views.iter().filter_map(|view|match &view.scope { Scope::Worktree{repository,path} if *repository==project.repository=>Some(path.clone()),_=>None }).collect::<Vec<_>>();
+        (current.kind,worktrees)
+    };
+    if kind==crate::model::ProjectKind::Git && !relocation.verification_only() { crate::project_recovery::git_repair::repair(relocation,&worktrees).map_err(error)?; }
     let sources = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let model = state.read_model()?;
@@ -310,6 +320,9 @@ pub(super) fn relocate(
         });
     }
     {
+        let gate=super::client::control_gate(host);
+        let _exclusive=gate.write().unwrap_or_else(|p|p.into_inner());
+        super::client::ensure_control_open(host)?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         for item in &prepared {
             let id = item.movement.source.id();
@@ -348,8 +361,9 @@ pub(super) fn relocate(
             .collect::<Vec<_>>();
         state.apply_session_relocation(&edit, &moves, &agent_moves)?;
     }
-    // The exclusive gate excludes further edits/starts while actor-local
-    // operational paths catch up. Keep any failed actor move explicitly blocked.
+    // The scoped reservation excludes related edits/starts while actor-local
+    // operational paths catch up; unrelated input stays responsive. Keep failed
+    // actor moves explicitly blocked.
     for item in &mut prepared {
         if item.proof.is_some()
             && let Owner::Chat(handle) = &item.owner
@@ -402,6 +416,7 @@ mod tests {
     struct PathAware {
         directory: PathBuf,
         calls: Arc<Mutex<Vec<PathBuf>>>,
+        pause: Option<(std::sync::mpsc::SyncSender<()>,std::sync::mpsc::Receiver<()>)>,
     }
     impl Adapter for PathAware {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -415,6 +430,12 @@ mod tests {
             Ok(Step { events, ..Default::default() })
         }
         fn command(&mut self, command: chat::Command) -> Result<Step, String> {
+            if matches!(&command,chat::Command::Prompt{text,..} if text=="__fixture_hold") {
+                if let Some((entered,release))=self.pause.take() {
+                    entered.send(()).map_err(|error|error.to_string())?;
+                    release.recv_timeout(Duration::from_secs(10)).map_err(|error|error.to_string())?;
+                }
+            }
             if matches!(&command, chat::Command::Interrupt) {
                 return Ok(Step { events: vec![chat::Event::Status { busy: false, detail: "Fixture interrupted".into() }], ..Default::default() });
             }
@@ -458,6 +479,9 @@ mod tests {
         }
     }
     fn fixture(context_mode: u8) -> Fixture {
+        fixture_with_pause(context_mode,None)
+    }
+    fn fixture_with_pause(context_mode:u8,pause:Option<(std::sync::mpsc::SyncSender<()>,std::sync::mpsc::Receiver<()>)>)->Fixture {
         let directory = tempfile::tempdir().unwrap();
         let old = directory.path().join("original");
         std::fs::create_dir(&old).unwrap();
@@ -547,6 +571,7 @@ mod tests {
             Box::new(PathAware {
                 directory: old.clone(),
                 calls: calls.clone(),
+                pause,
             }),
             initial,
             store,
@@ -618,6 +643,7 @@ mod tests {
     fn locate(fixture: &Fixture) -> WorkspaceModel {
         let request = ClientRequest::EditWorkspaceModel {
             edit: ModelEdit::RelocateProject {
+                    project: super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().project_instance(&fixture.old).unwrap(),
                 relocation: Relocation {
                     repository: fixture.old.clone(),
                     destination: fixture.moved.clone(),
@@ -757,6 +783,7 @@ mod tests {
                 1,
                 ClientRequest::EditWorkspaceModel {
                     edit: ModelEdit::RelocateProject {
+                    project: super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().project_instance(&fixture.old).unwrap(),
                         relocation: Relocation {
                             repository: fixture.old.clone(),
                             destination: fixture.moved.clone(),
@@ -843,6 +870,7 @@ mod tests {
         std::fs::rename(&fixture.old, &fixture.moved).unwrap();
         let request = || ClientRequest::EditWorkspaceModel {
             edit: ModelEdit::RelocateProject {
+                    project: super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().project_instance(&fixture.old).unwrap(),
                 relocation: Relocation {
                     repository: fixture.old.clone(),
                     destination: fixture.moved.clone(),
@@ -943,6 +971,7 @@ mod tests {
         std::fs::rename(&fixture.old, &fixture.moved).unwrap();
         let request = ClientRequest::EditWorkspaceModel {
             edit: ModelEdit::RelocateProject {
+                    project: super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().project_instance(&fixture.old).unwrap(),
                 relocation: Relocation {
                     repository: fixture.old.clone(),
                     destination: fixture.moved.clone(),
@@ -1361,6 +1390,7 @@ mod tests {
             1,
             ClientRequest::EditWorkspaceModel {
                 edit: ModelEdit::RelocateProject {
+                    project: super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().project_instance(&fixture.moved).unwrap(),
                     relocation: Relocation {
                         repository: fixture.moved.clone(),
                         destination: fixture.moved.clone(),
@@ -1390,4 +1420,56 @@ mod tests {
             .unwrap();
         assert_eq!(*fixture.calls.lock().unwrap(), vec![fixture.moved.clone()]);
     }
+    #[test]
+    fn locate_provider_proof_keeps_unrelated_admission_responsive_and_releases_scope() {
+        let (entered_tx,entered_rx)=std::sync::mpsc::sync_channel(1);
+        let (release_tx,release_rx)=std::sync::mpsc::sync_channel(1);
+        let fixture=fixture_with_pause(1,Some((entered_tx,release_rx)));
+        let expected=super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().project_instance(&fixture.old).unwrap();
+        let handle=fixture.handle.clone();
+        let paused=std::thread::spawn(move||handle.command(chat::Command::Prompt{text:"__fixture_hold".into(),attachments:Vec::new(),mode:chat::PromptMode::Send}));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        struct Release(Option<std::sync::mpsc::SyncSender<()>>);
+        impl Drop for Release { fn drop(&mut self){if let Some(sender)=self.0.take(){let _=sender.send(());}} }
+        let release=Release(Some(release_tx));
+        std::fs::rename(&fixture.old,&fixture.moved).unwrap();
+        let request=ClientRequest::EditWorkspaceModel{edit:ModelEdit::RelocateProject{project:expected,relocation:Relocation{repository:fixture.old.clone(),destination:fixture.moved.clone(),old_root:fixture.old.clone(),new_root:fixture.moved.clone()}}};
+        let host=fixture.host.clone();
+        let locating=std::thread::spawn(move||super::super::client::process_request(&host,1,request));
+        let deadline=Instant::now()+Duration::from_secs(3);
+        loop {
+            let reserved={let state=fixture.host.lock().unwrap();let entries=state.project_removals.lock().unwrap();!entries.is_empty()};
+            if reserved {break;}
+            assert!(Instant::now()<deadline,"Locate must install its project reservation before provider proof");
+            std::thread::yield_now();
+        }
+        let (done_tx,done_rx)=std::sync::mpsc::sync_channel(1);
+        let host=fixture.host.clone();
+        let unrelated=std::thread::spawn(move|| { let result=super::super::client::process_request(&host,2,ClientRequest::List);done_tx.send(result.is_ok()).unwrap(); });
+        assert!(done_rx.recv_timeout(Duration::from_millis(500)).unwrap(),"Unrelated List must not wait for the provider's proof");
+        unrelated.join().unwrap();
+        assert!(super::super::project_removal::ensure_available(&fixture.host,Some(&fixture.old),None,None).is_err());
+        assert!(super::super::project_removal::ensure_available(&fixture.host,Some(&fixture.moved),None,None).is_err());
+        drop(release);
+        paused.join().unwrap().unwrap();
+        locating.join().unwrap().unwrap();
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_locate_request_preserves_live_provider_and_reopened_project_before_proof_or_repair() {
+        let fixture=fixture(1);
+        let registry=super::super::agent_execution::registry(&fixture.host).unwrap();
+        let expected=registry.lock().unwrap().project_instance(&fixture.old).unwrap();
+        {let mut registry=registry.lock().unwrap();registry.apply(&ModelEdit::CloseProject{repository:fixture.old.clone()}).unwrap();registry.apply(&ModelEdit::ReopenProject{repository:fixture.old.clone(),checkout:None,primary_checkout:None,name:"Replacement".into(),kind:ProjectKind::Folder}).unwrap();}
+        let before=registry.lock().unwrap().model().unwrap();
+        let request=ClientRequest::EditWorkspaceModel{edit:ModelEdit::RelocateProject{project:expected,relocation:Relocation{repository:fixture.old.clone(),destination:fixture.moved.clone(),old_root:fixture.old.clone(),new_root:fixture.moved.clone()}}};
+        assert!(super::super::client::process_request(&fixture.host,1,request).unwrap_err().message.contains("replaced"));
+        assert_eq!(registry.lock().unwrap().model().unwrap(),before);
+        assert!(!fixture.handle.is_completed());
+        assert!(fixture.calls.lock().unwrap().is_empty());
+        assert!(!fixture.moved.exists());
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+    }
+
 }

@@ -303,7 +303,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
     let _ = writer.join();
 }
 
-fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
+pub(super) fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     // Never wait for admission while holding HostState: admitted operations
     // need to reacquire it after synchronous provider/PTY work.
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
@@ -367,15 +367,21 @@ pub(super) fn process_request(
         return result;
     }
     if let ClientRequest::EditWorkspaceModel {
-        edit: crate::workspace_model::ModelEdit::RelocateProject { relocation },
-    } = &request
-    {
-        let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
-        ensure_control_open(host)?;
-        super::agent_execution::terminals::admit(host, client_id, &request)?;
-        super::project_removal::admit(host, &request)?;
-        let model = super::session_locations::relocate(host, client_id, relocation.clone())?;
-        return Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false));
+        edit: crate::workspace_model::ModelEdit::RelocateProject { project, relocation },
+    } = &request {
+        let reservation = {
+            let _exclusive=gate.write().unwrap_or_else(|p|p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+            super::project_removal::admit(host, &request)?;
+            super::project_removal::reserve_relocation(host,project,relocation)?
+        };
+        // Filesystem/holder/provider proof runs without global admission.
+        // Related starts, work and edits remain fenced by the scoped lease.
+        let result=super::session_locations::relocate(host,client_id,project.clone(),relocation.clone());
+        drop(reservation);
+        let model=result?;
+        return Ok((ServerResponse::WorkspaceModel { model },Vec::new(),false));
     }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.

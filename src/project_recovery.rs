@@ -5,6 +5,8 @@ use crate::{
     workspace_model::views::{Scope, View},
 };
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature="host",all(feature="ui",test)))]
+pub(crate) mod git_repair;
 use std::path::{Path, PathBuf};
 
 /// A user-visible project selected from one exact registry incarnation.
@@ -26,7 +28,7 @@ impl ProjectInstance {
                 .any(|component| matches!(component, std::path::Component::ParentDir))
         {
             return Err(
-                "Project removal requires its original registry and assigned project identity"
+                "Project operations require their original registry and assigned project identity"
                     .into(),
             );
         }
@@ -221,6 +223,9 @@ mod tests {
             ClientRequest::CloseProjectGuarded {
                 project: project.clone(),
                 sessions: sessions.clone(),
+            },
+            ClientRequest::EditWorkspaceModel {
+                edit: crate::workspace_model::ModelEdit::RelocateProject { project:project.clone(),relocation:Relocation {repository:project.repository.clone(),destination:"/located/.git".into(),old_root:"/project".into(),new_root:"/located".into()} },
             },
             ClientRequest::EditWorkspaceModel {
                 edit: crate::workspace_model::ModelEdit::CloseProjectInstance { project },

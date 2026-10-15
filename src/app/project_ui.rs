@@ -658,7 +658,7 @@ impl Cagents {
         }
     }
 
-    fn project_instance(
+    pub(super) fn project_instance(
         &self,
         project: ProjectId,
     ) -> Option<crate::project_recovery::ProjectInstance> {
