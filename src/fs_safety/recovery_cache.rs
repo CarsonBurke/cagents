@@ -123,6 +123,14 @@ impl RecoveryDirectoryError {
     }
 }
 
+// Keep incoming native owners charged across ordinary rejection AND callback
+// unwind. This ordering does not turn an effectful panic into a recovery receipt.
+struct ReservedDirectoryOwner<T> {
+    owner: T,
+    context: FilesystemRecoveryContext,
+    slot: RecoverySlot,
+}
+
 struct PendingDirectory<T> {
     publication: DirectoryPublication,
     owner: T,
@@ -220,43 +228,47 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
     admission: FilesystemRecoveryReservation, leaf: &OsStr, cancelled: impl Fn() -> bool, owner: T,
     create: impl FnOnce(&DirectoryNamespace, &Root, &Path, u32) -> Result<DirectoryCreation, DirectoryCreateError>,
 ) -> Result<RecoveryDirectory<T>, RecoveryDirectoryError> {
+    let (context, slot) = admission.into_parts();
+    let reserved = ReservedDirectoryOwner { owner, context, slot };
     if components(Path::new(leaf)).is_none_or(|parts| parts.len() != 1) {
-        drop(owner);
         return Err(RecoveryDirectoryError::Rejected(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Recovery holding requires one ordinary leaf name",
         )));
     }
-    if let Err(cause) = admission.context().placement().require_payload_registration() {
-        drop(owner);
+    if let Err(cause) = reserved.context.placement().require_payload_registration() {
         return Err(RecoveryDirectoryError::Rejected(cause));
     }
     if cancelled() {
-        drop(owner);
         return Err(RecoveryDirectoryError::Rejected(io::Error::new(
             io::ErrorKind::Interrupted,
             "Recovery holding creation cancelled before any effect",
         )));
     }
-    let (context, slot) = admission.into_parts();
     // Qualified producer retains <=4 private handles plus bounded transient
     // work, inside this existing16-private-FD reservation. Shared context and
     // registry handles stay under the measured128-FD admission, not this bound.
-    const { assert!(MAX_RECOVERY_DESCRIPTORS >= 16); }
-    let publication = match create(context.placement().namespace(),
-        context.placement().directory(), Path::new(leaf), 0o700) {
+    const {
+        assert!(MAX_RECOVERY_DESCRIPTORS >= 16);
+    }
+    let publication = match create(
+        reserved.context.placement().namespace(),
+        reserved.context.placement().directory(),
+        Path::new(leaf),
+        0o700,
+    ) {
         Ok(DirectoryCreation::Published(publication)) => publication,
         Ok(DirectoryCreation::Existing(_)) => {
-            // Keep the original native owner inside the still-held slot on
-            // normal no-effect returns, not just on retained-error paths.
-            drop(owner);
             return Err(RecoveryDirectoryError::Rejected(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "Recovery holding already exists; it was left untouched",
             )));
         }
         Ok(DirectoryCreation::Unverified { directory, reason }) => {
-            let cause = io::Error::other(format!("Recovery holding has no creation authority: {reason}"));
+            let cause = io::Error::other(format!(
+                "Recovery holding has no creation authority: {reason}"
+            ));
+            let ReservedDirectoryOwner { owner, context, slot } = reserved;
             let recovery = slot.retain("Unverified recovery holding was left untouched".into(), move || {
                 // Preserve the observed Root and the original domain obligation.
                 // No automatic deletion/chmod or later ownership conversion.
@@ -272,9 +284,9 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
         Err(mut error) => {
             let cause = io::Error::other(error.to_string());
             let Some(mut preparation) = error.take_recovery() else {
-                drop(owner);
                 return Err(RecoveryDirectoryError::Rejected(cause));
             };
+            let ReservedDirectoryOwner { owner, context, slot } = reserved;
             let recovery = slot.retain(
                 "Private holding staging requires retained cleanup".into(),
                 move || {
@@ -287,11 +299,25 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
             return Err(RecoveryDirectoryError::Retained { cause, recovery });
         }
     };
-    let mut pending = PendingDirectory { publication, owner, private_metadata: None, context, setup_attempted: false, setup_complete: false,
-        enrollment_attempted: false, enrollment_confirmed: false };
-    let result = if cancelled() { Err(io::Error::new(io::ErrorKind::Interrupted,
-        "Recovery holding creation cancelled after publication; original authority retained")) }
-        else { pending.finish_setup() };
+    let ReservedDirectoryOwner { owner, context, slot } = reserved;
+    let mut pending = PendingDirectory {
+        publication,
+        owner,
+        private_metadata: None,
+        context,
+        setup_attempted: false,
+        setup_complete: false,
+        enrollment_attempted: false,
+        enrollment_confirmed: false,
+    };
+    let result = if cancelled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Recovery holding creation cancelled after publication; original authority retained",
+        ))
+    } else {
+        pending.finish_setup()
+    };
     if let Err(cause) = result {
         let recovery = slot.retain("Recovery holding initialization retains its original directory".into(),
             move || pending.retry_failed_preparation());
@@ -607,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn native_owner_drop_stays_charged_on_transfer_and_existing_rejection() {
+    fn native_owner_drop_stays_charged_on_transfer_rejection_and_callback_unwind() {
         struct NativeOwner {
             _file: Arc<fs::File>,
             entered: std::sync::mpsc::SyncSender<()>,
@@ -619,7 +645,15 @@ mod tests {
                 let _ = self.release.recv();
             }
         }
-        for existing in [false, true] {
+        #[derive(Clone, Copy)]
+        enum Case {
+            Transfer,
+            Existing,
+            PreEffectPanic,
+        }
+        for case in [Case::Transfer, Case::Existing, Case::PreEffectPanic] {
+            let existing = matches!(case, Case::Existing);
+            let panicking = matches!(case, Case::PreEffectPanic);
             let source = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
             let runtime = tempfile::tempdir().unwrap();
@@ -668,17 +702,30 @@ mod tests {
                 release: release_rx,
             };
             let worker = std::thread::spawn(move || {
-                let result = prepare_recovery_directory_with_owner(
-                    admission,
-                    OsStr::new("holding"),
-                    || false,
-                    owner,
-                );
-                if existing {
-                    assert!(matches!(result, Err(RecoveryDirectoryError::Rejected(_))));
-                } else {
-                    drop(result.unwrap().into_parts());
-                }
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let result = if panicking {
+                        prepare_recovery_directory_using(
+                            admission,
+                            OsStr::new("holding"),
+                            || false,
+                            owner,
+                            |_, _, _, _| panic!("fixture pre-effect creation callback panic"),
+                        )
+                    } else {
+                        prepare_recovery_directory_with_owner(
+                            admission,
+                            OsStr::new("holding"),
+                            || false,
+                            owner,
+                        )
+                    };
+                    if existing {
+                        assert!(matches!(result, Err(RecoveryDirectoryError::Rejected(_))));
+                    } else {
+                        drop(result.unwrap().into_parts());
+                    }
+                }));
+                assert_eq!(caught.is_err(), panicking);
             });
             let entered = entered_rx
                 .recv_timeout(std::time::Duration::from_secs(3))
@@ -701,6 +748,9 @@ mod tests {
             assert!(weak.upgrade().is_none());
             assert_eq!(registry.creation.lock().unwrap().in_flight, 0);
             drop(context.reserve_directory().unwrap());
+            if panicking {
+                assert!(names(context.placement().directory()).is_empty());
+            }
         }
     }
 
