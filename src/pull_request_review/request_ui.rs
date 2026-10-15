@@ -34,7 +34,9 @@ impl State {
             (Some(current), Some(next)) => Arc::ptr_eq(current, next) || current == next,
             _ => false,
         };
-        if unchanged { return false; }
+        if unchanged {
+            return false;
+        }
         self.snapshot = snapshot.cloned();
         true
     }
@@ -116,7 +118,9 @@ fn matching_snapshot<'a>(
     snapshots: impl IntoIterator<Item = (&'a GitHubRepoKey, &'a Arc<Snapshot>)>,
 ) -> Option<&'a Arc<Snapshot>> {
     let repository = repository?;
-    snapshots.into_iter().find_map(|(key, snapshot)| key.same_repository(repository).then_some(snapshot))
+    snapshots
+        .into_iter()
+        .find_map(|(key, snapshot)| key.same_repository(repository).then_some(snapshot))
 }
 
 #[cfg(test)]
@@ -139,7 +143,10 @@ mod snapshot_tests {
     fn review_snapshot_changes_and_removal_are_applied_once() {
         let original = Arc::new(Snapshot::default());
         let changed = Arc::new(Snapshot {
-            viewer: Some(crate::github::review_requests::Viewer { id: "viewer".into(), login: "viewer".into() }),
+            viewer: Some(crate::github::review_requests::Viewer {
+                id: "viewer".into(),
+                login: "viewer".into(),
+            }),
             error: Some("temporarily unavailable".into()),
             ..Default::default()
         });
@@ -156,15 +163,24 @@ mod snapshot_tests {
     #[test]
     fn changed_request_history_updates_the_label_and_identity() {
         let request = crate::github::review_requests::Current {
-            id: "request-1".into(), as_code_owner: false, requested_reviewer: None,
+            id: "request-1".into(),
+            as_code_owner: false,
+            requested_reviewer: None,
         };
         let mut original = Snapshot::default();
-        original.requested.insert(7, crate::github::review_requests::scan::Requested {
-            entry: crate::github::review_requests::Entry {
-                number: 7, title: "Review".into(), url: "https://github.com/o/r/pull/7".parse().unwrap(),
-                viewer_latest_review_request: Some(request.clone()),
-            }, current: request, history: History::First,
-        });
+        original.requested.insert(
+            7,
+            crate::github::review_requests::scan::Requested {
+                entry: crate::github::review_requests::Entry {
+                    number: 7,
+                    title: "Review".into(),
+                    url: "https://github.com/o/r/pull/7".parse().unwrap(),
+                    viewer_latest_review_request: Some(request.clone()),
+                },
+                current: request,
+                history: History::First,
+            },
+        );
         let original = Arc::new(original);
         let mut state = State::default();
         assert!(state.replace_snapshot(Some(&original)));
@@ -186,9 +202,15 @@ mod snapshot_tests {
         let same = GitHubRepoKey::new("github.com", None, "OWNER", "PROJECT").unwrap();
         let other = GitHubRepoKey::new("github.com", None, "owner", "other").unwrap();
         let first = Arc::new(Snapshot::default());
-        let second = Arc::new(Snapshot { error: Some("other".into()), ..Default::default() });
+        let second = Arc::new(Snapshot {
+            error: Some("other".into()),
+            ..Default::default()
+        });
         let snapshots = [(&other, &second), (&same, &first)];
-        assert!(Arc::ptr_eq(matching_snapshot(Some(&requested), snapshots).unwrap(), &first));
+        assert!(Arc::ptr_eq(
+            matching_snapshot(Some(&requested), snapshots).unwrap(),
+            &first
+        ));
         assert!(matching_snapshot(Some(&requested), [(&other, &second)]).is_none());
         assert!(matching_snapshot(None, snapshots).is_none());
     }

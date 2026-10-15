@@ -3177,7 +3177,8 @@ impl Application for Editor {
                 }
                 Message::WindowFocused(window, focused) => {
                     let regained = self.core.main_window_id() == Some(window)
-                        && focused && !self.window_focused;
+                        && focused
+                        && !self.window_focused;
                     if self.core.main_window_id() == Some(window) {
                         cagents::ui_controls::observe_activity_window_event(&if focused {
                             window::Event::Focused
@@ -3923,7 +3924,8 @@ impl Application for Editor {
                         .map(cosmic::Action::App);
                     let report = self.report_review_requests();
                     for tab in &mut self.tabs {
-                        tab.review.sync_review_requests(self.review_requests.snapshots());
+                        tab.review
+                            .sync_review_requests(self.review_requests.snapshots());
                     }
                     Task::batch([task, report])
                 }
@@ -6007,9 +6009,12 @@ mod tests {
             };
             let mut count = 0;
             while let Some(Some(action)) = stream.next().now_or_never() {
-                if matches!(action, iced::runtime::Action::Output(cosmic::Action::App(
-                    Message::ReviewRequests(pull_request_review::request_ui::monitor::Action::FocusGained)
-                ))) {
+                if matches!(
+                    action,
+                    iced::runtime::Action::Output(cosmic::Action::App(Message::ReviewRequests(
+                        pull_request_review::request_ui::monitor::Action::FocusGained
+                    )))
+                ) {
                     count += 1;
                 }
             }
@@ -6021,11 +6026,17 @@ mod tests {
         let mut app = editor();
         let main = window::Id::RESERVED;
         app.core.set_main_window_id(Some(main));
-        assert_eq!(refreshes(app.update(Message::WindowFocused(window::Id::unique(), true))), 0);
+        assert_eq!(
+            refreshes(app.update(Message::WindowFocused(window::Id::unique(), true))),
+            0
+        );
         assert!(!app.window_focused);
         assert_eq!(refreshes(app.update(Message::WindowFocused(main, true))), 1);
         assert_eq!(refreshes(app.update(Message::WindowFocused(main, true))), 0);
-        assert_eq!(refreshes(app.update(Message::WindowFocused(main, false))), 0);
+        assert_eq!(
+            refreshes(app.update(Message::WindowFocused(main, false))),
+            0
+        );
         assert_eq!(refreshes(app.update(Message::WindowFocused(main, true))), 1);
     }
 
