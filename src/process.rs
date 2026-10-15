@@ -1187,6 +1187,12 @@ fn read_pipe(
     let mut listing=records.map(|records|record_capture::NulPrefix::new(records,limit));
     let mut buffer = [0_u8; 8 * 1024];
     loop {
+        // A capped listing deliberately keeps draining. Check cleanup before
+        // EVERY bounded read, even when an escaped writer keeps stdout ready
+        // continuously and the pipe never reports WouldBlock.
+        if !wait_until_ready(pipe.as_fd(), libc::POLLIN, stop.as_fd())? {
+            return Ok(PipeRead::finish(output, listing, false));
+        }
         let read = match pipe.read(&mut buffer) {
             Ok(0) => {
                 return Ok(PipeRead::finish(output,listing,false));
@@ -1617,6 +1623,41 @@ sys.exit(7)
         assert!(output.success);
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.stderr, b"warning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_always_ready_stdout_observes_cleanup_between_read_turns() {
+        struct AlwaysReady {
+            descriptor: fs::File,
+            stop_writer: Option<OwnedFd>,
+            reads: usize,
+        }
+        impl AsFd for AlwaysReady {
+            fn as_fd(&self) -> BorrowedFd<'_> { self.descriptor.as_fd() }
+        }
+        impl Read for AlwaysReady {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads > 3 {
+                    return Err(io::Error::other("reader ignored cleanup on continuously ready stdout"));
+                }
+                let count = self.descriptor.read(buffer)?;
+                if self.reads == 3 { drop(self.stop_writer.take()); }
+                Ok(count)
+            }
+        }
+        // /dev/zero is always poll-readable. The third read signals cleanup;
+        // a fourth would fail immediately, keeping even the negative oracle
+        // bounded without creating an escaped process.
+        let (stop, writer) = stop_pipe().unwrap();
+        let source = AlwaysReady { descriptor:fs::File::open("/dev/zero").unwrap(), stop_writer:Some(writer), reads:0 };
+        let exceeded = AtomicBool::new(false);
+        let read = read_pipe(source, 32, &exceeded, &stop, Some(1)).unwrap();
+        assert_eq!(read.output, [0]);
+        assert!(read.stdout_truncated);
+        assert!(!read.limit_exceeded);
+        assert!(!exceeded.load(Ordering::Acquire));
     }
 
     #[cfg(unix)]
