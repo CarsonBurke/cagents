@@ -634,6 +634,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         }
         context.validate_for_source(&root).map_err(|error| ValidationError::Io(error.to_string()))?;
+        let source = self.recovery_source_authority(&recovery.worktree, &root)?;
         let mut paths = Vec::new();
         let mut failures = Vec::new();
         let mut created_directories =
@@ -661,6 +662,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 self.undo_discard_entry(
                     recovery,
                     &root,
+                    &source,
                     entry,
                     cancellation,
                     &mut created_directories,
@@ -719,6 +721,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         recovery: &DiscardRecovery,
         root: &fs_safety::Root,
+        source: &WorktreeAuthority,
         entry: &DiscardRecoveryEntry,
         cancellation: &CancellationToken,
         created_directories: &mut RecoveryDirectoryFrontier,
@@ -746,12 +749,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         self.undo_saved_entry(
             recovery,
-            root,
+            source,
             entry,
             &parent,
             &name,
-            &created_directories.context,
             cancellation,
+            &created_directories.context,
         )
     }
 }

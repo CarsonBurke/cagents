@@ -397,19 +397,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     pub(super) fn undo_saved_entry(
         &self,
         recovery: &DiscardRecovery,
-        root: &fs_safety::Root,
+        source: &WorktreeAuthority,
         entry: &DiscardRecoveryEntry,
         parent: &fs_safety::Root,
         name: &OsStr,
-        context: &FilesystemRecoveryContext,
         cancellation: &CancellationToken,
+        context: &FilesystemRecoveryContext,
     ) -> Result<Option<String>, String> {
-        let source = self
-            .recovery_source_authority(&recovery.worktree, root)
-            .map_err(|error| error.to_string())?;
         let mut holding = Holding::create(parent, recovery, context)?;
         let result =
-            self.publish_saved_entry(&source, &mut holding, recovery, entry, name, cancellation);
+            self.publish_saved_entry(source, &mut holding, recovery, entry, name, cancellation);
         if !holding.publication.is_removed() || result.as_ref().is_ok_and(|warning| warning.is_some()) {
             holding.retain(recovery);
         }

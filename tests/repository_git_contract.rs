@@ -148,7 +148,7 @@ impl Fixture {
 
     #[cfg(target_os = "linux")]
     fn recovery_service(&self) -> RepositoryService<IsolatedExecutor> {
-        self.service().with_recovery_context(self.recovery_context())
+        self.service().with_worktree_authority(cagents::repository::WorktreeAuthority::capture(&self.work()).unwrap()).unwrap().with_recovery_context(self.recovery_context())
     }
 
     /// Runs a raw `git` command and requires success, so a broken fixture fails
@@ -5872,10 +5872,7 @@ fn undo_discard_refuses_a_replaced_worktree_root() {
     let original = fixture.root.path().join("original-work");
     fs::rename(fixture.work(), &original).unwrap();
     fs::create_dir(fixture.work()).unwrap();
-    let undo = service.undo_discard(&result.recovery, &cancel).unwrap();
-    assert!(
-        matches!(undo, MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason } } if reason.contains("replaced"))
-    );
+    assert!(service.undo_discard(&result.recovery, &cancel).is_err(), "the original named-root authority must refuse its replacement before effects");
     assert!(!fixture.work().join("f.txt").exists());
     assert_eq!(fs::read(original.join("f.txt")).unwrap(), b"base\n");
 }
@@ -6157,6 +6154,7 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
     let context = fixture.recovery_context();
     let outside = context.placement().directory().path().to_owned();
     let result = RepositoryService::new("git", executor.clone())
+        .with_worktree_authority(cagents::repository::WorktreeAuthority::capture(&fixture.work()).unwrap()).unwrap()
         .with_recovery_context(context)
         .undo_discard(&receipt, &cancel)
         .unwrap();
@@ -6326,7 +6324,9 @@ fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_per
         root: fixture.work(),
         changed: AtomicBool::new(false),
     });
-    let service = RepositoryService::new("git", executor.clone()).with_recovery_context(fixture.recovery_context());
+    let service = RepositoryService::new("git", executor.clone())
+        .with_worktree_authority(cagents::repository::WorktreeAuthority::capture(&fixture.work()).unwrap()).unwrap()
+        .with_recovery_context(fixture.recovery_context());
     let first = service.undo_discard(&receipt, &cancel).unwrap();
     let MutationOutcome::PartiallyApplied { paths, failures } = first else {
         panic!("partial outcome required: {first:?}");

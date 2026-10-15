@@ -440,7 +440,8 @@ enum RecoveryObjectCommand<'a> {
 
 impl<E: ProcessExecutor> RepositoryService<E> {
     /// Retain the original object-store authority for one recovery operation.
-    /// A legacy unscoped caller captures once here, never after materialization.
+    /// Recovery requires the original retained metadata authority. A later
+    /// pathname capture cannot reconstruct the repository the user approved.
     pub(super) fn recovery_source_authority(
         &self,
         worktree: &Path,
@@ -451,7 +452,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             Some(_) => {
                 return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into());
             }
-            None => WorktreeAuthority::capture(worktree)?,
+            None => return Err(ValidationError::Io(
+                "Undo requires the original retained Git metadata authority; no path was undone".into()
+            ).into()),
         };
         authority.validate()?;
         let expected = expected_root.metadata().map_err(metadata_error)?;
