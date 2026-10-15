@@ -639,4 +639,44 @@ mod tests {
         assert!(schedule.stale.is_empty());
         assert!(schedule.failures.is_empty());
     }
+
+    #[test]
+    fn review_project_rate_limits_remain_failures_in_both_completion_routes() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let availability = || GitHubAvailability::RateLimited {
+            limit: crate::github::polling::RateLimit { retry_at: crate::github::polling::now() + 120 },
+        };
+        app.repository_generations.insert(project, 1);
+        drop(app.update(Message::GitUi(git_ui::Action::Remote {
+            project, generation: 1, result: Ok((availability(), Vec::new())),
+        })));
+        assert_eq!(app.refresh_ui.schedule.failures.get(&project), Some(&1));
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false, project_id: project, generation: 1,
+            result: Ok(Box::new(LoadedRepository {
+                project: ProjectState { id: project, generation: 0, name: "paused".into(), repository: "/review-paused-project".into(), existence: Existence::Open, kind: ProjectKind::Git },
+                repository: None, worktrees: Vec::new(), github: availability(),
+                review_repository: None, head_repositories: HashMap::new(),
+            })),
+        }));
+        assert_eq!(app.refresh_ui.schedule.failures.get(&project), Some(&2));
+    }
+
+    #[test]
+    fn review_project_polling_skips_shared_backoff_before_repository_discovery() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let key = GitHubRepoKey::new("review-project-backoff.invalid", None, "o", "r").unwrap();
+        app.review_repositories.insert(project, key.clone());
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project, RepositoryId::new(), "paused".into(), "/review-paused-project".into(), Vec::new(), Vec::new(),
+        ));
+        crate::github::polling::failed(&key.host, &crate::github::GitHubError::Inspection("offline".into()));
+        let sequence = app.repository_load_sequence;
+        drop(app.github_read_task(project));
+        assert_eq!(app.repository_load_sequence, sequence);
+        assert!(app.repository_generations.is_empty());
+        assert!(app.refresh_ui.projects.is_empty());
+    }
 }

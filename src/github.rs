@@ -1356,6 +1356,10 @@ pub enum GitHubAvailability {
 }
 
 impl GitHubAvailability {
+    pub(crate) fn refresh_succeeded(&self) -> bool {
+        !matches!(self, Self::Failed { .. } | Self::RateLimited { .. })
+    }
+
     pub fn guidance(&self) -> String {
         match self {
             Self::MissingCli => "GitHub CLI was not found on PATH. Install it from https://cli.github.com, then refresh.".into(),
@@ -1477,6 +1481,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .filter_map(|remote| remote.fetch_url.as_deref())
             .filter_map(remote_repository_key)
             .collect();
+        Self::check_remote_rate_limits(remotes)?;
         if keys.iter().any(|key| key.host == "github.com") {
             return Ok(true);
         }
@@ -1487,6 +1492,18 @@ impl<E: ProcessExecutor> GitHubService<E> {
             &self.gh_command(["auth", "status", "--json", "hosts"]),
             cancellation,
         )?;
+        if !output.success
+            && let Some(limit) = polling::RateLimit::classify(
+                &format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)),
+                polling::now(),
+            )
+        {
+            let error = GitHubError::RateLimited { limit };
+            for key in &keys {
+                polling::failed(&key.host, &error);
+            }
+            return Err(error);
+        }
         require_auth_status_json(&output, &self.gh)?;
         // gh can return a failing auth exit status while still reporting known
         // accounts as JSON; those hosts remain associated but cannot authorize.
@@ -1494,6 +1511,23 @@ impl<E: ProcessExecutor> GitHubService<E> {
         Ok(keys
             .iter()
             .any(|key| envelope.hosts.contains_key(&key.authority())))
+    }
+
+    // Discovery has not selected a repository yet. Conservatively pause it if
+    // any candidate fetch host is limited, before gh can choose that host.
+    fn check_remote_rate_limits(
+        remotes: &[crate::repository::RemoteRecord],
+    ) -> Result<(), GitHubError> {
+        if let Some(limit) = remotes
+            .iter()
+            .filter_map(|remote| remote.fetch_url.as_deref())
+            .filter_map(remote_repository_key)
+            .filter_map(|key| polling::rate_limit(&key.host))
+            .max_by_key(|limit| limit.retry_at)
+        {
+            return Err(GitHubError::RateLimited { limit });
+        }
+        Ok(())
     }
 }
 
@@ -1636,6 +1670,22 @@ impl<E: ProcessExecutor> GitHubService<E> {
     pub fn resolve_repository(
         &self,
         repository: &Path,
+        remotes: &[crate::repository::RemoteRecord],
+        cancellation: &CancellationToken,
+    ) -> Result<GitHubRepoKey, GitHubError> {
+        Self::check_remote_rate_limits(remotes)?;
+        let result = self.resolve_repository_inner(repository, cancellation);
+        if let Err(error) = &result {
+            for key in remotes.iter().filter_map(|remote| remote.fetch_url.as_deref()).filter_map(remote_repository_key) {
+                polling::failed(&key.host, error);
+            }
+        }
+        result
+    }
+
+    fn resolve_repository_inner(
+        &self,
+        repository: &Path,
         cancellation: &CancellationToken,
     ) -> Result<GitHubRepoKey, GitHubError> {
         let command = self.resolve_repository_command(repository);
@@ -1672,13 +1722,22 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<GhAuthStatus, GitHubError> {
         let command = self.auth_status_command(repository);
         repository.validate()?;
-        let output = self.execute(&command, cancellation)?;
-        require_auth_status_json(&output, &self.gh)?;
-        let output = self.checked_output(output, repository)?;
-        attach_process(
-            parse_auth_status(&output.stdout, &repository.authority()),
-            &output,
-        )
+        if let Some(limit) = polling::rate_limit(&repository.host) {
+            return Err(GitHubError::RateLimited { limit });
+        }
+        let result = (|| {
+            let output = self.execute(&command, cancellation)?;
+            require_auth_status_json(&output, &self.gh)?;
+            let output = self.checked_output(output, repository)?;
+            attach_process(
+                parse_auth_status(&output.stdout, &repository.authority()),
+                &output,
+            )
+        })();
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
+        result
     }
 
     pub fn list(
@@ -3280,6 +3339,39 @@ mod tests {
         });
         assert!(availability.guidance().contains("Retrying at"));
         assert!(!availability.guidance().contains("Could not connect"));
+    }
+
+    #[test]
+    fn review_discovery_and_auth_pause_before_launching_gh_on_a_limited_remote() {
+        let host = "review-discovery-pause.invalid";
+        let repository = GitHubRepoKey::new(host, None, "o", "r").unwrap();
+        let remotes = [remote("origin", &format!("https://{host}/o/r"))];
+        let executor = Arc::new(FakeExecutor::default());
+        let service = GitHubService::new("gh", executor.clone());
+        let cancellation = CancellationToken::new();
+        polling::failed(host, &GitHubError::RateLimited {
+            limit: polling::RateLimit { retry_at: polling::now() + 120 },
+        });
+        assert!(matches!(service.has_associated_remote(&remotes, &cancellation), Err(GitHubError::RateLimited { .. })));
+        assert!(matches!(service.resolve_repository(Path::new("/repo"), &remotes, &cancellation), Err(GitHubError::RateLimited { .. })));
+        assert!(matches!(service.auth_status(&repository, &cancellation), Err(GitHubError::RateLimited { .. })));
+        assert!(executor.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_discovery_failure_shares_its_reset_with_the_next_project_read() {
+        let host = "review-discovery-observed-limit.invalid";
+        let remotes = [remote("origin", &format!("https://{host}/o/r"))];
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![Ok(ProcessOutput {
+            exit_code: Some(1), signal: None, success: false, stdout: Vec::new(),
+            stderr: b"secondary rate limit\nRetry-After: 120".to_vec(),
+        })]));
+        let service = GitHubService::new("gh", executor.clone());
+        let cancellation = CancellationToken::new();
+        assert!(matches!(service.resolve_repository(Path::new("/repo"), &remotes, &cancellation), Err(GitHubError::Process(_))));
+        assert!(polling::rate_limit(host).is_some());
+        assert!(matches!(service.resolve_repository(Path::new("/repo"), &remotes, &cancellation), Err(GitHubError::RateLimited { .. })));
+        assert_eq!(executor.commands.lock().unwrap().len(), 1);
     }
 
     #[test]
