@@ -934,6 +934,25 @@ impl Store {
         Ok((key, home))
     }
 
+    /// Create a managed home with installation-owned initialization under the
+    /// same lifecycle/registry admission as pending publication. The borrowed
+    /// receipt comes only from the actual fresh mkdir, before seeding/links.
+    /// The initializer runs while lifecycle/registry locks remain held; it
+    /// must not reenter registry writes or invert any caller's admission order.
+    pub(crate) fn create_pending_initialized(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        started_at: u64,
+        system_home: Option<&Path>,
+        codex_config: super::home::CodexConfig,
+        initialize: impl FnOnce(&super::home::NewHomeCreationReceipt) -> io::Result<()>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        self.create_pending(homes, provider, started_at, || {
+            homes.create_with_config_initialized(provider, system_home, codex_config, initialize)
+        })
+    }
+
     /// Forget and park under the same lifecycle lock as spawning. A failed
     /// deletion cannot make an unregistered home launchable again. Only this
     /// operation's exact parked receipt may delete its tree; a failed cleanup

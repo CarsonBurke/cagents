@@ -219,6 +219,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
             verify: &|| Ok(()),
             deletion: None,
             parked: None,
+            initialize: &|_| Ok(()),
             #[cfg(test)] isolated_delete: false,
         },
     )
@@ -235,6 +236,24 @@ pub(crate) fn execute_reserved<'a>(
     deletion: impl Fn(&super::Account) -> Result<crate::host::DeletionPermit<'a>, String>,
     parked: impl Fn(&super::home::ParkedRemoval) -> Result<(), String>,
 ) -> Result<serde_json::Value, String> {
+    execute_reserved_initialized(operation, gate, verify, deletion, parked, |_| Ok(()))
+}
+
+/// The callback is invoked only for Create, against its genuine unpublished
+/// home receipt. Existing callers intentionally use a no-op initializer; this
+/// plumbing alone does not bootstrap or enable exported history. It currently
+/// runs under Commits' writer and the home/registry locks: do not reenter
+/// admission or take an earlier-ranked namespace/federation lock here. Such
+/// bootstrap needs a separate lock-order-qualified integration first.
+#[cfg(feature = "host")]
+pub(crate) fn execute_reserved_initialized<'a>(
+    operation: Operation,
+    gate: std::sync::Arc<std::sync::RwLock<()>>,
+    verify: impl Fn() -> Result<(), String>,
+    deletion: impl Fn(&super::Account) -> Result<crate::host::DeletionPermit<'a>, String>,
+    parked: impl Fn(&super::home::ParkedRemoval) -> Result<(), String>,
+    initialize: impl Fn(&super::home::NewHomeCreationReceipt) -> std::io::Result<()>,
+) -> Result<serde_json::Value, String> {
     execute_with_commits(
         operation,
         &Commits {
@@ -242,6 +261,7 @@ pub(crate) fn execute_reserved<'a>(
             verify: &verify,
             deletion: Some(&deletion),
             parked: Some(&parked),
+            initialize: &initialize,
             #[cfg(test)] isolated_delete: false,
         },
     )
@@ -253,6 +273,7 @@ struct Commits<'callbacks, 'reservation> {
     verify: &'callbacks dyn Fn() -> Result<(), String>,
     deletion: Option<&'callbacks dyn Fn(&super::Account) -> Result<crate::host::DeletionPermit<'reservation>, String>>,
     parked: Option<&'callbacks dyn Fn(&super::home::ParkedRemoval) -> Result<(), String>>,
+    initialize: &'callbacks dyn Fn(&super::home::NewHomeCreationReceipt) -> std::io::Result<()>,
     #[cfg(test)] isolated_delete: bool,
 }
 #[cfg(feature = "host")]
@@ -314,17 +335,14 @@ fn execute_with_commits(
             let program = probe::Cli::discover(provider, search.as_deref())?;
             let system = Account::system(provider).resolved_home();
             let (key, home) = commits.apply(|| {
-                store.create_pending(&homes, provider, now, || {
-                    homes.create_with_config(
-                        provider,
-                        system.as_deref(),
-                        if copy_codex_config {
-                            CodexConfig::Copy
-                        } else {
-                            CodexConfig::Shared
-                        },
-                    )
-                })
+                store.create_pending_initialized(
+                    &homes,
+                    provider,
+                    now,
+                    system.as_deref(),
+                    if copy_codex_config { CodexConfig::Copy } else { CodexConfig::Shared },
+                    |receipt| (commits.initialize)(receipt),
+                )
             })?;
             created_login(provider, key, home, &program)
         }
@@ -522,6 +540,7 @@ fn remove_account(
             verify: &|| Ok(()),
             deletion: None,
             parked: None,
+            initialize: &|_| Ok(()),
             isolated_delete: true,
         },
     )
@@ -780,6 +799,71 @@ pub(crate) fn login_recipe(
 #[cfg(feature = "host")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_operation_runs_the_borrowed_initializer_before_seed_and_publication() {
+        const CHILD: &str = "CAGENTS_ACCOUNT_INITIALIZER_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            std::fs::create_dir_all(root.path().join("home/.codex")).unwrap();
+            std::fs::create_dir(root.path().join("bin")).unwrap();
+            let shell = root.path().join("bin/shell");
+            std::fs::write(&shell, "#!/bin/sh\nexec /bin/sh -c \"$2\"\n").unwrap();
+            let codex = root.path().join("bin/codex");
+            std::fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+            for file in [&shell, &codex] {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "account::remote::tests::create_operation_runs_the_borrowed_initializer_before_seed_and_publication", "--nocapture"])
+                .env_clear().env(CHILD, root.path()).env("HOME", root.path().join("home"))
+                .env("SHELL", shell).env("PATH", format!("{}:/usr/bin:/bin", root.path().join("bin").display()))
+                .env("XDG_CONFIG_HOME", root.path().join("config")).env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_RUNTIME_DIR", root.path()).output().unwrap();
+            assert!(output.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let store = super::super::registry::Store::installation().unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let failed_home = std::cell::RefCell::new(None);
+        let initialize = |receipt: &super::super::home::NewHomeCreationReceipt| {
+            receipt.revalidate()?;
+            calls.set(calls.get() + 1);
+            assert_eq!(receipt.provider(), Provider::Codex);
+            assert!(std::fs::read_dir(receipt.home())?.next().is_none());
+            let current_registry = store.load()?;
+            let pending = current_registry.pending();
+            assert!(!pending.iter().any(|row| row.key == receipt.key()), "the new pending row must follow initialization");
+            std::fs::write(receipt.home().join("namespace-pointer-fixture"), "bootstrap metadata only")?;
+            if calls.get() == 2 {
+                *failed_home.borrow_mut() = Some(receipt.home().to_owned());
+                return Err(std::io::Error::other("fixture bootstrap refused"));
+            }
+            Ok(())
+        };
+        let commits = Commits {
+            gate: None, verify: &|| Ok(()), deletion: None, parked: None,
+            initialize: &initialize, isolated_delete: false,
+        };
+        let created: Created = serde_json::from_value(execute_with_commits(
+            Operation::Create { provider: Provider::Codex, copy_codex_config: false }, &commits,
+        ).unwrap()).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(std::fs::read_to_string(created.home.join("namespace-pointer-fixture")).unwrap(), "bootstrap metadata only");
+        let before = store.load().unwrap();
+        assert!(before.pending().iter().any(|row| row.key == created.key));
+        let error = execute_with_commits(
+            Operation::Create { provider: Provider::Codex, copy_codex_config: false }, &commits,
+        ).unwrap_err();
+        assert!(error.contains("fixture bootstrap refused"), "{error}");
+        assert!(error.contains("files were retained"), "{error}");
+        assert_eq!(calls.get(), 2);
+        assert_eq!(store.load().unwrap(), before);
+        let failed_home = failed_home.borrow().clone().unwrap();
+        assert!(failed_home.is_dir());
+        assert_eq!(std::fs::read_to_string(failed_home.join("namespace-pointer-fixture")).unwrap(), "bootstrap metadata only");
+    }
 
     #[test]
     fn failed_created_login_recipe_retains_pending_home_and_initialized_namespace() {
