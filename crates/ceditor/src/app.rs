@@ -6187,6 +6187,35 @@ mod tests {
     }
 
     #[test]
+    fn saved_native_menu_retains_actor_on_refresh_and_refuses_same_key_model_replacement() {
+        let directory = git_fixture();
+        let root = directory.path();
+        let mut app = editor();
+        let card = open_real_git(&mut app, root, None);
+        let source = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap();
+        let key = source.key.clone();
+        let binding = source.command_binding_id();
+        let raw = SidebarAction::FileCommand { key: key.clone(), path: RepoPath::parse("tracked.txt").unwrap(), command: FileCommand::Rename };
+        let saved = sidebar::commands::registered(sidebar::commands::bound(binding, raw.clone()));
+        let refresh = app.refresh_snapshot(card, true);
+        run_tasks(&mut app, refresh);
+        assert_eq!(app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().command_binding_id(), binding);
+        // Direct actual update: no helper is allowed to recapture a fresh ID.
+        drop(app.update(Message::Sidebar(saved.clone())));
+        assert!(app.file_dialog.is_some(), "same actual Tab refresh preserves its emitted menu");
+        drop(app.update(Message::CancelFileOperation));
+        let snapshot = read_display_snapshot(root, app.settings.git_status_limit, app.tab(card).unwrap().worktree_authority.clone()).unwrap();
+        let replacement = SourceControlModel::ready(key, &snapshot);
+        let current = replacement.command_binding_id();
+        assert_ne!(current, binding);
+        app.tab_mut(card).unwrap().sidebar.source_control = Some(replacement);
+        drop(app.update(Message::Sidebar(saved)));
+        assert!(app.file_dialog.is_none(), "equal path/rows never rebind a saved native menu to the new actor");
+        drop(app.update(Message::Sidebar(sidebar::commands::registered(sidebar::commands::bound(current, raw)))));
+        assert!(app.file_dialog.is_some(), "current actor retains host Rename support");
+    }
+
+    #[test]
     fn git_actions_commit_publish_and_push_through_the_sidebar() {
         let directory = git_fixture();
         let root = directory.path();
@@ -9065,13 +9094,14 @@ mod tests {
             .unwrap()
             .clone();
         let path = cagents::repository::RepoPath::parse("a.txt").unwrap();
+        let binding = app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().command_binding_id();
         for command in [FileCommand::Rename, FileCommand::CopyFile] {
             let action = SidebarAction::FileCommand {
                 key: key.clone(),
                 path: path.clone(),
                 command,
             };
-            drop(app.update(Message::Sidebar(sidebar::commands::registered(action))));
+            drop(app.update(Message::Sidebar(sidebar::commands::registered(sidebar::commands::bound(binding, action)))));
             let dialog = app
                 .file_dialog
                 .as_ref()
@@ -9095,13 +9125,13 @@ mod tests {
         );
         let mut stale_key = key;
         stale_key.canonical_path = root.join("replaced-worktree");
-        drop(app.update(Message::Sidebar(sidebar::commands::registered(
+        drop(app.update(Message::Sidebar(sidebar::commands::registered(sidebar::commands::bound(binding,
             SidebarAction::FileCommand {
                 key: stale_key,
                 path,
                 command: FileCommand::Rename,
             },
-        ))));
+        )))));
         assert!(
             app.file_dialog.is_none(),
             "the original worktree binding is required"
@@ -9114,7 +9144,7 @@ mod tests {
             .unwrap()
             .files
             .clear();
-        drop(app.update(Message::Sidebar(sidebar::commands::registered(action))));
+        drop(app.update(Message::Sidebar(sidebar::commands::registered(sidebar::commands::bound(binding, action)))));
         assert!(
             app.file_dialog.is_none(),
             "a removed row cannot invoke its old menu"
