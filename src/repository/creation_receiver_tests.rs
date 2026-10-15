@@ -334,3 +334,69 @@ fn original_creation_journal_retains_connection_and_refuses_its_shutdown() {
         "no global/path-based store substitute is retained"
     );
 }
+
+#[test]
+fn original_ui_session_token_answers_only_its_creator_and_exact_recipient() {
+    const CASE: &str = "CAGENTS_ORIGINAL_UI_STORE_RESPONSE_FIXTURE";
+    if std::env::var_os(CASE).is_none() {
+        let root=tempfile::tempdir().unwrap();
+        let runtime=root.path().join("runtime");fs::create_dir(&runtime).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&runtime,fs::Permissions::from_mode(0o700)).unwrap();
+        let name=concat!(module_path!(),"::original_ui_session_token_answers_only_its_creator_and_exact_recipient");
+        let name=name.strip_prefix(concat!(env!("CARGO_CRATE_NAME"),"::")).unwrap_or(name);
+        let spec=CommandSpec::new(std::env::current_exe().unwrap())
+            .args(["--exact",name,"--nocapture"])
+            .env(CASE,"1").env("XDG_DATA_HOME",root.path().join("data"))
+            .env("XDG_CONFIG_HOME",root.path().join("config"))
+            .env("XDG_RUNTIME_DIR",&runtime)
+            .timeout(Duration::from_secs(60)).output_limits(65536,65536);
+        let output=SystemProcessExecutor.execute(&spec,&CancellationToken::new()).unwrap();
+        assert!(output.success,"{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),"{output:?}");
+        return;
+    }
+    use crate::control::created_journal::UiJournalChallenge;
+    use crate::model::{CardId,DirectoryStartKind,DirectoryStartRequirement,HostSessionProof,TerminalId};
+    use std::os::unix::fs::MetadataExt;
+    let (session,_)=crate::session::SessionRuntime::open_default().unwrap();
+    let token=session.original_creation_journal_store().unwrap();
+    let mut fixture=Fixture::new();
+    fixture.store=session.operation_store();
+    let scoped=fixture.service.clone().with_worktree_authority(
+        WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+    let (sender,_)=async_channel::bounded(8);
+    let retained=scoped.create_worktree_journaled_retained(fixture.store.clone(),&fixture.request,
+        7,&CancellationToken::new(),&sender);
+    let created=retained.created.as_ref().expect("actual original settled creator");
+    let roots=received_original_roles(created);
+    let roles=roots.each_ref().map(|root|{let m=root.metadata().unwrap();[m.dev(),m.ino()]});
+    let requirement=DirectoryStartRequirement {card:CardId::new(),session:TerminalId::new(),
+        operation:created.operation(),generation:created.generation(),attempt:uuid::Uuid::new_v4(),
+        kind:DirectoryStartKind::Terminal};
+    let proof=HostSessionProof {host_session_id:"fixture-host".into(),boot_id:"fixture-boot".into(),
+        host_incarnation:"fixture-epoch".into()};
+    // This tests UI production only; a plain challenge has NO host audience or grant authority.
+    let challenge=UiJournalChallenge {request_id:8,nonce:OperationId::new(),proof:proof.clone(),
+        requirement:requirement.clone(),window:crate::instance::window_slot().to_owned(),
+        database:[0,0],roles};
+    let deadline=Instant::now()+Duration::from_secs(5);
+    let cancel=CancellationToken::new();
+    let response=challenge.answer_original(created,&token,8,&proof,&requirement,deadline,&cancel).unwrap();
+    let (echo,bytes)=response.into_wire();assert_eq!(echo,challenge);
+    let saved=fixture.store.journaled_worktree_operation(created.operation()).unwrap().unwrap();
+    assert_eq!(creation_journal::decode_creation_operation_description(&bytes).unwrap(),saved);
+    let mut changed=requirement.clone();changed.card=CardId::new();
+    assert!(challenge.answer_original(created,&token,8,&proof,&changed,deadline,&cancel).is_err());
+    let mut changed=requirement.clone();changed.attempt=uuid::Uuid::new_v4();
+    assert!(challenge.answer_original(created,&token,8,&proof,&changed,deadline,&cancel).is_err());
+    let mut changed=challenge.clone();changed.roles[5][1]+=1;
+    assert!(changed.answer_original(created,&token,8,&proof,&requirement,deadline,&cancel).is_err());
+    let (foreign,_)=crate::session::SessionRuntime::open(fixture.directory.path().join("not-profile.sqlite"),
+        BootId::new("foreign-ui-fixture")).unwrap();
+    assert!(foreign.original_creation_journal_store().is_err(),"no token from caller-selected store path");
+    cancel.cancel();
+    assert!(challenge.answer_original(created,&token,8,&proof,&requirement,deadline,&cancel).is_err());
+    assert_eq!(fixture.store.journaled_worktree_operation(created.operation()).unwrap().unwrap(),saved,
+        "refusals never rewrite the original journal or begin a terminal");
+}
