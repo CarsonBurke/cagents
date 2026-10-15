@@ -56,6 +56,24 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    PaneTransferFailed {
+        operation: uuid::Uuid,
+        error: String,
+    },
+    ViewRefused {
+        scope: crate::workspace_model::views::Scope,
+        operation: uuid::Uuid,
+        error: String,
+    },
+    /// The host did not apply any part of this edit. Its source basis changed;
+    /// ordinary revision retries cannot make that captured intent authoritative.
+    ViewConflicted {
+        scope: crate::workspace_model::views::Scope,
+        operation: uuid::Uuid,
+        change: crate::workspace_model::views::Change,
+        model: WorkspaceModel,
+        error: String,
+    },
     Ranked {
         channel: ChannelId,
         ordinal: u32,
@@ -207,6 +225,16 @@ fn publish(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
+                    if let ModelEdit::ChangeView {
+                        scope, operation, ..
+                    } = &request
+                    {
+                        let _ = updates.send_blocking(ModelUpdate::ViewRefused {
+                            scope: scope.clone(),
+                            operation: *operation,
+                            error: error.to_string(),
+                        });
+                    }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
@@ -263,6 +291,25 @@ fn send(
                 let model = client.read_workspace_model()?;
                 if let ModelEdit::ChangeView {
                     scope,
+                    operation,
+                    change,
+                    ..
+                } = &request
+                    && source_update_conflicts(&model, scope, change)
+                {
+                    let _ = updates.send_blocking(ModelUpdate::ViewConflicted {
+                        scope: scope.clone(),
+                        operation: *operation,
+                        change: change.clone(),
+                        model,
+                        error: error.to_string(),
+                    });
+                    // This is an explicit refusal delivered to the UI, never
+                    // a successful ViewApplied receipt or a partial commit.
+                    return Ok(());
+                }
+                if let ModelEdit::ChangeView {
+                    scope,
                     expected_revision,
                     ..
                 } = &mut request
@@ -303,6 +350,31 @@ fn send(
         let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
     }
     Ok(())
+}
+
+fn source_update_conflicts(
+    model: &WorkspaceModel,
+    scope: &crate::workspace_model::views::Scope,
+    change: &crate::workspace_model::views::Change,
+) -> bool {
+    use crate::workspace_model::views::Change;
+    let Change::Update { before, pane } = change else {
+        return false;
+    };
+    let sensitive = before.kind != pane.kind
+        || before.pending_terminal_start != pane.pending_terminal_start
+        || before.scope != pane.scope;
+    sensitive
+        && !model
+            .views
+            .iter()
+            .find(|view| &view.scope == scope)
+            .and_then(|view| view.panes.iter().find(|current| current.id == before.id))
+            .is_some_and(|current| {
+                current.kind == before.kind
+                    && current.pending_terminal_start == before.pending_terminal_start
+                    && current.scope == before.scope
+            })
 }
 
 /// What adopting one shared row asked of the window.
@@ -395,6 +467,33 @@ impl Cagents {
 
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::ViewConflicted {
+                scope,
+                operation,
+                change,
+                model,
+                error,
+            } => self.refuse_conflicting_view_update(scope, operation, change, model, error),
+            ModelUpdate::PaneTransferFailed { operation, error } => {
+                self.reject_pane_transfer(operation, error);
+                self.reconcile_shared_views()
+            }
+            ModelUpdate::ViewRefused {
+                scope,
+                operation,
+                error,
+            } => {
+                tracing::warn!(?scope, %operation, %error, "the registry refused a view edit");
+                if self.shared_views.is_requested_transfer(operation) {
+                    self.reject_pane_transfer(operation, error);
+                } else {
+                    self.shared_views.refused(operation);
+                    self.status = Some(TransientNotice::warning(format!(
+                        "The pane change was not applied: {error}"
+                    )));
+                }
+                self.reconcile_shared_views()
+            }
             ModelUpdate::NavigationFailed(error) => {
                 self.status = Some(TransientNotice::warning(format!(
                     "Could not reorder the sidebar: {error}"
@@ -411,10 +510,13 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                let transferred = operation
+                    .and_then(|operation| self.shared_views.requested_transfer_card(operation));
                 self.acknowledge_view_edit(scope, operation);
                 if model.sequence >= self.workspace_model.sequence {
                     self.workspace_model = model;
                 }
+                self.retarget_transferred_pane_updates(transferred);
                 self.reconcile_workspace_model()
             }
             ModelUpdate::Connected(model) => {
@@ -714,9 +816,11 @@ impl Cagents {
         if changed {
             self.sort_durable_channels();
             self.refresh_sidebar_channels();
-            self.persist();
             tasks.push(self.sync_chrome());
         }
+        // Reconciliation persists the completed projection. Publishing here
+        // would pair old local descriptors with pending-start flags from the
+        // newly received model, before its pane sources have been adopted.
         tasks.push(self.reconcile_shared_views());
         Task::batch(tasks)
     }
@@ -1162,6 +1266,7 @@ impl Cagents {
     /// publisher thread owns the connection and the retry, and the window learns
     /// the outcome as an update like any other.
     pub(super) fn publish_model_edit(&mut self, edit: ModelEdit) {
+        self.capture_view_update_source(&edit);
         let navigation = matches!(
             &edit,
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
@@ -1180,6 +1285,156 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_conflict_drains_the_stale_request_without_an_applied_receipt() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+        };
+        use crate::workspace_model::views::{Change, Pane, Scope, View};
+        use std::os::unix::net::UnixStream;
+        let app = super::super::tests::context_inspector_test_app(true);
+        let before = Pane::from_card(&app.durable.cards[0], None).unwrap();
+        let scope = Scope::Channel(ChannelId::new());
+        let mut desired = before.clone();
+        desired.pending_terminal_start = true;
+        desired.title = "Captured title".into();
+        let stale = uuid::Uuid::new_v4();
+        let next = uuid::Uuid::new_v4();
+        let change = Change::Update {
+            before: before.clone(),
+            pane: desired,
+        };
+        let mut current = before;
+        current.scope = Some("/changed-source".into());
+        let model = WorkspaceModel {
+            views: vec![View {
+                scope: scope.clone(),
+                revision: 2,
+                panes: vec![current.clone()],
+                retired: vec![],
+            }],
+            ..WorkspaceModel::default()
+        };
+        let mut presentation = current.clone();
+        presentation.title = "Independent next request".into();
+        let next_edit = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: 2,
+            operation: next,
+            change: Change::Update {
+                before: current,
+                pane: presentation,
+            },
+        };
+        let first_edit = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: 1,
+            operation: stale,
+            change: change.clone(),
+        };
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let expected_model = model.clone();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("conflict-fixture"),
+                boot_id: crate::model::BootId::new("conflict-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("conflict-host"),
+            };
+            let envelope = |request_id, message| ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(request_id),
+                proof: proof.clone(),
+                message,
+            };
+            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+            write_frame(
+                &mut server_stream,
+                &envelope(
+                    connect.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![],
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+            let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(edit.request, ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::ChangeView { operation, .. } } if operation == stale));
+            write_frame(
+                &mut server_stream,
+                &envelope(
+                    edit.request_id,
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::ViewConflict,
+                        "The pane source changed",
+                        true,
+                    )),
+                ),
+            )
+            .unwrap();
+            let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ReadWorkspaceModel));
+            write_frame(
+                &mut server_stream,
+                &envelope(
+                    read.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: model.clone(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+            // A revision-only retry would repeat stale here and fail. The
+            // publisher must instead be free to admit the next independent edit.
+            let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(edit.request, ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::ChangeView { operation, .. } } if operation == next));
+            write_frame(
+                &mut server_stream,
+                &envelope(
+                    edit.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel { model },
+                    },
+                ),
+            )
+            .unwrap();
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        send(&mut client, first_edit, &tx).unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(), ModelUpdate::ViewConflicted {
+            operation, change: actual, model, ..
+        } if operation == stale && actual == change && model == expected_model)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused source edit has no ViewApplied receipt"
+        );
+        send(&mut client, next_edit, &tx).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), ModelUpdate::ViewApplied {
+            operation: Some(operation), ..
+        } if operation == next));
+        drop(client);
+        server.join().unwrap();
+    }
 
     #[test]
     fn device_project_metadata_creates_durable_sidebar_without_local_filesystem() {
