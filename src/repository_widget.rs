@@ -5448,7 +5448,9 @@ impl RepositoryRuntime {
                     _ => column,
                 } } else { column };
                 let task = self.open_file_location(card, path.clone(), line, byte, 0);
-                if !loaded { self.pending_scalar_location = Some((path, line, column)); }
+                if !loaded && self.selected_path() == Some(path.as_path()) && matches!(self.document, DocumentState::Loading) {
+                    self.pending_scalar_location = Some((path, line, column));
+                }
                 task
             }
             RepositoryAction::OpenGoToLine { card } => {
@@ -6300,6 +6302,7 @@ impl RepositoryRuntime {
             return Task::none();
         }
         self.pending_fragment = None;
+        self.pending_scalar_location = None;
         self.pending_editor_navigation = None;
         self.pending_editor_focus = None;
         if self.descriptor.selected_file.is_some() {
