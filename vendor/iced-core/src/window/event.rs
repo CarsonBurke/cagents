@@ -45,6 +45,9 @@ pub enum Event {
     /// A window was unfocused.
     Unfocused,
 
+    /// Assistive technology activated or deactivated this window's tree.
+    AccessibilityEnabled(bool),
+
     /// A file is being hovered over the window.
     ///
     /// When the user hovers multiple files at once, this event will be emitted

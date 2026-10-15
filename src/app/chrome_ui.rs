@@ -1,11 +1,21 @@
 use super::*;
 use crate::interaction::tooltip;
 
+pub(super) const TITLE_STABILITY: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+pub(super) struct ReportedTitle {
+    pub(super) value: String,
+    pub(super) changed_at: Instant,
+    pub(super) pending: bool,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct State {
     hovered_tab: Option<CardId>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
+    pub(super) reported_titles: HashMap<CardId, ReportedTitle>,
     /// Tab visibility follows pane focus even when a creation path already
     /// updated durable focus before applying its viewport changes.
     pub(super) tabs_focus: Option<CardId>,

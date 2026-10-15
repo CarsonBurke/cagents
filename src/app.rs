@@ -43,6 +43,7 @@ mod terminal_end_ui;
 mod terminal_failure;
 mod terminal_ui;
 mod update_ui;
+mod update_tail;
 mod workspace_model_sync;
 mod worktree_dialog;
 mod worktree_operations;
@@ -4014,6 +4015,9 @@ pub enum Message {
     /// Hosted terminals the daemon reports, either as its full inventory on
     /// connect or as one terminal another client just created.
     HostedTerminalsObserved(Vec<crate::terminal::ipc::TerminalDescriptor>),
+    WorktreeOwnerPathsInvalidated,
+    WorktreeOwnerPathsResolved { generation: u64, paths: Vec<(PathBuf, PathBuf)> },
+    PersistStableTitles,
     TerminalWake {
         card: CardId,
         generation: u64,
@@ -4762,6 +4766,7 @@ pub struct Cagents {
     terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
+    update_tail: update_tail::State,
     navigation_cache: sidebar::NavigationCache,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
@@ -4899,6 +4904,7 @@ pub struct Cagents {
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
     known_worktree_roots: HashSet<PathBuf>,
+    worktree_owner_paths: worktree_ui::OwnerPaths,
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
@@ -5633,7 +5639,7 @@ impl Cagents {
                 // commands, which could otherwise mask a permanent failure
                 // as a closed visibility channel.
                 self.cards.insert(card, CardRuntime::Terminal(handle));
-                tasks.push(self.drain_terminal(card, 0));
+                tasks.push(self.drain_terminal(card, 0).0);
                 if ended_terminal(self.card_state(card)).is_some() {
                     // The daemon can report a session that already
                     // ended without a queued event to drain, and a card
@@ -7380,7 +7386,11 @@ impl Cagents {
         } else {
             title
         };
-        let Some(title) = normalize_card_name(&title) else {
+        let is_agent = self.sidebar_state.card_activity(id).is_some()
+            || self.card_state(id).is_some_and(|card| matches!(&card.kind,
+                CardKind::Terminal(session) if crate::agent::Provider::recognize_launch(&session.launch).is_some()));
+        let title = if is_agent { crate::agent::codex_title_without_status(&title) } else { &title };
+        let Some(title) = normalize_card_name(title) else {
             return false;
         };
         let presentation = if self
@@ -7392,6 +7402,20 @@ impl Cagents {
             &title
         };
         let _ = self.workspace.rename_card(id, presentation.to_owned());
+        if self.card_state(id).is_some_and(|card| matches!(card.kind, CardKind::Terminal(_))) {
+            // OSC titles are presentation state while a provider animates or
+            // replaces them. Only a stable title enters the durable snapshot.
+            let current = self.chrome_ui.reported_titles.get(&id)
+                .map(|reported| reported.value.as_str())
+                .or_else(|| self.card_state(id).map(|state| state.title.as_str()));
+            if current != Some(title.as_str()) {
+                self.chrome_ui.reported_titles.insert(id, chrome_ui::ReportedTitle {
+                    value: title, changed_at: Instant::now(), pending: true,
+                });
+                self.card_chrome.remove(&id);
+            }
+            return false;
+        }
         if self
             .card_state(id)
             .is_some_and(|state| state.title != title)
@@ -7403,9 +7427,28 @@ impl Cagents {
         false
     }
 
+    fn persist_stable_titles(&mut self, now: Instant) -> Task<Message> {
+        let stable = self.chrome_ui.reported_titles.iter()
+            .filter(|(_, title)| title.pending && now.saturating_duration_since(title.changed_at) >= chrome_ui::TITLE_STABILITY)
+            .map(|(&card, title)| (card, title.value.clone())).collect::<Vec<_>>();
+        let mut changed = false;
+        for (card, title) in stable {
+            if !self.chrome_ui.user_titles.contains_key(&card)
+                && self.card_state(card).is_some_and(|state| state.title != title)
+                && let Some(state) = self.card_state_mut(card)
+            { state.title = title; changed = true; }
+            if let Some(reported) = self.chrome_ui.reported_titles.get_mut(&card) {
+                reported.pending = false;
+            }
+        }
+        if changed { self.persist(); }
+        Task::none()
+    }
+
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
+        self.chrome_ui.reported_titles.retain(|card, _| self.cards.contains_key(card));
         self.terminal_working_directories
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
@@ -7493,6 +7536,9 @@ impl Cagents {
         }
         if matches!(card.kind, CardKind::Browser(_)) {
             return browser_host::TITLE;
+        }
+        if let Some(title) = self.chrome_ui.reported_titles.get(&card.id) {
+            return &title.value;
         }
         let title = crate::agent::codex_title_without_status(&card.title);
         // Provider recognition can only change an empty or status-prefixed
@@ -8479,17 +8525,18 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    fn drain_terminal(&mut self, card: CardId, _generation: u64) -> Task<Message> {
+    fn drain_terminal(&mut self, card: CardId, _generation: u64) -> (Task<Message>, bool) {
         if self.chat_start_pending(card) {
-            return Task::none();
+            return (Task::none(), false);
         }
         let (proof, collected) = {
             let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-                return Task::none();
+                return (Task::none(), false);
             };
             let events = handle.events();
             (handle.host_proof(), events.try_iter().collect::<Vec<_>>())
         };
+        let mut semantic_changed = !collected.is_empty();
         let mut durable_changed = false;
         let mut recovery = None;
         let mut clipboard_task = Task::none();
@@ -8521,14 +8568,28 @@ impl Cagents {
                 // not bring a finished agent's row back to life.
                 TerminalEvent::AgentActivityChanged(activity) => {
                     if ended_terminal(self.card_state(card)).is_none() {
-                        self.observe_agent_activity_for_card(card, activity);
+                        if self.sidebar_state.card_activity(card) != activity {
+                semantic_changed = true;
+                self.update_tail.mark(update_tail::Step::Channels);
+                self.observe_agent_activity_for_card(card, activity);
+            }
                     }
                 }
                 TerminalEvent::TitleChanged(title) => {
+                    let previous = self.chrome_ui.reported_titles.get(&card)
+                        .map(|title| title.value.clone())
+                        .or_else(|| self.card_state(card).map(|state| state.title.clone()));
                     durable_changed |= self.apply_reported_title(card, title);
+                    if self.chrome_ui.reported_titles.get(&card)
+                        .is_some_and(|title| Some(title.value.as_str()) != previous.as_deref()) {
+                        self.update_tail.mark(update_tail::Step::Chrome);
+                    }
                 }
                 TerminalEvent::WorkingDirectoryChanged(path) => {
-                    self.terminal_working_directories.insert(card, path);
+                    if self.terminal_working_directories.get(&card) != Some(&path) {
+                        self.terminal_working_directories.insert(card, path);
+                        self.update_tail.mark(update_tail::Step::Chrome);
+                    }
                 }
                 TerminalEvent::ClipboardText { request, text } => {
                     if let Some(find) = self.terminal_find.get_mut(&card)
@@ -8550,6 +8611,7 @@ impl Cagents {
                     self.terminal_search_results(card, request, query, matches, truncated);
                 }
                 TerminalEvent::ConversationTitleChanged(title) => {
+                    self.update_tail.changed();
                     if let Some(title) = crate::workspace_model::channel_title(&title) {
                         self.suggest_channel_title(
                             card,
@@ -8567,7 +8629,10 @@ impl Cagents {
                         durable_changed = true;
                     }
                 }
-                TerminalEvent::Bell => self.observe_agent_update_for_card(card),
+                TerminalEvent::Bell => {
+                    self.observe_agent_update_for_card(card);
+                    self.update_tail.mark(update_tail::Step::Channels);
+                }
                 // Root exit is not PTY completion: a descendant may still
                 // accept input and produce output. Keep its live surface.
                 TerminalEvent::Exited {
@@ -8652,10 +8717,16 @@ impl Cagents {
                 CardRuntime::Terminal(handle) => handle.agent_activity(),
                 _ => None,
             });
-            self.observe_agent_activity_for_card(card, activity);
+            if self.sidebar_state.card_activity(card) != activity {
+                semantic_changed = true;
+                self.update_tail.mark(update_tail::Step::Channels);
+                self.observe_agent_activity_for_card(card, activity);
+            }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
         if durable_changed {
+            semantic_changed = true;
+            self.update_tail.changed();
             self.persist();
         }
         if let Some((session, visible, hibernated)) = recovery {
@@ -8672,7 +8743,7 @@ impl Cagents {
                 }
                 self.cards.insert(card, CardRuntime::Loading);
                 self.restored_agent_attaches.push_back(card);
-                return self.attach_next_restored_agent();
+                return (self.attach_next_restored_agent(), true);
             }
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,
@@ -8691,9 +8762,10 @@ impl Cagents {
                 Instant::now(),
             );
             self.cards.insert(card, CardRuntime::Loading);
-            return self.start_terminal(card, session, visible, false);
+            return (self.start_terminal(card, session, visible, false), true);
         }
-        Task::batch([clipboard_task, self.refresh_live_terminal_find(card)])
+        (Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
+            semantic_changed || durable_changed)
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -11690,6 +11762,7 @@ impl Cagents {
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        let close_started = Instant::now();
         if self.exit.is_some() {
             return Task::none();
         }
@@ -11698,13 +11771,18 @@ impl Cagents {
         // window is being raised, and it would open none. Refused, the
         // launcher waits for this process to release the window lease and
         // starts a fresh window.
+        tracing::debug!(target: "cagents::lifecycle", stage = "close_accepted");
         self.activation_rx.close();
         // `Drop` writes the final state; this snapshot is queued now because
         // someone who has watched the window close may power off before then.
         self.persist();
+        tracing::debug!(target: "cagents::lifecycle", stage = "close_snapshot_queued",
+            elapsed_ms = close_started.elapsed().as_millis() as u64);
         let reaped = self.lsp.begin_shutdown();
         let reap = cosmic::task::future(async move {
             reaped.await;
+            tracing::debug!(target: "cagents::lifecycle", stage = "language_servers_reaped",
+                elapsed_ms = close_started.elapsed().as_millis() as u64);
             Message::LanguageServersReaped
         });
         let close = self.close_main_window();
@@ -11770,6 +11848,8 @@ impl Cagents {
     /// `Drop` runs it again for an exit this application did not drive.
     #[cfg(feature = "integrated-browser")]
     fn release_browser_parent(&mut self) {
+        let release_started = Instant::now();
+        tracing::debug!(target: "cagents::lifecycle", stage = "browser_parent_release_started");
         let cards = self
             .cards
             .iter()
@@ -11791,6 +11871,8 @@ impl Cagents {
         for teardown in self.browser_teardowns.drain(..) {
             let _ = teardown.join();
         }
+        tracing::debug!(target: "cagents::lifecycle", stage = "browser_threads_joined",
+            elapsed_ms = release_started.elapsed().as_millis() as u64);
         self.browser_backend.retire();
         if let Some(factory) = self.browser_factory.take() {
             factory.release_parent();
@@ -11798,6 +11880,8 @@ impl Cagents {
         if let Some(parent_lifetime) = self.browser_parent_lifetime.take() {
             parent_lifetime.deactivate();
         }
+        tracing::debug!(target: "cagents::lifecycle", stage = "browser_parent_released",
+            elapsed_ms = release_started.elapsed().as_millis() as u64);
     }
 
     fn activate_main_window(&self, token: Option<String>) -> Task<Message> {
@@ -12843,6 +12927,7 @@ impl Application for Cagents {
             terminal_paste: None,
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            update_tail: update_tail::State::default(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -12939,6 +13024,7 @@ impl Application for Cagents {
             worktree_offsets: HashMap::new(),
             channel_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
+            worktree_owner_paths: worktree_ui::OwnerPaths::default(),
             known_worktree_roots: worktrees
                 .iter()
                 .map(|worktree| worktree.path.clone())
@@ -13101,10 +13187,12 @@ impl Application for Cagents {
             app.update_update_ui(update_ui::Action::Check),
             app.update_update_ui(update_ui::Action::Poll),
             app.load_accounts(),
+            app.resolve_worktree_owner_paths(),
         ];
         // Unused default chats are never saved. Recreate the active scope's
         // placeholder only after restored runtimes have been initialized.
         tasks.push(app.ensure_default_pane());
+        app.refresh_draft_permission_previews();
         tasks.extend(
             projects
                 .into_iter()
@@ -13222,6 +13310,15 @@ impl Application for Cagents {
                     ..
                 }
         );
+        // These messages update only time/paint state. They cannot change
+        // workspace chrome, ownership, transcript probes or sidebar rows.
+        let terminal_wake = matches!(&message, Message::TerminalWake { .. });
+        let mut light_update = match &message {
+            Message::ChatUi(chat_ui::Action::Tick) => true,
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserProgressTick => true,
+            _ => false,
+        };
         let reconcile_row_selection = !matches!(
             &message,
             Message::Sidebar(SidebarAction::ScrollProjects(_) | SidebarAction::NavigateRow { .. })
@@ -13315,12 +13412,21 @@ impl Application for Cagents {
                     }
                 }
             }
+            Message::WorktreeOwnerPathsInvalidated => {
+                self.worktree_owner_paths.invalidate_watched();
+                self.resolve_worktree_owner_paths()
+            }
+            Message::WorktreeOwnerPathsResolved { generation, paths } => {
+                self.worktree_owner_paths_resolved(generation, paths)
+            }
+            Message::PersistStableTitles => self.persist_stable_titles(Instant::now()),
             Message::TerminalWake { card, generation } => {
                 tracing::trace!(target: "cagents::pane_open", stage = "wake", ?card, generation);
                 let started =
                     tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
                         .then(Instant::now);
-                let task = self.drain_terminal(card, generation);
+                let (task, semantic_changed) = self.drain_terminal(card, generation);
+                light_update = !semantic_changed;
                 if let Some(started) = started {
                     let activity_sequence = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
@@ -14694,6 +14800,8 @@ impl Application for Cagents {
             }
             Message::UpdateUi(action) => self.update_update_ui(action),
             Message::StartupWindowOpened(window) => {
+                tracing::debug!(target: "cagents::startup", stage = "window_opened",
+                    main_window = self.core.main_window_id() == Some(window));
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
                 }
@@ -14915,6 +15023,8 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowCloseRequested(window) => {
+                tracing::debug!(target: "cagents::lifecycle", stage = "close_requested",
+                    main_window = self.core.main_window_id() == Some(window));
                 // libcosmic reports the closed window through this same
                 // request, and a second close must not reopen the exit.
                 if self.exit.is_some() || self.dirty_repository_close.is_some() {
@@ -16427,6 +16537,12 @@ impl Application for Cagents {
                 Task::batch(refreshes)
             }
         };
+        if light_update {
+            // Terminal output still refreshes its surface/search task, and
+            // paint ticks still render; neither walks the workspace projection.
+            return task;
+        }
+        if !terminal_wake && !camera_only { self.update_tail.changed(); }
         // `status` is the shell's write channel: ninety-odd call sites raise a
         // notice by assigning it. Draining it here is what makes those notices
         // survive the next assignment instead of silently replacing each other,
@@ -16436,7 +16552,9 @@ impl Application for Cagents {
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
-        self.sync_worktree_protections();
+        if self.update_tail.run(update_tail::Step::Protections) {
+            self.sync_worktree_protections();
+        }
         self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take()
             && !crate::daemon_health::replaces_notice(&notice.message)
@@ -16460,11 +16578,15 @@ impl Application for Cagents {
         }
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
-        self.refresh_sidebar_channels();
+        if self.update_tail.run(update_tail::Step::Channels) {
+            self.refresh_sidebar_channels();
+        }
         if reconcile_row_selection {
             self.prune_sidebar_row_selection();
         }
-        self.refresh_sidebar_worktree_panes();
+        if self.update_tail.run(update_tail::Step::WorktreePanes) {
+            self.refresh_sidebar_worktree_panes();
+        }
         let binding = self.rebind_source_control();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
@@ -16482,9 +16604,15 @@ impl Application for Cagents {
         }
         let pull_request = self.sync_pull_request_inspector();
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
-        let chrome = self.sync_chrome();
+        let chrome = if self.update_tail.run(update_tail::Step::Chrome) {
+            self.sync_chrome()
+        } else { Task::none() };
         let deferred = self.release_deferred_navigation_if_unblocked();
-        let terminal_probes = self.terminal_transcript_probes();
+        self.refresh_draft_permission_previews();
+        let owner_paths = self.resolve_worktree_owner_paths();
+        let terminal_probes = if self.update_tail.run(update_tail::Step::TranscriptProbes) {
+            self.terminal_transcript_probes()
+        } else { Task::none() };
         Task::batch([
             task,
             binding,
@@ -16493,13 +16621,18 @@ impl Application for Cagents {
             pull_request,
             notices,
             terminal_probes,
+            owner_paths,
         ])
     }
 
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
+        let title_subscription = if self.chrome_ui.reported_titles.values().any(|title| title.pending) {
+            iced::time::every(Duration::from_secs(1)).map(|_| Message::PersistStableTitles)
+        } else { Subscription::none() };
         let mut subscriptions = vec![
             self.chat_subscription(),
+            self.worktree_owner_paths.subscription(self.refresh_ui.focused),
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             self.refresh_subscription(),
@@ -16510,6 +16643,7 @@ impl Application for Cagents {
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
+            title_subscription,
             Subscription::run_with(
                 TerminalWakeSource(self.terminal_wake_rx.clone()),
                 terminal_wake_stream,
@@ -17362,6 +17496,8 @@ impl Application for Cagents {
 
 impl Drop for Cagents {
     fn drop(&mut self) {
+        let drop_started = Instant::now();
+        tracing::debug!(target: "cagents::lifecycle", stage = "application_drop_started");
         self.latency.abandon_pending();
         self.persist();
         self.fold_settings_drafts();
@@ -17371,9 +17507,12 @@ impl Drop for Cagents {
             });
             tracing::error!(%error, "failed to persist settings");
         }
+        tracing::debug!(target: "cagents::lifecycle", stage = "final_persistence_shutdown_started");
         if let Some(session) = &mut self.session {
             session.shutdown();
         }
+        tracing::debug!(target: "cagents::lifecycle", stage = "final_persistence_shutdown_finished",
+            elapsed_ms = drop_started.elapsed().as_millis() as u64);
         // Reached without the exit path having run - a panic, or a close this
         // application did not drive - so nothing has awaited the reap and the
         // runtime is going away regardless. `shutdown` alone would leave every
@@ -25114,6 +25253,7 @@ mod tests {
                 .unwrap_or_default(),
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            update_tail: update_tail::State::default(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -25217,6 +25357,7 @@ mod tests {
             channel_offsets: HashMap::new(),
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
+            worktree_owner_paths: worktree_ui::OwnerPaths::default(),
             known_worktree_roots: HashSet::new(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),

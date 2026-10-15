@@ -862,22 +862,22 @@ impl Cagents {
         let durable = &self.durable;
         // A failure outlives nothing: a channel that has gone since, however
         // it went, has nothing left to retry.
-        self.channel_ui
-            .failed
-            .retain(|id, _| durable.channels.iter().any(|channel| channel.id == *id));
+        let channel_ids = durable.channels.iter().map(|channel| channel.id).collect::<HashSet<_>>();
+        self.channel_ui.failed.retain(|id, _| channel_ids.contains(id));
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
+        let cards = durable.cards.iter().map(|card| (card.id, card)).collect::<HashMap<_, _>>();
+        let mut channels = HashMap::<ProjectId, Vec<&ProjectChannel>>::new();
+        for channel in &durable.channels {
+            channels.entry(channel.project_id).or_default().push(channel);
+        }
         for project in &mut self.sidebar_model.projects {
             let mut index = 0;
             // Built in the durable vector's own order, which is the registry's
             // ascending creation ranks. Display order is not decided here:
             // `sidebar::channels_in_display_order` owns it, one named ordering
             // helper per row kind beside the one the worktree rows use.
-            for channel in durable
-                .channels
-                .iter()
-                .filter(|channel| channel.project_id == project.id)
-            {
+            for channel in channels.get(&project.id).into_iter().flatten().copied() {
                 let title = channel_display_title(channel);
                 let selected = durable.active_channel == Some(channel.id);
                 let deletion = channel_ui.row_deletion(channel.id);
@@ -887,8 +887,8 @@ impl Cagents {
                 let mut has_panes = false;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
-                    let Some(card) = durable.cards.iter().find(|card| {
-                        card.id == *id && card.existence.is_open() && !card.kind.is_utility()
+                    let Some(card) = cards.get(id).filter(|card| {
+                        card.existence.is_open() && !card.kind.is_utility()
                     }) else {
                         continue;
                     };
@@ -1167,6 +1167,47 @@ mod tests {
     /// live in the channel is not a conversation, and a closing card is no
     /// longer there. The channel's own identity is unaffected by either, which
     /// is what keeps a channel-level action distinct from the chats inside it.
+    #[test]
+    fn channel_projection_counts_many_cards_across_many_projects() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let template = super::super::tests::terminal_card_state();
+        for project_index in 0..20 {
+            let project = ProjectId::new();
+            app.sidebar_model.projects.push(SidebarProject::new(
+                project, RepositoryId::new(), format!("project {project_index}"),
+                format!("/repo/{project_index}").into(), Vec::new(), Vec::new(),
+            ));
+            for ordinal in 0..10 {
+                let mut ids = Vec::new();
+                for _ in 0..10 {
+                    let mut card = template.clone();
+                    card.id = CardId::new();
+                    card.kind = CardKind::Chat(chat_session());
+                    ids.push(card.id);
+                    Arc::make_mut(&mut app.durable).cards.push(card);
+                }
+                Arc::make_mut(&mut app.durable).channels.push(ProjectChannel {
+                    id: ChannelId::new(), project_id: project, title: format!("channel {ordinal}"),
+                    title_source: Default::default(), ordinal, shared: false,
+                    focused: ids.first().copied(), cards: ids,
+                });
+            }
+        }
+        app.refresh_sidebar_channels();
+        assert_eq!(app.sidebar_model.projects.len(), 20);
+        for project in &app.sidebar_model.projects {
+            assert_eq!(project.channels.len(), 10);
+            assert!(project.channels.iter().all(|channel| channel.chats == 10 && channel.has_panes));
+        }
+        let previous = app.sidebar_model.projects.iter().map(|project| {
+            project.channels.iter().map(|channel| channel.id).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        app.refresh_sidebar_channels();
+        assert_eq!(previous, app.sidebar_model.projects.iter().map(|project| {
+            project.channels.iter().map(|channel| channel.id).collect::<Vec<_>>()
+        }).collect::<Vec<_>>());
+    }
+
     #[test]
     fn a_channel_row_counts_only_the_open_chats_it_contains() {
         let mut app = super::super::tests::context_inspector_test_app(true);
