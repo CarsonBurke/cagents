@@ -187,6 +187,7 @@ mod tests {
         pending.recv_timeout(Duration::from_secs(2)).unwrap();
         let provider = handle.provider_process().map(ProviderIncarnation::from_process);
         let host = fixture.host.clone(); let expected = fixture.expected.clone();
+        let reserved_session=session.clone();
         let (closed, closing) = crossbeam_channel::bounded(1);
         let close = thread::spawn(move || { let result = super::super::client::process_request(&host,1,ClientRequest::CloseProjectGuarded { project: expected, sessions: vec![SessionClose { source: HostedSession::Chat(session), execution_instance: Some(instance), provider }] }); closed.send(result).unwrap(); });
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -202,6 +203,11 @@ mod tests {
         let transfer = ClientRequest::EditWorkspaceModel { edit: ModelEdit::ChangeView { scope: Scope::Worktree { repository: unrelated_dir.clone(), path: unrelated_dir }, expected_revision:0, operation:uuid::Uuid::new_v4(), change:crate::workspace_model::views::Change::Transfer { id: crate::model::CardId::new(), destination: Scope::Worktree { repository: fixture.root.clone(), path: fixture.root.clone() }, before:None } } };
         assert!(super::super::client::process_request(&fixture.host,1,transfer).unwrap_err().message.contains("being removed"));
         assert!(ensure_available(&fixture.host,None,Some(&fixture.root),None).is_err());
+        for request in [ClientRequest::ChatCloseSession{session:reserved_session.clone()},ClientRequest::ChatAttach{session:reserved_session}] {
+            let refusal=super::super::client::process_request(&fixture.host,1,request).unwrap_err();
+            assert!(refusal.message.contains("being removed"));
+            assert!(fixture.host.lock().unwrap().chats[&id].handle.same_actor(&handle));
+        }
         let github = crate::github_identity::GitHubRepoKey::new("github.com",None,"fixture","project").unwrap();
         let cleanup = ClientRequest::DeviceOperation { operation: crate::device_service::Operation::RemoveMergedWorktree { request: crate::worktree_cleanup::RemovalRequest { repository: fixture.root.clone(), path: fixture.root.join("linked"), branch: "fixture".into(), head_oid: "a".repeat(40), source_repository: github.clone(), pull_request: crate::github_identity::PullRequestKey { repository: github, number: 1 } } } };
         assert!(super::super::client::process_request(&fixture.host,1,cleanup).unwrap_err().message.contains("being removed"),"the early automatic-cleanup port must refuse before Git or GitHub preparation");
