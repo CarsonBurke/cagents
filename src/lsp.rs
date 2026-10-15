@@ -39,6 +39,7 @@ use std::future::Future;
 use std::io;
 use std::ops::{ControlFlow, Range};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1679,6 +1680,36 @@ struct LaunchSpec {
 }
 
 type TransportFactory = Arc<dyn Fn(&LaunchSpec) -> Result<Transport, String> + Send + Sync>;
+
+/// Keep the original directory inode allocated while a server owns its root.
+/// A path can be renamed and replaced between watchdog polls; existence alone
+/// would then keep a server for the previous checkout alive indefinitely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl RootIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+async fn pin_session_root(root: &Path) -> io::Result<(tokio::fs::File, RootIdentity)> {
+    // O_PATH pins identity without requiring directory read permissions. This
+    // happens on the async launch path, never on the application update thread.
+    let directory = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)
+        .await?;
+    let identity = RootIdentity::from_metadata(&directory.metadata().await?);
+    Ok((directory, identity))
+}
 
 /// Anchors `path` to `working_directory` without consulting the filesystem.
 fn absolute_in(working_directory: &Path, path: &Path) -> PathBuf {
@@ -3560,6 +3591,9 @@ struct RetiringSession {
 #[derive(Default)]
 struct SessionActivity {
     documents: HashSet<LspDocumentId>,
+    // Resource refreshes also need a routing identity after the final tab closes.
+    // The application refreshes global metrics before resolving that tab.
+    last_document: Option<LspDocumentId>,
     // Monotonic ticks relative to the manager's epoch, convenient for fake-clock tests.
     last_used: Duration,
 }
@@ -3590,6 +3624,9 @@ struct SessionHandle {
 
 impl SessionHandle {
     fn status(&self) -> LspStatus {
+        if self.retired.load(Ordering::Acquire) {
+            return LspStatus::Disabled;
+        }
         self.status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3698,8 +3735,42 @@ struct DocumentRef {
 /// distinguish it from the one it retired.
 static NEXT_MANAGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Shares an outgoing manager's bounded reap without letting cancellation of
+/// any one new session cancel that reap or release other sessions early.
+struct LaunchBarrier {
+    predecessor: Mutex<Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
+    ready: AtomicBool,
+    changed: Notify,
+}
+impl LaunchBarrier {
+    async fn wait(self: Arc<Self>) {
+        let predecessor = {
+            self.predecessor
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+        };
+        if let Some(predecessor) = predecessor {
+            let barrier = Arc::clone(&self);
+            tokio::spawn(async move {
+                predecessor.await;
+                barrier.ready.store(true, Ordering::Release);
+                barrier.changed.notify_waiters();
+            });
+        }
+        loop {
+            let changed = self.changed.notified();
+            if self.ready.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 /// The application's single LSP client.
 pub struct LspManager {
+    launch_barrier: Option<Arc<LaunchBarrier>>,
     servers: Vec<LanguageServerSettings>,
     /// Lowercase extension to the first server and language that claims it.
     extensions: HashMap<String, LspLanguage>,
@@ -3775,6 +3846,7 @@ impl LspManager {
             transport: Arc::new(spawn_process_transport),
             retiring: Vec::new(),
             flusher: None,
+            launch_barrier: None,
             next_request: 1,
             generation: NEXT_MANAGER_GENERATION.fetch_add(1, Ordering::Relaxed),
             stopping: false,
@@ -4027,6 +4099,7 @@ impl LspManager {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             activity.documents.insert(doc);
+            activity.last_document = Some(doc);
             activity.last_used = self.epoch.elapsed();
         }
         handle.status()
@@ -4175,6 +4248,22 @@ impl LspManager {
         self.idle_timeout = Duration::from_secs(idle_seconds.clamp(1, 604800));
         self.session_cap = session_cap.clamp(1, 64);
         self.process_slots = Arc::new(tokio::sync::Semaphore::new(self.session_cap));
+        self
+    }
+
+    /// Delays new processes until a replaced manager has reaped its servers.
+    /// Configuration changes remain asynchronous while preserving the cap
+    /// across the old and new managers' independent admission semaphores.
+    #[must_use]
+    pub fn after_shutdown(
+        mut self,
+        predecessor: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        self.launch_barrier = Some(Arc::new(LaunchBarrier {
+            predecessor: Mutex::new(Some(Box::pin(predecessor))),
+            ready: AtomicBool::new(false),
+            changed: Notify::new(),
+        }));
         self
     }
 
@@ -4417,6 +4506,9 @@ impl LspManager {
     ///
     /// Bounded by [`SESSION_REAP_TIMEOUT`]; see [`reap_sessions`].
     pub async fn wait_for_shutdown(&mut self) {
+        if let Some(barrier) = self.launch_barrier.clone() {
+            barrier.wait().await;
+        }
         self.collect_retired_sessions();
         reap_sessions(std::mem::take(&mut self.retiring)).await;
         if let Some(flusher) = self.flusher.take() {
@@ -4437,6 +4529,7 @@ impl LspManager {
     pub fn begin_shutdown(&mut self) -> impl Future<Output = ()> + Send + 'static {
         self.shutdown();
         let sessions = std::mem::take(&mut self.retiring);
+        let launch_barrier = self.launch_barrier.clone();
         if let Some(flusher) = self.flusher.take() {
             flusher.abort();
         }
@@ -4448,6 +4541,9 @@ impl LspManager {
             Err(_) => Err(sessions),
         };
         async move {
+            if let Some(barrier) = launch_barrier {
+                barrier.wait().await;
+            }
             match reaper {
                 Ok(reaper) => {
                     let _ = reaper.await;
@@ -4652,17 +4748,40 @@ impl LspManager {
             stderr: Arc::new(StderrTail::default()),
         };
         let process_slots = Arc::clone(&self.process_slots);
+        let launch_barrier = self.launch_barrier.clone();
+        let root_identity = Arc::new(Mutex::new(None));
+        let launched_root_identity = Arc::clone(&root_identity);
         *handle
             .task
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime.spawn(async move {
+            if let Some(barrier) = launch_barrier {
+                barrier.wait().await;
+            }
             // A replacement waits until an evicted process is fully reaped,
             // so graceful shutdown cannot temporarily exceed the cap.
             let Ok(_slot) = process_slots.acquire_owned().await else {
                 return;
             };
             if !context.retired.load(Ordering::Acquire) {
+                let (directory_pin, identity) = match pin_session_root(&context.launch.root).await {
+                    Ok(pin) => pin,
+                    Err(error) => {
+                        context
+                            .set_status(LspStatus::Unavailable {
+                                reason: format!("cannot retain language server root: {error}"),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                *launched_root_identity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(identity);
                 run_session(context, rx).await;
+                // Prevent inode reuse until protocol teardown has reaped the
+                // process; the watchdog's identity comparison stays exact.
+                drop(directory_pin);
             }
         }));
         let watched = handle.clone();
@@ -4685,18 +4804,44 @@ impl LspManager {
                     expired
                 };
                 if expired {
+                    let doc = watched
+                        .activity
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .last_document;
                     retire_from_watchdog(watched).await;
+                    if let Some(doc) = doc {
+                        events.emit_now(LspEvent::Resources { doc });
+                    }
                     break;
                 }
                 if watched.retired.load(Ordering::Acquire) || watched.commands.is_closed() {
                     break;
                 }
-                // Also catches removal by git/another window outside our UI.
-                if tokio::fs::metadata(&watched_root)
-                    .await
-                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                {
+                // Also catches external rename/remove followed by recreation
+                // at the same spelling before this poll. The original inode
+                // remains pinned until the server finishes teardown.
+                let root_metadata = tokio::fs::metadata(&watched_root).await;
+                let original = *root_identity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let root_changed = match root_metadata {
+                    Ok(metadata) => original
+                        .is_some_and(|identity| identity != RootIdentity::from_metadata(&metadata)),
+                    Err(error) => error.kind() == io::ErrorKind::NotFound,
+                };
+                if root_changed {
+                    let doc = watched
+                        .activity
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .last_document;
                     retire_from_watchdog(watched).await;
+                    // Refresh cached inspector metrics even when this was the
+                    // final server, so no other watchdog remains to refresh it.
+                    if let Some(doc) = doc {
+                        events.emit_now(LspEvent::Resources { doc });
+                    }
                     break;
                 }
                 let pid = {
@@ -4728,10 +4873,7 @@ impl LspManager {
                     .activity
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .documents
-                    .iter()
-                    .next()
-                    .copied();
+                    .last_document;
                 // One wake per server refresh, independent of its tab count.
                 if let Some(doc) = doc {
                     events.emit_now(LspEvent::Resources { doc });
@@ -5285,6 +5427,7 @@ mod tests {
     fn idle_state_uses_monotonic_fake_clock_and_never_evicts_open_documents() {
         let mut activity = SessionActivity {
             documents: HashSet::new(),
+            last_document: None,
             last_used: Duration::from_secs(20),
         };
         let timeout = Duration::from_secs(600);
@@ -5530,6 +5673,15 @@ mod tests {
             manager.close(LspDocumentId(2));
             handle.wait_for("shutdown").await;
             handle.wait_for("exit").await;
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc } if *doc == LspDocumentId(2) => Some(()),
+                _ => None,
+            })
+            .await;
+            assert!(
+                manager.live_servers().is_empty(),
+                "idle retirement must refresh cached metrics even after every document closed"
+            );
             assert!(
                 manager
                     .sessions
@@ -9067,5 +9219,171 @@ mod tests {
             vec!["fine"],
             "the refused item is omitted and the rest are still offered"
         );
+    }
+
+    #[test]
+    fn reconfiguration_waits_for_prior_reap_even_across_an_empty_intermediate_manager() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let mut intermediate = rust_manager().after_shutdown(async move {
+                let _ = waiting.await;
+            });
+            // A second settings change before root discovery has opened any
+            // document must preserve the first manager's outstanding reap.
+            let predecessor = intermediate.begin_shutdown();
+            let mut manager = rust_manager()
+                .with_lifecycle(1, 1)
+                .after_shutdown(predecessor);
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn f() {}\n");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "replacement process started before old reap completed"
+            );
+            release.send(()).unwrap();
+            let _handle = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn cancelling_one_launch_waiter_does_not_release_or_cancel_other_waiters() {
+        block_on(async {
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let barrier = Arc::new(LaunchBarrier {
+                predecessor: Mutex::new(Some(Box::pin(async move {
+                    let _ = waiting.await;
+                }))),
+                ready: AtomicBool::new(false),
+                changed: Notify::new(),
+            });
+            let first = tokio::spawn(Arc::clone(&barrier).wait());
+            tokio::task::yield_now().await;
+            first.abort();
+            let second = tokio::spawn(Arc::clone(&barrier).wait());
+            tokio::task::yield_now().await;
+            assert!(!second.is_finished());
+            release.send(()).unwrap();
+            tokio::time::timeout(WAIT, second).await.unwrap().unwrap();
+            assert!(barrier.ready.load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn externally_removed_root_retires_and_refreshes_last_server_metrics() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let mut manager = rust_manager().with_lifecycle(1, 1);
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn f() {}\n");
+            let handle = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+            assert_eq!(manager.live_servers().len(), 1);
+            std::fs::remove_dir_all(&worktree).unwrap();
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc: at }
+                    if *at == doc && manager.live_servers().is_empty() =>
+                {
+                    Some(())
+                }
+                _ => None,
+            })
+            .await;
+            handle.wait_for("shutdown").await;
+            handle.wait_for("exit").await;
+            assert!(manager.live_servers().is_empty());
+            assert!(handle.methods().iter().any(|method| method == "shutdown"));
+            assert!(handle.methods().iter().any(|method| method == "exit"));
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn replaced_root_reaps_original_server_before_reopening_the_same_path() {
+        block_on(async {
+            let parent = tempfile::tempdir().unwrap();
+            let worktree = parent.path().join("workspace");
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+            let file = worktree.join("main.rs");
+            std::fs::write(&file, "fn old() {}\n").unwrap();
+            let child = spawn_test_child(
+                &["--exact", CHILD_HELPER_TEST, "--test-threads=1"],
+                Helper::Sleeps,
+                true,
+            );
+            let pid = child.process_group;
+            let mut manager = rust_manager().with_lifecycle(1, 1);
+            let slot = install_fake_with_child(
+                &mut manager,
+                incremental_capabilities(),
+                |_| Vec::new(),
+                Arc::new(Mutex::new(Some(child))),
+            );
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn old() {}\n");
+            let old = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+
+            // There is never a watchdog observation where this spelling is
+            // missing. The old open document also prevents idle expiration.
+            std::fs::rename(&worktree, parent.path().join("previous-workspace")).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(&file, "fn replacement() {}\n").unwrap();
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc: at }
+                    if *at == doc && manager.live_servers().is_empty() =>
+                {
+                    Some(())
+                }
+                _ => None,
+            })
+            .await;
+            assert!(
+                wait_until_gone(pid).await,
+                "the old server must be reaped before replacement admission"
+            );
+            assert!(manager.live_servers().is_empty());
+            assert!(old.methods().iter().any(|method| method == "shutdown"));
+            assert!(old.methods().iter().any(|method| method == "exit"));
+            assert!(matches!(manager.status(doc), LspStatus::Disabled));
+
+            manager.open_for_test(
+                LspDocumentId(2),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "fn replacement() {}\n",
+            );
+            await_ready(&events, LspDocumentId(2)).await;
+            let replacement = handle_of(&slot).await;
+            assert_eq!(replacement.entries("initialize").len(), 1);
+            assert!(replacement.entries("shutdown").is_empty());
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn root_pin_retains_original_directory_identity_after_path_replacement() {
+        block_on(async {
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("workspace");
+            std::fs::create_dir(&root).unwrap();
+            let (pin, identity) = pin_session_root(&root).await.unwrap();
+            std::fs::rename(&root, parent.path().join("original")).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            assert!(identity == RootIdentity::from_metadata(&pin.metadata().await.unwrap()));
+            assert!(identity != RootIdentity::from_metadata(&std::fs::metadata(&root).unwrap()));
+        });
     }
 }

@@ -10481,7 +10481,12 @@ impl Cagents {
         };
         match event {
             LspEvent::RootDiscovered { .. } => unreachable!("handled above"),
-            LspEvent::Resources { .. } => {}
+            LspEvent::Resources { .. } => {
+                // A root can retire while its editor remains open. Session
+                // retirement suppresses late protocol events, so refresh its
+                // status here instead of leaving a stale Ready indicator.
+                state.context.status = Some(self.lsp.status(doc));
+            }
             LspEvent::Diagnostics { version, items, .. } => {
                 // A delayed publication must not erase the shifted standing
                 // set for a newer buffer revision.
@@ -12664,12 +12669,15 @@ impl Cagents {
         // them unreaped - after which no exit path can reach them, because
         // every exit path addresses the manager that replaced it.
         // `begin_shutdown` spawns the reap on the runtime the sessions run on,
-        // so it survives the returned future being dropped here.
-        drop(self.lsp.begin_shutdown());
-        self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
-            self.settings.lsp_idle_timeout_seconds,
-            self.settings.lsp_max_sessions,
-        );
+        // so it survives if no new document is opened. New launches wait
+        // for the same reap instead of overlapping a second admission cap.
+        let predecessor = self.lsp.begin_shutdown();
+        self.lsp = LspManager::new(self.settings.language_servers.clone())
+            .with_lifecycle(
+                self.settings.lsp_idle_timeout_seconds,
+                self.settings.lsp_max_sessions,
+            )
+            .after_shutdown(predecessor);
         self.lsp_contexts.clear();
         self.lsp_documents.clear();
         self.lsp_pending_jumps.clear();

@@ -404,6 +404,13 @@ fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
     })
 }
 fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
+    census_with(deadline, read_process)
+}
+
+fn census_with(
+    deadline: Instant,
+    mut read_process: impl FnMut(libc::pid_t) -> io::Result<CloseProcess>,
+) -> Result<Vec<CloseProcess>, String> {
     let mut processes = Vec::new();
     for entry in fs::read_dir("/proc").map_err(|error| error.to_string())? {
         check_deadline(deadline)?;
@@ -417,7 +424,9 @@ fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
         };
         match read_process(pid) {
             Ok(process) => processes.push(process),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            // A proc entry can disappear before open (ENOENT), or its task
+            // can be reaped after open but before reading stat (ESRCH).
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {}
             Err(error) => return Err(format!("Cannot inspect terminal jobs: {error}")),
         }
         if processes.len() >= MAX_PROCESSES {
@@ -495,6 +504,47 @@ pub(super) fn signal(pidfd: &File, signal: libc::c_int) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn census_skips_candidates_that_disappear_before_or_during_stat_read() {
+        let own_pid = std::process::id() as libc::pid_t;
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            let mut injected = false;
+            let processes = census_with(Instant::now() + Duration::from_secs(2), |pid| {
+                if pid == own_pid {
+                    injected = true;
+                    Err(io::Error::from_raw_os_error(errno))
+                } else {
+                    read_process(pid)
+                }
+            })
+            .unwrap();
+            assert!(injected, "the census must inspect its own process");
+            assert!(processes.iter().all(|process| process.pid != own_pid));
+        }
+    }
+
+    #[test]
+    fn census_preserves_other_candidate_read_failures() {
+        let own_pid = std::process::id() as libc::pid_t;
+        for errno in [libc::EACCES, libc::EIO] {
+            let error = census_with(Instant::now() + Duration::from_secs(2), |pid| {
+                if pid == own_pid {
+                    Err(io::Error::from_raw_os_error(errno))
+                } else {
+                    read_process(pid)
+                }
+            })
+            .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "Cannot inspect terminal jobs: {}",
+                    io::Error::from_raw_os_error(errno)
+                )
+            );
+        }
+    }
 
     #[test]
     fn upgrade_agent_authority_excludes_unrelated_background_jobs() {

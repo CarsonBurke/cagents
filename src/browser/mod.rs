@@ -21,6 +21,7 @@ pub use fallback::{
 };
 pub use handle::BrowserHandle;
 pub use import::{ImportReport, ImportRequest};
+pub use runtime::ProcessShutdown;
 pub use types::{
     BackendSelection, BrowserBackend, BrowserError, BrowserEvent, BrowserInput, BrowserKeyLocation,
     BrowserLifecycle, BrowserModifiers, BrowserMouseButton, BrowserRestoreState, ButtonState,
