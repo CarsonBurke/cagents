@@ -283,6 +283,15 @@ pub enum HostedSession {
 }
 
 impl HostedSession {
+    /// Equality alone also compares absent proofs. Explicit live activation
+    /// requires a complete issued proof before comparing current descriptors.
+    pub(crate) fn has_complete_proof(&self) -> bool {
+        match self {
+            Self::Chat(session) => session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete),
+            Self::Terminal(session) => session.continuity.live_proof().is_some_and(|proof| proof.is_complete()),
+        }
+    }
+
     /// Runtime ownership excludes mutable conversation/presentation metadata.
     /// A successor proof or different launch never identifies this process.
     pub(crate) fn same_process(&self, other: &Self) -> bool {

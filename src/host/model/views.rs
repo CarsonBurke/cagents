@@ -159,17 +159,7 @@ fn current_agent_process(
     };
     // Equal absent or incomplete proofs do not authenticate a legacy record.
     // Keep same_process comparison semantics separate from live admission.
-    let proven = match &source {
-        HostedSession::Chat(session) => session
-            .proof
-            .as_ref()
-            .is_some_and(crate::model::HostSessionProof::is_complete),
-        HostedSession::Terminal(session) => session
-            .continuity
-            .live_proof()
-            .is_some_and(|proof| proof.is_complete()),
-    };
-    if !proven {
+    if !source.has_complete_proof() {
         return false;
     }
     agent
