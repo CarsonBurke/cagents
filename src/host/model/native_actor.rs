@@ -20,6 +20,7 @@ pub(in crate::host) enum NativeActorEvent {
         evidence: crate::notifications::Evidence,
         content: Option<crate::notifications::Content>,
     },
+    TurnOutcome { update:chat::turn_outcomes::TurnUpdate },
 }
 
 impl NativeActorEvent {
@@ -27,7 +28,7 @@ impl NativeActorEvent {
         match self {
             Self::Attention(evidence) => Some((evidence.clone(), None)),
             Self::AttentionContext {evidence,content} => Some((evidence.clone(),content.clone())),
-            Self::Execution {..} => None,
+            Self::Execution {..} | Self::TurnOutcome {..} => None,
         }
     }
 }
@@ -136,6 +137,7 @@ impl Registry {
         event: &NativeActorEvent,
         now_ms: u64,
     ) -> Result<bool, String> {
+        if let NativeActorEvent::TurnOutcome {update}=event {update.validate()?;}
         if actor.is_nil()
             || sequence == 0
             || sequence > i64::MAX as u64

@@ -179,6 +179,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
             Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
             Update::AttentionContext {evidence,content} => NativeActorEvent::AttentionContext {evidence,content},
+            Update::TurnOutcome {update} => NativeActorEvent::TurnOutcome {update},
             _ => return Err("The retained semantic outbox contains an unsupported event".into()),
         };
         let (changed, automation) = {
@@ -201,6 +202,12 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         };
         if changed {
             super::super::agent_execution::announce(host, &registry);
+        }
+        if let NativeActorEvent::TurnOutcome {update}=&semantic {
+            // The registry cursor and annotation DB are separate transactions.
+            // Even a repeated cursor must reach the idempotent Store commit:
+            // cursor success alone never authorizes the helper's ACK.
+            let _receipt=commit_turn_outcome(&handle,update)?;
         }
         if let Some((evidence,content)) = semantic.attention() {
             // Scheduled notifications are produced from committed run outcomes.
@@ -579,6 +586,7 @@ pub(in crate::host) fn finish_close(
                 Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
                 Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
             Update::AttentionContext {evidence,content} => NativeActorEvent::AttentionContext {evidence,content},
+                Update::TurnOutcome {update} => NativeActorEvent::TurnOutcome {update},
                 _ => {
                     return Err(
                         "Closing actor journal contains an unsupported semantic event".into(),
@@ -605,6 +613,9 @@ pub(in crate::host) fn finish_close(
             };
             if changed {
                 super::super::agent_execution::announce(host, &registry);
+            }
+            if let NativeActorEvent::TurnOutcome {update}=&event {
+                let _receipt=commit_turn_outcome(handle,update)?;
             }
             if let Some((evidence,content)) = event.attention()
                 && !automation
@@ -663,4 +674,13 @@ pub(super) fn register_ownership(host: &SharedHost, handle: &Handle, source: &Se
     registry.lock().unwrap_or_else(|p|p.into_inner()).register_native_actor_ownership(
         identity.instance,&identity.record,source,handle.launch_account_scope(),
     )
+}
+
+fn commit_turn_outcome(handle:&Handle,update:&chat::turn_outcomes::TurnUpdate)->Result<chat::turn_outcomes::TurnWriteReceipt,String> {
+    update.validate()?;
+    let scope=handle.launch_account_scope().map_err(|reason|format!("The retained actor's captured account is unavailable for outcome commit: {reason}"))?;
+    // Use immutable provider-supplied thread/turn identity and the original
+    // authenticated launch account; never a UI account choice or current page.
+    let mut store=chat::annotations::storage::Store::installation(scope,&update.identity().session_id)?;
+    store.apply_turn_update(update)
 }
