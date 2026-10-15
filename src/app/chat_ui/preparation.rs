@@ -99,8 +99,8 @@ fn same_kind(previous: &chat::Item, current: &chat::Item) -> bool {
 
 impl State {
     pub(super) fn clear(&mut self) {
-        for entry in self.entries.values() { entry.shared.cancel(); }
-        self.entries.clear(); self.errors.clear(); self.context = None;
+        for (_,entry) in self.entries.drain() {entry.shared.cancel();retire_shared(entry.shared);}
+        self.errors.clear(); self.context = None;
     }
     pub(super) fn context(&mut self, target: Target, session: Option<&str>, selected: Option<&str>, items: &[Arc<chat::Item>]) -> bool {
         let context = (target, session.map(str::to_owned), selected.map(str::to_owned));
@@ -109,11 +109,14 @@ impl State {
         let ids:HashSet<_>=items.iter().map(|item|item.id.as_str()).collect();
         self.entries.retain(|id, entry| {
             let retain = ids.contains(id.as_str());
-            if !retain { entry.shared.cancel(); }
+            if !retain {entry.shared.cancel();retire_shared(entry.shared.clone());}
             retain
         });
         self.errors.retain(|id, _| ids.contains(id.as_str()));
         changed
+    }
+    fn remove(&mut self,id:&str) {
+        if let Some(entry)=self.entries.remove(id) {retire_shared(entry.shared);}
     }
     pub(super) fn contains(&self, id: &str) -> bool { self.entries.contains_key(id) }
     pub(super) fn queued_bytes(&self) -> usize {
@@ -132,7 +135,7 @@ impl State {
         if self.errors.get(&item.id).is_some_and(|(old, _)| old.as_ptr() == Arc::as_ptr(item)) { return false; }
         self.errors.remove(&item.id);
         if body.len() > SOURCE_BYTES {
-            if let Some(entry)=self.entries.remove(&item.id) {entry.shared.cancel();}
+            if let Some(entry)=self.entries.get(&item.id) {entry.shared.cancel();} self.remove(&item.id);
             self.errors.insert(item.id.clone(), (Arc::downgrade(item), "This message is too large to display.".into()));
             return true;
         }
@@ -149,7 +152,7 @@ impl State {
             }
             entry.shared.cancel();
         }
-        self.entries.remove(&item.id);
+        self.remove(&item.id);
         let lease = Lease::default();
         if self.entries.len()>=QUEUED_ITEMS || !lease.resize(body.len()) {
             self.errors.insert(item.id.clone(), (Arc::downgrade(item), "Some messages could not be loaded. Retry when another message has finished loading.".into()));
@@ -170,12 +173,12 @@ impl State {
         let entry = self.entries.get_mut(id)?;
         if entry.run != run || self.context.as_ref().is_none_or(|(current, _, _)| *current != target)
             || entry.shared.cancelled.load(Ordering::Relaxed) { return None; }
-        let result = ready.0.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        let result = ready.0.0.lock().unwrap_or_else(|e| e.into_inner()).take()?;
         let prepared = match result {
             Ok(prepared) => prepared,
             Err(error) => {
                 let item = entry.shared.latest.lock().unwrap_or_else(|e| e.into_inner()).item.clone();
-                entry.shared.cancel(); self.entries.remove(id);
+                entry.shared.cancel(); self.remove(id);
                 self.errors.insert(id.into(), (Arc::downgrade(&item), error));
                 return None;
             }
@@ -188,7 +191,7 @@ impl State {
         } else { entry.running = false; }
         let finished = !latest.growing && latest.version == prepared.request.version;
         drop(latest);
-        if finished { self.entries.remove(id); }
+        if finished { self.remove(id); }
         Some(prepared)
     }
 }
@@ -209,23 +212,115 @@ pub(super) struct Prepared {
 impl Prepared {
     pub(super) fn item(&self) -> &Arc<chat::Item> { &self.request.item }
     pub(super) fn growing(&self) -> bool { self.request.growing }
+    pub(super) fn discard(self) {
+        retire(Retired { _parsed:self.parsed,_blocks:self.blocks,_item:Some(self.request.item),
+            _owner:self._owner,_permit:self._permit });
+    }
     pub(super) fn install(self, cached: &mut CachedItem, managed: bool) {
-        cached.source = self.parsed.source;
-        cached.markdown = self.parsed.markdown;
+        // Move the old owned parser containers out before replacing them:
+        // their destructors may visit thousands of blocks and free code.
+        let retired=Retired {
+            _parsed: Parsed {
+                source: std::mem::replace(&mut cached.source,self.parsed.source),
+                markdown: std::mem::replace(&mut cached.markdown,self.parsed.markdown),
+            },
+            _blocks: std::mem::replace(&mut cached.blocks,self.blocks),
+            _item: cached.item.replace(self.request.item.clone()),
+            _owner: self._owner,
+            _permit: self._permit,
+        };
         cached.token = ChangeToken::of(&self.request.item.content);
-        cached.item = Some(self.request.item);
         cached.preparing = self.request.growing || managed;
         cached.placeholder = false;
-        // Syntax was prepared on the worker; installation never traverses
-        // every fence or constructs a highlighter on the event thread.
-        cached.blocks = self.blocks;
         cached.open = None;
         cached.revision = CachedItem::next_revision();
+        retire(retired);
     }
 }
 
+/// A single background reclaimer drops only Send data. Installed output
+/// retirement retains one of the two global parser/output permits; detached
+/// canonical owners retain their existing source/item admission until dropped.
+/// Reader Rc state and renderer trees never leave the event thread.
+struct Retired {
+    _parsed: Parsed,
+    _blocks: HashMap<u64,prose::CodeBlock>,
+    _item: Option<Arc<chat::Item>>,
+    _owner: Arc<Shared>,
+    // Declared last so retirement completes before the next parser is admitted.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+enum Retirement {
+    Installed(Retired),
+    // Keep the existing queued-source lease until canonical parser/source
+    // destructors finish, including cancelled/hidden sources without output.
+    Detached(Arc<Shared>),
+    #[cfg(test)]
+    Barrier(std::sync::mpsc::Sender<std::thread::ThreadId>),
+}
+fn retire_shared(shared:Arc<Shared>) {enqueue_retirement(Retirement::Detached(shared));}
+fn retire(retired:Retired) {enqueue_retirement(Retirement::Installed(retired));}
+fn enqueue_retirement(retired:Retirement) {
+    static RETIRE:std::sync::OnceLock<std::sync::mpsc::Sender<Retirement>>=std::sync::OnceLock::new();
+    let sender=RETIRE.get_or_init(|| {
+        let (sender,receiver)=std::sync::mpsc::channel::<Retirement>();
+        std::thread::Builder::new().name("chat-markdown-retire".into()).spawn(move|| {
+            while let Ok(retired)=receiver.recv() {
+                match retired {
+                    Retirement::Installed(retired)=>drop(retired),Retirement::Detached(owner)=>drop(owner),
+                    #[cfg(test)]
+                    Retirement::Barrier(reply)=>{let _=reply.send(std::thread::current().id());}
+                }
+            }
+        }).expect("start Markdown retirement worker");
+        sender
+    });
+    // The receiver only drops owned standard containers and never exits.
+    // An exceptional worker failure still releases ownership safely.
+    if let Err(error)=sender.send(retired) {drop(error.0);}
+}
+
+#[cfg(test)]
+fn retirement_barrier()->std::thread::ThreadId {
+    let (sender,receiver)=std::sync::mpsc::channel();
+    enqueue_retirement(Retirement::Barrier(sender));
+    receiver.recv().expect("retirement worker remains alive")
+}
+
+fn prime_plain(items:&[markdown::Item],cancelled:&AtomicBool)->Result<(),String> {
+    for item in items {
+        if cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
+        match item {
+            markdown::Item::Paragraph(text)|markdown::Item::Heading(_,text)=>{text.plain();}
+            markdown::Item::Image {alt,..}=>{alt.plain();}
+            markdown::Item::Quote(items)=>prime_plain(items,cancelled)?,
+            markdown::Item::List {bullets,..}=>for bullet in bullets {
+                let (markdown::Bullet::Point {items}|markdown::Bullet::Task {items,..})=bullet;
+                prime_plain(items,cancelled)?;
+            },
+            markdown::Item::Table {columns,rows}=>{
+                for column in columns {prime_plain(&column.header,cancelled)?;}
+                for row in rows {for cell in &row.cells {prime_plain(cell,cancelled)?;}}
+            },
+            _=>{},
+        }
+    }
+    Ok(())
+}
+
+struct ReplySlot(Mutex<Option<Result<Prepared,String>>>);
+impl Drop for ReplySlot {
+    fn drop(&mut self) {
+        if let Some(Ok(prepared))=self.0.get_mut().unwrap_or_else(|error|error.into_inner()).take() {
+            prepared.discard();
+        }
+    }
+}
 #[derive(Clone)]
-pub(super) struct Ready(Arc<Mutex<Option<Result<Prepared, String>>>>);
+pub(super) struct Ready(Arc<ReplySlot>);
+impl Ready {
+    fn new(result:Result<Prepared,String>)->Self {Self(Arc::new(ReplySlot(Mutex::new(Some(result)))))}
+}
 impl std::fmt::Debug for Ready {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("PreparedMarkdown") }
 }
@@ -250,7 +345,7 @@ fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send
     let job = job.clone();
     Box::pin(iced::futures::stream::once(async move {
         let result = run(job.shared).await;
-        action(Action::MarkdownPrepared(job.target, job.id, job.run, Ready(Arc::new(Mutex::new(Some(result))))))
+        action(Action::MarkdownPrepared(job.target, job.id, job.run, Ready::new(result)))
     }))
 }
 async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
@@ -265,6 +360,7 @@ fn execute(shared: Arc<Shared>,permit:tokio::sync::OwnedSemaphorePermit) -> Resu
         let mut canonical = shared.canonical.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let body = CachedItem::prose(&request.item.content).ok_or("The source is not Markdown.")?;
         parse_publication(&mut canonical.parsed, body, request.growing, &shared.cancelled)?;
+        prime_plain(canonical.parsed.markdown.items(), &shared.cancelled)?;
         let mut previous=std::mem::take(&mut canonical.blocks);
         #[cfg(test)]
         let mut syntax_work=(0,0);
@@ -299,8 +395,9 @@ pub(super) fn drain_fixture(runtime:&mut Runtime) {
     for _ in 0..512 {
         let Some((id,run,shared))=runtime.preparation.entries.iter().find(|(_,entry)|entry.running)
             .map(|(id,entry)|(id.clone(),entry.run,entry.shared.clone())) else {return;};
-        let permit=permits.clone().try_acquire_owned().expect("previous fixture result consumed");
-        let ready=Ready(Arc::new(Mutex::new(Some(execute(shared,permit)))));
+        let permit=iced::futures::executor::block_on(permits.clone().acquire_owned())
+            .expect("fixture retirement releases the same real admission");
+        let ready=Ready::new(execute(shared,permit));
         runtime.markdown_prepared(runtime.target,&id,run,ready);
     }
     panic!("fixture preparation did not quiesce");
@@ -335,7 +432,7 @@ mod tests {
     fn permit()->tokio::sync::OwnedSemaphorePermit {
         Arc::new(tokio::sync::Semaphore::new(1)).try_acquire_owned().unwrap()
     }
-    fn ready(prepared:Result<Prepared,String>)->Ready {Ready(Arc::new(Mutex::new(Some(prepared))))}
+    fn ready(prepared:Result<Prepared,String>)->Ready {Ready::new(prepared)}
 
     #[test]
     fn owned_parser_moves_across_thread_and_matches_whole_document() {
@@ -390,6 +487,45 @@ mod tests {
             assert!(Arc::ptr_eq(&spans,output.blocks[&key].spans(true)));
             drop(state.accept(target,"message",run,ready(Ok(output))).unwrap());
         }
+    }
+    #[test]
+    fn worker_primes_plain_for_all_nested_logical_leaves() {
+        fn verify(items:&[markdown::Item])->usize {
+            items.iter().map(|item|match item {
+                markdown::Item::Paragraph(text)|markdown::Item::Heading(_,text)=>{assert!(text.plain_ready());1}
+                markdown::Item::Image {alt,..}=>{assert!(alt.plain_ready());1}
+                markdown::Item::Quote(items)=>verify(items),
+                markdown::Item::List {bullets,..}=>bullets.iter().map(|bullet| {
+                    let (markdown::Bullet::Point {items}|markdown::Bullet::Task {items,..})=bullet;verify(items)
+                }).sum(),
+                markdown::Item::Table {columns,rows}=>columns.iter().map(|column|verify(&column.header)).sum::<usize>()
+                    +rows.iter().flat_map(|row|&row.cells).map(|cell|verify(cell)).sum::<usize>(),
+                _=>0,
+            }).sum()
+        }
+        let source=item("# Heading\n\nA *rich* paragraph.\n\n> A quote.\n\n- A list item.\n\n| heading | second |\n| --- | --- |\n| cell | other |\n\n![image alt](https://example.com/image.png)\n");
+        let target=target();let mut state=configured(target,&source);
+        state.stage(&source,true,crate::settings::EditorSyntaxTheme::default(),|_,_|false);
+        let (_,shared)=job(&state);let output=execute(shared.clone(),permit()).unwrap();
+        assert!(verify(output.parsed.markdown.items())>=8);
+        assert!(verify(shared.canonical.lock().unwrap().as_ref().unwrap().parsed.markdown.items())>=8);
+    }
+    #[test]
+    fn installation_retires_old_owned_document_before_worker_readmission() {
+        let old=item(&"```rust\nlet old = 1;\n```\n\n".repeat(2_000));
+        let weak=Arc::downgrade(&old);
+        let mut cached=CachedItem::new(&old.content,crate::settings::EditorSyntaxTheme::default());
+        cached.item=Some(old.clone());drop(old);
+        let next=item("Replacement document.");let target=target();let mut state=configured(target,&next);
+        state.stage(&next,false,crate::settings::EditorSyntaxTheme::default(),|_,_|false);
+        let (_,shared)=job(&state);let permits=Arc::new(tokio::sync::Semaphore::new(1));
+        let output=execute(shared,permits.clone().try_acquire_owned().unwrap()).unwrap();
+        output.install(&mut cached,false);
+        let admitted=iced::futures::executor::block_on(permits.clone().acquire_owned()).unwrap();
+        assert!(weak.upgrade().is_none(),"old input is released before replacement parsing can resume");
+        assert_ne!(retirement_barrier(),std::thread::current().id(),"destructors run on the retirement thread");
+        assert_eq!(cached.markdown.items().len(),1);
+        drop(admitted);
     }
     #[test]
     fn syntax_theme_change_rejects_old_worker_palette_without_losing_input() {
@@ -448,8 +584,10 @@ mod tests {
         assert_eq!(owner.lease.0.load(Ordering::Relaxed),"a retained body".len());
         drop(owner);
         assert!(state.accept(target,"message",run,output).is_none());
+        let retired=iced::futures::executor::block_on(permits.clone().acquire_owned()).unwrap();
+        assert!(output_owner.upgrade().is_none(),"retired output releases its source lease before readmission");
+        drop(retired);
         assert_eq!(permits.available_permits(),1,"discarded stale output releases admission");
-        assert!(output_owner.upgrade().is_none(),"discarded output releases its source lease");
         drop(original);assert!(weak.upgrade().is_none());
         assert_eq!(state.queued_bytes(),0);
         let mut parsed=Parsed::default();
