@@ -10311,7 +10311,6 @@ impl Cagents {
     /// session. A card is closed far more often than a file is, so this is the
     /// path that decides whether a long session accumulates dead documents.
     fn retire_lsp_card(&mut self, card: CardId) {
-        self.retire_editor_features(card);
         self.close_lsp_document(card);
         self.lsp_contexts.remove(&card);
         self.lsp_pending_jumps.remove(&card);
@@ -10360,6 +10359,7 @@ impl Cagents {
     }
 
     fn close_lsp_document(&mut self, card: CardId) {
+        self.retire_editor_features(card);
         if let Some(state) = self.lsp_contexts.get_mut(&card)
             && let Some(doc) = state.document.take()
         {

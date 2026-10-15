@@ -126,6 +126,16 @@ mod tests {
     }
 
     #[test]
+    fn retired_manager_response_cannot_consume_a_new_documents_reused_request_id() {
+        let mut app = app();
+        let request = LspRequestId(7);
+        let current = Operation { card: CardId::new(), doc: LspDocumentId(2), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, open_files: Vec::new() };
+        app.editor_features.requests.insert(request, current);
+        drop(app.editor_feature_event(&LspEvent::WorkspaceEdit { request, doc: LspDocumentId(1), kind: LspEditKind::Rename, edit: LspWorkspaceEdit::default() }));
+        assert_eq!(app.editor_features.requests.get(&request).unwrap().doc, LspDocumentId(2));
+    }
+
+    #[test]
     fn opening_another_target_after_preview_refuses_before_any_buffer_or_disk_write() {
         let root = tempfile::tempdir().unwrap();
         let original = "fn old() {}\n";
@@ -273,10 +283,15 @@ impl Cagents {
         for request in retired { self.editor_features.requests.remove(&request); self.lsp.cancel(request); }
     }
 
+    fn take_editor_feature_request(&mut self, request: &LspRequestId, doc: &LspDocumentId) -> Option<Operation> {
+        if self.editor_features.requests.get(request)?.doc != *doc { return None; }
+        self.editor_features.requests.remove(request)
+    }
+
     pub(super) fn editor_feature_event(&mut self, event: &LspEvent) -> Option<Task<Message>> {
         match event {
             LspEvent::PrepareRename { request, doc, range, placeholder } => {
-                let Some(operation) = self.editor_features.requests.remove(request) else { return Some(Task::none()); };
+                let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 if !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 let Some(range) = range else { self.feature_failure(operation.card, "This symbol cannot be renamed"); return Some(Task::none()); };
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) else { return Some(Task::none()); };
@@ -285,29 +300,29 @@ impl Cagents {
                 self.editor_features.renames.insert(operation.card, Rename { doc: *doc, version: operation.version, at: range.start, draft });
                 Some(iced::widget::operation::focus(RepositoryRuntime::rename_focus_id(operation.card)).map(cosmic::Action::App))
             }
-            LspEvent::WorkspaceEdit { request, edit, .. } => {
-                let Some(operation) = self.editor_features.requests.remove(request) else { return Some(Task::none()); };
+            LspEvent::WorkspaceEdit { request, doc, edit, .. } => {
+                let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 if !self.editor_operation_current(&operation) { return Some(self.save_after_feature(&operation)); }
                 Some(self.prepare_editor_workspace_edit(operation, edit.clone()))
             }
-            LspEvent::CodeActions { request, items, .. } => {
-                let Some(operation) = self.editor_features.requests.remove(request) else { return Some(Task::none()); };
+            LspEvent::CodeActions { request, doc, items, .. } => {
+                let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 if !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 self.editor_features.code_actions.insert(operation.card, (operation.version, items.clone()));
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) { runtime.set_editor_code_actions(items.clone()); }
                 if items.is_empty() { self.status = Some(TransientNotice::success("No code actions are available here")); }
                 Some(Task::none())
             }
-            LspEvent::CodeActionResolved { request, item, .. } => {
-                let Some(mut operation) = self.editor_features.requests.remove(request) else { return Some(Task::none()); };
+            LspEvent::CodeActionResolved { request, doc, item, .. } => {
+                let Some(mut operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 if !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 if let Some(reason) = &item.disabled { self.feature_failure(operation.card, reason.clone()); return Some(Task::none()); }
                 operation.command = item.command.clone();
                 if let Some(edit) = &item.edit { Some(self.prepare_editor_workspace_edit(operation, edit.clone())) }
                 else { if let Some(command) = operation.command { self.lsp.execute_command(operation.doc, command); } Some(Task::none()) }
             }
-            LspEvent::SignatureHelp { request, help, .. } => {
-                let Some(operation) = self.editor_features.requests.remove(request) else { return Some(Task::none()); };
+            LspEvent::SignatureHelp { request, doc, help, .. } => {
+                let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 self.editor_features.signature_requests.remove(&operation.card);
                 if !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 if help.is_some() { self.editor_features.signatures.insert(operation.card); } else { self.editor_features.signatures.remove(&operation.card); }
@@ -332,8 +347,8 @@ impl Cagents {
                 } else { self.lsp.respond_workspace_edit(*id, false, Some("The source document was closed".into())); Some(Task::none()) }
             }
             LspEvent::CommandExecuted { .. } => Some(Task::none()),
-            LspEvent::RequestFailed { request, error, .. } => {
-                let operation = self.editor_features.requests.remove(request)?;
+            LspEvent::RequestFailed { request, doc, error, .. } => {
+                let operation = self.take_editor_feature_request(request, doc)?;
                 if !matches!(error, LspError::Cancelled) { self.feature_failure(operation.card, error.to_string()); }
                 Some(self.save_after_feature(&operation))
             }
@@ -511,6 +526,12 @@ impl Cagents {
                 match result {
                     Err(error) => { self.reject_server_edit(&operation, &error); self.feature_failure(operation.card, error); self.save_after_feature(&operation) }
                     Ok(plan) => {
+                        if plan.documents.iter().all(|document| document.before == document.after) {
+                            if let Some(id) = operation.server_request { self.lsp.respond_workspace_edit(id, true, None); }
+                            if let Some(command) = operation.command.clone() { self.lsp.execute_command(operation.doc, command); }
+                            if !operation.save_after { self.status = Some(TransientNotice::success("No source changes were needed")); }
+                            return self.save_after_feature(&operation);
+                        }
                         let preview = operation.kind == LspEditKind::Rename || plan.documents.len() > 1;
                         if preview {
                             if self.editor_features.modal_open() { self.reject_server_edit(&operation, "Another workspace edit is already open"); return Task::none(); }
