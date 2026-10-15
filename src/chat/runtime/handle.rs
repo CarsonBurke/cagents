@@ -18,10 +18,14 @@ enum Owner {
 impl Handle {
     /// Cached exact Store authority, with no transcript read or helper RPC.
     pub(crate) fn source_authority(&self) -> Option<super::SourceAuthority> {
+        if self.source_authority_unavailable().is_some() { return None; }
         match &self.0 {
             Owner::Local(local) => local.source_authority(),
             Owner::Remote(remote) => remote.state().source_authority,
         }
+    }
+    pub(crate) fn source_authority_unavailable(&self) -> Option<chat::SourceAuthorityUnavailableCause> {
+        match &self.0 { Owner::Local(local) => local.source_authority_unavailable(), Owner::Remote(remote) => remote.state().source_authority_unavailable }
     }
     /// Sticky original conflicting token, if an authenticated retained scope
     /// contradicted itself. Attach must replay both cached tokens before body.

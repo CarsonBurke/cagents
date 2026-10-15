@@ -938,6 +938,11 @@ impl PromptSuggestion {
     }
 }
 
+/// Source ordering was lost; cached bodies are revoked without new authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAuthorityUnavailableCause { ClockExhausted }
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Bounded live-turn metadata; excluded from transcript and wire snapshots.

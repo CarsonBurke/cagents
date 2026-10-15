@@ -195,6 +195,7 @@ pub(crate) enum Update {
     },
     SourceAuthority { incarnation: uuid::Uuid, generation: u64 },
     SourceAuthorityConflict { generation: u64, original: uuid::Uuid, conflicting: uuid::Uuid },
+    SourceAuthorityUnavailable { cause: super::SourceAuthorityUnavailableCause },
 }
 
 #[derive(Clone)]
@@ -238,7 +239,11 @@ impl Drop for OwnedSocket {
 
 impl LocalHandle {
     pub(crate) fn source_authority(&self) -> Option<SourceAuthority> {
+        if self.source_authority_unavailable().is_some() { return None; }
         *self.0.source_authority.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub(crate) fn source_authority_unavailable(&self) -> Option<super::SourceAuthorityUnavailableCause> {
+        self.0.source_unavailable.load(Ordering::Acquire).then_some(super::SourceAuthorityUnavailableCause::ClockExhausted)
     }
     fn retained_store_for_replacement(&self) -> Result<Arc<Mutex<Store>>, String> {
         if !self.is_completed() {
@@ -251,13 +256,19 @@ impl LocalHandle {
         self.0.store.lock().unwrap_or_else(|p| p.into_inner()).note_source_generation_floor(generation);
         Ok(self.0.store.clone())
     }
-    pub(super) fn refresh_source_authority(&self) {
-        let authority = {
+    pub(crate) fn refresh_source_authority(&self) {
+        let (authority, unavailable) = {
             let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             store.publish_source_authority(&mut state);
-            store.source_authority()
+            (store.source_authority(), store.source_authority_unavailable())
         };
+        if unavailable.is_some() {
+            if !self.0.source_unavailable.swap(true, Ordering::AcqRel) {
+                self.0.source_dirty.store(true, Ordering::Release); self.wake();
+            }
+            return;
+        }
         if let Some(authority) = authority {
             let changed = {
                 let mut cached = self.0.source_authority.lock().unwrap_or_else(|p| p.into_inner());
@@ -289,6 +300,7 @@ struct Inner {
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty: Arc<AtomicBool>,
+    source_unavailable: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -604,8 +616,17 @@ impl LocalHandle {
         let store = retained_store.unwrap_or_else(|| Arc::new(Mutex::new(store)));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
-        let source_authority = Arc::new(Mutex::new(None));
+        // The retained Store swap above is complete. Seed only that actual
+        // Store before Handle publication, never the discarded preparation.
+        let (initial_authority, initial_unavailable) = {
+            let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+            store.publish_source_authority(&mut state);
+            (store.source_authority(), store.source_authority_unavailable())
+        };
+        let source_authority = Arc::new(Mutex::new(initial_authority));
         let source_dirty = Arc::new(AtomicBool::new(false));
+        let source_unavailable = Arc::new(AtomicBool::new(initial_unavailable.is_some()));
         let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
@@ -632,6 +653,7 @@ impl LocalHandle {
             confirmed_session: confirmed_session.clone(),
             source_authority: source_authority.clone(),
             source_dirty: source_dirty.clone(),
+            source_unavailable: source_unavailable.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -688,7 +710,9 @@ impl LocalHandle {
                     confirmed_session,
                     source_authority,
                     source_dirty,
+                    source_unavailable,
                     source_notified: None,
+                    source_unavailable_notified: false,
                     store,
                     visible,
                     observe_next,
@@ -2610,7 +2634,9 @@ struct Actor {
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty: Arc<AtomicBool>,
+    source_unavailable: Arc<AtomicBool>,
     source_notified: Option<SourceAuthority>,
+    source_unavailable_notified: bool,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -3628,12 +3654,21 @@ impl Actor {
         Ok(())
     }
     fn publish_source_authority(&mut self) -> Result<(), String> {
-        let authority = {
+        let (authority, unavailable) = {
             let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             store.publish_source_authority(&mut state);
-            store.source_authority().ok_or("Source authority could not be ordered")?
+            (store.source_authority(), store.source_authority_unavailable())
         };
+        if let Some(cause) = unavailable {
+            self.source_unavailable.store(true, Ordering::Release);
+            if !self.source_unavailable_notified {
+                self.source_unavailable_notified = true;
+                (self.notify)(Update::SourceAuthorityUnavailable { cause });
+            }
+            return Ok(());
+        }
+        let authority = authority.ok_or("Source authority could not be ordered")?;
         let authority = {
             let mut cached = self.source_authority.lock().unwrap_or_else(|p| p.into_inner());
             if cached.is_none_or(|old| old.generation <= authority.generation) { *cached = Some(authority); }
@@ -3758,6 +3793,7 @@ impl Actor {
             if is_reset && self.state.lock().unwrap_or_else(|p| p.into_inner()).generation > u64::MAX - 2 {
                 frame_error.get_or_insert_with(|| "Reset was refused before source mutation because its generation is exhausted".into());
             }
+            let mut cache_failed_now = false;
             let events = if frame_error.is_some() {
                 None
             } else {
@@ -3769,6 +3805,7 @@ impl Actor {
                 {
                     Ok(events) => Some(events),
                     Err(error) => {
+                        cache_failed_now = true;
                         frame_error = Some(error);
                         None
                     }
@@ -3778,7 +3815,7 @@ impl Actor {
             // ACTUAL Store token now, while still draining this decoded frame's
             // known semantic outcomes through the existing immutable contexts.
             let reset_applied = is_reset && events.is_some();
-            if is_reset && !reset_applied {
+            if cache_failed_now || is_reset && !reset_applied {
                 if let Err(error) = self.publish_source_authority() {
                     frame_error.get_or_insert(error);
                 }
@@ -9221,6 +9258,7 @@ mod tests {
                 | Update::RetainedOutcomes
                 | Update::SourceAuthority { .. }
                 | Update::SourceAuthorityConflict { .. }
+                | Update::SourceAuthorityUnavailable { .. }
                 | Update::Identity
                 | Update::TurnOutcome { .. }
                 | Update::Ready

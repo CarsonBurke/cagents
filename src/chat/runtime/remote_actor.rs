@@ -76,6 +76,8 @@ pub(crate) struct Resident {
     pub source_authority: Option<SourceAuthority>,
     #[serde(default)]
     pub source_authority_conflict: Option<SourceAuthority>,
+    #[serde(default)]
+    pub source_authority_unavailable: Option<chat::SourceAuthorityUnavailableCause>,
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub ready: bool,
@@ -267,6 +269,7 @@ impl RemoteActor {
             generation: 1,
             source_authority: None,
             source_authority_conflict: None,
+            source_authority_unavailable: None,
             session_id: None,
             title: None,
             ready: true,
@@ -1393,7 +1396,7 @@ impl RemoteActor {
                     return Err(error);
                 }
                 let publication = final_snapshot::read_publication(&self.0.identity,&self.0.proof).map_err(|detail|format!("Provider cleanup is proved, but the exact final publication is unavailable: {detail}"))?;
-                self.publish_source_authority(publication.source_authority, publication.source_authority_conflict);
+                self.publish_source_authority(publication.source_authority, publication.source_authority_conflict, publication.source_authority_unavailable);
                 publication.snapshot
             }
         };
@@ -1825,7 +1828,7 @@ impl Server {
         // Ready may be published inside the initial decoded step before its
         // actual Store token is seeded. Do not expose a body-ready attachment
         // through that narrow window. Typed unavailability is added separately.
-        let ready = ready && journal.source_authority().is_some();
+        let ready = ready && (journal.source_authority().is_some() || journal.source_authority_unavailable().is_some());
         let continuity_loss = journal.continuity_loss()?;
         let failure = continuity_loss
             .as_ref()
@@ -1842,6 +1845,7 @@ impl Server {
             generation,
             source_authority: journal.source_authority(),
             source_authority_conflict: journal.source_authority_conflict(),
+            source_authority_unavailable: journal.source_authority_unavailable(),
             session_id,
             title,
             ready,
@@ -2417,11 +2421,11 @@ impl Server {
         // A closing actor may be adopted by a new authenticated daemon before
         // its last semantic ACK. Refresh receipt authority without changing
         // the exact immutable final publication.
-        let (source_authority, source_authority_conflict) = {
+        let (source_authority, source_authority_conflict, source_authority_unavailable) = {
             let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
-            (journal.source_authority(), journal.source_authority_conflict())
+            (journal.source_authority(), journal.source_authority_conflict(), journal.source_authority_unavailable())
         };
-        final_snapshot::save(&self.identity, &self.proof, &snapshot, source_authority, source_authority_conflict)?;
+        final_snapshot::save(&self.identity, &self.proof, &snapshot, source_authority, source_authority_conflict, source_authority_unavailable)?;
         chat::native_holder::publish_actor_close(
             &self.identity.record,
             &self.proof,
@@ -2805,8 +2809,9 @@ mod tests {
         arrived.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(fixture.server.actor.0.state.lock().unwrap().ready);
         let waiting = fixture.server.resident().unwrap();
-        assert!(waiting.source_authority.is_none());
-        assert!(!waiting.ready, "initial provider Ready is not yet a source-ready attachment");
+        assert_eq!(waiting.source_authority, fixture.server.actor.source_authority());
+        assert!(waiting.source_authority.is_some(), "actual Store is seeded before Handle is exposed, even while Ready callback is held");
+        assert!(waiting.ready);
         release.0.take().unwrap().try_send(()).unwrap();
         let deadline=Instant::now()+Duration::from_secs(2);
         loop {

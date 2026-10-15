@@ -10,6 +10,8 @@ struct Receipt {
     source_authority: Option<SourceAuthority>,
     #[serde(default)]
     source_authority_conflict: Option<SourceAuthority>,
+    #[serde(default)]
+    source_authority_unavailable: Option<chat::SourceAuthorityUnavailableCause>,
 }
 fn path(record: &Record) -> Result<PathBuf, String> {
     Ok(registry::directory(Kind::Native)?.join(format!(
@@ -23,14 +25,16 @@ pub(super) fn save(
     snapshot: &Snapshot,
     source_authority: Option<SourceAuthority>,
     source_authority_conflict: Option<SourceAuthority>,
+    source_authority_unavailable: Option<chat::SourceAuthorityUnavailableCause>,
 ) -> Result<(), String> {
-    validate_source_authority(snapshot, source_authority, source_authority_conflict)?;
+    validate_source_authority(snapshot, source_authority, source_authority_conflict, source_authority_unavailable)?;
     let bytes = serde_json::to_vec(&Receipt {
         identity: identity.clone(),
         proof: proof.clone(),
         snapshot: snapshot.clone(),
         source_authority,
         source_authority_conflict,
+        source_authority_unavailable,
     })
     .map_err(|error| error.to_string())?;
     if bytes.len() > MAX_FRAME - 64 * 1024 {
@@ -68,6 +72,7 @@ pub(super) struct Publication {
     pub snapshot: Snapshot,
     pub source_authority: Option<SourceAuthority>,
     pub source_authority_conflict: Option<SourceAuthority>,
+    pub source_authority_unavailable: Option<chat::SourceAuthorityUnavailableCause>,
 }
 pub(super) fn read_publication(identity: &ActorIdentity, proof: &HostSessionProof) -> Result<Publication, String> {
     let file = crate::secure_file::open_existing_private_file(&path(&identity.record)?)
@@ -86,10 +91,11 @@ fn decode_publication(identity: &ActorIdentity, proof: &HostSessionProof, bytes:
     if &receipt.identity != identity || &receipt.proof != proof {
         return Err("Final retained snapshot belongs to another actor or attachment".into());
     }
-    validate_source_authority(&receipt.snapshot, receipt.source_authority, receipt.source_authority_conflict)?;
-    Ok(Publication { snapshot: receipt.snapshot, source_authority: receipt.source_authority, source_authority_conflict: receipt.source_authority_conflict })
+    validate_source_authority(&receipt.snapshot, receipt.source_authority, receipt.source_authority_conflict, receipt.source_authority_unavailable)?;
+    Ok(Publication { snapshot: receipt.snapshot, source_authority: receipt.source_authority, source_authority_conflict: receipt.source_authority_conflict, source_authority_unavailable: receipt.source_authority_unavailable })
 }
-fn validate_source_authority(snapshot: &Snapshot, authority: Option<SourceAuthority>, conflict: Option<SourceAuthority>) -> Result<(), String> {
+fn validate_source_authority(snapshot: &Snapshot, authority: Option<SourceAuthority>, conflict: Option<SourceAuthority>, unavailable: Option<chat::SourceAuthorityUnavailableCause>) -> Result<(), String> {
+    if unavailable.is_some() { return Ok(()); } // exact cause quarantines body; it grants no identity.
     if let Some(conflict) = conflict {
         let first = authority.ok_or("Final retained conflict lacks its original source token")?;
         if conflict.generation != first.generation || conflict.incarnation == first.incarnation {
@@ -188,7 +194,7 @@ mod tests {
         let proof = actor.0.proof.clone();
         let token = SourceAuthority { incarnation: uuid::Uuid::new_v4(), generation: 17 };
         let receipt = Receipt { identity: identity.clone(), proof: proof.clone(),
-            snapshot: Snapshot { generation: 20, source_incarnation:Some(token.incarnation), ..Default::default() }, source_authority: Some(token), source_authority_conflict:None };
+            snapshot: Snapshot { generation: 20, source_incarnation:Some(token.incarnation), ..Default::default() }, source_authority: Some(token), source_authority_conflict:None, source_authority_unavailable:None };
         let bytes = serde_json::to_vec(&receipt).unwrap();
         let read = decode_publication(&identity, &proof, &bytes).unwrap();
         assert_eq!(read.source_authority, Some(token));
@@ -202,7 +208,14 @@ mod tests {
         let reopened = decode_publication(&identity, &proof, &serde_json::to_vec(&contradictory).unwrap()).unwrap();
         assert_eq!(reopened.source_authority, Some(token));
         assert_eq!(reopened.source_authority_conflict, contradictory.source_authority_conflict);
+        contradictory.source_authority = None;
+        contradictory.source_authority_conflict = None;
+        contradictory.source_authority_unavailable = Some(chat::SourceAuthorityUnavailableCause::ClockExhausted);
+        let unavailable = decode_publication(&identity,&proof,&serde_json::to_vec(&contradictory).unwrap()).unwrap();
+        assert_eq!(unavailable.source_authority_unavailable,Some(chat::SourceAuthorityUnavailableCause::ClockExhausted));
+        assert!(unavailable.source_authority.is_none());
         let mut malformed = contradictory;
+        malformed.source_authority_unavailable = None;
         malformed.source_authority_conflict = None;
         malformed.source_authority = Some(SourceAuthority { generation:21, ..token });
         assert!(decode_publication(&identity, &proof, &serde_json::to_vec(&malformed).unwrap()).is_err());
@@ -220,6 +233,7 @@ mod tests {
             proof: proof.clone(),
             source_authority: None,
             source_authority_conflict: None,
+            source_authority_unavailable: None,
             snapshot: Snapshot {
                 generation: 77,
                 title: Some("final".into()),

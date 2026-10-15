@@ -56,6 +56,7 @@ pub(super) struct Journal {
     outcome_latest: u64,
     source_authority: Option<super::SourceAuthority>,
     source_authority_conflict: Option<super::SourceAuthority>,
+    source_authority_unavailable: Option<crate::chat::SourceAuthorityUnavailableCause>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
 /// independently authoritative evidence or block later execution settlements.
@@ -105,6 +106,7 @@ impl Journal {
             outcome_latest: 0,
             source_authority: None,
             source_authority_conflict: None,
+            source_authority_unavailable: None,
         })
     }
     pub fn continuity_loss(&self) -> Result<Option<ContinuityLoss>, String> {
@@ -172,7 +174,12 @@ impl Journal {
         self.source_authority
     }
     pub fn source_authority_conflict(&self) -> Option<super::SourceAuthority> { self.source_authority_conflict }
+    pub fn source_authority_unavailable(&self) -> Option<crate::chat::SourceAuthorityUnavailableCause> { self.source_authority_unavailable }
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
+        if let Update::SourceAuthorityUnavailable { cause } = update {
+            self.source_authority_unavailable.get_or_insert(*cause);
+            return Ok(());
+        }
         // Invalidation survives even a failed Reset/storage write. It is a
         // coalesced scalar of this exact retained Store, never a semantic row
         // or a cursor/ACK. Never derive it from a Snapshot or raw-owner nonce.
@@ -1218,6 +1225,17 @@ mod tests {
 mod source_authority_tests {
     use super::*;
     use super::super::{Journal, SourceAuthority};
+    #[test]
+    fn clock_exhaustion_disposition_is_sticky_without_sql_or_invented_pair() {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal=Journal::open(root.path()).unwrap();
+        journal.db.execute_batch("DROP TABLE metadata; DROP TABLE outcomes;").unwrap();
+        let cause=crate::chat::SourceAuthorityUnavailableCause::ClockExhausted;
+        journal.append(&Update::SourceAuthorityUnavailable {cause}).unwrap();
+        assert_eq!(journal.source_authority_unavailable(),Some(cause));
+        assert!(journal.source_authority().is_none());
+        assert_eq!(journal.latest().unwrap(),0); assert_eq!(journal.acknowledged().unwrap(),0);
+    }
     #[test]
     fn explicit_historical_conflict_is_retained_after_a_higher_scalar_without_semantic_ack() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();

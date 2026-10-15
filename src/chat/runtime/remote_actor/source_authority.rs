@@ -40,25 +40,32 @@ impl RemoteActor {
             if self.0.stop.load(Ordering::Acquire) && !allow_closed { return false; }
             let mut authority = state.source_authority;
             let mut conflict = state.source_authority_conflict;
+            let unavailable = state.source_authority_unavailable.or(resident.source_authority_unavailable);
+            let unavailable_changed = unavailable != state.source_authority_unavailable;
             let changed = merge(&mut authority, &mut conflict, resident.source_authority, resident.source_authority_conflict);
             resident.source_authority = authority;
             resident.source_authority_conflict = conflict;
+            resident.source_authority_unavailable = unavailable;
             *state = Arc::new(resident);
-            changed.then_some((authority, conflict))
+            (changed.then_some((authority, conflict)).filter(|_| unavailable.is_none()), unavailable_changed.then_some(unavailable).flatten())
         };
         // No Host callback under the resident mutex. Receivers additionally
         // fence generation so concurrent delayed callbacks cannot undo Reset.
-        if let Some(authority) = authority { self.notify_source_authority(authority); }
+        if let Some(cause) = authority.1 { (self.0.notify)(Update::SourceAuthorityUnavailable { cause }); }
+        else if let Some(authority) = authority.0 { self.notify_source_authority(authority); }
         true
     }
-    pub(super) fn publish_source_authority(&self, incoming: Option<SourceAuthority>, conflicting: Option<SourceAuthority>) {
+    pub(super) fn publish_source_authority(&self, incoming: Option<SourceAuthority>, conflicting: Option<SourceAuthority>, unavailable: Option<chat::SourceAuthorityUnavailableCause>) {
         let authority = {
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             let state = Arc::make_mut(&mut state);
+            let unavailable_changed = state.source_authority_unavailable.is_none() && unavailable.is_some();
+            state.source_authority_unavailable = state.source_authority_unavailable.or(unavailable);
             let changed = merge(&mut state.source_authority, &mut state.source_authority_conflict, incoming, conflicting);
-            changed.then_some((state.source_authority, state.source_authority_conflict))
+            (changed.then_some((state.source_authority, state.source_authority_conflict)).filter(|_| state.source_authority_unavailable.is_none()), unavailable_changed.then_some(state.source_authority_unavailable).flatten())
         };
-        if let Some(authority) = authority { self.notify_source_authority(authority); }
+        if let Some(cause) = authority.1 { (self.0.notify)(Update::SourceAuthorityUnavailable { cause }); }
+        else if let Some(authority) = authority.0 { self.notify_source_authority(authority); }
     }
     fn notify_source_authority(&self, (authority, conflict): (Option<SourceAuthority>, Option<SourceAuthority>)) {
         if let Some(authority) = authority {
@@ -78,7 +85,7 @@ impl RemoteActor {
     }
     pub(super) fn accepts_body(&self, snapshot: &Snapshot) -> bool {
         let state = self.state();
-        state.source_authority_conflict.is_none() && state.source_authority.is_some_and(|authority|
+        state.source_authority_unavailable.is_none() && state.source_authority_conflict.is_none() && state.source_authority.is_some_and(|authority|
             !authority.incarnation.is_nil() && snapshot.source_incarnation == Some(authority.incarnation)
                 && snapshot.generation >= authority.generation)
     }
@@ -100,15 +107,18 @@ impl Server {
         // cheap cache remains truthful, while no actor remains to emit notify.
         // Try only resident metadata here: control admission never waits on
         // a source worker's Store/state locks or Journal SQLite operation.
-        let Some(actual) = self.actor.source_authority() else { return; };
+        let unavailable = self.actor.source_authority_unavailable();
+        let actual = self.actor.source_authority();
+        if actual.is_none() && unavailable.is_none() { return; }
         let mut journal = match self.journal.try_lock() {
             Ok(journal) => journal,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return,
         };
-        let before = (journal.source_authority(), journal.source_authority_conflict());
-        let _ = journal.append(&Update::SourceAuthority {incarnation:actual.incarnation,generation:actual.generation});
-        if before != (journal.source_authority(), journal.source_authority_conflict()) {
+        let before = (journal.source_authority(), journal.source_authority_conflict(), journal.source_authority_unavailable());
+        if let Some(cause) = unavailable { let _ = journal.append(&Update::SourceAuthorityUnavailable {cause}); }
+        else if let Some(actual) = actual { let _ = journal.append(&Update::SourceAuthority {incarnation:actual.incarnation,generation:actual.generation}); }
+        if before != (journal.source_authority(), journal.source_authority_conflict(), journal.source_authority_unavailable()) {
             self.changed.fetch_add(1, Ordering::Release);
         }
     }
@@ -148,17 +158,29 @@ mod tests {
         Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| sink.lock().unwrap().push(update));
         let first = SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:10};
         let conflict = SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:10};
-        actor.publish_source_authority(Some(first), Some(conflict));
-        actor.publish_source_authority(Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}), None);
+        actor.publish_source_authority(Some(first), Some(conflict), None);
+        actor.publish_source_authority(Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}), None, None);
         assert_eq!(actor.state().source_authority, Some(first));
         assert_eq!(actor.state().source_authority_conflict, Some(conflict));
         assert!(!actor.accepts_body(&Snapshot {generation:20,source_incarnation:Some(first.incarnation),..Default::default()}));
         assert!(matches!(observed.lock().unwrap().as_slice(), [Update::SourceAuthority {incarnation:a,generation:10},Update::SourceAuthorityConflict {original,conflicting,generation:10}] if *a==first.incarnation && *original==first.incarnation && *conflicting==conflict.incarnation));
         let fresh = RemoteActor::fixture();
-        fresh.publish_source_authority(Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}),None);
+        fresh.publish_source_authority(Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}), None, None);
         assert!(fresh.replace_resident(actor.state().as_ref().clone(), false));
         assert_eq!(fresh.state().source_authority_conflict, Some(conflict));
         assert!(!fresh.accepts_body(&Snapshot {generation:30,source_incarnation:Some(first.incarnation),..Default::default()}));
+    }
+    #[test]
+    fn explicit_clock_unavailability_revokes_body_without_minting_an_ordered_pair() {
+        let actor = RemoteActor::fixture();
+        let cause = chat::SourceAuthorityUnavailableCause::ClockExhausted;
+        actor.publish_source_authority(None, None, Some(cause));
+        actor.publish_source_authority(Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}), None, None);
+        assert_eq!(actor.state().source_authority_unavailable, Some(cause));
+        assert!(!actor.accepts_body(&Snapshot::default()));
+        let fresh = RemoteActor::fixture();
+        fresh.replace_resident(actor.state().as_ref().clone(), false);
+        assert_eq!(fresh.state().source_authority_unavailable, Some(cause));
     }
     #[test]
     fn final_publication_and_explicit_refresh_can_publish_authority_after_proxy_stop() {
@@ -172,7 +194,7 @@ mod tests {
         assert!(!actor.accepts_body(&Snapshot::default()));
         assert!(actor.replace_resident(resident, true));
         assert_eq!(actor.state().source_authority, Some(authority));
-        actor.publish_source_authority(None, None);
+        actor.publish_source_authority(None, None, None);
         assert_eq!(actor.state().source_authority, Some(authority), "legacy final receipt means unavailable, never a replacement token");
     }
 }
