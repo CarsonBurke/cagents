@@ -293,6 +293,7 @@ pub enum Action {
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
+    FooterPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -508,6 +509,10 @@ impl Default for State {
     }
 }
 impl State {
+    pub(super) fn parked_runtime(&self, card: CardId) -> Option<&Runtime> {
+        self.parked.get(&card).map(Box::as_ref)
+    }
+
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
             drafts,
@@ -1551,6 +1556,7 @@ pub(super) struct Runtime {
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
     permission_picker: bool,
+    footer_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
@@ -2115,6 +2121,7 @@ impl Runtime {
             failures: Vec::new(),
             reasoning_picker: false,
             permission_picker: false,
+            footer_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
             picker_focus: 0,
@@ -2237,6 +2244,20 @@ impl Runtime {
             cached.rehighlight(theme);
         }
     }
+    pub(super) fn native_activity(&self) -> Option<Activity> {
+        self.handle().map(|handle| Activity {
+            provider: self.session.launch.provider,
+            state: handle.take_activity(),
+        })
+    }
+
+    pub(super) fn activity_outcome(&self) -> Option<crate::agent::ActivityOutcome> {
+        match self.handle() {
+            Some(handle) => handle.activity_outcome(),
+            None => self.snapshot.outcome.clone(),
+        }
+    }
+
     fn source_now_ms(&self) -> Option<u64> {
         self.source_clock
             .map(chat::client::SourceClock::now)
@@ -2273,7 +2294,9 @@ impl Runtime {
         {
             return;
         }
-        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
+        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at
+            || self.snapshot.outcome != snapshot.outcome
+        {
             self.finished_stamp = snapshot.finished_at.and_then(|at| {
                 let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
                 let full = format!(
@@ -2283,7 +2306,16 @@ impl Runtime {
                     time.day,
                     time.clock()
                 );
-                Some((at, format!("Finished at {}", time.clock()), full))
+                let label = snapshot
+                    .outcome
+                    .as_ref()
+                    .map_or("Finished", crate::agent::ActivityOutcome::label);
+                let full = snapshot
+                    .outcome
+                    .as_ref()
+                    .and_then(crate::agent::ActivityOutcome::reason)
+                    .map_or_else(|| full.clone(), |reason| format!("{full} · {reason}"));
+                Some((at, format!("{label} at {}", time.clock()), full))
             });
         }
         self.subagent_scroll
@@ -2523,6 +2555,12 @@ impl Runtime {
             self.failures.retain(|(anchor, message)| {
                 anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
             });
+        }
+        let mut turns = turns;
+        if snapshot.outcome.is_some() && (!snapshot.is_working() || snapshot.exited) {
+            for turn in &mut turns {
+                turn.running = false;
+            }
         }
         self.turns = turns;
         reconcile_disclosure(&mut self.opened, &self.turns);
@@ -4228,6 +4266,11 @@ impl Cagents {
                 }
             }
         }
+        let mut agent_updates = self.sidebar_state.unread_updates().clone();
+        agent_updates.retain(|card, _| open_cards.contains(card));
+        if agent_updates != self.durable.agent_updates {
+            Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
+        }
         if defaults.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && repository_navigation == self.durable.repository_navigation
@@ -4306,11 +4349,13 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
+            || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
+        runtime.footer_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
         runtime.branch_picker = false;
@@ -4416,15 +4461,17 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: chat_card_title(session.launch.provider).into(),
-            width_fraction: beside
-                .and_then(|(source, _)| self.card_state(source))
-                .map_or(self.settings.default_native_pane_fraction, |source| {
-                    if matches!(source.kind, CardKind::Chat(_)) {
-                        source.width_fraction
-                    } else {
-                        self.settings.default_native_pane_fraction
-                    }
-                }),
+            width_fraction: self.new_pane_fraction(
+                beside
+                    .and_then(|(source, _)| self.card_state(source))
+                    .map_or(self.settings.default_native_pane_fraction, |source| {
+                        if matches!(source.kind, CardKind::Chat(_)) {
+                            source.width_fraction
+                        } else {
+                            self.settings.default_native_pane_fraction
+                        }
+                    }),
+            ),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -5736,6 +5783,7 @@ impl Cagents {
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
+            | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
@@ -5828,6 +5876,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -6214,7 +6263,7 @@ impl Cagents {
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
                         let channel_name = snapshot_channel_name(&snapshot);
-                        let title = snapshot.title.clone();
+                        let title = snapshot_channel_name(&snapshot).map(|(title, _)| title);
                         let activity = Activity {
                             provider: session.launch.provider,
                             state: handle.take_activity(),
@@ -6542,12 +6591,18 @@ impl Cagents {
                         }
                         _ => None,
                     };
+                    let activity = matches!(wake, Wake::Activity | Wake::Changed)
+                        .then(|| runtime.native_activity())
+                        .flatten();
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
                     if let Some((name, source)) = name {
                         self.suggest_channel_title(target.card, name, source);
+                    }
+                    if let Some(activity) = activity {
+                        self.observe_agent_activity_for_card(target.card, Some(activity));
                     }
                     return Task::none();
                 }
@@ -6589,7 +6644,7 @@ impl Cagents {
                         let channel_name = needs_name
                             .then(|| snapshot_channel_name(&snapshot))
                             .flatten();
-                        let title = snapshot.title.clone();
+                        let title = snapshot_channel_name(&snapshot).map(|(title, _)| title);
                         if let Some((name, source)) = channel_name {
                             self.suggest_channel_title(target.card, name, source);
                         }
@@ -7136,12 +7191,23 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
+            Action::FooterPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.footer_picker = open;
+                    runtime.model_picker = None;
+                    runtime.reasoning_picker = false;
+                    runtime.account_picker = false;
+                    runtime.permission_picker = false;
+                    runtime.composer_actions = false;
+                }
+            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
+                    runtime.footer_picker = false;
                     if open {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
@@ -7200,6 +7266,7 @@ impl Cagents {
                     runtime.history_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
                         target.card,
                         "chat-composer",
@@ -7319,7 +7386,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7482,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -7985,6 +8054,7 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.permission_picker = false;
+                runtime.footer_picker = false;
                 if !runtime
                     .snapshot
                     .capabilities
@@ -8387,6 +8457,7 @@ impl Cagents {
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
+                runtime.footer_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -8412,6 +8483,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.account_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
         }
@@ -11147,14 +11219,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11250,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -12537,6 +12617,71 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn prompt_and_provider_titles_name_the_chat_tab_and_window() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = Snapshot {
+            ready: true,
+            ..Snapshot::default()
+        };
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "prompt".into(),
+            role: chat::Role::User,
+            content: text("Implement conversation titles"),
+            started_at: None,
+            at: None,
+        }));
+        for title in [None, Some("Provider summary".to_owned())] {
+            snapshot.title = title.clone();
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot.clone());
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            drop(app.sync_chrome());
+            let expected = title.as_deref().unwrap_or("Implement conversation titles");
+            assert_eq!(
+                app.card_display_title(app.card_state(card).unwrap()),
+                expected
+            );
+            assert_eq!(app.card_chrome[&card].title, expected);
+            assert_eq!(app.core.window.header_title, expected);
+        }
+    }
+
+    #[test]
+    fn manual_channel_name_titles_its_main_chat_without_hiding_sibling_titles() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let mut sibling = app.card_state(card).unwrap().clone();
+        sibling.id = CardId::new();
+        sibling.title = "Sibling conversation".into();
+        let sibling_id = sibling.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(sibling);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: crate::model::ChannelId::new(),
+            project_id: crate::model::ProjectId::new(),
+            title: "My renamed conversation".into(),
+            title_source: crate::model::ChannelTitleSource::Manual,
+            ordinal: 1,
+            shared: false,
+            cards: vec![card, sibling_id],
+            focused: Some(card),
+        });
+        assert_eq!(
+            app.card_display_title(app.card_state(card).unwrap()),
+            "My renamed conversation"
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(sibling_id).unwrap()),
+            "Sibling conversation"
+        );
+        drop(app.sync_chrome());
+        assert_eq!(app.core.window.header_title, "My renamed conversation");
     }
 
     #[test]

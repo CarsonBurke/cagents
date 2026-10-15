@@ -85,6 +85,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Move pane left / right | `Alt+Shift+Left` / `Alt+Shift+Right` |
 | Reopen closed pane | `Ctrl+Shift+Z` |
 | Focus pane 1–9 | `Alt+1` through `Alt+9` |
+| Focus last pane | `Alt+0` |
 | New channel | `Ctrl+Shift+G` |
 | Clone focused pane | `Ctrl+Shift+D` |
 | Close focused pane | `Ctrl+W` |

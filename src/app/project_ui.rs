@@ -1005,6 +1005,13 @@ impl Cagents {
                     return Task::none();
                 }
                 match command {
+                    ProjectCommand::MarkRead => {
+                        return worktree_id.map_or_else(Task::none, |worktree| {
+                            self.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+                                project_id, worktree,
+                            )))
+                        });
+                    }
                     ProjectCommand::CopyPath => {
                         return iced::clipboard::write(target.path.display().to_string());
                     }

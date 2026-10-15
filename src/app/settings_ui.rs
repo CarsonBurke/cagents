@@ -1020,6 +1020,13 @@ fn settings_category_controls<'a>(
                     &draft.keyboard_shortcuts,
                 ),
                 shortcut_input(
+                    "Focus last pane",
+                    "Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.focus_last_pane,
+                    SettingsField::ShortcutFocusLastPane,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
                     "New terminal",
                     "Creates a terminal column.",
                     &draft.keyboard_shortcuts.new_terminal,
@@ -1094,6 +1101,20 @@ fn settings_category_controls<'a>(
                     "Opens the worktree or channel after this one in the sidebar; may repeat while held.",
                     &draft.keyboard_shortcuts.next_workspace,
                     SettingsField::ShortcutNextWorkspace,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Next pane needing attention",
+                    "Focuses waiting, failed and unread panes across all workspaces.",
+                    &draft.keyboard_shortcuts.next_attention,
+                    SettingsField::ShortcutNextAttention,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Previous pane needing attention",
+                    "Cycles backwards through agents needing attention.",
+                    &draft.keyboard_shortcuts.previous_attention,
+                    SettingsField::ShortcutPreviousAttention,
                     &draft.keyboard_shortcuts,
                 ),
                 shortcut_input(

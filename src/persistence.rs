@@ -261,6 +261,7 @@ pub struct WorkspaceManifest {
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
+    pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
@@ -1743,6 +1744,7 @@ impl StateStore {
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
+            agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
@@ -3290,6 +3292,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:agent_updates"),
+        &to_json(&state.agent_updates)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:chat_drafts"),
         &to_json(&state.chat_drafts)?,
     )?;
@@ -4636,6 +4643,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace editor navigation", &value))
         .transpose()?
         .unwrap_or_default(),
+        agent_updates: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:agent_updates"),
+        )?
+        .map(|value| from_json("workspace unread agent updates", &value))
+        .transpose()?
+        .unwrap_or_default(),
         chat_drafts: metadata(
             connection,
             &format!("workspace:{id}:navigation:chat_drafts"),
@@ -5264,6 +5278,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
@@ -6187,6 +6202,41 @@ mod tests {
             serde_json::from_value::<WorkspaceState>(legacy)
                 .unwrap()
                 .workspace_history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unread_agent_updates_survive_autosave_restore_and_read() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("state.db");
+        let boot_id = boot("unread");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let card = workspace.cards[0].id;
+        workspace
+            .agent_updates
+            .insert(card, Some((ProjectId::new(), WorktreeId::new())));
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&database, boot_id).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates,
+            workspace.agent_updates
+        );
+        workspace.agent_updates.clear();
+        lane.save(&store, &workspace).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates
                 .is_empty()
         );
     }

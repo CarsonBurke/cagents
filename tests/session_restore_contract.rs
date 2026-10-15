@@ -95,6 +95,7 @@ impl RestoreFixture {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            agent_updates: Default::default(),
             repository_navigation: HashMap::new(),
             local_only_cards: Default::default(),
             pending_terminal_creations: Default::default(),
