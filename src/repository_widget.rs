@@ -3660,12 +3660,13 @@ impl RepositoryRuntime {
             let prefix = &line[..char_boundary(line, cursor.column)];
             // Code and Zed remove a document-start BOM from their models. A U+FEFF
             // elsewhere is ordinary content and must still contribute a unit.
-            let prefix =
-                if cursor.line == 0 && crate::external_editor::normalizes_text_coordinates(editor) {
-                    prefix.strip_prefix('\u{feff}').unwrap_or(prefix)
-                } else {
-                    prefix
-                };
+            let prefix = if cursor.line == 0
+                && crate::external_editor::normalizes_text_coordinates(editor)
+            {
+                prefix.strip_prefix('\u{feff}').unwrap_or(prefix)
+            } else {
+                prefix
+            };
             crate::external_editor::column_for_prefix(editor, prefix)
         })?;
         let line = if crate::external_editor::normalizes_text_coordinates(editor) {
@@ -16217,9 +16218,15 @@ mod tests {
                 );
             }
             for editor in ["zed", "zeditor"] {
-                assert_eq!(runtime.editor_caret_for(editor), Some((code_line, scalar_column)));
+                assert_eq!(
+                    runtime.editor_caret_for(editor),
+                    Some((code_line, scalar_column))
+                );
             }
-            assert_eq!(runtime.editor_caret(), Some((native_line + 1, scalar_column)));
+            assert_eq!(
+                runtime.editor_caret(),
+                Some((native_line + 1, scalar_column))
+            );
         }
     }
 
@@ -16257,9 +16264,17 @@ mod tests {
             for editor in ["code", "codium", "cursor"] {
                 assert_eq!(runtime.editor_caret_for(editor), Some(expected), "{editor}");
             }
-            let scalar_expected = if line == 0 && bytes == 8 { (1, 3) } else { expected };
+            let scalar_expected = if line == 0 && bytes == 8 {
+                (1, 3)
+            } else {
+                expected
+            };
             for editor in ["zed", "zeditor"] {
-                assert_eq!(runtime.editor_caret_for(editor), Some(scalar_expected), "{editor}");
+                assert_eq!(
+                    runtime.editor_caret_for(editor),
+                    Some(scalar_expected),
+                    "{editor}"
+                );
             }
         }
     }
