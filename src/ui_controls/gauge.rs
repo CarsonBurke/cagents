@@ -16,12 +16,56 @@ static SPINNER_EPOCH: std::sync::LazyLock<cosmic::iced::time::Instant> =
 /// Bound whole-window redraws to eight activity steps per second.
 const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(125);
 
-// A newly mounted spinner may not have observed the window's last focus event.
-// Seed it from the main-window state rather than animating hidden new content.
-static ANIMATION_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Main-window visibility outlives individual indicators. UI widgets and app
+// updates share one UI thread; thread-local state also isolates headless tests.
+#[derive(Clone, Copy, Default)]
+struct ActivityVisibility {
+    focused: bool,
+    occluded: bool,
+    minimized: bool,
+}
+thread_local! {
+    static ACTIVITY_VISIBILITY: std::cell::Cell<ActivityVisibility> = Default::default();
+}
 
 pub(crate) fn set_activity_animation_active(active: bool) {
-    ANIMATION_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+    ACTIVITY_VISIBILITY.with(|visibility| {
+        let mut current = visibility.get();
+        current.focused = active;
+        visibility.set(current);
+    });
+}
+
+pub(crate) fn set_activity_window_occluded(occluded: bool) {
+    ACTIVITY_VISIBILITY.with(|visibility| {
+        let mut current = visibility.get();
+        current.occluded = occluded;
+        visibility.set(current);
+    });
+}
+
+pub(crate) fn set_activity_window_minimized(minimized: bool) {
+    ACTIVITY_VISIBILITY.with(|visibility| {
+        let mut current = visibility.get();
+        current.minimized = minimized;
+        visibility.set(current);
+    });
+}
+
+/// Remember the host application's main-window visibility before rendering
+/// indicators. Call this for the main window even when no spinner is mounted;
+/// new indicators inherit that window's current focus and visibility.
+pub fn observe_activity_window_event(event: &cosmic::iced::window::Event) {
+    use cosmic::iced::window;
+    match event {
+        window::Event::Focused => set_activity_animation_active(true),
+        window::Event::Unfocused | window::Event::Closed => set_activity_animation_active(false),
+        window::Event::Occluded(occluded) => set_activity_window_occluded(*occluded),
+        window::Event::Opened { size, .. } | window::Event::Resized(size) => {
+            set_activity_window_minimized(size.width == 0.0 || size.height == 0.0);
+        }
+        _ => {}
+    }
 }
 
 /// The arc the spinner draws `elapsed` after [`SPINNER_EPOCH`], as start and
@@ -105,10 +149,11 @@ struct SpinnerState {
 
 impl Default for SpinnerState {
     fn default() -> Self {
+        let visibility = ACTIVITY_VISIBILITY.with(std::cell::Cell::get);
         Self {
-            active: ANIMATION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
-            occluded: false,
-            minimized: false,
+            active: visibility.focused,
+            occluded: visibility.occluded,
+            minimized: visibility.minimized,
             elapsed: std::time::Duration::ZERO,
         }
     }

@@ -4166,6 +4166,14 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
+    WindowSizeObserved {
+        window: window::Id,
+        size: iced::Size,
+    },
+    WindowOccluded {
+        window: window::Id,
+        occluded: bool,
+    },
     ActivateUi {
         token: Option<String>,
     },
@@ -15239,6 +15247,21 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::WindowOccluded { window, occluded } => {
+                if self.core.main_window_id() == Some(window) {
+                    crate::ui_controls::observe_activity_window_event(&window::Event::Occluded(
+                        occluded,
+                    ));
+                }
+                return Task::none();
+            }
+            Message::WindowSizeObserved { window, size } => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                crate::ui_controls::observe_activity_window_event(&window::Event::Resized(size));
+                return self.update(Message::WindowResized(size.width, size.height));
+            }
             Message::WindowResized(width, height) => {
                 if height.is_finite() && height > 0.0 {
                     self.window_height = height;
@@ -16142,7 +16165,11 @@ impl Application for Cagents {
                     refresh_ui::Action::Focused(id, focused)
                         if self.core.main_window_id() == Some(id) =>
                     {
-                        crate::ui_controls::set_activity_animation_active(focused);
+                        crate::ui_controls::observe_activity_window_event(&if focused {
+                            window::Event::Focused
+                        } else {
+                            window::Event::Unfocused
+                        });
                         Some((focused, focused && !self.refresh_ui.focused))
                     }
                     _ => None,
@@ -16582,6 +16609,18 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Closed) => {
                     Some(Message::WindowClosed(event_window))
                 }
+                iced::Event::Window(window::Event::Occluded(occluded)) => {
+                    Some(Message::WindowOccluded {
+                        window: event_window,
+                        occluded,
+                    })
+                }
+                iced::Event::Window(
+                    window::Event::Opened { size, .. } | window::Event::Resized(size),
+                ) => Some(Message::WindowSizeObserved {
+                    window: event_window,
+                    size,
+                }),
                 iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, true),
                 )),
@@ -26049,6 +26088,76 @@ mod tests {
             iced::runtime::Action::Output(cosmic::Action::App(message)) => message,
             _ => panic!("task did not produce an application message"),
         }
+    }
+
+    #[test]
+    fn a_spinner_mounted_after_main_window_visibility_changes_stays_paused() {
+        use crate::ui_controls::activity_spinner;
+        use cosmic::Application as _;
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, window};
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        let renderer = headless_renderer();
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let requested_by_new_widget = || {
+            let mut element: Element<'_, ()> = activity_spinner(24.0, crate::design::accent_color);
+            let mut tree = Tree::new(element.as_widget());
+            let node = layout::Node::new(Size::new(24.0, 24.0));
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            // No visibility event is replayed to this newly mounted widget.
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            shell.redraw_request()
+        };
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: true,
+        }));
+        assert_eq!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: false,
+        }));
+        assert_ne!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, false))));
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: true,
+        }));
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: false,
+        }));
+        assert_eq!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        drop(app.update(Message::WindowSizeObserved {
+            window: main,
+            size: Size::ZERO,
+        }));
+        assert_eq!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::WindowSizeObserved {
+            window: main,
+            size: Size::new(800.0, 600.0),
+        }));
+        assert_ne!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::WindowOccluded {
+            window: window::Id::unique(),
+            occluded: true,
+        }));
+        assert_ne!(requested_by_new_widget(), window::RedrawRequest::Wait);
     }
 
     #[test]

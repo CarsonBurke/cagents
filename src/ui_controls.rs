@@ -15,8 +15,9 @@ mod responsive;
 mod tabs;
 
 pub use display::{badge, change_counts, comment_card};
-pub(crate) use gauge::set_activity_animation_active;
-pub use gauge::{activity_spinner, budget_bar, budget_radial, budget_radial_toned};
+pub use gauge::{
+    activity_spinner, budget_bar, budget_radial, budget_radial_toned, observe_activity_window_event,
+};
 pub use icon::{Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_icon};
 pub use icon_button::{
     IconButton, control_style, icon_button, segmented_controls, toolbar_actions,

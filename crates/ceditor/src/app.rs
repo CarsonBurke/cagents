@@ -142,6 +142,8 @@ pub enum Message {
     Reaped,
     WindowFocused(window::Id, bool),
     WindowResized(iced::Size),
+    WindowSizeObserved(window::Id, iced::Size),
+    WindowOccluded(window::Id, bool),
     RefreshVisible,
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -3148,12 +3150,34 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::Checkout(action) => self.checkout_action(action),
+                Message::WindowSizeObserved(window, size) => {
+                    if self.core.main_window_id() == Some(window) {
+                        cagents::ui_controls::observe_activity_window_event(
+                            &window::Event::Resized(size),
+                        );
+                        self.window_size = size;
+                    }
+                    Task::none()
+                }
+                Message::WindowOccluded(window, occluded) => {
+                    if self.core.main_window_id() == Some(window) {
+                        cagents::ui_controls::observe_activity_window_event(
+                            &window::Event::Occluded(occluded),
+                        );
+                    }
+                    Task::none()
+                }
                 Message::WindowResized(size) => {
                     self.window_size = size;
                     Task::none()
                 }
                 Message::WindowFocused(window, focused) => {
                     if self.core.main_window_id() == Some(window) {
+                        cagents::ui_controls::observe_activity_window_event(&if focused {
+                            window::Event::Focused
+                        } else {
+                            window::Event::Unfocused
+                        });
                         self.window_focused = focused;
                         if !focused {
                             self.tab_history.finish(self.active);
@@ -4497,7 +4521,12 @@ impl Application for Editor {
             iced::Event::Window(window::Event::Focused) => {
                 Some(Message::WindowFocused(window, true))
             }
-            iced::Event::Window(window::Event::Resized(size)) => Some(Message::WindowResized(size)),
+            iced::Event::Window(
+                window::Event::Opened { size, .. } | window::Event::Resized(size),
+            ) => Some(Message::WindowSizeObserved(window, size)),
+            iced::Event::Window(window::Event::Occluded(occluded)) => {
+                Some(Message::WindowOccluded(window, occluded))
+            }
             iced::Event::Window(window::Event::Unfocused) => {
                 Some(Message::WindowFocused(window, false))
             }
