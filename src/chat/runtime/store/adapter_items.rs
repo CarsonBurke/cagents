@@ -193,6 +193,24 @@ mod tests {
     }
 
     #[test]
+    fn failed_old_write_preserves_attempted_patch_without_guessing_an_expired_tool_name() {
+        use serde_json::json;
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));
+        let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(reader(&store));
+        let step=adapter.receive(json!({"type":"assistant","uuid":"old-call","message":{"content":[{"type":"tool_use","id":"old-write","name":"Write","input":{"file_path":"attempted.txt","content":"x".repeat(3*1024*1024)}}]}})).unwrap();
+        commit(&store,adapter.as_mut(),step);
+        for index in 0..513 {
+            let step=adapter.receive(json!({"type":"assistant","uuid":format!("later-{index}"),"message":{"content":[{"type":"tool_use","id":format!("later-{index}"),"name":"Opaque","input":{}}]}})).unwrap();
+            commit(&store,adapter.as_mut(),step);
+        }
+        let failed=adapter.receive(json!({"type":"user","uuid":"old-failure","message":{"content":[{"type":"tool_result","tool_use_id":"old-write","is_error":true,"content":"permission denied"}]}})).unwrap();
+        assert!(failed.events.iter().any(|event|matches!(event,Event::Error{message,fatal:false} if message.contains("permission denied") && message.contains("identity is unavailable"))));
+        assert!(failed.events.iter().any(|event|matches!(event,Event::Item(Item{id,content:ItemContent::Changes{changes,status:crate::chat::ToolStatus::Failed},..}) if id=="old-write" && changes[0].diff.len()>3*1024*1024)));
+        assert!(!failed.events.iter().any(|event|matches!(event,Event::Item(Item{id,content:ItemContent::Tool{..},..}) if id=="old-write")),"missing original metadata cannot become a synthetic Edit call");
+        commit(&store,adapter.as_mut(),failed);
+    }
+
+    #[test]
     fn presentation_shortening_is_not_promoted_to_complete_canonical_tool_identity() {
         let store=Arc::new(Mutex::new(Store::new().unwrap()));
         let item=Item {id:"shortened".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"n".repeat(METADATA_LIMIT+1),input:"original body".into(),output:String::new(),status:crate::chat::ToolStatus::Running}};
