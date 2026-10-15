@@ -2,20 +2,21 @@ use std::{
     collections::BTreeMap,
     io,
     net::Shutdown,
-    os::unix::{net::UnixStream, process::CommandExt},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
 
+use super::daemon_start::{HostedTerminalStartError, ensure_daemon_ready};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
-use thiserror::Error;
+#[cfg(test)]
+use std::process::Command;
 
 use crate::model::{HostSessionProof, TerminalId, TerminalSession};
 
@@ -26,7 +27,7 @@ use super::{
         ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, MAX_INPUT_BYTES,
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, ServerEnvelope,
         ServerMessage, ServerResponse, TerminalScroll, TerminalSnapshot, TerminalSpawnOptions,
-        TerminalVisibility, WireTerminalSize, daemon_socket_path, write_frame,
+        TerminalVisibility, WireTerminalSize, write_frame,
     },
 };
 
@@ -42,12 +43,12 @@ const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(50);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const DAEMON_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 type WakeCallback = dyn Fn(TerminalWake) + Send + Sync + 'static;
 
 struct WorkerStop {
     requested: AtomicBool,
+    async_wake: tokio::sync::Notify,
     worker: OnceLock<thread::Thread>,
     notification_tx: Sender<()>,
     notification_rx: Receiver<()>,
@@ -59,6 +60,7 @@ impl Default for WorkerStop {
         let (notification_tx, notification_rx) = crossbeam_channel::bounded(1);
         Self {
             requested: AtomicBool::new(false),
+            async_wake: tokio::sync::Notify::new(),
             worker: OnceLock::new(),
             notification_tx,
             notification_rx,
@@ -74,6 +76,7 @@ impl WorkerStop {
 
     fn request(&self) {
         self.requested.store(true, Ordering::Release);
+        self.async_wake.notify_one();
         if let Ok(connection) = self.connection.lock()
             && let Some(connection) = connection.as_ref()
         {
@@ -127,44 +130,6 @@ impl Drop for ConnectionRegistration<'_> {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum HostedTerminalStartError {
-    #[error("the expected cagents daemon proof is incomplete")]
-    InvalidProof,
-    #[error("could not locate the cagents daemon socket: {0}")]
-    SocketPath(#[source] io::Error),
-    #[error("could not start the hosted terminal client: {0}")]
-    Worker(#[source] io::Error),
-    #[error("could not locate the running application binary: {0}")]
-    CurrentExecutable(#[source] io::Error),
-    #[error("the sibling cagentsd binary does not exist at {0}")]
-    HostBinaryMissing(PathBuf),
-    #[error("could not launch cagentsd at {path}: {source}")]
-    LaunchHost {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("cagents daemon did not become ready at {path} within {timeout:?}")]
-    HostReadyTimeout { path: PathBuf, timeout: Duration },
-    #[error("could not complete cagents daemon startup: {0}")]
-    HostStartup(String),
-    #[error("could not verify the running cagents daemon: {0}")]
-    HostProtocol(#[source] crate::control::ControlError),
-    #[error(
-        "the running daemon uses protocol {actual}; this executable expects {PROTOCOL_VERSION}. Rebuild the matched executables; for a development session, run scripts/run-development --fresh-daemon (this stops its jobs and background subagents)"
-    )]
-    HostIncompatible { actual: u16 },
-    #[error("cagents daemon exited before becoming ready at {path}: {status}")]
-    HostExited { path: PathBuf, status: ExitStatus },
-    #[error("could not connect to the cagents daemon socket at {path}: {source}")]
-    HostSocket {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-}
-
 #[derive(Default)]
 struct AttachmentState {
     confirmed: bool,
@@ -180,6 +145,97 @@ struct OutputObservation {
 struct RetainedFrame {
     snapshot: Arc<RenderSnapshot>,
     expires: Instant,
+}
+
+/// Immutable authenticated identity of one hosted emulator/PTY owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedTerminalBinding {
+    pub source: TerminalSession,
+    pub execution_instance: uuid::Uuid,
+}
+
+/// Resolves after the exact authenticated worker admits the key, or reports
+/// an explicit refusal/unconfirmed delivery. This does not prove child input
+/// consumption. Dropping the receiver never cancels an admitted key.
+#[derive(Clone)]
+pub struct HostedKeyReceipt {
+    source: std::sync::Weak<HostedPublishedState>,
+    state: Arc<KeyReceiptState>,
+}
+struct KeyReceiptState {
+    outcome: OnceLock<Result<HostedTerminalBinding, String>>,
+    admission_proof: OnceLock<HostSessionProof>,
+    gate: Mutex<()>,
+    changed: Condvar,
+}
+impl std::fmt::Debug for HostedKeyReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostedKeyReceipt")
+            .field("outcome", &self.state.outcome.get())
+            .finish_non_exhaustive()
+    }
+}
+impl KeyReceiptState {
+    fn complete(&self, result: Result<HostedTerminalBinding, String>) {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.outcome.set(result);
+        self.changed.notify_all();
+    }
+}
+impl HostedKeyReceipt {
+    /// Historical authority from this key's authenticated Accepted frame.
+    /// It remains available after detach, and never reads a later connection
+    /// or live attachment getter. Pending/refused keys grant no authority.
+    pub fn admission_host_proof(&self) -> Option<HostSessionProof> {
+        if !matches!(self.state.outcome.get(), Some(Ok(_))) {
+            return None;
+        }
+        self.state.admission_proof.get().cloned()
+    }
+
+    /// A clone observes the same immutable completion; reading one clone never
+    /// consumes another clone's ownership evidence.
+    pub fn try_recv(&self) -> Result<Result<HostedTerminalBinding, String>, TryRecvError> {
+        self.state.outcome.get().cloned().ok_or(TryRecvError::Empty)
+    }
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Result<HostedTerminalBinding, String>, crossbeam_channel::RecvTimeoutError> {
+        if let Some(outcome) = self.state.outcome.get() {
+            return Ok(outcome.clone());
+        }
+        let deadline = Instant::now() + timeout;
+        let mut gate = self.state.gate.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(outcome) = self.state.outcome.get() {
+                return Ok(outcome.clone());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(crossbeam_channel::RecvTimeoutError::Timeout);
+            }
+            gate = self
+                .state
+                .changed
+                .wait_timeout(gate, remaining)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+struct KeyDelivery {
+    _owner: Arc<HostedHandleInner>,
+    completed: Arc<KeyReceiptState>,
+    after: Option<HostedKeyReceipt>,
+    deadline: Instant,
+    in_flight: bool,
+}
+#[derive(Default)]
+struct KeyDeliveries {
+    next_ticket: u64,
+    pending: BTreeMap<u64, KeyDelivery>,
 }
 
 struct HostedPublishedState {
@@ -200,6 +256,7 @@ struct HostedPublishedState {
     activity_current: AtomicBool,
     acknowledged_generation: AtomicU64,
     acknowledgement_tx: Sender<()>,
+    work_available: tokio::sync::Notify,
     acknowledgement_rx: Receiver<()>,
     /// The newest generation, or repaint reason, a wake has already announced
     /// to the UI.
@@ -217,6 +274,9 @@ struct HostedPublishedState {
     output_observation: Mutex<OutputObservation>,
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
+    worker_binding: OnceLock<HostedTerminalBinding>,
+    key_deliveries: Mutex<KeyDeliveries>,
+    delivery_changed: tokio::sync::Notify,
     attachment: Mutex<AttachmentState>,
     attachment_changed: Condvar,
     wake: Arc<WakeCallback>,
@@ -239,6 +299,7 @@ impl HostedPublishedState {
             activity_current: AtomicBool::new(false),
             acknowledged_generation: AtomicU64::new(0),
             acknowledgement_tx,
+            work_available: tokio::sync::Notify::new(),
             acknowledgement_rx,
             announced_generation: AtomicU64::new(0),
             semantic_wake_pending: AtomicBool::new(false),
@@ -249,10 +310,102 @@ impl HostedPublishedState {
                 TerminalVisibility::Hidden
             })),
             proof: Mutex::new(expected_host),
+            worker_binding: OnceLock::new(),
+            key_deliveries: Mutex::new(KeyDeliveries::default()),
+            delivery_changed: tokio::sync::Notify::new(),
             attachment: Mutex::new(AttachmentState::default()),
             attachment_changed: Condvar::new(),
             wake,
         }
+    }
+
+    fn admit_key(
+        &self,
+        ticket: u64,
+        result: Result<HostedTerminalBinding, String>,
+        proof: &HostSessionProof,
+    ) -> bool {
+        let mut accepted = result.is_ok();
+        if accepted {
+            let deliveries = self
+                .key_deliveries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(delivery) = deliveries.pending.get(&ticket) {
+                accepted = delivery.deadline > Instant::now();
+                // Publish the exact matching frame's proof before its Ok
+                // outcome, so delayed UI reaping needs no current attachment.
+                if accepted {
+                    let _ = delivery.completed.admission_proof.set(proof.clone());
+                }
+            } else {
+                accepted = false;
+            }
+        }
+        let result = match result {
+            Ok(binding) if accepted => Ok(binding),
+            Ok(_) => Err("terminal key admission was not confirmed before its deadline".into()),
+            Err(error) => Err(error),
+        };
+        self.complete_key(ticket, result);
+        accepted
+    }
+
+    fn complete_key(&self, ticket: u64, result: Result<HostedTerminalBinding, String>) {
+        let delivery = self
+            .key_deliveries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .remove(&ticket);
+        if let Some(delivery) = delivery {
+            delivery.completed.complete(result);
+            // Receipt completion must wake even a hidden/evicted card, whose
+            // semantic wake flag may never be drained again.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (self.wake)(TerminalWake {
+                    generation: self.generation.load(Ordering::Acquire),
+                })
+            }));
+            drop(delivery);
+        }
+        self.delivery_changed.notify_one();
+    }
+    fn fail_keys(&self, reason: &str) {
+        let deliveries = std::mem::take(
+            &mut self
+                .key_deliveries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending,
+        );
+        for (_, delivery) in deliveries {
+            delivery.completed.complete(Err(reason.to_owned()));
+            drop(delivery);
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.wake)(TerminalWake {
+                generation: self.generation.load(Ordering::Acquire),
+            })
+        }));
+        self.delivery_changed.notify_one();
+    }
+    fn key_deadline(&self) -> Option<Instant> {
+        self.key_deliveries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .values()
+            .map(|d| d.deadline)
+            .min()
+    }
+    fn has_in_flight_key(&self) -> bool {
+        self.key_deliveries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .values()
+            .any(|d| d.in_flight)
     }
 
     fn publish(&self, snapshot: RenderSnapshot) {
@@ -496,6 +649,7 @@ impl HostedPublishedState {
         // Wake after publication even if Hibernate was already drained before
         // the UI stored the placeholder and its expiration deadline.
         let _ = self.acknowledgement_tx.try_send(());
+        self.work_available.notify_one();
     }
 
     fn expire_retained(&self, now: Instant) {
@@ -568,6 +722,7 @@ impl HostedPublishedState {
             // The atomic carries the newest generation; one queued edge is
             // sufficient regardless of how many frames the UI acknowledges.
             let _ = self.acknowledgement_tx.try_send(());
+            self.work_available.notify_one();
         }
     }
 
@@ -623,6 +778,7 @@ impl HostedPublishedState {
             .attachment
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attachment.confirmed = false;
         if attachment.failure.is_none() {
             attachment.failure = Some(message);
         }
@@ -656,6 +812,17 @@ impl HostedPublishedState {
             .clone()
     }
 
+    fn pin_worker(&self, terminal: &super::ipc::TerminalDescriptor) -> bool {
+        if terminal.execution_instance.is_nil() {
+            return false;
+        }
+        let binding = self.worker_binding.get_or_init(|| HostedTerminalBinding {
+            source: terminal.session.clone(),
+            execution_instance: terminal.execution_instance,
+        });
+        binding.execution_instance == terminal.execution_instance
+    }
+
     fn pin_proof(&self, proof: &HostSessionProof) -> bool {
         if !proof.is_complete() {
             return false;
@@ -679,6 +846,10 @@ enum ClientCommand {
     Input(Vec<u8>),
     Paste(String, PasteOrigin),
     Key(KeyInput),
+    TrackedKey {
+        ticket: u64,
+        input: KeyInput,
+    },
     Mouse(MouseInput),
     Focus(bool),
     Resize(TerminalSize),
@@ -709,7 +880,7 @@ impl ClientCommand {
         match self {
             Self::Input(_) => "write terminal input",
             Self::Paste(..) => "paste into terminal",
-            Self::Key(_) => "send terminal key",
+            Self::Key(_) | Self::TrackedKey { .. } => "send terminal key",
             Self::Mouse(_) => "send terminal mouse input",
             Self::Focus(_) => "set terminal focus",
             Self::Resize(_) => "resize terminal",
@@ -735,7 +906,9 @@ impl ClientCommand {
                 text,
                 origin,
             },
-            Self::Key(input) => ClientRequest::Key { terminal_id, input },
+            Self::Key(input) | Self::TrackedKey { input, .. } => {
+                ClientRequest::Key { terminal_id, input }
+            }
             Self::Mouse(input) => ClientRequest::Mouse { terminal_id, input },
             Self::Focus(focused) => ClientRequest::Focus {
                 terminal_id,
@@ -790,7 +963,7 @@ struct HostedHandleInner {
     events: Receiver<TerminalEvent>,
     published: Arc<HostedPublishedState>,
     stop: Arc<WorkerStop>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Drop for HostedHandleInner {
@@ -799,9 +972,8 @@ impl Drop for HostedHandleInner {
         let _ = self.commands.try_send(ClientCommand::Stop);
         if let Ok(worker) = self.worker.get_mut()
             && let Some(worker) = worker.take()
-            && worker.thread().id() != thread::current().id()
         {
-            let _ = worker.join();
+            worker.abort();
         }
     }
 }
@@ -906,21 +1078,20 @@ impl HostedTerminalHandle {
         let stop = Arc::new(WorkerStop::default());
         let worker_stop = Arc::clone(&stop);
         let worker_published = Arc::clone(&published);
-        let worker = thread::Builder::new()
-            .name(format!("hosted-terminal-{terminal_id}"))
-            .spawn(move || {
-                worker_stop.register_current_thread();
-                client_loop(
-                    &socket,
-                    terminal_id,
-                    intent,
-                    command_rx,
-                    event_tx,
-                    worker_published,
-                    worker_stop,
-                );
-            })
-            .map_err(HostedTerminalStartError::Worker)?;
+        let runtime = super::transport::runtime()
+            .map_err(|error| HostedTerminalStartError::Worker(io::Error::other(error)))?;
+        let worker = runtime.spawn(async move {
+            run_with_key_deadlines(
+                &socket,
+                terminal_id,
+                intent,
+                command_rx,
+                event_tx,
+                worker_published,
+                worker_stop,
+            )
+            .await;
+        });
 
         Ok(Self {
             inner: Arc::new(HostedHandleInner {
@@ -948,6 +1119,19 @@ impl HostedTerminalHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .confirmed;
         confirmed.then(|| self.inner.published.proof()).flatten()
+    }
+
+    /// Original worker authority survives transport loss, never worker replacement.
+    pub fn worker_binding(&self) -> Option<HostedTerminalBinding> {
+        self.inner.published.worker_binding.get().cloned()
+    }
+
+    pub fn execution_instance(&self) -> Option<uuid::Uuid> {
+        self.inner
+            .published
+            .worker_binding
+            .get()
+            .map(|binding| binding.execution_instance)
     }
 
     /// Waits for a successful terminal attach, spawn, or reconnect resume.
@@ -1034,6 +1218,80 @@ impl HostedTerminalHandle {
         self.try_command(ClientCommand::Key(key))
     }
 
+    /// Queues a key with an exact-worker admission receipt. Initial keys may
+    /// wait for this actor's first authenticated binding. At most 256 tracked
+    /// keys are retained, each for five seconds including handshake time.
+    pub fn key_with_receipt(&self, input: KeyInput) -> Result<HostedKeyReceipt, TerminalSendError> {
+        self.tracked_key(input, None)
+    }
+
+    /// Orders a paired release behind its original press, and skips it if
+    /// that press was refused. A different actor's receipt grants no authority.
+    pub fn key_after_receipt(
+        &self,
+        input: KeyInput,
+        after: &HostedKeyReceipt,
+    ) -> Result<HostedKeyReceipt, TerminalSendError> {
+        if !std::sync::Weak::ptr_eq(&after.source, &Arc::downgrade(&self.inner.published)) {
+            return Err(TerminalSendError::Closed);
+        }
+        self.tracked_key(input, Some(after.clone()))
+    }
+
+    fn tracked_key(
+        &self,
+        input: KeyInput,
+        after: Option<HostedKeyReceipt>,
+    ) -> Result<HostedKeyReceipt, TerminalSendError> {
+        if self.inner.stop.is_requested() {
+            return Err(TerminalSendError::Closed);
+        }
+        let state = Arc::new(KeyReceiptState {
+            outcome: OnceLock::new(),
+            admission_proof: OnceLock::new(),
+            gate: Mutex::new(()),
+            changed: Condvar::new(),
+        });
+        let receipt = HostedKeyReceipt {
+            source: Arc::downgrade(&self.inner.published),
+            state: Arc::clone(&state),
+        };
+        let ticket = {
+            let mut deliveries = self
+                .inner
+                .published
+                .key_deliveries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if deliveries.pending.len() >= COMMAND_CAPACITY {
+                return Err(TerminalSendError::Full);
+            }
+            let Some(ticket) = deliveries.next_ticket.checked_add(1) else {
+                return Err(TerminalSendError::Closed);
+            };
+            deliveries.next_ticket = ticket;
+            deliveries.pending.insert(
+                ticket,
+                KeyDelivery {
+                    _owner: Arc::clone(&self.inner),
+                    completed: state,
+                    after,
+                    deadline: Instant::now() + DAEMON_READY_TIMEOUT,
+                    in_flight: false,
+                },
+            );
+            ticket
+        };
+        if let Err(error) = self.try_command(ClientCommand::TrackedKey { ticket, input }) {
+            self.inner
+                .published
+                .complete_key(ticket, Err(error.to_string()));
+            return Err(error);
+        }
+        self.inner.published.delivery_changed.notify_one();
+        Ok(receipt)
+    }
+
     pub fn mouse(&self, mouse: MouseInput) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Mouse(mouse))
     }
@@ -1060,6 +1318,10 @@ impl HostedTerminalHandle {
 
     pub fn scroll_to_row(&self, row: u64) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Scroll(TerminalScroll::Row(row)))
+    }
+
+    pub fn scroll_to_match(&self, range: super::SearchMatch) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::Scroll(TerminalScroll::Match(range)))
     }
 
     pub fn set_theme(&self, theme: super::TerminalTheme) -> Result<(), TerminalSendError> {
@@ -1152,7 +1414,9 @@ impl HostedTerminalHandle {
             .map_err(|error| match error {
                 TrySendError::Full(_) => TerminalSendError::Full,
                 TrySendError::Disconnected(_) => TerminalSendError::Closed,
-            })
+            })?;
+        self.inner.published.work_available.notify_one();
+        Ok(())
     }
 }
 
@@ -1170,6 +1434,7 @@ struct SpawnIntent {
 
 #[derive(Debug)]
 enum PendingRequest {
+    KeyDelivery(u64),
     Attach,
     Spawn,
     Snapshot,
@@ -1178,250 +1443,6 @@ enum PendingRequest {
     Hibernate,
     Shutdown(Sender<()>),
 }
-/// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
-///
-/// Ordinary startup is bounded to five seconds; upgrade restoration receives a
-/// bounded per-session allowance. On systemd hosts the daemon runs in its own
-/// user scope, keeping UI cgroup shutdown and memory-pressure kills away from
-/// hosted sessions. Other hosts retain the detached process-group fallback.
-pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
-    ensure_daemon_ready_for(crate::notifications::Application::Cagents)
-}
-
-pub fn ensure_daemon_ready_for(
-    application: crate::notifications::Application,
-) -> Result<PathBuf, HostedTerminalStartError> {
-    let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
-    if !crate::device::is_remote() {
-        ensure_daemon_ready_at(&socket, application)?;
-    }
-    Ok(socket)
-}
-
-fn ensure_daemon_ready_at(
-    socket: &Path,
-    application: crate::notifications::Application,
-) -> Result<(), HostedTerminalStartError> {
-    match UnixStream::connect(socket) {
-        Ok(stream) => {
-            // A listening socket can belong to an older development build.
-            // Verify the wire protocol before opening a window whose actions
-            // would otherwise all fail against that daemon.
-            return verify_daemon_protocol(stream);
-        }
-        Err(error)
-            if !matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Err(HostedTerminalStartError::HostSocket {
-                path: socket.to_owned(),
-                source: error,
-            });
-        }
-        Err(_) => {}
-    }
-
-    let timeout = crate::upgrade::handoff::startup_timeout()
-        .map_err(HostedTerminalStartError::HostStartup)?;
-    let current_exe =
-        std::env::current_exe().map_err(HostedTerminalStartError::CurrentExecutable)?;
-    let daemon_binary = crate::companion::Product::Daemon
-        .beside(&current_exe)
-        .map_err(|_| HostedTerminalStartError::HostBinaryMissing(current_exe))?;
-    if !daemon_binary.is_file() {
-        return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
-    }
-
-    start_daemon_at(
-        socket,
-        timeout,
-        &daemon_binary,
-        systemd_user_manager_available()
-            && !crate::instance::has_inherited_daemon_fence()
-                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?,
-        |scoped| spawn_daemon(&daemon_binary, application, scoped),
-    )?;
-    // Another launcher can win the daemon lease while we wait for readiness;
-    // it must satisfy the same protocol contract as an existing daemon.
-    let stream =
-        UnixStream::connect(socket).map_err(|source| HostedTerminalStartError::HostSocket {
-            path: socket.to_owned(),
-            source,
-        })?;
-    verify_daemon_protocol(stream)
-}
-
-fn verify_daemon_protocol(stream: UnixStream) -> Result<(), HostedTerminalStartError> {
-    crate::control::ControlClient::from_stream(stream)
-        .map(|_| ())
-        .map_err(|error| match error {
-            crate::control::ControlError::UnsupportedVersion { actual } => {
-                HostedTerminalStartError::HostIncompatible { actual }
-            }
-            error => HostedTerminalStartError::HostProtocol(error),
-        })
-}
-
-fn start_daemon_at(
-    socket: &Path,
-    timeout: Duration,
-    daemon_binary: &Path,
-    mut scoped: bool,
-    mut launch: impl FnMut(bool) -> io::Result<Child>,
-) -> Result<(), HostedTerminalStartError> {
-    let launch_error = |source| HostedTerminalStartError::LaunchHost {
-        path: daemon_binary.to_owned(),
-        source,
-    };
-    let mut child = match launch(scoped) {
-        Ok(child) => child,
-        Err(source) if scoped => {
-            tracing::warn!(%source, "could not launch daemon user scope; using process-group fallback");
-            scoped = false;
-            launch(false).map_err(launch_error)?
-        }
-        Err(source) => return Err(launch_error(source)),
-    };
-    let started = Instant::now();
-    let result = loop {
-        let status = match child.try_wait() {
-            Ok(status) => status,
-            Err(error) => break Err(HostedTerminalStartError::HostStartup(error.to_string())),
-        };
-        match daemon_startup_ready(socket, timeout, started.elapsed(), status) {
-            Ok(true) => break Ok(()),
-            Ok(false) => thread::sleep(
-                DAEMON_READY_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
-            ),
-            // A user manager may disappear or reject transient units after
-            // our availability check. Fall back only after the launcher has
-            // exited and no concurrent daemon owns the lease. Never terminate
-            // an existing daemon or retry while restoration owns its lease.
-            Err(HostedTerminalStartError::HostExited { status, .. })
-                if scoped && started.elapsed() < timeout =>
-            {
-                tracing::warn!(%status, "daemon user scope exited before readiness; using process-group fallback");
-                scoped = false;
-                let _ = child.wait();
-                child = match launch(false) {
-                    Ok(child) => child,
-                    Err(source) => break Err(launch_error(source)),
-                };
-            }
-            Err(error) => break Err(error),
-        }
-    };
-    let _ = thread::Builder::new()
-        .name("cagentsd-reaper".into())
-        .spawn(move || {
-            let _ = child.wait();
-        });
-    result
-}
-
-fn systemd_user_manager_available() -> bool {
-    // The private manager socket exists independently of a graphical session's
-    // D-Bus environment. No shell or global systemd environment is involved.
-    cfg!(target_os = "linux")
-        && std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .is_some_and(|runtime| runtime.join("systemd/private").exists())
-}
-
-fn daemon_launch_command(
-    daemon_binary: &Path,
-    application: crate::notifications::Application,
-    scoped: bool,
-) -> Command {
-    let mut command = if scoped {
-        let mut command = Command::new("systemd-run");
-        command.args([
-            "--user",
-            "--scope",
-            "--quiet",
-            "--collect",
-            "--expand-environment=no",
-        ]);
-        // Scope names are per launch rather than per installation: detached
-        // provider/terminal holders can outlive their daemon during upgrades.
-        command.arg(format!("--unit=cagentsd-{}", uuid::Uuid::new_v4()));
-        command.arg("--").arg(daemon_binary);
-        command
-    } else {
-        Command::new(daemon_binary)
-    };
-    crate::install_guard::sanitize_child_environment(&mut command);
-    if application == crate::notifications::Application::Ceditor {
-        command.arg(crate::instance::CEDITOR_NOTIFICATION_ARGUMENT);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        // A scope executes locally, preserving this exact sanitized environment
-        // instead of inheriting stale variables from the user service manager.
-        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV);
-    command
-}
-
-fn spawn_daemon(
-    daemon_binary: &Path,
-    application: crate::notifications::Application,
-    scoped: bool,
-) -> io::Result<Child> {
-    let mut command = daemon_launch_command(daemon_binary, application, scoped);
-    // SAFETY: the hook performs only the close_range syscall before exec.
-    unsafe {
-        command.pre_exec(crate::daemon::seal_inherited_descriptors);
-    }
-    crate::instance::inherit_daemon_fence(&mut command)?;
-    command.spawn()
-}
-
-fn daemon_startup_ready(
-    socket: &Path,
-    timeout: Duration,
-    elapsed: Duration,
-    child_status: Option<ExitStatus>,
-) -> Result<bool, HostedTerminalStartError> {
-    match UnixStream::connect(socket) {
-        Ok(_) => return Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) => {}
-        Err(source) => {
-            return Err(HostedTerminalStartError::HostSocket {
-                path: socket.to_owned(),
-                source,
-            });
-        }
-    }
-    if let Some(status) = child_status {
-        // A concurrent launch can win the lease while our child exits. Its
-        // listener is deliberately absent until every session has restored.
-        if !crate::daemon::HostLease::is_held_at(socket)
-            .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
-        {
-            return Err(HostedTerminalStartError::HostExited {
-                path: socket.to_owned(),
-                status,
-            });
-        }
-    }
-    if elapsed >= timeout {
-        return Err(HostedTerminalStartError::HostReadyTimeout {
-            path: socket.to_owned(),
-            timeout,
-        });
-    }
-    Ok(false)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionEnd {
     Retry,
@@ -1434,66 +1455,77 @@ enum ServerRead {
     Closed,
 }
 
-/// One blocking reader owns the socket clone. The client loop selects between
-/// its bounded inbox and the command channel, so a quiet daemon can never delay
-/// keyboard input. The bounded channel is allocated once per connection rather
-/// than once per frame.
+/// Socket reads share the transport reactor. A bounded inbox and explicit
+/// read credit preserve backpressure without parking one OS thread per pane.
 struct ConnectionIo {
-    writer: UnixStream,
+    writer: Arc<tokio::io::unix::AsyncFd<UnixStream>>,
     codec: FrameCodec,
     incoming: Option<Receiver<ServerRead>>,
-    reader: Option<JoinHandle<()>>,
+    credit: Arc<tokio::sync::Notify>,
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ConnectionIo {
-    fn new(writer: UnixStream, terminal_id: TerminalId) -> io::Result<Self> {
-        writer.set_read_timeout(None)?;
-        let mut reader_stream = writer.try_clone()?;
+    fn new(
+        writer: Arc<tokio::io::unix::AsyncFd<UnixStream>>,
+        published: Arc<HostedPublishedState>,
+    ) -> io::Result<Self> {
         let (incoming_tx, incoming_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
-        let reader = thread::Builder::new()
-            .name(format!("hosted-terminal-reader-{terminal_id}"))
-            .spawn(move || {
+        let socket = Arc::clone(&writer);
+        let credit = Arc::new(tokio::sync::Notify::new());
+        let read_credit = Arc::clone(&credit);
+        let reader = super::transport::runtime()
+            .map_err(io::Error::other)?
+            .spawn(async move {
                 let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
                 loop {
-                    let message = match codec.read::<ServerEnvelope>(&mut reader_stream) {
-                        Ok(Some(envelope)) => ServerRead::Envelope(Box::new(envelope)),
-                        Ok(None) | Err(_) => ServerRead::Closed,
-                    };
+                    let mut message =
+                        match super::transport::read::<ServerEnvelope>(&socket, &mut codec).await {
+                            Ok(Some(envelope)) => ServerRead::Envelope(Box::new(envelope)),
+                            Ok(None) | Err(_) => ServerRead::Closed,
+                        };
                     let closed = matches!(message, ServerRead::Closed);
-                    if incoming_tx.send(message).is_err() || closed {
+                    loop {
+                        match incoming_tx.try_send(message) {
+                            Ok(()) => {
+                                published.work_available.notify_one();
+                                break;
+                            }
+                            Err(TrySendError::Disconnected(_)) => return,
+                            Err(TrySendError::Full(pending)) => message = pending,
+                        }
+                        read_credit.notified().await;
+                    }
+                    if closed {
                         return;
                     }
+                    // A peer with buffered snapshots must return the shared I/O
+                    // executor between frames, even while every read is ready.
+                    tokio::task::yield_now().await;
                 }
-            })?;
+            });
         Ok(Self {
             writer,
             codec: FrameCodec::new(MAX_FRAME_BYTES),
             incoming: Some(incoming_rx),
+            credit,
             reader: Some(reader),
         })
     }
-
-    fn writer(&mut self) -> (&mut UnixStream, &mut FrameCodec) {
-        (&mut self.writer, &mut self.codec)
+    fn writer(&mut self) -> (&tokio::io::unix::AsyncFd<UnixStream>, &mut FrameCodec) {
+        (&self.writer, &mut self.codec)
     }
-
     fn incoming(&self) -> &Receiver<ServerRead> {
-        self.incoming
-            .as_ref()
-            .expect("connection inbox exists until close")
+        self.incoming.as_ref().expect("inbox until close")
     }
-
     fn close(&mut self) {
-        // Dropping the inbox releases a reader blocked on its bounded send;
-        // shutting down the socket releases one blocked in `read_frame`.
         self.incoming.take();
-        let _ = self.writer.shutdown(Shutdown::Both);
+        let _ = self.writer.get_ref().shutdown(Shutdown::Both);
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            reader.abort();
         }
     }
 }
-
 impl Drop for ConnectionIo {
     fn drop(&mut self) {
         self.close();
@@ -1511,6 +1543,7 @@ enum ClientWork {
     ServerClosed,
 }
 
+#[cfg(test)]
 fn wait_for_client_work(
     stop: &WorkerStop,
     commands: &Receiver<ClientCommand>,
@@ -1530,6 +1563,7 @@ fn wait_for_client_work(
     }
 }
 
+#[cfg(test)]
 fn wait_for_server_or_stop(
     stop: &WorkerStop,
     incoming: &Receiver<ServerRead>,
@@ -1551,17 +1585,129 @@ fn server_work(message: Result<ServerRead, crossbeam_channel::RecvError>) -> Cli
     }
 }
 
+async fn wait_for_work_async(
+    stop: &WorkerStop,
+    commands: Option<&Receiver<ClientCommand>>,
+    incoming: &Receiver<ServerRead>,
+    published: &HostedPublishedState,
+    credit: &tokio::sync::Notify,
+) -> ClientWork {
+    loop {
+        let changed = published.work_available.notified();
+        let stopping = stop.async_wake.notified();
+        tokio::pin!(changed, stopping);
+        changed.as_mut().enable();
+        stopping.as_mut().enable();
+        if stop.is_requested() {
+            return ClientWork::Stop;
+        }
+        if published.acknowledgement_rx.try_recv().is_ok() {
+            return ClientWork::Acknowledge;
+        }
+        let expires = published
+            .retained
+            .load()
+            .as_ref()
+            .map(|frame| frame.expires);
+        if expires.is_some_and(|deadline| deadline <= Instant::now()) {
+            return ClientWork::RetainedExpired;
+        }
+        if let Some(commands) = commands {
+            match commands.try_recv() {
+                Ok(command) => return ClientWork::Command(command),
+                Err(TryRecvError::Disconnected) => return ClientWork::CommandsClosed,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        match incoming.try_recv() {
+            Ok(message) => {
+                credit.notify_one();
+                return server_work(Ok(message));
+            }
+            Err(TryRecvError::Disconnected) => return ClientWork::ServerClosed,
+            Err(TryRecvError::Empty) => {}
+        }
+        let expiration = async {
+            match expires {
+                Some(deadline) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! { biased;
+            _ = stopping => {},
+            _ = changed => {},
+            _ = expiration => {},
+        }
+    }
+}
+
 struct ConnectionContext<'a> {
     socket: &'a Path,
     terminal_id: TerminalId,
     intent: &'a ConnectionIntent,
     commands: &'a Receiver<ClientCommand>,
     events: &'a Sender<TerminalEvent>,
-    published: &'a HostedPublishedState,
+    published: &'a Arc<HostedPublishedState>,
     stop: &'a WorkerStop,
 }
 
-fn client_loop(
+struct KeyReceiptGuard(Arc<HostedPublishedState>);
+impl Drop for KeyReceiptGuard {
+    fn drop(&mut self) {
+        self.0
+            .fail_keys("terminal key delivery ended without an authenticated admission receipt");
+    }
+}
+async fn run_with_key_deadlines(
+    socket: &Path,
+    terminal_id: TerminalId,
+    intent: ConnectionIntent,
+    commands: Receiver<ClientCommand>,
+    events: Sender<TerminalEvent>,
+    published: Arc<HostedPublishedState>,
+    stop: Arc<WorkerStop>,
+) {
+    let _receipts = KeyReceiptGuard(Arc::clone(&published));
+    let run = client_loop(
+        socket,
+        terminal_id,
+        intent,
+        commands,
+        events,
+        Arc::clone(&published),
+        Arc::clone(&stop),
+    );
+    tokio::pin!(run);
+    loop {
+        let changed = published.delivery_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let deadline = published.key_deadline();
+        let expired = async {
+            match deadline {
+                Some(deadline) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {biased;
+            _=&mut run=>break,
+            _=changed=>{},
+            _=expired=>{
+                // An unanswered write is not replayable: the old worker may
+                // already have admitted it. Fence this actor and fail queued
+                // later keys rather than replaying an old release out of order.
+                stop.request();
+                published.fail_keys("terminal key admission was not confirmed before its five-second deadline");
+            },
+        }
+    }
+}
+
+async fn client_loop(
     socket: &Path,
     terminal_id: TerminalId,
     intent: ConnectionIntent,
@@ -1590,7 +1736,19 @@ fn client_loop(
         let end = serve_connection(&connection, &mut carried, || {
             reconnect_started = None;
             reconnect_delay = INITIAL_RECONNECT_DELAY;
-        });
+        })
+        .await;
+        published
+            .attachment
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .confirmed = false;
+        if published.has_in_flight_key() {
+            stop.request();
+            published.fail_keys(
+                "terminal connection ended before key admission was confirmed; delivery is unknown",
+            );
+        }
         published.invalidate_activity();
         let _ = published.observe_agent_activity(&events, None);
         match end {
@@ -1598,7 +1756,7 @@ fn client_loop(
             ConnectionEnd::Retry => {
                 let started = reconnect_started.get_or_insert_with(Instant::now);
                 if started.elapsed() >= DAEMON_READY_TIMEOUT {
-                    reject_handshake(
+                    reject_handshake_async(
                         &events,
                         &published,
                         &stop,
@@ -1607,13 +1765,14 @@ fn client_loop(
                             "daemon connection was lost; rediscovery is required before this terminal can continue",
                             false,
                         ),
-                    );
+                    ).await;
                     break;
                 }
             }
         }
 
-        if wait_before_reconnect(&stop, &commands, &mut carried, reconnect_delay)
+        if wait_before_reconnect_async(&stop, &commands, &published, &mut carried, reconnect_delay)
+            .await
             == ConnectionEnd::Stop
         {
             break;
@@ -1628,6 +1787,7 @@ fn client_loop(
     published.fail_attachment("hosted terminal connection stopped".to_owned());
 }
 
+#[cfg(test)]
 fn wait_before_reconnect(
     stop: &WorkerStop,
     commands: &Receiver<ClientCommand>,
@@ -1665,6 +1825,43 @@ fn wait_before_reconnect(
         }
     }
 }
+async fn wait_before_reconnect_async(
+    stop: &WorkerStop,
+    commands: &Receiver<ClientCommand>,
+    published: &HostedPublishedState,
+    carried: &mut Option<ClientCommand>,
+    delay: Duration,
+) -> ConnectionEnd {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        let changed = published.work_available.notified();
+        let stopping = stop.async_wake.notified();
+        tokio::pin!(changed, stopping);
+        changed.as_mut().enable();
+        stopping.as_mut().enable();
+        if stop.is_requested() {
+            return ConnectionEnd::Stop;
+        }
+        if carried.is_none() {
+            match commands.try_recv() {
+                Ok(ClientCommand::Stop) | Err(TryRecvError::Disconnected) => {
+                    return ConnectionEnd::Stop;
+                }
+                Ok(command) => {
+                    *carried = Some(command);
+                    return ConnectionEnd::Retry;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        tokio::select! { biased;
+            _ = stopping => {},
+            _ = changed => {},
+            _ = tokio::time::sleep_until(deadline) => return ConnectionEnd::Retry,
+        }
+    }
+}
+
 fn coalesce_client_scroll_command(
     command: ClientCommand,
     commands: &Receiver<ClientCommand>,
@@ -1687,7 +1884,7 @@ fn coalesce_client_scroll_command(
     ClientCommand::Scroll(TerminalScroll::Lines(delta))
 }
 
-fn serve_connection(
+async fn serve_connection(
     context: &ConnectionContext<'_>,
     carried: &mut Option<ClientCommand>,
     mut did_attach: impl FnMut(),
@@ -1705,23 +1902,21 @@ fn serve_connection(
     if stop.is_requested() {
         return ConnectionEnd::Stop;
     }
-    let mut stream = match UnixStream::connect(socket) {
+    let stream = match tokio::net::UnixStream::connect(socket)
+        .await
+        .and_then(|stream| stream.into_std())
+    {
         Ok(stream) => stream,
         Err(_) => return ConnectionEnd::Retry,
     };
-    let _connection = match stop.register_connection(&stream) {
+    let stream = match tokio::io::unix::AsyncFd::new(stream) {
+        Ok(stream) => Arc::new(stream),
+        Err(_) => return ConnectionEnd::Retry,
+    };
+    let _connection = match stop.register_connection(stream.get_ref()) {
         Ok(registration) => registration,
         Err(_) => return ConnectionEnd::Retry,
     };
-    if stream
-        .set_read_timeout(Some(HANDSHAKE_POLL_INTERVAL))
-        .is_err()
-        || stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
 
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
@@ -1739,7 +1934,10 @@ fn serve_connection(
             }],
         },
     };
-    if write_frame(&mut stream, &connect).is_err() {
+    let mut connect_codec = FrameCodec::new(MAX_FRAME_BYTES);
+    if connect_codec.encode(&connect).is_err()
+        || write_encoded(&stream, &connect_codec).await.is_err()
+    {
         return ConnectionEnd::Retry;
     }
 
@@ -1755,7 +1953,14 @@ fn serve_connection(
         if Instant::now() >= handshake_deadline {
             return ConnectionEnd::Retry;
         }
-        let envelope = match handshake_codec.read::<ServerEnvelope>(&mut stream) {
+        let read_deadline = (Instant::now() + HANDSHAKE_POLL_INTERVAL).min(handshake_deadline);
+        let frame = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(read_deadline),
+            super::transport::read::<ServerEnvelope>(&stream, &mut handshake_codec),
+        )
+        .await
+        .unwrap_or_else(|_| Err(FrameError::Io(io::ErrorKind::TimedOut.into())));
+        let envelope = match frame {
             Ok(Some(envelope)) => envelope,
             Ok(None) => return ConnectionEnd::Retry,
             Err(FrameError::Io(error)) if is_timeout(&error) => {
@@ -1800,7 +2005,7 @@ fn serve_connection(
         let unsolicited = envelope.request_id.is_none();
         if envelope.request_id != Some(connect_id) {
             if unsolicited && let ServerMessage::Error(error) = envelope.message {
-                return reject_handshake(events, published, stop, error);
+                return reject_handshake_async(events, published, stop, error).await;
             }
             return ConnectionEnd::Retry;
         }
@@ -1809,7 +2014,7 @@ fn serve_connection(
                 response: ServerResponse::Connected { proof, resumed },
             } => {
                 if envelope.proof != proof || !published.pin_proof(&proof) {
-                    return reject_handshake(
+                    return reject_handshake_async(
                         events,
                         published,
                         stop,
@@ -1818,7 +2023,8 @@ fn serve_connection(
                             "the daemon returned a different or incomplete session proof",
                             false,
                         ),
-                    );
+                    )
+                    .await;
                 }
                 let attached = resumed
                     .iter()
@@ -1827,6 +2033,15 @@ fn serve_connection(
                     .iter()
                     .find(|terminal| terminal.session.id == terminal_id && terminal.attached)
                 {
+                    if !published.pin_worker(terminal) {
+                        return reject_handshake_async(
+                            events,
+                            published,
+                            stop,
+                            worker_changed_error(),
+                        )
+                        .await;
+                    }
                     published.observe_activity(terminal.activity);
                     if published
                         .observe_agent_activity(events, terminal.agent_activity)
@@ -1838,17 +2053,17 @@ fn serve_connection(
                     did_attach();
                 }
                 #[cfg(feature = "ui")]
-                crate::daemon_health::frame(&stream, None, health_request);
+                crate::daemon_health::frame(stream.get_ref(), None, health_request);
                 break (proof, attached);
             }
             ServerMessage::Error(error) => {
-                return reject_handshake(events, published, stop, error);
+                return reject_handshake_async(events, published, stop, error).await;
             }
             _ => return ConnectionEnd::Retry,
         }
     };
 
-    let mut connection = match ConnectionIo::new(stream, terminal_id) {
+    let mut connection = match ConnectionIo::new(stream, Arc::clone(published)) {
         Ok(connection) => connection,
         Err(_) => return ConnectionEnd::Retry,
     };
@@ -1864,7 +2079,18 @@ fn serve_connection(
     }
 
     if !attached {
+        // Once accepted, this handle can only reattach its original worker.
+        // Losing that worker must never replay the original spawn intent.
+        let attach_only = published.worker_binding.get().is_some();
         let (kind, request) = match intent {
+            ConnectionIntent::Spawn(_) if attach_only => (
+                PendingRequest::Attach,
+                ClientRequest::Attach {
+                    terminal_id,
+                    after_generation: published.snapshot_cursor(),
+                    after_event_sequence: published.event_sequence.load(Ordering::Acquire),
+                },
+            ),
             ConnectionIntent::Attach => (
                 PendingRequest::Attach,
                 ClientRequest::Attach {
@@ -1893,6 +2119,7 @@ fn serve_connection(
             kind,
             request,
         )
+        .await
         .is_err()
         {
             return ConnectionEnd::Retry;
@@ -1904,47 +2131,84 @@ fn serve_connection(
         return ConnectionEnd::Stop;
     }
 
-    if send_request(
-        connection.writer(),
-        &proof,
-        &mut next_request_id,
-        &mut pending,
-        PendingRequest::Command("restore hosted terminal visibility"),
-        ClientRequest::SetVisibility {
-            terminal_id,
-            visibility: published.desired_visibility(),
-        },
-    )
-    .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
-    let epoch = published
-        .output_observation
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .epoch;
-    if epoch != 0
-        && send_request(
-            connection.writer(),
-            &proof,
-            &mut next_request_id,
-            &mut pending,
-            PendingRequest::Command("restore terminal output observation"),
-            ClientRequest::TerminalAcknowledge { terminal_id, epoch },
-        )
-        .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
+    let mut presentation_restored = false;
+    // Attach registers a subscription before its descriptor reply is encoded.
+    // Retain broadcasts without publishing/cursor advancement until the reply
+    // proves this exact worker; a same-ID successor must not inherit consent.
+    let mut unconfirmed = std::collections::VecDeque::new();
+    let mut unconfirmed_bytes = 0usize;
+    let mut unconfirmed_codec = None;
+    let mut ready_turns = 0usize;
 
     loop {
+        if published
+            .key_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            stop.request();
+            published.fail_keys(
+                "terminal key admission was not confirmed before its five-second deadline",
+            );
+            return ConnectionEnd::Stop;
+        }
+        // A busy decoded inbox can be immediately ready indefinitely. Bound
+        // its executor turn as well as its memory so other attachments and the
+        // deadline supervisor can run without an idle polling timer.
+        ready_turns += 1;
+        if ready_turns == 32 {
+            ready_turns = 0;
+            tokio::task::yield_now().await;
+        }
         published.expire_retained(Instant::now());
         if stop.is_requested() {
             connection.close();
             return ConnectionEnd::Stop;
         }
-        while pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        if attached && !presentation_restored {
+            if send_request(
+                connection.writer(),
+                &proof,
+                &mut next_request_id,
+                &mut pending,
+                PendingRequest::Command("restore hosted terminal visibility"),
+                ClientRequest::SetVisibility {
+                    terminal_id,
+                    visibility: published.desired_visibility(),
+                },
+            )
+            .await
+            .is_err()
+            {
+                return ConnectionEnd::Retry;
+            }
+            let epoch = published
+                .output_observation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .epoch;
+            if epoch != 0
+                && send_request(
+                    connection.writer(),
+                    &proof,
+                    &mut next_request_id,
+                    &mut pending,
+                    PendingRequest::Command("restore terminal output observation"),
+                    ClientRequest::TerminalAcknowledge { terminal_id, epoch },
+                )
+                .await
+                .is_err()
+            {
+                return ConnectionEnd::Retry;
+            }
+
+            presentation_restored = true;
+        }
+        while attached
+            && pending.len() < MAX_IN_FLIGHT_REQUESTS
+            && !pending
+                .values()
+                .any(|kind| matches!(kind, PendingRequest::KeyDelivery(_)))
+        {
             if stop.is_requested() {
                 connection.close();
                 return ConnectionEnd::Stop;
@@ -1968,8 +2232,43 @@ fn serve_connection(
                 connection.close();
                 return ConnectionEnd::Stop;
             }
+            if let ClientCommand::TrackedKey { ticket, .. } = &command {
+                let prerequisite = published
+                    .key_deliveries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .get(ticket)
+                    .and_then(|delivery| delivery.after.as_ref())
+                    .map(HostedKeyReceipt::try_recv);
+                match prerequisite {
+                    Some(Ok(Err(reason))) => {
+                        published.complete_key(
+                            *ticket,
+                            Err(format!("paired press was not admitted: {reason}")),
+                        );
+                        continue;
+                    }
+                    Some(Err(_)) => {
+                        *carried = Some(command);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
             let operation = command.operation();
             let pending_kind = match &command {
+                ClientCommand::TrackedKey { ticket, .. } => {
+                    let mut deliveries = published
+                        .key_deliveries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let Some(delivery) = deliveries.pending.get_mut(ticket) else {
+                        continue;
+                    };
+                    delivery.in_flight = true;
+                    PendingRequest::KeyDelivery(*ticket)
+                }
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
@@ -1984,6 +2283,7 @@ fn serve_connection(
                 pending_kind,
                 command.into_request(terminal_id),
             )
+            .await
             .is_err()
             {
                 return ConnectionEnd::Retry;
@@ -2004,6 +2304,7 @@ fn serve_connection(
                         generation: acknowledged,
                     },
                 )
+                .await
                 .is_err()
                 {
                     return ConnectionEnd::Retry;
@@ -2012,10 +2313,27 @@ fn serve_connection(
             }
         }
 
-        let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS {
-            wait_for_client_work(stop, commands, connection.incoming(), published)
+        let work = if attached && !unconfirmed.is_empty() {
+            let envelope = unconfirmed.pop_front().expect("nonempty above");
+            if unconfirmed.is_empty() {
+                unconfirmed_bytes = 0;
+                unconfirmed_codec = None;
+            }
+            ClientWork::Server(envelope)
         } else {
-            wait_for_server_or_stop(stop, connection.incoming(), published)
+            wait_for_work_async(
+                stop,
+                (attached
+                    && pending.len() < MAX_IN_FLIGHT_REQUESTS
+                    && !pending
+                        .values()
+                        .any(|kind| matches!(kind, PendingRequest::KeyDelivery(_))))
+                .then_some(*commands),
+                connection.incoming(),
+                published,
+                &connection.credit,
+            )
+            .await
         };
         let envelope = match work {
             ClientWork::Acknowledge | ClientWork::RetainedExpired => continue,
@@ -2047,6 +2365,31 @@ fn serve_connection(
             return ConnectionEnd::Retry;
         }
 
+        if !attached
+            && envelope.request_id.is_none()
+            && matches!(
+                &envelope.message,
+                ServerMessage::Event { .. }
+                    | ServerMessage::Snapshot { .. }
+                    | ServerMessage::Redraw { .. }
+                    | ServerMessage::TerminalObserved { .. }
+                    | ServerMessage::Synchronized { .. }
+            )
+        {
+            let codec = unconfirmed_codec.get_or_insert_with(|| FrameCodec::new(MAX_FRAME_BYTES));
+            if codec.encode(&*envelope).is_err() {
+                return ConnectionEnd::Retry;
+            }
+            let bytes = codec.encoded().len();
+            if unconfirmed.len() >= EVENT_CAPACITY
+                || unconfirmed_bytes.saturating_add(bytes) > MAX_FRAME_BYTES
+            {
+                return ConnectionEnd::Retry;
+            }
+            unconfirmed_bytes += bytes;
+            unconfirmed.push_back(envelope);
+            continue;
+        }
         match envelope.message {
             ServerMessage::Response { response } => {
                 let Some(request_id) = envelope.request_id else {
@@ -2056,9 +2399,34 @@ fn serve_connection(
                     return ConnectionEnd::Retry;
                 };
                 match (kind, response) {
+                    (PendingRequest::KeyDelivery(ticket), ServerResponse::Accepted) => {
+                        let result = published.worker_binding.get().cloned().ok_or_else(|| {
+                            "key accepted without authenticated worker identity".to_owned()
+                        });
+                        if !published.admit_key(ticket, result, &proof) {
+                            stop.request();
+                            return ConnectionEnd::Stop;
+                        }
+                    }
+                    (PendingRequest::KeyDelivery(ticket), unexpected) => {
+                        published.complete_key(
+                            ticket,
+                            Err(format!("unexpected key admission response: {unexpected:?}")),
+                        );
+                        return ConnectionEnd::Stop;
+                    }
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
                     {
+                        if !published.pin_worker(&terminal) {
+                            return reject_handshake_async(
+                                events,
+                                published,
+                                stop,
+                                worker_changed_error(),
+                            )
+                            .await;
+                        }
                         attached = true;
                         published.observe_activity(terminal.activity);
                         if published
@@ -2082,6 +2450,15 @@ fn serve_connection(
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
                         if terminal.session.id == terminal_id =>
                     {
+                        if !published.pin_worker(&terminal) {
+                            return reject_handshake_async(
+                                events,
+                                published,
+                                stop,
+                                worker_changed_error(),
+                            )
+                            .await;
+                        }
                         attached = true;
                         published.observe_activity(terminal.activity);
                         if published
@@ -2126,6 +2503,7 @@ fn serve_connection(
                                     after_generation: 0,
                                 },
                             )
+                            .await
                             .is_err()
                             {
                                 return ConnectionEnd::Retry;
@@ -2178,6 +2556,23 @@ fn serve_connection(
                         ConnectionEnd::Stop
                     };
                 };
+                if let Some(PendingRequest::KeyDelivery(ticket)) = pending.get(&request_id) {
+                    let ticket = *ticket;
+                    pending.remove(&request_id);
+                    // A typed refusal is final for this key. Never retry an old
+                    // release behind a newer press. Later queued keys retain
+                    // their order; the consumer receives explicit failure.
+                    published.complete_key(
+                        ticket,
+                        Err(format!("key admission refused: {}", error.message)),
+                    );
+                    let fatal = error.code == ProtocolErrorCode::ProofMismatch;
+                    publish_protocol_error(events, published, "send terminal key", error);
+                    if fatal {
+                        return ConnectionEnd::Stop;
+                    }
+                    continue;
+                }
                 let mut attachment_failed = false;
                 let operation = match pending.remove(&request_id) {
                     Some(PendingRequest::Attach) => {
@@ -2198,6 +2593,7 @@ fn serve_connection(
                     Some(PendingRequest::Hibernate) => "hibernate terminal",
                     Some(PendingRequest::Shutdown(_)) => "shutdown terminal",
                     Some(PendingRequest::Command(operation)) => operation,
+                    Some(PendingRequest::KeyDelivery(_)) => unreachable!("handled above"),
                     None => return ConnectionEnd::Retry,
                 };
                 let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
@@ -2239,6 +2635,7 @@ fn serve_connection(
                             after_generation: published.snapshot_cursor(),
                         },
                     )
+                    .await
                     .is_err()
                     {
                         return ConnectionEnd::Retry;
@@ -2262,6 +2659,7 @@ fn serve_connection(
                             after_generation: 0,
                         },
                     )
+                    .await
                     .is_err()
                     {
                         return ConnectionEnd::Retry;
@@ -2303,6 +2701,7 @@ fn serve_connection(
                             after_generation: published.snapshot_cursor(),
                         },
                     )
+                    .await
                     .is_err()
                     {
                         return ConnectionEnd::Retry;
@@ -2318,8 +2717,16 @@ fn serve_connection(
     }
 }
 
-fn send_request(
-    (stream, codec): (&mut UnixStream, &mut FrameCodec),
+fn worker_changed_error() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::ProofMismatch,
+        "The terminal worker changed; rediscover its current attachment before sending input",
+        false,
+    )
+}
+
+async fn send_request(
+    (stream, codec): (&tokio::io::unix::AsyncFd<UnixStream>, &mut FrameCodec),
     proof: &HostSessionProof,
     next_request_id: &mut u64,
     pending: &mut BTreeMap<u64, PendingRequest>,
@@ -2328,17 +2735,28 @@ fn send_request(
 ) -> Result<(), FrameError> {
     let request_id = *next_request_id;
     *next_request_id = (*next_request_id).wrapping_add(1).max(2);
-    codec.write(
-        stream,
-        &ClientEnvelope {
-            version: PROTOCOL_VERSION,
-            request_id,
-            proof: Some(proof.clone()),
-            request,
-        },
-    )?;
+    codec.encode(&ClientEnvelope {
+        version: PROTOCOL_VERSION,
+        request_id,
+        proof: Some(proof.clone()),
+        request,
+    })?;
+    write_encoded(stream, codec).await?;
     pending.insert(request_id, kind);
     Ok(())
+}
+
+async fn write_encoded(
+    socket: &tokio::io::unix::AsyncFd<UnixStream>,
+    codec: &FrameCodec,
+) -> Result<(), FrameError> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        super::transport::write(socket, codec.encoded()),
+    )
+    .await
+    .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+    .map_err(FrameError::Io)
 }
 
 fn is_timeout(error: &io::Error) -> bool {
@@ -2392,7 +2810,19 @@ fn is_committed_daemon_shutdown(error: &ProtocolError) -> bool {
             == "Daemon upgrade/shutdown is committed; no further control mutations are accepted"
 }
 
+#[cfg(test)]
 fn reject_handshake(
+    events: &Sender<TerminalEvent>,
+    published: &HostedPublishedState,
+    stop: &WorkerStop,
+    error: ProtocolError,
+) -> ConnectionEnd {
+    super::transport::runtime()
+        .unwrap()
+        .block_on(reject_handshake_async(events, published, stop, error))
+}
+
+async fn reject_handshake_async(
     events: &Sender<TerminalEvent>,
     published: &HostedPublishedState,
     stop: &WorkerStop,
@@ -2421,13 +2851,31 @@ fn reject_handshake(
         operation: "connect to cagents daemon",
         message: error.message,
     };
-    crossbeam_channel::select_biased! {
-        recv(stop.notification()) -> _ => {}
-        send(events, event) -> sent => {
-            if sent.is_ok() {
-                published.request_semantic_wake();
-            }
+    let mut event = event;
+    let mut retry = Duration::from_millis(1);
+    loop {
+        let stopping = stop.async_wake.notified();
+        tokio::pin!(stopping);
+        stopping.as_mut().enable();
+        if stop.is_requested() {
+            break;
         }
+        match events.try_send(event) {
+            Ok(()) => {
+                published.request_semantic_wake();
+                break;
+            }
+            Err(TrySendError::Disconnected(_)) => break,
+            Err(TrySendError::Full(pending)) => event = pending,
+        }
+        // Only permanent failure delivery retries: ordinary idle connections
+        // have no timer. The existing public receiver has no consume hook;
+        // back off while preserving its final error and cancel on handle drop.
+        tokio::select! { biased;
+            _ = stopping => break,
+            _ = tokio::time::sleep(retry) => {},
+        }
+        retry = (retry * 2).min(Duration::from_millis(256));
     }
     ConnectionEnd::Stop
 }
@@ -2469,6 +2917,120 @@ mod tests {
 
     use super::*;
     #[test]
+    fn thirty_hosted_terminals_add_no_os_threads() {
+        const FIXTURE: &str = "CAGENTS_HOSTED_TRANSPORT_CENSUS";
+        if std::env::var_os(FIXTURE).is_none() {
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "terminal::hosted::tests::thirty_hosted_terminals_add_no_os_threads",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(FIXTURE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let runtime = super::super::transport::runtime().unwrap();
+        let count = || std::fs::read_dir("/proc/self/task").unwrap().count();
+        let idle = count();
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("transport-census.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let pinned = proof("transport-census");
+        let server_proof = pinned.clone();
+        let server = runtime.spawn(async move {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            let mut clients = Vec::new();
+            for _ in 0..30 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let pinned = server_proof.clone();
+                clients.push(tokio::spawn(async move {
+                    let stream = tokio::io::unix::AsyncFd::new(stream.into_std().unwrap()).unwrap();
+                    let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                    while let Ok(Some(request)) =
+                        super::super::transport::read::<ClientEnvelope>(&stream, &mut codec).await
+                    {
+                        let response = match request.request {
+                            ClientRequest::Connect { resume, .. } => {
+                                let terminal_id = resume[0].terminal_id;
+                                let mut terminal = TerminalDescriptor::relaunchable(
+                                    terminal_id,
+                                    session().launch,
+                                    None,
+                                );
+                                terminal.execution_instance = terminal_id.as_uuid();
+                                terminal.attached = true;
+                                ServerResponse::Connected {
+                                    proof: pinned.clone(),
+                                    resumed: vec![terminal],
+                                }
+                            }
+                            ClientRequest::Snapshot { terminal_id, .. } => {
+                                ServerResponse::Snapshot {
+                                    terminal_id,
+                                    snapshot: None,
+                                }
+                            }
+                            _ => ServerResponse::Accepted,
+                        };
+                        codec
+                            .encode(&ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: pinned.clone(),
+                                message: ServerMessage::Response { response },
+                            })
+                            .unwrap();
+                        if super::super::transport::write(&stream, codec.encoded())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
+            }
+            for client in clients {
+                client.await.unwrap();
+            }
+        });
+        let mut handles = Vec::new();
+        for _ in 0..30 {
+            let handle = HostedTerminalHandle::connect_at(
+                socket.clone(),
+                TerminalId::new(),
+                Some(pinned.clone()),
+                |_| {},
+            )
+            .unwrap();
+            handle.wait_until_attached(Duration::from_secs(3)).unwrap();
+            handles.push(handle);
+        }
+        let attached = count();
+        assert!(
+            attached <= idle,
+            "idle={idle}, thirty_hosted_terminals={attached}"
+        );
+        println!("hosted_transport_thread_census idle={idle} thirty_terminals={attached}");
+        drop(handles);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
     fn stopping_an_attachment_interrupts_blocked_socket_io() {
         let stop = Arc::new(WorkerStop::default());
         let (mut client, _server) = UnixStream::pair().unwrap();
@@ -2493,324 +3055,6 @@ mod tests {
         use std::io::Read;
         assert_eq!((&client).read(&mut [0]).unwrap(), 0);
     }
-    #[test]
-    fn startup_waits_for_six_second_restoration_before_accepting_listener() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("daemon.sock");
-        let timeout = Duration::from_secs(35);
-        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
-        let _listener = UnixListener::bind(&socket).unwrap();
-        assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
-    }
-
-    fn hold_startup_lease(socket: &Path) -> crate::daemon::HostLease {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let paths = crate::daemon::RuntimePaths {
-            #[cfg(feature = "host")]
-            directory: socket.parent().unwrap().to_owned(),
-            socket: socket.to_owned(),
-            lock: socket.with_file_name("cagentsd.lock"),
-        };
-        std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&paths.lock)
-            .unwrap();
-        // Match the daemon's explicit unlock: a concurrent fork can still own
-        // a copy of the descriptor after this thread drops its copy.
-        crate::daemon::HostLease::acquire_for_maintenance(&paths).unwrap()
-    }
-
-    #[test]
-    fn unavailable_scope_launcher_falls_back_once() {
-        for spawn_error in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let socket = directory.path().join("daemon.sock");
-            let mut attempts = Vec::new();
-            let mut listener = None;
-            start_daemon_at(
-                &socket,
-                Duration::from_secs(2),
-                Path::new("fixture-daemon"),
-                true,
-                |scoped| {
-                    attempts.push(scoped);
-                    if scoped && spawn_error {
-                        return Err(io::Error::from(io::ErrorKind::NotFound));
-                    }
-                    if !scoped {
-                        listener = Some(UnixListener::bind(&socket).unwrap());
-                    }
-                    Command::new("/bin/false").spawn()
-                },
-            )
-            .unwrap();
-            assert_eq!(attempts, [true, false]);
-        }
-    }
-
-    #[test]
-    fn failed_scope_and_direct_launch_stop_after_one_fallback() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("daemon.sock");
-        let mut attempts = Vec::new();
-        let result = start_daemon_at(
-            &socket,
-            Duration::from_secs(2),
-            Path::new("fixture-daemon"),
-            true,
-            |scoped| {
-                attempts.push(scoped);
-                Command::new("/bin/false").spawn()
-            },
-        );
-        assert!(matches!(
-            result,
-            Err(HostedTerminalStartError::HostExited { .. })
-        ));
-        assert_eq!(attempts, [true, false]);
-    }
-
-    #[test]
-    fn scoped_launch_failure_does_not_replace_a_restoring_daemon() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("daemon.sock");
-        let _lease = hold_startup_lease(&socket);
-        let mut attempts = Vec::new();
-        let result = start_daemon_at(
-            &socket,
-            Duration::from_millis(75),
-            Path::new("fixture-daemon"),
-            true,
-            |scoped| {
-                attempts.push(scoped);
-                Command::new("/bin/false").spawn()
-            },
-        );
-        assert!(matches!(
-            result,
-            Err(HostedTerminalStartError::HostReadyTimeout { .. })
-        ));
-        assert_eq!(attempts, [true]);
-    }
-
-    #[test]
-    fn existing_daemon_is_preserved_before_launch_selection() {
-        for version in [PROTOCOL_VERSION, PROTOCOL_VERSION - 1] {
-            let directory = tempfile::tempdir().unwrap();
-            let socket = directory.path().join("daemon.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
-            let server = thread::spawn(move || {
-                let mut stream = accept_connection(&listener);
-                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-                let proof = proof("existing");
-                write_frame(
-                    &mut stream,
-                    &ServerEnvelope {
-                        version,
-                        request_id: Some(request.request_id),
-                        proof: proof.clone(),
-                        message: ServerMessage::Response {
-                            response: ServerResponse::Connected {
-                                proof,
-                                resumed: Vec::new(),
-                            },
-                        },
-                    },
-                )
-                .unwrap();
-            });
-            let result =
-                ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
-            if version == PROTOCOL_VERSION {
-                result.unwrap();
-            } else {
-                assert!(
-                    matches!(result, Err(HostedTerminalStartError::HostIncompatible {
-                    actual
-                }) if actual == version)
-                );
-            }
-            server.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
-        if !systemd_user_manager_available() {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("scope-evidence");
-        let mut command = daemon_launch_command(
-            Path::new("/bin/sh"),
-            crate::notifications::Application::Cagents,
-            true,
-        );
-        // This argument and environment value must survive systemd without
-        // manager-side variable expansion or replacement by manager state.
-        command
-            .env("CAGENTS_SCOPE_TEST", "caller-value")
-            .args(["-c", "cat /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
-            .arg(&output)
-            .arg("$HOME");
-        let status = command.status().unwrap();
-        assert!(status.success(), "scope launch failed: {status}");
-        let evidence = std::fs::read_to_string(output).unwrap();
-        // A detached holder must survive a daemon handoff. Scope launchers
-        // return when the main process exits and leave its children in place.
-        let holder_pid: i32 = evidence.lines().nth(3).unwrap().parse().unwrap();
-        let holder_cgroup = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup"));
-        // SAFETY: this PID belongs to the fixture's own background sleep.
-        unsafe { libc::kill(holder_pid, libc::SIGTERM) };
-        let holder_cgroup = holder_cgroup.unwrap();
-        let caller = std::fs::read_to_string("/proc/self/cgroup").unwrap();
-        let mut lines = evidence.lines();
-        let scope = lines.next().unwrap();
-        assert_ne!(scope, caller.trim());
-        assert!(
-            scope.contains("cagentsd-") && scope.ends_with(".scope"),
-            "{scope}"
-        );
-        assert_eq!(lines.next(), Some("$HOME"));
-        assert_eq!(lines.next(), Some("caller-value"));
-        assert_eq!(holder_cgroup.trim(), scope);
-    }
-
-    #[test]
-    fn exited_launcher_waits_for_winners_sequential_restoration() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("daemon.sock");
-        let _lease = hold_startup_lease(&socket);
-        let timeout = Duration::from_secs(65);
-        let loser = Some(ExitStatus::from_raw(1 << 8));
-        // Two providers may each consume thirty seconds. The winner owns the
-        // inventory throughout; even incomplete lease metadata is not failure.
-        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(30), loser).unwrap());
-        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(60), loser).unwrap());
-        let _listener = UnixListener::bind(&socket).unwrap();
-        assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(61), loser).unwrap());
-    }
-
-    #[test]
-    fn exited_startup_fails_without_owner_and_owner_cannot_extend_deadline() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("daemon.sock");
-        let timeout = Duration::from_secs(35);
-        let exited = Some(ExitStatus::from_raw(1 << 8));
-        assert!(matches!(
-            daemon_startup_ready(&socket, timeout, Duration::from_secs(1), exited),
-            Err(HostedTerminalStartError::HostExited { .. })
-        ));
-        let lease = hold_startup_lease(&socket);
-        assert!(matches!(
-            daemon_startup_ready(&socket, timeout, timeout, exited),
-            Err(HostedTerminalStartError::HostReadyTimeout { .. })
-        ));
-        drop(lease);
-        // A stale lock file must not disguise a failed restoration as a winner.
-        assert!(matches!(
-            daemon_startup_ready(&socket, timeout, Duration::from_secs(2), exited),
-            Err(HostedTerminalStartError::HostExited { .. })
-        ));
-        assert!(matches!(
-            daemon_startup_ready(&socket, DAEMON_READY_TIMEOUT, DAEMON_READY_TIMEOUT, None,),
-            Err(HostedTerminalStartError::HostReadyTimeout { .. })
-        ));
-    }
-
-    #[test]
-    fn startup_lease_release_does_not_wait_for_concurrent_pre_exec() {
-        use std::io::{Read, Write};
-        use std::os::{fd::AsRawFd, unix::process::ExitStatusExt};
-
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("daemon.sock");
-        let lease = hold_startup_lease(&socket);
-        let (ready_write, mut ready_read) = UnixStream::pair().unwrap();
-        let (gate_read, mut gate_write) = UnixStream::pair().unwrap();
-        ready_read
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut command = Command::new("/bin/true");
-        // SAFETY: the forked child uses only async-signal-safe syscalls and
-        // initialized stack buffers until exec. Bound its wait even if the
-        // parent test fails before releasing it.
-        unsafe {
-            command.pre_exec(move || {
-                let mut byte = [1_u8];
-                loop {
-                    if libc::write(ready_write.as_raw_fd(), byte.as_ptr().cast(), 1) == 1 {
-                        break;
-                    }
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
-                let mut gate = libc::pollfd {
-                    fd: gate_read.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // Instant uses the async-signal-safe monotonic clock on Unix.
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
-                    }
-                    match libc::poll(&mut gate, 1, remaining.as_millis().max(1) as i32) {
-                        1 => break,
-                        0 => return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
-                        _ => {
-                            let error = io::Error::last_os_error();
-                            if error.kind() != io::ErrorKind::Interrupted {
-                                return Err(error);
-                            }
-                        }
-                    }
-                }
-                loop {
-                    match libc::read(gate.fd, byte.as_mut_ptr().cast(), 1) {
-                        1 => break,
-                        0 => return Err(io::Error::from_raw_os_error(libc::EPIPE)),
-                        _ => {
-                            let error = io::Error::last_os_error();
-                            if error.kind() != io::ErrorKind::Interrupted {
-                                return Err(error);
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            });
-        }
-        let child = thread::spawn(move || command.status().unwrap());
-        ready_read.read_exact(&mut [0_u8]).unwrap();
-        drop(lease);
-        // The child still holds the inherited descriptor here. A bare File
-        // drop would leave the lease locked and incorrectly keep startup alive.
-        let result = daemon_startup_ready(
-            &socket,
-            Duration::from_secs(35),
-            Duration::from_secs(1),
-            Some(ExitStatus::from_raw(1 << 8)),
-        );
-        gate_write.write_all(&[1]).unwrap();
-        assert!(child.join().unwrap().success());
-        assert!(
-            matches!(result, Err(HostedTerminalStartError::HostExited { .. })),
-            "{result:?}"
-        );
-    }
-
     fn published_state(visible: bool) -> (HostedPublishedState, Arc<AtomicUsize>) {
         let wake_count = Arc::new(AtomicUsize::new(0));
         let callback_count = Arc::clone(&wake_count);
@@ -3133,6 +3377,7 @@ mod tests {
             assert_eq!(handle.proof(), None);
             assert!(handle.wait_until_attached(Duration::ZERO).is_err());
             let terminal = TerminalDescriptor {
+                execution_instance: session.id.as_uuid(),
                 screen_lost_after_crash: false,
                 session,
                 generation: 0,
@@ -3206,6 +3451,7 @@ mod tests {
         stream.write_all(&frame[2..]).unwrap();
         let spawn: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
         let terminal = TerminalDescriptor {
+            execution_instance: session.id.as_uuid(),
             screen_lost_after_crash: false,
             session,
             generation: 0,
@@ -3430,11 +3676,6 @@ mod tests {
             );
             let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             assert!(matches!(attach.request, ClientRequest::Attach { .. }));
-            let visibility: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-            assert!(matches!(
-                visibility.request,
-                ClientRequest::SetVisibility { .. }
-            ));
             if !during_attach {
                 send(
                     &mut stream,
@@ -3443,6 +3684,7 @@ mod tests {
                     ServerMessage::Response {
                         response: ServerResponse::Attached {
                             terminal: TerminalDescriptor {
+                                execution_instance: session.id.as_uuid(),
                                 screen_lost_after_crash: false,
                                 session,
                                 generation: 0,
@@ -3460,12 +3702,22 @@ mod tests {
                 );
                 handle.wait_until_attached(Duration::from_secs(2)).unwrap();
             }
+            let visibility = if during_attach {
+                None
+            } else {
+                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(
+                    request.request,
+                    ClientRequest::SetVisibility { .. }
+                ));
+                Some(request)
+            };
             send(
                 &mut stream,
                 if during_attach {
                     attach.request_id
                 } else {
-                    visibility.request_id
+                    visibility.as_ref().unwrap().request_id
                 },
                 pinned.clone(),
                 shutdown(),
@@ -3526,6 +3778,554 @@ mod tests {
                 None
             );
         }
+    }
+
+    fn receipt_key(action: super::super::KeyAction) -> KeyInput {
+        KeyInput {
+            action,
+            key: super::super::TerminalKey::Character('a'),
+            modifiers: Default::default(),
+            text: Some("a".into()),
+            unshifted_codepoint: Some('a'),
+        }
+    }
+    fn receipt_response(
+        stream: &mut UnixStream,
+        proof: &HostSessionProof,
+        id: u64,
+        response: ServerResponse,
+    ) {
+        write_frame(
+            stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(id),
+                proof: proof.clone(),
+                message: ServerMessage::Response { response },
+            },
+        )
+        .unwrap();
+    }
+    fn receipt_connect(
+        stream: &mut UnixStream,
+        proof: &HostSessionProof,
+        source: TerminalSession,
+    ) -> HostedTerminalBinding {
+        let request: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+        assert!(matches!(request.request, ClientRequest::Connect { .. }));
+        let mut terminal = TerminalDescriptor::relaunchable(source.id, source.launch.clone(), None);
+        terminal.execution_instance = uuid::Uuid::new_v4();
+        terminal.session = source.clone();
+        terminal.attached = true;
+        let binding = HostedTerminalBinding {
+            source,
+            execution_instance: terminal.execution_instance,
+        };
+        receipt_response(
+            stream,
+            proof,
+            request.request_id,
+            ServerResponse::Connected {
+                proof: proof.clone(),
+                resumed: vec![terminal],
+            },
+        );
+        let visibility: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+        assert!(matches!(
+            visibility.request,
+            ClientRequest::SetVisibility { .. }
+        ));
+        receipt_response(
+            stream,
+            proof,
+            visibility.request_id,
+            ServerResponse::Accepted,
+        );
+        binding
+    }
+
+    #[test]
+    fn tracked_key_retains_last_actor_until_exact_worker_acknowledges() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("key.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let proof = proof("tracked-last-owner");
+        let source = session();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_count = Arc::clone(&wakes);
+        let handle =
+            HostedTerminalHandle::connect_at(socket, source.id, Some(proof.clone()), move |_| {
+                wake_count.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let mut stream = accept_connection(&listener);
+        let binding = receipt_connect(&mut stream, &proof, source);
+        handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+        let receipt = handle
+            .key_with_receipt(receipt_key(super::super::KeyAction::Release))
+            .unwrap();
+        let observer = receipt.clone();
+        let weak = Arc::downgrade(&handle.inner);
+        drop(handle);
+        let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(
+            request.request,
+            ClientRequest::Key {
+                input: KeyInput {
+                    action: super::super::KeyAction::Release,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            weak.upgrade().is_some(),
+            "tracked admission retains the final actor"
+        );
+        assert_eq!(receipt.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(receipt.admission_host_proof(), None);
+        let before = wakes.load(Ordering::Relaxed);
+        receipt_response(
+            &mut stream,
+            &proof,
+            request.request_id,
+            ServerResponse::Accepted,
+        );
+        assert_eq!(
+            receipt.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(binding.clone())
+        );
+        assert_eq!(
+            observer.try_recv().unwrap(),
+            Ok(binding),
+            "clones cannot consume one another's ownership proof"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak.upgrade().is_some() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(
+            wakes.load(Ordering::Relaxed) > before,
+            "receipt completion wakes an evicted owner"
+        );
+        assert_eq!(receipt.admission_host_proof(), Some(proof.clone()));
+        assert_eq!(observer.admission_host_proof(), Some(proof.clone()));
+        assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+    }
+
+    #[test]
+    fn late_key_ack_cannot_publish_success_or_historical_authority() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("late-key.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let proof = proof("late-key");
+        let source = session();
+        let handle =
+            HostedTerminalHandle::connect_at(socket, source.id, Some(proof.clone()), |_| {})
+                .unwrap();
+        let mut stream = accept_connection(&listener);
+        receipt_connect(&mut stream, &proof, source);
+        let receipt = handle
+            .key_with_receipt(receipt_key(super::super::KeyAction::Press))
+            .unwrap();
+        let key: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(key.request, ClientRequest::Key { .. }));
+        // Expire the exact in-flight ticket without waking the outer timer.
+        // The already-ready response path must independently enforce its bound.
+        handle
+            .inner
+            .published
+            .key_deliveries
+            .lock()
+            .unwrap()
+            .pending
+            .values_mut()
+            .next()
+            .unwrap()
+            .deadline = Instant::now();
+        receipt_response(
+            &mut stream,
+            &proof,
+            key.request_id,
+            ServerResponse::Accepted,
+        );
+        assert!(
+            receipt
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .contains("deadline")
+        );
+        assert_eq!(receipt.admission_host_proof(), None);
+        assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+        assert_eq!(
+            handle.key(receipt_key(super::super::KeyAction::Release)),
+            Err(TerminalSendError::Closed)
+        );
+    }
+
+    #[test]
+    fn startup_press_release_dependencies_preserve_fifo_and_skip_refused_press() {
+        for refuse in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let socket = directory.path().join("key.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let proof = proof("tracked-order");
+            let source = session();
+            let handle =
+                HostedTerminalHandle::connect_at(socket, source.id, Some(proof.clone()), |_| {})
+                    .unwrap();
+            assert!(handle.worker_binding().is_none());
+            let press = handle
+                .key_with_receipt(receipt_key(super::super::KeyAction::Press))
+                .unwrap();
+            let release = handle
+                .key_after_receipt(receipt_key(super::super::KeyAction::Release), &press)
+                .unwrap();
+            let later = handle
+                .key_with_receipt(receipt_key(super::super::KeyAction::Press))
+                .unwrap();
+            let mut stream = accept_connection(&listener);
+            let binding = receipt_connect(&mut stream, &proof, source);
+            let first: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                first.request,
+                ClientRequest::Key {
+                    input: KeyInput {
+                        action: super::super::KeyAction::Press,
+                        ..
+                    },
+                    ..
+                }
+            ));
+            stream
+                .set_read_timeout(Some(Duration::from_millis(30)))
+                .unwrap();
+            assert!(
+                matches!(read_frame::<ClientEnvelope>(&mut stream),Err(FrameError::Io(error)) if is_timeout(&error)),
+                "release/new press cannot overtake unanswered press"
+            );
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            if refuse {
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(first.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::QueueFull,
+                            "fixture full",
+                            true,
+                        )),
+                    },
+                )
+                .unwrap();
+                assert!(press.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+                assert!(
+                    release
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap()
+                        .unwrap_err()
+                        .contains("paired press")
+                );
+            } else {
+                receipt_response(
+                    &mut stream,
+                    &proof,
+                    first.request_id,
+                    ServerResponse::Accepted,
+                );
+                assert_eq!(
+                    press.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    Ok(binding.clone())
+                );
+                let next: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(
+                    next.request,
+                    ClientRequest::Key {
+                        input: KeyInput {
+                            action: super::super::KeyAction::Release,
+                            ..
+                        },
+                        ..
+                    }
+                ));
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(next.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::QueueFull,
+                            "fixture full",
+                            true,
+                        )),
+                    },
+                )
+                .unwrap();
+                assert!(
+                    release
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap()
+                        .is_err()
+                );
+            }
+            let next: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(
+                matches!(
+                    next.request,
+                    ClientRequest::Key {
+                        input: KeyInput {
+                            action: super::super::KeyAction::Press,
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "no refused/old release may replay behind a new press"
+            );
+            receipt_response(
+                &mut stream,
+                &proof,
+                next.request_id,
+                ServerResponse::Accepted,
+            );
+            assert_eq!(
+                later.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Ok(binding)
+            );
+        }
+    }
+
+    #[test]
+    fn unacknowledged_last_owner_key_expires_without_a_ui_timer() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("key.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let proof = proof("tracked-expiry");
+        let source = session();
+        let handle =
+            HostedTerminalHandle::connect_at(socket, source.id, Some(proof.clone()), |_| {})
+                .unwrap();
+        let mut stream = accept_connection(&listener);
+        receipt_connect(&mut stream, &proof, source);
+        let receipt = handle
+            .key_with_receipt(receipt_key(super::super::KeyAction::Release))
+            .unwrap();
+        let weak = Arc::downgrade(&handle.inner);
+        drop(handle);
+        let key: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(key.request, ClientRequest::Key { .. }));
+        assert!(
+            receipt
+                .recv_timeout(Duration::from_secs(6))
+                .unwrap()
+                .unwrap_err()
+                .contains("deadline")
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak.upgrade().is_some() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_reattach_buffers_semantic_payload_until_worker_is_authenticated() {
+        for replacement in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let socket = directory.path().join("pre-attach.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let proof = proof("pre-attach");
+            let source = session();
+            let handle =
+                HostedTerminalHandle::connect_at(socket, source.id, Some(proof.clone()), |_| {})
+                    .unwrap();
+            let mut first = accept_connection(&listener);
+            let original = receipt_connect(&mut first, &proof, source.clone());
+            handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+            drop(first);
+            let mut stream = accept_connection(&listener);
+            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            receipt_response(
+                &mut stream,
+                &proof,
+                connect.request_id,
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: Vec::new(),
+                },
+            );
+            let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(attach.request, ClientRequest::Attach { .. }));
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: proof.clone(),
+                    message: ServerMessage::Event {
+                        terminal_id: source.id,
+                        sequence: 1,
+                        event: super::super::ipc::WireTerminalEvent::TitleChanged {
+                            title: "pre-descriptor-payload".into(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let mut terminal =
+                TerminalDescriptor::relaunchable(source.id, source.launch.clone(), None);
+            terminal.session = source.clone();
+            terminal.execution_instance = if replacement {
+                uuid::Uuid::new_v4()
+            } else {
+                original.execution_instance
+            };
+            terminal.attached = true;
+            receipt_response(
+                &mut stream,
+                &proof,
+                attach.request_id,
+                ServerResponse::Attached { terminal },
+            );
+            let events = handle.events();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut saw_title = false;
+            loop {
+                for event in events.try_iter() {
+                    if let TerminalEvent::TitleChanged(title) = event {
+                        assert_eq!(title, "pre-descriptor-payload");
+                        saw_title = true;
+                    }
+                }
+                if replacement && handle.inner.stop.is_requested() {
+                    break;
+                }
+                if !replacement && saw_title {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "reattach did not settle");
+                thread::yield_now();
+            }
+            assert_eq!(
+                saw_title, !replacement,
+                "payload may only inherit its authenticated worker binding"
+            );
+            assert_eq!(
+                handle.execution_instance(),
+                Some(original.execution_instance)
+            );
+            assert_eq!(
+                handle
+                    .inner
+                    .published
+                    .event_sequence
+                    .load(Ordering::Acquire),
+                if replacement { 0 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn same_handle_refuses_same_daemon_same_id_successor_before_replaying_input() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("worker-pin.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let pinned = proof("worker-pin");
+        let source = session();
+        let id = source.id;
+        let first_instance = uuid::Uuid::new_v4();
+        let successor = uuid::Uuid::new_v4();
+        let descriptor = |instance| {
+            let mut value = TerminalDescriptor::relaunchable(id, source.launch.clone(), None);
+            value.session = source.clone();
+            value.execution_instance = instance;
+            value.attached = true;
+            value
+        };
+        let connect = |stream: &mut UnixStream, terminal| {
+            let request: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+            assert!(matches!(request.request, ClientRequest::Connect { .. }));
+            write_frame(
+                stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: pinned.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: pinned.clone(),
+                            resumed: vec![terminal],
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        };
+        let handle =
+            HostedTerminalHandle::connect_at(socket.clone(), id, Some(pinned.clone()), |_| {})
+                .unwrap();
+        let mut first = accept_connection(&listener);
+        connect(&mut first, descriptor(first_instance));
+        handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            handle.worker_binding(),
+            Some(HostedTerminalBinding {
+                source: source.clone(),
+                execution_instance: first_instance
+            })
+        );
+        let restore: ClientEnvelope = read_frame(&mut first).unwrap().unwrap();
+        assert!(matches!(
+            restore.request,
+            ClientRequest::SetVisibility { .. }
+        ));
+        drop(first);
+        let mut second = accept_connection(&listener);
+        handle
+            .input(b"MUST_NOT_REACH_SUCCESSOR\n".to_vec())
+            .unwrap();
+        connect(&mut second, descriptor(successor));
+        assert_eq!(
+            read_frame::<ClientEnvelope>(&mut second).unwrap(),
+            None,
+            "successor must see no replayed key, paste or presentation effect"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.input(vec![b'x']) != Err(TerminalSendError::Closed) {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(
+            handle.execution_instance(),
+            Some(first_instance),
+            "never refresh old authority from successor"
+        );
+        assert_eq!(handle.worker_binding().unwrap().source, source);
+        assert_eq!(handle.proof(), None);
+        let fresh =
+            HostedTerminalHandle::connect_at(socket, id, Some(pinned.clone()), |_| {}).unwrap();
+        let mut third = accept_connection(&listener);
+        connect(&mut third, descriptor(successor));
+        fresh.wait_until_attached(Duration::from_secs(2)).unwrap();
+        assert_eq!(fresh.execution_instance(), Some(successor));
+        let restore: ClientEnvelope = read_frame(&mut third).unwrap().unwrap();
+        assert!(matches!(
+            restore.request,
+            ClientRequest::SetVisibility { .. }
+        ));
+        fresh.input(b"fresh-owner\n".to_vec()).unwrap();
+        let input: ClientEnvelope = read_frame(&mut third).unwrap().unwrap();
+        assert!(
+            matches!(input.request,ClientRequest::Input {terminal_id,bytes} if terminal_id==id && bytes==b"fresh-owner\n")
+        );
     }
 
     #[test]
@@ -3600,6 +4400,22 @@ mod tests {
                 attach.request,
                 ClientRequest::Attach { terminal_id: id, .. } if id == terminal_id
             ));
+            let mut terminal =
+                TerminalDescriptor::relaunchable(terminal_id, session().launch, None);
+            terminal.execution_instance = terminal_id.as_uuid();
+            terminal.attached = true;
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(attach.request_id),
+                    proof: pinned.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Attached { terminal },
+                    },
+                },
+            )
+            .unwrap();
             let visibility: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             assert!(matches!(
                 visibility.request,
@@ -3612,7 +4428,8 @@ mod tests {
                 ClientRequest::Input { terminal_id: id, bytes }
                     if id == terminal_id && bytes == *b"x"
             ));
-            assert_eq!(handle.proof(), None);
+            assert_eq!(handle.proof(), Some(pinned.clone()));
+            assert_eq!(handle.execution_instance(), Some(terminal_id.as_uuid()));
             drop(handle);
             break;
         }
@@ -4018,6 +4835,7 @@ mod tests {
                 response: ServerResponse::Connected {
                     proof: pinned.clone(),
                     resumed: vec![TerminalDescriptor {
+                        execution_instance: session.id.as_uuid(),
                         screen_lost_after_crash: false,
                         session,
                         generation: 0,

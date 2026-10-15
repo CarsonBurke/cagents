@@ -71,6 +71,14 @@ impl TerminalSurface {
         self.handle.proof()
     }
 
+    pub fn worker_binding(&self) -> Option<super::HostedTerminalBinding> {
+        self.handle.worker_binding()
+    }
+
+    pub fn execution_instance(&self) -> Option<uuid::Uuid> {
+        self.handle.execution_instance()
+    }
+
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
         self.handle.acknowledge_redraw(observed_generation);
     }
@@ -100,6 +108,21 @@ impl TerminalSurface {
         origin: PasteOrigin,
     ) -> Result<(), TerminalSendError> {
         self.handle.paste(text, origin)
+    }
+
+    pub fn key_with_receipt(
+        &self,
+        key: KeyInput,
+    ) -> Result<super::hosted::HostedKeyReceipt, TerminalSendError> {
+        self.handle.key_with_receipt(key)
+    }
+
+    pub fn key_after_receipt(
+        &self,
+        key: KeyInput,
+        after: &super::hosted::HostedKeyReceipt,
+    ) -> Result<super::hosted::HostedKeyReceipt, TerminalSendError> {
+        self.handle.key_after_receipt(key, after)
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
@@ -135,6 +158,10 @@ impl TerminalSurface {
     pub fn scroll_to_row(&self, row: u64) -> Result<(), TerminalSendError> {
         self.handle.scroll_to_row(row)
     }
+    pub fn scroll_to_match(&self, range: super::SearchMatch) -> Result<(), TerminalSendError> {
+        self.handle.scroll_to_match(range)
+    }
+
     pub fn clear_scrollback(&self) -> Result<(), TerminalSendError> {
         self.handle.clear_scrollback()
     }

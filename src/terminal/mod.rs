@@ -1,9 +1,15 @@
+mod daemon_start;
 #[cfg(feature = "host")]
 pub(crate) mod holder;
+#[cfg(any(feature = "ui", feature = "host"))]
 mod hosted;
 pub mod ipc;
+#[cfg(feature = "host")]
+pub(crate) mod reactor;
 mod search;
 mod snapshot;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod transport;
 pub use search::SearchMatch;
 #[cfg(feature = "ui")]
 mod surface;
@@ -23,12 +29,12 @@ mod worker;
 pub(crate) const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use ipc::TerminalSpawnOptions;
 
-pub use hosted::{
-    HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
-};
+pub use daemon_start::{HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for};
+#[cfg(any(feature = "ui", feature = "host"))]
+pub use hosted::{HostedKeyReceipt, HostedTerminalBinding, HostedTerminalHandle};
 pub use snapshot::{
-    CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
-    RowSnapshot, ScrollSnapshot, Underline,
+    CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, HistoryPosition,
+    RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, Underline,
 };
 #[cfg(feature = "ui")]
 pub use surface::TerminalSurface;
@@ -41,6 +47,8 @@ pub use types::{
 pub(crate) use widget::ReviewInputBarrier;
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};
+#[cfg(feature = "host")]
+pub(crate) use worker::CompletedRelease;
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
 #[cfg(feature = "host")]

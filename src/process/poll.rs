@@ -1,0 +1,614 @@
+//! Run a child on its caller's thread, with one readiness wait for all I/O.
+
+use super::*;
+use std::process::{Child, ChildStdin};
+
+const IO_TURN_BYTES: usize = 256 * 1024;
+
+/// The caller is the only reaper. Retain the original pidfd and the unreaped
+/// leader until the final possible group signal, including output-limit cleanup.
+struct PolledChild {
+    child: Option<Child>,
+    identity: Option<OwnedFd>,
+    group: u32,
+    owned: bool,
+}
+
+impl PolledChild {
+    fn new(child: Child, identity: OwnedFd) -> Self {
+        Self {
+            group: child.id(),
+            child: Some(child),
+            identity: Some(identity),
+            owned: true,
+        }
+    }
+
+    fn observe(&mut self) -> io::Result<Option<ExitStatus>> {
+        let result = observe_child_exit(
+            self.identity.as_ref().expect("original child identity"),
+            self.group,
+            true,
+        );
+        if result.is_err() {
+            self.owned = false;
+        }
+        result
+    }
+
+    fn signal(&mut self, signal: i32) -> bool {
+        if !self.owned || self.observe().is_err() {
+            return false;
+        }
+        signal_process_group(self.group, signal);
+        true
+    }
+
+    fn descriptor(&self) -> i32 {
+        if self.owned {
+            self.identity
+                .as_ref()
+                .expect("original child identity")
+                .as_raw_fd()
+        } else {
+            -1
+        }
+    }
+
+    fn finish(&mut self, observed_exit: bool) -> Option<String> {
+        let child = self.child.take().expect("owned child");
+        let identity = self.identity.take().expect("original child identity");
+        self.owned = false;
+        if observed_exit {
+            // An observed WNOWAIT exit cannot block here. Numeric PID reuse is
+            // impossible until this final reap, and no further group signal runs.
+            match child_exit_status(&identity, self.group, libc::WEXITED | libc::WNOHANG) {
+                Ok(Some(_)) => None,
+                Ok(None) => {
+                    let mut waiter = GroupWaiter::new(child, Ok(identity));
+                    waiter.finish(false);
+                    Some("final child reap returned no status".into())
+                }
+                Err(error) => Some(format!("final child reap failed: {error}")),
+            }
+        } else {
+            // SIGKILL cannot immediately reap an uninterruptible kernel task.
+            // Only this exceptional cleanup retains one waiter, rather than
+            // parking the calling service or leaking a future zombie.
+            let mut waiter = GroupWaiter::new(child, Ok(identity));
+            waiter.finish(false);
+            None
+        }
+    }
+}
+
+impl Drop for PolledChild {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            self.signal(SIGKILL);
+            self.finish(false);
+        }
+    }
+}
+
+struct PipeCapture<R> {
+    pipe: Option<R>,
+    captured: PipeRead,
+    error: Option<String>,
+    limit: usize,
+}
+
+impl<R: Read + AsFd> PipeCapture<R> {
+    fn new(pipe: R, limit: usize) -> Self {
+        Self {
+            pipe: Some(pipe),
+            captured: PipeRead {
+                output: Vec::with_capacity(limit.min(8192)),
+                limit_exceeded: false,
+            },
+            error: None,
+            limit,
+        }
+    }
+
+    fn descriptor(&self) -> i32 {
+        self.pipe
+            .as_ref()
+            .map_or(-1, |pipe| pipe.as_fd().as_raw_fd())
+    }
+
+    fn drain_ready(&mut self) {
+        let Some(pipe) = self.pipe.as_mut() else {
+            return;
+        };
+        let mut buffer = [0_u8; 8192];
+        let mut drained = 0;
+        while drained < IO_TURN_BYTES {
+            match pipe.read(&mut buffer) {
+                Ok(0) => {
+                    self.pipe.take();
+                    break;
+                }
+                Ok(read) => {
+                    drained += read;
+                    let remaining = self.limit.saturating_sub(self.captured.output.len());
+                    self.captured
+                        .output
+                        .extend_from_slice(&buffer[..read.min(remaining)]);
+                    if read > remaining {
+                        self.captured.limit_exceeded = true;
+                        self.pipe.take();
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    self.pipe.take();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn write_ready(
+    stdin: &mut Option<ChildStdin>,
+    bytes: &[u8],
+    written: &mut usize,
+) -> Option<String> {
+    let pipe = stdin.as_mut()?;
+    let end = bytes.len().min(written.saturating_add(IO_TURN_BYTES));
+    while *written < end {
+        match pipe.write(&bytes[*written..end]) {
+            Ok(0) => {
+                stdin.take();
+                return Some("stdin: failed to write whole input".into());
+            }
+            Ok(count) => *written += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return None,
+            Err(error) => {
+                stdin.take();
+                return Some(format!("stdin: {error}"));
+            }
+        }
+    }
+    if *written == bytes.len() {
+        let error = pipe.flush().err().map(|error| format!("stdin: {error}"));
+        stdin.take();
+        return error;
+    }
+    None
+}
+
+fn cancellation_descriptor() -> io::Result<Arc<OwnedFd>> {
+    // SAFETY: eventfd returns a fresh, close-on-exec owned descriptor. Its
+    // nonblocking counter coalesces notifications and cannot stall cancel().
+    let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if raw < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+    }
+}
+
+fn timeout_milliseconds(deadline: Option<Instant>) -> i32 {
+    deadline.map_or(-1, |deadline| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
+        millis.min(i32::MAX as u128) as i32
+    })
+}
+
+pub(super) fn execute(
+    spec: &CommandSpec,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessFailure> {
+    let mut child = spec.to_command().spawn().map_err(|error| {
+        process_failure(spec, ProcessFailureKind::Spawn, &error.to_string(), false)
+    })?;
+    let identity = child_identity(&child);
+    let setup = (|| {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("stdout pipe was unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("stderr pipe was unavailable"))?;
+        let stdin = child.stdin.take();
+        if spec.stdin.is_some() && stdin.is_none() {
+            return Err(io::Error::other("stdin pipe was unavailable"));
+        }
+        set_nonblocking(stdout.as_fd())?;
+        set_nonblocking(stderr.as_fd())?;
+        if let Some(stdin) = &stdin {
+            set_nonblocking(stdin.as_fd())?;
+        }
+        Ok::<_, io::Error>((stdout, stderr, stdin, cancellation_descriptor()?))
+    })();
+    let (stdout, stderr, mut stdin, wake) = match setup {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            terminate_process_tree(child, identity);
+            return Err(process_failure(
+                spec,
+                ProcessFailureKind::Io,
+                &error.to_string(),
+                true,
+            ));
+        }
+    };
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            let message = format!("child identity was unavailable: {error}");
+            terminate_process_tree(child, Err(error));
+            return Err(process_failure(
+                spec,
+                ProcessFailureKind::Io,
+                &message,
+                true,
+            ));
+        }
+    };
+    let mut child = PolledChild::new(child, identity);
+    let _registration =
+        cancellation.register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake)));
+    let mut stdout = PipeCapture::new(stdout, spec.stdout_limit);
+    let mut stderr = PipeCapture::new(stderr, spec.stderr_limit);
+    let input = spec.stdin.as_deref().unwrap_or_default();
+    let mut written = 0;
+    if input.is_empty() {
+        stdin.take();
+    }
+    let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
+    let mut terminal_kind = None;
+    let mut term_deadline = None;
+    let mut cleanup_deadline = None;
+    let mut termination_started = false;
+    let mut status = None;
+    let mut stdin_error = None;
+    let mut wait_error = None;
+    loop {
+        let now = Instant::now();
+        if terminal_kind.is_none() {
+            terminal_kind = if cancellation.is_cancelled() {
+                Some(ProcessFailureKind::Cancelled)
+            } else if stdout.captured.limit_exceeded || stderr.captured.limit_exceeded {
+                Some(ProcessFailureKind::OutputLimit)
+            } else if deadline.is_some_and(|deadline| now >= deadline) {
+                Some(ProcessFailureKind::TimedOut)
+            } else {
+                None
+            };
+        }
+        if terminal_kind.is_some() && !termination_started {
+            termination_started = true;
+            // Stop feeding a cancelled command. Pipe reads still drain during
+            // termination, so a TERM handler cannot deadlock on its diagnostics.
+            stdin.take();
+            if child.signal(SIGTERM) {
+                term_deadline = Some(now + TERMINATION_GRACE);
+            } else {
+                cleanup_deadline = Some(now + CLEANUP_GRACE);
+            }
+        }
+        if term_deadline.is_some_and(|deadline| now >= deadline || status.is_some()) {
+            child.signal(SIGKILL);
+            term_deadline = None;
+            cleanup_deadline = Some(now + CLEANUP_GRACE);
+        }
+        if status.is_some()
+            && stdout.pipe.is_none()
+            && stderr.pipe.is_none()
+            && stdin.is_none()
+            && term_deadline.is_none()
+        {
+            break;
+        }
+        if cleanup_deadline.is_some_and(|deadline| now >= deadline) {
+            break;
+        }
+        let descriptor = |fd, events| libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let mut watched = [
+            descriptor(stdout.descriptor(), libc::POLLIN),
+            descriptor(stderr.descriptor(), libc::POLLIN),
+            descriptor(stdin.as_ref().map_or(-1, AsRawFd::as_raw_fd), libc::POLLOUT),
+            descriptor(
+                if status.is_none() {
+                    child.descriptor()
+                } else {
+                    -1
+                },
+                libc::POLLIN,
+            ),
+            descriptor(
+                if terminal_kind.is_none() {
+                    wake.as_raw_fd()
+                } else {
+                    -1
+                },
+                libc::POLLIN,
+            ),
+        ];
+        let next_deadline = if termination_started {
+            term_deadline.or(cleanup_deadline)
+        } else {
+            deadline
+        };
+        // SAFETY: all five descriptors are owned throughout this call. -1
+        // disables completed streams; readiness uses no timer when unbounded.
+        let ready = unsafe {
+            libc::poll(
+                watched.as_mut_ptr(),
+                watched.len() as libc::nfds_t,
+                timeout_milliseconds(next_deadline),
+            )
+        };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            wait_error = Some(format!("process readiness wait failed: {error}"));
+            terminal_kind.get_or_insert(ProcessFailureKind::Io);
+            child.signal(SIGKILL);
+            break;
+        }
+        // Bound work on each stream so an always-readable stdout cannot starve
+        // stderr, input, cancellation or a command's deadline.
+        if watched[0].revents != 0 {
+            stdout.drain_ready();
+        }
+        if watched[1].revents != 0 {
+            stderr.drain_ready();
+        }
+        if watched[2].revents != 0 {
+            stdin_error = write_ready(&mut stdin, input, &mut written).or(stdin_error);
+        }
+        if watched[3].revents != 0 {
+            match child.observe() {
+                Ok(exit) => status = exit,
+                Err(error) => {
+                    wait_error = Some(error.to_string());
+                    terminal_kind.get_or_insert(ProcessFailureKind::Io);
+                }
+            }
+        }
+    }
+    if let Some(error) = child.finish(status.is_some()) {
+        wait_error = Some(error);
+        terminal_kind.get_or_insert(ProcessFailureKind::Io);
+    }
+    let pipe_error = match (stdout.error, stderr.error) {
+        (Some(out), Some(err)) => Some(format!("stdout: {out}; stderr: {err}")),
+        (Some(error), None) => Some(format!("stdout: {error}")),
+        (None, Some(error)) => Some(format!("stderr: {error}")),
+        (None, None) => None,
+    };
+    let stdout_read = stdout.captured;
+    let stderr_read = stderr.captured;
+    if let Some(kind) = terminal_kind {
+        let message = match kind {
+            ProcessFailureKind::Cancelled => "operation was cancelled".into(),
+            ProcessFailureKind::TimedOut => format!(
+                "operation timed out after {:?}",
+                spec.timeout.expect("timeout deadline")
+            ),
+            ProcessFailureKind::OutputLimit => output_limit_message(
+                stdout_read.limit_exceeded,
+                spec.stdout_limit,
+                stderr_read.limit_exceeded,
+                spec.stderr_limit,
+            ),
+            ProcessFailureKind::Io => match (wait_error, pipe_error) {
+                (Some(wait), Some(pipe)) => format!("{wait}; {pipe}"),
+                (Some(error), None) | (None, Some(error)) => error,
+                (None, None) => "process wait failed".into(),
+            },
+            _ => unreachable!(),
+        };
+        let captured = |bytes| {
+            if kind == ProcessFailureKind::OutputLimit {
+                failure_excerpt(bytes)
+            } else {
+                bytes
+            }
+        };
+        return Err(ProcessFailure {
+            kind,
+            program: spec.program.clone(),
+            exit_code: status.as_ref().and_then(ExitStatus::code),
+            signal: status.as_ref().and_then(exit_signal),
+            stdout: captured(stdout_read.output),
+            stderr: captured(stderr_read.output),
+            message,
+            started: true,
+        });
+    }
+    let status = status.ok_or_else(|| {
+        process_failure(
+            spec,
+            ProcessFailureKind::Io,
+            "process ended without an exit status",
+            true,
+        )
+    })?;
+    if let Some(message) = stdin_error.or(pipe_error) {
+        return Err(ProcessFailure {
+            kind: ProcessFailureKind::Io,
+            program: spec.program.clone(),
+            exit_code: status.code(),
+            signal: exit_signal(&status),
+            stdout: stdout_read.output,
+            stderr: stderr_read.output,
+            message,
+            started: true,
+        });
+    }
+    Ok(ProcessOutput::from_parts(
+        status,
+        stdout_read.output,
+        stderr_read.output,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn git_calls_do_not_create_helper_threads() {
+        const CHILD: &str = "CAGENTS_PROCESS_THREAD_CENSUS";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate from other parallel tests so their threads cannot skew
+            // the census. This is a real Git invocation, not a source assertion.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::poll::tests::git_calls_do_not_create_helper_threads",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("git_call_threads="));
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let baseline = fs::read_dir("/proc/self/task").unwrap().count();
+        let command = CommandSpec::new("git")
+            .args([
+                "-c",
+                "alias.census=!find /proc/\"$CENSUS_PARENT\"/task -mindepth 1 -maxdepth 1 | wc -l",
+                "census",
+            ])
+            .env("CENSUS_PARENT", std::process::id().to_string())
+            .timeout(Duration::from_secs(5));
+        for _ in 0..5 {
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap();
+            assert!(
+                output.success,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let measured: usize = String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            println!("baseline_threads={baseline} git_call_threads={measured}");
+            assert!(
+                measured <= baseline,
+                "Git invocation added {} helper threads",
+                measured.saturating_sub(baseline)
+            );
+        }
+    }
+
+    #[test]
+    fn full_stdout_stderr_and_large_stdin_make_progress_together() {
+        let input: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2; cat",
+            ])
+            .stdin(input.clone())
+            .output_limits(3 * 1024 * 1024, 512 * 1024)
+            .timeout(Duration::from_secs(10));
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stderr, vec![0; 262144]);
+        assert_eq!(output.stdout.len(), 262144 + input.len());
+        assert!(output.stdout[..262144].iter().all(|byte| *byte == 0));
+        assert_eq!(&output.stdout[262144..], input);
+    }
+
+    #[test]
+    fn cancellation_wakes_poll_when_child_will_not_read_large_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "printf ready > \"$READY\"; exec sleep 300"])
+            .env("READY", ready.as_os_str())
+            .stdin(vec![b'x'; 2 * 1024 * 1024])
+            .timeout(Duration::from_secs(30));
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(Instant::now() < deadline, "child never started");
+                thread::sleep(Duration::from_millis(1));
+            }
+            canceller.cancel();
+        });
+        let start = Instant::now();
+        let failure = SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .unwrap_err();
+        worker.join().unwrap();
+        assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
+        assert!(failure.started);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(lock_wakers(&cancellation.0).is_empty());
+    }
+
+    #[test]
+    fn externally_reaped_leader_cannot_authorize_group_signals() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let identity = child_identity(&child).unwrap();
+        child.wait().unwrap();
+        let mut retained = PolledChild::new(child, identity);
+        assert!(
+            !retained.signal(SIGKILL),
+            "reaped original process is no longer an owned group leader"
+        );
+        assert!(!retained.owned);
+        assert!(retained.finish(true).is_some());
+    }
+
+    #[test]
+    fn cancellation_descriptor_registration_is_nonblocking_and_deregistered() {
+        let cancellation = CancellationToken::new();
+        let descriptor = cancellation_descriptor().unwrap();
+        let registration = cancellation
+            .register_notifier(CancellationNotifier::Descriptor(Arc::clone(&descriptor)));
+        cancellation.cancel();
+        let mut watched = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: this borrowed eventfd remains owned by descriptor.
+        assert_eq!(unsafe { libc::poll(&mut watched, 1, 0) }, 1);
+        drop(registration);
+        assert!(lock_wakers(&cancellation.0).is_empty());
+    }
+}

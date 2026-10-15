@@ -3,6 +3,7 @@
 - [Redraw scheduling](#redraw-scheduling)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
+- [Terminal resource accounting](#terminal-resource-accounting)
 - [Terminal search](#terminal-search)
 - [Reference results](#reference-results)
 
@@ -126,6 +127,37 @@ unmeasured.
 inside the native UI: it accepts `r`, `g`, and `b` to repaint with distinct RGB
 colors, and `q` exits.
 
+## Terminal resource accounting
+
+Measure terminal holders with **PSS** as well as RSS. Every holder maps the
+same executable and shared libraries; summing RSS counts those shared pages
+once for every holder. `/proc/<pid>/smaps_rollup` reports `Pss` in KiB and
+apportions a shared page among its mappings. Sum PSS across the daemon, its
+verified holder processes and the UI to estimate their resident physical cost.
+Keep the per-process RSS figures too, and report both rather than treating the
+sum of holder RSS as private terminal memory. Do not include unrelated daemons
+or terminals merely because their executable names match.
+
+Use an isolated development runtime and record the exact executable revisions,
+profiles, daemon identity, process start ticks and fixture settings. Sample
+`Threads` from each process's `/proc/<pid>/status` and RSS/PSS from its
+`smaps_rollup`. Verify process identity again after sampling. Record separate
+phases: warmed idle, eight fixture chats, thirty CLI terminals, and the same
+terminals attached to one native UI window. Include holder processes in the
+memory accounting, while keeping daemon/UI thread counts separate. Warm the
+fixed transport and cleanup services before the idle sample so lazy service
+startup is visible in the baseline. A census with fake socket peers is a useful
+contract test; it does not substitute for the native workload.
+
+For input-latency comparisons, use the same `scripts/benchmark-terminal input`
+workload, build profiles, socket/direct mode, acknowledgement cadence and
+terminal settings before and after the change. Preserve each raw JSON result
+and its p99. Report individual runs or the median of per-run p99 values;
+averaging percentiles does not produce a pooled p99. Direct PTY and hosted
+socket results are separate measurements, and neither measures compositor
+presentation. Record machine load and memory pressure alongside each run, then
+clean up only the fixture-owned sessions and verify their exit.
+
 ## Terminal search
 
 ```sh
@@ -212,3 +244,44 @@ Both fit the 50/100 ms input budgets. This is an upper bound to
 compositor-visible pixels, not presentation timestamps or physical scanout. The
 settled idle native terminal produced no additional terminal draws and no
 measurable UI CPU ticks in a three-second observation.
+
+## Connection transport resources
+
+Terminal attachments and daemon connections share a transport runtime with two
+I/O threads and fixed dispatcher pools: two for terminal input, two for
+snapshots, two for outbound encoding, and four for blocking domain requests. Requests on one connection remain
+serial, including the handshake and resume replay. Each pool admits at most 64 jobs. Slow provider, Git, account, and notification
+requests cannot occupy terminal input, snapshot or encoding capacity. Socket reads and writes use nonblocking readiness rather than one
+reader and writer thread per connection. The transport runtime is separate
+from the PTY reactor so host requests cannot park PTY output reads.
+
+A retiring client keeps its admission permit until unregistration finishes.
+This bounds queued cleanup by the admitted client count and allows retirement
+to run before ordinary dispatcher work. Per-frame writes have a five-second
+deadline; peer closure and delivery overflow still close both socket halves.
+UI terminal clients retain their bounded command/event queues and read credit.
+Ordinary idle attachments have no polling timer. Permanent handshake errors
+back off while awaiting space in the existing public semantic event receiver
+and remain cancelable when the handle is dropped.
+
+The isolated transport census tests warm shared resources before recording
+`/proc/self/task`, then attach thirty peers and thirty hosted terminal handles.
+These tests cover transport growth only; the full native measurement must also
+include the daemon's emulator workers, holder PSS, eight provider chats, and
+`scripts/benchmark-terminal input` p99 on the same workload before and after.
+## Terminal process memory and threads
+
+Measure the daemon and UI separately from the per-terminal holder processes.
+A holder maps the matched daemon executable, so summing holder RSS counts
+shared file-backed pages repeatedly. Record PSS from `/proc/PID/smaps_rollup`
+for each explicitly owned holder and sum PSS for a proportional memory total;
+retain RSS alongside it to make the measurement comparable to system tools.
+Pin each sampled PID with its process start time before and after sampling.
+
+PTY reads and holder control observers use one shared terminal I/O reactor.
+A full terminal output inbox returns credit before its reader runs again;
+it does not block unrelated streams on the reactor. Semantic terminal events
+share a separate dispatcher because host callbacks can acquire host locks.
+The emulator remains on one worker per live terminal. Connection transport,
+provider processes and transcript writers need separate accounting when
+comparing an attached window with CLI-only terminals.
