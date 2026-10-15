@@ -8,8 +8,8 @@
 mod authority;
 #[path = "repository_recovery.rs"]
 mod recovery;
-pub use recovery::{DiscardRecovery, DiscardRecoveryResolution, RecoverableDiscard};
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
+pub use recovery::{DiscardRecovery, DiscardRecoveryResolution, RecoverableDiscard};
 
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
@@ -3623,11 +3623,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         // Canonical CLI creator concern4aa: inherited FD spellings describe
         // the actual read but never replace stable original display identity.
-        let (common_dir,git_dir,worktree_root)=if let Some(authority)=&self.authority {
-            if selected_path!=authority.path() {return Err(ValidationError::InvalidWorktree(selected_path.display().to_string()).into());}
+        let (common_dir, git_dir, worktree_root) = if let Some(authority) = &self.authority {
+            if selected_path != authority.path() {
+                return Err(
+                    ValidationError::InvalidWorktree(selected_path.display().to_string()).into(),
+                );
+            }
             authority.validate()?;
-            (authority.stable_common_metadata_path().to_owned(),authority.stable_private_metadata_path().to_owned(),worktree_root.map(|_|authority.path().to_owned()))
-        } else {(common_dir,git_dir,worktree_root)};
+            (
+                authority.stable_common_metadata_path().to_owned(),
+                authority.stable_private_metadata_path().to_owned(),
+                worktree_root.map(|_| authority.path().to_owned()),
+            )
+        } else {
+            (common_dir, git_dir, worktree_root)
+        };
         Ok(RepositoryInfo {
             id: RepositoryId(stable_path_uuid(&common_dir)),
             selected_path: selected_path.to_path_buf(),
@@ -4958,14 +4968,25 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     });
                     continue;
                 }
-                match native_batch.as_mut().ok_or_else(|| "No reserved native Trash batch".to_owned())
-                    .and_then(|batch|batch.discard(path,live,cancellation)) {
-                    Ok(receipt)=>{
-                        if let Some(reason)=&receipt.warning {failures.push(MutationFailure::Path{path:path.clone(),reason:reason.clone()});}
+                match native_batch
+                    .as_mut()
+                    .ok_or_else(|| "No reserved native Trash batch".to_owned())
+                    .and_then(|batch| batch.discard(path, live, cancellation))
+                {
+                    Ok(receipt) => {
+                        if let Some(reason) = &receipt.warning {
+                            failures.push(MutationFailure::Path {
+                                path: path.clone(),
+                                reason: reason.clone(),
+                            });
+                        }
                         trashed.push(receipt);
                         applied.push(path.clone());
                     }
-                    Err(reason)=>failures.push(MutationFailure::Path{path:path.clone(),reason}),
+                    Err(reason) => failures.push(MutationFailure::Path {
+                        path: path.clone(),
+                        reason,
+                    }),
                 }
             }
             failures
@@ -4991,9 +5012,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<GitFileLock, RepositoryError> {
-        if let Some(authority)=&self.authority {
+        if let Some(authority) = &self.authority {
             authority.validate()?;
-            if authority.path()!=worktree {return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into());}
+            if authority.path() != worktree {
+                return Err(
+                    ValidationError::InvalidWorktree(worktree.display().to_string()).into(),
+                );
+            }
             return authority.discard_index_lock();
         }
         let output = self.run_checked(
