@@ -1,6 +1,7 @@
 //! Small durable command/decision authority, separate from ephemeral body caches.
 use super::*;
 mod pending;
+mod turns;
 use crate::account::scope::LaunchAccountScope;
 pub(crate) use pending::PreparedCommand;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -110,10 +111,9 @@ pub(crate) fn purge_session(
     if !valid_id(confirmed_session) {
         return Err("Invalid confirmed conversation identity".into());
     }
-    if !root.join(account_key(scope)).exists() {
-        return Ok(());
-    }
-    Store::at(&root, scope, confirmed_session)?.purge_current_session()
+    // Even a previously empty namespace needs a deletion tombstone. The
+    // caller must prove final semantic retirement before invoking this API.
+    Store::open(&root, scope, None)?.purge_session_identity(confirmed_session)
 }
 fn purge_account_at(root: &Path, scope: &LaunchAccountScope) -> Result<(), String> {
     scope.revalidate()?;
@@ -209,7 +209,43 @@ fn associate_for_purge(root: &Path, scope: &LaunchAccountScope) -> Result<(), St
     Ok(())
 }
 
+// Published together with the additive schema under initialize's write reservation.
+const BASE_SCHEMA: &str = " CREATE TABLE IF NOT EXISTS prompts(session TEXT NOT NULL,user_id TEXT NOT NULL,metadata BLOB NOT NULL,digest BLOB NOT NULL,PRIMARY KEY(session,user_id));
+ CREATE TABLE IF NOT EXISTS prompt_text(session TEXT NOT NULL,user_id TEXT NOT NULL,position INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(session,user_id,position),FOREIGN KEY(session,user_id) REFERENCES prompts(session,user_id) ON DELETE CASCADE);
+ CREATE TABLE IF NOT EXISTS aliases(session TEXT NOT NULL,alias TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(session,alias),FOREIGN KEY(session,user_id) REFERENCES prompts(session,user_id) ON DELETE CASCADE);
+ CREATE TABLE IF NOT EXISTS approvals(session TEXT NOT NULL,agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,decision INTEGER NOT NULL,PRIMARY KEY(session,agent,item,request));
+ CREATE TABLE IF NOT EXISTS current_approval(session TEXT NOT NULL,agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,PRIMARY KEY(session,agent,item));
+ CREATE TABLE IF NOT EXISTS retained_attachments(path TEXT PRIMARY KEY,accepted INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL,session TEXT);
+ CREATE TABLE IF NOT EXISTS pending_commands(command_id TEXT PRIMARY KEY,expected_session TEXT,metadata BLOB NOT NULL);
+ CREATE INDEX IF NOT EXISTS pending_command_sessions ON pending_commands(expected_session);
+ CREATE TABLE IF NOT EXISTS command_captures(command_id TEXT NOT NULL REFERENCES pending_commands(command_id) ON DELETE CASCADE,path TEXT NOT NULL UNIQUE REFERENCES retained_attachments(path),PRIMARY KEY(command_id,path));
+ CREATE INDEX IF NOT EXISTS pending_attachments ON retained_attachments(accepted) WHERE accepted=0;
+ CREATE INDEX IF NOT EXISTS session_attachments ON retained_attachments(session) WHERE session IS NOT NULL;
+ CREATE TABLE IF NOT EXISTS latest(session TEXT PRIMARY KEY,user_id TEXT NOT NULL);";
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_ORIGINAL_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_ANNOTATION_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn before_annotation_write() {
+    let hook=BEFORE_ANNOTATION_WRITE.with(|slot|slot.borrow_mut().take());
+    if let Some(hook)=hook { hook(); }
+}
+
 impl Store {
+    /// Reserve the writer before checking schema and session revocation.
+    /// Preliminary confirmed() checks cannot fence a concurrent explicit purge.
+    fn begin_write(&self, session: Option<&str>) -> Result<rusqlite::Transaction<'_>,String> {
+        self.revalidate()?;
+        #[cfg(test)] before_annotation_write();
+        let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error|error.to_string())?;
+        turns::require_schema(&transaction)?;
+        if let Some(session)=session { turns::reject_revoked_session(&transaction,session)?; }
+        Ok(transaction)
+    }
     fn revalidate(&self) -> Result<(), String> {
         self.scope.revalidate()?;
         let root = self
@@ -264,9 +300,9 @@ impl Store {
         Self::open(root, scope, Some(session))
     }
     fn confirmed(&self) -> Result<&str, String> {
-        self.session
-            .as_deref()
-            .ok_or_else(|| "Pending command storage has no confirmed conversation authority".into())
+        let session = self.session.as_deref().ok_or_else(|| "Pending command storage has no confirmed conversation authority".to_owned())?;
+        turns::reject_revoked_session(&self.db, session)?;
+        Ok(session)
     }
     fn open(
         root: &Path,
@@ -311,25 +347,15 @@ impl Store {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| e.to_string())?;
-        if version > 1 {
+        if version > 2 {
             return Err(format!(
-                "Conversation annotation schema {version} is newer than supported schema 1"
+                "Conversation annotation schema {version} is newer than supported schema 2"
             ));
         }
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-512; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;
-          CREATE TABLE IF NOT EXISTS prompts(session TEXT NOT NULL,user_id TEXT NOT NULL,metadata BLOB NOT NULL,digest BLOB NOT NULL,PRIMARY KEY(session,user_id));
-          CREATE TABLE IF NOT EXISTS prompt_text(session TEXT NOT NULL,user_id TEXT NOT NULL,position INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(session,user_id,position),FOREIGN KEY(session,user_id) REFERENCES prompts(session,user_id) ON DELETE CASCADE);
-          CREATE TABLE IF NOT EXISTS aliases(session TEXT NOT NULL,alias TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(session,alias),FOREIGN KEY(session,user_id) REFERENCES prompts(session,user_id) ON DELETE CASCADE);
-          CREATE TABLE IF NOT EXISTS approvals(session TEXT NOT NULL,agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,decision INTEGER NOT NULL,PRIMARY KEY(session,agent,item,request));
-          CREATE TABLE IF NOT EXISTS current_approval(session TEXT NOT NULL,agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,PRIMARY KEY(session,agent,item));
-          CREATE TABLE IF NOT EXISTS retained_attachments(path TEXT PRIMARY KEY,accepted INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL,session TEXT);
-          CREATE TABLE IF NOT EXISTS pending_commands(command_id TEXT PRIMARY KEY,expected_session TEXT,metadata BLOB NOT NULL);
-          CREATE INDEX IF NOT EXISTS pending_command_sessions ON pending_commands(expected_session);
-          CREATE TABLE IF NOT EXISTS command_captures(command_id TEXT NOT NULL REFERENCES pending_commands(command_id) ON DELETE CASCADE,path TEXT NOT NULL UNIQUE REFERENCES retained_attachments(path),PRIMARY KEY(command_id,path));
-          CREATE INDEX IF NOT EXISTS pending_attachments ON retained_attachments(accepted) WHERE accepted=0;
-          CREATE INDEX IF NOT EXISTS session_attachments ON retained_attachments(session) WHERE session IS NOT NULL;
-          CREATE TABLE IF NOT EXISTS latest(session TEXT PRIMARY KEY,user_id TEXT NOT NULL); PRAGMA user_version=1;")
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-512; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")
             .map_err(|e|e.to_string())?;
+        turns::initialize(&db)?;
+        if let Some(session) = session { turns::reject_revoked_session(&db, session)?; }
         let store = Self {
             db,
             scope: scope.clone(),
@@ -351,9 +377,14 @@ impl Store {
         self.db.execute_batch("CREATE TRIGGER fixture_latest_error BEFORE INSERT ON latest BEGIN SELECT RAISE(FAIL,'fixture latest write failure'); END;").unwrap();
     }
     fn purge_current_session(&mut self) -> Result<(), String> {
+        let session = self.session.as_deref().ok_or("No confirmed conversation to purge")?.to_owned();
+        self.purge_session_identity(&session)
+    }
+    fn purge_session_identity(&mut self, session: &str) -> Result<(), String> {
         self.revalidate()?;
-        let session = self.confirmed()?.to_owned();
-        let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        if !valid_id(session) { return Err("Invalid confirmed conversation identity".into()); }
+        let transaction = self.begin_write(None)?;
+        turns::mark_session_revoked(&transaction, session)?;
         transaction
             .execute(
                 "DELETE FROM pending_commands WHERE expected_session=?1",
@@ -363,7 +394,7 @@ impl Store {
         transaction
             .execute("DELETE FROM prompts WHERE session=?1", [&session])
             .map_err(|e| e.to_string())?;
-        for table in ["approvals", "current_approval", "latest"] {
+        for table in ["approvals", "current_approval", "latest", "turn_records", "turn_revisions"] {
             transaction
                 .execute(&format!("DELETE FROM {table} WHERE session=?1"), [&session])
                 .map_err(|e| e.to_string())?;
@@ -388,11 +419,7 @@ impl Store {
                 libc::LOCK_EX,
             )
             .map_err(|e| e.to_string())?;
-            let transaction = rusqlite::Transaction::new_unchecked(
-                &self.db,
-                rusqlite::TransactionBehavior::Immediate,
-            )
-            .map_err(|e| e.to_string())?;
+            let transaction = self.begin_write(None)?;
             let mut statement=transaction.prepare("SELECT path FROM retained_attachments WHERE accepted=0 AND path>?1 AND NOT EXISTS(SELECT 1 FROM command_captures c WHERE c.path=retained_attachments.path) ORDER BY path LIMIT 128").map_err(|e|e.to_string())?;
             let paths = statement
                 .query_map([&after], |row| row.get::<_, String>(0))
@@ -531,7 +558,9 @@ impl Store {
                 libc::LOCK_EX,
             )
             .map_err(|e| OriginalError::Unavailable(e.to_string()))?;
-            if self.db.execute("INSERT INTO retained_attachments(path,bytes) SELECT ?1,?2 WHERE (SELECT count(*) FROM retained_attachments WHERE accepted=0)<1024 AND (SELECT coalesce(sum(bytes),0) FROM retained_attachments WHERE accepted=0)+?2<=268435456",params![name,reserved_bytes]).map_err(storage_error)?!=1{return Err(OriginalError::TooLarge);}
+            let transaction=self.begin_write(None).map_err(OriginalError::Unavailable)?;
+            if transaction.execute("INSERT INTO retained_attachments(path,bytes) SELECT ?1,?2 WHERE (SELECT count(*) FROM retained_attachments WHERE accepted=0)<1024 AND (SELECT coalesce(sum(bytes),0) FROM retained_attachments WHERE accepted=0)+?2<=268435456",params![name,reserved_bytes]).map_err(storage_error)?!=1{return Err(OriginalError::TooLarge);}
+            transaction.commit().map_err(storage_error)?;
             let mut output = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -697,7 +726,7 @@ impl Store {
         hash.update(&metadata);
         hash.update(text_sha);
         let digest = hash.finalize();
-        let transaction = self.db.transaction().map_err(storage_error)?;
+        let transaction = self.begin_write(Some(&session)).map_err(OriginalError::Unavailable)?;
         let old: Option<Vec<u8>> = transaction
             .query_row(
                 "SELECT digest FROM prompts WHERE session=?1 AND user_id=?2",
@@ -785,11 +814,13 @@ impl Store {
     /// An unannotated newest user intentionally makes latest lookup unavailable.
     pub(crate) fn latest_user(&mut self, user_id: &str) -> Result<(), String> {
         self.revalidate()?;
-        let session = self.confirmed()?;
+        let session = self.confirmed()?.to_owned();
         if !valid_id(user_id) {
             return Err("Invalid user identity".into());
         }
-        self.db.execute("INSERT INTO latest VALUES(?1,?2) ON CONFLICT(session) DO UPDATE SET user_id=excluded.user_id",params![session,user_id]).map(|_|()).map_err(|e|e.to_string())
+        let transaction=self.begin_write(Some(&session))?;
+        transaction.execute("INSERT INTO latest VALUES(?1,?2) ON CONFLICT(session) DO UPDATE SET user_id=excluded.user_id",params![session,user_id]).map_err(|e|e.to_string())?;
+        transaction.commit().map_err(|e|e.to_string())
     }
     pub(crate) fn original(
         &self,
@@ -802,8 +833,11 @@ impl Store {
         if !(4..=ORIGINAL_PAGE_BYTES).contains(&limit) {
             return Err(OriginalError::InvalidRange);
         }
+        let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Deferred).map_err(storage_error)?;
+        turns::require_schema(&transaction).map_err(OriginalError::Unavailable)?;
+        turns::reject_revoked_session(&transaction,session).map_err(OriginalError::Unavailable)?;
         let latest: Option<String> = if user_id.is_none() {
-            self.db
+            transaction
                 .query_row(
                     "SELECT user_id FROM latest WHERE session=?1",
                     [session],
@@ -817,7 +851,7 @@ impl Store {
         let id = user_id
             .or(latest.as_deref())
             .ok_or_else(|| OriginalError::Unavailable("No confirmed latest user message".into()))?;
-        let found:Option<(String,Vec<u8>)>=self.db.query_row("SELECT prompts.user_id,metadata FROM prompts JOIN aliases ON aliases.session=prompts.session AND aliases.user_id=prompts.user_id WHERE aliases.session=?1 AND aliases.alias=?2",params![session,id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(storage_error)?;
+        let found:Option<(String,Vec<u8>)>=transaction.query_row("SELECT prompts.user_id,metadata FROM prompts JOIN aliases ON aliases.session=prompts.session AND aliases.user_id=prompts.user_id WHERE aliases.session=?1 AND aliases.alias=?2",params![session,id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(storage_error)?;
         let (id, metadata) = found.ok_or_else(|| {
             OriginalError::Unavailable("The exact original accepted command is unavailable".into())
         })?;
@@ -827,7 +861,7 @@ impl Store {
             return Err(OriginalError::InvalidRange);
         }
         let end = offset.saturating_add(limit).min(original.text_bytes);
-        let mut statement=self.db.prepare("SELECT position,body FROM prompt_text WHERE session=?1 AND user_id=?2 AND position+length(body)>?3 AND position<?4 ORDER BY position").map_err(storage_error)?;
+        let mut statement=transaction.prepare("SELECT position,body FROM prompt_text WHERE session=?1 AND user_id=?2 AND position+length(body)>?3 AND position<?4 ORDER BY position").map_err(storage_error)?;
         let rows = statement
             .query_map(params![session, id, offset, end], |r| {
                 Ok((r.get::<_, usize>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -851,7 +885,14 @@ impl Store {
         let text = String::from_utf8(bytes).map_err(|_| OriginalError::InvalidRange)?;
         let next_offset = offset + text.len();
         let complete = next_offset == original.text_bytes;
+        drop(statement);
+        transaction.commit().map_err(storage_error)?;
+        #[cfg(test)] {
+            let hook=BEFORE_ORIGINAL_PUBLISH.with(|slot|slot.borrow_mut().take());
+            if let Some(hook)=hook { hook(); }
+        }
         self.revalidate().map_err(OriginalError::Unavailable)?;
+        self.confirmed().map_err(OriginalError::Unavailable)?;
         Ok(OriginalPage {
             session_id: session.to_owned(),
             original,
@@ -875,7 +916,7 @@ impl Store {
         if !valid_id(&key.item_id) || !valid_id(request) || agent.len() > ID_BYTES {
             return Err("Approval identity exceeds its limit".into());
         }
-        let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        let transaction = self.begin_write(Some(&session))?;
         let known:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE session=?1 AND agent=?2 AND item=?3 AND request=?4)",params![session,agent,key.item_id,request],|r|r.get(0)).map_err(|e|e.to_string())?;
         if decision == ApprovalDecision::Awaiting {
             if !known {
@@ -938,6 +979,97 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn stale_session_writers_cannot_repopulate_after_a_second_connection_purges() {
+        for operation in ["accept","latest","approval","prepare","associate","settings"] {
+            let root=test_directory(); let account=scope(root.path(),crate::agent::Provider::Claude);
+            let path=root.path().join("annotations");
+            let mut stale=Store::at(&path,&account,"confirmed-session").unwrap();
+            let mut purger=Store::at(&path,&account,"confirmed-session").unwrap();
+            let mut text=stale.capture_text("original exact text").unwrap();
+            if matches!(operation,"associate"|"settings") {
+                stale.prepare_command("command",(operation=="settings").then_some("confirmed-session"),&mut text,&mut []).unwrap();
+            }
+            // Run the real purge API after the stale writer's preliminary
+            // authority checks, but before it reserves its write transaction.
+            BEFORE_ANNOTATION_WRITE.with(|slot|*slot.borrow_mut()=Some(Box::new(move || {
+                purger.purge_for_test().unwrap();
+            })));
+            let rejected=match operation {
+                "accept"=>stale.accept(&prompt("actual-user","text"),"text",&["actual-alias".into()],&mut []).is_err(),
+                "latest"=>stale.latest_user("actual-user").is_err(),
+                "approval"=>stale.approval(&ApprovalKey{agent_id:None,item_id:"actual-tool".into()},"request",ApprovalDecision::Awaiting).is_err(),
+                "prepare"=>stale.prepare_command("command",Some("confirmed-session"),&mut text,&mut []).is_err(),
+                "associate"=>stale.associate_command("command","confirmed-session").is_err(),
+                "settings"=>stale.prepared_settings("command",&prompt("user","text").settings).is_err(),
+                _=>unreachable!(),
+            };
+            assert!(rejected,"{operation} must refuse a revoked session after acquiring the writer");
+            for table in ["prompts","aliases","latest","approvals","current_approval","turn_records","turn_revisions"] {
+                assert_eq!(stale.db.query_row(&format!("SELECT count(*) FROM {table} WHERE session='confirmed-session'"),[],|row|row.get::<_,i64>(0)).unwrap(),0,"{operation}: {table}");
+            }
+            assert_eq!(stale.db.query_row("SELECT count(*) FROM pending_commands WHERE expected_session='confirmed-session'",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+            assert!(Store::at(&path,&account,"confirmed-session").is_err());
+            assert!(Store::at(&path,&account,"other-session").is_ok());
+            if operation=="associate" {
+                assert!(stale.prepared("command").unwrap().expected_session.is_none(),"unknown-session intent must not be assigned to the deleted session");
+                stale.prepared_settings("command",&prompt("user","text").settings).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn stale_annotation_writers_and_page_reads_refuse_future_database_formats() {
+        for operation in ["accept","latest","approval","original"] {
+            let root=test_directory(); let account=scope(root.path(),crate::agent::Provider::Claude);
+            let mut stale=Store::at(&root.path().join("annotations"),&account,"confirmed-session").unwrap();
+            stale.accept(&prompt("actual-user","text"),"text",&[],&mut []).unwrap();
+            if operation=="original" {
+                stale.db.pragma_update(None,"user_version",3).unwrap();
+            } else {
+                let future=Connection::open(stale.directory.join("annotations.sqlite")).unwrap();
+                BEFORE_ANNOTATION_WRITE.with(|slot|*slot.borrow_mut()=Some(Box::new(move || { future.pragma_update(None,"user_version",3).unwrap(); })));
+            }
+            let rejected=match operation {
+                "accept"=>stale.accept(&prompt("later-user","text"),"text",&[],&mut []).is_err(),
+                "latest"=>stale.latest_user("later-user").is_err(),
+                "approval"=>stale.approval(&ApprovalKey{agent_id:None,item_id:"actual-tool".into()},"request",ApprovalDecision::Awaiting).is_err(),
+                "original"=>stale.original(Some("actual-user"),0,1024).is_err(),
+                _=>unreachable!(),
+            };
+            assert!(rejected,"{operation} must not interpret or mutate a future format");
+            assert_eq!(stale.db.pragma_query_value(None,"user_version",|row|row.get::<_,i64>(0)).unwrap(),3);
+            assert_eq!(stale.db.query_row("SELECT count(*) FROM prompts",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        }
+    }
+
+    #[test]
+    fn original_page_is_not_published_after_a_concurrent_session_purge() {
+        let root=test_directory(); let account=scope(root.path(),crate::agent::Provider::Claude);
+        let path=root.path().join("annotations");
+        let mut reader=Store::at(&path,&account,"confirmed-session").unwrap();
+        reader.accept(&prompt("actual-user","exact text"),"exact text",&[],&mut []).unwrap();
+        let mut purger=Store::at(&path,&account,"confirmed-session").unwrap();
+        BEFORE_ORIGINAL_PUBLISH.with(|slot|*slot.borrow_mut()=Some(Box::new(move || { purger.purge_for_test().unwrap(); })));
+        assert!(matches!(reader.original(Some("actual-user"),0,1024),Err(OriginalError::Unavailable(_))));
+    }
+
+    #[test]
+    fn session_association_retains_settings_written_by_a_second_connection() {
+        let root=test_directory(); let account=scope(root.path(),crate::agent::Provider::Claude);
+        let path=root.path().join("annotations");
+        let mut pending=Store::open(&path,&account,None).unwrap();
+        let mut other=Store::open(&path,&account,None).unwrap();
+        let mut text=pending.capture_text("exact input").unwrap();
+        pending.prepare_command("command",None,&mut text,&mut []).unwrap();
+        let settings=prompt("user","text").settings; let expected=settings.clone();
+        BEFORE_ANNOTATION_WRITE.with(|slot|*slot.borrow_mut()=Some(Box::new(move || { other.prepared_settings("command",&settings).unwrap(); })));
+        pending.associate_command("command","confirmed-session").unwrap();
+        let command=pending.prepared("command").unwrap();
+        assert_eq!(command.settings,Some(expected));
+        assert_eq!(command.expected_session.as_deref(),Some("confirmed-session"));
+    }
+
     #[test]
     fn originals_are_immutable_paged_exact_and_isolated_across_cold_open() {
         let root = test_directory();

@@ -26,6 +26,7 @@ impl Store {
         {
             return Err(OriginalError::TooLarge);
         }
+        if let Some(session) = expected_session { super::turns::reject_revoked_session(&self.db, session).map_err(OriginalError::Unavailable)?; }
         let command = PreparedCommand {
             command_id: id.to_owned(),
             expected_session: expected_session.map(str::to_owned),
@@ -41,7 +42,7 @@ impl Store {
         if metadata.len() > META_BYTES {
             return Err(OriginalError::TooLarge);
         }
-        let transaction = self.db.transaction().map_err(storage_error)?;
+        let transaction = self.begin_write(expected_session).map_err(OriginalError::Unavailable)?;
         transaction
             .execute(
                 "INSERT INTO pending_commands VALUES(?1,?2,?3)",
@@ -106,7 +107,7 @@ impl Store {
             ));
         }
         self.revalidate().map_err(OriginalError::Unavailable)?;
-        let transaction = self.db.transaction().map_err(storage_error)?;
+        let transaction = self.begin_write(None).map_err(OriginalError::Unavailable)?;
         let metadata: Vec<u8> = transaction
             .query_row(
                 "SELECT metadata FROM pending_commands WHERE command_id=?1",
@@ -116,6 +117,9 @@ impl Store {
             .map_err(storage_error)?;
         let mut command: PreparedCommand = postcard::from_bytes(&metadata)
             .map_err(|e| OriginalError::Unavailable(e.to_string()))?;
+        if let Some(session)=command.expected_session.as_deref() {
+            super::turns::reject_revoked_session(&transaction,session).map_err(OriginalError::Unavailable)?;
+        }
         if command
             .settings
             .as_ref()
@@ -139,9 +143,9 @@ impl Store {
     }
     pub(crate) fn abandon_command(&mut self, id: &str) -> Result<(), OriginalError> {
         self.revalidate().map_err(OriginalError::Unavailable)?;
-        self.db
-            .execute("DELETE FROM pending_commands WHERE command_id=?1", [id])
-            .map_err(storage_error)?;
+        let transaction=self.begin_write(None).map_err(OriginalError::Unavailable)?;
+        transaction.execute("DELETE FROM pending_commands WHERE command_id=?1", [id]).map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
         self.recover_pending().map_err(OriginalError::Unavailable)
     }
     /// Restore only one exact intent by provider-correlated ID. Neither the
@@ -206,6 +210,11 @@ impl Store {
         if !valid_id(session) {
             return Err(OriginalError::TooLarge);
         }
+        self.revalidate().map_err(OriginalError::Unavailable)?;
+        super::turns::reject_revoked_session(&self.db, session).map_err(OriginalError::Unavailable)?;
+        let transaction=self.begin_write(Some(session)).map_err(OriginalError::Unavailable)?;
+        // Read under the same reservation, so a concurrent settings update
+        // cannot be overwritten by a stale pre-transaction metadata copy.
         let mut command = self.prepared(id)?;
         if command
             .expected_session
@@ -220,7 +229,8 @@ impl Store {
         if metadata.len() > META_BYTES {
             return Err(OriginalError::TooLarge);
         }
-        if self.db.execute("UPDATE pending_commands SET expected_session=?2,metadata=?3 WHERE command_id=?1 AND (expected_session IS NULL OR expected_session=?2)",params![id,session,metadata]).map_err(storage_error)?!=1{return Err(OriginalError::Changed);}
+        if transaction.execute("UPDATE pending_commands SET expected_session=?2,metadata=?3 WHERE command_id=?1 AND (expected_session IS NULL OR expected_session=?2)",params![id,session,metadata]).map_err(storage_error)?!=1{return Err(OriginalError::Changed);}
+        transaction.commit().map_err(storage_error)?;
         Ok(())
     }
     fn restore_capture(
