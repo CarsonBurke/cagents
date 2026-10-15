@@ -1159,6 +1159,16 @@ where
 
     pub fn set_auto_close(&mut self, enabled: bool) { self.0.get_mut().auto_close = enabled; }
 
+    /// Whole-buffer recovery keeps the file's editing preferences. Native
+    /// content, snapshots and annotations are rebuilt together.
+    pub fn reset_text(&mut self, text: &str) {
+        let (indentation, auto_close) = { let internal = self.0.borrow(); (internal.indentation, internal.auto_close) };
+        *self = Self::with_text(text);
+        self.configure_indentation(indentation);
+        self.set_auto_close(auto_close);
+    }
+
+
     /// Cached by caret/selection and invalidated by text edits. Large selected
     /// regions are counted without allocating a selected-text copy every frame.
     pub fn cursor_metrics(&self) -> (usize, usize, usize) {

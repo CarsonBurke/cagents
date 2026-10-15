@@ -1122,7 +1122,7 @@ impl EditorDocument {
                 tracing::warn!(
                     "discarded edits by rebuilding the editor buffer; they cannot be undone"
                 );
-                self.content = text_editor::Content::with_text(&self.saved_text);
+                self.content.reset_text(&self.saved_text);
                 self.history.clear();
                 edits.push(None);
             }
@@ -1162,7 +1162,7 @@ impl EditorDocument {
     /// actions — applying a completion — which the widget's `Content` has no
     /// other way to express.
     fn replace_text(&mut self, text: &str) {
-        self.content = text_editor::Content::with_text(text);
+        self.content.reset_text(text);
         // The positions the history recorded address the buffer that was
         // just thrown away.
         self.history.clear();
@@ -3254,6 +3254,7 @@ impl RepositoryRuntime {
         let edits = document.discard_edits();
         document.saved_history_revision = document.history.revision();
         document.saved_snapshot = document.content.text_snapshot();
+        document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, document.indentation));
         let map = |mut position: text_editor::Position| { position.line = version.mapping.map(position.line); position };
         document.content.set_cursor(text_editor::Cursor { position: map(cursor.position), selection: cursor.selection.map(map) });
         document.content.restore_scroll_position(text_editor::ScrollPosition { line: version.mapping.map(scroll.line), ..scroll });
@@ -17768,6 +17769,19 @@ mod tests {
         assert_eq!(document.saved_text, "C");
         assert_eq!(document.saved_snapshot.text().as_ref(), "C");
         assert_ne!(document.saved_history_revision, document.history.revision());
+    }
+
+    #[test]
+    fn whole_buffer_recovery_preserves_file_editing_preferences_and_snapshots() {
+        let mut document = EditorDocument::new("a.rs".into(), "a.rs".into(), "before".into(), blake3::hash(b"before"), false);
+        document.content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 8, tab_width: 8 });
+        document.content.set_auto_close(false);
+        document.replace_text("after");
+        assert_eq!(document.content.indentation().tab_width, 8);
+        assert!(document.content.indentation().tabs);
+        document.content.perform(text_editor::Action::Edit(text_editor::Edit::Insert('(')));
+        assert_eq!(document.content.text(), "(after");
+        assert_eq!(document.content.text_snapshot().text().as_ref(), "(after");
     }
 
     #[test]
