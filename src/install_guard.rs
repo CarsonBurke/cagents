@@ -22,7 +22,7 @@ use std::{
 use crate::instance::UiUpdateGuard;
 
 mod companions;
-pub(crate) use companions::preflight_editor_companions;
+pub(crate) use companions::{preflight_editor_companions, trusted_executable_owner};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

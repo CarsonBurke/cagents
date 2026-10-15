@@ -154,6 +154,10 @@ fn preflight_in(
 /// Never execute an unknown older daemon to ask its version: historical
 /// entrypoints may ignore informational flags and start a service. Only exact
 /// bytes from the coordinator's already trusted matched daemon qualify.
+pub(crate) fn trusted_executable_owner(owner: u32) -> bool {
+    owner == 0 || owner == unsafe { libc::geteuid() }
+}
+
 fn same_daemon_binary(candidate: &Path, expected: &Path) -> io::Result<bool> {
     use std::os::unix::fs::OpenOptionsExt;
     fn open(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
@@ -161,7 +165,7 @@ fn same_daemon_binary(candidate: &Path, expected: &Path) -> io::Result<bool> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
+        if !metadata.is_file() || !trusted_executable_owner(metadata.uid())
             || metadata.mode() & 0o022 != 0 || metadata.mode() & 0o111 == 0
             || metadata.len() == 0 || metadata.len() > 512 * 1024 * 1024
         {
@@ -322,6 +326,14 @@ mod tests {
         })).unwrap_err();
         assert!(error.to_string().contains("private daemon cannot be qualified"));
         assert!(error.to_string().contains("kept open"));
+    }
+
+    #[test]
+    fn executable_ownership_accepts_root_or_current_user_only() {
+        assert!(trusted_executable_owner(0));
+        assert!(trusted_executable_owner(unsafe { libc::geteuid() }));
+        let other = if unsafe { libc::geteuid() } == 1 {2} else {1};
+        assert!(!trusted_executable_owner(other));
     }
 
     #[test]

@@ -1121,7 +1121,7 @@ pub(crate) fn inspect_source_panes(
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
     let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
     let before = fs::symlink_metadata(&helper)?;
-    if !before.is_file() || before.uid() != unsafe { libc::geteuid() } || before.mode() & 0o022 != 0
+    if !before.is_file() || !crate::install_guard::trusted_executable_owner(before.uid()) || before.mode() & 0o022 != 0
     {
         return Err(invalid(
             "The matched source inspector is unavailable; source windows remain usable",
@@ -1210,7 +1210,7 @@ fn companion_read(
     runtime: Option<&Path>,
 ) -> Result<serde_json::Value, UpdateError> {
     let before = fs::symlink_metadata(executable)?;
-    if !before.is_file() || before.uid() != unsafe { libc::geteuid() } || before.mode() & 0o022 != 0
+    if !before.is_file() || !crate::install_guard::trusted_executable_owner(before.uid()) || before.mode() & 0o022 != 0
     {
         return Err(invalid("Ceditor's companion is not an owned executable"));
     }
