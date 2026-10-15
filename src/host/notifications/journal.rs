@@ -249,21 +249,32 @@ impl Journal {
 
     /// Remove opt-in excerpts without changing attention, delivery or evidence
     /// identities. Turning privacy back on must also cover restored notices.
-    pub fn clear_content(&mut self) -> Result<Vec<Uuid>, String> {
-        self.0.transaction::<_, diesel::result::Error, _>(|connection| {
-            let rows = notices::table.select((notices::session, notices::id, notices::event))
-                .load::<(String,String,String)>(connection)?;
-            let mut changed = Vec::new();
-            for (target,id,serialized) in rows {
-                let mut event = Event::from_journal(&serialized).map_err(|_| diesel::result::Error::RollbackTransaction)?;
-                if event.content.take().is_none() { continue; }
-                let event = serde_json::to_string(&event).map_err(|_| diesel::result::Error::RollbackTransaction)?;
-                let id = id.parse().map_err(|_| diesel::result::Error::RollbackTransaction)?;
-                diesel::update(notices::table.find(target)).set(notices::event.eq(event)).execute(connection)?;
-                changed.push(id);
-            }
-            Ok(changed)
-        }).map_err(|error| format!("Could not clear private notification previews: {error}"))
+    pub fn clear_content(&mut self) -> Result<Vec<(Uuid, Target)>, String> {
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                let rows = notices::table
+                    .select((notices::session, notices::id, notices::event))
+                    .load::<(String, String, String)>(connection)?;
+                let mut changed = Vec::new();
+                for (target, id, serialized) in rows {
+                    let mut event = Event::from_journal(&serialized)
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    if event.content.take().is_none() {
+                        continue;
+                    }
+                    let serialized = serde_json::to_string(&event)
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    let id = id
+                        .parse()
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    diesel::update(notices::table.find(target))
+                        .set(notices::event.eq(serialized))
+                        .execute(connection)?;
+                    changed.push((id, event.target));
+                }
+                Ok(changed)
+            })
+            .map_err(|error| format!("Could not clear private notification previews: {error}"))
     }
 
     pub fn acknowledge(&mut self, id: Uuid) -> Result<Option<String>, String> {
@@ -355,12 +366,17 @@ mod tests {
         let mut journal = Journal::open(&path).unwrap();
         let mut original = event(TerminalId::new(), "one");
         original.content = Some(crate::notifications::Content {
-            conversation: "Private conversation".into(), preview: "Private response".into(), request: None,
+            conversation: "Private conversation".into(),
+            preview: "Private response".into(),
+            request: None,
         });
         let notice = journal.record(original, false).unwrap().unwrap();
         journal.delivered(notice.id).unwrap();
         journal.acknowledge(notice.id).unwrap();
-        assert_eq!(journal.clear_content().unwrap(), vec![notice.id]);
+        let cleared = journal.clear_content().unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].0, notice.id);
+        assert_eq!(cleared[0].1, notice.event.target);
         assert!(journal.clear_content().unwrap().is_empty());
         drop(journal);
         let mut reopened = Journal::open(&path).unwrap();
@@ -368,6 +384,25 @@ mod tests {
         assert_eq!(retained[0].id, notice.id);
         assert!(retained[0].acknowledged && retained[0].delivered);
         assert!(retained[0].event.content.is_none());
+    }
+
+    #[test]
+    fn acknowledgement_of_first_question_cannot_swallow_the_next_waiting_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("notifications.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        let mut first = event(session, "turn:waiting:1");
+        first.evidence.kind = Kind::Waiting;
+        let first = journal.record(first, false).unwrap().unwrap();
+        let mut second = event(session, "turn:waiting:2");
+        second.evidence.kind = Kind::Waiting;
+        let second = journal.record(second, false).unwrap().unwrap();
+        assert_ne!(first.id, second.id);
+        assert!(journal.acknowledge(first.id).unwrap().is_none());
+        let notices = journal.list().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, second.id);
+        assert!(!notices[0].acknowledged);
     }
 
     fn seed_owners(journal: &mut Journal) {

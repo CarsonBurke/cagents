@@ -9,9 +9,15 @@ By default, desktop notifications show the provider and folder with a concise
 outcome. In Settings → Notifications, **Show message previews** opts in to the
 conversation name and a short response, question, approval request or error
 excerpt. These details may be visible on a shared or locked screen. Disabling
-previews removes retained excerpts from the journal's current records and
+previews removes retained excerpts from the attention journal's current records and
 withdraws rich desktop notices. The existing event-category, enabled and
-while-focused switches still control delivery.
+while-focused switches still control delivery. Disabling delivery or a category
+withdraws its current desktop notices without marking the journal attention read.
+
+This preference controls notification presentation and the attention journal. It
+does not delete ordinary conversation history or private, bounded semantic replay
+history retained for a native session while its daemon is unavailable. Replay
+records retire after the daemon durably acknowledges them.
 
 Native conversation previews use semantic provider events, independently of the
 transcript page a window is viewing. They prefer prose over fenced code, omit
@@ -22,7 +28,9 @@ name; cagents does not scrape their terminal screens for notification text.
 
 Updates from one conversation coalesce briefly before desktop delivery; continuous
 updates wait at most two seconds. Unrelated conversations have independent
-delivery schedules. Replaced or acknowledged notices are withdrawn, and existing
+delivery schedules. Desktop replacement uses a stable conversation identity;
+acknowledgement still uses the exact current journal notice. A stale acknowledgement
+cannot clear a later request. Replaced or acknowledged notices are withdrawn, and existing
 unread attention remains available in the application if desktop delivery fails.
 Channel and pane attention tooltips reuse the same bounded context when previews
 are enabled.
