@@ -62,8 +62,9 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   agent resumes or finishes. The All, Attention, and Pull requests views keep separate
   scroll positions.
 - Collapse Projects to a compact rail with stable project initials and colors.
-  Waiting and unread badges remain visible; hover or keyboard focus exposes the
-  project name and status.
+  Waiting and unread badges remain visible. Hover for the project name and
+  status; keyboard-focused controls expose the same information to assistive
+  technology.
 - Project search ranks exact and prefix matches before looser matches. Long
   highlighted labels end in an ellipsis, leaving room for the row's status.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
