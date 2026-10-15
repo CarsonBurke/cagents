@@ -1864,10 +1864,13 @@ mod retained_parent_tests {
         assert!(open_at(child.descriptor(), OsStr::new(".."), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).is_err(), "confined public component lookup still rejects parent traversal");
         let parent = retained_parent_directory(&child).unwrap();
         assert_eq!((parent.metadata().unwrap().dev(), parent.metadata().unwrap().ino()), (expected.metadata().unwrap().dev(), expected.metadata().unwrap().ino()));
-        let retired = directory.path().join("retired");
-        std::fs::rename(directory.path().join("child"), &retired).unwrap();
+        let moved_parent_path = directory.path().join("actual-parent");
+        std::fs::create_dir(&moved_parent_path).unwrap();
+        let moved_parent = Root::open(&moved_parent_path).unwrap();
+        std::fs::rename(directory.path().join("child"), moved_parent_path.join("held-child")).unwrap();
         std::fs::create_dir(directory.path().join("child")).unwrap();
         let after = retained_parent_directory(&child).unwrap();
-        assert_eq!((after.metadata().unwrap().dev(), after.metadata().unwrap().ino()), (expected.metadata().unwrap().dev(), expected.metadata().unwrap().ino()), "the parent is observed from the original held child, not its replacement name");
+        assert_eq!((after.metadata().unwrap().dev(), after.metadata().unwrap().ino()), (moved_parent.metadata().unwrap().dev(), moved_parent.metadata().unwrap().ino()), "the parent is observed from the original held child, not its replacement name");
+        assert_ne!(after.metadata().unwrap().ino(), expected.metadata().unwrap().ino(), "reopening the old child name would choose the wrong parent");
     }
 }
