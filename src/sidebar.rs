@@ -1546,7 +1546,92 @@ pub struct FileRow {
     pub depth: usize,
     pub directory: bool,
     pub ignored: bool,
+    pub status: Option<FileStatus>,
     chrome: FileRowChrome,
+}
+
+/// Decoration shared by file leaves and their ancestor folders. Order is
+/// deliberate: a conflict must remain visible even among thousands of edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FileStatus {
+    Untracked,
+    Added,
+    Deleted,
+    Modified,
+    Conflicted,
+}
+
+impl FileStatus {
+    fn from_change(entry: &ChangedPath) -> Option<Self> {
+        if entry.conflict.is_some() || entry.kind == ChangeKind::Unmerged {
+            return Some(Self::Conflicted);
+        }
+        match entry.kind {
+            ChangeKind::Added | ChangeKind::Copied => Some(Self::Added),
+            ChangeKind::Deleted => Some(Self::Deleted),
+            ChangeKind::Untracked => Some(Self::Untracked),
+            ChangeKind::Ignored => None,
+            _ => Some(Self::Modified),
+        }
+    }
+
+    fn badge(self) -> &'static str {
+        match self {
+            Self::Untracked => "U",
+            Self::Added => "A",
+            Self::Deleted => "D",
+            Self::Modified => "M",
+            Self::Conflicted => "C",
+        }
+    }
+
+    fn tone(self) -> BadgeTone {
+        match self {
+            Self::Added | Self::Untracked => BadgeTone::Success,
+            Self::Deleted | Self::Conflicted => BadgeTone::Danger,
+            Self::Modified => BadgeTone::Warning,
+        }
+    }
+
+    fn text_class(self) -> theme::Text {
+        theme::Text::Custom(match self.tone() {
+            BadgeTone::Success => |theme| cosmic::iced::widget::text::Style {
+                color: Some(theme.cosmic().success.base.into()),
+                ..Default::default()
+            },
+            BadgeTone::Danger => |theme| cosmic::iced::widget::text::Style {
+                color: Some(theme.cosmic().destructive.base.into()),
+                ..Default::default()
+            },
+            _ => |theme| cosmic::iced::widget::text::Style {
+                color: Some(theme.cosmic().warning.base.into()),
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// Computed once while preparing the model, never by the Files view. This
+/// consumes the existing status snapshot and performs no filesystem/Git reads.
+fn file_statuses(entries: &[ChangedPath]) -> BTreeMap<RepoPath, FileStatus> {
+    let mut statuses = BTreeMap::new();
+    for entry in entries {
+        let Some(status) = FileStatus::from_change(entry) else {
+            continue;
+        };
+        for ancestor in entry.path.as_path().ancestors() {
+            let Ok(path) = RepoPath::parse(ancestor) else {
+                continue;
+            };
+            statuses
+                .entry(path)
+                .and_modify(|current: &mut FileStatus| {
+                    *current = (*current).max(status);
+                })
+                .or_insert(status);
+        }
+    }
+    statuses
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1973,6 +2058,7 @@ fn file_rows_from_tree(entries: Vec<crate::repository::FileTreeEntry>) -> Vec<Fi
                 depth: entry.depth,
                 directory: entry.directory,
                 ignored: false,
+                status: None,
                 chrome,
             }
         })
@@ -2074,6 +2160,14 @@ impl SourceControlModel {
 
     /// Builds the panel from a loaded snapshot.
     pub fn ready(key: ActiveWorktreeKey, snapshot: &RepositorySnapshot) -> Self {
+        Self::ready_for_tab(key, snapshot, true)
+    }
+
+    pub fn ready_for_tab(
+        key: ActiveWorktreeKey,
+        snapshot: &RepositorySnapshot,
+        browse_files: bool,
+    ) -> Self {
         let worktree_id = key.worktree_id;
         // The header's label and the branch a push names come from the same
         // `HEAD` and are not the same value: the label is a lossy decoding of
@@ -2113,18 +2207,25 @@ impl SourceControlModel {
             .collect::<BTreeSet<_>>()
             .len();
         let change_count_label = (changed_paths > 0).then(|| tab_count_label(changed_paths));
-        let mut paths;
-        let paths = if snapshot.files.ignored.is_empty() {
-            &snapshot.files.paths
-        } else {
-            paths = snapshot.files.paths.clone();
+        let mut files = if browse_files {
+            // Staged deletions are absent from ls-files, but remain navigable
+            // review rows with their D decoration in this snapshot.
+            let mut paths = snapshot.files.paths.clone();
             paths.extend(snapshot.files.ignored.iter().cloned());
-            &paths
+            paths.extend(
+                snapshot
+                    .status
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.clone()),
+            );
+            file_rows_from_tree(build_file_tree_with_directories(
+                &paths,
+                &snapshot.files.ignored_directories,
+            ))
+        } else {
+            Vec::new()
         };
-        let mut files = file_rows_from_tree(build_file_tree_with_directories(
-            paths,
-            &snapshot.files.ignored_directories,
-        ));
         let ignored: BTreeSet<_> = snapshot.files.ignored.iter().collect();
         let ignored_directories: BTreeSet<_> = snapshot
             .files
@@ -2132,7 +2233,13 @@ impl SourceControlModel {
             .iter()
             .map(|path| path.as_path())
             .collect();
+        let statuses = if browse_files {
+            file_statuses(&snapshot.status.entries)
+        } else {
+            BTreeMap::new()
+        };
         for row in &mut files {
+            row.status = statuses.get(&row.path).copied();
             row.ignored = ignored.contains(&row.path)
                 || row
                     .path
@@ -4700,8 +4807,13 @@ fn project_identity_row<'a>(
         .on_press_maybe(
             project_primary_action(
                 project,
-                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
-            ).and_then(|action| gated(action, modal_open)),
+                if review_mode {
+                    SidebarFilter::PullRequests
+                } else {
+                    SidebarFilter::All
+                },
+            )
+            .and_then(|action| gated(action, modal_open)),
         );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
@@ -4725,16 +4837,20 @@ pub(crate) fn project_primary_action(
             repository: project.repository.clone(),
         });
     }
-    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
-        SidebarAction::BrowsePullRequests { project_id: project.id }
-    } else if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(
+        if filter == SidebarFilter::PullRequests && project.github_ready {
+            SidebarAction::BrowsePullRequests {
+                project_id: project.id,
+            }
+        } else if project.kind == ProjectKind::Folder {
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }
+        } else {
+            SidebarAction::ToggleProject(project.id)
+        },
+    )
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -4949,8 +5065,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = project_primary_action(project, state.filter)
-        .and_then(|action| gated(action, modal_open));
+    let reload =
+        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -7385,7 +7501,9 @@ fn files_section<'a>(
                 } else {
                     Cow::Borrowed(&*chrome.label)
                 })
-                .class(if row.ignored {
+                .class(if let Some(status) = row.status {
+                    status.text_class()
+                } else if row.ignored {
                     theme::Text::Custom(design::muted_text)
                 } else {
                     theme::Text::Default
@@ -7396,6 +7514,10 @@ fn files_section<'a>(
                 ))
                 .width(Length::Fill)
                 .into(),
+                match row.status {
+                    Some(status) => semantic_caption(status.badge(), status.tone()),
+                    None => widget::Space::new().width(Length::Fixed(12.0)).into(),
+                },
             ])
             .align_y(Alignment::Center)
             .spacing(space::XS),
@@ -10469,7 +10591,9 @@ mod row_interaction {
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
                 && let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key), modifiers, ..
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
                 }) = event
                 && modifiers.is_empty()
             {
@@ -11258,58 +11382,61 @@ pub(crate) mod tests {
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
-        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
-        for (focused, modal) in [(false, false), (true, false), (true, true)] {
-            let state = SidebarState::default();
-            let renderer = headless_renderer();
-            let mut element = search(&state, modal);
-            let mut tree = Tree::new(&element);
-            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            );
-            if focused {
-                element.as_widget_mut().operate(
+        for key in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            for (focused, modal) in [(false, false), (true, false), (true, true)] {
+                let state = SidebarState::default();
+                let renderer = headless_renderer();
+                let mut element = search(&state, modal);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+                let node = element.as_widget_mut().layout(
                     &mut tree,
-                    Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if focused {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(search_focus_id()),
+                    );
+                }
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if focused && !modal {
+                        vec![if key == keyboard::key::Named::Escape {
+                            SidebarAction::ToggleControls
+                        } else {
+                            SidebarAction::FocusFirstSearchResult
+                        }]
+                    } else {
+                        vec![]
+                    }
                 );
             }
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
-                    text: None,
-                    repeat: false,
-                }),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                messages,
-                if focused && !modal {
-                    vec![if key == keyboard::key::Named::Escape {
-                        SidebarAction::ToggleControls
-                    } else {
-                        SidebarAction::FocusFirstSearchResult
-                    }]
-                } else {
-                    vec![]
-                }
-            );
-        }
         }
     }
 
@@ -15568,6 +15695,112 @@ pub(crate) mod tests {
                 target: ref_name("refs/remotes/origin/main"),
             }],
         }
+    }
+
+    #[test]
+    fn files_decorate_all_git_statuses_and_roll_up_highest_priority() {
+        let entries = [
+            ("src/added.rs", ChangeKind::Added, FileStatus::Added),
+            ("src/changed.rs", ChangeKind::Modified, FileStatus::Modified),
+            ("src/deleted.rs", ChangeKind::Deleted, FileStatus::Deleted),
+            ("src/new.rs", ChangeKind::Untracked, FileStatus::Untracked),
+            (
+                "src/nested/conflict.rs",
+                ChangeKind::Unmerged,
+                FileStatus::Conflicted,
+            ),
+        ];
+        let changes = entries
+            .iter()
+            .map(|(path, kind, _)| changed(repo_path(path), ChangeArea::Unstaged, *kind, None))
+            .collect::<Vec<_>>();
+        let statuses = file_statuses(&changes);
+        for (path, _, status) in entries {
+            assert_eq!(statuses.get(&repo_path(path)), Some(&status));
+        }
+        assert_eq!(
+            statuses.get(&repo_path("src")),
+            Some(&FileStatus::Conflicted)
+        );
+        assert_eq!(
+            statuses.get(&repo_path("src/nested")),
+            Some(&FileStatus::Conflicted)
+        );
+        let without_conflict = file_statuses(&changes[..4]);
+        assert_eq!(
+            without_conflict.get(&repo_path("src")),
+            Some(&FileStatus::Modified)
+        );
+    }
+
+    #[test]
+    fn git_views_do_not_prepare_hidden_file_decorations() {
+        let model = SourceControlModel::ready_for_tab(main_key(), &snapshot(), false);
+        assert!(model.files.is_empty());
+        assert!(!model.groups.is_empty());
+    }
+
+    #[test]
+    fn files_keep_staged_deleted_and_untracked_paths_absent_from_listing() {
+        let mut snapshot = snapshot();
+        snapshot.status.entries.push(changed(
+            repo_path("deleted/gone.rs"),
+            ChangeArea::Staged,
+            ChangeKind::Deleted,
+            None,
+        ));
+        let model = SourceControlModel::ready(main_key(), &snapshot);
+        assert_eq!(
+            model
+                .files
+                .iter()
+                .find(|row| row.path == repo_path("deleted/gone.rs"))
+                .unwrap()
+                .status,
+            Some(FileStatus::Deleted)
+        );
+        assert_eq!(
+            model
+                .files
+                .iter()
+                .find(|row| row.path == repo_path("deleted"))
+                .unwrap()
+                .status,
+            Some(FileStatus::Deleted)
+        );
+        assert_eq!(
+            model
+                .files
+                .iter()
+                .find(|row| row.path == repo_path("notes.txt"))
+                .unwrap()
+                .status,
+            Some(FileStatus::Untracked)
+        );
+    }
+
+    #[test]
+    fn files_decorations_follow_replaced_snapshot_and_plain_folders_stay_clean() {
+        let model = source_control();
+        assert_eq!(
+            model
+                .files
+                .iter()
+                .find(|row| row.path == repo_path("src"))
+                .unwrap()
+                .status,
+            Some(FileStatus::Conflicted)
+        );
+        let mut clean = snapshot();
+        clean.status.entries.clear();
+        let ready = SourceControlModel::ready(main_key(), &clean);
+        assert!(ready.files.iter().all(|row| row.status.is_none()));
+        assert!(
+            SourceControlModel::directory(main_key(), &[repo_path("src/plain.rs")])
+                .files
+                .iter()
+                .all(|row| row.status.is_none())
+        );
     }
 
     fn source_control() -> SourceControlModel {

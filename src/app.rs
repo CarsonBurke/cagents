@@ -33,6 +33,7 @@ mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
+mod search_ui;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
@@ -2066,6 +2067,7 @@ pub struct PullRequestDialog {
 pub enum ContextTab {
     #[default]
     Files,
+    Search,
     Changes,
     PullRequest,
     Details,
@@ -2171,11 +2173,18 @@ async fn flush_workspace(
 }
 
 impl ContextTab {
-    const ALL: [Self; 4] = [Self::Files, Self::Changes, Self::PullRequest, Self::Details];
+    const ALL: [Self; 5] = [
+        Self::Files,
+        Self::Search,
+        Self::Changes,
+        Self::PullRequest,
+        Self::Details,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Files => "Files",
+            Self::Search => "Search",
             // The panel holds the Changes, Branch, and History views; naming
             // it after the first of them said "Changes" twice.
             Self::Changes => "Source control",
@@ -2509,6 +2518,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsDraftChanged { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
+        Message::ProjectSearch(action) => !matches!(action, search_ui::Action::Progress { .. } | search_ui::Action::Run(_) | search_ui::Action::QueryFocus(_)),
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
@@ -3958,7 +3968,7 @@ pub enum Message {
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Box<RepositorySnapshot>, String>,
+        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel)>>, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -4285,6 +4295,7 @@ pub enum Message {
     },
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
+    ProjectSearch(search_ui::Action),
     TerminalFind(terminal_ui::Action),
     ZoomFont {
         card: CardId,
@@ -4754,6 +4765,7 @@ pub struct Cagents {
     cards: HashMap<CardId, CardRuntime>,
     terminal_working_directories: HashMap<CardId, PathBuf>,
     terminal_find: HashMap<CardId, terminal_ui::Find>,
+    search_ui: search_ui::State,
     terminal_review_card: Option<CardId>,
     terminal_review_revision: u64,
     terminal_review_identity: Option<crate::model::TerminalId>,
@@ -10941,7 +10953,8 @@ impl Cagents {
             });
         }
         let worktree = key.canonical_path.clone();
-        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
+        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked)
+            || self.context_tab == ContextTab::Files;
         let options = crate::repository::SnapshotOptions {
             untracked_changes,
             untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
@@ -10959,6 +10972,7 @@ impl Cagents {
             .expanded_directory_paths()
             .cloned()
             .collect::<Vec<_>>();
+        let model_key = key.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
@@ -10979,12 +10993,15 @@ impl Cagents {
                         &cancellation,
                     )?;
                 }
-                Ok(snapshot)
+                let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
+                if cancellation.is_cancelled() {
+                    return Err("source-control read cancelled".to_owned());
+                }
+                Ok(Some(Box::new((snapshot, model))))
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
-            .and_then(|result| result)
-            .map(Box::new);
+            .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -11272,8 +11289,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -12835,6 +12855,7 @@ impl Application for Cagents {
             cards: HashMap::new(),
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
+            search_ui: search_ui::State::default(),
             terminal_review_card: None,
             terminal_review_revision: 0,
             terminal_review_identity: None,
@@ -15768,6 +15789,9 @@ impl Application for Cagents {
                     }
                     return Task::none();
                 }
+                if let Some(task) = self.project_search_key_event(&event) {
+                    return task;
+                }
                 if let Some(task) = self.palette_key_event(&event) {
                     return task;
                 }
@@ -16043,10 +16067,14 @@ impl Application for Cagents {
             }
             Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
             Message::TerminalFind(action) => self.handle_terminal_find(action),
+            Message::ProjectSearch(action) => self.update_project_search(action),
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
             Message::SelectContextTab(tab) => {
+                if tab == ContextTab::Search {
+                    return self.update_project_search(search_ui::Action::Open);
+                }
                 if self.active_folder_scope()
                     && matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
                 {
@@ -16306,7 +16334,13 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.source_cancel = None;
-                if let Ok(snapshot) = &result
+                if matches!(result, Ok(None)) {
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_reloading(false);
+                    }
+                    return Task::none();
+                }
+                if let Ok(Some(prepared)) = &result
                     && let Some(worktree) = self
                         .sidebar_model
                         .projects
@@ -16319,11 +16353,15 @@ impl Application for Cagents {
                                 .find(|worktree| worktree.id == key.worktree_id)
                         })
                 {
-                    worktree.apply_status(&snapshot.status);
+                    worktree.apply_status(&prepared.0.status);
                 }
-                let mut next = match &result {
-                    Ok(snapshot) => SourceControlModel::ready(key, snapshot),
-                    Err(error) => SourceControlModel::failed(key, error.clone()),
+                let (snapshot, mut next) = match result {
+                    Ok(Some(prepared)) => {
+                        let (snapshot, model) = *prepared;
+                        (Some(snapshot), model)
+                    }
+                    Ok(None) => unreachable!(),
+                    Err(error) => (None, SourceControlModel::failed(key, error)),
                 };
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
@@ -16332,9 +16370,9 @@ impl Application for Cagents {
                     previous.carry_mutation_into(&mut next);
                 }
                 self.sidebar_model.source_control = Some(next);
-                match result {
-                    Ok(snapshot) => self.refresh_branch_changes(&snapshot),
-                    Err(_) => {
+                match snapshot {
+                    Some(snapshot) => self.refresh_branch_changes(&snapshot),
+                    None => {
                         self.cancel_branch_changes();
                         Task::none()
                     }
@@ -16466,6 +16504,7 @@ impl Application for Cagents {
         }
         self.refresh_sidebar_worktree_panes();
         let binding = self.rebind_source_control();
+        let search_binding = self.rebind_project_search();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
                 .workspace
@@ -16488,6 +16527,7 @@ impl Application for Cagents {
         Task::batch([
             task,
             binding,
+            search_binding,
             chrome,
             deferred,
             pull_request,
@@ -25107,6 +25147,7 @@ mod tests {
             durable,
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
+            search_ui: search_ui::State::default(),
             terminal_context: None,
             terminal_paste: None,
             cards: card_id
