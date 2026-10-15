@@ -1,6 +1,6 @@
 mod accessibility;
 #[cfg(test)]
-mod accessibility_tests;
+pub(crate) mod accessibility_tests;
 mod links;
 pub(crate) use accessibility::ReviewInputBarrier;
 

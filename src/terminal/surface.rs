@@ -43,6 +43,8 @@ impl TerminalSurface {
 
     pub(crate) fn same_attachment(&self, other: &Self) -> bool { self.handle.same_attachment(&other.handle) }
 
+    pub(crate) fn execution_instance(&self) -> Option<uuid::Uuid> { self.handle.execution_instance() }
+
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
         self.handle.snapshot()
     }
