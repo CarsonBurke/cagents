@@ -6065,7 +6065,7 @@ fn recovery_refuses_late_writes_during_other_batches_and_destructive_prechecks()
 
 #[test]
 fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
-    struct SubstituteUnpacked { root: PathBuf, changed: std::sync::atomic::AtomicBool }
+    struct SubstituteUnpacked { changed: std::sync::atomic::AtomicBool }
     impl ProcessExecutor for SubstituteUnpacked {
         fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
             let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancel)?;
@@ -6073,7 +6073,8 @@ fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
                 use std::os::unix::ffi::OsStrExt;
                 let name = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
                 assert!(name.starts_with(b".merge_file_"));
-                let path = self.root.join(OsStr::from_bytes(name));
+                let cwd = command.arguments.windows(2).find(|pair| pair[0] == "-C").expect("fixed recovery command has a held cwd");
+                let path = Path::new(&cwd[1]).join(OsStr::from_bytes(name));
                 assert_eq!(fs::metadata(&path).unwrap().len(), 4);
                 fs::remove_file(&path).unwrap();
                 fs::write(&path, b"EVIL").unwrap();
@@ -6088,12 +6089,12 @@ fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
     fixture.commit("base");
     fixture.write("tracked.txt", b"work");
     let cancel = CancellationToken::default();
-    let receipt = fixture.service().discard_recoverable(&DiscardRequest {
+    let mut receipt = fixture.service().discard_recoverable(&DiscardRequest {
         worktree: fixture.work(), tracked: vec![PathSelection::new(path("tracked.txt"))],
         untracked: vec![], confirmed: true,
     }, &cancel).unwrap().recovery;
     assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"base");
-    let executor = Arc::new(SubstituteUnpacked { root: fixture.work(), changed: std::sync::atomic::AtomicBool::new(false) });
+    let executor = Arc::new(SubstituteUnpacked { changed: std::sync::atomic::AtomicBool::new(false) });
     let result = RepositoryService::new("git", executor.clone()).undo_discard(&receipt, &cancel).unwrap();
     assert!(executor.changed.load(std::sync::atomic::Ordering::Acquire));
     assert!(!matches!(result, MutationOutcome::Applied { .. }), "{result:?}");
@@ -6110,4 +6111,29 @@ fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
     let before = receipt.entries.iter().find(|entry| entry.path == path("tracked.txt")).unwrap();
     let cagents::repository::SavedEntry::Blob { oid, .. } = &before.before else { panic!("tracked backup required") };
     assert_eq!(fixture.git_in_work(&["cat-file", "blob", oid.as_str()]), b"work");
+    assert!(receipt.live_recovery.is_pending(), "the unresolved file must retain live authority");
+    receipt.expires_unix_ms = 0;
+    assert!(receipt.can_undo(), "a live recovery cannot expire while it owns unresolved filesystem state");
+    let holding = fs::read_dir(fixture.work()).unwrap().filter_map(Result::ok)
+        .find(|entry| entry.file_type().unwrap().is_dir() && entry.file_name().as_encoded_bytes().starts_with(b".cagents-undo-")).unwrap().file_name();
+    let parked = fixture.root.path().join("parked-original");
+    fs::rename(fixture.work(), &parked).unwrap();
+    fs::create_dir(fixture.work()).unwrap();
+    fixture.run(&fixture.work(), &["init", "-b", "main"]);
+    fixture.write("tracked.txt", b"replacement");
+    fs::create_dir(fixture.work().join(&holding)).unwrap();
+    fs::write(fixture.work().join(&holding).join("foreign"), b"preserve").unwrap();
+    assert!(!matches!(fixture.service().undo_discard(&receipt, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+    // Explicitly resolve the unexpected entry; retry may remove only the exact
+    // empty original holding using retained descriptors, never the new B path.
+    for entry in fs::read_dir(parked.join(&holding)).unwrap() {
+        let entry = entry.unwrap();
+        assert_eq!(fs::read(entry.path()).unwrap(), b"EVIL");
+        fs::remove_file(entry.path()).unwrap();
+    }
+    assert!(matches!(fixture.service().undo_discard(&receipt, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+    assert!(!receipt.live_recovery.is_pending());
+    assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"replacement");
+    assert_eq!(fs::read(fixture.work().join(&holding).join("foreign")).unwrap(), b"preserve");
+    assert_eq!(fs::read(parked.join("tracked.txt")).unwrap(), b"base");
 }

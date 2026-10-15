@@ -35061,6 +35061,7 @@ mod tests {
         drop(app.enqueue_git_mutation(key.clone(), super::QueuedGitMutation::Discard(request)));
         let operation = app.source_control_mutations[&key.canonical_path].id;
         let recovery = crate::repository::DiscardRecovery {
+            live_recovery: Default::default(),
             worktree: key.canonical_path.clone(),
             worktree_identity: (0, 0),
             directories: std::collections::BTreeMap::new(),
@@ -35151,6 +35152,7 @@ mod tests {
         let other = key.canonical_path.join("other-worktree");
         let receipt = |worktree: PathBuf, until| {
             Arc::new(crate::repository::DiscardRecovery {
+                live_recovery: Default::default(),
                 worktree,
                 worktree_identity: (0, 0),
                 directories: std::collections::BTreeMap::new(),

@@ -10,6 +10,9 @@ use std::{
     },
 };
 
+#[path = "repository/recovery_publication.rs"]
+mod publication;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SavedEntry {
     Absent,
@@ -39,6 +42,9 @@ pub struct DiscardRecoveryEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscardRecovery {
+    /// Ephemeral exact recovery authority; never serialized or reconstructed
+    /// from a diagnostic pathname. Clones share the same bounded payload.
+    pub live_recovery: LiveDiscardRecovery,
     pub worktree: PathBuf,
     pub worktree_identity: (u64, u64),
     pub directories: BTreeMap<RepoPath, u32>,
@@ -46,9 +52,46 @@ pub struct DiscardRecovery {
     pub expires_unix_ms: u64,
 }
 
+/// Keeps unresolved worker-owned receipts with the actual discard receipt.
+/// Mutex guards never cover filesystem IO: clone then retry on the worker.
+#[derive(Debug, Clone, Default)]
+pub struct LiveDiscardRecovery(Arc<std::sync::Mutex<LiveDiscardState>>);
+#[derive(Debug, Default)]
+struct LiveDiscardState {
+    authority: Option<crate::recovery_authority::RecoveryAuthority>,
+    uncertain: bool,
+}
+impl LiveDiscardRecovery {
+    pub fn authority(&self) -> Option<crate::recovery_authority::RecoveryAuthority> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).authority.clone()
+    }
+    pub fn is_pending(&self) -> bool {
+        self.authority().is_some_and(|authority| !authority.is_resolved())
+    }
+    fn set_uncertain(&self, uncertain: bool) {
+        self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner()).uncertain = uncertain;
+    }
+    fn is_uncertain(&self) -> bool {
+        self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner()).uncertain
+    }
+    fn retain(&self, authority: crate::recovery_authority::RecoveryAuthority) {
+        let mut current = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.authority = Some(match current.authority.take() {
+            Some(previous) => previous.combine(authority), None => authority,
+        });
+    }
+}
+impl PartialEq for LiveDiscardRecovery {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.authority() == other.authority()
+    }
+}
+impl Eq for LiveDiscardRecovery {}
+
 impl DiscardRecovery {
     pub fn can_undo(&self) -> bool {
-        !self.entries.is_empty() && unix_ms() <= self.expires_unix_ms
+        self.live_recovery.is_pending()
+            || (!self.entries.is_empty() && unix_ms() <= self.expires_unix_ms)
     }
 }
 
@@ -151,6 +194,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(RecoverableDiscard {
             outcome,
             recovery: DiscardRecovery {
+                live_recovery: LiveDiscardRecovery::default(),
                 worktree: request.worktree.clone(),
                 worktree_identity,
                 directories,
@@ -266,6 +310,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(RecoverableDiscard {
             outcome,
             recovery: DiscardRecovery {
+                live_recovery: LiveDiscardRecovery::default(),
                 worktree: worktree.to_owned(),
                 worktree_identity,
                 directories,
@@ -454,6 +499,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         recovery: &DiscardRecovery,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
+        if let Some(authority) = recovery.live_recovery.authority().filter(|authority| !authority.is_resolved()) {
+            return Ok(match authority.retry() {
+                Ok(()) => { recovery.live_recovery.set_uncertain(false); MutationOutcome::Applied { paths: vec![] } },
+                Err(reason) => MutationOutcome::NotApplied { failure: MutationFailure::Rejected {
+                    reason: format!("Discard recovery is still unresolved; no new Undo was attempted: {reason}"),
+                } },
+            });
+        }
         if !recovery.can_undo() {
             return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason: "Undo discard has expired; backups remain in Git objects and the system Trash".into() } });
         }
@@ -480,7 +533,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         entries.sort_by(|left, right| left.path.as_path().components().cmp(right.path.as_path().components()));
         for entry in entries {
             created_directories.flush_before(Some(&entry.path), &mut failures);
-            let result = if cancellation.is_cancelled() {
+            let result = if recovery.live_recovery.is_pending() {
+                Err("An earlier recovery entry is unresolved; this path was not changed".into())
+            } else if cancellation.is_cancelled() {
                 Err("Undo cancelled".into())
             } else {
                 self.undo_discard_entry(
@@ -510,6 +565,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // retained authority before the actual archived-mode chmod.
         created_directories.flush_before(None, &mut failures);
         failures.extend(created_directories.warnings.into_values());
+        if recovery.live_recovery.is_uncertain() {
+            return Ok(MutationOutcome::OutcomeUnknown { failure: MutationFailure::Reconciliation {
+                reason: format!("Undo publication/putback remains unresolved; {} earlier paths were confirmed restored. Live filesystem recovery authority was retained. {}",
+                    paths.len(), failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")),
+            } });
+        }
         if paths.is_empty() && failures.len() > 1 {
             return Ok(MutationOutcome::NotApplied {
                 failure: MutationFailure::Rejected {
@@ -552,110 +613,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if let Some(trash) = &entry.trash {
             return restore_trashed_entry(trash, &parent, &name, cancellation, || {});
         }
-        let temporary = OsString::from(format!(".cagents-undo-{}", Uuid::new_v4()));
-        match &entry.before {
-            SavedEntry::Absent => {}
-            SavedEntry::Trashed => return Err("the Trash receipt is missing".into()),
-            SavedEntry::Unavailable { reason } => {
-                return Err(format!("the backup is unavailable: {reason}"));
-            }
-            SavedEntry::Symlink { target } => {
-                fs_safety::symlink_within(&parent, target, &temporary)
-                    .map_err(|error| error.to_string())?
-            }
-            SavedEntry::Blob { oid, mode, bytes } => {
-                // Git streams the blob into its own private temporary file.
-                // Capturing cat-file stdout here would allocate the whole file
-                // again and make Undo of a large generated artifact expensive.
-                let output = self
-                    .run_checked(
-                        &self.git_mutation(&recovery.worktree, ["unpack-file", oid.as_str()]),
-                        cancellation,
-                    )
-                    .map_err(|error| error.to_string())?;
-                let name = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
-                let generated = RepoPath::parse(Path::new(OsStr::from_bytes(name)))
-                    .map_err(|error| error.to_string())?;
-                if generated.as_path().components().count() != 1
-                    || !name.starts_with(b".merge_file_")
-                {
-                    return Err("Git returned an invalid recovery temporary name".into());
-                }
-                let generated_name = generated.as_os_str();
-                let file = fs_safety::open_beneath(root, generated.as_path())
-                    .map_err(|error| error.to_string())?;
-                let install = file.metadata().and_then(|metadata| {
-                    if metadata.len() != *bytes {
-                        return Err(io::Error::other("recovery blob has an unexpected size"));
-                    }
-                    file.set_permissions(fs::Permissions::from_mode(*mode))
-                        .and_then(|()| file.sync_all())
-                });
-                if let Err(error) = install {
-                    let _ = fs_safety::unlink_within(root, generated_name);
-                    return Err(error.to_string());
-                }
-                if let Err(error) =
-                    fs_safety::rename_new_between(root, generated_name, &parent, &temporary)
-                {
-                    let _ = fs_safety::unlink_within(root, generated_name);
-                    return Err(error.to_string());
-                }
-            }
-        }
-        // Move the expected post-discard entry aside before installing its
-        // previous contents. A newly created destination is never overwritten.
-        let displaced = OsString::from(format!(".cagents-undo-previous-{}", Uuid::new_v4()));
-        let had_current = entry.after != SavedEntry::Absent;
-        if had_current {
-            if let Err(error) = fs_safety::rename_new_within(&parent, &name, &displaced) {
-                let _ = fs_safety::unlink_within(&parent, &temporary);
-                return Err(error.to_string());
-            }
-            let displaced_path =
-                RepoPath::parse(Path::new(&displaced)).map_err(|error| error.to_string())?;
-            let displaced_state = self.capture_recovery_entry(
-                &recovery.worktree,
-                &parent,
-                &displaced_path,
-                false,
-                cancellation,
-            );
-            if displaced_state.as_ref() != Ok(&entry.after) {
-                let restored = fs_safety::rename_new_within(&parent, &displaced, &name);
-                let _ = fs_safety::unlink_within(&parent, &temporary);
-                return Err(format!(
-                    "changed while Undo was running; preserved previous entry{}",
-                    if restored.is_ok() {
-                        String::new()
-                    } else {
-                        format!(" at {}", parent.path().join(&displaced).display())
-                    }
-                ));
-            }
-        }
-        if entry.before != SavedEntry::Absent {
-            if let Err(error) = fs_safety::rename_new_within(&parent, &temporary, &name) {
-                if had_current {
-                    let _ = fs_safety::rename_new_within(&parent, &displaced, &name);
-                }
-                let _ = fs_safety::unlink_within(&parent, &temporary);
-                return Err(format!(
-                    "could not restore without replacing newer work: {error}"
-                ));
-            }
-        }
-        let mut warnings = Vec::new();
-        if had_current && let Err(error) = fs_safety::unlink_within(&parent, &displaced) {
-            warnings.push(format!(
-                "could not remove displaced entry {}: {error}",
-                parent.path().join(&displaced).display()
-            ));
-        }
-        if let Err(error) = fs_safety::sync_directory(&parent) {
-            warnings.push(format!("directory sync failed: {error}"));
-        }
-        Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
+        self.undo_saved_entry(recovery, root, entry, &parent, &name, cancellation)
     }
 }
 
