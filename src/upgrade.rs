@@ -875,7 +875,11 @@ pub(crate) mod handoff {
             && saved.id == source.id
             && saved.launch.provider == source.launch.provider
             && saved.launch.recipe == source.launch.recipe
-            && source.launch.session_id.as_ref().is_none_or(|id| saved.launch.session_id.as_ref() == Some(id))
+            && source
+                .launch
+                .session_id
+                .as_ref()
+                .is_none_or(|id| saved.launch.session_id.as_ref() == Some(id))
             && saved.owned_codex_listener == source.owned_codex_listener
             && saved.terminal == source.terminal
     }

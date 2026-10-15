@@ -35,7 +35,11 @@ pub(crate) fn preflight_editor_companions(candidate_protocol: Option<u16>) -> io
                 &crate::companion::Product::Daemon.beside(cli)?,
                 &crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?,
             )?;
-        Ok(CompanionIdentity { instance, protocol, daemon_qualified })
+        Ok(CompanionIdentity {
+            instance,
+            protocol,
+            daemon_qualified,
+        })
     })
 }
 
@@ -161,15 +165,21 @@ pub(crate) fn trusted_executable_owner(owner: u32) -> bool {
 fn same_daemon_binary(candidate: &Path, expected: &Path) -> io::Result<bool> {
     use std::os::unix::fs::OpenOptionsExt;
     fn open(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
-        let file = std::fs::OpenOptions::new().read(true)
+        let file = std::fs::OpenOptions::new()
+            .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
         let metadata = file.metadata()?;
-        if !metadata.is_file() || !trusted_executable_owner(metadata.uid())
-            || metadata.mode() & 0o022 != 0 || metadata.mode() & 0o111 == 0
-            || metadata.len() == 0 || metadata.len() > 512 * 1024 * 1024
+        if !metadata.is_file()
+            || !trusted_executable_owner(metadata.uid())
+            || metadata.mode() & 0o022 != 0
+            || metadata.mode() & 0o111 == 0
+            || metadata.len() == 0
+            || metadata.len() > 512 * 1024 * 1024
         {
-            return Err(io::Error::other("The editor daemon is not an owned bounded executable"));
+            return Err(io::Error::other(
+                "The editor daemon is not an owned bounded executable",
+            ));
         }
         Ok((file, metadata))
     }
@@ -182,19 +192,32 @@ fn same_daemon_binary(candidate: &Path, expected: &Path) -> io::Result<bool> {
         let mut right = [0; 64 * 1024];
         loop {
             if Instant::now() >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "Editor daemon qualification exceeded its bound"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Editor daemon qualification exceeded its bound",
+                ));
             }
             let count = candidate_file.read(&mut left)?;
             expected_file.read_exact(&mut right[..count])?;
-            if left[..count] != right[..count] {equal = false; break;}
-            if count == 0 {break;}
+            if left[..count] != right[..count] {
+                equal = false;
+                break;
+            }
+            if count == 0 {
+                break;
+            }
         }
     }
-    for (path, file, before) in [(candidate, &candidate_file, &before_candidate), (expected, &expected_file, &before_expected)] {
+    for (path, file, before) in [
+        (candidate, &candidate_file, &before_candidate),
+        (expected, &expected_file, &before_expected),
+    ] {
         if companion_stamp(before) != companion_stamp(&file.metadata()?)
             || companion_stamp(before) != companion_stamp(&std::fs::symlink_metadata(path)?)
         {
-            return Err(io::Error::other("The matched daemon changed during qualification"));
+            return Err(io::Error::other(
+                "The matched daemon changed during qualification",
+            ));
         }
     }
     Ok(equal)
@@ -321,10 +344,19 @@ mod tests {
         let proc_root = root.path().join("proc");
         let runtime = root.path().join("runtime");
         editor(&proc_root, &root.path().join("editor/bin"), &runtime);
-        let error = preflight_in(&proc_root, &runtime, Some(77), |_| Ok(CompanionIdentity {
-            instance: crate::instance::NAME.into(), protocol: 77, daemon_qualified: false,
-        })).unwrap_err();
-        assert!(error.to_string().contains("private daemon cannot be qualified"));
+        let error = preflight_in(&proc_root, &runtime, Some(77), |_| {
+            Ok(CompanionIdentity {
+                instance: crate::instance::NAME.into(),
+                protocol: 77,
+                daemon_qualified: false,
+            })
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("private daemon cannot be qualified")
+        );
         assert!(error.to_string().contains("kept open"));
     }
 
@@ -332,7 +364,11 @@ mod tests {
     fn executable_ownership_accepts_root_or_current_user_only() {
         assert!(trusted_executable_owner(0));
         assert!(trusted_executable_owner(unsafe { libc::geteuid() }));
-        let other = if unsafe { libc::geteuid() } == 1 {2} else {1};
+        let other = if unsafe { libc::geteuid() } == 1 {
+            2
+        } else {
+            1
+        };
         assert!(!trusted_executable_owner(other));
     }
 

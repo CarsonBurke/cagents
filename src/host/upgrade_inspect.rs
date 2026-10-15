@@ -150,7 +150,10 @@ fn inspect(request: Request) -> Result<(), String> {
     let mut ids = HashSet::new();
     for session in &inventory {
         if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
-            return Err(format!("Source conversation {} has ambiguous ownership; reconnect or close it before updating. Source windows remain usable", session.id));
+            return Err(format!(
+                "Source conversation {} has ambiguous ownership; reconnect or close it before updating. Source windows remain usable",
+                session.id
+            ));
         }
         validate_live_chat(session, request.require_resumable)
             .map_err(|_| format!("Source conversation {} has no qualified immutable migration; reconnect or close it before updating. Source windows remain usable", session.id))?;
@@ -297,12 +300,15 @@ mod tests {
         let live = session();
         let mut supplied = live.clone();
         supplied.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
-        assert!(qualify(
-            &supplied,
-            std::slice::from_ref(&live),
-            live.proof.as_ref().unwrap(),
-            |_| panic!("same-proof requests cannot invent a thread identity"),
-        ).is_err());
+        assert!(
+            qualify(
+                &supplied,
+                std::slice::from_ref(&live),
+                live.proof.as_ref().unwrap(),
+                |_| panic!("same-proof requests cannot invent a thread identity"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -338,11 +344,10 @@ mod tests {
     fn already_corrupted_77_published_resume_argv_cannot_qualify_a_saved_pane() {
         let saved = session();
         let mut current = saved.clone();
-        current
-            .launch
-            .recipe
-            .arguments
-            .extend(["--resume".into(), "11111111-1111-4111-8111-111111111111".into()]);
+        current.launch.recipe.arguments.extend([
+            "--resume".into(),
+            "11111111-1111-4111-8111-111111111111".into(),
+        ]);
         assert!(
             qualify(
                 &saved,
