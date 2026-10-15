@@ -705,15 +705,20 @@ impl Credits {
 /// How an account stands against its limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageStatus {
+    #[serde(alias = "ok")]
     Ok,
     /// A window is past [`WARNING_FRACTION`], or the provider said so.
+    #[serde(alias = "warning")]
     Warning,
     /// A window the whole account depends on is exhausted.
+    #[serde(alias = "limited")]
     Limited,
     /// The CLI is installed and has a home, but its login no longer works.
+    #[serde(alias = "needs_login")]
     NeedsLogin,
     /// There is nothing to report: the CLI is missing, the account has never
     /// been set up, or the provider does not report limits for it.
+    #[serde(alias = "unavailable")]
     Unavailable,
 }
 
@@ -721,13 +726,17 @@ pub enum UsageStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageSource {
     /// Reported by a conversation that is running on the account right now.
+    #[serde(alias = "live")]
     Live,
     /// Asked of the CLI by cagents.
+    #[serde(alias = "probe")]
     Probe,
     /// Read back from the cache another window, or an earlier run, wrote.
+    #[serde(alias = "cache")]
     Cache,
     /// Read from the record a CLI that brokers its own accounts keeps of what
     /// it observed, as of when it observed it.
+    #[serde(alias = "recorded")]
     Recorded,
 }
 

@@ -1279,8 +1279,11 @@ pub enum PermissionSettingsUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
+    #[serde(alias = "user")]
     User,
+    #[serde(alias = "assistant")]
     Assistant,
+    #[serde(alias = "system")]
     System,
 }
 /// Where an assistant message sits within its turn.
@@ -1295,19 +1298,26 @@ pub enum Role {
 pub enum Phase {
     /// The answer a turn was asked for.
     #[default]
+    #[serde(alias = "final")]
     Final,
     /// Progress narration emitted while the turn is still working.
+    #[serde(alias = "commentary")]
     Commentary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolStatus {
+    #[serde(alias = "running")]
     Running,
+    #[serde(alias = "succeeded")]
     Succeeded,
+    #[serde(alias = "failed")]
     Failed,
+    #[serde(alias = "denied")]
     Denied,
     /// Ended before it finished because it was asked to stop: cancelled by
     /// the user, or interrupted with the work that started it.
+    #[serde(alias = "stopped")]
     Stopped,
 }
 
@@ -1320,18 +1330,26 @@ pub enum ToolStatus {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandAction {
     #[default]
+    #[serde(alias = "run")]
     Run,
+    #[serde(alias = "read")]
     Read,
+    #[serde(alias = "search")]
     Search,
+    #[serde(alias = "list")]
     List,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
+    #[serde(alias = "added")]
     Added,
+    #[serde(alias = "deleted")]
     Deleted,
+    #[serde(alias = "updated")]
     Updated,
     /// `from` is the pre-rename path; the change's own path is the new one.
+    #[serde(alias = "renamed")]
     Renamed {
         from: String,
     },
@@ -1437,6 +1455,7 @@ pub struct SearchResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemContent {
+    #[serde(alias = "text")]
     Text {
         text: String,
         thinking: bool,
@@ -1445,6 +1464,7 @@ pub enum ItemContent {
         phase: Phase,
     },
     /// A shell command the provider ran on the user's behalf.
+    #[serde(alias = "command")]
     Command {
         /// What the command was applied to, or the provider's own summary of
         /// it: `src/app.rs` for a read, `TODO in src` for a search, `Run the
@@ -1462,22 +1482,26 @@ pub enum ItemContent {
         output: String,
     },
     /// A provider edit, one entry per touched path.
+    #[serde(alias = "changes")]
     Changes {
         changes: Vec<FileChange>,
         status: ToolStatus,
     },
+    #[serde(alias = "web_search")]
     WebSearch {
         query: String,
         results: Vec<SearchResult>,
     },
     /// Every other tool call, including MCP. The fallback that keeps an
     /// unrecognized provider item renderable instead of dropped.
+    #[serde(alias = "tool")]
     Tool {
         name: String,
         input: String,
         output: String,
         status: ToolStatus,
     },
+    #[serde(alias = "image")]
     Image {
         path: String,
         description: String,
@@ -1490,6 +1514,7 @@ pub enum ItemContent {
     /// prompt, but the user did not write it. Typesetting it as their own
     /// message, wrapped in the framing the harness adds for the model,
     /// made the transcript read as though they had.
+    #[serde(alias = "delivery")]
     Delivery {
         kind: DeliveryKind,
         /// The name the sender goes by: a subagent's type, a teammate's or a

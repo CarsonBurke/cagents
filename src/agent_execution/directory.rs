@@ -21,28 +21,37 @@ use crate::{
 pub enum Scope {
     /// Sessions in the project that contains this directory. A directory
     /// outside every open project widens to `All`, and the reply says so.
+    #[serde(alias = "containing")]
     Containing(PathBuf),
     /// Sessions in this open project, identified by its repository key, by
     /// any directory inside it, or, as a relative path of one component, by
     /// its name.
+    #[serde(alias = "project")]
     Project(PathBuf),
+    #[serde(alias = "all")]
     All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Surface {
+    #[serde(alias = "chat")]
     Chat,
+    #[serde(alias = "terminal")]
     Terminal,
 }
 
 /// How a listed session relates to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Relation {
+    #[serde(alias = "myself")]
     Myself,
     /// The session that owns the caller's agent.
+    #[serde(alias = "parent")]
     Parent,
     /// An agent the caller owns and therefore may control.
+    #[serde(alias = "child")]
     Child,
+    #[serde(alias = "peer")]
     Peer,
 }
 
@@ -50,9 +59,12 @@ pub enum Relation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Owner {
     /// A CLI caller outside any cagents session.
+    #[serde(alias = "user")]
     User,
     /// Every session of this lineage.
+    #[serde(alias = "session")]
     Session(super::Lineage),
+    #[serde(alias = "automation")]
     Automation(uuid::Uuid),
 }
 
