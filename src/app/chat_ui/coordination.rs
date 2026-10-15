@@ -447,6 +447,8 @@ enum Tone {
 enum BackgroundState {
     Working,
     Waiting,
+    LastReported,
+    LastReportedWaiting,
     Failed,
     Stopped,
     Finished,
@@ -457,6 +459,8 @@ impl BackgroundState {
         match self {
             Self::Working => "Working",
             Self::Waiting => "Waiting for you",
+            Self::LastReported => "Last reported running",
+            Self::LastReportedWaiting => "Last reported waiting",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
             Self::Finished => "Finished",
@@ -465,7 +469,7 @@ impl BackgroundState {
 
     fn tool_status(self) -> ToolStatus {
         match self {
-            Self::Working | Self::Waiting => ToolStatus::Running,
+            Self::Working | Self::Waiting | Self::LastReported | Self::LastReportedWaiting => ToolStatus::Running,
             Self::Failed => ToolStatus::Failed,
             Self::Stopped => ToolStatus::Stopped,
             Self::Finished => ToolStatus::Succeeded,
@@ -577,6 +581,7 @@ impl Runtime {
     /// The glyph or spinner a card's heading opens with.
     fn card_indicator(&self, status: ToolStatus, icon: Icon) -> Element<'static, Message> {
         match status {
+            ToolStatus::Running if !self.observes_live_work() => muted_glyph(Icon::Info),
             ToolStatus::Running => crate::ui_controls::activity_spinner(14.0, design::accent_color),
             ToolStatus::Failed => widget::icon(Icon::Error.handle())
                 .size(14)
@@ -664,6 +669,10 @@ impl Runtime {
         let receipt = reading.outcome.receipt.as_ref();
         let replies = &reading.outcome.messages;
         let line = match (status, receipt) {
+            (ToolStatus::Running, _) if !self.observes_live_work() => Some((
+                if message.waits { "Last reported waiting for an answer" } else { "Last reported sending" }.to_owned(),
+                Tone::Plain,
+            )),
             (ToolStatus::Running, _) if message.waits => {
                 Some(("Waiting for an answer…".to_owned(), Tone::Plain))
             }
@@ -840,6 +849,7 @@ impl Runtime {
         let run = reading.outcome.run.as_ref();
         let line = match status {
             ToolStatus::Running if background.is_some() => None,
+            ToolStatus::Running if !self.observes_live_work() => Some(("Last reported running".to_owned(), Tone::Plain)),
             ToolStatus::Running if spawn.waits => Some(("Working…".to_owned(), Tone::Plain)),
             ToolStatus::Running => Some(("Starting…".to_owned(), Tone::Plain)),
             ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped => {
@@ -880,6 +890,12 @@ impl Runtime {
         let any = |wanted: ToolStatus| agents.iter().any(|agent| agent.status == wanted);
         if agents.is_empty() {
             None
+        } else if any(ToolStatus::Running) && !self.observes_live_work() {
+            Some(if agents.iter().any(|agent| agent.status == ToolStatus::Running && agent.waiting) {
+                BackgroundState::LastReportedWaiting
+            } else {
+                BackgroundState::LastReported
+            })
         } else if agents
             .iter()
             .any(|agent| agent.status == ToolStatus::Running && agent.waiting)

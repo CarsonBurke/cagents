@@ -1033,6 +1033,14 @@ impl Runtime {
         }
     }
 
+    fn observed_native_child_status(&self, agent: &chat::Subagent) -> &'static str {
+        if agent.status == chat::ToolStatus::Running && !self.observes_live_work() {
+            if agent.waiting { "Last reported waiting" } else { "Last reported running" }
+        } else {
+            Self::native_child_status(agent)
+        }
+    }
+
     fn native_child_identity(&self, agent: &chat::Subagent) -> String {
         let provider = match self.session.launch.provider {
             Provider::Codex => "Codex",
@@ -1049,7 +1057,7 @@ impl Runtime {
             "{provider} native subagent · {} · {} · {}",
             Self::short_description(Self::native_child_name(agent), 80),
             Self::short_description(model, 80),
-            Self::native_child_status(agent)
+            self.observed_native_child_status(agent)
         );
         if !agent.detail.trim().is_empty() {
             identity.push_str(" · ");
@@ -1082,11 +1090,11 @@ impl Runtime {
         ) {
             // The invocation ended; independently owned requests and background
             // work still report their own state until native proof settles them.
-            let state = if !snapshot.exited
+            let state = if self.observes_live_work()
                 && snapshot.activity() == crate::agent::ActivityState::Waiting
             {
                 "Cancelled · waiting for you"
-            } else if !snapshot.exited && snapshot.is_working() {
+            } else if self.observes_live_work() && snapshot.is_working() {
                 "Cancelled · work continues"
             } else {
                 "Cancelled"
@@ -1095,7 +1103,7 @@ impl Runtime {
         } else if matches!(
             &snapshot.outcome,
             Some(crate::agent::ActivityOutcome::Succeeded)
-        ) && (!snapshot.is_working() || snapshot.exited)
+        ) && (!snapshot.is_working() || !self.observes_live_work())
         {
             (Some(Icon::Check), "Finished")
         } else if self.disconnected {
@@ -1621,7 +1629,9 @@ impl Runtime {
             )];
             for agent in snapshot.subagents.iter().rev() {
                 let label = Self::native_child_name(agent);
-                let marker = if agent.status == chat::ToolStatus::Running && agent.waiting {
+                let marker = if agent.status == chat::ToolStatus::Running && !self.observes_live_work() {
+                    crate::ui_controls::passive_icon(Icon::Info, design::COMPACT_ICON_SIZE)
+                } else if agent.status == chat::ToolStatus::Running && agent.waiting {
                     crate::ui_controls::passive_icon(Icon::AgentWaiting, design::COMPACT_ICON_SIZE)
                 } else if agent.status == chat::ToolStatus::Running {
                     crate::ui_controls::activity_spinner(
@@ -2404,7 +2414,7 @@ impl Runtime {
             .filter(|entry| entry.status == chat::PlanState::Done)
             .count();
         let mut rows: Vec<Element<'_, Message>> = vec![
-            design::caption(format!("Plan · {done} of {} done", plan.len()))
+            design::caption(format!("{} · {done} of {} done", if self.observes_live_work() { "Plan" } else { "Last reported plan" }, plan.len()))
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .into(),
         ];
@@ -2413,6 +2423,9 @@ impl Runtime {
             // shell uses for work in flight, so a reader can tell where the
             // agent is without reading the plan at all.
             let marker: Element<'_, Message> = match entry.status {
+                chat::PlanState::Active if !self.observes_live_work() => widget::icon(Icon::Info.handle())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
                 chat::PlanState::Active => crate::ui_controls::activity_spinner(
                     f32::from(design::COMPACT_ICON_SIZE),
                     design::accent_color,
@@ -3069,6 +3082,9 @@ impl Runtime {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
         (self.target, dark, self.syntax_theme as u8).hash(&mut hasher);
+        if turn.running {
+            self.observes_live_work().hash(&mut hasher);
+        }
         (
             &turn.key,
             &turn.summary,
@@ -3087,11 +3103,12 @@ impl Runtime {
             .any(|placed| placed.slot == turn::Slot::Thinking)
         {
             self.snapshot.busy.hash(&mut hasher);
+            self.observes_live_work().hash(&mut hasher);
         }
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
-            now.and_then(|now| turn.working_for(now))
+            self.observed_turn_time(turn, now).and_then(|now| turn.working_for(now))
                 .map(|millis| if turn.running { millis / 1_000 } else { millis })
                 .hash(&mut hasher);
         }
@@ -3157,6 +3174,7 @@ impl Runtime {
             }
         }
         if coordinating {
+            self.observes_live_work().hash(&mut hasher);
             for agent in &self.snapshot.subagents {
                 (
                     &agent.id,
@@ -3946,8 +3964,10 @@ impl Runtime {
                 || {
                     if finished {
                         "Thought process"
-                    } else {
+                    } else if self.observes_live_work() {
                         "Thinking…"
+                    } else {
+                        "Last reported thinking"
                     }
                     .to_owned()
                 },
@@ -5444,6 +5464,111 @@ mod tests {
             Some(chat::ToolStatus::Running),
             "a terminal current scalar never proves an unbound/background task stopped"
         );
+    }
+
+    #[test]
+    fn attention_ended_observation_qualifies_running_work_without_inventing_terminal_status() {
+        let item = chat::Item {
+            id: "external-tool".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "MCP task".into(),
+                input: "external operation".into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+            started_at: Some(1000),
+            at: Some(2000),
+        };
+        for exited in [false, true] {
+            let (mut runtime, handle) = frame_cost::live_runtime(&[item.clone()]);
+            let mut snapshot = (*runtime.snapshot).clone();
+            snapshot.sampled_at = Some(4000);
+            snapshot.finished_at = Some(4000);
+            snapshot.outcome = Some(crate::agent::ActivityOutcome::Cancelled);
+            snapshot.busy = true;
+            let mut child = native_child_fixture();
+            child.waiting = true;
+            snapshot.subagents = vec![child];
+            snapshot.generation += 1;
+            handle.replace_snapshot_for_test(snapshot.clone());
+            runtime.refresh();
+            let live = runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(5000));
+            assert!(runtime.observed_turn_summary(&runtime.turns[0]).ends_with(" · working"));
+            assert_ne!(
+                runtime.observed_turn_duration(&runtime.turns[0], Some(5000)),
+                runtime.observed_turn_duration(&runtime.turns[0], Some(9000))
+            );
+            snapshot.exited = exited;
+            snapshot.busy = !exited;
+            snapshot.generation += 1;
+            handle.replace_snapshot_for_test(snapshot.clone());
+            runtime.refresh();
+            runtime.disconnected = !exited;
+            let turn = &runtime.turns[0];
+            assert!(turn.running, "presentation must not overwrite native item status");
+            assert_eq!(runtime.snapshot.items[0].content.status(), Some(chat::ToolStatus::Running));
+            assert_eq!(runtime.snapshot.subagents[0].status, chat::ToolStatus::Running);
+            assert!(!runtime.observes_live_work());
+            assert_eq!(runtime.conversation_status(false).1, "Cancelled");
+            assert!(runtime.observed_turn_summary(turn).ends_with(" · last reported running"));
+            assert_eq!(runtime.observed_turn_duration(turn, Some(5000)).as_deref(), Some("observed 3s"));
+            assert_eq!(
+                runtime.observed_turn_duration(turn, Some(5000)),
+                runtime.observed_turn_duration(turn, Some(90000))
+            );
+            let unknown = runtime.turn_fingerprint_at(turn, true, Some(5000));
+            assert_ne!(unknown, live, "observation loss invalidates the retained live strip");
+            assert_eq!(unknown, runtime.turn_fingerprint_at(turn, true, Some(90000)));
+            assert_eq!(runtime.observed_native_child_status(&runtime.snapshot.subagents[0]), "Last reported waiting");
+            // A fresh observed snapshot can report the same still-running
+            // external work. This is a presentation fixture, not rehosting.
+            snapshot.exited = false;
+            snapshot.busy = true;
+            snapshot.generation += 1;
+            handle.replace_snapshot_for_test(snapshot);
+            runtime.refresh();
+            runtime.disconnected = false;
+            let turn = &runtime.turns[0];
+            assert!(runtime.observes_live_work());
+            assert!(runtime.observed_turn_summary(turn).ends_with(" · working"));
+            assert_ne!(
+                runtime.turn_fingerprint_at(turn, true, Some(5000)),
+                runtime.turn_fingerprint_at(turn, true, Some(90000))
+            );
+            assert_eq!(runtime.observed_native_child_status(&runtime.snapshot.subagents[0]), "Waiting for you");
+        }
+    }
+
+    #[test]
+    fn attention_disconnected_reasoning_invalidates_its_retained_live_label() {
+        let item = chat::Item {
+            id: "thinking".into(),
+            role: chat::Role::Assistant,
+            started_at: Some(1000),
+            at: Some(2000),
+            content: ItemContent::Text {
+                text: "Unfinished reasoning".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+        };
+        let (mut runtime, handle) = frame_cost::live_runtime(&[item]);
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.busy = true;
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
+        let turn = &runtime.turns[0];
+        assert!(!turn.running);
+        assert!(turn.prose.iter().any(|placed| placed.slot == turn::Slot::Thinking));
+        let live = runtime.turn_fingerprint_at(turn, true, Some(3000));
+        runtime.disconnected = true;
+        let turn = &runtime.turns[0];
+        let unknown = runtime.turn_fingerprint_at(turn, true, Some(3000));
+        assert_ne!(live, unknown);
+        assert_eq!(unknown, runtime.turn_fingerprint_at(turn, true, Some(90000)));
+        assert!(matches!(runtime.snapshot.items[0].content, ItemContent::Text { thinking: true, .. }));
     }
 
     #[test]

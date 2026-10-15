@@ -45,7 +45,7 @@ const THREAD_RAIL_OFFSET: f32 =
 /// a static glyph for work in flight says only that something was running
 /// when the frame was drawn, so it is the animated indicator the rest of the
 /// shell uses for the same state.
-fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<design::Tone>) {
+fn status_indicator<'a>(status: ToolStatus, observed: bool) -> (Element<'a, Message>, Option<design::Tone>) {
     let glyph = |name: Icon, tone: Option<design::Tone>| {
         (
             widget::icon(name.handle())
@@ -55,6 +55,7 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
         )
     };
     match status {
+        ToolStatus::Running if !observed => glyph(Icon::Info, None),
         ToolStatus::Running => (
             crate::ui_controls::activity_spinner(
                 f32::from(design::COMPACT_ICON_SIZE),
@@ -270,6 +271,38 @@ fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Mess
 }
 
 impl Runtime {
+    /// A retained native status is evidence of its last report. Losing the
+    /// observer does not prove external work ended, or that it is still live.
+    pub(super) fn observes_live_work(&self) -> bool {
+        !self.disconnected && !self.snapshot.exited
+    }
+
+    pub(super) fn observed_turn_summary<'a>(&self, turn: &'a turn::Turn) -> std::borrow::Cow<'a, str> {
+        if turn.running && !self.observes_live_work() {
+            let summary = turn.summary.strip_suffix(" · working").unwrap_or(&turn.summary);
+            format!("{summary} · last reported running").into()
+        } else {
+            turn.summary.as_str().into()
+        }
+    }
+
+    pub(super) fn observed_turn_time(&self, turn: &turn::Turn, now: Option<u64>) -> Option<u64> {
+        if turn.running && !self.observes_live_work() {
+            self.snapshot.sampled_at.or(turn.ended_at)
+        } else {
+            now
+        }
+    }
+
+    pub(super) fn observed_turn_duration(&self, turn: &turn::Turn, now: Option<u64>) -> Option<String> {
+        let label = turn.duration_label(self.observed_turn_time(turn, now)?)?;
+        Some(if turn.running && !self.observes_live_work() {
+            format!("observed {label}")
+        } else {
+            label
+        })
+    }
+
     fn tool_code_surface<'a>(
         &'a self,
         item: &'a chat::Item,
@@ -348,23 +381,22 @@ impl Runtime {
             .size(design::COMPACT_ICON_SIZE)
             .into(),
         ];
-        let tone = match turn.glyph().map(status_indicator) {
+        let tone = match turn.glyph().map(|status| status_indicator(status, self.observes_live_work())) {
             Some((indicator, tone)) => {
                 line.push(indicator);
                 tone
             }
             None => None,
         };
+        let summary = self.observed_turn_summary(turn).into_owned();
         line.push(
-            design::heading(turn.summary.clone())
+            design::heading(summary.clone())
                 .width(Length::Fill)
                 .into(),
         );
         // The one-second chat tick advances running timers even while a tool
         // is quiet. The label shares its cadence with the retained-turn cache.
-        let elapsed = self
-            .source_now_ms()
-            .and_then(|now| turn.duration_label(now));
+        let elapsed = self.observed_turn_duration(turn, self.source_now_ms());
         if let Some(elapsed) = &elapsed {
             line.push(design::caption(elapsed.clone()).into());
         }
@@ -372,8 +404,8 @@ impl Runtime {
         // name as well: a reader on a screen reader is the one who cannot see
         // the caption beside it.
         let name = match &elapsed {
-            Some(elapsed) => format!("{} · {elapsed}", turn.summary),
-            None => turn.summary.clone(),
+            Some(elapsed) => format!("{summary} · {elapsed}"),
+            None => summary,
         };
         let header = widget::button::custom(
             widget::row::with_children(line)
@@ -527,7 +559,12 @@ impl Runtime {
                 .into(),
         );
         if let Some(detail) = &cached.detail {
-            line.push(design::caption(detail.clone()).into());
+            let detail = if item.content.status() == Some(ToolStatus::Running) && !self.observes_live_work() {
+                format!("Last reported: {detail}")
+            } else {
+                detail.clone()
+            };
+            line.push(design::caption(detail).into());
         }
         let name = if verb.is_empty() {
             label
