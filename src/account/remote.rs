@@ -217,6 +217,8 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
         &Commits {
             gate: None,
             verify: &|| Ok(()),
+            deletion: None,
+            #[cfg(test)] isolated_delete: false,
         },
     )
 }
@@ -225,27 +227,32 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
 /// filesystem work stays outside global admission; only final registry/rename
 /// transactions take its writer. Unit callers retain their isolated stores.
 #[cfg(feature = "host")]
-pub(crate) fn execute_reserved(
+pub(crate) fn execute_reserved<'a>(
     operation: Operation,
     gate: std::sync::Arc<std::sync::RwLock<()>>,
     verify: impl Fn() -> Result<(), String>,
+    deletion: impl Fn(&super::Account) -> Result<crate::host::DeletionPermit<'a>, String>,
 ) -> Result<serde_json::Value, String> {
     execute_with_commits(
         operation,
         &Commits {
             gate: Some(gate),
             verify: &verify,
+            deletion: Some(&deletion),
+            #[cfg(test)] isolated_delete: false,
         },
     )
 }
 
 #[cfg(feature = "host")]
-struct Commits<'a> {
+struct Commits<'callbacks, 'reservation> {
     gate: Option<std::sync::Arc<std::sync::RwLock<()>>>,
-    verify: &'a dyn Fn() -> Result<(), String>,
+    verify: &'callbacks dyn Fn() -> Result<(), String>,
+    deletion: Option<&'callbacks dyn Fn(&super::Account) -> Result<crate::host::DeletionPermit<'reservation>, String>>,
+    #[cfg(test)] isolated_delete: bool,
 }
 #[cfg(feature = "host")]
-impl Commits<'_> {
+impl Commits<'_, '_> {
     fn apply<T>(&self, change: impl FnOnce() -> std::io::Result<T>) -> Result<T, String> {
         let _writer = self
             .gate
@@ -259,7 +266,7 @@ impl Commits<'_> {
 #[cfg(feature = "host")]
 fn execute_with_commits(
     operation: Operation,
-    commits: &Commits<'_>,
+    commits: &Commits<'_, '_>,
 ) -> Result<serde_json::Value, String> {
     use super::{
         Account, UsageStatus,
@@ -491,6 +498,7 @@ fn execute_with_commits(
 }
 
 #[cfg(feature = "host")]
+#[cfg(test)]
 fn remove_account(
     operation: Operation,
     store: &super::registry::Store,
@@ -507,6 +515,8 @@ fn remove_account(
         &Commits {
             gate: None,
             verify: &|| Ok(()),
+            deletion: None,
+            isolated_delete: true,
         },
     )
 }
@@ -518,7 +528,7 @@ fn remove_account_with_commits(
     homes: &super::home::Homes,
     cache: &super::cache::Cache,
     mut logout: impl FnMut(super::Account) -> Result<(), String>,
-    commits: &Commits<'_>,
+    commits: &Commits<'_, '_>,
 ) -> Result<(super::registry::Registry, Option<String>), String> {
     use super::probe;
     let expected_home = match &operation {
@@ -558,6 +568,21 @@ fn remove_account_with_commits(
     affected.extend(target.as_ref());
     let _locks = probe::lock_accounts(cache, &affected)?;
     (commits.verify)()?;
+    // Qualify before sign-out, annotation purge or credential-tree mutation.
+    // Holding a probe lock or seeing no current actor is not enough.
+    let deletion_permit = if delete && !account.is_linked() {
+        match commits.deletion {
+            Some(authorize) => Some(authorize(&account)?),
+            None => {
+                #[cfg(test)]
+                if commits.isolated_delete { None } else {
+                    return Err("Account file deletion requires a daemon ownership permit".into());
+                }
+                #[cfg(not(test))]
+                return Err("Account file deletion requires a daemon ownership permit".into());
+            }
+        }
+    } else { None };
     if let Some(target) = &target {
         super::handoff::move_history(&account, target)?;
     }
@@ -571,9 +596,6 @@ fn remove_account_with_commits(
         (registry, None)
     } else {
         if delete {
-            // Explicit file deletion remains available without an installed
-            // provider CLI. Report failed sign-out separately from deletion.
-            let logout_error = logout(account.clone()).err();
             (commits.verify)()?;
             // Purge is potentially large. Scoped admission and probe locks keep
             // this home quiet without blocking unrelated terminal requests.
@@ -583,8 +605,20 @@ fn remove_account_with_commits(
             {
                 None
             } else {
-                purge_deleted_account_annotations(&account)?
+                match deletion_permit.as_ref() {
+                    Some(permit) => purge_deleted_account_annotations(&account, permit)?,
+                    None => {
+                        #[cfg(test)]
+                        { purge_deleted_account_annotations_fixture(&account)? }
+                        #[cfg(not(test))]
+                        return Err("Account deletion lost its ownership permit".into());
+                    }
+                }
             };
+            // Resolve/reserve every historical namespace before any sign-out
+            // effect. Explicit deletion still works without an installed CLI.
+            let logout_error = logout(account.clone()).err();
+            if let Some(permit) = &deletion_permit { permit.verify()?; }
             let (registry, error) = commits
                 .apply(|| store.park_home_checked(homes, account.provider, key, true, || Ok(())))?;
             homes.finish_removals();
@@ -618,8 +652,25 @@ fn remove_account_with_commits(
 /// Physical home identity authorizes deletion of retained originals. A missing
 /// home can only use a previously persisted purge-only registration index.
 #[cfg(feature = "host")]
-fn purge_deleted_account_annotations(account: &super::Account) -> Result<Option<String>, String> {
-    use crate::chat::annotations::storage;
+fn purge_deleted_account_annotations(account: &super::Account, permit: &crate::host::DeletionPermit<'_>) -> Result<Option<String>, String> {
+    purge_deleted_account_annotations_with(account,
+        |scope| crate::chat::annotations::storage::purge_account(permit, scope),
+        |id| crate::chat::annotations::storage::purge_registered(permit, id))
+}
+
+#[cfg(all(feature = "host", test))]
+fn purge_deleted_account_annotations_fixture(account: &super::Account) -> Result<Option<String>, String> {
+    purge_deleted_account_annotations_with(account,
+        crate::chat::annotations::storage::purge_account_fixture,
+        crate::chat::annotations::storage::purge_registered_fixture)
+}
+
+#[cfg(feature = "host")]
+fn purge_deleted_account_annotations_with(
+    account: &super::Account,
+    purge_scope: impl FnOnce(&super::scope::LaunchAccountScope) -> Result<(), String>,
+    purge_id: impl FnOnce(&super::AccountId) -> Result<Option<usize>, String>,
+) -> Result<Option<String>, String> {
     let home = account
         .resolved_home()
         .ok_or("The account has no credential directory")?;
@@ -633,11 +684,11 @@ fn purge_deleted_account_annotations(account: &super::Account) -> Result<Option<
                 &home,
                 |name| (name == variable).then(|| home.as_os_str().to_owned()),
             )?;
-            storage::purge_account(&scope)?;
+            purge_scope(&scope)?;
             Ok(None)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match storage::purge_registered(&account.id())? {
+            match purge_id(&account.id())? {
                 Some(_) => Ok(None),
                 None => Ok(Some("The account home was already absent. No prior physical annotation association was available, so removal of older retained prompt data could not be verified".into())),
             }

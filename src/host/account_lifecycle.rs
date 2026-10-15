@@ -16,7 +16,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-type Map = BTreeMap<uuid::Uuid, Vec<Home>>;
+mod deletion;
+pub(crate) use deletion::DeletionPermit;
+
+type Map = BTreeMap<uuid::Uuid, Reserved>;
+pub(super) struct Reserved {
+    homes: Vec<Home>,
+    /// Opaque physical annotation namespaces from a selected missing account's
+    /// historical purge index. These grant deletion only, never scope recovery.
+    namespaces: BTreeSet<String>,
+}
 pub(super) type Reservations = Arc<Mutex<Map>>;
 
 #[derive(Clone)]
@@ -24,6 +33,7 @@ pub(super) struct Home {
     path: PathBuf,
     canonical: PathBuf,
     pin: Option<Arc<File>>,
+    identity: Option<(u64, u64)>,
 }
 
 fn refusal(message: impl Into<String>) -> ProtocolError {
@@ -45,10 +55,13 @@ impl Home {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(format!("Cannot reserve account home: {error}")),
         };
+        let identity = pin.as_ref().map(|pin| pin.metadata()).transpose().map_err(|e| e.to_string())?
+            .map(|metadata| (metadata.dev(), metadata.ino()));
         let home = Self {
             path,
             canonical,
             pin,
+            identity,
         };
         home.verify()?;
         Ok(home)
@@ -72,16 +85,13 @@ impl Home {
     fn overlaps(&self, other: &Self) -> bool {
         self.canonical.starts_with(&other.canonical)
             || other.canonical.starts_with(&self.canonical)
-            || match (&self.pin, &other.pin) {
-                (Some(left), Some(right)) => left
-                    .metadata()
-                    .ok()
-                    .zip(right.metadata().ok())
-                    .is_some_and(|(left, right)| {
-                        (left.dev(), left.ino()) == (right.dev(), right.ino())
-                    }),
-                _ => false,
-            }
+            || self.identity.zip(other.identity).is_some_and(|(left,right)| left==right)
+    }
+
+    fn scope(&self, provider: crate::agent::Provider) -> Option<crate::account::scope::LaunchAccountScope> {
+        self.identity.map(|(device,inode)| crate::account::scope::LaunchAccountScope {
+            provider, canonical_home: self.canonical.clone(), device, inode,
+            registered_id: None, purge_ids: Vec::new() })
     }
 }
 
@@ -125,6 +135,7 @@ pub(super) struct Reservation {
     map: Reservations,
     token: uuid::Uuid,
     homes: Vec<Home>,
+    accounts: Vec<Account>,
     /// Only relevant registrations, not the global revision: unrelated edits
     /// must be preserved while a provider is taking time to sign out.
     registered: Vec<(
@@ -179,6 +190,10 @@ impl Reservation {
                 )
             })
             .collect();
+        let physical_namespaces = accounts.iter().zip(&homes)
+            .filter_map(|(account, home)| home.scope(account.provider))
+            .map(|scope| crate::chat::annotations::storage::account_key(&scope))
+            .collect::<BTreeSet<_>>();
         let token = uuid::Uuid::new_v4();
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if entries.len() >= 64 {
@@ -188,25 +203,32 @@ impl Reservation {
         }
         if entries
             .values()
-            .flatten()
+            .flat_map(|entry| entry.homes.iter())
             .any(|other| homes.iter().any(|home| home.overlaps(other)))
         {
             return Err(refusal(
                 "An operation is already changing this account home. Wait for it to finish, then retry.",
             ));
         }
-        entries.insert(token, homes.clone());
+        if entries.values().any(|entry| !entry.namespaces.is_disjoint(&physical_namespaces)) {
+            return Err(refusal("This physical account's historical annotations are being deleted; wait and retry"));
+        }
+        entries.insert(token, Reserved { homes: homes.clone(), namespaces: BTreeSet::new() });
         drop(entries);
         Ok(Self {
             map,
             token,
             homes,
+            accounts: accounts.to_vec(),
             registered,
         })
     }
 
     /// Call outside HostState and before each destructive stage/final commit.
     pub(super) fn verify(&self) -> Result<(), String> {
+        if !self.map.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&self.token) {
+            return Err("The account mutation reservation was released; reload accounts and retry".into());
+        }
         for home in &self.homes {
             home.verify()?;
         }
@@ -244,7 +266,7 @@ pub(super) fn ensure_paths(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .values()
-        .flatten()
+        .flat_map(|entry| entry.homes.iter())
         .cloned()
         .collect();
     if reserved.is_empty() {
@@ -288,7 +310,15 @@ pub(super) fn ensure_launch(
             paths.push(cwd.join(home).join(fallback));
         }
     }
-    ensure_paths(host, paths)
+    ensure_paths(host, paths)?;
+    if has_namespace_reservations(host) {
+        for provider in crate::account::Account::PROVIDERS {
+            let scope = crate::account::scope::LaunchAccountScope::resolve(provider, cwd, effective)
+                .map_err(|_| refusal("Cannot establish the launched account's physical namespace while historical deletion is pending"))?;
+            ensure_namespace(host, &scope)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn ensure_update(host: &SharedHost, proposed: &Registry) -> Result<(), ProtocolError> {
@@ -674,7 +704,8 @@ mod tests {
                     expected_home: None
                 },
                 gate.clone(),
-                || reservation.verify()
+                || reservation.verify(),
+                |account| reservation.deletion_permit(&host, account)
             )
             .is_err()
         );
@@ -854,6 +885,7 @@ pub(super) fn ensure_captured_scope(
 ) -> Result<(), ProtocolError> {
     if let Some(scope) = scope {
         scope.revalidate().map_err(refusal)?;
+        ensure_namespace(host, scope)?;
         ensure_paths(host, [scope.canonical_home.clone()])
     } else {
         let map = host
@@ -865,7 +897,7 @@ pub(super) fn ensure_captured_scope(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-            .any(|homes| !homes.is_empty())
+            .any(|entry| !entry.homes.is_empty() || !entry.namespaces.is_empty())
         {
             Err(refusal(
                 "This retained provider has no captured account ownership. Let the account operation finish before reattaching it.",
@@ -874,4 +906,17 @@ pub(super) fn ensure_captured_scope(
             Ok(())
         }
     }
+}
+
+fn has_namespace_reservations(host: &SharedHost) -> bool {
+    let map = host.lock().unwrap_or_else(|p| p.into_inner()).account_lifecycle.clone();
+    map.lock().unwrap_or_else(|p| p.into_inner()).values().any(|entry| !entry.namespaces.is_empty())
+}
+
+fn ensure_namespace(host: &SharedHost, scope: &crate::account::scope::LaunchAccountScope) -> Result<(), ProtocolError> {
+    let key = crate::chat::annotations::storage::account_key(scope);
+    let map = host.lock().unwrap_or_else(|p| p.into_inner()).account_lifecycle.clone();
+    if map.lock().unwrap_or_else(|p| p.into_inner()).values().any(|entry| entry.namespaces.contains(&key)) {
+        Err(refusal("This exact physical account's historical annotations are being deleted. Wait for the account operation before starting or reattaching its provider."))
+    } else { Ok(()) }
 }

@@ -1,4 +1,5 @@
 mod account_lifecycle;
+pub(crate) use account_lifecycle::DeletionPermit;
 mod accounts;
 mod activity;
 mod agent_execution;

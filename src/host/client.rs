@@ -345,7 +345,7 @@ type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
 
 /// Both local UI and remote device lifecycle calls enter this daemon guard.
 /// Idle hosted actors still own their homes and must release them first.
-fn ensure_account_homes_unused(
+pub(super) fn ensure_account_homes_unused(
     host: &SharedHost,
     accounts: impl IntoIterator<Item = crate::account::Account>,
 ) -> Result<(), ProtocolError> {
@@ -611,6 +611,9 @@ pub(super) fn process_request(
             crate::account::remote::execute_reserved(operation.clone(), gate.clone(), || {
                 ensure_control_open(host).map_err(|error| error.message)?;
                 reservation.verify()
+            }, |account| {
+                ensure_control_open(host).map_err(|error| error.message)?;
+                reservation.deletion_permit(host, account)
             })
             .map(crate::device_service::Reply::AccountLifecycle)
             .map_err(|message| {
