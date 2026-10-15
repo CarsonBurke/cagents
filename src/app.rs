@@ -6383,7 +6383,7 @@ impl Cagents {
         }
         self.register_channel_card(card_id);
         let mut pane = self.pull_request_pane(&view);
-        pane.runtime.set_diff_surface_visible(self.workspace_surfaces_visible() && self.card_state(card).is_some_and(|state| state.existence.is_open() && state.exposure == Exposure::Visible));
+        pane.runtime.set_diff_surface_visible(self.workspace_surfaces_visible() && self.card_state(card_id).is_some_and(|state| state.existence.is_open() && state.exposure == Exposure::Visible));
         self.cards
             .insert(card_id, CardRuntime::PullRequests(Box::new(pane)));
         let index = self.workspace.cards().len();
