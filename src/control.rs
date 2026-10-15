@@ -88,6 +88,9 @@ pub struct Cli {
     /// Emit stable JSON envelopes for automation.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Connect to an existing daemon without starting one (also CAGENTS_NO_START=1).
+    #[arg(long, global = true)]
+    pub no_start: bool,
 
     #[command(subcommand)]
     pub command: TopCommand,
@@ -1940,6 +1943,45 @@ impl AppError {
     }
 }
 
+static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn daemon_autostart_disabled() -> bool {
+    NO_START.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct StartPolicy(bool);
+impl Drop for StartPolicy {
+    fn drop(&mut self) {
+        NO_START.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn control_daemon_socket() -> Result<PathBuf, AppError> {
+    if !daemon_autostart_disabled() {
+        return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
+    }
+    let socket = daemon_socket_path().map_err(|e| AppError::new(if daemon_missing(&e) { "daemon_not_running" } else { "socket_path" }, e))?;
+    match UnixStream::connect(&socket) {
+        Ok(_) => Ok(socket),
+        Err(error) if daemon_missing(&error) => Err(AppError::new(
+            "daemon_not_running", "The daemon is not running; omit --no-start to start it",
+        )),
+        Err(error) => Err(AppError::new("daemon_connection", error)),
+    }
+}
+
+fn daemon_missing(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+}
+
+fn already_stopped() -> CommandOutput {
+    CommandOutput {
+        command: "daemon.stop",
+        data: json!({"state": "already_stopped"}),
+        human: "Daemon already stopped".into(),
+    }
+}
+
 pub fn run_from<I, T>(arguments: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -1965,6 +2007,10 @@ where
             return ExitCode::from(2);
         }
     };
+
+    let no_start = cli.no_start || std::env::var("CAGENTS_NO_START")
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
     // Local evidence must remain readable when a staged owner, backend, or
     // daemon cannot start. Do not select/prepare a device or follow a route.
@@ -2007,7 +2053,7 @@ where
         return ExitCode::FAILURE;
     }
     if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
-        let recover = staged_command_requires_daemon(&cli.command);
+        let recover = !no_start && staged_command_requires_daemon(&cli.command);
         match crate::install_guard::staged_owner_bin(
             &std::env::current_exe().unwrap_or_default(),
             recover,
@@ -2584,9 +2630,16 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             expected_generation,
             confirm,
         } => {
-            let socket =
-                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
-            let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+            let socket = match daemon_socket_path() {
+                Ok(socket) => socket,
+                Err(error) if daemon_missing(&error) => return Ok(already_stopped()),
+                Err(error) => return Err(AppError::new("socket_path", error)),
+            };
+            let mut client = match ControlClient::connect(&socket) {
+                Ok(client) => client,
+                Err(ControlError::Connect(error)) if daemon_missing(&error) => return Ok(already_stopped()),
+                Err(error) => return Err(protocol_error(error)),
+            };
             let outcome = match confirm {
                 // A capability is already a counted, daemon-bound, expiring
                 // authority over one observed inventory, so a script that
@@ -2873,8 +2926,7 @@ pub enum StopReport {
 }
 
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     // Inside a hosted session the daemon lets these commands change only the
@@ -3035,8 +3087,7 @@ fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
         }
         ProjectCommand::List => None,
     };
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     let model = selected
@@ -3233,8 +3284,7 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
         } => Some(project_directory(Some(path.clone()))?),
         _ => None,
     };
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     let model = selected
