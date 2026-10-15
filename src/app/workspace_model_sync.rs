@@ -2032,6 +2032,11 @@ mod tests {
         );
         project.worktrees.truncate(1);
         assert_eq!(app.project_activation_worktree(&project), None);
+        project.kind = ProjectKind::Folder;
+        project.worktrees.clear();
+        assert_eq!(app.project_activation_worktree(&project), Some(repository.clone()),
+            "folder projects navigate to their root without Git rows");
+        project.kind = ProjectKind::Git;
         project.repository = primary.join(".git");
         project.worktrees = vec![row(&linked), row(&primary)];
         app.project_ui
@@ -2042,6 +2047,99 @@ mod tests {
             Some(primary),
             "an ordinary primary remains selected when only a linked checkout was opened explicitly"
         );
+    }
+
+    #[test]
+    fn bare_project_activation_selects_a_checkout_in_both_observer_orders_and_duplicate_loads() {
+        let fixture = tempfile::tempdir().unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .args(["-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
+                    "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid"])
+                .args(args)
+                .output()
+                .expect("Git is required for repository message-order contracts");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        git(fixture.path(), &["init", "--quiet", "--initial-branch=main", "seed"]);
+        git(&fixture.path().join("seed"), &["commit", "--quiet", "--allow-empty", "-m", "initial"]);
+        git(fixture.path(), &["clone", "--quiet", "--bare", "seed", "metadata.git"]);
+        let repository = fixture.path().join("metadata.git").canonicalize().unwrap();
+        let linked = fixture.path().join("linked-b");
+        git(&repository, &["worktree", "add", "--quiet", "-b", "linked-b", linked.to_str().unwrap()]);
+        let other = fixture.path().join("linked-c");
+        git(&repository, &["worktree", "add", "--quiet", "-b", "linked-c", other.to_str().unwrap()]);
+        let linked = linked.canonicalize().unwrap();
+        let other = other.canonicalize().unwrap();
+        let model = || {
+            let mut model = registry(Vec::new());
+            model.projects.push(ModelProject {
+                repository: repository.clone(), checkout: Some(linked.clone()),
+                primary_checkout: None, name: "Shared bare project".into(),
+                kind: ProjectKind::Git, ordinal: 1,
+            });
+            model
+        };
+
+        // Activation and model observation arrive on independent subscriptions.
+        // Drive their real read tasks through the normal updater in both orders;
+        // also cover the early return which reconciles a concurrent duplicate.
+        for order in ["activation-first", "model-first", "duplicate"] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let _publishes = intercept_publishes(&mut app);
+            let cards = app.durable.cards.len();
+            let task = if order == "model-first" {
+                let task = app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(model())));
+                drop(app.update(Message::ActivateProject(repository.clone())));
+                task
+            } else {
+                app.update(Message::ActivateProject(repository.clone()))
+            };
+            let message = first_message(task).expect("actual repository read completion");
+            let Message::RepositoryLoaded { result: Ok(loaded), .. } = &message else {
+                panic!("expected a successful actual Git read for {order}");
+            };
+            if order != "model-first" {
+                assert!(loaded.repository.as_ref().unwrap().is_bare);
+                assert!(loaded.repository.as_ref().unwrap().worktree_root.is_none());
+                assert_eq!(loaded.worktrees.first().unwrap().0.path, repository,
+                    "fixture must exercise Git's metadata-first bare listing");
+            }
+            let existing = if order == "duplicate" {
+                let existing = ProjectId::new();
+                app.sidebar_model.projects.push(SidebarProject::new(
+                    existing, loaded.repository.as_ref().unwrap().id,
+                    "Concurrent row".into(), repository.clone(),
+                    loaded.worktrees.iter().map(|(record, status)|
+                        SidebarWorktree::from_repository(record, status.as_ref())).collect(),
+                    Vec::new(),
+                ));
+                Some(existing)
+            } else { None };
+            drop(app.update(message));
+            assert_eq!(app.active_workspace.as_deref(), Some(linked.as_path()), "{order}");
+            assert_ne!(app.active_workspace.as_deref(), Some(repository.as_path()));
+            assert!(app.project_ui.select_on_load.is_none());
+            assert_eq!(app.sidebar_model.projects.len(), 1, "{order}");
+            if let Some(existing) = existing {
+                assert_eq!(app.sidebar_model.projects[0].id, existing);
+            }
+            if order != "model-first" {
+                drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(model()))));
+            }
+            assert_eq!(app.active_workspace.as_deref(), Some(linked.as_path()), "late observer: {order}");
+            assert_eq!(app.durable.cards.len(), cards, "activation must not create a terminal");
+            let project = &app.sidebar_model.projects[0];
+            assert!(project.worktrees.iter().any(|row| row.path == other));
+        }
     }
 
     #[test]

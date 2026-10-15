@@ -13932,10 +13932,18 @@ impl Application for Cagents {
                             self.sidebar_model.data_state = SidebarDataState::Ready;
                             let selecting = self.project_ui.select_on_load.as_ref()
                                 == Some(&loaded.project.repository);
-                            if selecting {
+                            let activation = if selecting {
+                                self.sidebar_model.project(existing_id)
+                                    .and_then(|project| self.project_activation_worktree(project))
+                            } else {
+                                None
+                            };
+                            if activation.is_some() {
                                 self.project_ui.select_on_load = None;
                             }
+                            let worktree = if selecting { activation } else { Some(worktree) };
                             let task = if (selecting || open_cards)
+                                && let Some(worktree) = worktree
                                 && !self.refuse_in_deleting_worktree(&worktree)
                             {
                                 self.select_worktree(worktree, open_cards)
@@ -14131,9 +14139,16 @@ impl Application for Cagents {
                         if self.project_ui.select_on_load.as_ref()
                             == Some(&loaded.project.repository)
                         {
-                            self.project_ui.select_on_load = None;
-                            if !self.refuse_in_deleting_worktree(&worktree) {
-                                task = self.select_worktree(worktree.clone(), false);
+                            // Model observation and activation are independent
+                            // subscriptions. Even before checkout metadata
+                            // arrives, select only a navigable current row.
+                            let activation = self.sidebar_model.project(project_id)
+                                .and_then(|project| self.project_activation_worktree(project));
+                            if let Some(path) = activation {
+                                self.project_ui.select_on_load = None;
+                                if !self.refuse_in_deleting_worktree(&path) {
+                                    task = self.select_worktree(path, false);
+                                }
                             }
                         } else if open_cards {
                             if !self.refuse_in_deleting_worktree(&worktree) {

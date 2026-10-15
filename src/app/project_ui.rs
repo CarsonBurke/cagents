@@ -250,6 +250,9 @@ impl Cagents {
     /// Prefer those known roots while they are in the current row inventory;
     /// a bare common directory is metadata, never a navigable checkout.
     pub(super) fn project_activation_worktree(&self, project: &SidebarProject) -> Option<PathBuf> {
+        if project.kind == ProjectKind::Folder {
+            return Some(project.repository.clone());
+        }
         let checkout =
             |path: &Path| project.kind != ProjectKind::Git || path != project.repository.as_path();
         let listed = |path: &Path| {
