@@ -9395,6 +9395,33 @@ mod tests {
     });}
 
     #[test]
+    fn externally_removed_root_retires_and_refreshes_last_server_metrics() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let mut manager = rust_manager().with_lifecycle(1, 1);
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn f() {}\n");
+            let handle = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+            assert_eq!(manager.live_servers().len(), 1);
+            std::fs::remove_dir_all(&worktree).unwrap();
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc: at } if *at == doc && manager.live_servers().is_empty() => Some(()),
+                _ => None,
+            })
+            .await;
+            handle.wait_for("shutdown").await;
+            handle.wait_for("exit").await;
+            assert!(manager.live_servers().is_empty());
+            assert!(handle.methods().iter().any(|method| method == "shutdown"));
+            assert!(handle.methods().iter().any(|method| method == "exit"));
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
     fn cross_file_rename_flushes_other_buffers_inside_their_debounce_window(){block_on(async{
         let (_guard,worktree,file)=workspace();let other=file.with_file_name("other.rs");let other_uri=Url::from_file_path(&other).unwrap();
         let mut manager=rust_manager();let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"renameProvider":true}),|request|if request.method=="textDocument/rename"{vec![json!({"jsonrpc":"2.0","id":request.id,"result":null})]}else{vec![]});
@@ -9453,16 +9480,7 @@ mod tests {
         assert!(!second.is_finished());release.send(()).unwrap();tokio::time::timeout(WAIT,second).await.unwrap().unwrap();assert!(barrier.ready.load(Ordering::Acquire));
     });}
 
-    #[test]
-    fn externally_removed_root_retires_and_refreshes_last_server_metrics(){block_on(async{
-        let (_guard,worktree,file)=workspace();let mut manager=rust_manager().with_lifecycle(1,1);
-        let slot=install_fake(&mut manager,incremental_capabilities(), |_|Vec::new());let events=manager.events();let doc=LspDocumentId(1);
-        manager.open_for_test(doc,&file,&worktree,rust_language(),1,"fn f() {}\n");let handle=handle_of(&slot).await;await_ready(&events,doc).await;assert_eq!(manager.live_servers().len(),1);
-        std::fs::remove_dir_all(&worktree).unwrap();
-        next_matching(&events,|event|match event{LspEvent::Resources{doc:at}if *at==doc=>Some(()),_=>None}).await;
-        assert!(manager.live_servers().is_empty());assert!(handle.methods().iter().any(|method|method=="shutdown"));assert!(handle.methods().iter().any(|method|method=="exit"));
-        manager.begin_shutdown().await;
-    });}
+
     #[test]
     fn replaced_root_reaps_original_server_before_reopening_the_same_path() {
         block_on(async {
@@ -9498,14 +9516,14 @@ mod tests {
             std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
             std::fs::write(&file, "fn replacement() {}\n").unwrap();
             next_matching(&events, |event| match event {
-                LspEvent::Resources { doc: at } if *at == doc => Some(()),
+                LspEvent::Resources { doc: at } if *at == doc && manager.live_servers().is_empty() => Some(()),
                 _ => None,
             }).await;
+            assert!(wait_until_gone(pid).await, "the old server must be reaped before replacement admission");
             assert!(manager.live_servers().is_empty());
             assert!(old.methods().iter().any(|method| method == "shutdown"));
             assert!(old.methods().iter().any(|method| method == "exit"));
             assert!(matches!(manager.status(doc), LspStatus::Disabled));
-            assert!(wait_until_gone(pid).await, "the old server must be reaped before replacement admission");
 
             manager.open_for_test(LspDocumentId(2), &file, &worktree, rust_language(), 1, "fn replacement() {}\n");
             await_ready(&events, LspDocumentId(2)).await;
