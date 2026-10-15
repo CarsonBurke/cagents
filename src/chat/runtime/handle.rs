@@ -75,6 +75,7 @@ impl Handle {
     pub(crate) fn presentation(&self,chat_id:crate::model::TerminalId,after:Option<u64>)->Option<crate::terminal_ipc::ServerResponse> {match &self.0 {Owner::Local(local)=>local.presentation(chat_id,after),Owner::Remote(remote)=>remote.call("presentation",serde_json::json!([chat_id,after])).ok().flatten()}}
     pub fn session_id(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.session_id(),Owner::Remote(remote)=>remote.state().session_id.clone()}}
     pub(crate) fn confirmed_session_id(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.confirmed_session_id(),Owner::Remote(remote)=>remote.state().confirmed_session.clone()}}
+    pub(crate) fn launch_account_scope(&self)->Result<&crate::account::scope::LaunchAccountScope,&str> {match &self.0 {Owner::Local(local)=>local.launch_account_scope(),Owner::Remote(remote)=>remote.launch_account_scope()}}
     pub(crate) fn execution_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {match &self.0 {Owner::Local(local)=>local.execution_environment(),Owner::Remote(remote)=>remote.execution_environment()}}
     pub(crate) fn recovery_environment_matches(&self,environment:&BTreeMap<String,String>)->bool {match &self.0 {Owner::Local(local)=>local.recovery_environment_matches(environment),Owner::Remote(remote)=>remote.recovery_environment_matches(environment)}}
     pub fn is_completed(&self)->bool {match &self.0 {Owner::Local(local)=>local.is_completed(),Owner::Remote(remote)=>remote.state().completed}}

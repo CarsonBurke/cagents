@@ -60,6 +60,7 @@ pub(crate) struct ActorInspection {
     pub execution_console:Option<crate::model::LaunchRecipe>,
     pub paired_holder:Option<crate::terminal::holder::Record>,
     pub state:Resident,
+    pub launch_account_scope:Result<crate::account::scope::LaunchAccountScope,String>,
     pub execution_environment:crate::terminal_ipc::ChatExecutionEnvironment,
     pub recovery_environment:BTreeMap<String,String>,
 }
@@ -81,7 +82,7 @@ struct Startup {
 #[derive(Serialize,Deserialize)]
 struct Invocation { proof:HostSessionProof,epoch:Option<uuid::Uuid>,method:String,args:Value }
 #[derive(Serialize,Deserialize)]
-struct Attached { protocol:u32,identity:ActorIdentity,epoch:uuid::Uuid,resident:Resident,source:chat::Session,execution_environment:crate::terminal_ipc::ChatExecutionEnvironment,recovery_environment:BTreeMap<String,String> }
+struct Attached { protocol:u32,identity:ActorIdentity,epoch:uuid::Uuid,resident:Resident,source:chat::Session,launch_account_scope:Result<crate::account::scope::LaunchAccountScope,String>,execution_environment:crate::terminal_ipc::ChatExecutionEnvironment,recovery_environment:BTreeMap<String,String> }
 #[derive(Clone)]
 pub(super) struct RemoteActor(Arc<Remote>);
 struct Pending { identity:InputIdentity,payload:Value,bytes:usize,reply:Option<crossbeam_channel::Sender<Result<(),String>>> }
@@ -92,6 +93,7 @@ struct Remote {
     socket:PathBuf,
     state:Mutex<Arc<Resident>>,
     environment:crate::terminal_ipc::ChatExecutionEnvironment,
+    launch_account_scope:Result<crate::account::scope::LaunchAccountScope,String>,
     recovery_environment:BTreeMap<String,String>,
     desired_visible:Mutex<Option<bool>>,
     desired_observe:AtomicBool,
@@ -141,7 +143,7 @@ impl RemoteActor {
         let process=Process::read(std::process::id() as i32).unwrap();
         let boot=BootId::new("fixture-boot");
         let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,close:super::CloseObservation {actor_id:uuid::Uuid::new_v4(),close_revision:0,turn_generation:0,activity:crate::agent::ActivityState::Idle,ready:true,exited:false,completed:false,closing:false,owns_work:true,working_directory:PathBuf::from("/var/tmp")},idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,retained_runs:Vec::new(),outbox_ack:0,outbox_latest:0,changed:1};
-        Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:Default::default(),desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
+        Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),launch_account_scope:Err("fixture has no account scope".into()),recovery_environment:Default::default(),desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
     }
     #[cfg(test)]
     pub(super) fn completed_failure_fixture()->Self {
@@ -163,6 +165,7 @@ impl RemoteActor {
             native_continuity:state.native_continuity.clone(),outcome:state.outcome.clone(),
             error:state.failure.clone(),exited:state.completed,..Snapshot::default()}
     }
+    pub fn launch_account_scope(&self)->Result<&crate::account::scope::LaunchAccountScope,&str> {self.0.launch_account_scope.as_ref().map_err(String::as_str)}
     pub fn execution_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {self.0.environment.clone()}
     pub fn restart_environment(&self)->BTreeMap<String,String> {self.0.recovery_environment.clone()}
     pub fn recovery_environment_matches(&self,value:&BTreeMap<String,String>)->bool {&self.0.recovery_environment==value}
@@ -238,7 +241,7 @@ impl RemoteActor {
         if attached.protocol!=PROTOCOL {return Err("Retained Claude actor protocol is incompatible; no prompt was replayed".into());}
         validate_record(&attached.identity.record)?;
         let socket=registry::socket(&registry::directory(Kind::Native)?,attached.identity.record.terminal);
-        let remote=Self(Arc::new(Remote {identity:attached.identity,epoch:attached.epoch,proof,socket,desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(attached.resident.next_input),uncertain_input:Mutex::new(None),state:Mutex::new(Arc::new(attached.resident)),environment:attached.execution_environment,recovery_environment:attached.recovery_environment,pending:Mutex::new(Vec::new()),notify:Arc::new(notify),stop:AtomicBool::new(false),installed:AtomicBool::new(false),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(startup)}));
+        let remote=Self(Arc::new(Remote {identity:attached.identity,epoch:attached.epoch,proof,socket,desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(attached.resident.next_input),uncertain_input:Mutex::new(None),state:Mutex::new(Arc::new(attached.resident)),environment:attached.execution_environment,launch_account_scope:attached.launch_account_scope,recovery_environment:attached.recovery_environment,pending:Mutex::new(Vec::new()),notify:Arc::new(notify),stop:AtomicBool::new(false),installed:AtomicBool::new(false),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(startup)}));
         let weak=Arc::downgrade(&remote.0);
         let worker=thread::Builder::new().name("cagents-actor-proxy".into()).spawn(move||{
             loop {
@@ -461,7 +464,8 @@ impl Server {
         let published=changed.clone();let outcomes=journal.clone();
         let account_reports=Arc::new(Mutex::new(Vec::<Update>::new()));let reported=account_reports.clone();
         if disconnected(control)? {return Err("Retained actor launch cancelled before process creation".into());}
-        let actor=LocalHandle::start_inner(spec_and_adapter.0,spec_and_adapter.1,initial,store,None,startup.source.launch.session_id.clone(),None,false,move|update|{
+        let launch_account_scope=super::capture_account_scope(&spec_and_adapter.0,crate::agent::Provider::Claude);
+        let actor=LocalHandle::start_inner(spec_and_adapter.0,spec_and_adapter.1,initial,store,None,startup.source.launch.session_id.clone(),None,false,launch_account_scope,move|update|{
             let mut journal=outcomes.lock().unwrap_or_else(|p|p.into_inner());
             if let Err(error)=journal.append(&update) {let _=journal.record_loss(&format!("Retained actor outcome continuity is unconfirmed: {error}"));}
             drop(journal);
@@ -507,7 +511,7 @@ impl Server {
         }
         sources
     }
-    fn attached(&self)->Result<Attached,String> {Ok(Attached {protocol:PROTOCOL,identity:self.identity.clone(),epoch:self.epoch,resident:self.resident()?,source:self.source.clone(),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()})}
+    fn attached(&self)->Result<Attached,String> {Ok(Attached {protocol:PROTOCOL,identity:self.identity.clone(),epoch:self.epoch,resident:self.resident()?,source:self.source.clone(),launch_account_scope:self.actor.launch_account_scope().cloned().map_err(str::to_owned),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()})}
     fn finish_inputs(&mut self) {
         let journal=self.journal.clone();
         self.pending.retain(|(identity,response)| {
@@ -520,7 +524,7 @@ impl Server {
         });
     }
     fn invoke(&mut self,request:Invocation)->Result<Value,String> {
-        if request.method=="inspect" {return serde_json::to_value(ActorInspection {identity:self.identity.clone(),source:self.source.clone(),previous_sources:self.published_sources(),execution_console:self.execution_console.clone(),paired_holder:self.paired_holder.clone(),state:self.resident()?,execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()}).map_err(|error|error.to_string());}
+        if request.method=="inspect" {return serde_json::to_value(ActorInspection {identity:self.identity.clone(),source:self.source.clone(),previous_sources:self.published_sources(),execution_console:self.execution_console.clone(),paired_holder:self.paired_holder.clone(),state:self.resident()?,launch_account_scope:self.actor.launch_account_scope().cloned().map_err(str::to_owned),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()}).map_err(|error|error.to_string());}
         if request.method=="attach" {
             let (source,):(chat::Session,)=serde_json::from_value(request.args).map_err(|error|error.to_string())?;
             if source!=self.source && !self.published_sources().contains(&source) {return Err("Retained actor source/account identity does not match this chat".into());}
