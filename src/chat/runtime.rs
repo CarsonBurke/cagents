@@ -1069,7 +1069,7 @@ impl Handle {
             return Err("Native provider has already been explicitly closed".into());
         }
         self.0.preserve_native.store(true, Ordering::Release);
-        self.close_inner(true)
+        self.close_inner(true,None)
     }
 
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {
@@ -1086,34 +1086,68 @@ impl Handle {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
         }
-        self.close_inner(false)
+        self.close_inner(false,None)
     }
 
-    fn close_inner(&self, preserving: bool) -> Result<(), String> {
+    /// A caller-owned teardown budget. An unfinished worker or retained native
+    /// reconciliation remains owned and retryable; timeout is never cleanup.
+    pub(crate) fn close_until(&self,deadline:Instant)->Result<(),String> {
+        if self.0.native_installed.load(Ordering::Acquire) {
+            self.0.release_native.store(true,Ordering::Release);
+        }
+        self.close_inner(false,Some(deadline))
+    }
+
+    fn join_worker_until(&self,deadline:Instant)->Result<(),String> {
+        loop {
+            let joined=match self.0.worker.try_lock() {
+                Ok(mut worker)=>match worker.as_ref() {
+                    Some(current) if !current.is_finished()=>None,
+                    _=>Some(worker.take().map(|worker|worker.join())),
+                },
+                Err(std::sync::TryLockError::Poisoned(poisoned))=> {
+                    let mut worker=poisoned.into_inner();
+                    match worker.as_ref() {
+                        Some(current) if !current.is_finished()=>None,
+                        _=>Some(worker.take().map(|worker|worker.join())),
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock)=>None,
+            };
+            match joined {
+                Some(Some(Err(_)))=> {
+                    let error="Native chat worker did not shut down cleanly; provider state is unconfirmed".to_owned();
+                    self.0.completed.store(false,Ordering::Release);
+                    *self.0.failure.lock().unwrap_or_else(|p|p.into_inner())=Some(error.clone());
+                    return Err(error);
+                }
+                Some(_)=>return Ok(()),
+                None=> {}
+            }
+            let Some(remaining)=deadline.checked_duration_since(Instant::now()) else {
+                return Err("Native chat close is still pending; its exact provider cleanup owner is retained".into());
+            };
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    }
+
+    fn close_inner(&self, preserving: bool, deadline:Option<Instant>) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
-        // Serialize explicit closes through the join. A protocol failure is
-        // still useful diagnostic history, but it must not prevent retiring an
-        // actor whose process teardown has subsequently completed.
-        let mut worker = self.0.worker.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(worker) = worker.take()
-            && worker.join().is_err()
+        // Never hold a worker mutex while waiting for provider code. Only
+        // join after is_finished proves that its user cleanup has returned.
+        self.join_worker_until(deadline.unwrap_or_else(||Instant::now()+IO_TIMEOUT+super::TERMINATE_GRACE))?;
         {
-            let error =
-                "Native chat worker did not shut down cleanly; provider state is unconfirmed"
-                    .to_owned();
-            // Even if the panic happened after the completion publication,
-            // repeated closes must preserve the uncertain teardown outcome.
-            self.0.completed.store(false, Ordering::Release);
-            *self.0.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
-            return Err(error);
-        }
-        {
-            let mut retained = self
-                .0
-                .retained_native
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut retained = if deadline.is_some() {
+                match self.0.retained_native.try_lock() {
+                    Ok(retained)=>retained,
+                    Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock)=>return Err("Native provider reconciliation is still pending; its owner is retained".into()),
+                }
+            } else {self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner())};
+            if deadline.is_some() && retained.is_some() {
+                return Err("Retained provider reconciliation requires a separate close retry; its exact owner is retained".into());
+            }
             if let Some(holder) = retained.as_mut() {
                 holder.close_inner(self.0.retain_cleanup_receipt.load(Ordering::Acquire))?;
                 retained.take();
@@ -1121,11 +1155,16 @@ impl Handle {
             }
         }
         if !preserving && self.0.native_installed.load(Ordering::Acquire) {
-            let mut detached = self
-                .0
-                .detached_native
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut detached = if deadline.is_some() {
+                match self.0.detached_native.try_lock() {
+                    Ok(detached)=>detached,
+                    Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock)=>return Err("Detached provider reconciliation is still pending; its owner is retained".into()),
+                }
+            } else {self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner())};
+            if deadline.is_some() && detached.is_some() {
+                return Err("Detached provider reconciliation requires a separate close retry; its exact owner is retained".into());
+            }
             if let Some(owner) = detached.as_ref() {
                 if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {
                     owner.close_retaining_receipt()?;
@@ -1270,7 +1309,11 @@ impl Drop for Inner {
             .unwrap_or_else(|p| p.into_inner())
             .take()
         {
-            let _ = worker.join();
+            if worker.is_finished() {
+                let _=worker.join();
+            } else {
+                tracing::warn!("Final chat handle dropped while its existing provider cleanup worker remains active; cleanup is unconfirmed");
+            }
         }
     }
 }
@@ -5293,6 +5336,59 @@ mod tests {
             handle.failure().is_some(),
             "closing retains the failure diagnosis"
         );
+    }
+
+    #[test]
+    fn bounded_close_preserves_a_stuck_worker_and_does_not_hold_the_join_mutex() {
+        struct Blocked {entered:crossbeam_channel::Sender<()>,release:crossbeam_channel::Receiver<()>}
+        impl Adapter for Blocked {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,_:Command)->Result<Step,String> {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).map_err(|error|error.to_string())?;
+                Ok(Step::default())
+            }
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step::default();
+        let store=preflight(&spec,&mut initial).unwrap();
+        let (entered,entered_command)=crossbeam_channel::bounded(1);
+        let (release,released)=crossbeam_channel::bounded(1);
+        let handle=Handle::start(spec,Box::new(Blocked {entered,release:released}),initial,store,None,|_|{}).unwrap();
+        let command_handle=handle.clone();
+        let command=thread::spawn(move||command_handle.command(Command::SetFastMode {enabled:true}));
+        entered_command.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started=Instant::now();
+        assert!(handle.close_until(Instant::now()+Duration::from_millis(40)).unwrap_err().contains("retained"));
+        assert!(started.elapsed()<Duration::from_secs(1));
+        assert!(!handle.is_completed()); assert!(handle.owns_work());
+        assert!(handle.0.worker.try_lock().unwrap().as_ref().is_some_and(|worker|!worker.is_finished()),"the exact join handle is retained without a held mutex");
+        let held=handle.0.worker.lock().unwrap();
+        assert!(handle.close_until(Instant::now()+Duration::from_millis(20)).is_err(),"even another caller holding worker metadata cannot block this deadline");
+        assert!(held.is_some());drop(held);
+        release.send(()).unwrap();
+        let _=command.join().unwrap();
+        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+        assert!(handle.is_completed());
+        assert!(handle.0.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn final_handle_drop_does_not_wait_for_an_unfinished_cleanup_thread() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        handle.close().unwrap();
+        let (release,released)=crossbeam_channel::bounded(1);
+        let (finished,finished_worker)=crossbeam_channel::bounded(1);
+        *handle.0.worker.lock().unwrap()=Some(thread::spawn(move|| {let _=released.recv_timeout(Duration::from_secs(5));let _=finished.send(());}));
+        let started=Instant::now();drop(handle);
+        assert!(started.elapsed()<Duration::from_secs(1),"destruction must not join arbitrary provider code");
+        assert!(finished_worker.try_recv().is_err(),"dropping a frontend handle is not proof that its cleanup thread finished");
+        release.send(()).unwrap();finished_worker.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
