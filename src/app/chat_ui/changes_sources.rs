@@ -877,6 +877,38 @@ mod tests {
         assert!(app.chat_runtime_mut(target).unwrap().logical_changes.entries[&page.source].copy_error.is_none());
     }
 
+    #[tokio::test]
+    async fn full_revocation_rejects_successful_patch_read_and_copy_with_unchanged_source_proof() {
+        use iced::futures::StreamExt as _;
+        let text="@@ -1 +1 @@\n-before\n+exact revoked patch\n";let page=fixture(text);
+        let(mut state,raw,expanded)=open(&page,"same-visible-part");let request=state.entries[&page.source].patch_requests[&0];
+        assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
+        let owner=Arc::downgrade(&state.entries[&page.source].patches[&0].text);
+        let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
+        let handle=Arc::new(ClientHandle::fixture(session.clone(),(*raw).clone()));
+        let mut runtime=Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle),true,crate::settings::EditorSyntaxTheme::default());
+        runtime.logical_changes=state;runtime.expanded=expanded;let target=runtime.target;
+        let mut app=crate::app::tests::context_inspector_test_app(false);app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        let task=app.handle_chat_ui(Action::CopyChangePatch(target,page.source.source_id.clone(),0));
+        let mut stream=iced::runtime::task::into_stream(task).unwrap();
+        let copy=loop {if let Some(iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(action@Action::CompleteChangeCopy(..)))))=stream.next().await {break action;}};
+        if let Action::CompleteChangeCopy(_,_,_,_,Ok(reply))=&copy {
+            assert_eq!(reply.0.value.lock().unwrap().as_ref().unwrap().as_ref().unwrap().text,text);
+        } else {panic!("actual successful copy completion required")}
+        let pending=ready(&page,text).await;
+        let pending_owner=Arc::downgrade(&pending.0.lock().unwrap().as_ref().unwrap().text);
+        let runtime=app.chat_runtime_mut(target).unwrap();let snapshot=runtime.snapshot.clone();let actor=runtime.handle().cloned().unwrap();
+        let context=runtime.logical_changes.context;runtime.forget_transcript();
+        assert!(Arc::ptr_eq(&snapshot,&runtime.snapshot));assert!(Arc::ptr_eq(&actor,runtime.handle().unwrap()));
+        assert_ne!(runtime.logical_changes.context,context);flush_retired();assert!(owner.upgrade().is_none());
+        drop(app.handle_chat_ui(Action::ChangePatchReady(target,page.source.clone(),0,request,Ok(pending))));
+        drop(app.handle_chat_ui(copy));flush_retired();
+        assert!(pending_owner.upgrade().is_none());
+        let runtime=app.chat_runtime_mut(target).unwrap();assert!(runtime.logical_changes.entries.is_empty());
+        assert_eq!(runtime.logical_changes.retained_bytes(),0);
+        assert!(runtime.copied.is_none(),"unchanged source epoch and current clipboard intent cannot bypass explicit revocation");
+    }
+
     #[test]
     fn reader_future_and_pending_output_are_send_without_ui_cache_owners() {
         fn assert_send<T:Send>() {}assert_send::<PendingPatch>();
