@@ -95,8 +95,9 @@ impl Content {
         {
             self.state.leftover.push_str(markdown);
             reader_source.append(code, markdown);
-            Arc::make_mut(code).push_str(markdown);
-            *source = Arc::from(code.as_str());
+            let mut appended=String::with_capacity(code.len()+markdown.len());
+            appended.push_str(code);appended.push_str(markdown);
+            *code=Arc::from(appended);*source=code.clone();
             self.open_fence = Some(fence);
             return;
         }
@@ -258,7 +259,7 @@ pub enum Item {
         /// The language of the code block, if any.
         language: Option<String>,
         /// The raw code of the code block.
-        code: Arc<String>,
+        code: Arc<str>,
         /// Immutable display input prepared once with this parser revision.
         source: Arc<str>,
         /// The styled lines of text in the code block.
@@ -866,14 +867,15 @@ fn parse_with<'a>(
                 code_block = false;
 
 
+                let source:Arc<str>=Arc::from(mem::take(&mut code));
                 produce(
                     state.borrow_mut(),
                     &mut stack,
                     Item::CodeBlock {
                         language: code_language.take(),
-                        source: Arc::from(code.as_str()),
-                        reader_source: super::reader_source::Source::new(&code),
-                        code: Arc::new(mem::take(&mut code)),
+                        source: source.clone(),
+                        reader_source: super::reader_source::Source::new(&source),
+                        code: source,
                         lines: code_lines.drain(..).collect(),
                     },
                     source,
@@ -1085,7 +1087,7 @@ mod tests {
         let Item::CodeBlock{code,..}=&content.items()[0] else {panic!("code fixture")};
         let weak=Arc::downgrade(code);
         let copies:Vec<_>=(0..1000).map(|_|content.items()[0].clone()).collect();
-        assert_eq!(Arc::strong_count(code),1001);
+        assert_eq!(Arc::strong_count(code),2002);
         assert!(copies.iter().all(|item|matches!(item,Item::CodeBlock{code:copy,..} if Arc::ptr_eq(code,copy))));
         drop(copies);drop(content);
         assert!(weak.upgrade().is_none());
