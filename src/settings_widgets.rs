@@ -82,6 +82,15 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
 fn highlighted<'a, Message: 'a>(text: String, query: &str, font: iced::Font) -> Element<'a, Message> {
     let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     let max_chars = words.iter().map(|word| word.chars().count()).max().unwrap_or(0);
+    // Ordinary settings views need a single shaping run, not one rich span per
+    // character. Search results also coalesce adjacent equal emphasis below.
+    if words.is_empty() {
+        let span: iced::widget::text::Span<'_, ()> = iced::widget::text::Span::new(text).font(font);
+        return iced::widget::rich_text([span])
+            .size(design::TEXT_BODY)
+            .line_height(iced::widget::text::LineHeight::Absolute(design::LINE_BODY.into()))
+            .width(Length::Fill).into();
+    }
     let mut spans = Vec::new();
     let boundaries: Vec<_> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
     let mut highlighted = vec![false; text.len()];
@@ -92,11 +101,14 @@ fn highlighted<'a, Message: 'a>(text: String, query: &str, font: iced::Font) -> 
             }
         }
     }
-    for range in boundaries.windows(2) {
-        let span: iced::widget::text::Span<'_, ()> = iced::widget::text::Span::new(text[range[0]..range[1]].to_owned());
-        spans.push(if highlighted[range[0]] {
+    let mut run_start = 0;
+    for &end in boundaries.iter().skip(1) {
+        if end != text.len() && highlighted[end] == highlighted[run_start] { continue; }
+        let span: iced::widget::text::Span<'_, ()> = iced::widget::text::Span::new(text[run_start..end].to_owned());
+        spans.push(if highlighted[run_start] {
             span.font(iced::Font { weight: iced::font::Weight::Bold, ..font })
         } else { span.font(font) });
+        run_start = end;
     }
     iced::widget::rich_text(spans)
         .size(design::TEXT_BODY)
