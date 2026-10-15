@@ -408,7 +408,7 @@ impl Cagents {
         cosmic::task::future(async move {
             let removed = tokio::task::spawn_blocking(move || {
                 let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request }).ok()?;
-                let crate::device_service::Reply::MergedWorktreeRemoved(Some(removed)) = reply else { return None; };
+                let crate::device_service::Reply::MergedWorktreeRemoved(Ok(removed)) = reply else { return None; };
                 if let Some(store) = store
                     && let Err(errors) = crate::repository::release_deleted_worktree_creations(&store, &removed) {
                     for error in errors { tracing::warn!(%error, "could not release removed worktree creation receipt"); }
