@@ -11,6 +11,7 @@ use iced::{Event, Point, Rectangle, Size, Vector};
 use std::{cell::Cell, rc::Rc};
 
 const OVERSCAN: f32 = 600.0;
+static NEXT_COLUMN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 pub(super) struct Viewport {
@@ -56,10 +57,11 @@ impl<'a> Row<'a> {
 }
 
 pub(super) fn column<'a>(rows: Vec<Row<'a>>, window: Window) -> Element<'a, Message> {
-    Element::new(Column { rows, window })
+    Element::new(Column { rows, window, revision: NEXT_COLUMN.fetch_add(1, Ordering::Relaxed) })
 }
 
 struct Column<'a> {
+    revision: u64,
     rows: Vec<Row<'a>>,
     window: Window,
 }
@@ -80,7 +82,8 @@ struct State {
     width: f32,
     heights: HashMap<u64, Height>,
     mounted: Vec<(usize, u64)>,
-    offsets: Vec<f32>,
+    offsets: PrefixSums,
+    descriptors: u64,
     observed: Option<Viewport>,
     positions: HashMap<u64, usize>,
     anchors: HashSet<u64>,
@@ -88,10 +91,46 @@ struct State {
     aliased: Vec<usize>,
 }
 
-fn visible(offsets: &[f32], top: f32, height: f32) -> std::ops::Range<usize> {
-    let count = offsets.len().saturating_sub(1);
-    let first = offsets.partition_point(|offset| *offset < top - OVERSCAN).saturating_sub(1).min(count);
-    let end = offsets.partition_point(|offset| *offset <= top + height + OVERSCAN).min(count);
+/// Mutable measured heights with logarithmic corrections and prefix lookup.
+/// Ordinary wheel/layout passes never rebuild an all-history offset vector.
+#[derive(Default)]
+struct PrefixSums { values: Vec<f32>, tree: Vec<f32> }
+impl PrefixSums {
+    fn new(values: Vec<f32>) -> Self {
+        let mut index = Self { tree: vec![0.0; values.len() + 1], values };
+        for at in 1..index.tree.len() {
+            index.tree[at] += index.values[at - 1];
+            let next = at + (at & at.wrapping_neg());
+            if next < index.tree.len() { index.tree[next] += index.tree[at]; }
+        }
+        index
+    }
+    fn prefix(&self, mut end: usize) -> f32 {
+        let mut sum = 0.0;
+        while end > 0 { sum += self.tree[end]; end &= end - 1; }
+        sum
+    }
+    fn total(&self) -> f32 { self.prefix(self.values.len()) }
+    fn set(&mut self, index: usize, value: f32) {
+        let delta = value - self.values[index];
+        self.values[index] = value;
+        let mut at = index + 1;
+        while at < self.tree.len() { self.tree[at] += delta; at += at & at.wrapping_neg(); }
+    }
+    fn partition_point(&self, predicate: impl Fn(f32) -> bool) -> usize {
+        let mut low = 0; let mut high = self.values.len() + 1;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if predicate(self.prefix(middle)) { low = middle + 1; } else { high = middle; }
+        }
+        low
+    }
+}
+
+fn visible(offsets: &PrefixSums, top: f32, height: f32) -> std::ops::Range<usize> {
+    let count = offsets.values.len();
+    let first = offsets.partition_point(|offset| offset < top - OVERSCAN).saturating_sub(1).min(count);
+    let end = offsets.partition_point(|offset| offset <= top + height + OVERSCAN).min(count);
     first..end.max(first)
 }
 
@@ -103,10 +142,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
     fn layout(&mut self, tree: &mut Tree, renderer: &cosmic::Renderer, limits: &layout::Limits) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
         let width = if limits.max().width.is_finite() { limits.max().width } else { design::READABLE_MEASURE };
-        if state.width != width {
+        let width_changed = state.width != width;
+        if width_changed {
             state.heights.clear();
             state.width = width;
         }
+        if width_changed || state.descriptors != self.revision {
         state.positions = self.rows.iter().enumerate().map(|(index, row)| (row.key, index)).collect();
         state.anchors = self.rows.iter().filter(|row| row.anchor).map(|row| row.key).collect();
         state.aliased = self.rows.iter().enumerate().filter_map(|(index, row)| (!row.aliases.is_empty()).then_some(index)).collect();
@@ -119,16 +160,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         // Retain only descriptors still loaded by the transcript window.
         let keys: HashSet<_> = self.rows.iter().map(|row| row.key).collect();
         state.heights.retain(|key, _| keys.contains(key));
+            state.offsets = PrefixSums::new(self.rows.iter().map(|row| {
+                state.heights.get(&row.key).map_or(row.estimate, |height| height.for_row(row)).max(0.0)
+            }).collect());
+            state.descriptors = self.revision;
+        }
         let mut nodes = Vec::new();
         for _ in 0..3 {
-            state.offsets.clear();
-            state.offsets.push(0.0);
-            for row in &self.rows {
-                let height = state.heights.get(&row.key)
-                    .map_or(row.estimate, |height| height.for_row(row)).max(0.0);
-                state.offsets.push(state.offsets.last().copied().unwrap() + height);
-            }
-            let total = state.offsets.last().copied().unwrap_or_default();
+            let total = state.offsets.total();
             let viewport = state.observed.or(self.window.get()).unwrap_or(Viewport {
                 top: 0.0, height: 800.0, bottom: true,
             });
@@ -149,9 +188,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 let mut node = element.as_widget_mut().layout(&mut child, renderer,
                     &layout::Limits::new(Size::ZERO, Size::new(width, f32::INFINITY)));
                 let height = node.size().height;
-                changed |= (height - (state.offsets[index + 1] - state.offsets[index])).abs() > 0.5;
+                changed |= (height - state.offsets.values[index]).abs() > 0.5;
                 state.heights.insert(key, Height { revision, height, estimate });
-                node.move_to_mut(Point::new(0.0, state.offsets[index]));
+                state.offsets.set(index, height);
+                node.move_to_mut(Point::new(0.0, state.offsets.prefix(index)));
                 nodes.push(node);
                 tree.children.push(child);
                 state.mounted.push((index, key));
@@ -160,15 +200,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         }
         // Update positions after measurements, retaining the viewport's anchor
         // through the outer transcript's layout-time anchoring operation.
-        let mut total = 0.0;
-        for (index, row) in self.rows.iter().enumerate() {
-            state.offsets[index] = total;
-            total += state.heights.get(&row.key)
-                .map_or(row.estimate, |height| height.for_row(row)).max(0.0);
-        }
-        if let Some(last) = state.offsets.last_mut() { *last = total; }
+        let total = state.offsets.total();
         for ((index, _), node) in state.mounted.iter().zip(&mut nodes) {
-            node.move_to_mut(Point::new(0.0, state.offsets[*index]));
+            node.move_to_mut(Point::new(0.0, state.offsets.prefix(*index)));
         }
         layout::Node::with_children(Size::new(width, total), nodes)
     }
@@ -183,8 +217,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             let row = &self.rows[index];
             for id in &row.aliases {
                 operation.container(Some(id), Rectangle {
-                    x: layout.bounds().x, y: layout.bounds().y + state.offsets[index],
-                    width: layout.bounds().width, height: state.offsets[index + 1] - state.offsets[index],
+                    x: layout.bounds().x, y: layout.bounds().y + state.offsets.prefix(index),
+                    width: layout.bounds().width, height: state.offsets.prefix(index + 1) - state.offsets.prefix(index),
                 });
             }
         }
@@ -260,8 +294,8 @@ pub(super) fn logical_bounds(state: &dyn std::any::Any, bounds: Rectangle, ident
     let at = ranges.partition_point(|(range, _, _)| range.start <= byte).saturating_sub(1);
     let (range, index, chunk) = ranges.get(at)?;
     if byte > range.end { return None; }
-    let top = state.offsets[*index];
-    let height = state.offsets[*index + 1] - top;
+    let top = state.offsets.prefix(*index);
+    let height = state.offsets.prefix(*index + 1) - top;
     let fraction = byte.saturating_sub(range.start) as f32 / range.len().max(1) as f32;
     Some((Rectangle { x: bounds.x, y: bounds.y + top + height * fraction,
         width: bounds.width, height: 1.0 }, if *chunk { 2 } else { 1 }))
@@ -276,8 +310,8 @@ pub(super) fn anchor_points(state: &mut dyn std::any::Any, bounds: Rectangle, wa
     keys.extend(wanted.iter().filter(|key| state.anchors.contains(key)).copied());
     keys.into_iter().filter_map(|key| {
         let index = *state.positions.get(&key)?;
-        Some((key, Rectangle { x: bounds.x, y: bounds.y + state.offsets[index], width: bounds.width,
-            height: state.offsets[index + 1] - state.offsets[index] }))
+        Some((key, Rectangle { x: bounds.x, y: bounds.y + state.offsets.prefix(index), width: bounds.width,
+            height: state.offsets.prefix(index + 1) - state.offsets.prefix(index) }))
     }).collect()
 }
 
@@ -336,8 +370,25 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     #[test]
+    fn measured_height_index_matches_flat_offsets_after_sparse_corrections() {
+        let mut values: Vec<_> = (0..10000).map(|at| (at % 17) as f32).collect();
+        let mut index = PrefixSums::new(values.clone());
+        for at in (0..values.len()).step_by(97) {
+            values[at] += 19.5;
+            index.set(at, values[at]);
+        }
+        let mut offsets = vec![0.0];
+        for height in values { offsets.push(offsets.last().unwrap() + height); }
+        for (at, expected) in offsets.iter().enumerate() { assert_eq!(index.prefix(at), *expected); }
+        for top in [0.0, 1000.0, 10000.0, index.total()] {
+            assert_eq!(index.partition_point(|offset| offset < top), offsets.partition_point(|offset| *offset < top));
+            assert_eq!(index.partition_point(|offset| offset <= top), offsets.partition_point(|offset| *offset <= top));
+        }
+    }
+
+    #[test]
     fn logical_navigation_uses_only_descriptor_offsets_until_a_chunk_is_mounted() {
-        let mut state = State { offsets: vec![0.0, 1000.0, 1500.0], ..Default::default() };
+        let mut state = State { offsets: PrefixSums::new(vec![1000.0, 500.0]), ..Default::default() };
         state.logical.insert(42, vec![(0..100, 0, true), (100..200, 1, true)]);
         let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(720.0, 1500.0));
         let (first, stage) = logical_bounds(&state, bounds, 42, 50).unwrap();
