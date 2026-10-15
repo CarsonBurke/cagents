@@ -111,6 +111,8 @@ const PANEL_ROW_HEIGHT: f32 = design::DENSE_ROW_HEIGHT;
 /// is explicit - the section says how many rows it withheld and the quick
 /// filter narrows to them - rather than a silent truncation.
 pub(crate) const MAX_VISIBLE_FILE_ROWS: usize = 400;
+/// Read-only sidebar summaries never authorize complete-set mutations.
+pub(crate) const STATUS_DISPLAY_LIMIT:usize=10_000;
 /// How many change rows one `Changes` group renders at once, bounded for the
 /// same reason as the file tree. "Stage all" and "Unstage all" act on exactly
 /// the rows that are visible, so the bound is never a hidden side effect.
@@ -699,6 +701,7 @@ pub struct SidebarWorktree {
     pub locked: bool,
     pub dirty: Option<DirtyState>,
     pub untracked_omitted: bool,
+    pub listing_truncated: bool,
     untracked_complete: bool,
     pub status_error: Option<String>,
     pub ahead: Option<u64>,
@@ -726,7 +729,7 @@ impl SidebarWorktree {
         let untracked_complete = dirty.is_some();
         let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
-        let status = status_summary(detached, locked, dirty.as_ref(), false, ahead, behind);
+        let status = status_summary(detached, locked, dirty.as_ref(), false, false, ahead, behind);
         let accessible_name = format!(
             "Open worktree {label}, {}, {status}",
             branch.as_deref().unwrap_or(&path_label)
@@ -761,6 +764,7 @@ impl SidebarWorktree {
             locked,
             dirty,
             untracked_omitted: false,
+            listing_truncated: false,
             untracked_complete,
             status_error: None,
             ahead,
@@ -807,7 +811,8 @@ impl SidebarWorktree {
             behind,
         );
         row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
-        row.untracked_complete = status.is_some_and(|status| !status.untracked_omitted);
+        row.listing_truncated = status.is_some_and(|status| status.listing_truncated);
+        row.untracked_complete = status.is_some_and(|status| !status.untracked_omitted && !status.listing_truncated);
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row
@@ -869,27 +874,25 @@ impl SidebarWorktree {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
         };
-        // A -uno watcher read has no authority over the last complete untracked
-        // count. Reuse it until a full read replaces it or a failed read makes
-        // that old count explicitly last-known rather than current.
-        let mut dirty = status.dirty.clone();
-        let untracked_omitted =
-            status.untracked_omitted && (!self.untracked_complete || self.status_error.is_some());
-        if status.untracked_omitted && !untracked_omitted {
-            dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
-        }
+        // Only a successful complete full read can authorize reuse of its
+        // untracked count. A tracked-only cap is independent of that saved
+        // completeness; a capped full read or read error invalidates it.
+        let mut dirty=status.dirty.clone();
+        let reuse_untracked=status.untracked_omitted && self.untracked_complete && self.status_error.is_none();
+        let untracked_complete=reuse_untracked || !status.untracked_omitted && !status.listing_truncated;
+        let untracked_omitted=status.untracked_omitted && !reuse_untracked;
+        if reuse_untracked {dirty.untracked=self.dirty.as_ref().map_or(0,|known|known.untracked);}
         if self.status_error.is_none()
-            && self.untracked_omitted == untracked_omitted
-            && self.dirty.as_ref() == Some(&dirty)
-            && self.ahead == ahead
-            && self.behind == behind
-        {
-            return;
-        }
-        self.untracked_complete = !untracked_omitted;
-        self.status_error = None;
-        self.dirty = Some(dirty);
-        self.untracked_omitted = untracked_omitted;
+            && self.untracked_omitted==untracked_omitted
+            && self.untracked_complete==untracked_complete
+            && self.listing_truncated==status.listing_truncated
+            && self.dirty.as_ref()==Some(&dirty)
+            && self.ahead==ahead && self.behind==behind {return;}
+        self.untracked_complete=untracked_complete;
+        self.status_error=None;
+        self.dirty=Some(dirty);
+        self.untracked_omitted=untracked_omitted;
+        self.listing_truncated=status.listing_truncated;
         self.ahead = ahead;
         self.behind = behind;
         self.refresh_status_chrome();
@@ -948,6 +951,7 @@ impl SidebarWorktree {
             self.locked,
             self.dirty.as_ref(),
             self.untracked_omitted,
+            self.listing_truncated,
             self.ahead,
             self.behind,
         );
@@ -980,11 +984,12 @@ impl SidebarWorktree {
         self.chrome.dirty_badge =
             self.dirty
                 .as_ref()
-                .filter(|dirty| dirty.is_dirty())
+                .filter(|dirty| dirty.is_dirty() || self.listing_truncated)
                 .map(|dirty| {
                     format!(
-                        "{} {}changes",
+                        "{}{} {}changes",
                         dirty_count(dirty),
+                        if self.listing_truncated { "+" } else { "" },
                         if self.untracked_omitted {
                             "tracked "
                         } else {
@@ -5971,7 +5976,7 @@ fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
 fn worktree_change_count(worktree: &SidebarWorktree) -> String {
     if worktree.status_error.is_some() { return "?".to_owned(); }
     let count = worktree.dirty.as_ref().map_or(0, dirty_count);
-    if count > 999 { "999+".to_owned() } else { count.to_string() }
+    if count > 999 { "999+".to_owned() } else if worktree.listing_truncated {format!("{count}+")} else { count.to_string() }
 }
 
 fn worktree_indicator(
@@ -9422,20 +9427,23 @@ fn status_summary(
     locked: bool,
     dirty: Option<&DirtyState>,
     untracked_omitted: bool,
+    listing_truncated:bool,
     ahead: Option<u64>,
     behind: Option<u64>,
 ) -> String {
     let mut parts = Vec::with_capacity(4);
     match dirty {
-        Some(dirty) if dirty.is_dirty() => parts.push(format!(
-            "{} {}changes",
+        Some(dirty) if dirty.is_dirty() || listing_truncated => parts.push(format!(
+            "{}{} {}changes",
             dirty_count(dirty),
+            if listing_truncated { "+" } else { "" },
             if untracked_omitted { "tracked " } else { "" }
         )),
         Some(_) if untracked_omitted => parts.push("no tracked changes".to_owned()),
         Some(_) => parts.push("No changes".to_owned()),
         None => parts.push("status unavailable".to_owned()),
     }
+    if listing_truncated {parts.push("listing limited".to_owned());}
     if detached {
         parts.push("detached".to_owned());
     }
@@ -15856,6 +15864,64 @@ pub(crate) mod tests {
         assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
         assert!(row.chrome.tooltip.contains("No changes"));
         assert!(row.chrome.dirty_badge.is_none());
+    }
+
+    #[test]
+    fn capped_tracked_reads_keep_independent_complete_untracked_authority() {
+        let mut row=worktree(11,"feature/cap",false);
+        let mut full=StatusSnapshot::default();
+        full.dirty.untracked=12;
+        full.dirty.unstaged=2;
+        row.apply_status(&full);
+        let mut tracked=StatusSnapshot {untracked_omitted:true,listing_truncated:true,..Default::default()};
+        tracked.dirty.unstaged=3;
+        row.apply_status(&tracked);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked,12);
+        assert!(row.untracked_complete);
+        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("15+ changes"));
+        assert_eq!(worktree_change_count(&row),"15+");
+        assert!(row.status_description().contains("listing limited"));
+        tracked.listing_truncated=false;
+        row.apply_status(&tracked);
+        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("15 changes"));
+        assert!(row.untracked_complete);
+        let mut partial_full=StatusSnapshot {listing_truncated:true,..Default::default()};
+        partial_full.dirty.untracked=1;
+        row.apply_status(&partial_full);
+        assert!(!row.untracked_complete);
+        row.apply_status(&tracked);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked,0);
+        assert!(row.untracked_omitted);
+        assert!(!row.untracked_complete);
+        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("3 tracked changes"));
+        row.apply_status(&full);
+        assert!(row.untracked_complete);
+        assert!(!row.untracked_omitted);
+        assert!(!row.listing_truncated);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked,12);
+    }
+
+    #[test]
+    fn capped_zero_and_failed_reads_never_publish_a_complete_clean_claim() {
+        let mut row=worktree(11,"feature/large-record",false);
+        row.apply_status(&StatusSnapshot {listing_truncated:true,..Default::default()});
+        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("0+ changes"));
+        assert_eq!(worktree_change_count(&row),"0+");
+        assert!(!row.status_description().contains("No changes"));
+        row.apply_status_error(Some("status unavailable"));
+        assert_eq!(worktree_change_count(&row),"?");
+        assert!(row.status_description().contains("Last known: 0+ changes"));
+        let mut tracked=StatusSnapshot {untracked_omitted:true,..Default::default()};
+        tracked.dirty.unstaged=1;
+        row.apply_status(&tracked);
+        assert!(row.status_error.is_none());
+        assert!(!row.untracked_complete);
+        assert!(row.untracked_omitted);
+        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("1 tracked changes"));
+        row.apply_status(&StatusSnapshot::default());
+        assert!(row.untracked_complete);
+        assert!(row.chrome.dirty_badge.is_none());
+        assert!(row.status_description().contains("No changes"));
     }
 
     #[test]

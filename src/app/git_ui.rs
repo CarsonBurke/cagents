@@ -1001,9 +1001,10 @@ fn read_local_with_plan(
         let include_untracked = change.topology || change.membership || change.untracked;
         snapshot.status_updates.insert(record.id);
         snapshot.status_reads.insert(record.id, next_status_read());
-        let current = match git.status_with_untracked(
+        let current = match git.status_projection(
             &record.path,
             include_untracked,
+            sidebar::STATUS_DISPLAY_LIMIT,
             &cancellation,
         ) {
             Ok(current) => current,

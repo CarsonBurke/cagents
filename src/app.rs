@@ -17783,7 +17783,7 @@ fn load_repository(
             let status = (!worktree.bare)
                 .then(|| {
                     service
-                        .status_with_untracked(&worktree.path, true, &cancellation)
+                        .status_projection(&worktree.path, true, sidebar::STATUS_DISPLAY_LIMIT, &cancellation)
                         .ok()
                         .map(|status| status.display_summary())
                 })
