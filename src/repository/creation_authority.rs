@@ -41,7 +41,7 @@ fn durable_parent(plan: &DestinationPlan, relative: &Path)
     let (leaf, parents) = parts.split_last().ok_or(ValidationError::DestinationOutsideRoot)?;
     let mut held = plan.ancestor.try_clone().map_err(filesystem)?;
     for name in parents {
-        let created = fs_safety::create_directory_in_namespace(&plan.namespace, &held, Path::new(name), 0o777)
+        let created = fs_safety::create_directory_beneath(&held, Path::new(name), 0o777)
             .map_err(filesystem)?;
         let child = match created {
             fs_safety::DirectoryCreation::Published(publication) => plan.retain_publication(publication)?,
@@ -54,7 +54,6 @@ fn durable_parent(plan: &DestinationPlan, relative: &Path)
         // were concurrently created by another cooperating writer.
         fs_safety::sync_directory(&child).map_err(filesystem)?;
         fs_safety::sync_directory(&held).map_err(filesystem)?;
-        fs_safety::sync_directory(plan.namespace.directory()).map_err(filesystem)?;
         held = child;
     }
     Ok((held, leaf.clone()))
@@ -153,7 +152,7 @@ impl CreationSession {
             return Err(ValidationError::InvalidWorktree(request.repository.display().to_string()).into());
         }
         let (root, private, common) = authority.retained_roots()?;
-        let plan = DestinationPlan::capture_with_namespace(&root, &common, &request.managed_root, &request.destination)?;
+        let plan = DestinationPlan::capture(&root, &request.managed_root, &request.destination)?;
         let evidence = CreationEvidence {
             operation: request.operation_id,
             source: [DirectoryWitness::held(&root)?, DirectoryWitness::held(&private)?, DirectoryWitness::held(&common)?],
@@ -185,7 +184,6 @@ impl CreationSession {
             destination_relative: request.destination.strip_prefix(&evidence.ancestor.path)
                 .map_err(|_| ValidationError::DestinationOutsideRoot)?.to_owned(),
             destination: request.destination.clone(),
-            namespace: protected_namespace(&ancestor, &common)?,
             ancestor, witness: evidence.ancestor.clone(),
             publications: Mutex::new(Vec::new()),
         };
@@ -425,29 +423,12 @@ pub(super) struct DestinationPlan {
     managed_relative: PathBuf,
     destination_relative: PathBuf,
     destination: PathBuf,
-    namespace: fs_safety::DirectoryNamespace,
     publications: Mutex<Vec<fs_safety::DirectoryPublication>>,
 }
 
-fn protected_namespace(ancestor: &fs_safety::Root, source: &fs_safety::Root)
-    -> Result<fs_safety::DirectoryNamespace, RepositoryError>
-{
-    fs_safety::DirectoryNamespace::acquire(ancestor)
-        .or_else(|_| fs_safety::DirectoryNamespace::acquire(source))
-        .map_err(|error| invalid(format!("Creation requires a protected directory-publication namespace: {error}")))
-}
-
 impl DestinationPlan {
-    #[cfg(test)]
-    pub(super) fn capture(source: &fs_safety::Root, managed_root: &Path, destination: &Path)
-        -> Result<Self, RepositoryError>
-    {
-        Self::capture_with_namespace(source, source, managed_root, destination)
-    }
-
-    fn capture_with_namespace(
+    pub(super) fn capture(
         source: &fs_safety::Root,
-        namespace_fallback: &fs_safety::Root,
         managed_root: &Path,
         destination: &Path,
     ) -> Result<Self, RepositoryError> {
@@ -480,7 +461,6 @@ impl DestinationPlan {
             destination_relative: destination.strip_prefix(&ancestor)
                 .map_err(|_| ValidationError::DestinationOutsideRoot)?.to_owned(),
             destination: destination.to_owned(),
-            namespace: protected_namespace(&held, namespace_fallback)?,
             ancestor: held,
             witness,
             publications: Mutex::new(Vec::new()),
@@ -525,8 +505,13 @@ impl DestinationPlan {
         let (parent, leaf) = durable_parent(self, &self.destination_relative)?;
         let parent_witness = DirectoryWitness::held(&parent)?;
         parent_witness.validate(&parent)?;
+        // Acquire publication authority from the exact actual parent before
+        // any destination effect. An unsafe shared parent must not create an
+        // unverified checkout that the journal could mistake for its own.
+        let namespace = fs_safety::DirectoryNamespace::acquire(&parent)
+            .map_err(|error| invalid(format!("The destination parent cannot prove creation ownership; no checkout was created: {error}")))?;
         let publication = match fs_safety::create_directory_in_namespace(
-            &self.namespace, &parent, Path::new(&leaf), 0o777,
+            &namespace, &parent, Path::new(&leaf), 0o777,
         ).map_err(filesystem)? {
             fs_safety::DirectoryCreation::Published(publication) => publication,
             fs_safety::DirectoryCreation::Existing(_)
@@ -550,7 +535,6 @@ impl DestinationPlan {
         }
         fs_safety::sync_directory(&root).map_err(filesystem)?;
         fs_safety::sync_directory(&parent).map_err(filesystem)?;
-        fs_safety::sync_directory(self.namespace.directory()).map_err(filesystem)?;
         // The public name is compared with the original retained inode. It
         // never supplies fresh authority, even if it was replaced already.
         witness.validate(&root)?;
@@ -691,6 +675,28 @@ mod tests {
         assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o711);
         assert!(fs::read_dir(destination.with_extension("original")).unwrap().next().is_none());
         assert!(plan.publications.lock().unwrap().iter().any(|receipt| receipt.identity() == (witness.device, witness.inode)));
+    }
+
+
+    #[test]
+    fn unsafe_destination_parent_refuses_before_checkout_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let source_path = fixture.path().join("source");
+        fs::create_dir(&source_path).unwrap();
+        let source = fs_safety::Root::open(&source_path).unwrap();
+        let managed = source_path.join(".worktrees");
+        fs::create_dir(&managed).unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o777)).unwrap();
+        let destination = managed.join("topic");
+        let plan = DestinationPlan::capture(&source, &managed, &destination).unwrap();
+        plan.ensure_managed_root().unwrap();
+        let publication = plan.publish();
+        assert!(publication.result.is_err());
+        assert!(publication.known.is_none());
+        assert!(!destination.exists());
+        assert_eq!(fs::metadata(&managed).unwrap().mode() & 0o777, 0o777);
+        assert!(fs::read_dir(&managed).unwrap().next().is_none());
     }
 
 }
