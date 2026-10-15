@@ -2075,6 +2075,7 @@ mod tests {
             ActivityOutcome::Succeeded,
             ActivityOutcome::Cancelled,
             ActivityOutcome::Failed { reason: "Provider exited with status 3: authentication failed".into() },
+            ActivityOutcome::Interrupted { reason: "Provider exited with status 0 before its final result".into() },
         ] {
             let snapshot = super::Snapshot {
                 outcome: Some(outcome),
