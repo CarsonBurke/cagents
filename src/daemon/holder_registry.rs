@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{BootId, TerminalId};
 
+// This isolated helper is consumed only by Linux retained-provider hosts.
+// Other Unix CLI lanes retain their existing ordinary connector.
+#[cfg(all(feature = "host", target_os = "linux"))]
 mod connection;
+#[cfg(all(feature = "host", target_os = "linux"))]
 pub(crate) use connection::connect_until;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
