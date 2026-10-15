@@ -172,6 +172,26 @@ mod tests {
     }
 
     #[test]
+    fn evicted_delegated_write_results_keep_exact_child_parent_and_sibling_sources() {
+        use serde_json::json;
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));
+        let mut adapter=crate::chat::protocol::claude::fixture_adapter();
+        adapter.bind_item_reader(reader(&store));
+        for (parent,path) in [(None,"parent.txt"),(Some("one"),"one.txt"),(Some("two"),"two.txt")] {
+            let step=adapter.receive(json!({"type":"assistant","uuid":format!("call-{path}"),"parent_tool_use_id":parent,"message":{"content":[{"type":"tool_use","id":"shared","name":"Write","input":{"file_path":path,"content":"x".repeat(3*1024*1024)}}]}})).unwrap();
+            assert!(!step.events.iter().any(|event|matches!(event,Event::Error {..})));
+            commit(&store,adapter.as_mut(),step);
+        }
+        for (parent,path) in [(Some("two"),"two.txt"),(None,"parent.txt"),(Some("one"),"one.txt")] {
+            let step=adapter.receive(json!({"type":"user","uuid":format!("result-{path}"),"parent_tool_use_id":parent,"message":{"content":[{"type":"tool_result","tool_use_id":"shared","content":"created","is_error":false}]}})).unwrap();
+            assert!(!step.events.iter().any(|event|matches!(event,Event::Error {..})),"evicted exact child source remains readable");
+            commit(&store,adapter.as_mut(),step);
+            let item=reader(&store).read(&CanonicalItemKey::new(parent,"shared")).unwrap().unwrap();
+            assert!(matches!(item.content,ItemContent::Changes {status:crate::chat::ToolStatus::Succeeded,changes} if changes.len()==1 && changes[0].path.ends_with(path) && changes[0].diff.len()>3*1024*1024));
+        }
+    }
+
+    #[test]
     fn oversized_existing_metadata_is_an_explicit_source_error_not_a_missing_tool() {
         for field in ["metadata","spans"] {
             let store=Arc::new(Mutex::new(Store::new().unwrap()));
