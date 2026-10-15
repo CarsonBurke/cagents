@@ -1555,6 +1555,18 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_channel_drop_from_an_old_workspace_is_ignored() {
+        let (mut app, _, destination, pane) = channel_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::PaneDropToChannel {
+            generation: app.workspace_view_generation.wrapping_add(1), card: pane.id, channel: destination,
+        }));
+        assert!(rx.try_recv().is_err());
+        assert!(!app.pane_transfer_pending(pane.id));
+    }
+
+    #[test]
     fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
         let (mut app, channel, _, pane) = fixture();
         let repository = PathBuf::from("/repo/.git");

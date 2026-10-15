@@ -78,12 +78,12 @@ pub fn channel_target<'a, Message: 'a>(
 /// Observe tab drags across the entire native surface, keeping ordinary strip
 /// reordering local until a valid channel actually receives the release.
 pub fn channel_scope<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>, source_strip: Id, enabled: bool,
+    content: impl Into<Element<'a, Message>>, source_strip: Id, generation: u64, enabled: bool,
     allowed: impl Fn(CardId, ChannelId) -> bool + 'a,
     dropped: impl Fn(CardId, ChannelId) -> Message + 'a,
 ) -> Element<'a, Message> {
     Element::new(Reorder { content: content.into(), kind: Kind::ChannelScope {
-        source_strip, enabled, allowed: Box::new(allowed), dropped: Box::new(dropped),
+        source_strip, generation, enabled, allowed: Box::new(allowed), dropped: Box::new(dropped),
     } })
 }
 
@@ -91,7 +91,7 @@ enum Kind<'a, Message> {
     Handle(CardId),
     ChannelTarget { channel: ChannelId, enabled: bool },
     ChannelScope {
-        source_strip: Id, enabled: bool,
+        source_strip: Id, generation: u64, enabled: bool,
         allowed: Box<dyn Fn(CardId, ChannelId) -> bool + 'a>,
         dropped: Box<dyn Fn(CardId, ChannelId) -> Message + 'a>,
     },
@@ -116,7 +116,7 @@ struct State {
     channel_drag: Option<ChannelDrag>,
     channel_targeted: bool,
 }
-struct ChannelDrag { source: CardId, origin: Point, moved: bool }
+struct ChannelDrag { source: CardId, origin: Point, generation: u64, moved: bool }
 struct ChannelTarget { channel: ChannelId, enabled: bool, highlighted: bool }
 struct WindowHandle(CardId);
 struct ChannelDropBlocker;
@@ -259,10 +259,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Kind::ChannelScope { source_strip, enabled, allowed, dropped } = &self.kind {
+        if let Kind::ChannelScope { source_strip, generation, enabled, allowed, dropped } = &self.kind {
             let mut drag = tree.state.downcast_mut::<State>().channel_drag.take();
             let was_dragging = drag.is_some();
-            let cancel = !enabled || matches!(event, Event::Window(window::Event::Unfocused))
+            let cancel = !enabled || drag.as_ref().is_some_and(|drag| drag.generation != *generation)
+                || matches!(event, Event::Window(window::Event::Unfocused))
                 || matches!(event, Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape), .. }));
             if cancel { drag = None; }
@@ -281,7 +282,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                 && hit.strip_bounds.is_some_and(|bounds| bounds.contains(hit.point))
                 && let Some(source) = hit.source
             {
-                drag = Some(ChannelDrag { source, origin: hit.point, moved: false });
+                drag = Some(ChannelDrag { source, origin: hit.point, generation: *generation, moved: false });
             }
             if let (Some(drag), Some(hit)) = (drag.as_mut(), hit.as_ref()) {
                 drag.moved |= drag.origin.distance(hit.point) >= THRESHOLD;
@@ -772,7 +773,7 @@ mod tests {
             let target = channel_target(widget::button::custom(widget::Space::new())
                 .width(120).height(30).on_press(Action::Select(ids[1])), channel, true);
             surface.element = channel_scope(widget::row::with_children(vec![target, tabs(&ids, false)]),
-                widget::Id::new("reorder.test"), true, move |_, _| allowed, Action::Move);
+                widget::Id::new("reorder.test"), 1, true, move |_, _| allowed, Action::Move);
             surface.tree = Tree::new(surface.element.as_widget());
             surface.node = surface.element.as_widget_mut().layout(&mut surface.tree, &surface.renderer,
                 &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)));
@@ -783,6 +784,30 @@ mod tests {
             assert_eq!(surface.release(20.0), if allowed { vec![Action::Move(moved, channel)] } else { vec![] });
             assert!(surface.release(130.0).is_empty(), "the original held tab press was cancelled");
         }
+    }
+
+    #[test]
+    fn changing_workspaces_cancels_a_retained_channel_drag() {
+        let ids = [CardId::new(), CardId::new()];
+        let channel = ChannelId::new();
+        let make = |generation| {
+            let target = channel_target(widget::button::custom(widget::Space::new())
+                .width(120).height(30).on_press(Action::Select(ids[1])), channel, true);
+            channel_scope(widget::row::with_children(vec![target, tabs(&ids, false)]),
+                widget::Id::new("reorder.test"), generation, true, |_, _| true, Action::Move)
+        };
+        let mut surface = Surface::new(&ids, false);
+        surface.element = make(1);
+        surface.tree = Tree::new(surface.element.as_widget());
+        surface.node = surface.element.as_widget_mut().layout(&mut surface.tree, &surface.renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)));
+        assert!(surface.press(130.0).is_empty());
+        assert!(surface.moved(20.0).is_empty());
+        surface.element = make(2);
+        surface.tree.diff(surface.element.as_widget_mut());
+        surface.node = surface.element.as_widget_mut().layout(&mut surface.tree, &surface.renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)));
+        assert!(surface.release(20.0).is_empty(), "a stale drag must never move the prior workspace's pane");
     }
 
     #[test]
