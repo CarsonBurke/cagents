@@ -15,6 +15,8 @@ pub(super) struct ActiveWorktreeOperation {
     request: Option<CreateWorktreeRequest>,
     source: Option<WorktreeCreationSource>,
     project_creation_id: Option<OperationId>,
+    project_generation: Option<u64>,
+    settled_outcome: Option<WorktreeCreationOutcome>,
     token: Option<CancellationToken>,
     receiver: Option<async_channel::Receiver<WorktreeProgressEvent>>,
     stage: Option<WorktreeProgressStage>,
@@ -35,6 +37,8 @@ pub(super) struct ActiveWorktreeOperation {
 }
 
 impl ActiveWorktreeOperation {
+    pub(super) fn project_generation(&self) -> Option<u64> { self.project_generation }
+
     pub(super) fn project_creation_id(&self) -> Option<OperationId> { self.project_creation_id }
 
     pub(super) fn source(&self) -> Option<WorktreeCreationSource> { self.source.clone() }
@@ -187,15 +191,15 @@ impl Cagents {
         draft: Option<WorktreeDraft>,
         source: Option<WorktreeCreationSource>,
     ) -> Task<Message> {
-        self.start_worktree_operation_with_project_source(project, request, draft, source, None)
+        self.start_worktree_operation_with_project_source(project, request, draft, source, None, None)
     }
 
     pub(super) fn start_worktree_operation_with_project_source(
         &mut self, project: ProjectId, request: CreateWorktreeRequest,
         draft: Option<WorktreeDraft>, source: Option<WorktreeCreationSource>,
-        project_creation_id: Option<OperationId>,
+        project_creation_id: Option<OperationId>, project_generation: Option<u64>,
     ) -> Task<Message> {
-        if project_creation_id.is_some_and(|id| {
+        if !self.creation_project_is_current(project, project_generation) || project_creation_id.is_some_and(|id| {
             !self.current_project_creation_source(project, id) || source.as_ref().is_none_or(|source| source.id() != id || !source.is_available())
         }) {
             self.status = Some(TransientNotice::warning("The original project source changed. No worktree creation was started; reload the project."));
@@ -221,6 +225,8 @@ impl Cagents {
                 request: Some(request.clone()),
                 source: source.clone(),
                 project_creation_id,
+                project_generation,
+                settled_outcome: None,
                 token: Some(token.clone()),
                 receiver: Some(receiver),
                 stage: None,
@@ -359,12 +365,15 @@ impl Cagents {
         operation.receiver = None;
         let project_id = operation.project;
         let project_creation_id = operation.project_creation_id;
+        let project_generation = operation.project_generation;
+        let source_id = operation.source.as_ref().map(WorktreeCreationSource::id);
         let repository = operation
             .request
             .as_ref()
             .map(|request| request.repository.clone());
         let outcome = match result {
             Ok(report) => {
+                operation.settled_outcome = report.outcome.clone();
                 operation.created_worktree = match &report.outcome {
                     Some(WorktreeCreationOutcome::Created { worktree, .. }) => {
                         Some((worktree.path.clone(), report.created_at_unix_ms))
@@ -376,27 +385,49 @@ impl Cagents {
                 report.outcome
             }
             Err(error) => {
+                operation.settled_outcome = None;
                 operation.state = Some(WorktreeOperationState::OutcomeUnknown);
                 operation.detail = error;
                 None
             }
         };
         self.sync_worktree_operation_rows();
-        if project_creation_id.is_some_and(|binding| !self.current_project_creation_source(project_id, binding)) {
+        if !self.creation_project_is_current(project_id, project_generation)
+            || project_creation_id.is_some_and(|binding| !self.current_project_creation_source(project_id, binding)) {
             self.status = Some(TransientNotice::warning("Creation settled against its original source after the displayed project changed. Its journal receipt was retained; reload the original project to inspect the result."));
             return Task::none();
         }
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
         {
-            return cosmic::task::message(Message::WorktreeCreated {
-                project_id,
-                repository,
-                result: Ok(outcome),
+            return cosmic::task::message(match (source_id, project_generation) {
+                (Some(source_id), Some(project_generation)) => Message::ProjectWorktreeCreated {
+                    project_id, source_id, project_generation, operation: id, repository, result: Ok(outcome),
+                },
+                _ => Message::WorktreeCreated { project_id, repository, result: Ok(outcome) },
             });
         }
         Task::none()
     }
+    /// Final queued UI publication must still name this exact settled receipt.
+    /// Recheck logical generation and the original physical source lifetime at ingress.
+    pub(super) fn completed_project_creation_matches(
+        &self, id: OperationId, project: ProjectId, source_id: OperationId, project_generation: u64,
+        repository: &Path, outcome: &WorktreeCreationOutcome,
+    ) -> bool {
+        self.creation_project_is_current(project, Some(project_generation))
+            && self.worktree_operations.get(&id).is_some_and(|operation| {
+            operation.project == project && operation.finished
+                && operation.state == Some(WorktreeOperationState::Created)
+                && operation.project_generation == Some(project_generation)
+                && operation.project_creation_id.is_none_or(|binding| self.current_project_creation_source(project, binding))
+                && operation.source.as_ref().is_some_and(|source| source.id() == source_id && source.is_available())
+                && operation.request.as_ref().is_some_and(|request| request.operation_id == id && request.repository == repository)
+                && matches!(outcome, WorktreeCreationOutcome::Created { .. })
+                && operation.settled_outcome.as_ref() == Some(outcome)
+        })
+    }
+
     pub(super) fn rehydrate_worktree_operations(&self) -> Task<Message> {
         let Some(session) = self.session.as_ref() else {
             return Task::none();
@@ -455,6 +486,8 @@ impl Cagents {
                             request: report.request,
                             source: None,
                             project_creation_id: None,
+                            project_generation: None,
+                            settled_outcome: report.outcome.clone(),
                             token: None,
                             receiver: None,
                             stage: None,
@@ -559,6 +592,8 @@ mod tests {
                     request: None,
                     source: None,
                     project_creation_id: None,
+                    project_generation: None,
+                    settled_outcome: None,
                     token: Some(token.clone()),
                     receiver: None,
                     stage,
@@ -630,6 +665,8 @@ mod tests {
             request: None,
             source: None,
             project_creation_id: None,
+            project_generation: None,
+            settled_outcome: None,
             token: None,
             receiver: None,
             stage: Some(WorktreeProgressStage::Finished),

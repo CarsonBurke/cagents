@@ -266,6 +266,7 @@ pub struct WorktreeDialog {
     repository: PathBuf,
     source: Option<WorktreeCreationSource>,
     project_creation_id: Option<OperationId>,
+    project_generation: Option<u64>,
     draft: WorktreeDraft,
     advanced: bool,
     resolving: Option<Resolution>,
@@ -287,6 +288,7 @@ impl WorktreeDialog {
             repository,
             source: None,
             project_creation_id: None,
+            project_generation: None,
             advanced: draft.uses_options(),
             draft,
             resolving: None,
@@ -391,6 +393,21 @@ impl Cagents {
         }
     }
 
+    pub(super) fn invalidate_project_worktree_creations(&self, project: ProjectId) {
+        if let Some(dialog) = self.worktree_dialog.as_ref().filter(|dialog| dialog.project_id == project) {
+            if let Some(source) = &dialog.source { source.invalidate(); }
+            if let Some(resolution) = &dialog.resolving { resolution.token.cancel(); }
+        }
+        for operation in self.worktree_operations.values().filter(|operation| operation.project() == project) {
+            if let Some(source) = operation.source() { source.invalidate(); }
+        }
+    }
+
+    pub(super) fn creation_project_is_current(&self, project: ProjectId, generation: Option<u64>) -> bool {
+        generation.is_none_or(|generation| self.repository_generations.get(&project) == Some(&generation)
+            && self.sidebar_model.project(project).is_some())
+    }
+
     /// Generic project creation consumes the exact asynchronously published
     /// project capability. The caller's action must already carry this ID.
     pub(super) fn open_worktree_dialog_project_bound(
@@ -402,7 +419,11 @@ impl Cagents {
             self.status = Some(TransientNotice::warning("The displayed project source changed. Reload the project before creating a worktree."));
             return Task::none();
         }
-        self.open_worktree_dialog_with_source(project_id, source.repository().to_owned(), draft, None, Some(source), replaces, Some(id))
+        let Some(generation) = self.repository_generations.get(&project_id).copied() else {
+            self.status = Some(TransientNotice::warning("The project generation is unavailable. Reload the project before creating a worktree."));
+            return Task::none();
+        };
+        self.open_worktree_dialog_with_source(project_id, source.repository().to_owned(), draft, None, Some(source), replaces, Some(id), Some(generation))
     }
 
     /// Opens History creation against the authority the displayed source already
@@ -414,8 +435,12 @@ impl Cagents {
         draft: WorktreeDraft,
         replaces: Option<OperationId>,
     ) -> Task<Message> {
+        let Some(generation) = self.repository_generations.get(&project_id).copied().filter(|_| self.sidebar_model.project(project_id).is_some()) else {
+            self.status = Some(TransientNotice::warning("The original project generation is unavailable. Reload the project before creating a worktree."));
+            return Task::none();
+        };
         let source = WorktreeCreationSource::new(authority);
-        self.open_worktree_dialog_with_source(project_id, source.repository().to_owned(), draft, None, Some(source), replaces, None)
+        self.open_worktree_dialog_with_source(project_id, source.repository().to_owned(), draft, None, Some(source), replaces, None, Some(generation))
     }
 
     fn open_worktree_dialog_with_source(
@@ -427,6 +452,7 @@ impl Cagents {
         source: Option<WorktreeCreationSource>,
         replaces: Option<OperationId>,
         project_creation_id: Option<OperationId>,
+        project_generation: Option<u64>,
     ) -> Task<Message> {
         if let Some(replaced) = self.worktree_dialog.take() {
             replaced.cancel();
@@ -434,6 +460,7 @@ impl Cagents {
         let mut opened = WorktreeDialog::new(project_id, repository, draft);
         opened.source = source;
         opened.project_creation_id = project_creation_id;
+        opened.project_generation = project_generation;
         opened.replaces = replaces;
         let dialog = self.worktree_dialog.insert(opened);
         match error {
@@ -445,7 +472,8 @@ impl Cagents {
     /// Resolves the dialog's request, keeping it open until Git answers.
     pub(super) fn submit_worktree_dialog(&mut self) -> Task<Message> {
         let stale = self.worktree_dialog.as_ref().is_some_and(|dialog| {
-            dialog.project_creation_id.is_some_and(|id| !self.current_project_creation_source(dialog.project_id, id))
+            !self.creation_project_is_current(dialog.project_id, dialog.project_generation)
+                || dialog.project_creation_id.is_some_and(|id| !self.current_project_creation_source(dialog.project_id, id))
         });
         if stale {
             return self.worktree_dialog.as_mut().expect("dialog checked").show_error(WorktreeInputError::general(
@@ -525,7 +553,8 @@ impl Cagents {
     ) -> Task<Message> {
         let stale = self.worktree_dialog.as_ref().filter(|dialog| {
             dialog.project_id == project_id && dialog.resolving.as_ref().is_some_and(|resolution| resolution.id == operation_id)
-        }).is_some_and(|dialog| dialog.project_creation_id.is_some_and(|id| !self.current_project_creation_source(project_id, id)));
+        }).is_some_and(|dialog| !self.creation_project_is_current(project_id, dialog.project_generation)
+            || dialog.project_creation_id.is_some_and(|id| !self.current_project_creation_source(project_id, id)));
         if stale {
             let dialog = self.worktree_dialog.as_mut().expect("dialog checked");
             dialog.resolving = None;
@@ -548,13 +577,14 @@ impl Cagents {
                 }
                 let source = dialog.source.clone();
                 let project_creation_id = dialog.project_creation_id;
+                let project_generation = dialog.project_generation;
                 let draft = dialog.draft.clone();
                 let replaces = dialog.replaces;
                 self.worktree_dialog = None;
                 if let Some(replaced) = replaces {
                     let _ = self.dismiss_worktree_operation(replaced);
                 }
-                let start = self.start_worktree_operation_with_project_source(project_id, request, Some(draft), source, project_creation_id);
+                let start = self.start_worktree_operation_with_project_source(project_id, request, Some(draft), source, project_creation_id, project_generation);
                 let focus = match self.nested_modal_focus_target() {
                     Some(target) => iced::widget::operation::focus(target).map(cosmic::Action::App),
                     None => self.focus_context_overlay_if_exposed(),
@@ -576,7 +606,7 @@ impl Cagents {
         if self.worktree_dialog.is_some() {
             return Task::none();
         }
-        let Some((project_id, repository, draft, failure, source, project_creation_id)) =
+        let Some((project_id, repository, draft, failure, source, project_creation_id, project_generation)) =
             self.worktree_operations.get(&id).and_then(|operation| {
                 operation.reopenable_draft().map(|draft| {
                     (
@@ -586,6 +616,7 @@ impl Cagents {
                         operation.failure().map(WorktreeInputError::recorded),
                         operation.source(),
                         operation.project_creation_id(),
+                        operation.project_generation(),
                     )
                 })
             })
@@ -601,12 +632,13 @@ impl Cagents {
         }) else {
             return Task::none();
         };
-        if project_creation_id.is_some_and(|binding| !self.current_project_creation_source(project_id, binding)) {
+        if !self.creation_project_is_current(project_id, project_generation)
+            || project_creation_id.is_some_and(|binding| !self.current_project_creation_source(project_id, binding)) {
             self.status = Some(TransientNotice::warning("The original project source is no longer displayed. Reload the project and create a new request."));
             return Task::none();
         }
         let error = failure.filter(|_| !submit);
-        let focus = self.open_worktree_dialog_with_source(project_id, repository, draft, error, source, Some(id), project_creation_id);
+        let focus = self.open_worktree_dialog_with_source(project_id, repository, draft, error, source, Some(id), project_creation_id, project_generation);
         if let Some(dialog) = &mut self.worktree_dialog {
             dialog.replaces = Some(id);
         }
@@ -830,7 +862,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
             ));
-        drop(app.open_worktree_dialog_with_source(project, PathBuf::from("/repo"), WorktreeDraft::default(), None, None, None, None));
+        drop(app.open_worktree_dialog_with_source(project, PathBuf::from("/repo"), WorktreeDraft::default(), None, None, None, None, None));
         Fixture {
             app,
             project,
@@ -1350,6 +1382,7 @@ mod tests {
         let root = temporary.path().join("displayed");
         super::super::git_binding::tests::init(&root, "original\n");
         let (mut app, key) = super::super::git_binding::tests::app_for(&root);
+        app.repository_generations.insert(key.project_id, 1);
         let identity = crate::repository::CommitIdentity {
             name: "Fixture".into(), email: "fixture@example.invalid".into(),
             timestamp: 0, offset_minutes: 0,
@@ -1391,6 +1424,7 @@ mod tests {
         let oid = crate::repository::Oid::parse_object(isolated_git(&root, &["rev-parse", "HEAD"])).unwrap();
         fixture.app.settings.managed_worktree_directory = ".worktrees".into();
         fixture.app.sidebar_model.projects[0].repository = root.clone();
+        fixture.app.repository_generations.insert(fixture.project, 1);
         let authority = crate::repository::WorktreeAuthority::capture(&root).unwrap();
         drop(fixture.app.open_worktree_dialog_bound(fixture.project, authority,
             WorktreeDraft { branch: "history-topic".into(), base: oid.as_str().into(), destination: String::new() }, None));
