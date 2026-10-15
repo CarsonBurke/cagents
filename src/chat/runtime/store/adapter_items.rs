@@ -220,6 +220,21 @@ mod tests {
     }
 
     #[test]
+    fn byte_evicted_immediate_failed_write_with_known_name_preserves_full_uncaptured_input_source(){
+        use serde_json::json;
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(reader(&store));
+        let mut step=adapter.receive(json!({"type":"assistant","uuid":"large-call","message":{"content":[{"type":"tool_use","id":"large-write","name":"Write","input":{"file_path":"attempted.txt","content":"x".repeat(3*1024*1024)}}]}})).unwrap();
+        // Exercise the explicit legacy/missing-capture branch. Actual captured
+        // originals have separate positive full-Write recovery coverage.
+        step.events.retain(|event|!matches!(event,Event::RawToolCapture(_)));commit(&store,adapter.as_mut(),step);
+        let before=reader(&store).read(&CanonicalItemKey::new(None,"large-write")).unwrap().unwrap();
+        let failed=adapter.receive(json!({"type":"user","uuid":"immediate-failure","message":{"content":[{"type":"tool_result","tool_use_id":"large-write","is_error":true,"content":"permission denied"}]}})).unwrap();
+        assert!(failed.events.iter().any(|event|matches!(event,Event::Error{message,fatal:false} if message.contains("input is unavailable"))));
+        commit(&store,adapter.as_mut(),failed);let after=reader(&store).read(&CanonicalItemKey::new(None,"large-write")).unwrap().unwrap();
+        let (ItemContent::Changes{changes:before,..},ItemContent::Changes{changes:after,status})=(before.content,after.content) else{panic!("missing raw input must not discard the complete canonical attempted patch");};assert_eq!(before,after);assert_eq!(status,crate::chat::ToolStatus::Failed);
+    }
+
+    #[test]
     fn uncaptured_legacy_failed_write_preserves_patch_without_guessing_an_expired_tool_name() {
         use serde_json::json;
         let store=Arc::new(Mutex::new(Store::new().unwrap()));
