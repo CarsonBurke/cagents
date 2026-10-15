@@ -1,4 +1,5 @@
 //! Real hosted-client delivery into Application::update; no daemon or PTY.
+use super::worktree_ui::card_directory;
 use super::*;
 use crate::terminal::{
     RenderSnapshot,
@@ -456,7 +457,10 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
             RepositoryId::new(),
             "Repository".into(),
             root.clone(),
-            vec![row(second_row, root.clone()), row(nested_row, nested.clone())],
+            vec![
+                row(second_row, root.clone()),
+                row(nested_row, nested.clone()),
+            ],
             vec![],
         ),
     ];
