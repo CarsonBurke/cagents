@@ -23,18 +23,32 @@ const CRITICAL_EVENT_RESERVE: usize = 8;
 const ADMITTED_KEY_LIMIT: usize = 512;
 static EVENT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 static MAILBOX_FOCUS_ID: AtomicU64 = AtomicU64::new(1);
-static BROWSER_FOCUS: LazyLock<Arc<DesiredFocus>> = LazyLock::new(|| Arc::new(DesiredFocus::default()));
+static BROWSER_FOCUS: LazyLock<Arc<DesiredFocus>> =
+    LazyLock::new(|| Arc::new(DesiredFocus::default()));
 
 #[derive(Debug, Default)]
 struct DesiredFocus(Mutex<u64>);
 
 impl DesiredFocus {
-    fn request(&self, mailbox: u64, focused: bool, engine_gone: &AtomicBool,
-        publish: impl FnOnce() -> Result<(), BrowserError>) -> Result<(), BrowserError> {
-        let mut owner = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if engine_gone.load(Ordering::Acquire) { return Err(BrowserError::ThreadStopped); }
-        if focused { *owner = mailbox; }
-        else if *owner == mailbox { *owner = 0; }
+    fn request(
+        &self,
+        mailbox: u64,
+        focused: bool,
+        engine_gone: &AtomicBool,
+        publish: impl FnOnce() -> Result<(), BrowserError>,
+    ) -> Result<(), BrowserError> {
+        let mut owner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if engine_gone.load(Ordering::Acquire) {
+            return Err(BrowserError::ThreadStopped);
+        }
+        if focused {
+            *owner = mailbox;
+        } else if *owner == mailbox {
+            *owner = 0;
+        }
         // Publish metadata in this same order. Otherwise an older false can
         // overwrite a newer true after the desired owner has already changed.
         let result = publish();
@@ -43,13 +57,22 @@ impl DesiredFocus {
     }
 
     fn release(&self, mailbox: u64) {
-        let mut owner = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut owner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A delayed old-card blur/teardown cannot revoke a newer request.
-        if *owner == mailbox { *owner = 0; }
+        if *owner == mailbox {
+            *owner = 0;
+        }
     }
 
     fn owns(&self, mailbox: u64) -> bool {
-        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) == mailbox
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == mailbox
     }
 }
 
@@ -62,7 +85,10 @@ struct KeyboardInput {
 
 impl KeyboardInput {
     fn release_modifiers(&mut self, release: &mut BrowserInput) {
-        let BrowserInput::Key { code, modifiers, .. } = release else {
+        let BrowserInput::Key {
+            code, modifiers, ..
+        } = release
+        else {
             return;
         };
         // The event snapshot at keydown may predate a normally delivered
@@ -83,8 +109,8 @@ impl KeyboardInput {
                 self.modifiers.alt = remaining("AltLeft", "AltRight");
             }
             "SuperLeft" | "SuperRight" | "MetaLeft" | "MetaRight" => {
-                self.modifiers.meta = remaining("MetaLeft", "MetaRight")
-                    || remaining("SuperLeft", "SuperRight");
+                self.modifiers.meta =
+                    remaining("MetaLeft", "MetaRight") || remaining("SuperLeft", "SuperRight");
             }
             _ => {}
         }
@@ -259,8 +285,10 @@ impl CommandMailbox {
 
     fn request_focus(&self, focused: bool) -> Result<(), BrowserError> {
         self.check_live()?;
-        self.desired_focus.request(self.focus_id, focused, &self.engine_gone,
-            || self.update_coalesced(|state| state.focused = Some(focused)))
+        self.desired_focus
+            .request(self.focus_id, focused, &self.engine_gone, || {
+                self.update_coalesced(|state| state.focused = Some(focused))
+            })
     }
 
     pub(crate) fn wants_focus(&self) -> bool {
@@ -289,7 +317,9 @@ impl CommandMailbox {
     }
 
     pub(crate) fn observe_modifiers(&self, modifiers: super::BrowserModifiers) {
-        self.keyboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.keyboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .modifiers = modifiers;
     }
 
@@ -305,11 +335,17 @@ impl CommandMailbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = self.key_session.load(Ordering::Acquire);
         if session % 2 == 0 {
-            return Err(BrowserError::Servo("browser session is not ready for keyboard input".into()));
+            return Err(BrowserError::Servo(
+                "browser session is not ready for keyboard input".into(),
+            ));
         }
         // A held physical key from a retired session must finish its native
         // release/blur cleanup before being admitted against a replacement.
-        if keyboard.held.iter().any(|(key, input)| *key == physical && input.session != session) {
+        if keyboard
+            .held
+            .iter()
+            .any(|(key, input)| *key == physical && input.session != session)
+        {
             return Err(BrowserError::CommandQueueFull);
         }
         if keyboard.held.len() >= ADMITTED_KEY_LIMIT
@@ -321,13 +357,22 @@ impl CommandMailbox {
             BrowserInput::Key { modifiers, .. } => Some(*modifiers),
             _ => None,
         };
-        self.send(Command::OwnedKey(OwnedKeyInput { session, input: press }))?;
+        self.send(Command::OwnedKey(OwnedKeyInput {
+            session,
+            input: press,
+        }))?;
         if let Some(modifiers) = observed {
             keyboard.modifiers = modifiers;
         }
         keyboard.released.retain(|key| *key != physical);
         if !keyboard.held.iter().any(|(key, _)| *key == physical) {
-            keyboard.held.push((physical, OwnedKeyInput { session, input: release }));
+            keyboard.held.push((
+                physical,
+                OwnedKeyInput {
+                    session,
+                    input: release,
+                },
+            ));
         }
         Ok(())
     }
@@ -354,9 +399,14 @@ impl CommandMailbox {
         self.check_live()?;
         // A native keyup must survive queue pressure just like blur cleanup.
         // Keep it behind its admitted press and ahead of any later input.
-        let mut pending = self.deferred_releases.lock()
+        let mut pending = self
+            .deferred_releases
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.push_back(OwnedKeyInput { session: keyboard.held[index].1.session, input: release });
+        pending.push_back(OwnedKeyInput {
+            session: keyboard.held[index].1.session,
+            input: release,
+        });
         self.refill_releases(&mut pending);
         keyboard.held.swap_remove(index);
         Ok(true)
@@ -938,21 +988,34 @@ mod tests {
         let (resume, resumed) = crossbeam_channel::bounded(1);
         let (started, starting) = crossbeam_channel::bounded(1);
         std::thread::scope(|scope| {
-            let old = scope.spawn(|| mailbox.desired_focus.request(mailbox.focus_id, false,
-                &mailbox.engine_gone, || {
-                    paused.send(()).unwrap();
-                    resumed.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-                    mailbox.update_coalesced(|state| state.focused = Some(false))
-                }));
-            pause.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            assert!(matches!(mailbox.desired_focus.0.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)),
-                "authority remains serialized through metadata publication");
+            let old = scope.spawn(|| {
+                mailbox
+                    .desired_focus
+                    .request(mailbox.focus_id, false, &mailbox.engine_gone, || {
+                        paused.send(()).unwrap();
+                        resumed
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        mailbox.update_coalesced(|state| state.focused = Some(false))
+                    })
+            });
+            pause
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                matches!(
+                    mailbox.desired_focus.0.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "authority remains serialized through metadata publication"
+            );
             let newer = scope.spawn(|| {
                 started.send(()).unwrap();
                 mailbox.request_focus(true)
             });
-            starting.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            starting
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             resume.send(()).unwrap();
             old.join().unwrap().unwrap();
             newer.join().unwrap().unwrap();
@@ -985,7 +1048,10 @@ mod tests {
         old.mark_engine_gone();
         assert!(new.wants_focus(), "old teardown cannot revoke new focus");
         assert_eq!(old.request_focus(true), Err(BrowserError::ThreadStopped));
-        assert!(new.wants_focus(), "a retired mailbox cannot claim focus again");
+        assert!(
+            new.wants_focus(),
+            "a retired mailbox cannot claim focus again"
+        );
         new.mark_engine_gone();
         assert!(!new.wants_focus());
     }
@@ -993,26 +1059,57 @@ mod tests {
     #[test]
     fn retired_session_keys_never_reach_a_recreated_session() {
         use super::super::{ButtonState, input::iced_key};
-        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Physical},
+        };
         let mailbox = CommandMailbox::new();
         let physical = Physical::Code(Code::KeyA);
         let key = keyboard::Key::Character("a".into());
-        let input = |state| iced_key(state, &key, physical,
-            keyboard::Location::Standard, keyboard::Modifiers::empty(), false, false);
-        assert!(mailbox.press_key(physical, input(ButtonState::Pressed),
-            input(ButtonState::Released)).is_err());
-        assert!(mailbox.receiver().is_empty(), "no session has admitted this key");
+        let input = |state| {
+            iced_key(
+                state,
+                &key,
+                physical,
+                keyboard::Location::Standard,
+                keyboard::Modifiers::empty(),
+                false,
+                false,
+            )
+        };
+        assert!(
+            mailbox
+                .press_key(
+                    physical,
+                    input(ButtonState::Pressed),
+                    input(ButtonState::Released)
+                )
+                .is_err()
+        );
+        assert!(
+            mailbox.receiver().is_empty(),
+            "no session has admitted this key"
+        );
         mailbox.begin_key_session();
-        mailbox.press_key(physical, input(ButtonState::Pressed),
-            input(ButtonState::Released)).unwrap();
-        let Command::OwnedKey(first_down) = mailbox.receiver().try_recv().unwrap() else { panic!() };
+        mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
+        let Command::OwnedKey(first_down) = mailbox.receiver().try_recv().unwrap() else {
+            panic!()
+        };
         let first_session = first_down.session;
         assert!(mailbox.take_current_key_input(first_down).is_some());
         // A full queue delays the original session's cleanup behind lifecycle
         // work. Recreating the session cannot retarget that cleanup.
         mailbox.send(Command::Hibernate).unwrap();
         mailbox.send(Command::Restore).unwrap();
-        for _ in 2..COMMAND_CAPACITY { mailbox.send(Command::Reload).unwrap(); }
+        for _ in 2..COMMAND_CAPACITY {
+            mailbox.send(Command::Reload).unwrap();
+        }
         mailbox.release_pressed_keys();
         mailbox.end_key_session();
         assert!(!mailbox.key_session_matches(first_session));
@@ -1029,10 +1126,21 @@ mod tests {
         assert_eq!(stale_releases, 1);
         // The native physical up was already paired by blur, including across
         // replacement. A genuinely new down belongs to the new generation.
-        assert!(mailbox.release_key(physical, input(ButtonState::Released)).unwrap());
-        mailbox.press_key(physical, input(ButtonState::Pressed),
-            input(ButtonState::Released)).unwrap();
-        let Command::OwnedKey(next_down) = mailbox.receiver().try_recv().unwrap() else { panic!() };
+        assert!(
+            mailbox
+                .release_key(physical, input(ButtonState::Released))
+                .unwrap()
+        );
+        mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
+        let Command::OwnedKey(next_down) = mailbox.receiver().try_recv().unwrap() else {
+            panic!()
+        };
         assert_ne!(next_down.session, first_session);
         assert!(mailbox.take_current_key_input(next_down).is_some());
     }
@@ -1040,24 +1148,60 @@ mod tests {
     #[test]
     fn native_release_keeps_its_original_session_after_recreation() {
         use super::super::{ButtonState, input::iced_key};
-        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Physical},
+        };
         let mailbox = active_mailbox();
         let physical = Physical::Code(Code::KeyA);
         let key = keyboard::Key::Character("a".into());
-        let input = |state| iced_key(state, &key, physical,
-            keyboard::Location::Standard, keyboard::Modifiers::empty(), false, false);
-        mailbox.press_key(physical, input(ButtonState::Pressed),
-            input(ButtonState::Released)).unwrap();
+        let input = |state| {
+            iced_key(
+                state,
+                &key,
+                physical,
+                keyboard::Location::Standard,
+                keyboard::Modifiers::empty(),
+                false,
+                false,
+            )
+        };
+        mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
         mailbox.end_key_session();
         mailbox.begin_key_session();
-        assert!(mailbox.press_key(physical, input(ButtonState::Pressed),
-            input(ButtonState::Released)).is_err(), "a held old key cannot become a new-session repeat");
-        assert!(mailbox.release_key(physical, input(ButtonState::Released)).unwrap());
-        let old_keys: Vec<_> = mailbox.receiver().try_iter().filter_map(|command| match command {
-            Command::OwnedKey(key) => Some(key), _ => None,
-        }).collect();
+        assert!(
+            mailbox
+                .press_key(
+                    physical,
+                    input(ButtonState::Pressed),
+                    input(ButtonState::Released)
+                )
+                .is_err(),
+            "a held old key cannot become a new-session repeat"
+        );
+        assert!(
+            mailbox
+                .release_key(physical, input(ButtonState::Released))
+                .unwrap()
+        );
+        let old_keys: Vec<_> = mailbox
+            .receiver()
+            .try_iter()
+            .filter_map(|command| match command {
+                Command::OwnedKey(key) => Some(key),
+                _ => None,
+            })
+            .collect();
         assert_eq!(old_keys.len(), 2);
-        for old in old_keys { assert!(mailbox.take_current_key_input(old).is_none()); }
+        for old in old_keys {
+            assert!(mailbox.take_current_key_input(old).is_none());
+        }
     }
 
     #[test]
@@ -1230,28 +1374,81 @@ mod tests {
     #[test]
     fn native_release_survives_a_full_queue_without_needing_blur() {
         use super::super::{ButtonState, input::iced_key};
-        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Physical},
+        };
         let mailbox = active_mailbox();
         let physical = Physical::Code(Code::KeyA);
         let key = keyboard::Key::Character("a".into());
-        let input = |state| iced_key(state, &key, physical,
-            keyboard::Location::Standard, keyboard::Modifiers::empty(), false, false);
-        mailbox.press_key(physical, input(ButtonState::Pressed), input(ButtonState::Released)).unwrap();
-        for _ in 1..COMMAND_CAPACITY { mailbox.send(Command::Reload).unwrap(); }
-        assert!(mailbox.release_key(physical, input(ButtonState::Released)).unwrap());
-        assert!(!mailbox.release_key(physical, input(ButtonState::Released)).unwrap());
-        assert!(matches!(mailbox.press_key(physical,
-            input(ButtonState::Pressed), input(ButtonState::Released)),
-            Err(BrowserError::CommandQueueFull)));
+        let input = |state| {
+            iced_key(
+                state,
+                &key,
+                physical,
+                keyboard::Location::Standard,
+                keyboard::Modifiers::empty(),
+                false,
+                false,
+            )
+        };
+        mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
+        for _ in 1..COMMAND_CAPACITY {
+            mailbox.send(Command::Reload).unwrap();
+        }
+        assert!(
+            mailbox
+                .release_key(physical, input(ButtonState::Released))
+                .unwrap()
+        );
+        assert!(
+            !mailbox
+                .release_key(physical, input(ButtonState::Released))
+                .unwrap()
+        );
+        assert!(matches!(
+            mailbox.press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released)
+            ),
+            Err(BrowserError::CommandQueueFull)
+        ));
         let mut observed = Vec::new();
         while let Ok(command) = mailbox.receiver().try_recv() {
             mailbox.refill_after_receive();
-            if let Command::OwnedKey(OwnedKeyInput { input, .. }) = command { observed.push(input); }
+            if let Command::OwnedKey(OwnedKeyInput { input, .. }) = command {
+                observed.push(input);
+            }
         }
-        assert_eq!(observed, vec![input(ButtonState::Pressed), input(ButtonState::Released)]);
+        assert_eq!(
+            observed,
+            vec![input(ButtonState::Pressed), input(ButtonState::Released)]
+        );
         assert!(mailbox.keyboard.lock().unwrap().held.is_empty());
-        mailbox.press_key(physical, input(ButtonState::Pressed), input(ButtonState::Released)).unwrap();
-        assert!(matches!(mailbox.receiver().try_recv(), Ok(Command::OwnedKey(OwnedKeyInput { input: BrowserInput::Key { state: ButtonState::Pressed, .. }, .. }))));
+        mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
+        assert!(matches!(
+            mailbox.receiver().try_recv(),
+            Ok(Command::OwnedKey(OwnedKeyInput {
+                input: BrowserInput::Key {
+                    state: ButtonState::Pressed,
+                    ..
+                },
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -1264,22 +1461,49 @@ mod tests {
             key: if code == "KeyA" { "a" } else { "Control" }.into(),
             code: code.into(),
             location: BrowserKeyLocation::Standard,
-            modifiers: BrowserModifiers { control, ..Default::default() },
+            modifiers: BrowserModifiers {
+                control,
+                ..Default::default()
+            },
             repeat: false,
             composing: false,
         };
-        for (physical, code) in [(Physical::Code(Code::ControlLeft), "ControlLeft"),
-            (Physical::Code(Code::KeyA), "KeyA")] {
-            mailbox.press_key(physical, input(ButtonState::Pressed, code, true),
-                input(ButtonState::Released, code, true)).unwrap();
+        for (physical, code) in [
+            (Physical::Code(Code::ControlLeft), "ControlLeft"),
+            (Physical::Code(Code::KeyA), "KeyA"),
+        ] {
+            mailbox
+                .press_key(
+                    physical,
+                    input(ButtonState::Pressed, code, true),
+                    input(ButtonState::Released, code, true),
+                )
+                .unwrap();
         }
-        assert!(mailbox.release_key(Physical::Code(Code::ControlLeft),
-            input(ButtonState::Released, "ControlLeft", false)).unwrap());
+        assert!(
+            mailbox
+                .release_key(
+                    Physical::Code(Code::ControlLeft),
+                    input(ButtonState::Released, "ControlLeft", false)
+                )
+                .unwrap()
+        );
         mailbox.release_pressed_keys();
-        let observed: Vec<_> = mailbox.receiver().try_iter().filter_map(|command| {
-            if let Command::OwnedKey(OwnedKeyInput { input, .. }) = command { Some(input) } else { None }
-        }).collect();
-        assert_eq!(observed.last(), Some(&input(ButtonState::Released, "KeyA", false)));
+        let observed: Vec<_> = mailbox
+            .receiver()
+            .try_iter()
+            .filter_map(|command| {
+                if let Command::OwnedKey(OwnedKeyInput { input, .. }) = command {
+                    Some(input)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            observed.last(),
+            Some(&input(ButtonState::Released, "KeyA", false))
+        );
     }
 
     #[test]
@@ -1289,34 +1513,63 @@ mod tests {
         for native_release in [false, true] {
             let mailbox = active_mailbox();
             let mut input = BrowserInput::Key {
-                state: ButtonState::Pressed, key: "a".into(), code: "KeyA".into(),
+                state: ButtonState::Pressed,
+                key: "a".into(),
+                code: "KeyA".into(),
                 location: BrowserKeyLocation::Standard,
-                modifiers: BrowserModifiers { control: true, ..Default::default() },
-                repeat: false, composing: false,
+                modifiers: BrowserModifiers {
+                    control: true,
+                    ..Default::default()
+                },
+                repeat: false,
+                composing: false,
             };
             let mut release = input.clone();
             if let BrowserInput::Key { state, .. } = &mut release {
                 *state = ButtonState::Released;
             }
-            mailbox.press_key(Physical::Code(Code::KeyA), input.clone(), release).unwrap();
+            mailbox
+                .press_key(Physical::Code(Code::KeyA), input.clone(), release)
+                .unwrap();
             if native_release {
-                assert!(!mailbox.release_key(Physical::Code(Code::ControlLeft),
-                    BrowserInput::Key {
-                        state: ButtonState::Released, key: "Control".into(),
-                        code: "ControlLeft".into(), location: BrowserKeyLocation::Left,
-                        modifiers: BrowserModifiers::default(), repeat: false, composing: false,
-                    }).unwrap());
+                assert!(
+                    !mailbox
+                        .release_key(
+                            Physical::Code(Code::ControlLeft),
+                            BrowserInput::Key {
+                                state: ButtonState::Released,
+                                key: "Control".into(),
+                                code: "ControlLeft".into(),
+                                location: BrowserKeyLocation::Left,
+                                modifiers: BrowserModifiers::default(),
+                                repeat: false,
+                                composing: false,
+                            }
+                        )
+                        .unwrap()
+                );
             } else {
                 mailbox.observe_modifiers(BrowserModifiers::default());
             }
             mailbox.release_pressed_keys();
-            if let BrowserInput::Key { state, modifiers, .. } = &mut input {
+            if let BrowserInput::Key {
+                state, modifiers, ..
+            } = &mut input
+            {
                 *state = ButtonState::Released;
                 *modifiers = BrowserModifiers::default();
             }
-            let observed: Vec<_> = mailbox.receiver().try_iter().filter_map(|command| {
-                if let Command::OwnedKey(OwnedKeyInput { input, .. }) = command { Some(input) } else { None }
-            }).collect();
+            let observed: Vec<_> = mailbox
+                .receiver()
+                .try_iter()
+                .filter_map(|command| {
+                    if let Command::OwnedKey(OwnedKeyInput { input, .. }) = command {
+                        Some(input)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             assert_eq!(observed.last(), Some(&input));
         }
     }
@@ -1334,8 +1587,11 @@ mod tests {
             for reverse in [false, true] {
                 let mailbox = active_mailbox();
                 let expected_modifiers = BrowserModifiers {
-                    control: kind == 0, shift: kind == 1,
-                    alt: kind == 2, meta: kind == 3, ..Default::default()
+                    control: kind == 0,
+                    shift: kind == 1,
+                    alt: kind == 2,
+                    meta: kind == 3,
+                    ..Default::default()
                 };
                 let code_name = |code| match code {
                     Code::SuperLeft => "MetaLeft".into(),
@@ -1343,24 +1599,53 @@ mod tests {
                     _ => format!("{code:?}"),
                 };
                 let input = |state, code, location| BrowserInput::Key {
-                    state, key: name.into(), code: code_name(code), location,
+                    state,
+                    key: name.into(),
+                    code: code_name(code),
+                    location,
                     modifiers: expected_modifiers,
-                    repeat: false, composing: false,
+                    repeat: false,
+                    composing: false,
                 };
-                let mut keys = [(left, BrowserKeyLocation::Left),
-                    (right, BrowserKeyLocation::Right)];
-                if reverse { keys.reverse(); }
+                let mut keys = [
+                    (left, BrowserKeyLocation::Left),
+                    (right, BrowserKeyLocation::Right),
+                ];
+                if reverse {
+                    keys.reverse();
+                }
                 for (code, location) in keys {
-                    mailbox.press_key(Physical::Code(code),
-                        input(ButtonState::Pressed, code, location),
-                        input(ButtonState::Released, code, location)).unwrap();
+                    mailbox
+                        .press_key(
+                            Physical::Code(code),
+                            input(ButtonState::Pressed, code, location),
+                            input(ButtonState::Released, code, location),
+                        )
+                        .unwrap();
                 }
                 mailbox.release_pressed_keys();
-                let releases: Vec<_> = mailbox.receiver().try_iter().filter_map(|command| {
-                    if let Command::OwnedKey(OwnedKeyInput { input: BrowserInput::Key {
-                        state: ButtonState::Released, code, location, modifiers, ..
-                    }, .. }) = command { Some((code, location, modifiers)) } else { None }
-                }).collect();
+                let releases: Vec<_> = mailbox
+                    .receiver()
+                    .try_iter()
+                    .filter_map(|command| {
+                        if let Command::OwnedKey(OwnedKeyInput {
+                            input:
+                                BrowserInput::Key {
+                                    state: ButtonState::Released,
+                                    code,
+                                    location,
+                                    modifiers,
+                                    ..
+                                },
+                            ..
+                        }) = command
+                        {
+                            Some((code, location, modifiers))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 assert_eq!(releases.len(), 2);
                 assert_eq!(releases[0].0, code_name(keys[1].0));
                 assert_eq!(releases[0].1, keys[1].1);

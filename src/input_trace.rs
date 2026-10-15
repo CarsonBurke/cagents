@@ -462,7 +462,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
         {
             let child_captured = shell.is_event_captured();
             if self.modal_keyboard {
-                if !matches!(event, keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }) {
+                if !matches!(
+                    event,
+                    keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }
+                ) {
                     return; // Modifiers still update widgets below the dialog.
                 }
                 // Claim ignored keys too: otherwise the global Popover would
@@ -659,7 +662,10 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         {
             let child_captured = shell.is_event_captured();
             if self.modal_keyboard {
-                if !matches!(event, keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }) {
+                if !matches!(
+                    event,
+                    keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }
+                ) {
                     return;
                 }
                 shell.capture_event();
@@ -670,7 +676,15 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
                 shell.capture_event();
             }
             if shell.is_event_captured() {
-                shell.publish(callback(event.clone(), if self.modal_keyboard { child_captured } else { true }, region));
+                shell.publish(callback(
+                    event.clone(),
+                    if self.modal_keyboard {
+                        child_captured
+                    } else {
+                        true
+                    },
+                    region,
+                ));
             }
         }
     }
@@ -698,7 +712,9 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         self.content
             .as_overlay_mut()
             .overlay(layout, renderer)
-            .map(|nested| ObservedOverlay::wrap(nested, &trace, regions, keyboard_callback, modal_keyboard))
+            .map(|nested| {
+                ObservedOverlay::wrap(nested, &trace, regions, keyboard_callback, modal_keyboard)
+            })
     }
 
     fn index(&self) -> f32 {

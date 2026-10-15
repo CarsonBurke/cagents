@@ -147,13 +147,17 @@ fn lock_registry() -> std::sync::MutexGuard<'static, Option<(u64, Sender<Registr
 struct FocusOwner<T>(Cell<Option<T>>);
 
 impl<T> Default for FocusOwner<T> {
-    fn default() -> Self { Self(Cell::new(None)) }
+    fn default() -> Self {
+        Self(Cell::new(None))
+    }
 }
 
 impl<T: Copy + Eq> FocusOwner<T> {
     fn request(&self, session: T, focused: bool) -> bool {
         if focused {
-            if self.0.get() == Some(session) { return false; }
+            if self.0.get() == Some(session) {
+                return false;
+            }
             self.0.set(Some(session));
             true
         } else if self.0.get() == Some(session) {
@@ -749,12 +753,18 @@ impl Card {
     }
 
     fn synchronize_session_focus(&self) {
-        let Some(session) = &self.session else { return; };
+        let Some(session) = &self.session else {
+            return;
+        };
         // Coalesced card messages and restore requests arrive from independent
         // mailboxes. Cached per-card focus alone is not current UI authority.
         let focused = self.focused && self.mailbox.wants_focus();
         if self.focus_owner.request(session.webview.id(), focused) {
-            if focused { session.webview.focus(); } else { session.webview.blur(); }
+            if focused {
+                session.webview.focus();
+            } else {
+                session.webview.blur();
+            }
         }
     }
 
@@ -1535,52 +1545,96 @@ mod tests {
         let focus = FocusOwner::<u64>::default();
         assert!(focus.request(1, true));
         assert!(focus.request(2, true));
-        assert!(!focus.request(1, false), "Servo blur is global: old session must not emit it");
+        assert!(
+            !focus.request(1, false),
+            "Servo blur is global: old session must not emit it"
+        );
         assert_eq!(focus.0.get(), Some(2));
         assert!(focus.request(2, false));
-        assert!(!focus.request(2, false), "ordinary redraw must not duplicate blur");
+        assert!(
+            !focus.request(2, false),
+            "ordinary redraw must not duplicate blur"
+        );
         assert!(focus.request(3, true));
-        assert!(!focus.request(2, false), "destroying an old generation must not blur its replacement");
+        assert!(
+            !focus.request(2, false),
+            "destroying an old generation must not blur its replacement"
+        );
         assert_eq!(focus.0.get(), Some(3));
     }
 
     #[test]
     fn coalesced_hide_keeps_same_session_fifo_keys_and_retirement_rejects_them() {
         use super::super::{ButtonState, input::iced_key};
-        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Physical},
+        };
         // No compositor/Servo is involved: exercise the exact generation
         // selector used by forward_owned_key after a session-presence check.
         let mut card = sessionless_card(true);
         card.mailbox.begin_key_session();
         let physical = Physical::Code(Code::KeyA);
         let key = keyboard::Key::Character("a".into());
-        let input = |state| iced_key(state, &key, physical,
-            keyboard::Location::Standard, keyboard::Modifiers::empty(), false, false);
+        let input = |state| {
+            iced_key(
+                state,
+                &key,
+                physical,
+                keyboard::Location::Standard,
+                keyboard::Modifiers::empty(),
+                false,
+                false,
+            )
+        };
         // Metadata may already have a wake before down was admitted. Hiding
         // can then overtake down/up without retiring their original session.
-        card.mailbox.update_coalesced(|state| state.presented = Some(false)).unwrap();
-        card.mailbox.press_key(physical, input(ButtonState::Pressed),
-            input(ButtonState::Released)).unwrap();
+        card.mailbox
+            .update_coalesced(|state| state.presented = Some(false))
+            .unwrap();
+        card.mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
         card.mailbox.release_pressed_keys();
         let mut observed = Vec::new();
         while let Ok(command) = card.mailbox.receiver().try_recv() {
             card.mailbox.refill_after_receive();
             match command {
-                Command::WakeCoalesced => { card.apply_coalesced(card.mailbox.drain_coalesced()); }
+                Command::WakeCoalesced => {
+                    card.apply_coalesced(card.mailbox.drain_coalesced());
+                }
                 Command::OwnedKey(key) => {
                     assert!(!card.visible);
-                    if let Some(input) = card.mailbox.take_current_key_input(key) { observed.push(input); }
+                    if let Some(input) = card.mailbox.take_current_key_input(key) {
+                        observed.push(input);
+                    }
                 }
                 _ => {}
             }
         }
-        assert_eq!(observed, vec![input(ButtonState::Pressed), input(ButtonState::Released)]);
+        assert_eq!(
+            observed,
+            vec![input(ButtonState::Pressed), input(ButtonState::Released)]
+        );
         // destroy_session retires even if there is no compositor fixture, so
         // queued old key events cannot become input to a future adoption.
-        card.mailbox.release_key(physical, input(ButtonState::Released)).unwrap();
-        card.mailbox.press_key(physical, input(ButtonState::Pressed),
-            input(ButtonState::Released)).unwrap();
-        let Command::OwnedKey(old_down) = card.mailbox.receiver().try_recv().unwrap() else { panic!() };
+        card.mailbox
+            .release_key(physical, input(ButtonState::Released))
+            .unwrap();
+        card.mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
+        let Command::OwnedKey(old_down) = card.mailbox.receiver().try_recv().unwrap() else {
+            panic!()
+        };
         card.destroy_session();
         card.mailbox.begin_key_session();
         assert!(card.mailbox.take_current_key_input(old_down).is_none());

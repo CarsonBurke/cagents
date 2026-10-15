@@ -622,7 +622,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                self.handle.mailbox.observe_modifiers(super::input::iced_modifiers(*modifiers));
+                self.handle
+                    .mailbox
+                    .observe_modifiers(super::input::iced_modifiers(*modifiers));
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
@@ -813,7 +815,10 @@ mod tests {
             .try_iter()
             .filter_map(|command| match command {
                 super::super::handle::Command::Input(input) => Some(input),
-                super::super::handle::Command::OwnedKey(super::super::handle::OwnedKeyInput { input, .. }) => Some(input),
+                super::super::handle::Command::OwnedKey(super::super::handle::OwnedKeyInput {
+                    input,
+                    ..
+                }) => Some(input),
                 _ => None,
             })
             .collect()
