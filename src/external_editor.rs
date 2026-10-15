@@ -159,11 +159,16 @@ pub fn launch(editor: &Editor, path: &Path) -> Result<(), String> {
 /// count UTF-16 code units; Zed and the other supported character-based
 /// launchers take character positions. Vim launch syntax uses only the line.
 pub fn column_for_prefix(editor: &str, prefix: &str) -> usize {
-    let column = match editor {
-        "code" | "codium" | "cursor" => prefix.encode_utf16().count(),
-        _ => prefix.chars().count(),
+    let column = if uses_code_coordinates(editor) {
+        prefix.encode_utf16().count()
+    } else {
+        prefix.chars().count()
     };
     column.saturating_add(1)
+}
+
+pub(crate) fn uses_code_coordinates(editor: &str) -> bool {
+    matches!(editor, "code" | "codium" | "cursor")
 }
 
 /// Positions use one-based lines and editor-specific columns. Convert a native

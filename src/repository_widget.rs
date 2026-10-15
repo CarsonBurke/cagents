@@ -3650,7 +3650,7 @@ impl RepositoryRuntime {
         self.editor_caret_for("")
     }
 
-    /// Converts the native UTF-8 caret into the selected editor's column units.
+    /// Converts native rows and UTF-8 columns into the launcher's coordinates.
     pub fn editor_caret_for(&self, editor: &str) -> Option<(usize, usize)> {
         let DocumentState::Editable(document) = &self.document else {
             return None;
@@ -3662,7 +3662,19 @@ impl RepositoryRuntime {
                 &line[..char_boundary(line, cursor.column)],
             )
         })?;
-        Some((cursor.line + 1, column))
+        let line = if crate::external_editor::uses_code_coordinates(editor) {
+            // cosmic-text folds LFCR into one native terminator. Code splits
+            // CRLF, CR and LF, so LFCR contributes two model lines. Inspect
+            // only ending metadata; do not serialize or clone source text.
+            (0..cursor.line).try_fold(1usize, |row, index| {
+                document.content.with_line(index, |_, ending| {
+                    row.saturating_add(if ending.as_str() == "\n\r" { 2 } else { 1 })
+                })
+            })?
+        } else {
+            cursor.line.saturating_add(1)
+        };
+        Some((line, column))
     }
 
     /// The file the open buffer really is, when the selected path is a
@@ -16159,6 +16171,31 @@ mod tests {
         assert_eq!(runtime.editor_caret_for("code"), Some((120, 9)));
         assert_eq!(runtime.editor_caret_for("zed"), Some((120, 8)));
         assert_eq!(runtime.editor_caret(), Some((120, 8)));
+    }
+
+    #[test]
+    fn external_editor_caret_maps_actual_mixed_native_line_endings_for_code() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(
+            card, "mixed.rs", "α\n\rβ\r\nγ\rδ\né😀X",
+        );
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editable"); };
+        assert_eq!(document.content.line_count(), 5);
+        assert_eq!(document.content.with_line(0, |_, ending| ending.as_str()), Some("\n\r"));
+        for (native_line, byte_column, code_line, code_column, scalar_column) in [
+            (0, 0, 1, 1, 1), (1, 0, 3, 1, 1), (2, 0, 4, 1, 1),
+            (3, 0, 5, 1, 1), (4, 6, 6, 4, 3),
+        ] {
+            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: native_line, column: byte_column },
+                selection: None,
+            });
+            for editor in ["code", "codium", "cursor"] {
+                assert_eq!(runtime.editor_caret_for(editor), Some((code_line, code_column)), "{editor}");
+            }
+            assert_eq!(runtime.editor_caret_for("zed"), Some((native_line + 1, scalar_column)));
+        }
     }
 
     #[test]
