@@ -2634,7 +2634,18 @@ pub(crate) fn fresh_session_configured(
     configuration: &crate::settings::AgentLaunchSettings,
     overrides: crate::settings::agents::LaunchDefaults<'_>,
 ) -> Result<Session, String> {
-    configuration.validate(provider)?;
+    // Explicit conversation choices supersede saved defaults, including a
+    // retained default from a newer build. Validate only the effective policy.
+    let mut effective = configuration.clone();
+    if overrides.model.is_some() { effective.model = None; }
+    if overrides.effort.is_some() { effective.effort = None; }
+    if overrides.permission_mode.is_some() { effective.permission_mode = None; }
+    effective.validate(provider)?;
+    for value in [overrides.model, overrides.effort, overrides.permission_mode].into_iter().flatten() {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err("Conversation model, effort and permission choices must be non-empty names without control characters.".into());
+        }
+    }
     let mut recipe = LaunchRecipe {
         unset_environment: account
             .credential_overrides()

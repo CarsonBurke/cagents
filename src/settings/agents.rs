@@ -331,6 +331,18 @@ mod tests {
 
     #[cfg(any(feature = "ui", feature = "host"))]
     #[test]
+    fn explicit_choices_override_retained_invalid_defaults_before_launch_validation() {
+        let configuration = AgentLaunchSettings { model: Some("bad\nmodel".into()), permission_mode: Some("future-permission-mode".into()), ..Default::default() };
+        let root = tempfile::tempdir().unwrap();
+        let account = crate::account::Account::system(Provider::Claude);
+        assert!(crate::chat::fresh_session_configured(Provider::Claude, crate::model::TerminalId::new(), root.path().into(), &account, &configuration, Default::default()).is_err());
+        let session = crate::chat::fresh_session_configured(Provider::Claude, crate::model::TerminalId::new(), root.path().into(), &account, &configuration, LaunchDefaults { model: Some("chosen-model"), permission_mode: Some("plan"), ..Default::default() }).unwrap();
+        assert!(session.launch.recipe.arguments.windows(2).any(|pair| pair == ["--model", "chosen-model"]));
+        assert!(session.launch.recipe.arguments.windows(2).any(|pair| pair == ["--permission-mode", "plan"]));
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
     fn configured_launch_records_executable_arguments_environment_and_model() {
         let directory = tempfile::tempdir().unwrap();
         let configuration = AgentLaunchSettings { executable: Some("/bin/sh".into()), model: Some("fixture-model".into()), effort: Some("low".into()), permission_mode: Some("plan".into()), arguments: vec!["--fixture-launch".into()], environment: BTreeMap::from([("PROXY_URL".into(), "http://localhost:8080".into())]) };
