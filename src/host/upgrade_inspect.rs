@@ -223,6 +223,18 @@ fn terminal_ended(session: &crate::model::TerminalSession) -> bool {
     )
 }
 
+// A foreground process hint is an observation of the retained PTY, not an
+// issued launch or a choice of provider/thread to resume. Match the exact
+// complete proof and all immutable fields across Live/Detached presentation.
+fn issued_terminal_matches(authoritative:&crate::model::TerminalSession,saved:&crate::model::TerminalSession)->bool{
+    let Some(proof)=authoritative.continuity.live_proof().filter(|proof|proof.is_complete()) else{return false;};
+    if saved.continuity.live_proof().as_ref()!=Some(&proof){return false;}
+    let mut normalized=authoritative.clone();
+    normalized.continuity=saved.continuity.clone();
+    normalized.resume_hint=saved.resume_hint.clone();
+    normalized==*saved
+}
+
 fn qualify_terminal(
     saved: &crate::model::TerminalSession,
     terminals: &[v77::Terminal],
@@ -240,11 +252,9 @@ fn qualify_terminal(
                 return false;
             }
             if &old == proof {
-                let mut normalized = terminal.session.clone();
-                normalized.continuity = saved.continuity.clone();
-                normalized == *saved
+                issued_terminal_matches(&terminal.session,saved)
             } else {
-                old.boot_id == proof.boot_id && terminal.upgrade_sources.contains(saved)
+                old.boot_id == proof.boot_id && terminal.upgrade_sources.iter().any(|source|issued_terminal_matches(source,saved))
             }
         })
         .count();
@@ -430,6 +440,23 @@ mod tests {
         };
         let saved = descriptor.session.clone();
         qualify_terminal(&saved, &[descriptor.clone().into()], &proof).unwrap();
+        descriptor.session.resume_hint=Some("observed-agent-inside-original-shell".into());
+        qualify_terminal(&saved, &[descriptor.clone().into()], &proof).unwrap();
+        let mut detached=saved.clone();detached.continuity=crate::model::TerminalContinuity::DetachedSameBoot{
+            host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone(),
+        };
+        qualify_terminal(&detached,&[descriptor.clone().into()],&proof).unwrap();
+        for field in 0..5 {
+            let mut changed=descriptor.clone();
+            match field{
+                0=>changed.session.launch.working_directory="/another".into(),
+                1=>{changed.session.launch.unset_environment.insert("ACCOUNT".into());},
+                2=>changed.session.transcript_path=Some("/another/transcript".into()),
+                3=>changed.session.id=crate::model::TerminalId::new(),
+                _=>changed.session.owned_codex_listener=Some(crate::chat::OwnedCodexListener{socket:"/another/socket".into(),allocator:proof.clone()}),
+            }
+            assert!(qualify_terminal(&saved,&[changed.into()],&proof).is_err(),"immutable field {field}");
+        }
         descriptor
             .session
             .launch
@@ -445,8 +472,10 @@ mod tests {
             host_incarnation: replacement.host_incarnation.clone(),
         };
         assert!(qualify_terminal(&saved, &[descriptor.clone().into()], &replacement).is_err());
-        descriptor.upgrade_sources.push(saved.clone());
-        qualify_terminal(&saved, &[descriptor.into()], &replacement).unwrap();
+        descriptor.upgrade_sources.push(detached);
+        qualify_terminal(&saved, &[descriptor.clone().into()], &replacement).unwrap();
+        descriptor.upgrade_sources[0].launch.environment.insert("ACCOUNT".into(),"another".into());
+        assert!(qualify_terminal(&saved,&[descriptor.into()],&replacement).is_err());
     }
 }
 
