@@ -9931,8 +9931,15 @@ mod tests {
         };
         publish(&mut app, &snapshot);
         assert!(chat_runtime(&app, card).child_cache.is_empty());
-        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("finished-child".into()))));
-        assert!(chat_runtime(&app, card).child_cache["finished"].open.is_none());
+        drop(app.handle_chat_ui(Action::SelectSubagent(
+            target,
+            Some("finished-child".into()),
+        )));
+        assert!(
+            chat_runtime(&app, card).child_cache["finished"]
+                .open
+                .is_none()
+        );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("running-child".into()))));
         let runtime = chat_runtime(&app, card);
         assert!(
@@ -9944,7 +9951,11 @@ mod tests {
         // An unchanged snapshot must also preserve the child's continuation.
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
-        assert!(chat_runtime(&app, card).child_cache["child-first"].open.is_some());
+        assert!(
+            chat_runtime(&app, card).child_cache["child-first"]
+                .open
+                .is_some()
+        );
         let longer = format!("{body}fn second() {{}}\n");
         snapshot.subagents[0].items[0] = item("child-first", &longer);
         snapshot.generation += 1;
