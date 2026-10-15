@@ -232,10 +232,10 @@ pub(super) fn apply(
                         false
                     }
                 }
-                Change::InsertArchiveReport { reference, pane, .. } => {
+                Change::InsertArchiveReport { repository, reference, pane, .. } => {
                     let crate::model::CardKind::Chat(session)=&pane.kind else { return Err("A saved report must have a native read-only presentation".into()); };
                     let report=super::automation_reports::report_in(transaction,reference,session)?;
-                    if &report.scope!=scope || session.archive_report.as_ref()!=Some(reference)
+                    if &report.scope!=scope || &report.repository!=repository || session.archive_report.as_ref()!=Some(reference)
                         || owner(transaction,pane.id)?.is_some()
                         || pane.scope!=super::automation_reports::presentation_scope_in(transaction,reference)? {
                         return Err("The saved report presentation source or scope changed".into());

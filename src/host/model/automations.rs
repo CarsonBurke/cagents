@@ -4818,7 +4818,7 @@ mod tests {
             content:crate::chat::ItemContent::Text {text:"r".repeat(15*1024*1024/4),thinking:false,phase:Default::default()},at:None,started_at:None}));
         assert!(serde_json::to_vec(&archive.agent).unwrap().len()<3*1024*1024);
         assert!(serde_json::to_vec(&archive.snapshot).unwrap().len()<4*1024*1024);
-        let report=crate::automations::ArchiveReport {reference,scope,source_revision:1,presentation_scope:None,
+        let report=crate::automations::ArchiveReport {reference,scope,repository:agent.spec.target.repository.clone(),source_revision:1,presentation_scope:None,
             session_digest:crate::automations::ArchiveReport::session_digest(&issued).unwrap(),archive};
         let expected=crate::terminal_ipc::ServerEnvelope {version:crate::terminal_ipc::PROTOCOL_VERSION,request_id:Some(1),proof,
             message:crate::terminal_ipc::ServerMessage::Response {response:crate::terminal_ipc::ServerResponse::Automation(crate::automations::Response::ArchiveReport(Box::new(report)))}};

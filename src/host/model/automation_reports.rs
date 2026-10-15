@@ -24,7 +24,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     CREATE TABLE automation_report_sources (
         operation TEXT PRIMARY KEY CHECK(length(CAST(operation AS BLOB))=36),
         agent TEXT NOT NULL CHECK(length(CAST(agent AS BLOB))=36) REFERENCES automation_snapshots(agent) ON DELETE CASCADE,
-        card TEXT NOT NULL CHECK(length(CAST(card AS BLOB))=36), registry TEXT NOT NULL CHECK(length(CAST(registry AS BLOB))=36), scope TEXT NOT NULL,
+        card TEXT NOT NULL CHECK(length(CAST(card AS BLOB))=36), registry TEXT NOT NULL CHECK(length(CAST(registry AS BLOB))=36), scope TEXT NOT NULL, repository TEXT NOT NULL,
         revision INTEGER NOT NULL CHECK(revision>=0), descriptor TEXT NOT NULL CHECK(length(CAST(descriptor AS BLOB))=64), presentation TEXT NOT NULL,
         FOREIGN KEY(agent,descriptor) REFERENCES automation_report_descriptors(agent,digest) ON DELETE CASCADE
     ) STRICT;
@@ -39,15 +39,15 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     CREATE TRIGGER automation_report_descriptor_removed AFTER DELETE ON automation_report_descriptors BEGIN
       UPDATE automation_report_usage SET descriptors=descriptors-length(CAST(OLD.content AS BLOB)) WHERE key=0; END;
     CREATE TRIGGER automation_report_source_budget BEFORE INSERT ON automation_report_sources
-      WHEN (SELECT count(*) FROM automation_report_usage WHERE key=0)!=1 OR length(CAST(NEW.presentation AS BLOB))>16384 OR length(CAST(NEW.scope AS BLOB))>16384 OR
+      WHEN (SELECT count(*) FROM automation_report_usage WHERE key=0)!=1 OR length(CAST(NEW.presentation AS BLOB))>16384 OR length(CAST(NEW.scope AS BLOB))>16384 OR length(CAST(NEW.repository AS BLOB))>16384 OR
         (SELECT receipts FROM automation_report_usage WHERE key=0)>=65536 OR
         (SELECT count(*) FROM automation_report_sources WHERE agent=NEW.agent)>=4096 OR
-        (SELECT receipt_bytes FROM automation_report_usage WHERE key=0)+length(CAST(NEW.presentation AS BLOB))+length(CAST(NEW.scope AS BLOB))+256>67108864
+        (SELECT receipt_bytes FROM automation_report_usage WHERE key=0)+length(CAST(NEW.presentation AS BLOB))+length(CAST(NEW.scope AS BLOB))+length(CAST(NEW.repository AS BLOB))+256>67108864
       BEGIN SELECT RAISE(ABORT,'Saved report receipt budget is full; its pane and run report were preserved'); END;
     CREATE TRIGGER automation_report_source_added AFTER INSERT ON automation_report_sources BEGIN
-      UPDATE automation_report_usage SET receipts=receipts+1,receipt_bytes=receipt_bytes+length(CAST(NEW.presentation AS BLOB))+length(CAST(NEW.scope AS BLOB))+256 WHERE key=0; END;
+      UPDATE automation_report_usage SET receipts=receipts+1,receipt_bytes=receipt_bytes+length(CAST(NEW.presentation AS BLOB))+length(CAST(NEW.scope AS BLOB))+length(CAST(NEW.repository AS BLOB))+256 WHERE key=0; END;
     CREATE TRIGGER automation_report_source_removed AFTER DELETE ON automation_report_sources BEGIN
-      UPDATE automation_report_usage SET receipts=receipts-1,receipt_bytes=receipt_bytes-length(CAST(OLD.presentation AS BLOB))-length(CAST(OLD.scope AS BLOB))-256 WHERE key=0; END;
+      UPDATE automation_report_usage SET receipts=receipts-1,receipt_bytes=receipt_bytes-length(CAST(OLD.presentation AS BLOB))-length(CAST(OLD.scope AS BLOB))-length(CAST(OLD.repository AS BLOB))-256 WHERE key=0; END;
     CREATE TRIGGER automation_report_descriptor_immutable BEFORE UPDATE ON automation_report_descriptors
       BEGIN SELECT RAISE(ABORT,'Saved report descriptors are immutable'); END;
     CREATE TRIGGER automation_report_source_immutable BEFORE UPDATE ON automation_report_sources
@@ -91,12 +91,20 @@ pub(super) fn capture_removal(db: &Connection, operation: Uuid, scope: &Scope, r
     if !exists {
         db.execute("INSERT INTO automation_report_descriptors(agent,digest,content) VALUES(?1,?2,?3)",params![agent.id.to_string(),descriptor,encoded]).map_err(|error|error.to_string())?;
     }
+    let repository:PathBuf=match scope {
+        Scope::Worktree {repository,..}=>repository.clone(),
+        Scope::Channel(channel)=> {
+            let repository:Option<String>=db.query_row("SELECT CASE WHEN length(CAST(repository AS BLOB))<=16384 THEN repository END FROM channels WHERE id=?1",[channel.to_string()],|row|row.get(0)).map_err(|_|"The original report project is unavailable")?;
+            repository.ok_or("The original report project exceeds its metadata limit")?.into()
+        }
+    };
+    let repository=serde_json::to_string(&repository).map_err(|error|error.to_string())?;
     let presentation=serde_json::to_string(&Presentation {title:pane.title.clone(),user_title:pane.user_title.clone(),width_fraction:pane.width_fraction,scope:pane.scope.clone(),source_reference}).map_err(|error|error.to_string())?;
     let scope=serde_json::to_string(scope).map_err(|error|error.to_string())?;
-    if presentation.len()>16384 || scope.len()>16384 {return Err("The saved report presentation metadata exceeds its limit; its pane was preserved".into());}
+    if presentation.len()>16384 || scope.len()>16384 || repository.len()>16384 {return Err("The saved report presentation metadata exceeds its limit; its pane was preserved".into());}
     let identity: String = db.query_row("SELECT identity FROM metadata WHERE key=0", [], |row| row.get(0)).map_err(|error| error.to_string())?;
-    db.execute("INSERT INTO automation_report_sources(operation,agent,card,registry,scope,revision,descriptor,presentation) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![operation.to_string(),agent.id.to_string(),pane.id.to_string(),identity,scope,revision,descriptor,presentation])
+    db.execute("INSERT INTO automation_report_sources(operation,agent,card,registry,scope,revision,descriptor,presentation,repository) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![operation.to_string(),agent.id.to_string(),pane.id.to_string(),identity,scope,revision,descriptor,presentation,repository])
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -104,6 +112,7 @@ pub(super) fn capture_removal(db: &Connection, operation: Uuid, scope: &Scope, r
 struct Source {
     reference: ArchiveReportReference,
     scope: Scope,
+    repository:PathBuf,
     revision: u64,
     pane: Pane,
 }
@@ -111,14 +120,15 @@ fn source(db: &Connection, reference: &ArchiveReportReference) -> Result<Source,
     if !reference.is_supported() { return Err("The saved report reference is unsupported".into()); }
     let identity: String = db.query_row("SELECT identity FROM metadata WHERE key=0", [], |row| row.get(0)).map_err(|error| error.to_string())?;
     if identity != reference.registry.to_string() { return Err("The saved report belongs to a different registry".into()); }
-    type SourceRow=(String,String,String,Option<String>,u64,Option<String>,String,Option<String>);
+    type SourceRow=(String,String,String,Option<String>,u64,Option<String>,String,Option<String>,Option<String>);
     let row: Option<SourceRow> = db.query_row(
-        "SELECT CASE WHEN length(CAST(s.agent AS BLOB))<=36 THEN s.agent ELSE '' END,CASE WHEN length(CAST(s.registry AS BLOB))<=36 THEN s.registry ELSE '' END,CASE WHEN length(CAST(s.card AS BLOB))<=36 THEN s.card ELSE '' END,CASE WHEN length(CAST(s.scope AS BLOB))<=16384 THEN s.scope END,s.revision,CASE WHEN length(CAST(s.presentation AS BLOB))<=16384 THEN s.presentation END,CASE WHEN length(CAST(s.descriptor AS BLOB))<=64 THEN s.descriptor ELSE '' END,CASE WHEN length(CAST(d.content AS BLOB))<=3145728 THEN d.content END FROM automation_report_sources s JOIN automation_report_descriptors d ON d.agent=s.agent AND d.digest=s.descriptor WHERE s.operation=?1",
-        [reference.source_operation.to_string()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))
+        "SELECT CASE WHEN length(CAST(s.agent AS BLOB))<=36 THEN s.agent ELSE '' END,CASE WHEN length(CAST(s.registry AS BLOB))<=36 THEN s.registry ELSE '' END,CASE WHEN length(CAST(s.card AS BLOB))<=36 THEN s.card ELSE '' END,CASE WHEN length(CAST(s.scope AS BLOB))<=16384 THEN s.scope END,s.revision,CASE WHEN length(CAST(s.presentation AS BLOB))<=16384 THEN s.presentation END,CASE WHEN length(CAST(s.descriptor AS BLOB))<=64 THEN s.descriptor ELSE '' END,CASE WHEN length(CAST(d.content AS BLOB))<=3145728 THEN d.content END,CASE WHEN length(CAST(s.repository AS BLOB))<=16384 THEN s.repository END FROM automation_report_sources s JOIN automation_report_descriptors d ON d.agent=s.agent AND d.digest=s.descriptor WHERE s.operation=?1",
+        [reference.source_operation.to_string()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)))
         .optional().map_err(|error| error.to_string())?;
-    let Some((agent,registry,card,scope,revision,presentation,key,content))=row else { return Err("The saved report source expired or was never committed".into()); };
+    let Some((agent,registry,card,scope,revision,presentation,key,content,repository))=row else { return Err("The saved report source expired or was never committed".into()); };
     if agent != reference.agent.to_string() || registry != identity { return Err("The saved report source owner changed".into()); }
     let scope: Scope=serde_json::from_str(&scope.ok_or("The saved report scope exceeds its limit")?).map_err(|_| "The saved report scope is unreadable")?;
+    let repository:PathBuf=serde_json::from_str(&repository.ok_or("The saved report project exceeds its limit")?).map_err(|_|"The saved report project is unreadable")?;
     let presentation:Presentation=serde_json::from_str(&presentation.ok_or("The saved report presentation exceeds its limit")?).map_err(|_|"The saved report presentation is unreadable")?;
     let content=content.ok_or("The saved report descriptor exceeds its limit")?;
     if descriptor_key(reference.agent,&content)!=key {return Err("The saved report descriptor changed".into());}
@@ -130,7 +140,7 @@ fn source(db: &Connection, reference: &ArchiveReportReference) -> Result<Source,
     }
     let pane=Pane {id:card.parse().map_err(|_|"The saved report source card is invalid")?,title:presentation.title,user_title:presentation.user_title,width_fraction:presentation.width_fraction,scope:presentation.scope,pending_terminal_start:false,kind};
     pane.validate()?;
-    Ok(Source {reference:reference.clone(),scope,revision,pane})
+    Ok(Source {reference:reference.clone(),scope,repository,revision,pane})
 }
 
 pub(super) fn report_in(db: &Connection, reference: &ArchiveReportReference, session: &Session) -> Result<ArchiveReport,String> {
@@ -157,7 +167,7 @@ pub(super) fn report_in(db: &Connection, reference: &ArchiveReportReference, ses
     ArchivedPaneReadiness::qualify(reference.agent,&original,&archive)?;
     let mut issued=original;issued.archive_report=Some(reference.clone());
     let presentation_scope=match &source.scope {Scope::Worktree{path,..}=>Some(path.clone()),Scope::Channel(_)=>source.pane.scope.clone()};
-    Ok(ArchiveReport {reference:source.reference,scope:source.scope,source_revision:source.revision,presentation_scope,session_digest:ArchiveReport::session_digest(&issued)?,archive})
+    Ok(ArchiveReport {reference:source.reference,scope:source.scope,repository:source.repository,source_revision:source.revision,presentation_scope,session_digest:ArchiveReport::session_digest(&issued)?,archive})
 }
 
 impl Registry {

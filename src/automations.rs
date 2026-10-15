@@ -179,6 +179,7 @@ impl ArchiveReportDescriptor {
 pub struct ArchiveReport {
     pub reference: crate::chat::ArchiveReportReference,
     pub scope: crate::agent_execution::Placement,
+    pub repository: std::path::PathBuf,
     pub source_revision: u64,
     pub presentation_scope: Option<std::path::PathBuf>,
     /// Binds the exact requested presentation without duplicating a potentially

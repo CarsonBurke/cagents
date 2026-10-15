@@ -973,6 +973,13 @@ impl Cagents {
             && self.resume_ui.generation==restore.generation
             && self.workspace_model.identity==restore.registry
             && restore.report.reference.registry==restore.registry
+            && self.workspace_model.projects.iter().any(|project|project.repository==restore.report.repository)
+            && match &restore.report.scope {
+                crate::agent_execution::Placement::Channel(channel)=>self.durable.channels.iter().any(|current|current.id==*channel&&current.shared)
+                    && self.workspace_model.channel(*channel).is_some_and(|current|current.repository==restore.report.repository),
+                crate::agent_execution::Placement::Worktree{path,repository}=>repository==&restore.report.repository
+                    && self.worktree_view_scope(path).as_ref()==Some(&restore.report.scope),
+            }
             && crate::automations::archive::ArchivedPaneReadiness::qualify_report(&restore.report,&issued).is_ok()
     }
 
@@ -1333,7 +1340,7 @@ mod tests {
         let reference=chat::ArchiveReportReference {format:1,registry:app.workspace_model.identity,agent,source_operation:uuid::Uuid::new_v4()};
         let mut issued=original.clone();issued.archive_report=Some(reference.clone());
         let report=crate::automations::ArchiveReport {
-            reference,scope:app.workspace_model.views[0].scope.clone(),source_revision:1,
+            reference,scope:app.workspace_model.views[0].scope.clone(),repository:archive.agent.spec.target.repository.clone(),source_revision:1,
             presentation_scope:Some(original.launch.recipe.working_directory.clone()),
             session_digest:crate::automations::ArchiveReport::session_digest(&issued).unwrap(),archive:(*archive).clone(),
         };
@@ -1360,12 +1367,12 @@ mod tests {
 
     #[test]
     fn a_report_continuation_cannot_insert_into_the_old_scope_or_outlive_its_request() {
-        for scenario in 0..4 {
+        for scenario in 0..6 {
             let (mut app,card,agent,archive)=crate::app::chat_ui::qualified_closed_console_archive_for_test();
             let CardKind::Chat(session)=app.card_state(card).unwrap().kind.clone() else{unreachable!()};
             let reference=chat::ArchiveReportReference {format:1,registry:app.workspace_model.identity,agent,source_operation:uuid::Uuid::new_v4()};
             let mut issued=session.clone();issued.archive_report=Some(reference.clone());
-            let report=crate::automations::ArchiveReport {reference,scope:app.workspace_model.views[0].scope.clone(),source_revision:1,
+            let report=crate::automations::ArchiveReport {reference,scope:app.workspace_model.views[0].scope.clone(),repository:archive.agent.spec.target.repository.clone(),source_revision:1,
                 presentation_scope:Some(session.launch.recipe.working_directory.clone()),session_digest:crate::automations::ArchiveReport::session_digest(&issued).unwrap(),archive:(*archive).clone()};
             let nonce=uuid::Uuid::new_v4();app.resume_ui.report_restore_nonce=Some(nonce);
             let restore=ReportRestore {nonce,generation:app.resume_ui.generation,registry:app.workspace_model.identity,picker_origin:false,
@@ -1374,7 +1381,9 @@ mod tests {
                 0=>Arc::make_mut(&mut app.durable).active_channel=Some(ChannelId::new()),
                 1=>app.resume_ui.report_restore_nonce=Some(uuid::Uuid::new_v4()),
                 2=>app.workspace_model.identity=uuid::Uuid::new_v4(),
-                _=>app.update_prepared=true,
+                3=>app.update_prepared=true,
+                4=>app.sidebar_model.projects.clear(),
+                _=>app.workspace_model.projects.clear(),
             }
             let cards=app.durable.cards.clone();let order=app.workspace.order().collect::<Vec<_>>();
             drop(app.finish_archive_report_restore(restore));
