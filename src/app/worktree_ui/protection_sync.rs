@@ -249,6 +249,7 @@ mod tests {
     #[test]
     fn camera_update_drives_the_protection_preparation_it_schedules() {
         use cosmic::Application as _;
+        use cosmic::iced::futures::StreamExt as _;
         let mut app = empty_window();
         let width = app.workspace.viewport_width();
         let task = app.update(Message::Viewport {
@@ -256,13 +257,19 @@ mod tests {
             event: WorkspaceViewportEvent::Resized(width),
         });
         assert!(app.worktree_protection_sync.inflight.is_some());
-        let Message::WorktreeProtectionsPrepared {
-            generation,
-            receipt,
-        } = crate::app::tests::task_app_message(task)
-        else {
-            panic!("camera update did not return its protection task")
-        };
+        let mut stream = iced::runtime::task::into_stream(task).expect("camera update has tasks");
+        let (generation, receipt) = tokio::runtime::Builder::new_current_thread()
+            .build().unwrap().block_on(async move {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        Message::WorktreeProtectionsPrepared { generation, receipt },
+                    )) = action {
+                        return (generation, receipt);
+                    }
+                    // Viewport updates also emit a scroll widget operation.
+                }
+                panic!("camera update did not return its protection task")
+            });
         drop(app.window_protections_prepared(generation, receipt));
         assert!(app.worktree_protection_sync.inflight.is_none());
         assert_eq!(app.worktree_protection_sync.applied, Some(Vec::new()));
