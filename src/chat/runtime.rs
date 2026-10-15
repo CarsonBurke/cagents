@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod execution;
+mod directory;
 mod store;
 mod websocket;
 mod remote_actor;
@@ -28,6 +29,7 @@ mod handle;
 pub use handle::Handle;
 pub(crate) use remote_actor::{ActorIdentity,ActorInspection,InputIdentity,InputReceipt,InputState,OutboxEntry};
 use store::Store;
+pub(crate) use directory::DirectoryProof;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -40,6 +42,10 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    CaptureExecutionDirectory {
+        directory: std::path::PathBuf,
+        proof: crossbeam_channel::Sender<Result<DirectoryProof, String>>,
+    },
     UpdateSource(
         super::Session,
         Option<crate::model::LaunchRecipe>,
@@ -2179,6 +2185,12 @@ impl Actor {
                 continue;
             }
             let (run, command) = match command {
+                ActorCommand::CaptureExecutionDirectory { directory, proof } => {
+                    let result = directory::capture(self, &directory);
+                    let _ = proof.send(result);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
                 ActorCommand::Provider { run, command } => (run, command),
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
