@@ -2363,6 +2363,7 @@ impl Editor {
     /// re-sourcing a snapshot triggers, so nothing waits in the outbox for
     /// the next keystroke.
     fn apply_review_effects(&mut self, id: CardId) -> Task<Message> {
+        self.invalidate_stale_checkout();
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
         };
@@ -2415,7 +2416,7 @@ impl Editor {
             self.notice=Some("Open this worktree in Cagents and use Delete worktree to review its branch cleanup safely.".into());
         }
         if let Some(target) = checkout_target {
-            self.begin_checkout(target);
+            self.begin_review_checkout(id, target);
         }
         if let Some(path) = checkout_open {
             self.selection_epoch = self.selection_epoch.wrapping_add(1);
@@ -5415,6 +5416,84 @@ mod tests {
                 .any(|tab| tab.runtime.descriptor.worktree == destination)
         );
         assert_eq!(git(&destination, &["rev-parse", "HEAD"]), original);
+    }
+
+    #[test]
+    fn ceditor_checkout_rejects_inflight_same_head_review_identity_changes() {
+        use cagents::{github::{GitHubRepoKey, PullRequestKey}, repository::{ExistingPrCheckoutRequest, Oid, PrCheckoutTracking, ValidatedBranchName, ValidatedRefName, PullRequestRange}};
+        let directory = git_fixture();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["remote", "add", "origin", "https://github.com/o/r.git"]);
+        let head = Oid::parse(&git(&root, &["rev-parse", "HEAD"])).unwrap();
+        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        let pr: cagents::github::PullRequest = serde_json::from_value(serde_json::json!({
+            "id":"PR_7", "number":7, "title":"Change", "state":"OPEN",
+            "headRefName":"main", "headRefOid":head.as_str(), "baseRefName":"main",
+            "headRepository":{"name":"r"}, "headRepositoryOwner":{"login":"o"},
+            "updatedAt":"2026-01-01T00:00:00Z", "url":"https://github.com/o/r/pull/7"
+        })).unwrap();
+        let target = pull_request_review::CheckoutTarget { repository:root.clone(), number:7, head:head.clone(),
+            pull_request:Some(PullRequestKey::new(repository.clone(),7).unwrap()), head_ref_name:"main".into() };
+        let loaded = pull_request_review::Loaded { pull_request:pr.clone(),
+            context:cagents::github::ReviewContext { pull_request_id:"PR_7".into(), head_oid:head.as_str().into(), base_oid:head.as_str().into(), viewer:"fixture".into(), viewer_is_author:false, pending:None },
+            files:Default::default(), next_file_cursor:None,
+            range:PullRequestRange {number:7, base_branch:ValidatedBranchName::parse("main").unwrap(),
+                head_mirror:ValidatedRefName::parse("refs/cagents/pull/7/head").unwrap(), base_mirror:ValidatedRefName::parse("refs/cagents/pull/7/base").unwrap(),
+                head:head.clone(),base_tip:head.clone(),merge_base:head.clone()}, entries:Vec::new(), discussion_stamp:None };
+        let service = RepositoryService::system("git");
+        let plan = service.prepare_existing_pr_checkout(&ExistingPrCheckoutRequest {
+            repository:root.clone(),worktree:root.clone(),branch:ValidatedBranchName::parse("main").unwrap(),
+            head_repository:repository.clone(),head_branch:ValidatedBranchName::parse("main").unwrap(),expected_head:head.clone(),remote:"origin".into(),tracking:PrCheckoutTracking::ReadOnly
+        }, &CancellationToken::new()).unwrap();
+        assert_eq!(plan.disposition(),cagents::repository::PrCheckoutDisposition::AlreadyCurrent);
+        // Only GitHub preparation is replaced: the backend plan/receipt and all
+        // owning-tab Loaded/confirm/open reducers below are their real paths.
+        let mut prepared = pull_request_review::checkout::prepare(&pull_request_review::CheckoutTarget::read_only(root.clone(),7,head.clone()), &CancellationToken::new()).unwrap();
+        prepared.reconciliation=Some(plan.clone()); prepared.existing_worktree=Some(root.clone());
+        for changed_source in [false,true] {
+            for phase in 0..5 {
+                let mut app=editor(); let card=add(&mut app,root.to_str().unwrap(),None);
+                app.tab_mut(card).unwrap().review = pull_request_review::State::new(Arc::new(GitHubService::system("gh")), RepositoryService::system("git"));
+                let owner=pull_request_review::ReviewTarget {repository:repository.clone(),worktree:root.clone(),pull_request:Arc::new(pr.clone())};
+                drop(app.update(Message::PullRequestReview(card,pull_request_review::Action::Open(owner))));
+                let generation=app.tab(card).unwrap().review.selection_generation();
+                drop(app.update(Message::PullRequestReview(card,pull_request_review::Action::Loaded {generation,load:1,result:Ok(Arc::new(loaded.clone()))})));
+                // This request is already in flight before the checkout modal.
+                drop(app.update(Message::PullRequestReview(card,pull_request_review::Action::Refresh)));
+                app.begin_review_checkout(card,target.clone());
+                let id=app.checkout_dialog.as_mut().unwrap().fixture_prepared(prepared.clone());
+                let mut pending=None;
+                if phase==1 { pending=Some(app.update(Message::Checkout(checkout::Action::ReconcileExisting))); }
+                if phase==2 {
+                    let task=app.update(Message::Checkout(checkout::Action::ReconcileExisting)); run_tasks(&mut app,task);
+                    assert_eq!(app.checkout_dialog.as_ref().unwrap().completed_for_test(),Some(root.as_path()));
+                }
+                let completed_receipt = if phase == 4 {
+                    app.checkout_dialog.as_mut().unwrap().fixture_pending_existing();
+                    Some(service.reconcile_existing_pr_checkout(&plan, &CancellationToken::new()).unwrap())
+                } else { None };
+                let token=app.checkout_dialog.as_ref().unwrap().cancellation_for_test();
+                let mut refreshed=loaded.clone();
+                if changed_source { refreshed.pull_request.head_repository_owner.as_mut().unwrap().login="other".into(); }
+                else { refreshed.pull_request.head_ref_name="renamed".into(); }
+                drop(app.update(Message::PullRequestReview(card,pull_request_review::Action::Loaded {generation,load:2,result:Ok(Arc::new(refreshed))})));
+                let current=app.tab(card).unwrap().review.target().unwrap();
+                assert_eq!(current.pull_request.head_ref_oid,head.as_str());
+                assert!(if changed_source {current.pull_request.head_repository_owner.as_ref().unwrap().login=="other"} else {current.pull_request.head_ref_name=="renamed"},"in-flight Loaded must actually adopt metadata behind the modal");
+                if let Some(token)=token {assert!(token.is_cancelled());}
+                match phase {
+                    0=>{let task=app.update(Message::Checkout(checkout::Action::ReconcileExisting));run_tasks(&mut app,task);},
+                    1=>run_tasks(&mut app,pending.take().unwrap()),
+                    2=>{let task=app.update(Message::Checkout(checkout::Action::Open(root.clone())));run_tasks(&mut app,task);},
+                    3=>{let task=app.update(Message::Checkout(checkout::Action::Prepared(id,Ok(prepared.clone()))));run_tasks(&mut app,task);},
+                    _=>{let task=app.update(Message::Checkout(checkout::Action::ExistingFinished(id,Ok(completed_receipt.unwrap()))));run_tasks(&mut app,task);}
+                }
+                let dialog=app.checkout_dialog.as_ref().expect("stale owner must not open/close checkout");
+                if phase==4 {assert_eq!(dialog.retained_receipt_for_test().unwrap().path(),root.as_path());}
+                assert!(!dialog.busy()); assert!(dialog.completed_for_test().is_none()); assert!(dialog.error_for_test().is_some());
+                assert_eq!(app.tabs.len(),1); assert_eq!(git(&root,&["rev-parse","HEAD"]),head.as_str());
+            }
+        }
     }
 
     #[test]
