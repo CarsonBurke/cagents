@@ -8992,4 +8992,15 @@ mod tests {
         loop {if let Some(response)=handle.entries("").into_iter().find(|e|e.id==Some(601)){assert_eq!(response.result.unwrap(),json!([{"command":"clippy"},null]));break;}assert!(tokio::time::Instant::now()<deadline);tokio::time::sleep(Duration::from_millis(2)).await;}
         manager.begin_shutdown().await;
     });}
+
+    #[test]
+    fn cross_file_rename_flushes_other_buffers_inside_their_debounce_window(){block_on(async{
+        let (_guard,worktree,file)=workspace();let other=file.with_file_name("other.rs");let other_uri=Url::from_file_path(&other).unwrap();
+        let mut manager=rust_manager();let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"renameProvider":true}),|request|if request.method=="textDocument/rename"{vec![json!({"jsonrpc":"2.0","id":request.id,"result":null})]}else{vec![]});
+        let events=manager.events();let doc=LspDocumentId(1);let second=LspDocumentId(2);manager.open_for_test(doc,&file,&worktree,rust_language(),1,"foo\n");let handle=handle_of(&slot).await;await_ready(&events,doc).await;
+        manager.open_for_test(second,&other,&worktree,rust_language(),1,"foo\n");handle.wait_for_count("textDocument/didOpen",2).await;
+        manager.change(second,2,&[],"changed foo\n");let request=manager.request_rename(doc,LspPosition::new(0,1),"bar".into());
+        next_matching(&events,|e|match e{LspEvent::WorkspaceEdit{request:r,..}if *r==request=>Some(()),_=>None}).await;
+        let entries=handle.log.lock().unwrap();let change=entries.iter().position(|e|e.method=="textDocument/didChange"&&e.params["textDocument"]["uri"]==json!(other_uri)).unwrap();let rename=entries.iter().position(|e|e.method=="textDocument/rename").unwrap();assert!(change<rename);drop(entries);manager.begin_shutdown().await;
+    });}
 }
