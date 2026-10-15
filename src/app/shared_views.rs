@@ -578,11 +578,29 @@ impl Cagents {
                 }
             }
         }
+        // Finish the existing optimistic projection passes before capturing
+        // admission. InsertIfEmpty followed by removal can change membership
+        // on the second pass; it must not run after alias effects begin.
+        for view in &mut views {
+            if !self.shared_views.initialized.contains(&view.scope)
+                || self.shared_views.seeding.contains(&view.scope)
+            {
+                continue;
+            }
+            for (_, scope, change) in &self.shared_views.pending {
+                if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
+                    if let Err(error) = view.apply(change) {
+                        self.status = Some(TransientNotice::error(error));
+                    }
+                }
+            }
+        }
         let owned = views
             .iter()
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
-        self.prepare_shared_aliases(&views, &owned);
+        let closures = self.closure_projection(&views);
+        self.prepare_shared_aliases(&views, &owned, &closures);
         // Root discovery is immutable during this projection. Keep only owned
         // paths across mutable view updates, and refresh the panes each view
         // changes before visiting the next one.
@@ -599,7 +617,7 @@ impl Cagents {
                 .collect::<HashMap<_, _>>()
         };
         let mut projected_scopes = Vec::new();
-        for mut view in views {
+        for view in views {
             if self.shared_views.blocked.contains(&view.scope) {
                 continue;
             }
@@ -607,13 +625,6 @@ impl Cagents {
                 || self.shared_views.seeding.contains(&view.scope)
             {
                 continue;
-            }
-            for (_, scope, change) in &self.shared_views.pending {
-                if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
-                    if let Err(error) = view.apply(change) {
-                        self.status = Some(TransientNotice::error(error));
-                    }
-                }
             }
             let current = match &view.scope {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
@@ -637,7 +648,7 @@ impl Cagents {
                         .collect()
                 }
             };
-            tasks.push(self.project_shared_view_with_cards(&view, &owned, current));
+            tasks.push(self.project_shared_view_with_cards(&view, &owned, current, &closures));
             if !view.panes.is_empty() {
                 let roots = self.indexed_worktree_roots();
                 for pane in &view.panes {
@@ -689,7 +700,26 @@ impl Cagents {
         self.local_closure_observation(id).unwrap_or(true)
     }
 
-    fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
+    /// One UI reconciliation uses one decision per identity across alias
+    /// preparation and final projection. A worker invalidation schedules the
+    /// next reconciliation, rather than leaving this one half detached. The
+    /// eventual ownership transfer still rechecks actual SQL authority.
+    fn closure_projection(&self, views: &[View]) -> HashMap<CardId, Option<bool>> {
+        let mut decisions = HashMap::new();
+        for pane in views.iter().flat_map(|view| &view.panes) {
+            decisions
+                .entry(pane.id)
+                .or_insert_with(|| self.local_closure_observation(pane.id));
+        }
+        decisions
+    }
+
+    fn prepare_shared_aliases(
+        &mut self,
+        views: &[View],
+        owned: &HashSet<CardId>,
+        closures: &HashMap<CardId, Option<bool>>,
+    ) {
         self.shared_views.blocked.clear();
         // Decide which whole views can project before retiring any local alias.
         // Otherwise a later blocked pane could leave an earlier adoption without
@@ -703,7 +733,7 @@ impl Cagents {
         }
         for view in views {
             for shared in &view.panes {
-                let closure = self.local_closure_observation(shared.id);
+                let closure = closures.get(&shared.id).copied().flatten();
                 if closure == Some(true) {
                     continue;
                 }
@@ -843,7 +873,8 @@ impl Cagents {
 
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
         let current = self.local_view_cards(&view.scope);
-        self.project_shared_view_with_cards(view, owned, current)
+        let closures = self.closure_projection(std::slice::from_ref(view));
+        self.project_shared_view_with_cards(view, owned, current, &closures)
     }
 
     fn project_shared_view_with_cards(
@@ -851,12 +882,13 @@ impl Cagents {
         view: &View,
         owned: &HashSet<CardId>,
         current: Vec<CardId>,
+        closures: &HashMap<CardId, Option<bool>>,
     ) -> Task<Message> {
         // A pending requested answer cannot prove removal. Capture only
         // proven closure decisions before any strip/runtime/alias effects.
         let mut closed = HashSet::new();
         for pane in &view.panes {
-            match self.local_closure_observation(pane.id) {
+            match closures.get(&pane.id).copied().flatten() {
                 None => return Task::none(),
                 Some(true) => {
                     closed.insert(pane.id);
@@ -1858,6 +1890,107 @@ mod tests {
                 && restoration < Duration::from_millis(100)
                 && alias < Duration::from_millis(100),
             "native model callbacks waited on contended autosave: normal={normal:?}, closed-owner restoration={restoration:?}, pending-alias={alias:?}"
+        );
+    }
+
+    #[test]
+    fn closed_projection_finishes_its_admitted_plan_across_an_unrelated_worker_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let mut canonical = app.durable.cards[0].clone();
+        let alias = canonical.id;
+        canonical.id = CardId::new();
+        let channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = Some(channel);
+        durable.channels.push(ProjectChannel {
+            id: channel,
+            project_id: ProjectId::new(),
+            title: "current view".into(),
+            title_source: Default::default(),
+            ordinal: 0,
+            shared: true,
+            cards: vec![alias],
+            focused: Some(alias),
+        });
+        let (runtime, _) = crate::session::SessionRuntime::open(
+            &path,
+            crate::model::BootId::new("projection-plan"),
+        )
+        .unwrap();
+        runtime.snapshot(Arc::clone(&app.durable));
+        runtime.flush(Duration::from_secs(5)).unwrap();
+        let store = runtime.operation_store();
+        app.session = Some(runtime);
+        let mut queued = (*app.durable).clone();
+        let mut unrelated = canonical.clone();
+        unrelated.id = CardId::new();
+        unrelated.kind = CardKind::Settings;
+        unrelated.existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("unrelated earlier close".into()),
+            },
+        };
+        queued.cards.push(unrelated);
+        let mut view = View::empty(Scope::Channel(channel));
+        view.panes.push(Pane::from_card(&canonical, None).unwrap());
+        app.workspace_model.views = vec![view.clone()];
+        app.shared_views.initialized.insert(view.scope.clone());
+        let owned = HashSet::from([canonical.id]);
+        let current = vec![alias];
+        let decisions = app.closure_projection(std::slice::from_ref(&view));
+        assert_eq!(decisions.get(&canonical.id), Some(&Some(false)));
+        app.prepare_shared_aliases(std::slice::from_ref(&view), &owned, &decisions);
+        assert!(
+            !app.card_state(alias).unwrap().existence.is_open(),
+            "actual alias phase reached its detach boundary"
+        );
+        assert!(app.card_state(canonical.id).is_none());
+        // Commit a real unrelated close on the existing worker precisely
+        // between alias effects and final projection. It invalidates the RAM
+        // answer; no fresh query is allowed to make this barrier disappear.
+        app.session.as_ref().unwrap().snapshot(Arc::new(queued));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            store.cached_closure(&crate::persistence::ClosureQuery::Card(canonical.id)),
+            None
+        );
+        drop(app.project_shared_view_with_cards(&view, &owned, current, &decisions));
+        assert!(
+            app.card_state(canonical.id).unwrap().existence.is_open(),
+            "one admitted plan cannot stop after detaching its alias"
+        );
+        assert!(app.workspace.card(canonical.id).is_some());
+        // This UI decision does not replace the actual SQL ownership/CAS
+        // checks: finish through the original ordered adoption transaction.
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            store
+                .load_card(canonical.id, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
+        );
+        assert!(
+            !store
+                .load_card(alias, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
         );
     }
 
