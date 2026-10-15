@@ -11,7 +11,7 @@
 
 use std::{
     fs, io,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -31,6 +31,7 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod navigation;
+mod schema;
 mod terminal_owners;
 mod views;
 
@@ -70,15 +71,7 @@ impl Registry {
 
     /// Opens or creates the registry at `path`.
     pub(crate) fn at(path: &Path) -> Result<Self, String> {
-        if let Some(parent) = path.parent() {
-            create_private_directory(parent)
-                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-        }
-        prepare_private_file(path)
-            .map_err(|error| format!("cannot prepare {}: {error}", path.display()))?;
-        let db = Connection::open(path).map_err(|error| error.to_string())?;
-        configure(&db)?;
-        migrate(&db)?;
+        let db = schema::open(path)?;
         Ok(Self {
             db,
             path: path.to_owned(),
@@ -208,7 +201,11 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
-        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        let transaction = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        schema::require_current(&transaction)?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
@@ -458,78 +455,14 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Creates the store file with a private mode, or re-asserts the mode of one
-/// that already exists.
-///
-/// The model names every repository the user has open, which is nobody else's
-/// business on a shared machine.
-fn prepare_private_file(path: &Path) -> io::Result<()> {
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(FILE_MODE)
-        .open(path)
-    {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// Applies the pragmas this store depends on, and verifies each one.
-///
-/// `foreign_keys` is load-bearing rather than hygienic: closing a project
-/// removes its channels through the cascade, so an unenforced foreign key would
-/// silently leave channels behind that no sidebar can reach. `FULL` makes
-/// execution acceptance durable before launching a child or submitting its
-/// prompt, including a power failure after the external side effect begins.
-fn configure(db: &Connection) -> Result<(), String> {
-    db.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|error| error.to_string())?;
-    db.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = FULL;",
-    )
-    .map_err(|error| error.to_string())?;
-    let foreign_keys: i64 = db
-        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if foreign_keys != 1 {
-        return Err("SQLite foreign key enforcement could not be enabled".into());
-    }
-    let journal_mode: String = db
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(format!(
-            "SQLite journal mode is `{journal_mode}`, but write-ahead logging is required"
-        ));
-    }
-    // 0 = OFF, 1 = NORMAL, 2 = FULL, 3 = EXTRA.
-    let synchronous: i64 = db
-        .pragma_query_value(None, "synchronous", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if synchronous != 2 {
-        return Err(format!(
-            "SQLite synchronous mode is {synchronous}, but FULL (2) is required"
-        ));
-    }
-    Ok(())
-}
-
-fn migrate(db: &Connection) -> Result<(), String> {
-    let version: u32 = db
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if version > SCHEMA_VERSION {
-        return Err(format!(
-            "workspace registry schema {version} is newer than supported schema {SCHEMA_VERSION}"
-        ));
-    }
-    db.execute_batch(
+/// Runs the published migration bodies inside the caller's writer transaction.
+/// The header is published only after every body and the final layout validate.
+fn migrate_through(
+    tx: &rusqlite::Transaction<'_>,
+    version: u32,
+    target: u32,
+) -> Result<(), String> {
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS projects(
              repository TEXT PRIMARY KEY,
              name TEXT NOT NULL,
@@ -558,7 +491,7 @@ fn migrate(db: &Connection) -> Result<(), String> {
          ) STRICT;",
     )
     .map_err(|error| error.to_string())?;
-    let has_kind: bool = db
+    let has_kind: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'kind')",
             [],
@@ -566,62 +499,64 @@ fn migrate(db: &Connection) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     if !has_kind {
-        db.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'));")
+        tx.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'));")
             .map_err(|error| error.to_string())?;
     }
     // The identity is minted here rather than in `at`, because this is the only
     // place that can tell a store being created from one being reopened: the
     // ignored insert is what makes minting happen exactly once, and a reopened
     // registry has to keep the identity every window recorded against it.
-    db.execute(
+    tx.execute(
         "INSERT OR IGNORE INTO metadata(
              key, identity, sequence, next_project_ordinal, next_channel_ordinal
          ) VALUES (0, ?1, 0, 1, 1)",
         [Uuid::new_v4().to_string()],
     )
     .map_err(|error| error.to_string())?;
-    if version < 1 {
-        execution::migrate(db)?;
+    if version < 1 && target >= 1 {
+        execution::migrate(tx)?;
+        schema::migration_checkpoint(1)?;
     }
-    if version < 2 {
-        automations::migrate(db)?;
+    if version < 2 && target >= 2 {
+        automations::migrate(tx)?;
+        schema::migration_checkpoint(2)?;
     }
-    if version < 3 {
-        let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+    if version < 3 && target >= 3 {
+        tx.execute_batch("ALTER TABLE channels ADD COLUMN title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2);")
             .map_err(|error| error.to_string())?;
-        let current: u32 = tx
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        if current < 3 {
-            tx.execute_batch("ALTER TABLE channels ADD COLUMN title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2); PRAGMA user_version = 3;")
-                .map_err(|error| error.to_string())?;
-        }
-        tx.commit().map_err(|error| error.to_string())?;
+        schema::migration_checkpoint(3)?;
     }
-    if version < 4 {
-        lineage::migrate(db)?;
+    if version < 4 && target >= 4 {
+        lineage::migrate(tx)?;
+        schema::migration_checkpoint(4)?;
     }
-    if version < 5 {
-        mailbox::migrate(db)?;
+    if version < 5 && target >= 5 {
+        mailbox::migrate(tx)?;
+        schema::migration_checkpoint(5)?;
     }
-    if version < 6 {
-        terminal_owners::migrate(db)?;
+    if version < 6 && target >= 6 {
+        terminal_owners::migrate(tx)?;
+        schema::migration_checkpoint(6)?;
     }
-    if version < 8 {
-        views::migrate(db)?;
+    if version < 8 && target >= 8 {
+        views::migrate(tx)?;
+        schema::migration_checkpoint(8)?;
     }
-    if version < 9 {
-        db.pragma_update(None, "user_version", 9)
-            .map_err(|error| error.to_string())?;
+    // Version nine changed the wire contract without changing the layout.
+    if version < 9 && target >= 9 {
+        schema::migration_checkpoint(9)?;
     }
-    if version < 10 {
-        execution::migrate_names(db)?;
+    if version < 10 && target >= 10 {
+        execution::migrate_names(tx)?;
+        schema::migration_checkpoint(10)?;
     }
-    if version < 11 {
-        automation_proposals::migrate(db)?;
+    if version < 11 && target >= 11 {
+        automation_proposals::migrate(tx)?;
+        schema::migration_checkpoint(11)?;
     }
-    if version < 12 {
-        mailbox::migrate_attention(db)?;
+    if version < 12 && target >= 12 {
+        mailbox::migrate_attention(tx)?;
+        schema::migration_checkpoint(12)?;
     }
     Ok(())
 }
