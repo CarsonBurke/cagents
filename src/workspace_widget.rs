@@ -4505,15 +4505,13 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
     ) {
         let content_layout = Self::child_layout(layout);
 
+        // Reserve shortcut presses only. A release belongs to the raw child
+        // that admitted its physical press, even if the modifiers or focus
+        // changed meanwhile. Browser/terminal ownership guards reject an up
+        // whose down was intercepted here; current-chord matching cannot do so.
         match event {
             Event::Keyboard(
                 keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                }
-                | keyboard::Event::KeyReleased {
                     key,
                     physical_key,
                     modifiers,
@@ -5724,6 +5722,87 @@ mod tests {
             modifiers,
             text: None,
             repeat,
+        }
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    fn browser_surface_key_input(events: &[keyboard::Event]) -> Vec<crate::browser::BrowserInput> {
+        use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
+        use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let shortcuts = KeyboardShortcuts::default();
+        let handle = crate::browser::BrowserHandle::fixture();
+        let content = widget::Id::unique();
+        let browser = crate::browser::BrowserWidget::<()>::new(&handle)
+            .id(content.clone()).model_focused(true);
+        let surface = WorkspaceSurface::new(browser, &shortcuts, FocusedPane::Browser, 400., |_| ());
+        let mut ui = UserInterface::build(surface.into(), Size::new(400., 240.), Cache::new(), &mut renderer);
+        ui.operate(&renderer, &mut focusable::focus::<()>(content));
+        let events = events.iter().cloned().map(Event::Keyboard).collect::<Vec<_>>();
+        let _ = ui.update(&events, mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        // Inspect before destroying the native tree: a synthetic blur release
+        // must not conceal a missing physical up in this event batch.
+        handle.fixture_take_input()
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    fn key_release(key: keyboard::Key, code: keyboard::key::Code, modifiers: keyboard::Modifiers) -> keyboard::Event {
+        keyboard::Event::KeyReleased {
+            key: key.clone(), modified_key: key,
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard, modifiers,
+        }
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn browser_surface_preserves_owned_releases_after_modifier_changes() {
+        use crate::browser::{BrowserInput, ButtonState};
+        use keyboard::key::{Code, Named};
+        let ctrl = keyboard::Modifiers::CTRL;
+        let empty = keyboard::Modifiers::empty();
+        let cases = [
+            (vec![
+                key_press("r", Code::KeyR, empty, false),
+                named_key_press(Named::Control, Code::ControlLeft, ctrl, false),
+                key_release(keyboard::Key::Character("r".into()), Code::KeyR, ctrl),
+                key_release(keyboard::Key::Named(Named::Control), Code::ControlLeft, empty),
+            ], vec![("KeyR", ButtonState::Pressed), ("ControlLeft", ButtonState::Pressed),
+                ("KeyR", ButtonState::Released), ("ControlLeft", ButtonState::Released)]),
+            (vec![
+                named_key_press(Named::F5, Code::F5, keyboard::Modifiers::SHIFT, false),
+                key_release(keyboard::Key::Named(Named::Shift), Code::ShiftLeft, empty),
+                key_release(keyboard::Key::Named(Named::F5), Code::F5, empty),
+            ], vec![("F5", ButtonState::Pressed), ("F5", ButtonState::Released)]),
+            (vec![
+                key_press("r", Code::KeyR, empty, false),
+                named_key_press(Named::Control, Code::ControlLeft, ctrl, false),
+                key_press("r", Code::KeyR, ctrl, true),
+                key_release(keyboard::Key::Character("r".into()), Code::KeyR, ctrl),
+                key_release(keyboard::Key::Named(Named::Control), Code::ControlLeft, empty),
+            ], vec![("KeyR", ButtonState::Pressed), ("ControlLeft", ButtonState::Pressed),
+                ("KeyR", ButtonState::Released), ("ControlLeft", ButtonState::Released)]),
+        ];
+        for (events, expected) in cases {
+            let actual = browser_surface_key_input(&events).into_iter().filter_map(|input| match input {
+                BrowserInput::Key { code, state, .. } => Some((code, state)), _ => None,
+            }).collect::<Vec<_>>();
+            let expected = expected.into_iter().map(|(code, state)| (code.to_owned(), state)).collect::<Vec<_>>();
+            assert_eq!(actual, expected, "raw owned up must survive a newly matching global chord");
+        }
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn browser_surface_does_not_emit_an_up_for_a_global_shortcut_down() {
+        use keyboard::key::{Code, Named};
+        for events in [
+            vec![key_press("r", Code::KeyR, keyboard::Modifiers::CTRL, false),
+                key_release(keyboard::Key::Character("r".into()), Code::KeyR, keyboard::Modifiers::empty())],
+            vec![named_key_press(Named::F5, Code::F5, keyboard::Modifiers::empty(), false),
+                key_release(keyboard::Key::Named(Named::F5), Code::F5, keyboard::Modifiers::SHIFT)],
+        ] {
+            assert!(browser_surface_key_input(&events).is_empty(), "an intercepted down creates no raw release ownership");
         }
     }
 
