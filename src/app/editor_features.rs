@@ -549,13 +549,15 @@ impl Cagents {
     pub(super) fn open_lsp_source_tab(&mut self, mut view: RepositoryView, path: PathBuf, at: LspPosition, coordinates: LspCoordinates, external: bool) -> Task<Message> {
         if crate::device::is_remote() { return Task::none(); }
         let existing = self.cards.iter().find_map(|(card, runtime)| match runtime {
-            CardRuntime::Repository(runtime) if runtime.descriptor.worktree == view.worktree
+            CardRuntime::Repository(runtime) if self.workspace.card(*card).is_some()
+                && self.workspace.pending_close().is_none_or(|closing| closing.unmounting != *card)
+                && runtime.descriptor.worktree == view.worktree
                 && runtime.is_read_only_source() == external
                 && runtime.source_tab_path().as_ref() == Some(&path) => Some(*card),
             _ => None,
         });
         if let Some(card) = existing {
-            let update = self.workspace.focus(card).unwrap_or_else(|_| ViewportUpdate::unchanged());
+            let Ok(update) = self.workspace.focus(card) else { return Task::none(); };
             let focus = self.apply_viewport(update, true, false);
             if self.lsp_document(card).is_none() {
                 self.lsp_pending_jumps.insert(card, PendingLspJump { path, at, coordinates });
