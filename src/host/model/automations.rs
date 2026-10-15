@@ -4766,6 +4766,32 @@ mod tests {
     }
 
     #[test]
+    fn pending_automation_archive_reservations_do_not_invalidate_visible_discovery() {
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.session_mode = SessionMode::Fresh;
+        let (_, firing, agent) = completed_reusable_run(&mut registry, definition);
+        assert!(!agent.closed);
+        let before = registry.automation_archive_sequence().unwrap();
+        let snapshot = crate::chat::Snapshot {
+            session_id: Some("pending-visible-clock-thread".into()),
+            ..Default::default()
+        };
+        registry.archive_automation_conversation(firing.id, &agent, snapshot.clone()).unwrap();
+        assert_eq!(registry.automation_archive_sequence().unwrap(), before, "an open reservation is not a discoverable archived pane");
+        let current = registry.agent(agent.id).unwrap();
+        let mut changed = snapshot;
+        changed.title = Some("Later pending snapshot".into());
+        registry.archive_automation_conversation(firing.id, &current, changed).unwrap();
+        assert_eq!(registry.automation_archive_sequence().unwrap(), before, "pending report changes cannot require an archive watch edge before a close receipt");
+        let closed = registry.close_agent(&current.origin, current.id).unwrap();
+        let visible = registry.automation_archive_sequence().unwrap();
+        assert!(visible > before, "the closed-owner mutation publishes the first visible archive edge");
+        assert!(registry.archived_automation_conversation(closed.id).is_ok());
+        registry.db.execute("DELETE FROM automation_snapshots WHERE agent=?1", [closed.id.to_string()]).unwrap();
+        assert!(registry.automation_archive_sequence().unwrap() > visible, "retiring a visible archive still invalidates discovery");
+    }
+
+    #[test]
     fn scoped_discovery_keeps_old_offline_destinations_beyond_the_global_push_window() {
         use crate::agent_execution::Placement;
         let (mut registry, directory, mut definition) = fixture();

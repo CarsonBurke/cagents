@@ -3236,10 +3236,13 @@ fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart()
         .reconcile_automation_run(done.id, now())
         .unwrap()
         .unwrap();
+    let discovery_before = store.lock().unwrap().model().unwrap();
+    let saved_generation;
     {
         let gate = agent_gate(&host, agent.id);
         let _guard = gate.lock().unwrap();
         let snapshot = handle.snapshot(None).unwrap();
+        saved_generation = snapshot.generation;
         store
             .lock()
             .unwrap()
@@ -3263,6 +3266,28 @@ fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(
+        handle.close_if_idle(saved_generation).is_err(),
+        "a real late provider request invalidates the pre-save idle generation"
+    );
+    let page = store
+        .lock()
+        .unwrap()
+        .archived_automation_agents_page(
+            agent.placement.clone(),
+            discovery_before.identity,
+            discovery_before.automation_archive_sequence,
+            None,
+            64,
+            session.proof.clone().unwrap(),
+        )
+        .unwrap();
+    assert!(page.agents.is_empty(), "the refused close is still live");
+    assert_eq!(
+        store.lock().unwrap().automation_archive_sequence().unwrap(),
+        discovery_before.automation_archive_sequence,
+        "an unannounced pending report cannot invalidate existing page authority"
+    );
     let current = store.lock().unwrap().agent(agent.id).unwrap();
     assert!(
         store
@@ -3371,6 +3396,25 @@ fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart()
         },
     )
     .unwrap();
+    let discovery_after = store.lock().unwrap().model().unwrap();
+    assert!(
+        discovery_after.automation_archive_sequence
+            > discovery_before.automation_archive_sequence,
+        "the confirmed close publishes the first discoverable archive edge"
+    );
+    let page = store
+        .lock()
+        .unwrap()
+        .archived_automation_agents_page(
+            agent.placement.clone(),
+            discovery_after.identity,
+            discovery_after.automation_archive_sequence,
+            None,
+            64,
+            session.proof.clone().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(page.agents.iter().map(|agent| agent.id).collect::<Vec<_>>(), vec![agent.id]);
     let closed =
         crate::host::chat::process(&host, 17, ClientRequest::ChatAttach { session }).unwrap_err();
     assert!(
