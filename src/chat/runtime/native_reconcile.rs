@@ -38,7 +38,10 @@ pub(super) fn request(handle: &Handle) -> Result<(), String> {
                             .lock()
                             .unwrap_or_else(|p| p.into_inner()) = result
                             .err()
-                            .map(|error| crate::chat::protocol::preview(error.as_bytes(), 1024));
+                            .map(|mut error| {
+                                crate::agent_execution::truncate(&mut error, 1024);
+                                error
+                            });
                         handle.0.native_reconciling.store(false, Ordering::Release);
                     }
                 })

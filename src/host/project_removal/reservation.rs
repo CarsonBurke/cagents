@@ -420,7 +420,7 @@ pub(crate) fn ensure_available(
 
 pub(crate) fn ensure_agent_available(
     host: &SharedHost,
-    id: crate::agent_execution::AgentId,
+    id: crate::model::AgentId,
 ) -> Result<(), ProtocolError> {
     if scopes(host).is_empty() {
         return Ok(());
