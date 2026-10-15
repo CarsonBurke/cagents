@@ -2171,6 +2171,7 @@ pub struct SettingsSaved {
     generation: u64,
     path: PathBuf,
     settings: AppSettings,
+    captured_base: AppSettings,
     desired: AppSettings,
     reload_error: Option<String>,
     observed_at: Instant,
@@ -2214,17 +2215,17 @@ impl SettingsSave {
                 (Some(backup), settings::load_live_observed(&self.path))
             }
         } else {
-            // A captured edit may predate the previous queued write, but a
-            // newer observed baseline already incorporates it. Reusing the old
-            // desired snapshot in that case would turn external values into edits.
-            let base = lane
-                .as_ref()
-                .filter(|saved| {
-                    !saved.undo
-                        && self.base_observed_at.is_none_or(|at| at < saved.observed_at)
-                })
-                .map_or(&self.base, |saved| &saved.desired);
-            let saved = settings::save_merged_observed(&self.path, base, &self.desired)
+            // Earlier queued saves can contain edits this capture reverses.
+            // Rebase those edits onto this capture's observed external baseline;
+            // completion time alone cannot make an old snapshot authoritative.
+            let base = match lane.as_ref().filter(|saved| {
+                !saved.undo && self.base_observed_at.is_none_or(|at| at < saved.observed_at)
+            }) {
+                Some(saved) => settings::merge_live(&saved.captured_base, &saved.desired, &self.base)
+                    .map_err(|error| error.to_string())?,
+                None => self.base.clone(),
+            };
+            let saved = settings::save_merged_observed(&self.path, &base, &self.desired)
                 .map_err(|error| error.to_string())?;
             (
                 None,
@@ -2242,6 +2243,7 @@ impl SettingsSave {
             generation: self.generation,
             path: self.path,
             settings,
+            captured_base: self.base,
             desired: self.desired,
             reload_error,
             observed_at: observed.observed_at,
@@ -3178,7 +3180,6 @@ impl SettingsField {
             | Self::MaxHotCards
             | Self::HibernationDelayMs
             | Self::ManagedWorktreeDirectory
-            | Self::AutoDeleteMergedWorktrees
             | Self::WorktreeSort
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
@@ -17030,6 +17031,7 @@ impl Application for Cagents {
                             generation,
                             path,
                             settings: result.result.as_ref().unwrap_or(&fallback).clone(),
+                            captured_base: fallback.clone(),
                             desired: fallback,
                             reload_error: result.result.as_ref().err().cloned(),
                             observed_at: result.observed_at,
@@ -20479,6 +20481,39 @@ mod tests {
         drop(app.acknowledge_settings_save(saved));
         assert_eq!(app.settings.terminal_font_size, 18.0);
         assert_eq!(settings::load_live(&path).unwrap(), app.settings);
+    }
+
+    #[test]
+    fn settings_captured_before_earlier_save_completes_rebases_its_external_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 14.0;
+        app.save_settings_now().unwrap();
+        app.settings.show_status_bar = !app.settings.show_status_bar;
+        let first = app.capture_settings_save().unwrap();
+
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_size = 16.0;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        app.settings.terminal_padding = 12.0;
+        let second = app.capture_settings_save().unwrap();
+        let first_ack = first.run().unwrap();
+        assert_eq!(first_ack.settings.terminal_font_size, 16.0);
+
+        external = settings::load_live(&path).unwrap();
+        external.terminal_font_size = 18.0;
+        settings::save(&path, &external).unwrap();
+        let second_ack = second.run().unwrap();
+        assert_eq!(second_ack.settings.terminal_font_size, 18.0);
+        assert_eq!(second_ack.settings.terminal_padding, 12.0);
+        assert_eq!(second_ack.settings.show_status_bar, app.settings.show_status_bar);
+        drop(app.acknowledge_settings_save(second_ack));
+        drop(app.acknowledge_settings_save(first_ack));
+        assert_eq!(app.settings.terminal_font_size, 18.0);
     }
 
     #[test]
