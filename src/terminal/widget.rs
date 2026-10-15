@@ -1004,6 +1004,9 @@ struct WidgetState {
     input_owner: Option<TerminalSurface>,
     input_keys: Vec<keyboard::key::Physical>,
     native_window_focused: Option<bool>,
+    // A native click/focus operation can precede the App's logical selection
+    // message. This authority lasts only until the next widget diff.
+    activation_observed: bool,
     focused: bool,
     focus_requested: bool,
     pressed_buttons: u8,
@@ -1055,10 +1058,12 @@ impl operation::Focusable for WidgetState {
 
     fn focus(&mut self) {
         self.input_focused = true;
+        self.activation_observed = true;
     }
 
     fn unfocus(&mut self) {
         self.input_focused = false;
+        self.activation_observed = false;
         if let Some(surface) = &self.input_owner {
             self.a11y.borrow().barrier.orphan_keys(surface);
         }
@@ -1709,8 +1714,11 @@ impl<Message> TerminalWidget<Message> {
         self.window_focused = focused;
         self
     }
+    fn native_owner(&self, state: &WidgetState) -> bool {
+        self.model_focused || (state.activation_observed && self.on_focus.is_some())
+    }
     fn keyboard_focused(&self, state: &WidgetState) -> bool {
-        self.model_focused
+        self.native_owner(state)
             && state.input_focused
             && state.native_window_focused.unwrap_or(self.window_focused)
     }
@@ -2190,6 +2198,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
     fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<WidgetState>();
         state.native_window_focused = None;
+        state.activation_observed = false;
         if !self.model_focused {
             operation::Focusable::unfocus(state);
         }
@@ -2213,10 +2222,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        // The workspace owns which terminal receives raw input. Register the
-        // active surface so a handoff clears focus from buttons and text fields
-        // instead of focusing the tab button that would consume Enter.
-        if self.model_focused {
+        // Expose the native owner even when its click's logical selection
+        // message is still queued. The next diff resets that batch authority.
+        if self.native_owner(tree.state.downcast_ref::<WidgetState>()) {
             operation.focusable(
                 self.id.as_ref(),
                 layout.bounds(),
@@ -2274,6 +2282,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             Event::Mouse(mouse::Event::ButtonPressed(_)) => {
                 if cursor.is_over(Self::grid_bounds(bounds)) {
                     state.input_focused = true;
+                    state.activation_observed = true;
                 } else {
                     operation::Focusable::unfocus(state);
                 }
@@ -2301,7 +2310,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             columns: geometry.columns,
             offset: self.snapshot.scroll.offset,
             alternate: self.snapshot.scroll.alternate_screen,
-            focused: self.model_focused && window_focused,
+            focused: self.native_owner(state) && window_focused,
         };
         if let Some(due) =
             state
@@ -2336,6 +2345,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             state.preedit = None;
             state.review_control_pressed = true;
             state.input_focused = true;
+            state.activation_observed = true;
             self.publish_review(a11y.review, shell);
             shell.capture_event();
             shell.request_redraw();
@@ -2386,10 +2396,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         a11y.move_review(0, 0, false);
                         state.preedit = None;
                         state.input_focused = true;
+                        state.activation_observed = true;
                         self.publish_review(true, shell);
                     }
                     Action::Click if control => {
                         state.input_focused = true;
+                        state.activation_observed = true;
                         a11y.review = !a11y.review;
                         a11y.selection = None;
                         state.preedit = None;
@@ -2402,6 +2414,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         if let Some(ActionData::SetTextSelection(selection)) = &request.data {
                             if a11y.valid_selection(selection) {
                                 state.input_focused = true;
+                                state.activation_observed = true;
                                 a11y.review = true;
                                 a11y.selection = Some(selection.clone());
                                 state.preedit = None;

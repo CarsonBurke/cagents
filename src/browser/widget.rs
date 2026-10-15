@@ -25,6 +25,9 @@ struct WidgetState {
     shortcut_keys: Vec<keyboard::key::Physical>,
     keyboard_owner: Option<Arc<super::handle::CommandMailbox>>,
     input_focused: bool,
+    // Native activation can precede the App's logical focus message in one
+    // event batch. A fresh diff restores the authoritative view snapshot.
+    activation_observed: bool,
     // Native events run before their queued application messages. This
     // observation overrides the view snapshot only until the next diff.
     window_focus_observed: Option<bool>,
@@ -47,11 +50,13 @@ impl operation::Focusable for WidgetState {
     }
     fn focus(&mut self) {
         self.input_focused = true;
+        self.activation_observed = true;
         // A parked tree may have been blurred through its runtime handle.
         self.focused = false;
     }
     fn unfocus(&mut self) {
         self.input_focused = false;
+        self.activation_observed = false;
     }
 }
 
@@ -313,8 +318,11 @@ impl<'a, Message> BrowserWidget<'a, Message> {
         Ok(())
     }
 
+    fn native_owner(&self, state: &WidgetState) -> bool {
+        self.model_focused || (state.activation_observed && self.on_focus.is_some())
+    }
     fn owns_keyboard(&self, state: &WidgetState) -> bool {
-        self.model_focused
+        self.native_owner(state)
             && state.window_focus_observed.unwrap_or(self.window_focused)
             && state.input_focused
             && !self.obscured
@@ -402,6 +410,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         // supersedes the previous batch, including a parked tree that missed
         // a window event while absent from native traversal.
         state.window_focus_observed = None;
+        state.activation_observed = false;
+        if !self.model_focused { operation::Focusable::unfocus(state); }
         self.attach_keyboard(state);
         let _ = self.synchronize_presentation(state);
         let _ = self.synchronize_focus(state);
@@ -422,7 +432,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         _renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        if self.model_focused {
+        if self.native_owner(tree.state.downcast_ref::<WidgetState>()) {
             operation.focusable(
                 self.id.as_ref(),
                 layout.bounds(),
@@ -450,9 +460,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
             Event::Window(window::Event::Focused) => state.window_focus_observed = Some(true),
             Event::Mouse(mouse::Event::ButtonPressed(_)) => {
                 state.input_focused = cursor.is_over(bounds) && cursor.is_over(*viewport);
+                state.activation_observed = state.input_focused;
             }
             Event::Touch(touch::Event::FingerPressed { position, .. }) => {
                 state.input_focused = bounds.contains(*position) && viewport.contains(*position);
+                state.activation_observed = state.input_focused;
             }
             _ => {}
         }
@@ -1500,6 +1512,48 @@ mod tests {
         assert!(native.placement.source_x + native.placement.source_width <= native.buffer.width);
         assert!(native.placement.source_y + native.placement.source_height <= native.buffer.height);
     }
+    #[test]
+    fn inactive_browser_native_click_admits_first_key_and_ime_before_the_app_diff() {
+        use crate::input_trace::{InputTrace, KeyboardRegion, observe_keyboard_events};
+        use crate::workspace_widget::FocusedPane;
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use std::{cell::RefCell, rc::Rc};
+        use keyboard::key::Code;
+        let handle = BrowserHandle::fixture();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let trace = InputTrace::default();
+        let id = Id::unique();
+        let card = crate::model::CardId::new();
+        let samples = Rc::new(RefCell::new(Vec::new()));
+        let make_view = || {
+            let samples = samples.clone();
+            observe_keyboard_events(BrowserWidget::<()>::new(&handle).id(id.clone()).model_focused(false).on_focus(()), &trace, vec![(id.clone(), KeyboardRegion { pane: FocusedPane::Browser, card: Some(card) })], move |event, _, region, widget| {
+                if matches!(event, keyboard::Event::KeyPressed { .. }) { samples.borrow_mut().push((region, widget)); }
+            })
+        };
+        let mut ui = UserInterface::build(make_view(), Size::new(400.0, 240.0), Cache::new(), &mut renderer);
+        let release = |code, letter: &str| Event::Keyboard(keyboard::Event::KeyReleased { key: keyboard::Key::Character(letter.to_owned().into()), modified_key: keyboard::Key::Character(letter.to_owned().into()), physical_key: keyboard::key::Physical::Code(code), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty() });
+        let _ = ui.update(&[
+            Event::Mouse(mouse::Event::ButtonPressed(Button::Left)),
+            Event::Mouse(mouse::Event::ButtonReleased(Button::Left)),
+            press("a", Code::KeyA, keyboard::Modifiers::empty()), release(Code::KeyA, "a"),
+            Event::InputMethod(input_method::Event::Commit("native-ime".into())),
+        ], mouse::Cursor::Available(Point::new(80.0, 80.0)), &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        assert_eq!(samples.borrow().as_slice(), &[(KeyboardRegion { pane: FocusedPane::Browser, card: Some(card) }, Some(id.clone()))]);
+        let input = queued_input(&handle);
+        let keys: Vec<_> = input.iter().filter_map(|input| match input { BrowserInput::Key { state, code, .. } => Some((*state, code.as_str())), _ => None }).collect();
+        assert_eq!(keys, [(ButtonState::Pressed, "KeyA"), (ButtonState::Released, "KeyA")], "inspect before TreeDrop: {input:?}");
+        assert!(input.iter().any(|input| matches!(input, BrowserInput::Ime(ImeInput::Commit(text)) if text == "native-ime")), "{input:?}");
+        let cache = ui.into_cache();
+        samples.borrow_mut().clear();
+        let mut ui = UserInterface::build(make_view(), Size::new(400.0, 240.0), cache, &mut renderer);
+        let _ = ui.update(&[press("b", Code::KeyB, keyboard::Modifiers::empty()), Event::InputMethod(input_method::Event::Commit("must-not-send".into()))], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        let input = queued_input(&handle);
+        assert!(!input.iter().any(|input| matches!(input, BrowserInput::Key { .. } | BrowserInput::Ime(_))), "stale click authority survived a fresh inactive diff: {input:?}");
+        assert_eq!(samples.borrow()[0].0.card, None);
+    }
+
     #[test]
     fn actual_workspace_reservation_preserves_browser_owned_up_across_modifier_changes() {
         use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
