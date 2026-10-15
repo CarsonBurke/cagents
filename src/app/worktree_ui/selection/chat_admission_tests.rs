@@ -61,7 +61,10 @@ fn new_chat_same_scope_or_channel_launch_refusal_never_exposes_a_draft() {
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
         assert_eq!(app.active_workspace.as_deref(), Some(filing.path()));
         assert_eq!(app.durable.active_channel, selected);
-        assert!(app.status.is_some());
+        assert!(app.notices.entries.iter().any(|entry|
+            entry.notice.severity == NoticeSeverity::Warning
+                && entry.notice.message.contains("Cannot open this worktree yet")),
+            "the actual App update retains the refusal in its notice log");
         if channel { drop(fixture_protection(runtime.path(), filing.path(), true).unwrap()); }
         drop(refusal);
     }
