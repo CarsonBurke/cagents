@@ -14,7 +14,7 @@ use cagents::{
         StageRequest, UnstageRequest,
     },
     repository_widget::{
-        self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryFile,
+        self, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryFile,
         RepositoryRuntime,
     },
     settings::{self, AppSettings, AppTheme},
@@ -8306,6 +8306,7 @@ mod tests {
 
     #[test]
     fn standalone_captured_paste_receipt_retains_source_and_selection_through_host_dispatch() {
+        use cagents::repository_widget::ClipboardOp;
         use cosmic::iced::futures::StreamExt;
         for change in 0..4 {
             let directory = git_fixture();
