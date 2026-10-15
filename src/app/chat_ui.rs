@@ -4070,9 +4070,8 @@ impl Cagents {
     /// existing unsent draft stays ahead of the context; sending remains explicit.
     pub(super) fn prepare_pr_agent_context(&mut self, worktree: PathBuf, prompt: String) -> Task<Message> {
         let candidates = self.durable.cards.iter().enumerate().filter(|(_, card)| {
-            card.existence.is_open() && matches!(&card.kind, CardKind::Chat(session)
-                if self.card_worktree(card) == Some(worktree.as_path())
-                    || session.launch.recipe.working_directory == worktree)
+            card.existence.is_open() && matches!(&card.kind, CardKind::Chat(_))
+                && self.context_card_worktree(card).is_some_and(|owner| self.context_paths_match(&owner, &worktree))
         });
         // Durable creation order remains available for cold/hidden chats too.
         // A hydrated older transcript must not outrank a newer draft merely
@@ -12481,6 +12480,22 @@ mod tests {
         assert_eq!(app.workspace.focused(),Some(second));
         assert_eq!(chat_runtime(&app,second).composer.text(),"Latest draft\n\nReview context");
         assert!(!app.chat_start_pending(second));
+    }
+
+    #[test]
+    fn pr_context_selection_does_not_reuse_a_chat_filed_elsewhere_with_the_same_cwd() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let elsewhere = draft_chat(&mut app);
+        write(&mut app, elsewhere, "Keep the other workspace draft");
+        app.durable_mut().card_scopes.insert(elsewhere, "/filed-elsewhere".into());
+        drop(app.prepare_pr_agent_context(PathBuf::from(FIXTURE_DIRECTORY), "Target workspace context".into()));
+        let target = app.workspace.focused().unwrap();
+        assert_ne!(target, elsewhere);
+        assert_eq!(chat_runtime(&app, target).composer.text(), "Target workspace context");
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts[&elsewhere], "Keep the other workspace draft");
+        assert_eq!(saved.card_scopes[&target], PathBuf::from(FIXTURE_DIRECTORY));
+        assert!(!app.chat_start_pending(target));
     }
 
     #[test]
