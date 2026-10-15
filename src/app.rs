@@ -7748,24 +7748,53 @@ impl Cagents {
     }
 
     fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
-        let tasks: Vec<_> = cards.into_iter().map(|card| {
-            self.sidebar_state.acknowledge_agent_update(card);
-            self.acknowledge_card_notices(card);
-            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
-                && let Err(error) = handle.acknowledge_updates() {
-                self.status = Some(TransientNotice::error(format!("Could not acknowledge terminal output: {error}")));
-            }
-            self.acknowledge_chat_updates(card)
-        }).collect();
+        let tasks: Vec<_> = cards
+            .into_iter()
+            .map(|card| {
+                if (self.sidebar_state.has_card_update(card)
+                    || self.sidebar_state.card_attention(card).is_some_and(sidebar::AttentionState::needs_attention))
+                    && let Some(channel) = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card))
+                {
+                    self.sidebar_state.retain_attention_channel(channel.id);
+                }
+                self.sidebar_state.acknowledge_agent_update(card);
+                self.acknowledge_card_notices(card);
+                if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+                    && let Err(error) = handle.acknowledge_updates()
+                {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not acknowledge terminal output: {error}"
+                    )));
+                }
+                self.acknowledge_chat_updates(card)
+            })
+            .collect();
         self.refresh_sidebar_channels();
         self.persist();
         Task::batch(tasks)
     }
 
     fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
-        if self.workspace_inputs_blocked() { return Task::none(); }
-        let Some(card) = self.card_state(id).filter(|card| card.existence.is_open()).cloned() else { return Task::none(); };
-        let channel = self.durable.channels.iter().find(|channel| channel.cards.contains(&id)).map(|channel| channel.id);
+        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() || self.update_prepared {
+            return Task::none();
+        }
+        let Some(card) = self
+            .card_state(id)
+            .filter(|card| card.existence.is_open())
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&id))
+            .map(|channel| channel.id);
         let scope = if let Some(channel) = channel {
             self.select_channel(channel)
         } else {
@@ -14672,7 +14701,6 @@ impl Application for Cagents {
                     SidebarAction::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
                     SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
                     SidebarAction::MarkChannelRead(id) => {
-                        self.sidebar_state.retain_attention_channel(id);
                         let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
                         self.mark_cards_read(cards)
                     }
@@ -25905,6 +25933,81 @@ mod tests {
         assert_eq!(app.durable.active_channel, Some(channels[0]));
         assert_eq!(app.workspace.focused(), Some(first));
         assert!(!app.sidebar_state.has_card_update(first));
+    }
+
+    #[test]
+    fn channel_attention_rolls_into_launch_worktree_and_bulk_reads_keep_other_worktrees_unread() {
+        use crate::agent::{Activity, ActivityState};
+        use crate::model::{ChannelId, ProjectChannel};
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let project = ProjectId::new();
+        let primary = WorktreeId::new();
+        let linked = WorktreeId::new();
+        let roots = [(primary, "/repo", "main"), (linked, "/repo/.worktrees/login", "feature/login")];
+        let mut cards = Vec::new();
+        for directory in ["/repo/.worktrees/login/src", "/repo/.worktrees/login/tests", "/repo/src"] {
+            let mut card = terminal_card_state();
+            let CardKind::Terminal(session) = &mut card.kind else { unreachable!() };
+            session.launch.working_directory = directory.into();
+            app.cards.insert(card.id, CardRuntime::Loading);
+            cards.push(card);
+        }
+        let ids: Vec<_> = cards.iter().map(|card| card.id).collect();
+        let channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend(cards);
+        durable.channels.push(ProjectChannel { title_source: Default::default(), id: channel, project_id: project, title: "Login".into(), ordinal: 0, shared: false, cards: ids[..2].to_vec(), focused: Some(ids[0]) });
+        app.observe_agent_activity_for_card(ids[0], Some(Activity { provider: Provider::Omp, state: ActivityState::Working }));
+        app.observe_agent_activity_for_card(ids[1], Some(Activity { provider: Provider::Omp, state: ActivityState::Waiting }));
+        assert!(app.agent_worktree(ids[0]).is_none());
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project, RepositoryId::new(), "Repository".into(), "/repo".into(),
+            roots.into_iter().map(|(id, path, branch)| SidebarWorktree::new(id, path.into(), Some(branch.into()), false, false, None, None, None)).collect(), Vec::new(),
+        ));
+        app.known_worktree_roots = roots.into_iter().map(|(_, path, _)| PathBuf::from(path)).collect();
+        assert!(app.reconcile_agent_attention_owners());
+        app.refresh_sidebar_channels();
+        assert_eq!(app.sidebar_state.agent_activity(project, linked), Some(ActivityState::Waiting));
+        assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert_eq!(row.worktree, Some((linked, "feature/login".into())));
+        assert!(row.tooltip.contains("feature/login"));
+        for id in &ids { app.observe_agent_update_for_card(*id); }
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(project, linked))));
+        assert!(!app.sidebar_state.has_card_update(ids[0]));
+        assert!(!app.sidebar_state.has_card_update(ids[1]));
+        assert!(app.sidebar_state.has_card_update(ids[2]));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(!app.sidebar_state.has_card_update(ids[2]));
+        assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
+    }
+
+    #[test]
+    fn attention_shortcut_does_not_leave_a_repository_with_an_active_save_or_acknowledge_target() {
+        use crate::model::{ChannelId, ProjectChannel};
+        let (mut app, first) = editing_repository_app();
+        app.context_inspector_open = false;
+        let other = terminal_card_state();
+        let target = other.id;
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Attention".into(), "/tmp".into(), Vec::new(), Vec::new()));
+        let channels = [ChannelId::new(), ChannelId::new()];
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(other);
+        for (index, card) in [first, target].into_iter().enumerate() {
+            durable.channels.push(ProjectChannel { title_source: Default::default(), id: channels[index], project_id: project, title: format!("Channel{index}"), ordinal: index as u32, shared: false, cards: vec![card], focused: Some(card) });
+        }
+        drop(app.select_channel(channels[0]));
+        app.sidebar_state.observe_card_update(target);
+        drop(app.update(Message::Repository(RepositoryAction::Save { card: first, overwrite: false })));
+        assert!(app.focused_repository_is_saving());
+        for command in [workspace_widget::GlobalShortcut::NextAttention, workspace_widget::GlobalShortcut::PreviousAttention] {
+            drop(app.update(Message::RunCommand(command)));
+            assert_eq!(app.workspace.focused(), Some(first));
+            assert_eq!(app.durable.active_channel, Some(channels[0]));
+            assert!(app.sidebar_state.has_card_update(target));
+        }
     }
 
     #[test]
