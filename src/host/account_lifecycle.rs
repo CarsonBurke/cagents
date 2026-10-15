@@ -405,14 +405,15 @@ impl Reservation {
                 .values()
                 .filter(|record| !record.handle.is_completed())
                 .map(|record| {
+                    let launch = record.execution_launch();
                     (
-                        record.session.launch.working_directory.clone(),
+                        launch.working_directory.clone(),
                         record
                             .execution_environment
                             .as_ref()
                             .map(|value| value.0.clone())
-                            .unwrap_or_else(|| record.session.launch.environment.clone()),
-                        crate::account::launch_credential_overrides(&record.session.launch),
+                            .unwrap_or_else(|| launch.environment.clone()),
+                        crate::account::launch_credential_overrides(launch),
                         record.execution_environment.is_none(),
                     )
                 })
@@ -921,11 +922,12 @@ pub(super) fn ensure_terminal(
     let selected = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.terminals.get(&id).map(|record| {
+            let launch = record.execution_launch();
             let environment = record
                 .execution_environment
                 .as_ref()
                 .map(|value| &value.0)
-                .unwrap_or(&record.session.launch.environment);
+                .unwrap_or(&launch.environment);
             let environment = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"]
                 .into_iter()
                 .filter_map(|name| {
@@ -935,9 +937,9 @@ pub(super) fn ensure_terminal(
                 })
                 .collect();
             (
-                record.session.launch.working_directory.clone(),
+                launch.working_directory.clone(),
                 environment,
-                crate::account::launch_credential_overrides(&record.session.launch),
+                crate::account::launch_credential_overrides(launch),
                 record.execution_environment.is_none(),
             )
         })

@@ -62,6 +62,8 @@ pub(crate) struct TerminalRecord {
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    /// The actual validated worker command, independent of its issued pane.
+    execution_recipe: Option<crate::model::LaunchRecipe>,
     options: TerminalSpawnOptions,
     upgrade_sources: Vec<TerminalSession>,
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
@@ -76,6 +78,12 @@ pub(crate) struct TerminalRecord {
 }
 
 impl TerminalRecord {
+    pub(super) fn execution_launch(&self) -> &crate::model::LaunchRecipe {
+        self.execution_recipe
+            .as_ref()
+            .unwrap_or(&self.session.launch)
+    }
+
     /// The title the provider last set, for the session directory.
     pub(super) fn conversation_title(&self) -> Option<&str> {
         self.conversation_title
@@ -1172,9 +1180,21 @@ impl HostState {
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
+        session: TerminalSession,
+        handle: TerminalHandle,
+        initially_visible: bool,
+    ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.finish_spawn_with_execution(client_id, session, handle, initially_visible, None, None)
+    }
+
+    fn finish_spawn_with_execution(
+        &mut self,
+        client_id: ClientId,
         mut session: TerminalSession,
         handle: TerminalHandle,
         initially_visible: bool,
+        execution_recipe: Option<crate::model::LaunchRecipe>,
+        execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     ) -> Result<TerminalDescriptor, ProtocolError> {
         let terminal_id = session.id;
         self.cancel_spawn(terminal_id);
@@ -1196,7 +1216,8 @@ impl HostState {
                 session,
                 handle,
                 options: TerminalSpawnOptions::default(),
-                execution_environment: None,
+                execution_environment,
+                execution_recipe,
                 upgrade_sources: Vec::new(),
                 upgrade_relaunches: Vec::new(),
                 running: true,
@@ -3862,8 +3883,14 @@ fn start_terminal_view_owned(
         let issued_hint = execution_recipe
             .as_ref()
             .map(|_| session.resume_hint.clone());
-        let mut descriptor =
-            state.finish_spawn(client_id, session, handle, options.initially_visible);
+        let mut descriptor = state.finish_spawn_with_execution(
+            client_id,
+            session,
+            handle,
+            options.initially_visible,
+            execution_recipe.clone(),
+            retained_environment,
+        );
         if let (Some(hint), Ok(descriptor)) = (issued_hint, &mut descriptor) {
             state
                 .terminals
@@ -3877,11 +3904,6 @@ fn start_terminal_view_owned(
             finish_pending_terminal(&mut state, terminal_id);
         }
         if descriptor.is_ok() {
-            state
-                .terminals
-                .get_mut(&terminal_id)
-                .expect("finished spawn")
-                .execution_environment = retained_environment;
             state
                 .terminals
                 .get_mut(&terminal_id)

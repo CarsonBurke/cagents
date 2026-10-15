@@ -664,6 +664,18 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
     if isolated_with_environment(&[("CODEX_API_KEY", "synthetic-inherited-fixture-key")]) {
         return;
     }
+    run_effective_holder(false);
+}
+
+#[test]
+fn failed_native_restore_keeps_carried_effective_account_scope() {
+    if isolated_with_environment(&[("CODEX_API_KEY", "synthetic-inherited-fixture-key")]) {
+        return;
+    }
+    run_effective_holder(true);
+}
+
+fn run_effective_holder(failed_native: bool) {
     let root = tempfile::Builder::new()
         .prefix("paired-holder-")
         .tempdir()
@@ -779,11 +791,23 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
             );
             break;
         }
+        let previous_proof = proof.clone();
         handle.carry(socket.clone()).unwrap();
         drop(handle);
         drop(lease.take());
         proof = make_proof(generation + 1);
         lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        if failed_native {
+            restore_missing_native_with_carried_scope(
+                &root,
+                &issued,
+                &effective,
+                &previous_proof,
+                &proof,
+                &original,
+            );
+            return;
+        }
         let (mut recovery, _) =
             crate::terminal::inspect_holder(&socket, &original, &proof).unwrap();
         assert_eq!(recovery.execution_recipe.as_ref(), Some(&effective));
@@ -825,4 +849,115 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
         )
         .unwrap();
     }
+}
+
+fn restore_missing_native_with_carried_scope(
+    root: &Path,
+    issued: &TerminalSession,
+    effective: &LaunchRecipe,
+    previous_proof: &HostSessionProof,
+    proof: &HostSessionProof,
+    original: &crate::terminal::holder::Record,
+) {
+    use crate::upgrade::handoff::{Carried, Chat, Checkpoint, Phase};
+    // The terminal holder and child are real. Encode a valid checkpoint whose
+    // native holder is deliberately unavailable to exercise the actual
+    // unattached-chat branch, without claiming prior native provider issuance.
+    let mut source = Session {
+        id: issued.id,
+        launch: Launch {
+            provider: Provider::Codex,
+            recipe: LaunchRecipe {
+                arguments: vec!["--remote".into(), "unix://".into()],
+                ..effective.clone()
+            },
+            session_id: None,
+        },
+        proof: Some(previous_proof.clone()),
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: NativeContinuity::ReconnectOnly,
+    };
+    assert!(source.claim_owned_codex_listener(root, previous_proof));
+    source.launch.session_id = Some(ID.into());
+    source.terminal = Some(issued.clone());
+    source.native_continuity = NativeContinuity::Durable {
+        provider_version: "0.157.1".into(),
+    };
+    let mut checkpoint = Checkpoint::new(
+        previous_proof.clone(),
+        Vec::new(),
+        vec![Carried {
+            source: issued.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: Default::default(),
+        }],
+        vec![Chat {
+            launch: source.launch.clone(),
+            source,
+            previous_sources: Vec::new(),
+        }],
+    );
+    checkpoint.phase = Phase::Ready;
+    checkpoint.preserve_carried = true;
+    let store_root = root.join("failed-native-upgrade");
+    let store = Store::open(&store_root).unwrap();
+    store.save(&checkpoint).unwrap();
+    let restored = Arc::new(HostLock::new(HostState::new(proof.clone())));
+    let holders = crate::terminal::holder::directory().unwrap();
+    let proc_root = root.join("empty-proc");
+    fs::create_dir(&proc_root).unwrap();
+    assert_eq!(
+        restore_upgrade_from(&restored, store, &proc_root, Some(&holders)).unwrap(),
+        vec![issued.id]
+    );
+    let handle = {
+        let state = restored.lock().unwrap();
+        assert!(state.chats.is_empty(), "native restore must remain refused");
+        let terminal = &state.terminals[&issued.id];
+        assert_eq!(terminal.session.launch, issued.launch);
+        assert_eq!(terminal.execution_launch(), effective);
+        assert_eq!(terminal.handle.holder_identity(), Some(original));
+        assert!(original.root.is_current());
+        terminal.handle.clone()
+    };
+    let unattached = Store::open(&store_root).unwrap().unattached().unwrap();
+    assert_eq!(unattached.len(), 1);
+    assert_eq!(unattached[0].summary.id, issued.id);
+    let selected = PathBuf::from(&effective.environment["CODEX_HOME"]);
+    let account = crate::account::Account::linked(Provider::Codex, uuid::Uuid::new_v4(), selected);
+    let account_store = crate::account::registry::Store::at(root.join("account-registry"));
+    let homes = crate::account::home::Homes::at(root.join("account-homes"));
+    let foreign = root.join("foreign-home");
+    fs::create_dir(&foreign).unwrap();
+    let unrelated = crate::host::AccountReservation::test_install(
+        &restored,
+        &[crate::account::Account::linked(
+            Provider::Codex,
+            uuid::Uuid::new_v4(),
+            foreign,
+        )],
+        account_store.clone(),
+        &homes,
+    )
+    .unwrap();
+    drop(unrelated);
+    assert!(
+        crate::host::AccountReservation::test_install(
+            &restored,
+            std::slice::from_ref(&account),
+            account_store.clone(),
+            &homes,
+        )
+        .is_err(),
+        "the live adopted worker still owns its effective account home"
+    );
+    handle.shutdown().unwrap();
+    assert!(!original.root.is_current());
+    let reserved =
+        crate::host::AccountReservation::test_install(&restored, &[account], account_store, &homes)
+            .unwrap();
+    assert!(super::super::account_lifecycle::ensure_terminal(&restored, issued.id).is_err());
+    drop(reserved);
 }
