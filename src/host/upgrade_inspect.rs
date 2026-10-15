@@ -12,7 +12,7 @@ use crate::{
 use std::{
     collections::HashSet,
     io::{self, Write},
-    path::{Path,PathBuf},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -26,7 +26,7 @@ pub(super) fn entry() -> Option<Result<(), String>> {
     {
         return None;
     }
-    Some((|| -> Result<(),String> {
+    Some((|| -> Result<(), String> {
         crate::instance::validate_stage_guard()
             .map_err(|_| "Source inspection requires the active authenticated update fence")?;
         if arguments.len() != 2 {
@@ -126,16 +126,22 @@ fn inspect(request: Request) -> Result<(), String> {
         saved.extend(
             crate::persistence::read_open_migration_sessions(&path)
                 .map_err(|_| "A saved source pane is unreadable; source windows remain usable")?
-                .into_iter().map(|(card,kind)|(path.clone(),card,kind)),
+                .into_iter()
+                .map(|(card, kind)| (path.clone(), card, kind)),
         );
         if saved.len() > 4096 {
             return Err("Saved pane inventory exceeds the migration inspection limit".into());
         }
     }
-    let registry=crate::instance::project_dirs().ok_or("Cannot locate the source archive registry")?
-        .data_dir().join("workspace-model.sqlite3");
-    let saved=require_live_panes(saved,deadline,|database,card,kind| {
-        crate::automations::archive::inspect_completed_automation_pane(database,&registry,card,kind).map(|receipt|receipt.is_some())
+    let registry = crate::instance::project_dirs()
+        .ok_or("Cannot locate the source archive registry")?
+        .data_dir()
+        .join("workspace-model.sqlite3");
+    let saved = require_live_panes(saved, deadline, |database, card, kind| {
+        crate::automations::archive::inspect_completed_automation_pane(
+            database, &registry, card, kind,
+        )
+        .map(|receipt| receipt.is_some())
     })?;
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
         CardKind::Chat(session) => session.is_unstarted(),
@@ -187,8 +193,13 @@ fn inspect(request: Request) -> Result<(), String> {
     Ok(())
 }
 
-fn check_deadline(deadline:Instant)->Result<(),String>{
-    if Instant::now()>=deadline {return Err("Source pane inspection exceeded its bounded budget; source windows remain usable".into());}
+fn check_deadline(deadline: Instant) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err(
+            "Source pane inspection exceeded its bounded budget; source windows remain usable"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -196,18 +207,21 @@ fn check_deadline(deadline:Instant)->Result<(),String>{
 /// require a daemon or authorize starting/attaching any provider. An absent
 /// binding keeps the ordinary exact-live-owner requirements in force.
 fn require_live_panes(
-    saved:Vec<(PathBuf,CardId,CardKind)>,deadline:Instant,
-    mut archive:impl FnMut(&Path,CardId,&CardKind)->Result<bool,String>,
-)->Result<Vec<(CardId,CardKind)>,String>{
-    let mut live=Vec::new();
-    for (database,card,kind) in saved {
+    saved: Vec<(PathBuf, CardId, CardKind)>,
+    deadline: Instant,
+    mut archive: impl FnMut(&Path, CardId, &CardKind) -> Result<bool, String>,
+) -> Result<Vec<(CardId, CardKind)>, String> {
+    let mut live = Vec::new();
+    for (database, card, kind) in saved {
         check_deadline(deadline)?;
-        if matches!(&kind,CardKind::Chat(_)|CardKind::Terminal(_)) {
+        if matches!(&kind, CardKind::Chat(_) | CardKind::Terminal(_)) {
             let qualified=archive(&database,card,&kind).map_err(|_|format!("Saved archive pane {card} has no qualified readable history. Recover or close that pane before updating; source windows remain usable"))?;
             check_deadline(deadline)?;
-            if qualified {continue;}
+            if qualified {
+                continue;
+            }
         }
-        live.push((card,kind));
+        live.push((card, kind));
     }
     Ok(live)
 }
@@ -226,13 +240,24 @@ fn terminal_ended(session: &crate::model::TerminalSession) -> bool {
 // A foreground process hint is an observation of the retained PTY, not an
 // issued launch or a choice of provider/thread to resume. Match the exact
 // complete proof and all immutable fields across Live/Detached presentation.
-fn issued_terminal_matches(authoritative:&crate::model::TerminalSession,saved:&crate::model::TerminalSession)->bool{
-    let Some(proof)=authoritative.continuity.live_proof().filter(|proof|proof.is_complete()) else{return false;};
-    if saved.continuity.live_proof().as_ref()!=Some(&proof){return false;}
-    let mut normalized=authoritative.clone();
-    normalized.continuity=saved.continuity.clone();
-    normalized.resume_hint=saved.resume_hint.clone();
-    normalized==*saved
+fn issued_terminal_matches(
+    authoritative: &crate::model::TerminalSession,
+    saved: &crate::model::TerminalSession,
+) -> bool {
+    let Some(proof) = authoritative
+        .continuity
+        .live_proof()
+        .filter(|proof| proof.is_complete())
+    else {
+        return false;
+    };
+    if saved.continuity.live_proof().as_ref() != Some(&proof) {
+        return false;
+    }
+    let mut normalized = authoritative.clone();
+    normalized.continuity = saved.continuity.clone();
+    normalized.resume_hint = saved.resume_hint.clone();
+    normalized == *saved
 }
 
 fn qualify_terminal(
@@ -252,9 +277,13 @@ fn qualify_terminal(
                 return false;
             }
             if &old == proof {
-                issued_terminal_matches(&terminal.session,saved)
+                issued_terminal_matches(&terminal.session, saved)
             } else {
-                old.boot_id == proof.boot_id && terminal.upgrade_sources.iter().any(|source|issued_terminal_matches(source,saved))
+                old.boot_id == proof.boot_id
+                    && terminal
+                        .upgrade_sources
+                        .iter()
+                        .any(|source| issued_terminal_matches(source, saved))
             }
         })
         .count();
@@ -275,23 +304,108 @@ mod tests {
 
     #[test]
     fn archived_panes_require_typed_history_and_never_hide_unclaimed_live_panes() {
-        let archived=CardId::new();let live=CardId::new();let mut draft=session();draft.proof=None;draft.launch.session_id=None;
-        let draft_id=CardId::new();
-        let saved=vec![(PathBuf::from("/window/a"),archived,CardKind::Chat(session())),(PathBuf::from("/window/b"),live,CardKind::Chat(session())),(PathBuf::from("/window/c"),draft_id,CardKind::Chat(draft))];
-        let mut inspected=Vec::new();
-        let remaining=require_live_panes(saved,Instant::now()+Duration::from_secs(1),|database,card,_|{inspected.push(database.to_owned());Ok(card==archived)}).unwrap();
-        assert_eq!(remaining.iter().map(|(card,_)|*card).collect::<Vec<_>>(),vec![live,draft_id]);
-        assert_eq!(inspected,vec![PathBuf::from("/window/a"),PathBuf::from("/window/b"),PathBuf::from("/window/c")]);
-        let saved=vec![(PathBuf::from("/window"),archived,CardKind::Chat(session()))];
-        let error=require_live_panes(saved.clone(),Instant::now()+Duration::from_secs(1),|_,_,_|Err("private archive payload must not leak".into())).unwrap_err();
-        assert!(error.contains(&archived.to_string()));assert!(!error.contains("private archive payload"));
-        assert!(require_live_panes(saved.clone(),Instant::now(),|_,_,_|panic!("expired inspection must not open another database")).is_err());
-        assert!(require_live_panes(saved,Instant::now()+Duration::from_secs(1),|_,_,_|Ok(true)).unwrap().is_empty(),"archives-only saved panes require no live source");
-        let terminal=crate::terminal_ipc::TerminalDescriptor::relaunchable(crate::model::TerminalId::new(),session().launch.recipe,None).session;
-        let terminal=CardKind::Terminal(terminal);
-        let saved=vec![(PathBuf::from("/closed-terminal"),archived,terminal.clone())];
-        assert!(require_live_panes(saved.clone(),Instant::now()+Duration::from_secs(1),|_,card,kind| {assert_eq!(card,archived);assert_eq!(kind,&terminal);Ok(true)}).unwrap().is_empty(),"cold terminal presentations require their typed archive receipt");
-        assert_eq!(require_live_panes(saved,Instant::now()+Duration::from_secs(1),|_,_,_|Ok(false)).unwrap(),vec![(archived,terminal)],"unclaimed ordinary terminals retain their live-owner contract");
+        let archived = CardId::new();
+        let live = CardId::new();
+        let mut draft = session();
+        draft.proof = None;
+        draft.launch.session_id = None;
+        let draft_id = CardId::new();
+        let saved = vec![
+            (
+                PathBuf::from("/window/a"),
+                archived,
+                CardKind::Chat(session()),
+            ),
+            (PathBuf::from("/window/b"), live, CardKind::Chat(session())),
+            (PathBuf::from("/window/c"), draft_id, CardKind::Chat(draft)),
+        ];
+        let mut inspected = Vec::new();
+        let remaining = require_live_panes(
+            saved,
+            Instant::now() + Duration::from_secs(1),
+            |database, card, _| {
+                inspected.push(database.to_owned());
+                Ok(card == archived)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            remaining.iter().map(|(card, _)| *card).collect::<Vec<_>>(),
+            vec![live, draft_id]
+        );
+        assert_eq!(
+            inspected,
+            vec![
+                PathBuf::from("/window/a"),
+                PathBuf::from("/window/b"),
+                PathBuf::from("/window/c")
+            ]
+        );
+        let saved = vec![(
+            PathBuf::from("/window"),
+            archived,
+            CardKind::Chat(session()),
+        )];
+        let error = require_live_panes(
+            saved.clone(),
+            Instant::now() + Duration::from_secs(1),
+            |_, _, _| Err("private archive payload must not leak".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains(&archived.to_string()));
+        assert!(!error.contains("private archive payload"));
+        assert!(
+            require_live_panes(saved.clone(), Instant::now(), |_, _, _| panic!(
+                "expired inspection must not open another database"
+            ))
+            .is_err()
+        );
+        assert!(
+            require_live_panes(
+                saved,
+                Instant::now() + Duration::from_secs(1),
+                |_, _, _| Ok(true)
+            )
+            .unwrap()
+            .is_empty(),
+            "archives-only saved panes require no live source"
+        );
+        let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            crate::model::TerminalId::new(),
+            session().launch.recipe,
+            None,
+        )
+        .session;
+        let terminal = CardKind::Terminal(terminal);
+        let saved = vec![(
+            PathBuf::from("/closed-terminal"),
+            archived,
+            terminal.clone(),
+        )];
+        assert!(
+            require_live_panes(
+                saved.clone(),
+                Instant::now() + Duration::from_secs(1),
+                |_, card, kind| {
+                    assert_eq!(card, archived);
+                    assert_eq!(kind, &terminal);
+                    Ok(true)
+                }
+            )
+            .unwrap()
+            .is_empty(),
+            "cold terminal presentations require their typed archive receipt"
+        );
+        assert_eq!(
+            require_live_panes(
+                saved,
+                Instant::now() + Duration::from_secs(1),
+                |_, _, _| Ok(false)
+            )
+            .unwrap(),
+            vec![(archived, terminal)],
+            "unclaimed ordinary terminals retain their live-owner contract"
+        );
     }
 
     pub(super) fn session() -> Session {
@@ -440,22 +554,39 @@ mod tests {
         };
         let saved = descriptor.session.clone();
         qualify_terminal(&saved, &[descriptor.clone().into()], &proof).unwrap();
-        descriptor.session.resume_hint=Some("observed-agent-inside-original-shell".into());
+        descriptor.session.resume_hint = Some("observed-agent-inside-original-shell".into());
         qualify_terminal(&saved, &[descriptor.clone().into()], &proof).unwrap();
-        let mut detached=saved.clone();detached.continuity=crate::model::TerminalContinuity::DetachedSameBoot{
-            host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone(),
+        let mut detached = saved.clone();
+        detached.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
         };
-        qualify_terminal(&detached,&[descriptor.clone().into()],&proof).unwrap();
+        qualify_terminal(&detached, &[descriptor.clone().into()], &proof).unwrap();
         for field in 0..5 {
-            let mut changed=descriptor.clone();
-            match field{
-                0=>changed.session.launch.working_directory="/another".into(),
-                1=>{changed.session.launch.unset_environment.insert("ACCOUNT".into());},
-                2=>changed.session.transcript_path=Some("/another/transcript".into()),
-                3=>changed.session.id=crate::model::TerminalId::new(),
-                _=>changed.session.owned_codex_listener=Some(crate::chat::OwnedCodexListener{socket:"/another/socket".into(),allocator:proof.clone()}),
+            let mut changed = descriptor.clone();
+            match field {
+                0 => changed.session.launch.working_directory = "/another".into(),
+                1 => {
+                    changed
+                        .session
+                        .launch
+                        .unset_environment
+                        .insert("ACCOUNT".into());
+                }
+                2 => changed.session.transcript_path = Some("/another/transcript".into()),
+                3 => changed.session.id = crate::model::TerminalId::new(),
+                _ => {
+                    changed.session.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+                        socket: "/another/socket".into(),
+                        allocator: proof.clone(),
+                    })
+                }
             }
-            assert!(qualify_terminal(&saved,&[changed.into()],&proof).is_err(),"immutable field {field}");
+            assert!(
+                qualify_terminal(&saved, &[changed.into()], &proof).is_err(),
+                "immutable field {field}"
+            );
         }
         descriptor
             .session
@@ -474,8 +605,11 @@ mod tests {
         assert!(qualify_terminal(&saved, &[descriptor.clone().into()], &replacement).is_err());
         descriptor.upgrade_sources.push(detached);
         qualify_terminal(&saved, &[descriptor.clone().into()], &replacement).unwrap();
-        descriptor.upgrade_sources[0].launch.environment.insert("ACCOUNT".into(),"another".into());
-        assert!(qualify_terminal(&saved,&[descriptor.into()],&replacement).is_err());
+        descriptor.upgrade_sources[0]
+            .launch
+            .environment
+            .insert("ACCOUNT".into(), "another".into());
+        assert!(qualify_terminal(&saved, &[descriptor.into()], &replacement).is_err());
     }
 }
 

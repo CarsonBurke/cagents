@@ -418,9 +418,7 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     // Discovery is upgrade-specific and bounded across the entire handshake.
     // Do not run the ordinary per-read version probe before this adapter.
     let (source_protocol, source_proof) = source::inspect_identity(None)?;
-    if served == layout.version_root
-        && source_protocol == crate::terminal_ipc::PROTOCOL_VERSION
-    {
+    if served == layout.version_root && source_protocol == crate::terminal_ipc::PROTOCOL_VERSION {
         return Err(invalid("the installed application is already running"));
     }
     if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {

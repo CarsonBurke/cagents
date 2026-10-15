@@ -2313,9 +2313,13 @@ pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, C
             continue;
         }
         let card = parse_id("migration card", &card)?;
-        let session=read_migration_session_at(&transaction,card,&kind,content.as_deref())?;
+        let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
         sessions.push((card, session));
-        if sessions.len()>4096 {return Err(StoreError::InvalidState("Saved pane inventory exceeds the migration inspection limit".into()));}
+        if sessions.len() > 4096 {
+            return Err(StoreError::InvalidState(
+                "Saved pane inventory exceeds the migration inspection limit".into(),
+            ));
+        }
     }
     Ok(sessions)
 }
@@ -2325,11 +2329,14 @@ pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, C
 /// The caller must read and validate this card's kind/existence in that same
 /// transaction; this helper never opens a store or changes its schema/state.
 pub(crate) fn read_migration_session_at(
-    connection:&Connection,card:CardId,kind:&str,content:Option<&str>,
-)->Result<CardKind>{
-    const MAX_DESCRIPTOR_BYTES:usize=4*1024*1024;
+    connection: &Connection,
+    card: CardId,
+    kind: &str,
+    content: Option<&str>,
+) -> Result<CardKind> {
+    const MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
     match kind {
-        "terminal"=>{
+        "terminal" => {
             // Check lengths in SQLite before allocating any descriptor fields
             // in Rust, including the nullable provenance and transcript path.
             let bounded:Option<bool>=connection.query_row(
@@ -2339,11 +2346,29 @@ pub(crate) fn read_migration_session_at(
                     + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
                  FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1",
                 params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
-            if bounded!=Some(true) {return Err(StoreError::corrupt_row(format!("migration terminal card {card}"),"missing or oversized immutable descriptor"));}
-            load_terminal_record(connection,card).map(CardKind::Terminal)
-        },
-        "chat"=>from_json("migration chat",content.filter(|value|value.len()<=MAX_DESCRIPTOR_BYTES).ok_or_else(||StoreError::corrupt_row(format!("migration chat card {card}"),"missing or oversized session descriptor"))?).map(CardKind::Chat),
-        _=>Err(StoreError::InvalidState("Migration inspection requires a saved native or terminal pane".into())),
+            if bounded != Some(true) {
+                return Err(StoreError::corrupt_row(
+                    format!("migration terminal card {card}"),
+                    "missing or oversized immutable descriptor",
+                ));
+            }
+            load_terminal_record(connection, card).map(CardKind::Terminal)
+        }
+        "chat" => from_json(
+            "migration chat",
+            content
+                .filter(|value| value.len() <= MAX_DESCRIPTOR_BYTES)
+                .ok_or_else(|| {
+                    StoreError::corrupt_row(
+                        format!("migration chat card {card}"),
+                        "missing or oversized session descriptor",
+                    )
+                })?,
+        )
+        .map(CardKind::Chat),
+        _ => Err(StoreError::InvalidState(
+            "Migration inspection requires a saved native or terminal pane".into(),
+        )),
     }
 }
 
@@ -6369,27 +6394,78 @@ mod tests {
 
     #[test]
     fn migration_session_sql_bounds_all_normalized_fields_before_decoding() {
-        let directory=tempdir().unwrap();let path=directory.path().join("bounded-source.sqlite3");
-        let store=StateStore::open(&path,boot("chat-boot")).unwrap();
-        let workspace=workspace_with_terminal(&boot("chat-boot"));let card=workspace.cards[0].id;
-        SaveLane::default().save(&store,&workspace).unwrap();drop(store);
-        let connection=Connection::open(&path).unwrap();
-        assert!(connection.query_row("SELECT content_json IS NULL FROM cards WHERE card_id=?1",[card.to_string()],|row|row.get::<_,bool>(0)).unwrap());
-        assert_eq!(read_migration_session_at(&connection,card,"terminal",None).unwrap(),workspace.cards[0].kind);
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bounded-source.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let workspace = workspace_with_terminal(&boot("chat-boot"));
+        let card = workspace.cards[0].id;
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        assert!(
+            connection
+                .query_row(
+                    "SELECT content_json IS NULL FROM cards WHERE card_id=?1",
+                    [card.to_string()],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            read_migration_session_at(&connection, card, "terminal", None).unwrap(),
+            workspace.cards[0].kind
+        );
         // Non-ASCII forces a byte limit rather than a character-count limit.
-        let oversized="🦀".repeat(1024*1024+1);
-        for column in ["terminal_id","recipe_json","continuity_json","resume_hint","recovery_origin","owned_codex_listener","predecessor"] {
-            let original:Option<String>=connection.query_row(&format!("SELECT {column} FROM terminal_recipes WHERE card_id=?1"),[card.to_string()],|row|row.get(0)).unwrap();
-            connection.execute(&format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),params![card.to_string(),&oversized]).unwrap();
-            let error=read_migration_session_at(&connection,card,"terminal",None).unwrap_err().to_string();
-            assert!(error.contains("oversized immutable descriptor"),"field {column}: {error}");
-            connection.execute(&format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),params![card.to_string(),original]).unwrap();
+        let oversized = "🦀".repeat(1024 * 1024 + 1);
+        for column in [
+            "terminal_id",
+            "recipe_json",
+            "continuity_json",
+            "resume_hint",
+            "recovery_origin",
+            "owned_codex_listener",
+            "predecessor",
+        ] {
+            let original: Option<String> = connection
+                .query_row(
+                    &format!("SELECT {column} FROM terminal_recipes WHERE card_id=?1"),
+                    [card.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    &format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),
+                    params![card.to_string(), &oversized],
+                )
+                .unwrap();
+            let error = read_migration_session_at(&connection, card, "terminal", None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("oversized immutable descriptor"),
+                "field {column}: {error}"
+            );
+            connection
+                .execute(
+                    &format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),
+                    params![card.to_string(), original],
+                )
+                .unwrap();
         }
         let original:String=connection.query_row("SELECT path_json FROM transcript_metadata WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",[card.to_string()],|row|row.get(0)).unwrap();
         connection.execute("UPDATE transcript_metadata SET path_json=?2 WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",params![card.to_string(),&oversized]).unwrap();
-        assert!(read_migration_session_at(&connection,card,"terminal",None).unwrap_err().to_string().contains("oversized immutable descriptor"));
+        assert!(
+            read_migration_session_at(&connection, card, "terminal", None)
+                .unwrap_err()
+                .to_string()
+                .contains("oversized immutable descriptor")
+        );
         connection.execute("UPDATE transcript_metadata SET path_json=?2 WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",params![card.to_string(),original]).unwrap();
-        assert_eq!(read_migration_session_at(&connection,card,"terminal",None).unwrap(),workspace.cards[0].kind);
+        assert_eq!(
+            read_migration_session_at(&connection, card, "terminal", None).unwrap(),
+            workspace.cards[0].kind
+        );
     }
 
     #[test]
