@@ -228,6 +228,11 @@ impl Store {
         }
     }
     fn raw_remove(&mut self,ids:&[String])->Result<(),String>{
+        // These bytes have not entered SQLite. Flushing after publishing the
+        // tombstone would either revive removed data or repeatedly fail every
+        // later event against the same pending batch.
+        if self.pending_input.as_ref().is_some_and(|pending|ids.contains(&pending.0)){self.pending_input=None;}
+        if self.pending_text.as_ref().is_some_and(|pending|ids.contains(&pending.0)){self.pending_text=None;}
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;guard(&tx,self.raw_sources.nonce)?;
         for id in ids{
             let old:Option<(usize,usize)>=tx.query_row("SELECT cost,(SELECT count(*) FROM raw_tool_chunks c WHERE c.agent=s.agent AND c.id=s.id) FROM raw_tool_sources s WHERE agent='' AND id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
@@ -243,6 +248,7 @@ impl Store {
         Ok(())
     }
     fn raw_reset(&mut self)->Result<(),String>{
+        self.pending_input=None;self.pending_text=None;
         let nonce=uuid::Uuid::new_v4();let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;guard(&tx,self.raw_sources.nonce)?;
         tx.execute_batch("DELETE FROM raw_tool_chunks;DELETE FROM raw_tool_sources;DELETE FROM raw_tool_revoked;").map_err(err)?;
         tx.execute("UPDATE raw_source_schema SET nonce=?1,bytes=0,keys=0,chunks=0,disabled=NULL WHERE singleton=1",[nonce.to_string()]).map_err(err)?;tx.commit().map_err(err)?;
@@ -472,6 +478,7 @@ mod mixed_history_tests {
     fn a_revoked_history_member_never_discards_unrelated_history_or_recovery_bookkeeping(){
         for earlier in [true,false]{
             let mut store=Store::new().unwrap();captured(&mut store);store.apply(Event::ItemsRemoved{ids:vec!["private".into()]}).unwrap();
+            store.pending_earlier=Some((0,0));
             let items=vec![ordinary("private"),ordinary("valid")];let event=if earlier{Event::History{items,has_earlier:false}}else{store.apply(Event::LatestHistoryStarted).unwrap();Event::LatestHistory{items,has_earlier:false}};
             let out=store.apply(event).unwrap();assert!(out.iter().any(|event|matches!(event,Event::HistoryRecovered)));assert!(store.exists("valid").unwrap());assert!(!store.exists("private").unwrap());assert!(!store.provider_earlier);assert!(store.latest_boundary.is_none());assert!(store.pending_earlier.is_none());
         }
@@ -481,5 +488,22 @@ mod mixed_history_tests {
         let mut store=Store::new().unwrap();captured(&mut store);
         let out=store.apply(Event::LatestHistory{items:vec![ordinary("private"),ordinary("valid")],has_earlier:false}).unwrap();assert!(out.iter().any(|event|matches!(event,Event::HistoryRecovered)));assert!(store.exists("valid").unwrap());
         let metadata:Vec<u8>=store.db.query_row("SELECT metadata FROM items WHERE id='private'",[],|r|r.get(0)).unwrap();let item:Item=postcard::from_bytes(&metadata).unwrap();assert!(matches!(item.content,ItemContent::Changes{..}));assert!(store.raw_revoked(&key("","private")).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod pending_revocation_tests {
+    use super::*;
+    fn start(store:&mut Store,id:&str){store.apply(Event::RawToolCapture(RawToolCapture::Start{source:key("",id),name:"Write".into()})).unwrap();store.apply(Event::Item(Item{id:id.into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool{name:"Write".into(),input:String::new(),output:String::new(),status:crate::chat::ToolStatus::Running}})).unwrap();}
+    #[test]
+    fn removed_uncommitted_input_is_discarded_before_tombstone_without_poisoning_following_events(){
+        let mut store=Store::new().unwrap();start(&mut store,"private");store.apply(Event::InputDelta{id:"private".into(),offset:0,delta:"p".repeat(50)}).unwrap();assert!(store.pending_input.is_some());
+        store.apply(Event::ItemsRemoved{ids:vec!["private".into()]}).unwrap();assert!(store.pending_input.is_none());assert!(!store.exists("private").unwrap());assert!(store.raw_original(&key("","private")).is_err());assert_eq!(store.db.query_row("SELECT count(*) FROM chunks WHERE id='private'",[],|r|r.get::<_,usize>(0)).unwrap(),0);
+        store.apply(Event::Status{busy:false,detail:"normal following event".into()}).unwrap();
+    }
+    #[test]
+    fn removing_one_key_preserves_unrelated_pending_input(){
+        let mut store=Store::new().unwrap();start(&mut store,"removed");start(&mut store,"retained");store.apply(Event::InputDelta{id:"retained".into(),offset:0,delta:"r".repeat(50)}).unwrap();
+        store.apply(Event::ItemsRemoved{ids:vec!["removed".into()]}).unwrap();assert_eq!(store.db.query_row("SELECT len0 FROM items WHERE id='retained'",[],|r|r.get::<_,usize>(0)).unwrap(),50);assert_eq!(store.field("retained",0,0,50).unwrap(),vec![b'r';50]);
     }
 }
