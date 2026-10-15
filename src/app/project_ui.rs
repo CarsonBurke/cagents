@@ -91,6 +91,10 @@ impl State {
         self.remove_dialog.as_ref().map(|removal| removal.request)
     }
 
+    pub(super) fn removal_request_for(&self, project: ProjectId) -> Option<crate::model::OperationId> {
+        self.remove_dialog.as_ref().filter(|removal| removal.project == project).map(|removal| removal.request)
+    }
+
     pub fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.remove_dialog.is_some()
