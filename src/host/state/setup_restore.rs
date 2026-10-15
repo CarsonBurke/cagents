@@ -66,6 +66,10 @@ mod tests {
 
     fn isolated_fixture(name: &str) -> bool {
         use crate::process::ProcessExecutor;
+        // Libtest omits the crate prefix included by module_path!.
+        let name = name
+            .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+            .unwrap_or(name);
         const MARKER: &str = "CAGENTS_SETUP_RESTORE_FIXTURE";
         if std::env::var_os(MARKER).as_deref() == Some(std::ffi::OsStr::new(name)) {
             return false;
