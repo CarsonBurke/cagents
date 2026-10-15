@@ -157,6 +157,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         } else {
             &request.repository
         };
+        self.validate_pr_creation_tracking_at(request, consent, scope, settled, cancellation)
+    }
+
+    pub(super) fn validate_pr_creation_tracking_at(
+        &self,
+        request: &CreateWorktreeRequest,
+        consent: &PrWorktreeCreationConsent,
+        scope: &Path,
+        require_exact: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
         let read = |key: &str| {
             self.pr_values(scope, key, cancellation)
                 .map_err(ValidationError::InvalidBase)
@@ -166,7 +177,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let absent = remote.is_empty() && merge.is_empty();
         let correct =
             remote == [consent.remote.clone()] && merge == [consent.head_branch.full_ref()];
-        if (!consent.track && !absent) || (consent.track && !correct && (settled || !absent)) {
+        if (!consent.track && !absent) || (consent.track && !correct && (require_exact || !absent))
+        {
             return Err(ValidationError::InvalidBranch(
                 "The local branch tracking differs from the reviewed PR choice; existing configuration was preserved. Reconcile it explicitly before opening".into(),
             ).into());
@@ -210,6 +222,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .into());
         }
         if consent.track {
+            self.validate_pr_checkout_push_behavior(
+                scope,
+                &request.branch,
+                &consent.head_branch,
+                &consent.remote,
+                cancellation,
+            )
+            .map_err(ValidationError::InvalidBase)?;
             let push = self
                 .pr_values(
                     scope,

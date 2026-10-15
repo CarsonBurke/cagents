@@ -186,7 +186,65 @@ impl VerifiedPrCheckout {
     }
 }
 
+fn validate_push_behavior(
+    branch: &ValidatedBranchName,
+    head_branch: &ValidatedBranchName,
+    remote: &str,
+    push_remote: &[String],
+    push_default: &[String],
+    refspecs: &[String],
+    mode: &[String],
+) -> Result<(), String> {
+    if push_remote.len() > 1
+        || push_default.len() > 1
+        || push_remote
+            .first()
+            .or(push_default.first())
+            .is_some_and(|name| name != remote)
+    {
+        return Err(
+            "The branch's push destination differs from the PR remote; reconcile it explicitly"
+                .into(),
+        );
+    }
+    if !refspecs.is_empty() {
+        return Err("The PR remote has explicit push refspecs; reconcile its push behavior before opening a writable checkout".into());
+    }
+    if mode.len() > 1
+        || mode
+            .first()
+            .is_some_and(|mode| !matches!(mode.as_str(), "simple" | "upstream" | "current"))
+        || (branch != head_branch && mode.first().map(String::as_str) != Some("upstream"))
+    {
+        return Err("The configured push mode cannot safely publish this local branch to the PR head; reconcile it explicitly".into());
+    }
+    Ok(())
+}
+
 impl<E: ProcessExecutor> RepositoryService<E> {
+    pub(super) fn validate_pr_checkout_push_behavior(
+        &self,
+        worktree: &Path,
+        branch: &ValidatedBranchName,
+        head_branch: &ValidatedBranchName,
+        remote: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        validate_push_behavior(
+            branch,
+            head_branch,
+            remote,
+            &self.pr_values(
+                worktree,
+                &format!("branch.{}.pushremote", branch.as_str()),
+                cancellation,
+            )?,
+            &self.pr_values(worktree, "remote.pushdefault", cancellation)?,
+            &self.pr_values(worktree, &format!("remote.{remote}.push"), cancellation)?,
+            &self.pr_values(worktree, "push.default", cancellation)?,
+        )
+    }
+
     /// Execute a confirmed plan. Refusal and partial outcomes never authorize
     /// opening a checkout as if it matched the reviewed pull-request head.
     pub fn reconcile_existing_pr_checkout(
@@ -403,29 +461,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Err("This branch has no PR upstream. Configure its tracking explicitly before opening preserved local work; no commits or files were changed".into());
             }
             if request.tracking == PrCheckoutTracking::RemoteBranch {
-                if tracking.push_remote.len() > 1
-                    || tracking.push_default.len() > 1
-                    || tracking
-                        .push_remote
-                        .first()
-                        .or(tracking.push_default.first())
-                        .is_some_and(|name| name != &request.remote)
-                {
-                    return Err("The branch's push destination differs from the PR remote; reconcile it explicitly".into());
-                }
-                if !read(&format!("remote.{}.push", request.remote))?.is_empty() {
-                    return Err("The PR remote has explicit push refspecs; reconcile its push behavior before opening a writable checkout".into());
-                }
-                let push_mode = read("push.default")?;
-                if push_mode.len() > 1
-                    || push_mode.first().is_some_and(|mode| {
-                        !matches!(mode.as_str(), "simple" | "upstream" | "current")
-                    })
-                    || (request.branch != request.head_branch
-                        && push_mode.first().map(String::as_str) != Some("upstream"))
-                {
-                    return Err("The configured push mode cannot safely publish this local branch to the PR head; reconcile it explicitly".into());
-                }
+                validate_push_behavior(
+                    &request.branch,
+                    &request.head_branch,
+                    &request.remote,
+                    &tracking.push_remote,
+                    &tracking.push_default,
+                    &read(&format!("remote.{}.push", request.remote))?,
+                    &read("push.default")?,
+                )?;
             }
             if repair {
                 let storage = read("extensions.refstorage")?;

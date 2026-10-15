@@ -11334,6 +11334,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ValidationError::Io(format!("journal write failed: {error}"))
                 })?;
             if journal.request.track && !cancellation.is_cancelled() {
+                if let Some(consent) = &journal.pr_checkout {
+                    // Preserve an upstream selected by a post-checkout hook or
+                    // another admitted product action instead of overwriting it.
+                    self.reviewed_pr_creation_endpoint_at(
+                        &journal.request,
+                        consent,
+                        &journal.request.destination,
+                        cancellation,
+                    )?;
+                    self.validate_pr_creation_tracking_at(
+                        &journal.request,
+                        consent,
+                        &journal.request.destination,
+                        false,
+                        cancellation,
+                    )?;
+                }
                 let mut upstream = self.set_upstream_command(&journal.request)?;
                 upstream.inherited_lease = Some(lease.as_raw_fd());
                 self.run_checked(&upstream, cancellation)?;

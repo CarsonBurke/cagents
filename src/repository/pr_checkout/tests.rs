@@ -2243,6 +2243,9 @@ fn creation_request(
     track: bool,
 ) -> (CreateWorktreeRequest, PrWorktreeCreationConsent, StateStore) {
     let root = fixture.temporary.path().join("managed");
+    if track {
+        run_git(&fixture.root, &["config", "push.default", "upstream"]);
+    }
     let consent = PrWorktreeCreationConsent::new(
         GitHubRepoKey::new("fixture.invalid", None, "owner", "repo").unwrap(),
         ValidatedBranchName::parse("feature").unwrap(),
@@ -2819,4 +2822,159 @@ fn new_pr_creation_preserves_tracking_and_refuses_late_read_only_upstream() {
         "refs/heads/other"
     );
     assert!(!request.managed_root.exists());
+}
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_preserves_writable_upstream_selected_after_fetch_or_by_hook() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::new_pr_creation_preserves_writable_upstream_selected_after_fetch_or_by_hook"
+    )) {
+        return;
+    }
+    for phase in ["fetch", "post-checkout"] {
+        let fixture = Fixture::new(false);
+        let (request, consent, store) = creation_request(&fixture, true);
+        run_git(
+            &fixture.root,
+            &["branch", "reviewed", fixture.original.as_str()],
+        );
+        if phase == "post-checkout" {
+            let config = fixture.root.join(".git/config");
+            let quoted = format!("'{}'", config.to_str().unwrap().replace('\'', "'\\''"));
+            let hook = fixture.root.join(".git/hooks/post-checkout");
+            fs::write(&hook, format!("#!/bin/sh\ncat >> {quoted} <<'CAGENTS_UPSTREAM'\n[branch \"reviewed\"]\nremote = origin\nmerge = refs/heads/other\nCAGENTS_UPSTREAM\n")).unwrap();
+            fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = fixture.root.clone();
+        let mut changed = false;
+        fixture.intercept(move |command| {
+            assert!(
+                !command
+                    .arguments
+                    .iter()
+                    .any(|arg| arg.as_encoded_bytes().starts_with(b"--set-upstream-to=")),
+                "a differing user upstream must never be rewritten"
+            );
+            if phase == "fetch" && !changed && command.arguments.iter().any(|arg| arg == "fetch") {
+                changed = true;
+                run_git(&root, &["config", "branch.reviewed.remote", "origin"]);
+                run_git(
+                    &root,
+                    &["config", "branch.reviewed.merge", "refs/heads/other"],
+                );
+            }
+        });
+        let report = create_reviewed(&fixture, &request, &consent, &store);
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::OutcomeUnknown,
+            "{phase}: {report:?}"
+        );
+        assert!(!matches!(
+            report.outcome,
+            Some(WorktreeCreationOutcome::Created { .. })
+        ));
+        assert_eq!(
+            git_text(&request.destination, &["rev-parse", "HEAD"]),
+            fixture.original.as_str()
+        );
+        assert_eq!(
+            git_text(&request.destination, &["config", "branch.reviewed.merge"]),
+            "refs/heads/other"
+        );
+        assert_eq!(
+            git_text(&request.destination, &["config", "branch.reviewed.remote"]),
+            "origin"
+        );
+        assert!(!matches!(
+            fixture
+                .service
+                .rehydrate_worktree_operations(&store)
+                .unwrap()[0]
+                .outcome,
+            Some(WorktreeCreationOutcome::Created { .. })
+        ));
+    }
+}
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_refuses_redirected_or_broad_push_policy() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::new_pr_creation_refuses_redirected_or_broad_push_policy"
+    )) {
+        return;
+    }
+    for (key, value) in [
+        ("branch.reviewed.pushremote", "other"),
+        ("remote.pushdefault", "other"),
+        ("remote.origin.push", "refs/heads/reviewed:refs/heads/main"),
+        ("push.default", "matching"),
+        ("push.default", "simple"),
+    ] {
+        let fixture = Fixture::new(false);
+        let (request, consent, store) = creation_request(&fixture, true);
+        run_git(&fixture.root, &["config", key, value]);
+        let report = create_reviewed(&fixture, &request, &consent, &store);
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::NotCreated,
+            "{key}: {report:?}"
+        );
+        assert!(!request.managed_root.exists());
+        assert_eq!(git_text(&fixture.root, &["config", key]), value);
+        assert_eq!(
+            run_git(
+                &fixture.root,
+                &["show-ref", "--verify", "--quiet", "refs/heads/reviewed"]
+            )
+            .status
+            .code(),
+            Some(1)
+        );
+    }
+    for phase in ["fetch", "unlock"] {
+        let fixture = Fixture::new(false);
+        let (request, consent, store) = creation_request(&fixture, true);
+        let root = fixture.root.clone();
+        let mut changed = false;
+        fixture.intercept(move |command| {
+            if !changed && command.arguments.iter().any(|arg| arg == phase) {
+                changed = true;
+                run_git(&root, &["config", "branch.reviewed.pushremote", "other"]);
+            }
+        });
+        let report = create_reviewed(&fixture, &request, &consent, &store);
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::OutcomeUnknown,
+            "{phase}: {report:?}"
+        );
+        assert!(!matches!(
+            report.outcome,
+            Some(WorktreeCreationOutcome::Created { .. })
+        ));
+        assert_eq!(
+            git_text(
+                &request.destination,
+                &["config", "branch.reviewed.pushremote"]
+            ),
+            "other"
+        );
+        assert_eq!(
+            git_text(&request.destination, &["rev-parse", "HEAD"]),
+            fixture.original.as_str()
+        );
+        assert!(!matches!(
+            fixture
+                .service
+                .rehydrate_worktree_operations(&store)
+                .unwrap()[0]
+                .outcome,
+            Some(WorktreeCreationOutcome::Created { .. })
+        ));
+    }
 }
