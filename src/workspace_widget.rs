@@ -1253,7 +1253,9 @@ pub fn global_shortcut(
         return None;
     };
     let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
-    if focused.is_text_editing() && text_editing_conflict(descriptor.action, key, *physical_key, *modifiers) {
+    if focused.is_text_editing()
+        && text_editing_conflict(descriptor.action, key, *physical_key, *modifiers)
+    {
         return None;
     }
     (shortcut_applies(descriptor, focused, shortcuts) && (!*repeat || descriptor.repeatable))
@@ -1280,18 +1282,30 @@ pub(crate) fn is_global_shortcut_chord(
     focused: FocusedPane,
 ) -> bool {
     crate::tab_history::is_chord(key, modifiers)
-        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts)
-            .is_some_and(|descriptor| {
-                !(focused.is_text_editing() && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
+        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts).is_some_and(
+            |descriptor| {
+                !(focused.is_text_editing()
+                    && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
                     && shortcut_applies(descriptor, focused, shortcuts)
-            })
+            },
+        )
 }
 
 /// Native text controls retain their editing vocabulary even when a global
 /// action is rebound to it. Find is context-dependent and handled by scope.
-fn text_editing_conflict(action: GlobalShortcut, key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: keyboard::Modifiers) -> bool {
+fn text_editing_conflict(
+    action: GlobalShortcut,
+    key: &keyboard::Key,
+    physical: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> bool {
     text_editing_chord(key, physical, modifiers)
-        || (action != GlobalShortcut::FindInPane && modifiers.control() && !modifiers.shift() && !modifiers.alt() && !modifiers.logo() && latin_key(key, physical) == Some('f'))
+        || (action != GlobalShortcut::FindInPane
+            && modifiers.control()
+            && !modifiers.shift()
+            && !modifiers.alt()
+            && !modifiers.logo()
+            && latin_key(key, physical) == Some('f'))
 }
 
 fn text_editing_chord(
@@ -3838,8 +3852,14 @@ mod tests {
         shortcuts.find_in_pane.clear();
         shortcuts.rename_pane = vec!["Ctrl+F".into()];
         let event = key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false);
-        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Editor), None);
-        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Other), Some(GlobalShortcut::RenamePane));
+        assert_eq!(
+            global_shortcut(&event, &shortcuts, FocusedPane::Editor),
+            None
+        );
+        assert_eq!(
+            global_shortcut(&event, &shortcuts, FocusedPane::Other),
+            Some(GlobalShortcut::RenamePane)
+        );
     }
 
     #[test]

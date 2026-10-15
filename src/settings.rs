@@ -726,30 +726,121 @@ pub struct FixedShortcut {
 }
 
 pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
-    FixedShortcut { label: "Cycle recent panes", chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"], scope: "Navigation", refusal: "This chord is reserved for Cycle recent panes" },
-    FixedShortcut { label: "Increase font size", chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"], scope: "Editor", refusal: "This chord is reserved for Increase font size" },
-    FixedShortcut { label: "Decrease font size", chords: &["Ctrl+-"], scope: "Editor", refusal: "This chord is reserved for Decrease font size" },
-    FixedShortcut { label: "Reset font size", chords: &["Ctrl+0"], scope: "Editor", refusal: "This chord is reserved for Reset font size" },
-    FixedShortcut { label: "Save file", chords: &["Ctrl+S"], scope: "Editor", refusal: "This chord is reserved for Save file" },
-    FixedShortcut { label: "Stage / unstage selected lines", chords: &["Ctrl+Shift+S"], scope: "Editor", refusal: "This chord is reserved for Stage / unstage selected lines" },
-    FixedShortcut { label: "Copy terminal selection", chords: &["Ctrl+Shift+C"], scope: "Panes", refusal: "This chord is reserved for Copy terminal selection" },
-    FixedShortcut { label: "Paste into terminal", chords: &["Ctrl+Shift+V"], scope: "Panes", refusal: "This chord is reserved for Paste into terminal" },
+    FixedShortcut {
+        label: "Cycle recent panes",
+        chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
+        scope: "Navigation",
+        refusal: "This chord is reserved for Cycle recent panes",
+    },
+    FixedShortcut {
+        label: "Increase font size",
+        chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Increase font size",
+    },
+    FixedShortcut {
+        label: "Decrease font size",
+        chords: &["Ctrl+-"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Decrease font size",
+    },
+    FixedShortcut {
+        label: "Reset font size",
+        chords: &["Ctrl+0"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Reset font size",
+    },
+    FixedShortcut {
+        label: "Save file",
+        chords: &["Ctrl+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Save file",
+    },
+    FixedShortcut {
+        label: "Stage / unstage selected lines",
+        chords: &["Ctrl+Shift+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Stage / unstage selected lines",
+    },
+    FixedShortcut {
+        label: "Copy terminal selection",
+        chords: &["Ctrl+Shift+C"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Copy terminal selection",
+    },
+    FixedShortcut {
+        label: "Paste into terminal",
+        chords: &["Ctrl+Shift+V"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Paste into terminal",
+    },
 ];
 
 /// These chords remain valid workspace bindings outside text editing. They
 /// are shown as scoped conflicts, rather than rejecting a useful workspace
 /// default such as Reopen pane on the editor's Redo chord.
 pub const TEXT_EDITING_SHORTCUTS: &[FixedShortcut] = &[
-    FixedShortcut { label: "Undo text edit", chords: &["Ctrl+Z"], scope: "Editor", refusal: "Text inputs keep Undo; this action is available outside text editing" },
-    FixedShortcut { label: "Redo text edit", chords: &["Ctrl+Shift+Z", "Ctrl+Y"], scope: "Editor", refusal: "Text inputs keep Redo; this action is available outside text editing" },
-    FixedShortcut { label: "Select all text", chords: &["Ctrl+A"], scope: "Editor", refusal: "Text inputs keep Select all; this action is available outside text editing" },
-    FixedShortcut { label: "Copy / cut / paste text", chords: &["Ctrl+C", "Ctrl+X", "Ctrl+V"], scope: "Editor", refusal: "Text inputs keep clipboard editing; this action is available outside text editing" },
-    FixedShortcut { label: "Find in text", chords: &["Ctrl+F"], scope: "Editor", refusal: "Text inputs keep Find; other actions are available outside text editing" },
-    FixedShortcut { label: "Navigate / delete words", chords: &["Ctrl+Left", "Ctrl+Right", "Ctrl+Shift+Left", "Ctrl+Shift+Right", "Ctrl+Backspace", "Ctrl+Delete", "Alt+Left", "Alt+Right", "Alt+Shift+Left", "Alt+Shift+Right", "Alt+Backspace", "Alt+Delete"], scope: "Editor", refusal: "Text inputs keep word editing; this action is available outside text editing" },
+    FixedShortcut {
+        label: "Undo text edit",
+        chords: &["Ctrl+Z"],
+        scope: "Editor",
+        refusal: "Text inputs keep Undo; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Redo text edit",
+        chords: &["Ctrl+Shift+Z", "Ctrl+Y"],
+        scope: "Editor",
+        refusal: "Text inputs keep Redo; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Select all text",
+        chords: &["Ctrl+A"],
+        scope: "Editor",
+        refusal: "Text inputs keep Select all; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Copy / cut / paste text",
+        chords: &["Ctrl+C", "Ctrl+X", "Ctrl+V"],
+        scope: "Editor",
+        refusal: "Text inputs keep clipboard editing; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Find in text",
+        chords: &["Ctrl+F"],
+        scope: "Editor",
+        refusal: "Text inputs keep Find; other actions are available outside text editing",
+    },
+    FixedShortcut {
+        label: "Navigate / delete words",
+        chords: &[
+            "Ctrl+Left",
+            "Ctrl+Right",
+            "Ctrl+Shift+Left",
+            "Ctrl+Shift+Right",
+            "Ctrl+Backspace",
+            "Ctrl+Delete",
+            "Alt+Left",
+            "Alt+Right",
+            "Alt+Shift+Left",
+            "Alt+Shift+Right",
+            "Alt+Backspace",
+            "Alt+Delete",
+        ],
+        scope: "Editor",
+        refusal: "Text inputs keep word editing; this action is available outside text editing",
+    },
 ];
 
 pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'static str> {
-    TEXT_EDITING_SHORTCUTS.iter().find(|fixed| fixed.chords.iter().any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))).map(|fixed| fixed.refusal)
+    TEXT_EDITING_SHORTCUTS
+        .iter()
+        .find(|fixed| {
+            fixed
+                .chords
+                .iter()
+                .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
+        })
+        .map(|fixed| fixed.refusal)
 }
 
 /// The same refusal is used by the recorder, typed edits and file validation.
@@ -757,7 +848,15 @@ pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> 
     if let Some(reason) = withheld_from_the_card(binding) {
         return Some(reason);
     }
-    FIXED_SHORTCUTS.iter().find(|fixed| fixed.chords.iter().any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))).map(|fixed| fixed.refusal)
+    FIXED_SHORTCUTS
+        .iter()
+        .find(|fixed| {
+            fixed
+                .chords
+                .iter()
+                .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
+        })
+        .map(|fixed| fixed.refusal)
 }
 
 /// Legacy actions that must retain a route back to the workspace.
@@ -925,23 +1024,40 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
 /// Canonical keys for searching bindings accepted with aliases, whitespace or
 /// reordered modifiers. Display text remains exactly as the user entered it.
 pub fn shortcut_search_keywords(value: &str) -> String {
-    parse_chords(value).iter().filter_map(|chord| parse_shortcut(chord).ok()).map(|binding| {
-        let mut parts = Vec::new();
-        if binding.control { parts.push("Ctrl".to_owned()); }
-        if binding.alt { parts.push("Alt".to_owned()); }
-        if binding.logo { parts.push("Super".to_owned()); }
-        if binding.shift { parts.push("Shift".to_owned()); }
-        parts.push(match binding.key {
-            ShortcutKey::Character(',') => "Comma".into(),
-            ShortcutKey::Character('+') => "Plus".into(),
-            ShortcutKey::Character(character) => character.to_ascii_uppercase().to_string(),
-            ShortcutKey::ArrowLeft => "Left".into(), ShortcutKey::ArrowRight => "Right".into(),
-            ShortcutKey::ArrowUp => "Up".into(), ShortcutKey::ArrowDown => "Down".into(),
-            ShortcutKey::Tab => "Tab".into(), ShortcutKey::PageUp => "PageUp".into(), ShortcutKey::PageDown => "PageDown".into(),
-            ShortcutKey::Function(number) => format!("F{number}"),
-        });
-        parts.join("+")
-    }).collect::<Vec<_>>().join(" ")
+    parse_chords(value)
+        .iter()
+        .filter_map(|chord| parse_shortcut(chord).ok())
+        .map(|binding| {
+            let mut parts = Vec::new();
+            if binding.control {
+                parts.push("Ctrl".to_owned());
+            }
+            if binding.alt {
+                parts.push("Alt".to_owned());
+            }
+            if binding.logo {
+                parts.push("Super".to_owned());
+            }
+            if binding.shift {
+                parts.push("Shift".to_owned());
+            }
+            parts.push(match binding.key {
+                ShortcutKey::Character(',') => "Comma".into(),
+                ShortcutKey::Character('+') => "Plus".into(),
+                ShortcutKey::Character(character) => character.to_ascii_uppercase().to_string(),
+                ShortcutKey::ArrowLeft => "Left".into(),
+                ShortcutKey::ArrowRight => "Right".into(),
+                ShortcutKey::ArrowUp => "Up".into(),
+                ShortcutKey::ArrowDown => "Down".into(),
+                ShortcutKey::Tab => "Tab".into(),
+                ShortcutKey::PageUp => "PageUp".into(),
+                ShortcutKey::PageDown => "PageDown".into(),
+                ShortcutKey::Function(number) => format!("F{number}"),
+            });
+            parts.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 const fn default_terminal_scrollback_lines() -> usize {
@@ -2395,7 +2511,10 @@ fn normalize_current(table: &mut toml::Table) {
         }
         if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts")
             && !shortcuts.contains_key("terminal_passthrough_actions")
-            && shortcuts.get("close_focused_column").and_then(parsed_chords).is_some_and(|chords| chords.contains(&parse_shortcut("Ctrl+W").unwrap()))
+            && shortcuts
+                .get("close_focused_column")
+                .and_then(parsed_chords)
+                .is_some_and(|chords| chords.contains(&parse_shortcut("Ctrl+W").unwrap()))
         {
             // Another customized action may own Ctrl+Shift+W. Preserve its
             // chord and release the stranded old close default to the shell.
@@ -3835,7 +3954,13 @@ next_column = ["Alt+W", "Alt+Right"]
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.keyboard_shortcuts.close_focused_column, ["Ctrl+W"]);
         assert_eq!(loaded.keyboard_shortcuts.new_channel, ["Ctrl+Shift+W"]);
-        assert!(loaded.keyboard_shortcuts.terminal_passthrough_actions.iter().any(|name| name == "close_focused_column"));
+        assert!(
+            loaded
+                .keyboard_shortcuts
+                .terminal_passthrough_actions
+                .iter()
+                .any(|name| name == "close_focused_column")
+        );
     }
 
     #[test]
@@ -4501,10 +4626,18 @@ new_thread = "Alt+Shift+G"
 
     #[test]
     fn native_fixed_chords_refuse_conflicting_actions_by_name() {
-        for (chord, label) in [("Ctrl+Tab", "Cycle recent panes"), ("Ctrl+=", "Increase font size"), ("Ctrl+Shift+C", "Copy terminal selection"), ("Ctrl+Shift+S", "Stage / unstage selected lines")] {
+        for (chord, label) in [
+            ("Ctrl+Tab", "Cycle recent panes"),
+            ("Ctrl+=", "Increase font size"),
+            ("Ctrl+Shift+C", "Copy terminal selection"),
+            ("Ctrl+Shift+S", "Stage / unstage selected lines"),
+        ] {
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.new_terminal = vec![chord.into()];
-            assert!(matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)), "{chord}");
+            assert!(
+                matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)),
+                "{chord}"
+            );
         }
     }
 

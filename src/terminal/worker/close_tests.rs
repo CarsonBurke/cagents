@@ -216,8 +216,14 @@ fn installed_fish() -> Option<PathBuf> {
 #[test]
 fn a_shell_without_prompt_integration_requires_confirmation_even_when_idle() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
-    assert_eq!(shell.terminal.close_checked(false), TerminalCloseResult::Active);
-    assert_eq!(shell.terminal.close_checked(true), TerminalCloseResult::Closed);
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
 }
 
 #[test]
@@ -225,8 +231,14 @@ fn an_unsent_command_without_prompt_integration_is_never_discarded_silently() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     shell.terminal.input(b"echo unfinished-command").unwrap();
     shell.wait_for_text("unfinished-command");
-    assert_eq!(shell.terminal.close_checked(false), TerminalCloseResult::Active);
-    assert_eq!(shell.terminal.close_checked(true), TerminalCloseResult::Closed);
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
 }
 
 #[test]
@@ -307,8 +319,14 @@ fn a_shell_builtin_read_requires_confirmation_without_prompt_integration() {
         .input(b"printf 'READY_%s\\n' BUILTIN; read reply\n")
         .unwrap();
     shell.wait_for_text("READY_BUILTIN");
-    assert_eq!(shell.terminal.close_checked(false), TerminalCloseResult::Active);
-    assert_eq!(shell.terminal.close_checked(true), TerminalCloseResult::Closed);
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
 }
 
 #[test]

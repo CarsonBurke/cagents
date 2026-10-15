@@ -125,7 +125,9 @@ pub struct KeyboardRegion {
     pub card: Option<CardId>,
 }
 impl From<FocusedPane> for KeyboardRegion {
-    fn from(pane: FocusedPane) -> Self { Self { pane, card: None } }
+    fn from(pane: FocusedPane) -> Self {
+        Self { pane, card: None }
+    }
 }
 
 /// Sample native widget focus before workspace interception. IDs identify
@@ -155,7 +157,12 @@ pub fn observe_keyboard_events<'a, Message: 'a>(
     regions: Vec<(cosmic::iced::widget::Id, KeyboardRegion)>,
     on_key: KeyboardCallback<Message>,
 ) -> Element<'a, Message> {
-    Element::new(Observed { content: content.into(), trace: trace.clone(), focus_regions: Some(regions), keyboard_callback: Some(on_key) })
+    Element::new(Observed {
+        content: content.into(),
+        trace: trace.clone(),
+        focus_regions: Some(regions),
+        keyboard_callback: Some(on_key),
+    })
 }
 
 pub(crate) struct ScopedKeyboardRegion {
@@ -163,11 +170,16 @@ pub(crate) struct ScopedKeyboardRegion {
     previous: Option<KeyboardRegion>,
 }
 impl Drop for ScopedKeyboardRegion {
-    fn drop(&mut self) { self.focus.set(self.previous); }
+    fn drop(&mut self) {
+        self.focus.set(self.previous);
+    }
 }
 impl InputTrace {
     pub(crate) fn scoped_keyboard_region(&self, region: KeyboardRegion) -> ScopedKeyboardRegion {
-        ScopedKeyboardRegion { focus: Rc::clone(&self.1), previous: self.1.replace(Some(region)) }
+        ScopedKeyboardRegion {
+            focus: Rc::clone(&self.1),
+            previous: self.1.replace(Some(region)),
+        }
     }
 }
 
@@ -230,12 +242,36 @@ impl Operation for KeyboardFocus {
 }
 impl KeyboardFocus {
     fn region(&self, regions: &[(cosmic::iced::widget::Id, KeyboardRegion)]) -> KeyboardRegion {
-        let Some((id, bounds)) = &self.focused else { return FocusedPane::Other.into(); };
-        if let Some((_, region)) = regions.iter().find(|(candidate, _)| Some(candidate) == id.as_ref()) { return *region; }
-        let container = self.containers.iter().rev().find(|(_, container)| container.contains(bounds.center())).map_or_else(|| KeyboardRegion::from(FocusedPane::OutsideWorkspace), |(region, _)| *region);
-        if self.inputs.iter().any(|(candidate, rectangle)| candidate == id && rectangle == bounds) {
-            KeyboardRegion { pane: FocusedPane::TextInput, ..container }
-        } else { container }
+        let Some((id, bounds)) = &self.focused else {
+            return FocusedPane::Other.into();
+        };
+        if let Some((_, region)) = regions
+            .iter()
+            .find(|(candidate, _)| Some(candidate) == id.as_ref())
+        {
+            return *region;
+        }
+        let container = self
+            .containers
+            .iter()
+            .rev()
+            .find(|(_, container)| container.contains(bounds.center()))
+            .map_or_else(
+                || KeyboardRegion::from(FocusedPane::OutsideWorkspace),
+                |(region, _)| *region,
+            );
+        if self
+            .inputs
+            .iter()
+            .any(|(candidate, rectangle)| candidate == id && rectangle == bounds)
+        {
+            KeyboardRegion {
+                pane: FocusedPane::TextInput,
+                ..container
+            }
+        } else {
+            container
+        }
     }
 }
 
@@ -319,7 +355,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             // chord's pane after the user moves focus with the pointer.
             self.trace.1.set(None);
         }
-        let region = self.trace.1.get().unwrap_or_else(|| FocusedPane::Other.into());
+        let region = self
+            .trace
+            .1
+            .get()
+            .unwrap_or_else(|| FocusedPane::Other.into());
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -330,7 +370,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             shell,
             viewport,
         );
-        if let Event::Keyboard(event) = event && let Some(callback) = &self.keyboard_callback {
+        if let Event::Keyboard(event) = event
+            && let Some(callback) = &self.keyboard_callback
+        {
             shell.publish(callback(event.clone(), shell.is_event_captured(), region));
         }
     }
@@ -390,7 +432,14 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
                 viewport,
                 translation,
             )
-            .map(|content| ObservedOverlay::wrap(content, &self.trace, self.focus_regions.clone(), self.keyboard_callback))
+            .map(|content| {
+                ObservedOverlay::wrap(
+                    content,
+                    &self.trace,
+                    self.focus_regions.clone(),
+                    self.keyboard_callback,
+                )
+            })
     }
 
     fn a11y_nodes(
@@ -471,23 +520,45 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
     }
 
     fn update(
-        &mut self, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor,
-        renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>,
+        &mut self,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
     ) {
         self.trace.record(event);
         let mut owns_keyboard = false;
-        if matches!(event, Event::Keyboard(_)) && let Some(regions) = &self.focus_regions {
-            let mut focus = KeyboardFocus { known_regions: regions.clone(), ..KeyboardFocus::default() };
-            self.content.as_overlay_mut().operate(layout, renderer, &mut focus);
+        if matches!(event, Event::Keyboard(_))
+            && let Some(regions) = &self.focus_regions
+        {
+            let mut focus = KeyboardFocus {
+                known_regions: regions.clone(),
+                ..KeyboardFocus::default()
+            };
+            self.content
+                .as_overlay_mut()
+                .operate(layout, renderer, &mut focus);
             owns_keyboard = focus.focused.is_some();
             self.trace.1.set(Some(focus.region(regions)));
         }
-        let region = self.trace.1.get().unwrap_or_else(|| FocusedPane::OutsideWorkspace.into());
-        self.content.as_overlay_mut().update(event, layout, cursor, renderer, clipboard, shell);
-        if let Event::Keyboard(event) = event && let Some(callback) = &self.keyboard_callback {
+        let region = self
+            .trace
+            .1
+            .get()
+            .unwrap_or_else(|| FocusedPane::OutsideWorkspace.into());
+        self.content
+            .as_overlay_mut()
+            .update(event, layout, cursor, renderer, clipboard, shell);
+        if let Event::Keyboard(event) = event
+            && let Some(callback) = &self.keyboard_callback
+        {
             // A focused overlay owns ignored editing chords too. Capturing
             // those prevents both background input and duplicate root routing.
-            if owns_keyboard { shell.capture_event(); }
+            if owns_keyboard {
+                shell.capture_event();
+            }
             if shell.is_event_captured() {
                 shell.publish(callback(event.clone(), true, region));
             }
@@ -556,7 +627,9 @@ mod tests {
         query.focusable(Some(&sidebar), bounds, &mut Focus(true));
         query.custom(Some(&sidebar), bounds, &mut TextEditing);
         assert_eq!(
-            query.region(&[(editor.clone(), FocusedPane::Editor.into())]).pane,
+            query
+                .region(&[(editor.clone(), FocusedPane::Editor.into())])
+                .pane,
             FocusedPane::TextInput
         );
         let mut query = KeyboardFocus::default();
@@ -570,7 +643,10 @@ mod tests {
     #[test]
     fn queued_events_restore_their_own_focus_snapshot() {
         let trace = InputTrace::default();
-        let editor = KeyboardRegion { pane: FocusedPane::Editor, card: Some(CardId::new()) };
+        let editor = KeyboardRegion {
+            pane: FocusedPane::Editor,
+            card: Some(CardId::new()),
+        };
         let sidebar = KeyboardRegion::from(FocusedPane::TextInput);
         trace.1.set(Some(sidebar));
         {
