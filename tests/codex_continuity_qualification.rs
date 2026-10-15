@@ -216,6 +216,9 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
             "type":"message","role":"assistant","id":format!("message-{number}"),
             "content":[{"type":"output_text","text":"SCENARIO_COMPLETE"}]
         }),
+        None if scenario.contains("SCENARIO orphan-reaping") => shell(
+            "orphan-tools", "i=0; while [ \"$i\" -lt 3600 ]; do sh -c 'sleep 0.05 & echo $! >> orphan-pids'; sleep 0.2; i=$((i+1)); done; echo ORPHAN_LOOP_FINISHED".into(), 1000,
+        ),
         None if scenario.contains("SCENARIO long") => shell(
             "long",
             format!("sleep {COMMAND_SECONDS}; echo {LONG_MARKER}"),
@@ -390,6 +393,7 @@ fn exchange(
 // has its own runtime, data and account directories, so it can be killed
 // without touching an installed one.
 struct Fixture {
+    cli_program: PathBuf,
     root: tempfile::TempDir,
     daemon: Child,
     model: Model,
@@ -418,6 +422,10 @@ impl Fixture {
     }
 
     fn new() -> Self {
+        Self::with_products(Path::new(env!("CARGO_BIN_EXE_cagents")), Path::new(env!("CARGO_BIN_EXE_cagentsd")))
+    }
+
+    fn with_products(cli_program: &Path, daemon_program: &Path) -> Self {
         let codex = std::env::var_os(CODEX).unwrap_or_else(|| {
             panic!("set {CODEX} to the native Codex executable this run qualifies")
         });
@@ -476,8 +484,9 @@ unified_exec = true
             ),
         )
         .unwrap();
-        let daemon = Self::daemon(root.path());
+        let daemon = Self::daemon_at(root.path(), daemon_program);
         let fixture = Self {
+            cli_program: cli_program.to_owned(),
             root,
             daemon,
             model,
@@ -488,12 +497,16 @@ unified_exec = true
     }
 
     fn daemon(root: &Path) -> Child {
+        Self::daemon_at(root, Path::new(env!("CARGO_BIN_EXE_cagentsd")))
+    }
+
+    fn daemon_at(root: &Path, program: &Path) -> Child {
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(root.join("daemon.log"))
             .unwrap();
-        Self::command(root, Path::new(env!("CARGO_BIN_EXE_cagentsd")))
+        Self::command(root, program)
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
@@ -516,7 +529,7 @@ unified_exec = true
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
-        let mut child = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
+        let mut child = Self::command(self.root.path(), &self.cli_program)
             .arg("--json")
             .args(arguments)
             .stdout(Stdio::piped())
@@ -618,6 +631,7 @@ unified_exec = true
         self.daemon.wait().unwrap();
         thread::sleep(Duration::from_secs(2));
         self.daemon = Self::daemon(self.root.path());
+        self.cli_program = PathBuf::from(env!("CARGO_BIN_EXE_cagents"));
         self.await_daemon();
     }
 
@@ -889,4 +903,99 @@ fn a_pending_approval_survives_a_killed_daemon_unanswered() {
     });
     assert_one_uninterrupted_turn(&fixture, "approval", &servers, 2);
     close(&fixture, &mut window, &chat);
+}
+
+/// Runs the real provider's execution tool against a local model fixture. The
+/// parent shells exit before their background children, exercising subreaper
+/// adoption continuously rather than just checking direct child cleanup.
+#[test]
+#[ignore = "ten-minute native Codex orphan qualification; no remote model calls"]
+fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
+    let fixture = Fixture::new();
+    fixture.start("orphan-reaping", "never");
+    let mut window = fixture.window();
+    let chat = fixture.durable_chat(&mut window);
+    window.attach(chat.clone());
+    let directory = fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join("native-holders");
+    let record: Value = until(Duration::from_secs(10), "the native holder registry", || {
+        fs::read_dir(&directory).ok()?.flatten().filter(|entry| entry.path().extension().is_some_and(|extension| extension == "json"))
+            .find_map(|entry| serde_json::from_slice(&fs::read(entry.path()).ok()?).ok())
+    });
+    let holder = record["holder"]["pid"].as_u64().unwrap();
+    let children = format!("/proc/{holder}/task/{holder}/children");
+    let started = Instant::now();
+    let mut samples = 0u64;
+    let mut zombies = BTreeSet::new();
+    while started.elapsed() < Duration::from_secs(10 * 60) {
+        let pids = fs::read_to_string(&children).expect("native holder vanished during the qualification");
+        for pid in pids.split_whitespace() {
+            if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+                let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
+                if fields.first() == Some(&"Z") && fields.get(1).and_then(|parent| parent.parse::<u64>().ok()) == Some(holder) {
+                    zombies.insert(pid.to_owned());
+                }
+            }
+        }
+        samples += 1;
+        thread::sleep(Duration::from_millis(100));
+    }
+    let tools = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap().lines().count();
+    let report = json!({"provider":fixture.version, "seconds":started.elapsed().as_secs_f64(),
+        "holder":holder, "samples":samples, "background_children":tools, "observed_zombies":zombies});
+    eprintln!("{report}");
+    if let Some(path) = std::env::var_os("CAGENTS_QUALIFICATION_EVIDENCE") {
+        fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    assert!(tools >= 1000, "the provider did not repeatedly background tools: {report}");
+    assert!(zombies.is_empty(), "holder children were observed unreaped: {report}");
+    let diagnostics = fixture.cli(&["diagnostics"]);
+    let reports = diagnostics["holders"].as_array().expect("CLI holder diagnostics are absent");
+    assert!(reports.iter().any(|report| report["pid"] == holder && report["zombie_children"] == 0));
+    close(&fixture, &mut window, &chat);
+}
+
+/// Uses genuine binaries of the previous build, then replaces only its private
+/// fixture daemon. The old durable holder remains alive until the idle restart
+/// request proves cleanup and starts the same external thread in a new helper.
+#[test]
+#[ignore = "needs matched old binaries and native Codex; no remote model calls"]
+fn an_old_helper_is_flagged_and_rolls_over_without_changing_its_conversation() {
+    let old_cli = std::env::var_os("CAGENTS_QUALIFY_OLD_CLI").expect("set CAGENTS_QUALIFY_OLD_CLI to the matched older CLI");
+    let old_daemon = std::env::var_os("CAGENTS_QUALIFY_OLD_DAEMON").expect("set CAGENTS_QUALIFY_OLD_DAEMON to the matched older daemon");
+    let mut fixture = Fixture::with_products(Path::new(&old_cli), Path::new(&old_daemon));
+    fixture.start("long", "never");
+    until(Duration::from_secs(30), "the older provider turn", || (!fixture.model.requests().is_empty()).then_some(()));
+    thread::sleep(Duration::from_secs(2));
+    let old_servers = fixture.servers();
+    assert_eq!(old_servers.len(), 1);
+    fixture.replace_daemon();
+    let mut window = fixture.window();
+    let old_chat = fixture.durable_chat(&mut window);
+    let attached = window.attach(old_chat.clone());
+    assert!(attached.native_helper.as_ref().is_some_and(|helper| helper.outdated),
+        "the genuinely older helper was not identified: {:?}", attached.native_helper);
+    assert_eq!(fixture.servers(), old_servers, "adoption replaced the old provider before permission");
+    let idle = until(Duration::from_secs(COMMAND_SECONDS + 30), "the exact old turn to finish", || {
+        let snapshot = window.read(old_chat.id);
+        (!snapshot.busy && snapshot.ready && snapshot.requests.is_empty()).then_some(snapshot)
+    });
+    let prepared = match window.request(ClientRequest::ChatRestartHelper { source: old_chat.clone(), generation: idle.generation }) {
+        ServerResponse::ChatResumePrepared { session } => session,
+        response => panic!("helper restart was not prepared: {response:?}"),
+    };
+    assert_eq!(prepared.launch.session_id, old_chat.launch.session_id);
+    let (replacement, snapshot) = match window.request(ClientRequest::ChatStart { session: prepared,
+        source: None, terminate_source: false, execution_environment: Default::default() }) {
+        ServerResponse::ChatAttached { session, snapshot } => (session, snapshot),
+        response => panic!("replacement helper did not start: {response:?}"),
+    };
+    assert_eq!(snapshot.session_id, old_chat.launch.session_id);
+    assert!(snapshot.native_helper.as_ref().is_some_and(|helper| !helper.outdated));
+    assert!(cagents::chat::is_helper_recovery(&old_chat, &replacement));
+    assert!(fixture.servers().is_disjoint(&old_servers), "the outdated provider was retained");
+    window.request(ClientRequest::ChatVisibility { chat_id: replacement.id, visible: true });
+    let restored = window.read(replacement.id);
+    assert!(!restored.items.is_empty(), "the same conversation resumed without its transcript");
+    eprintln!("helper rollover retained thread {:?}: {} -> {}", replacement.launch.session_id, old_chat.id, replacement.id);
+    close(&fixture, &mut window, &replacement);
 }

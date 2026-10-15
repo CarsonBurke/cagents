@@ -1470,6 +1470,17 @@ impl Runtime {
                 "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
             ));
         }
+        if snapshot.native_helper.as_ref().is_some_and(|helper| helper.outdated) {
+            content.push(widget::row::with_children(vec![
+                design::caption(if self.helper_restart_requested {
+                    "Helper update queued. It will restart when this conversation is idle."
+                } else { "Running on an outdated helper" }).width(Length::Fill).into(),
+                crate::ui_controls::button::secondary("Restart to update")
+                    .on_press_maybe((!transitioning && !self.helper_restart_requested
+                        && !self.disconnected && !snapshot.exited)
+                        .then_some(action(Action::RestartHelper(target)))).into(),
+            ]).spacing(space::S).align_y(Alignment::Center).into());
+        }
         if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
             let enabled =

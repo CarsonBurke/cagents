@@ -391,6 +391,7 @@ pub(super) fn process_request(
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
+            | ClientRequest::ChatRestartHelper { .. }
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
                 ..
@@ -679,6 +680,7 @@ pub(super) fn process_request(
         }
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatPrepareResume { .. }
+        | ClientRequest::ChatRestartHelper { .. }
         | ClientRequest::ChatRecoverAccount { .. }
         | ClientRequest::ChatPreview { .. }
         | ClientRequest::ChatCandidates { .. }

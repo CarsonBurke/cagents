@@ -185,6 +185,8 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    pub(crate) fn record(&self) -> &Record { &self.identity.record }
+
     pub fn is_durable(&self) -> bool {
         self.durable
     }
@@ -1300,6 +1302,66 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v2_record_without_build_is_inspected_and_adopted_as_outdated() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_V2_ADOPTION_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::legacy_v2_record_without_build_is_inspected_and_adopted_as_outdated", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path()).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let boot = crate::daemon::read_boot_id().unwrap();
+        let mut recovery = super::super::tests::recovery();
+        recovery.source.proof.as_mut().unwrap().boot_id = boot.clone();
+        recovery.source.owned_codex_listener.as_mut().unwrap().allocator.boot_id = boot.clone();
+        let process = Process::read(std::process::id() as i32).unwrap();
+        recovery.confirm("v2-thread".into(), super::super::tests::server_identity(), process.clone()).unwrap();
+        let source = recovery.source.clone();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let directory = registry::directory(Kind::Native).unwrap();
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let record = Record { version: 2, build: None, kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(), boot,
+            terminal: source.id, holder: process.clone(), root: process };
+        record.create(&directory).unwrap();
+        let path = directory.join(format!("{}.json", source.id));
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("build");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let parsed: Record = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(parsed, record);
+        assert!(parsed.is_outdated());
+        let listener = Listener::bind(registry::socket(&directory, source.id)).unwrap();
+        let peer_record = record.clone();
+        let peer_proof = proof.clone();
+        let server = std::thread::spawn(move || {
+            let (inspect, _) = listener.socket.accept().unwrap();
+            assert!(matches!(receive(&inspect, TIMEOUT).unwrap(), Some(Request::Inspect { .. })));
+            authorize(&inspect, &peer_proof).unwrap();
+            send(&inspect, &Report::Inspected { protocol: 2, record: peer_record, recovery: recovery.clone(), exited: false }, TIMEOUT).unwrap();
+            drop(inspect);
+            let (adopted, _) = listener.socket.accept().unwrap();
+            let Some(Request::Adopt { source, proof }) = receive(&adopted, TIMEOUT).unwrap() else { panic!("missing adoption"); };
+            authorize(&adopted, &proof).unwrap();
+            recovery.adopt(&source, proof).unwrap();
+            send(&adopted, &Report::Adopted(recovery), TIMEOUT).unwrap();
+        });
+        let (inspected, exited) = inspect(&parsed, &proof).unwrap();
+        assert!(!exited);
+        assert_eq!(inspected.confirmed_thread.as_deref(), Some("v2-thread"));
+        let (holder, adopted) = adopt(&parsed, &source, &proof).unwrap();
+        assert!(holder.record().is_outdated());
+        assert_eq!(adopted.confirmed_thread, inspected.confirmed_thread);
+        holder.preserve();
+        server.join().unwrap();
+        record.remove(&directory);
+    }
+
+    #[test]
     fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_TRANSPORT_TEST";
         if std::env::var_os(STAGE).is_none() {
@@ -1356,6 +1418,23 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(record.root.is_current());
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Observe the actual helper's blocking syscall. This catches a
+            // reintroduced one-second timeout without a timing-based guess.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let syscall = std::fs::read_to_string(format!("/proc/{}/syscall", record.holder.pid)).unwrap();
+                let fields: Vec<_> = syscall.split_whitespace().collect();
+                if fields.first() == Some(&"7") && fields.len() >= 4 {
+                    let timeout = u64::from_str_radix(fields[3].trim_start_matches("0x"), 16).unwrap();
+                    assert_eq!(timeout as u32, u32::MAX, "idle poll has a timeout: {syscall}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "idle helper did not block in poll: {syscall}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         crate::daemon::process_scope::tests::assert_separate(
             record.holder.pid as u32,
             record.root.pid as u32,

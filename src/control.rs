@@ -902,6 +902,35 @@ impl ControlClient {
         }
     }
 
+    /// A failed idle fence leaves the live provider untouched. Successful
+    /// teardown returns a new transport descriptor for the same conversation.
+    pub fn restart_chat_helper(
+        &mut self, source: crate::chat::Session, generation: u64,
+    ) -> Result<crate::chat::Session, ControlError> {
+        let id = source.id;
+        self.attached_chats.insert(id);
+        match self.request_strict(ClientRequest::ChatAttach { session: source.clone() })? {
+            ServerResponse::ChatAttached { .. } => {},
+            response => return Err(unexpected_response("a native chat attachment", &response)),
+        }
+        let result = self.request_with_deadline(ClientRequest::ChatRestartHelper { source, generation },
+            Instant::now() + CHAT_CLOSE_TIMEOUT);
+        match result {
+            Ok(ServerResponse::ChatResumePrepared { session }) => {
+                self.attached_chats.remove(&id);
+                Ok(session)
+            },
+            Ok(response) => Err(unexpected_response("a prepared helper restart", &response)),
+            Err(error) => {
+                if matches!(error, ControlError::Remote { .. })
+                    && matches!(self.request_strict(ClientRequest::ChatDetach { chat_id: id }), Ok(ServerResponse::Detached)) {
+                    self.attached_chats.remove(&id);
+                }
+                Err(error)
+            },
+        }
+    }
+
     pub fn prepare_chat_resume(
         &mut self,
         source: crate::chat::Session,

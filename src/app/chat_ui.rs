@@ -168,6 +168,7 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    RestartHelper(Target),
     SignIn(Target, Account),
     ResumeAfterSignIn(Target),
     /// Starts a new conversation in the same session directory and working
@@ -347,7 +348,7 @@ impl Action {
     /// The card whose provider session this action starts afresh.
     fn starts_session(&self) -> Option<CardId> {
         match self {
-            Self::Reconnect(target) | Self::ResumeAfterSignIn(target) => Some(target.card),
+            Self::Reconnect(target) | Self::ResumeAfterSignIn(target) | Self::RestartHelper(target) => Some(target.card),
             Self::Switch(card) | Self::StartFresh(card) | Self::RecoverAccount(card, _) => {
                 Some(*card)
             }
@@ -362,6 +363,7 @@ impl Action {
             | Self::ChooseAccount(target, _)
             | Self::AccountPicker(target, _)
             | Self::Reconnect(target)
+            | Self::RestartHelper(target)
             | Self::SignIn(target, _)
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
@@ -398,6 +400,7 @@ impl Action {
 }
 
 struct AccountRecovery {
+    helper: bool,
     source: chat::Session,
     committed: bool,
     /// Only a composer submission that has never reached a provider can be
@@ -1542,6 +1545,7 @@ pub(super) struct Runtime {
     pending: Option<PendingCommand>,
     next_command: u64,
     disconnected: bool,
+    helper_restart_requested: bool,
     /// A fingerprint of the models this conversation last listed to the
     /// catalog, which takes each list once rather than on every change.
     listed_models: u64,
@@ -2109,6 +2113,7 @@ impl Runtime {
             pending: None,
             next_command: 0,
             disconnected: false,
+            helper_restart_requested: false,
             listed_models: 0,
             visible: AtomicBool::new(visible),
             error: None,
@@ -3872,6 +3877,7 @@ impl Cagents {
                 session: replacement.clone(),
                 upgrade_committed: false,
                 recovery: Some(AccountRecovery {
+                    helper: false,
                     source: source.clone(),
                     committed: false,
                     submit,
@@ -5141,6 +5147,35 @@ impl Cagents {
         self.observe_listed_models(provider, snapshot.models.clone())
     }
 
+    fn restart_chat_helper_if_idle(&mut self, target: Target) -> Task<Message> {
+        if self.chat_start_pending(target.card) { return Task::none(); }
+        let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
+        let Some(handle) = runtime.handle() else { return Task::none(); };
+        let snapshot = handle.snapshot();
+        if !runtime.helper_restart_requested || snapshot.activity() != ActivityState::Idle
+            || !snapshot.ready || snapshot.exited || runtime.pending.is_some()
+            || runtime.queued.is_some() || !runtime.followups.is_empty()
+            || runtime.attachment_chooser_pending || runtime.pastes_pending != 0 { return Task::none(); }
+        let source = handle.session();
+        let generation = snapshot.generation;
+        runtime.helper_restart_requested = false;
+        let target = self.chat_ui.next_target(target.card);
+        self.chat_ui.phases.insert(target.card, Phase::Starting(Attempt {
+            target, session: source.clone(), upgrade_committed: false,
+            recovery: Some(AccountRecovery { helper: true, source: source.clone(), committed: false, submit: None }),
+        }));
+        let sender = self.chat_ui.sender.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                Self::started_chat(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                    ClientHandle::restart_helper(source, generation, move |wake| {
+                        let _ = sender.try_send((target, wake));
+                    }).map(Arc::new))))
+            }).await.map_err(|error| chat::StartFailure::retry(error.to_string())).and_then(|result| result);
+            Message::ChatUi(Action::Ready(target, Ready(Arc::new(Mutex::new(Some(result))))))
+        })
+    }
+
     pub(super) fn start_chat(
         &mut self,
         card: CardId,
@@ -6070,6 +6105,7 @@ impl Cagents {
                 let automatic_submit = recovery.as_ref().and_then(|recovery| recovery.submit);
                 let account_committed =
                     recovery.as_ref().is_some_and(|recovery| recovery.committed);
+                let helper_recovery = recovery.as_ref().is_some_and(|recovery| recovery.helper);
                 let account_source = recovery.map(|recovery| recovery.source);
                 let upgrade_source = result
                     .as_ref()
@@ -6160,7 +6196,8 @@ impl Cagents {
                         }
                         if let Some(source) = &account_source {
                             let replacement = handle.session();
-                            if !chat::is_account_recovery(source, &replacement)
+                            if !(if helper_recovery { chat::is_helper_recovery(source, &replacement) }
+                                else { chat::is_account_recovery(source, &replacement) })
                                 || handle.snapshot().session_id != source.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
@@ -6170,6 +6207,7 @@ impl Cagents {
                             }
                             if !account_committed {
                                 attempt.recovery = Some(AccountRecovery {
+                    helper: helper_recovery,
                                     source: source.clone(),
                                     committed: false,
                                     submit: automatic_submit,
@@ -6182,11 +6220,11 @@ impl Cagents {
                                     .as_ref()
                                     .ok_or_else(|| "Session storage is unavailable".to_owned())
                                     .and_then(|writer| {
-                                        writer.rebind_chat_account(
-                                            target.card,
-                                            source.clone(),
-                                            replacement,
-                                        )
+                                        if helper_recovery {
+                                            writer.rebind_chat_helper(target.card, source.clone(), replacement)
+                                        } else {
+                                            writer.rebind_chat_account(target.card, source.clone(), replacement)
+                                        }
                                     });
                                 let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
                                 return cosmic::task::future(async move {
@@ -6604,6 +6642,7 @@ impl Cagents {
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
+                            self.restart_chat_helper_if_idle(target),
                             fork.map_or_else(Task::none, |session| {
                                 let scope = if let Some(channel) = self
                                     .durable
@@ -6639,7 +6678,7 @@ impl Cagents {
                         let session = runtime.session.clone();
                         self.commit_chat_session(target.card, session);
                         self.observe_agent_activity_for_card(target.card, Some(activity));
-                        return Task::none();
+                        return self.restart_chat_helper_if_idle(target);
                     }
                     // Taken above, for a parked conversation too.
                     Wake::AccountUsage => return Task::none(),
@@ -6660,6 +6699,14 @@ impl Cagents {
             Action::SignIn(target, account) => return self.sign_in_chat(target, account),
             Action::ResumeAfterSignIn(target) => {
                 return self.resume_after_sign_in(target);
+            }
+            Action::RestartHelper(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
+                if !runtime.snapshot.native_helper.as_ref().is_some_and(|helper| helper.outdated) {
+                    return Task::none();
+                }
+                runtime.helper_restart_requested = true;
+                return self.restart_chat_helper_if_idle(target);
             }
             Action::Reconnect(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7535,6 +7582,7 @@ impl Cagents {
                 return Task::batch([
                     self.dispatch_queued(target),
                     self.resume_history_navigation(target),
+                    self.restart_chat_helper_if_idle(target),
                 ]);
             }
             Action::Toggle(target, id) => {
@@ -16482,6 +16530,28 @@ mod tests {
         assert!(!chat_runtime(&app, card).changes.open);
         assert!(chat_runtime(&app, card).branch_picker);
     }
+    #[test]
+    fn helper_restart_waits_for_idle_without_losing_the_unsent_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        app.chat_runtime_mut(target).unwrap().replace_draft(text_editor::Content::with_text("unsent helper-update draft"));
+        let mut snapshot = handle.snapshot().as_ref().clone();
+        snapshot.native_helper = Some(chat::NativeHelper { version: "older".into(), outdated: true });
+        snapshot.busy = true;
+        snapshot.ready = true;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.handle_chat_ui(Action::RestartHelper(target)));
+        assert!(chat_runtime(&app, card).helper_restart_requested);
+        assert!(app.chat_ui.attempt(card).is_none(), "a running provider must not be closed");
+        assert_eq!(chat_runtime(&app, card).composer.text(), "unsent helper-update draft");
+        snapshot.busy = false;
+        handle.replace_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert!(app.chat_ui.attempt(card).is_some(), "the first idle publication starts the requested rollover");
+        assert_eq!(chat_runtime(&app, card).composer.text(), "unsent helper-update draft");
+    }
+
     #[test]
     fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

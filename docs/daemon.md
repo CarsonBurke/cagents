@@ -486,3 +486,19 @@ reviewed handoff before starting the replacement. Unlocked stale lease records
 do not block startup. Public staged-owner routing and explicit reviewed update
 handoffs keep their existing ownership checks; admission does not stop windows
 or hosted terminals automatically.
+
+## Native helper updates
+
+Native chat snapshots identify the helper build that owns the provider. A
+helper from an earlier build remains attached to its conversation and shows
+“Running on an outdated helper”. “Restart to update” waits for the conversation
+to become idle. The daemon then checks the exact actor generation after all
+previously admitted commands, proves old-owner and paired-terminal cleanup,
+and resumes the same external conversation through a new helper. A stale or
+busy idle check leaves the provider untouched. The composer draft is retained,
+and session storage accepts only the exact thread, account and launch-settings
+transition after provider confirmation.
+
+`cagents diagnostics` reports helper build age and zombie-child counts from
+read-only process observations. The native holder uses SIGCHLD/signalfd in its
+existing poll set; an idle helper has no periodic reaping timer.

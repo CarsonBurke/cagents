@@ -380,6 +380,7 @@ enum ConversionCheckpoint {
 enum ChatRecoveryKind {
     Account,
     Upgrade,
+    Helper,
 }
 
 #[derive(Debug)]
@@ -752,6 +753,12 @@ impl SessionRuntime {
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
     {
         self.rebind_chat(ChatRecoveryKind::Account, card_id, source, replacement)
+    }
+
+    pub fn rebind_chat_helper(&self, card_id: CardId, source: crate::chat::Session,
+        replacement: crate::chat::Session)
+        -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String> {
+        self.rebind_chat(ChatRecoveryKind::Helper, card_id, source, replacement)
     }
 
     /// Commit authenticated daemon-upgrade lineage before activating the chat.
@@ -1338,6 +1345,10 @@ trait SessionStore {
             "This store does not support terminal ownership recovery".into(),
         ))
     }
+    fn rebind_chat_helper(&self, _card_id: CardId, _source: &crate::chat::Session,
+        _replacement: &crate::chat::Session) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState("This store does not support helper recovery".into()))
+    }
     fn rebind_chat_upgrade(
         &self,
         _card_id: CardId,
@@ -1426,6 +1437,10 @@ impl SessionStore for StateStore {
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
+    fn rebind_chat_helper(&self, card_id: CardId, source: &crate::chat::Session,
+        replacement: &crate::chat::Session) -> Result<(), StoreError> {
+        StateStore::rebind_chat_helper(self, card_id, source, replacement)
     }
     fn rebind_chat_upgrade(
         &self,
@@ -1523,6 +1538,10 @@ impl SessionStore for Arc<StateStore> {
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
+    fn rebind_chat_helper(&self, card_id: CardId, source: &crate::chat::Session,
+        replacement: &crate::chat::Session) -> Result<(), StoreError> {
+        StateStore::rebind_chat_helper(self, card_id, source, replacement)
     }
     fn rebind_chat_upgrade(
         &self,
@@ -1892,6 +1911,8 @@ impl PendingWrites {
                 }
                 ConversionCheckpoint::ChatRecovery(recovery) => {
                     let result = match recovery.kind {
+                        ChatRecoveryKind::Helper => store.rebind_chat_helper(
+                            recovery.card, &recovery.source, &recovery.replacement),
                         ChatRecoveryKind::Account => store.rebind_chat_account(
                             recovery.card,
                             &recovery.source,
