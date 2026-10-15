@@ -252,11 +252,13 @@ impl Cagents {
         let value=match output.value {
             Ok(value)=>value,
             Err(OriginalError::Unavailable(_))=>{
-                // Editing is new user intent. A complete visible prompt can
-                // still be edited even if it predates original annotations;
-                // its current settings are never eligibility for Retry.
+                // Only a retained complete local submission proves that this
+                // fallback has the entire input. A visible first transport part
+                // can be incomplete even when its siblings are off the page.
+                // Current snapshot settings never establish Retry eligibility.
                 if let Purpose::Edit {branch}=&query.purpose
-                    && let Some(prompt)=query.user.as_deref().and_then(|id|runtime.recovery.for_user(&runtime.snapshot,id)) {
+                    && let Some(prompt)=query.user.as_deref().and_then(|id|runtime.recovery.submitted.as_ref()
+                        .filter(|prompt|prompt.user_id.as_deref()==Some(id)).cloned()) {
                     return self.finish_original_edit(target,prompt,branch.clone(),context.session);
                 }
                 if !matches!(query.purpose,Purpose::Metadata) {
@@ -441,6 +443,26 @@ mod tests {
         assert!(runtime.recovery.prepared_prompt.is_none());
         assert_eq!(runtime.composer.text(),"independently typed draft");
         assert_eq!(runtime.attachments,vec![Attachment {path:"/user/draft.png".into()}]);
+    }
+
+    #[test]
+    fn unavailable_original_cannot_edit_a_possibly_partial_visible_root() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let mut runtime=runtime();let target=runtime.target;
+        let item=Arc::new(chat::Item {id:"opaque-root".into(),role:chat::Role::User,started_at:None,at:None,
+            content:ItemContent::Text {text:"only the first visible transport part".into(),thinking:false,phase:chat::Phase::Final}});
+        let mut snapshot=(*runtime.snapshot).clone();snapshot.generation+=1;snapshot.items=vec![item];
+        runtime.handle().unwrap().publish_snapshot_for_test(snapshot);runtime.refresh();
+        runtime.sync_original();let context=Context::current(&runtime).unwrap();
+        runtime.recovery.originals.begin(target,context.clone(),runtime.handle().cloned().unwrap(),
+            Some("opaque-root".into()),Purpose::Edit {branch:None});
+        let id=runtime.recovery.originals.query_id_for_test();
+        app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        drop(app.original_ready(target,id,None,0,Reply::fixture(Err(OriginalError::Unavailable("no accepted record".into())))));
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.composer.is_empty(),"absence of visible sibling fragments is not completeness proof");
+        assert!(runtime.recovery.prepared_prompt.is_none());
+        assert_eq!(runtime.recovery.notice.as_deref(),Some("The complete original prompt is unavailable for this turn."));
     }
 
     #[test]
