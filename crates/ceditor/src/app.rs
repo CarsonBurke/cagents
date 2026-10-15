@@ -1625,44 +1625,6 @@ impl Editor {
         )
     }
 
-    fn editor_clipboard(&mut self, id: CardId, op: ClipboardOp) -> Task<Message> {
-        match op {
-            ClipboardOp::Copy => self
-                .tab(id)
-                .and_then(|tab| tab.runtime.selected_text())
-                .map_or_else(Task::none, |text| {
-                    iced::clipboard::write(text).map(cosmic::Action::App)
-                }),
-            ClipboardOp::Cut => {
-                let Some(text) = self.tab(id).and_then(|tab| tab.runtime.selected_text()) else {
-                    return Task::none();
-                };
-                Task::batch([
-                    iced::clipboard::write(text).map(cosmic::Action::App),
-                    self.update(Message::Repository(RepositoryAction::EditorAction {
-                        card: id,
-                        action: EditorAction::Edit(EditorEdit::Delete),
-                    })),
-                ])
-            }
-            ClipboardOp::Paste => iced::clipboard::read().map(move |text| {
-                cosmic::Action::App(match text {
-                    Some(text) => Message::Repository(RepositoryAction::EditorAction {
-                        card: id,
-                        action: EditorAction::Edit(EditorEdit::Paste(std::sync::Arc::new(text))),
-                    }),
-                    None => Message::RefreshVisible,
-                })
-            }),
-            ClipboardOp::SelectAll => {
-                self.update(Message::Repository(RepositoryAction::EditorAction {
-                    card: id,
-                    action: EditorAction::SelectAll,
-                }))
-            }
-        }
-    }
-
     fn save_as(&mut self, id: CardId) -> Task<Message> {
         let Some(tab) = self.tab(id).filter(|tab| self.tab_is_untitled(tab)) else {
             return Task::none();
@@ -3474,9 +3436,6 @@ impl Application for Editor {
                             });
                         }
                         return Task::none();
-                    }
-                    if let RepositoryAction::Clipboard { card, op } = action {
-                        return self.editor_clipboard(card, op);
                     }
                     if let RepositoryAction::OpenFile { path, .. } = action {
                         return self.request_file(id, path);
@@ -8343,6 +8302,54 @@ mod tests {
         assert!(app.tab(id).is_some());
         assert!(app.tab_is_untitled(app.tab(id).unwrap()));
         assert!(app.pending_save_as.is_some());
+    }
+
+    #[test]
+    fn standalone_captured_paste_receipt_retains_source_and_selection_through_host_dispatch() {
+        use cosmic::iced::futures::StreamExt;
+        for change in 0..4 {
+            let directory = git_fixture();
+            let root = directory.path();
+            std::fs::write(root.join("other.txt"), "other source\n").unwrap();
+            let mut app = editor();
+            let card = open_real_git(&mut app, root, Some("tracked.txt"));
+            let target = Arc::new(app.tab(card).unwrap().runtime.command_target(card));
+            let task = app.update(Message::Repository(RepositoryAction::CapturedCommand {
+                target,
+                action: Box::new(RepositoryAction::Clipboard { card, op: ClipboardOp::Paste }),
+            }));
+            let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let mut stream = iced::runtime::task::into_stream(task).expect("actual paste admission reads clipboard");
+            let channel = executor.block_on(async {
+                loop {
+                    let action = stream.next().await.expect("clipboard read effect");
+                    if let iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Read { channel, .. }) = action { break channel; }
+                }
+            });
+            match change {
+                1 => { drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: EditorAction::Edit(EditorEdit::Insert('x')) }))); }
+                2 => { drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: EditorAction::SelectAll }))); }
+                3 => { let task = app.request_file(card, "other.txt".into()); run_tasks(&mut app, task); }
+                _ => {}
+            }
+            let before = app.tab(card).unwrap().runtime.editor_text().unwrap();
+            channel.send(Some("PASTED".into())).expect("admitted clipboard receiver remains alive");
+            let receipts = executor.block_on(async {
+                let mut receipts = Vec::new();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action { receipts.push(message); }
+                }
+                receipts
+            });
+            assert_eq!(receipts.len(), 1);
+            for receipt in receipts {
+                assert!(matches!(&receipt, Message::Repository(RepositoryAction::PasteCaptured { .. })), "host must retain the shared fenced receipt");
+                drop(app.update(receipt));
+            }
+            let after = app.tab(card).unwrap().runtime.editor_text().unwrap();
+            if change == 0 { assert_eq!(after, format!("PASTED{before}")); }
+            else { assert_eq!(after, before, "new edit, native selection or document retires clipboard receipt"); }
+        }
     }
 
     #[test]
