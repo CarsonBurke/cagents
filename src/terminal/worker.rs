@@ -6632,7 +6632,12 @@ mod tests {
 
     #[test]
     fn concurrent_checked_close_cannot_hold_shutdown_behind_its_join() {
+        let reservation = joins::reserve().expect("test worker cleanup admission");
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        published
+            .join_reservation
+            .set(reservation)
+            .expect("test worker reserves cleanup before spawning");
         let completion = Arc::clone(&published);
         let (commands, _receiver) = command_channel(1);
         let (_events, event_receiver) = crossbeam_channel::unbounded();
@@ -6678,10 +6683,16 @@ mod tests {
             "shutdown waited on a lock held by join"
         );
         release.send(()).unwrap();
-        assert_eq!(
+        // This synthetic worker has no holder or family-cleanup receipt.
+        // Actual thread joining cannot turn its fake completion bit into
+        // authority to report the terminal family as closed.
+        assert!(matches!(
             closer.join().unwrap(),
-            super::super::ipc::TerminalCloseResult::Closed
-        );
+            super::super::ipc::TerminalCloseResult::Unknown(reason)
+                if reason.contains("no retained cleanup owner or published family proof")
+        ));
+        assert_eq!(handle.inner.published.worker_join.load(Ordering::Acquire), 2);
+        assert!(!handle.inner.published.cleanup_published.load(Ordering::Acquire));
     }
 
     #[test]
