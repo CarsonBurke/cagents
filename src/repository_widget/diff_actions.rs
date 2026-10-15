@@ -248,7 +248,7 @@ impl RepositoryRuntime {
                     });
                 }
                 self.viewports.editor = text_editor::ScrollPosition {
-                    line: line.saturating_sub(1) as usize,
+                    line: self.editor_line_for_diff_source(line),
                     vertical: 0.0,
                     horizontal: 0.0,
                 };
@@ -406,6 +406,7 @@ impl RepositoryRuntime {
     }
 
     fn reveal_diff_row(&mut self, row: usize) {
+        self.pending_diff_source = None;
         let fold = self.diff_layout().and_then(|layout| {
             let folded = layout.folded(self.diff_mode);
             match folded.row(folded.display(row)) {
