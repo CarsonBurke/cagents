@@ -260,20 +260,40 @@ impl From<PathBuf> for Cli {
 /// Unless `force`d, a cached answer another window observed within
 /// [`STALE_AFTER`] is returned instead of probing again.
 pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome {
+    let provider = account.provider;
+    let configuration = match tokio::task::spawn_blocking(move || {
+        crate::settings::agents::provider_settings(provider)
+    }).await {
+        Ok(Ok(configuration)) => configuration,
+        Ok(Err(error)) => return Outcome::Failed(error),
+        Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
+    };
+    run_configured(account, cache, force, configuration).await.1
+}
+
+/// The UI supplies its last acknowledged policy, so a queued worker cannot
+/// silently pair a newer disk policy with an older callback generation.
+/// Installation and metadata are resolved from this same immutable capture.
+pub(crate) async fn run_configured(
+    account: Account,
+    cache: Option<Cache>,
+    force: bool,
+    configuration: crate::settings::AgentLaunchSettings,
+) -> (bool, Outcome) {
     let now = now_ms();
     let search_path = search_path().await;
     let setup = {
         let account = account.clone();
         let cache = cache.clone();
         tokio::task::spawn_blocking(move || {
-            prepare(&account, cache.as_ref(), force, now, search_path.as_deref())
+            prepare(&account, cache.as_ref(), force, now, search_path.as_deref(), configuration)
         })
         .await
     };
-    let (cli, key, lock) = match setup {
-        Ok(Prepared::Done(outcome)) => return outcome,
-        Ok(Prepared::Probe { cli, key, lock }) => (cli, key, lock),
-        Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
+    let (cli, key, lock, cache) = match setup {
+        Ok(Prepared::Done { installed, outcome }) => return (installed, outcome),
+        Ok(Prepared::Probe { cli, key, lock, cache }) => (cli, key, lock, cache),
+        Err(_) => return (false, Outcome::Failed("The probe could not be prepared".into())),
     };
     let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &cli)).await;
     let outcome = match probed {
@@ -325,13 +345,14 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
             drop(lock);
         });
     }
-    outcome
+    (true, outcome)
 }
 
 enum Prepared {
-    Done(Outcome),
+    Done { installed: bool, outcome: Outcome },
     Probe {
         cli: Cli,
+        cache: Option<Cache>,
         key: Option<String>,
         lock: Option<crate::instance::OwnedLock>,
     },
@@ -343,30 +364,30 @@ fn prepare(
     force: bool,
     now: u64,
     search_path: Option<&OsStr>,
+    configuration: crate::settings::AgentLaunchSettings,
 ) -> Prepared {
     let unavailable = |detail: String| {
-        Prepared::Done(answered(
+        Prepared::Done { installed: false, outcome: answered(
             None,
             UsageSnapshot::state(UsageStatus::Unavailable, detail, now),
-        ))
+        ) }
     };
-    // An account whose home was never created was never set up. It is not a
-    // login to prompt for - most people have one of the two CLIs, not both -
-    // so it reports nothing rather than a "Sign in" chip.
-    if !account.resolved_home().is_some_and(|home| home.is_dir()) {
-        return unavailable(format!(
-            "{} has not been set up",
-            cli_name(account.provider)
-        ));
-    }
-    let cli = match Cli::capture(account.provider, search_path) {
+    let cli = match Cli::configured(account.provider, search_path, configuration) {
         Ok(cli) => cli,
         Err(CliFailure::Unavailable(error)) => return unavailable(error),
-        Err(CliFailure::Invalid(error)) => return Prepared::Done(Outcome::Failed(error)),
+        Err(CliFailure::Invalid(error)) => return Prepared::Done { installed: false, outcome: Outcome::Failed(error) },
     };
+    // CLI presence and account-home presence are distinct verdicts.
+    if !account.resolved_home().is_some_and(|home| home.is_dir()) {
+        return Prepared::Done { installed: true, outcome: answered(None,
+            UsageSnapshot::state(UsageStatus::Unavailable,
+                format!("{} has not been set up", cli_name(account.provider)), now)) };
+    }
     let key = account.cache_key();
+    let cache = cache.map(|cache| cache.for_cli(account.provider, &cli));
     let Some(cache) = cache else {
         return Prepared::Probe {
+            cache: None,
             cli,
             key,
             lock: None,
@@ -374,7 +395,7 @@ fn prepare(
     };
     let lock = match cache.try_probe_lock(&account.lock_name()) {
         Ok(Some(lock)) => Some(lock),
-        Ok(None) => return Prepared::Done(Outcome::Busy),
+        Ok(None) => return Prepared::Done { installed: true, outcome: Outcome::Busy },
         // Without a lock directory the probe still runs; it only loses the
         // guarantee that another window is not running the same one.
         Err(_) => None,
@@ -385,9 +406,9 @@ fn prepare(
     {
         let mut snapshot = entry.snapshot;
         snapshot.source = UsageSource::Cache;
-        return Prepared::Done(answered(entry.identity, snapshot));
+        return Prepared::Done { installed: true, outcome: answered(entry.identity, snapshot) };
     }
-    Prepared::Probe { cli, key, lock }
+    Prepared::Probe { cli, key, lock, cache: Some(cache) }
 }
 
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
@@ -1218,6 +1239,33 @@ fn rpc_result(mut frame: Value) -> RpcResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_probe_uses_only_cache_for_its_captured_execution_policy() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path().join("cache"));
+        let account = Account::linked(Provider::Claude, uuid::Uuid::new_v4(), directory.path().to_path_buf());
+        let key = account.cache_key().unwrap();
+        let now = now_ms();
+        let configuration = |name: &str| {
+            let executable = directory.path().join(name);
+            std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::settings::AgentLaunchSettings { executable: Some(executable.to_str().unwrap().into()), ..Default::default() }
+        };
+        let before = configuration("before");
+        let after = configuration("after");
+        cache.for_cli(Provider::Claude, &Cli::configured(Provider::Claude, None, before).ok().unwrap()).store(&key, Entry { identity: None, snapshot: UsageSnapshot::state(UsageStatus::Ok, "before", now) }).unwrap();
+        let after_cache = cache.for_cli(Provider::Claude, &Cli::configured(Provider::Claude, None, after.clone()).ok().unwrap());
+        match prepare(&account, Some(&cache), false, now, None, after.clone()) {
+            Prepared::Probe { cli, .. } => assert_eq!(cli.program, PathBuf::from(after.executable.as_ref().unwrap())),
+            _ => panic!("another policy's fresh cache must not answer"),
+        }
+        after_cache.store(&key, Entry { identity: None, snapshot: UsageSnapshot::state(UsageStatus::Ok, "after", now) }).unwrap();
+        assert!(matches!(prepare(&account, Some(&cache), false, now, None, after.clone()), Prepared::Done { installed: true, outcome: Outcome::Answered { snapshot, .. } } if snapshot.source == UsageSource::Cache && snapshot.detail.as_deref() == Some("after")));
+        assert!(matches!(prepare(&account, Some(&cache), true, now, None, after), Prepared::Probe { .. }), "policy refresh forces an actual CLI observation");
+    }
+
     #[test]
     fn explicit_authentication_failure_overrides_a_cached_identity() {
         let identity = Identity::default();

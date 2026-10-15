@@ -15241,6 +15241,7 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::SettingsSaved { generation, result } => {
+                let previous_policy = self.settings_base.clone();
                 let mut refresh_accounts = false;
                 match result {
                     Ok(saved) => {
@@ -15263,7 +15264,7 @@ impl Application for Cagents {
                     // Discovery reads saved execution policy. Run after the
                     // write acknowledgement, so it cannot observe old paths
                     // or environment while the settings save is still queued.
-                    self.accounts_surface_changed()
+                    self.accounts_policy_changed(&previous_policy)
                 } else {
                     Task::none()
                 }

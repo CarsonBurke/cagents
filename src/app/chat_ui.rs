@@ -11350,6 +11350,8 @@ mod tests {
             (alternate.clone(), account::UsageStatus::Ok),
         ] {
             let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                revision: 0,
+                installed: None,
                 owner: app.account_ui.probe_owner(&id).unwrap(),
                 id,
                 outcome: account::probe::Outcome::Answered {
@@ -13201,6 +13203,8 @@ mod tests {
         let now = crate::chat::now_ms().unwrap();
         // Live figures refine a reading the account already has.
         let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.probe_owner(&account).unwrap(),
             id: account.clone(),
             outcome: crate::account::probe::Outcome::Answered {
@@ -17510,6 +17514,8 @@ mod tests {
             ),
         ] {
             drop(app.update(Message::AccountUi(account_ui::Action::Probed {
+                revision: 0,
+                installed: None,
                 owner: app.account_ui.probe_owner(&id).unwrap(),
                 id: id.clone(),
                 outcome: account::probe::Outcome::Answered {

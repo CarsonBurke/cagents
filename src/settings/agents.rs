@@ -136,6 +136,13 @@ pub fn environment_reserved(provider: Provider, name: &str) -> bool {
 }
 
 impl AgentLaunchSettings {
+    /// Conversation presets do not change the CLI used for account metadata.
+    pub(crate) fn same_execution_policy(&self, other: &Self) -> bool {
+        self.executable == other.executable
+            && self.arguments == other.arguments
+            && self.environment == other.environment
+    }
+
     /// Resolve from this immutable policy capture so probes cannot pair an
     /// executable from one settings revision with arguments from another.
     /// A provider's explicit PATH applies to discovery as it does to launch.

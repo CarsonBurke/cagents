@@ -94,6 +94,8 @@ const COMPACT_WIDTH: f32 = design::OVERLAY_DOCK_BREAKPOINT;
 pub(super) struct State {
     accounts: Vec<AccountState>,
     installed: BTreeMap<Provider, bool>,
+    /// Only acknowledged execution changes advance these callback fences.
+    metadata_revisions: BTreeMap<Provider, u64>,
     registry: Registry,
     store: Option<Store>,
     homes: Option<Homes>,
@@ -170,6 +172,10 @@ impl OmpRecord {
 }
 
 impl State {
+    fn metadata_revision_matches(&self, provider: Provider, revisions: &BTreeMap<Provider, u64>) -> bool {
+        self.metadata_revisions.get(&provider).copied().unwrap_or(0) == revisions.get(&provider).copied().unwrap_or(0)
+    }
+
     pub(super) fn probe_owner(&self, id: &AccountId) -> Option<u64> {
         self.account(id).map(|state| state.owner)
     }
@@ -235,6 +241,7 @@ impl State {
         let mut state = Self {
             accounts: Vec::new(),
             installed: BTreeMap::new(),
+            metadata_revisions: BTreeMap::new(),
             registry,
             store,
             homes,
@@ -708,6 +715,8 @@ struct AccountState {
     /// A probe that came due while another account of the same provider was
     /// being probed, and starts once that one answers.
     queued: Option<Trigger>,
+    probe_revision: Option<u64>,
+    policy_refresh: bool,
     /// The login the account reported when the reader started signing it
     /// in, while that sign-in is watched for.
     signing_in_from: Option<Identity>,
@@ -737,6 +746,8 @@ impl AccountState {
             schedule: Schedule::default(),
             failure: None,
             queued: None,
+            probe_revision: None,
+            policy_refresh: false,
             signing_in_from: None,
             sign_in_terminal: None,
         }
@@ -864,12 +875,16 @@ pub enum Action {
     Install(Provider),
     Tick,
     Loaded(Loaded),
+    PolicyLoaded { revisions: BTreeMap<Provider, u64>, loaded: Loaded },
+    PolicyLocated { revisions: BTreeMap<Provider, u64>, restored: Vec<Restored>, installed: BTreeMap<Provider, bool> },
     /// Presence judged again on the shell's `PATH`, once it is known.
     Located {
         restored: Vec<Restored>,
         installed: BTreeMap<Provider, bool>,
     },
     Probed {
+        revision: u64,
+        installed: Option<bool>,
         owner: u64,
         id: AccountId,
         outcome: Outcome,
@@ -1057,8 +1072,32 @@ fn restore(
         .collect()
 }
 
-fn provider_installations(search_path: Option<&std::ffi::OsStr>) -> BTreeMap<Provider, bool> {
-    provider_installations_with(|provider| probe::Cli::discover(provider, search_path).is_ok())
+fn policy_for(policies: &BTreeMap<String, settings::AgentLaunchSettings>, provider: Provider) -> settings::AgentLaunchSettings {
+    policies.get(settings::agents::provider_key(provider)).cloned().unwrap_or_default()
+}
+
+fn configured_metadata(
+    accounts: &[Account], cache: Option<&Cache>, now: Millis,
+    policies: &BTreeMap<String, settings::AgentLaunchSettings>, search_path: Option<&std::ffi::OsStr>, prune: bool,
+) -> (Vec<Restored>, BTreeMap<Provider, bool>, BTreeMap<Provider, Catalog>) {
+    let mut restored = Vec::new();
+    let mut installed = BTreeMap::new();
+    let mut catalogs = BTreeMap::new();
+    for provider in Provider::ALL {
+        let cli = probe::Cli::configured(provider, search_path, policy_for(policies, provider)).ok();
+        installed.insert(provider, cli.is_some());
+        let cache = cache.zip(cli.as_ref()).map(|(cache, cli)| cache.for_cli(provider, cli));
+        let accounts: Vec<_> = accounts.iter().filter(|account| account.provider == provider).cloned().collect();
+        restored.extend(restore(&accounts, cache.as_ref(), now, &installed));
+        if let Some(cache) = cache {
+            if let Some(catalog) = cache.catalogs(now).remove(&provider) { catalogs.insert(provider, catalog); }
+            if prune {
+                let keep = accounts.iter().filter_map(Account::cache_key).collect();
+                if let Err(error) = cache.prune(&keep, now) { tracing::debug!(%error, "the account usage cache could not be pruned"); }
+            }
+        }
+    }
+    (restored, installed, catalogs)
 }
 
 fn provider_installations_with(
@@ -1669,6 +1708,8 @@ impl Cagents {
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let cache = self.account_ui.cache.clone();
+        let policies = self.settings_base.agents.clone();
+        let revisions = self.account_ui.metadata_revisions.clone();
         let load = cosmic::task::future(async move {
             let provisional = !probe::shell_asked();
             let search_path = probe::current_search_path();
@@ -1685,21 +1726,7 @@ impl Cagents {
                     .map(|registry| registry.accounts(homes.as_ref()))
                     .unwrap_or_else(|_| Account::system_accounts().into());
                 let now = now_ms();
-                let installed = provider_installations(search_path.as_deref());
-                let restored = restore(&accounts, cache.as_ref(), now, &installed);
-                let catalogs = cache
-                    .as_ref()
-                    .map(|cache| cache.catalogs(now))
-                    .unwrap_or_default();
-                // Not while the registry cannot be read, or its accounts' homes
-                // cannot be found, which would take every added account for
-                // one since removed.
-                if let (Some(cache), Ok(_), Some(_)) = (&cache, &registry, &homes) {
-                    let keep = accounts.iter().filter_map(Account::cache_key).collect();
-                    if let Err(error) = cache.prune(&keep, now) {
-                        tracing::debug!(%error, "the account usage cache could not be pruned");
-                    }
-                }
+                let (restored, installed, catalogs) = configured_metadata(&accounts, cache.as_ref(), now, &policies, search_path.as_deref(), registry.is_ok() && homes.is_some());
                 Loaded {
                     registry,
                     restored,
@@ -1716,7 +1743,7 @@ impl Cagents {
                 installed: BTreeMap::new(),
                 provisional,
             });
-            Message::AccountUi(Action::Loaded(loaded))
+            Message::AccountUi(Action::PolicyLoaded { revisions, loaded })
         });
         match self.start_omp_read() {
             Some(read) => Task::batch([load, read]),
@@ -1736,18 +1763,18 @@ impl Cagents {
             .map(|state| state.account.clone())
             .collect();
         let cache = self.account_ui.cache.clone();
+        let policies = self.settings_base.agents.clone();
+        let revisions = self.account_ui.metadata_revisions.clone();
         cosmic::task::future(async move {
             let search_path = probe::search_path().await;
             let (restored, installed) = tokio::task::spawn_blocking(move || {
-                let installed = provider_installations(search_path.as_deref());
-                (
-                    restore(&accounts, cache.as_ref(), now_ms(), &installed),
-                    installed,
-                )
+                let (restored, installed, _) = configured_metadata(&accounts, cache.as_ref(), now_ms(), &policies, search_path.as_deref(), false);
+                (restored, installed)
             })
             .await
             .unwrap_or_default();
-            Message::AccountUi(Action::Located {
+            Message::AccountUi(Action::PolicyLocated {
+                revisions,
                 restored,
                 installed,
             })
@@ -1840,6 +1867,31 @@ impl Cagents {
         })
     }
 
+    /// A local persisted policy changed. Keep an old worker's real slot
+    /// until it returns, then force one probe of the latest accepted policy.
+    pub(super) fn accounts_policy_changed(&mut self, previous: &AppSettings) -> Task<Message> {
+        if crate::device::is_remote() { return Task::none(); }
+        let mut changed = false;
+        for provider in Provider::ALL {
+            let before = policy_for(&previous.agents, provider);
+            let after = policy_for(&self.settings_base.agents, provider);
+            if before.same_execution_policy(&after) { continue; }
+            changed = true;
+            *self.account_ui.metadata_revisions.entry(provider).or_default() += 1;
+            self.account_ui.installed.remove(&provider);
+            self.account_ui.catalogs.remove(&provider);
+            self.account_ui.catalogs_unsaved.remove(&provider);
+            for state in self.account_ui.accounts.iter_mut().filter(|state| state.account.provider == provider) {
+                state.schedule.invalidate();
+                state.policy_refresh = true;
+                state.queued = Some(Trigger::Focus);
+            }
+        }
+        if !changed { return Task::none(); }
+        self.refresh_chat_drafts();
+        Task::batch([self.locate_accounts(), self.probe_accounts(Trigger::Focus)])
+    }
+
     /// The status bar was shown or hidden, or the Accounts pane opened.
     pub(super) fn accounts_surface_changed(&mut self) -> Task<Message> {
         if !self.settings.show_status_bar {
@@ -1890,7 +1942,7 @@ impl Cagents {
     fn probe_accounts(&mut self, trigger: Trigger) -> Task<Message> {
         let now = now_ms();
         self.account_ui.now_ms = now;
-        if !self.accounts_surface_visible() {
+        if !self.accounts_surface_visible() && !self.account_ui.accounts.iter().any(|state| state.policy_refresh) {
             return Task::none();
         }
         let ids: Vec<AccountId> = self
@@ -1929,6 +1981,8 @@ impl Cagents {
             return None;
         }
         let provider = account.provider;
+        let revision = self.account_ui.metadata_revisions.get(&provider).copied().unwrap_or(0);
+        let configuration = policy_for(&self.settings_base.agents, provider);
         let busy = self.account_ui.provider_busy(provider, id, now);
         let state = self.account_ui.account_mut(id)?;
         // Figures from before a reset are wrong however recent they are, so
@@ -1944,7 +1998,8 @@ impl Cagents {
             }
             trigger => trigger,
         };
-        if !state.schedule.should_probe(trigger, now, focused) {
+        let policy_due = state.policy_refresh && focused && !state.schedule.in_flight(now);
+        if !policy_due && !state.schedule.should_probe(trigger, now, focused) {
             return None;
         }
         if busy {
@@ -1958,13 +2013,15 @@ impl Cagents {
         state.queued = None;
         // The cache is only as fresh as the last probe, which is exactly
         // what a reader asking again, or signing in, is trying to get past.
-        let force = trigger == Trigger::Manual || state.schedule.awaiting_login(now);
+        let force = state.policy_refresh || trigger == Trigger::Manual || state.schedule.awaiting_login(now);
+        state.probe_revision = Some(revision);
         state.schedule.start(trigger, now);
         let account = state.account.clone();
         let id = state.id.clone();
         let owner = state.owner;
         let probe = cosmic::task::future(async move {
-            let outcome = if crate::device::is_remote() {
+            let (installed, outcome) = if crate::device::is_remote() {
+                (None,
                 tokio::task::spawn_blocking(move || {
                     match crate::device_service::request(
                         crate::device_service::Operation::AccountProbe { account, force },
@@ -1978,11 +2035,12 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result)
-                .unwrap_or_else(Outcome::Failed)
+                .unwrap_or_else(Outcome::Failed))
             } else {
-                probe::run(account, cache, force).await
+                let (installed, outcome) = probe::run_configured(account, cache, force, configuration).await;
+                (Some(installed), outcome)
             };
-            Message::AccountUi(Action::Probed { owner, id, outcome })
+            Message::AccountUi(Action::Probed { revision, installed, owner, id, outcome })
         });
         // The refresh control comes back the moment its debounce lifts,
         // rather than on whichever tick next reads the clock.
@@ -2276,6 +2334,21 @@ impl Cagents {
                 task
             }
             Action::Tick => self.probe_accounts(Trigger::Tick),
+            Action::PolicyLoaded { revisions, mut loaded } => {
+                loaded.installed.retain(|provider, _| self.account_ui.metadata_revision_matches(*provider, &revisions));
+                loaded.catalogs.retain(|provider, _| self.account_ui.metadata_revision_matches(*provider, &revisions));
+                loaded.restored.retain(|entry| Provider::ALL.into_iter().find(|provider| entry.id.as_str().starts_with(&format!("{}/", provider.executable()))).is_some_and(|provider| self.account_ui.metadata_revision_matches(provider, &revisions)));
+                // Preserve newer verdicts while a stale startup read finishes.
+                loaded.installed.extend(self.account_ui.installed.clone());
+                self.update_account_ui(Action::Loaded(loaded))
+            }
+            Action::PolicyLocated { revisions, mut restored, mut installed } => {
+                restored.retain(|entry| self.account_ui.account(&entry.id).is_some_and(|state| self.account_ui.metadata_revision_matches(state.account.provider, &revisions)));
+                installed.retain(|provider, _| self.account_ui.metadata_revision_matches(*provider, &revisions));
+                self.account_ui.installed.extend(installed);
+                self.account_ui.restore(restored);
+                Task::none()
+            }
             Action::Loaded(loaded) => {
                 self.account_ui.installed = loaded.installed;
                 let mut migration = Task::none();
@@ -2321,7 +2394,22 @@ impl Cagents {
                 self.account_ui.restore(restored);
                 Task::none()
             }
-            Action::Probed { owner, id, outcome } => self.account_probed(id, owner, outcome),
+            Action::Probed { revision, installed, owner, id, outcome } => {
+                let Some(state) = self.account_ui.account(&id).filter(|state| state.owner == owner) else { return Task::none(); };
+                let provider = state.account.provider;
+                if revision != self.account_ui.metadata_revisions.get(&provider).copied().unwrap_or(0) {
+                    if state.probe_revision != Some(revision) { return Task::none(); }
+                    let state = self.account_ui.account_mut(&id).unwrap();
+                    state.schedule.abandon();
+                    state.probe_revision = None;
+                    return self.probe_account(&id, Trigger::Focus, now_ms()).unwrap_or_else(Task::none);
+                }
+                if let Some(installed) = installed { self.account_ui.installed.insert(provider, installed); }
+                let state = self.account_ui.account_mut(&id).unwrap();
+                state.probe_revision = None;
+                if !matches!(&outcome, Outcome::Busy) { state.policy_refresh = false; }
+                self.account_probed(id, owner, outcome)
+            },
             Action::OmpRead(history) => {
                 let now = now_ms();
                 self.account_ui.now_ms = now;
@@ -5203,6 +5291,73 @@ mod tests {
     const NOW: Millis = 1_790_000_000_000;
 
     #[test]
+    fn saved_execution_policy_refreshes_recent_metadata_and_refuses_old_probe_callbacks() {
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        app.settings.show_status_bar = true;
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 9101);
+        let now = now_ms();
+        // Other accounts are recent so this account owns the single-flight slot.
+        for state in &mut app.account_ui.accounts { state.schedule.succeed(now); }
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.schedule.start(Trigger::Focus, now);
+        state.probe_revision = Some(0);
+        app.account_ui.installed.insert(Provider::Claude, true);
+        let model = |id: &str| crate::chat::Model { id: id.into(), label: id.into(), reasoning: Vec::new() };
+        app.account_ui.catalogs.insert(Provider::Claude, Catalog { models: vec![model("old")], observed_at: now });
+        let old_load = Action::PolicyLocated { revisions: BTreeMap::new(), restored: Vec::new(), installed: BTreeMap::from([(Provider::Claude, false)]) };
+        // Exercise the real settings acknowledgement twice while the old probe
+        // owns its slot. Only the last saved policy may populate the catalog.
+        for (generation, pin) in [(1, "/policy/first"), (2, "/policy/latest")] {
+            app.settings.agents.entry("claude".into()).or_default().executable = Some(pin.into());
+            drop(app.update(Message::SettingsSaved { generation, result: Ok(SettingsSaved { generation, path: PathBuf::from("/unused/settings.toml"), settings: app.settings.clone() }) }));
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(state.schedule.in_flight(now));
+            assert_eq!(state.probe_revision, Some(0), "old worker retains the slot");
+            assert!(state.policy_refresh);
+        }
+        assert!(app.account_ui.catalog(Provider::Claude).is_none());
+        assert!(!app.account_ui.installed.contains_key(&Provider::Claude));
+        drop(app.update(Message::AccountUi(old_load)));
+        assert!(!app.account_ui.installed.contains_key(&Provider::Claude));
+        let answer = |revision, installed, name: &str| Message::AccountUi(Action::Probed {
+            revision, installed: Some(installed), owner, id: id.clone(),
+            outcome: Outcome::Answered { identity: None, snapshot: UsageSnapshot::state(UsageStatus::Ok, name, now), catalog: Some(Catalog { models: vec![model(name)], observed_at: now }) },
+        });
+        drop(app.update(answer(0, false, "stale")));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.owner, owner, "policy is independent of account-home authority");
+        assert_eq!(state.probe_revision, Some(2), "latest policy starts after actual completion");
+        assert!(state.schedule.in_flight(now_ms()));
+        assert!(app.account_ui.catalog(Provider::Claude).is_none());
+        drop(app.update(Message::AccountUi(Action::PolicyLoaded {
+            revisions: BTreeMap::new(),
+            loaded: Loaded { registry: Ok(app.account_ui.registry.clone()),
+                restored: vec![Restored { id: id.clone(), present: false, entry: None }],
+                installed: BTreeMap::from([(Provider::Claude, false)]),
+                catalogs: BTreeMap::from([(Provider::Claude, Catalog { models: vec![model("stale startup")], observed_at: now + 1 })]),
+                provisional: false,
+            },
+        })));
+        assert!(app.account_ui.catalog(Provider::Claude).is_none());
+        assert_eq!(app.account_ui.account(&id).unwrap().probe_revision, Some(2));
+        // Duplicate old completion cannot release the new worker or install data.
+        drop(app.update(answer(0, false, "duplicate")));
+        assert_eq!(app.account_ui.account(&id).unwrap().probe_revision, Some(2));
+        drop(app.update(answer(2, true, "latest")));
+        assert_eq!(app.account_ui.installed.get(&Provider::Claude), Some(&true));
+        assert_eq!(app.account_ui.catalog(Provider::Claude).unwrap().models[0].id, "latest");
+        // Conversation-only preset changes do not retire this metadata.
+        let revision = app.account_ui.metadata_revisions[&Provider::Claude];
+        let mut next = app.settings_base.clone();
+        next.agents.get_mut("claude").unwrap().model = Some("other".into());
+        drop(app.update(Message::SettingsSaved { generation: 3, result: Ok(SettingsSaved { generation: 3, path: PathBuf::from("/unused/settings.toml"), settings: next }) }));
+        assert_eq!(app.account_ui.metadata_revisions[&Provider::Claude], revision);
+        assert_eq!(app.account_ui.catalog(Provider::Claude).unwrap().models[0].id, "latest");
+    }
+
+    #[test]
     fn provider_status_does_not_treat_retained_signed_out_identity_as_available() {
         for provider in [Provider::Claude, Provider::Codex] {
             let mut state = State::new(None, None, None);
@@ -6306,6 +6461,8 @@ mod app_tests {
 
     fn signed_in_as(app: &Cagents, id: &AccountId, email: &str) -> Message {
         Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
@@ -6647,6 +6804,8 @@ mod app_tests {
         let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
         // Its token expired: signed out, still the account it was.
         let _ = app.update(Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
@@ -6855,6 +7014,8 @@ mod app_tests {
             binding: false,
         }];
         let _ = app.update(Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
@@ -6867,6 +7028,8 @@ mod app_tests {
         assert!(state.present);
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
         let _ = app.update(Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Failed("timed out".into()),
@@ -6880,6 +7043,8 @@ mod app_tests {
         let mut older = UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW - 1);
         older.source = UsageSource::Cache;
         let _ = app.update(Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
@@ -6965,6 +7130,8 @@ mod app_tests {
         let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "ok", now - 5_000);
         snapshot.source = UsageSource::Probe;
         let _ = app.update(Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&managed).unwrap().owner,
             id: managed.clone(),
             outcome: Outcome::Answered {
@@ -7061,6 +7228,8 @@ mod app_tests {
         probed.detail = None;
         probed.plan = Some("max".into());
         let _ = app.update(Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&managed).unwrap().owner,
             id: managed.clone(),
             outcome: Outcome::Answered {
@@ -7184,6 +7353,8 @@ mod app_tests {
         let mut probed = cached(0.8).snapshot;
         probed.observed_at = now + 1;
         let _ = app.update(Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&codex).unwrap().owner,
             id: codex.clone(),
             outcome: Outcome::Answered {
@@ -7246,6 +7417,8 @@ mod app_tests {
         let id = Account::system(Provider::Codex).id();
         let now = now_ms();
         let _ = app.update(Message::AccountUi(Action::Probed {
+            revision: 0,
+            installed: None,
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {

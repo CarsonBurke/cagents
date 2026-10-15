@@ -1306,19 +1306,30 @@ fn accounts() -> Result<Reply, String> {
         .build()
         .map_err(|error| error.to_string())?;
     let search_path = runtime.block_on(probe::search_path());
-    let installed = [
-        crate::agent::Provider::Claude,
-        crate::agent::Provider::Codex,
-        crate::agent::Provider::Omp,
-    ]
-    .into_iter()
-    .map(|provider| {
-        (
-            provider,
-            probe::Cli::discover(provider, search_path.as_deref()).is_ok(),
-        )
-    })
-    .collect();
+    // Capture all daemon execution policies once; installation and cached
+    // metadata in this snapshot must describe the same saved policy.
+    let policies = crate::settings::default_path()
+        .and_then(crate::settings::load)
+        .map(|settings| settings.agents);
+    let mut installed = std::collections::BTreeMap::new();
+    let mut entries = std::collections::BTreeMap::new();
+    let mut catalogs = std::collections::BTreeMap::new();
+    for provider in crate::agent::Provider::ALL {
+        let Some(policies) = policies.as_ref().ok() else {
+            installed.insert(provider, false);
+            continue;
+        };
+        let configuration = policies.get(crate::settings::agents::provider_key(provider)).cloned().unwrap_or_default();
+        let cli = probe::Cli::configured(provider, search_path.as_deref(), configuration).ok();
+        installed.insert(provider, cli.is_some());
+        if let Some((cache, cli)) = cache.as_ref().zip(cli.as_ref()) {
+            let cache = cache.for_cli(provider, cli);
+            entries.extend(cache.load(now));
+            if let Some(catalog) = cache.catalogs(now).remove(&provider) {
+                catalogs.insert(provider, catalog);
+            }
+        }
+    }
     let cache_keys = registry
         .accounts(homes.as_ref())
         .into_iter()
@@ -1336,14 +1347,8 @@ fn accounts() -> Result<Reply, String> {
                     .map(|home| (provider, home))
             })
             .collect(),
-        entries: cache
-            .as_ref()
-            .map(|cache| cache.load(now))
-            .unwrap_or_default(),
-        catalogs: cache
-            .as_ref()
-            .map(|cache| cache.catalogs(now))
-            .unwrap_or_default(),
+        entries,
+        catalogs,
         installed,
     };
     serde_json::to_value(snapshot)
