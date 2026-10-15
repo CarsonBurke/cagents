@@ -3,11 +3,30 @@ pub use iced::widget::Text;
 use iced_core::text::LineHeight;
 use std::borrow::Cow;
 
+thread_local! {
+    static DEFAULT_SIZE: std::cell::Cell<f32> = const { std::cell::Cell::new(14.0) };
+}
+
+/// Set the default size for subsequently constructed interface text on this UI
+/// thread. Explicit typography presets and `.size()` overrides retain their size.
+pub fn set_default_size(size: f32) {
+    if size.is_finite() && size > 0.0 {
+        DEFAULT_SIZE.with(|current| current.set(size));
+    }
+}
+
+/// The size inherited by unsized interface text on this UI thread.
+pub fn default_size() -> f32 {
+    DEFAULT_SIZE.with(std::cell::Cell::get)
+}
+
 /// Creates a new [`Text`] widget with the provided content.
 ///
 /// [`Text`]: widget::Text
 pub fn text<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Text<'a, crate::Theme, Renderer> {
-    Text::new(text.into()).font(crate::font::default())
+    Text::new(text.into())
+        .font(crate::font::default())
+        .size(default_size())
 }
 
 /// Available presets for text typography
