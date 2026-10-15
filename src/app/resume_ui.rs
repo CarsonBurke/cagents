@@ -769,10 +769,7 @@ impl Cagents {
             return Task::none();
         }
         let session = &entry.session;
-        if matches!(
-            session.native_continuity,
-            chat::NativeContinuity::Durable { .. }
-        ) {
+        if session.native_continuity.retains_provider() {
             let generation = self.resume_ui.generation;
             self.resume_ui.loading = true;
             return cosmic::task::future(async move {
@@ -801,10 +798,7 @@ impl Cagents {
             self.resume_error("This conversation's project folder is unavailable. Restore the folder before resuming.");
             return Task::none();
         }
-        if !matches!(
-            session.native_continuity,
-            chat::NativeContinuity::Durable { .. }
-        ) {
+        if !session.native_continuity.retains_provider() {
             session.reset_owned_codex_listener();
             session.id = TerminalId::new();
             session.proof = None;

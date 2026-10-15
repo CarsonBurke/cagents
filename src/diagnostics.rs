@@ -627,12 +627,52 @@ impl ProductReport {
     }
 }
 #[derive(Debug, Serialize)]
+pub struct HolderReport {
+    pub terminal: crate::model::TerminalId,
+    pub pid: i32,
+    pub kind: String,
+    pub version: Option<String>,
+    pub outdated: bool,
+    /// None means the holder changed or procfs could not be inspected.
+    pub zombie_children: Option<usize>,
+}
+
+fn observe_holders() -> (bool, Vec<HolderReport>) {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let mut readable = true;
+    let mut holders = Vec::new();
+    for kind in [Kind::Terminal, Kind::Native] {
+        match registry::observed(kind) {
+            Ok(records) => holders.extend(records.into_iter().map(|record| {
+                HolderReport {
+                    terminal: record.terminal,
+                    pid: record.holder.pid,
+                    kind: match kind {
+                        Kind::Terminal => "terminal",
+                        Kind::Native => "native",
+                    }
+                    .into(),
+                    version: record.build.as_ref().map(|build| build.version.clone()),
+                    outdated: record.is_outdated(),
+                    zombie_children: record.zombie_children().ok(),
+                }
+            })),
+            Err(_) => readable = false,
+        }
+    }
+    holders.sort_by_key(|holder| holder.pid);
+    (readable, holders)
+}
+
+#[derive(Debug, Serialize)]
 pub struct Report {
     pub schema_version: u16,
     pub cli_version: &'static str,
     pub cli_protocol: u16,
     pub path: PathBuf,
     pub products: Vec<ProductReport>,
+    pub holders_readable: bool,
+    pub holders: Vec<HolderReport>,
 }
 impl Report {
     pub fn human(&self) -> String {
@@ -666,14 +706,35 @@ impl Report {
                 ));
             }
         }
+        lines.push(if self.holders_readable {
+            format!("Live holder observations: {}", self.holders.len())
+        } else {
+            "Live holder observations: partially unavailable".into()
+        });
+        for holder in &self.holders {
+            lines.push(format!(
+                "{} holder {}: terminal={}, version={}, outdated={}, zombie_children={}",
+                holder.kind,
+                holder.pid,
+                holder.terminal,
+                holder.version.as_deref().unwrap_or("unknown"),
+                holder.outdated,
+                holder
+                    .zombie_children
+                    .map_or_else(|| "unknown".into(), |count| count.to_string())
+            ));
+        }
         lines.join("\n")
     }
 }
 
-/// This intentionally reads only recorded evidence, never runtime sockets,
-/// installation routes or databases. Absence is not proof of a clean shutdown.
+/// Reads recorded lifecycle evidence and a read-only procfs snapshot of live
+/// holders. It never starts services or connects to runtime sockets. Absence
+/// of recorded evidence is not proof of a clean shutdown.
 pub fn inspect() -> io::Result<Report> {
-    inspect_at(state_path()?)
+    let mut report = inspect_at(state_path()?)?;
+    (report.holders_readable, report.holders) = observe_holders();
+    Ok(report)
 }
 fn inspect_at(path: PathBuf) -> io::Result<Report> {
     let (dir, readable) = match directory(&path, false) {
@@ -697,6 +758,8 @@ fn inspect_at(path: PathBuf) -> io::Result<Report> {
         cli_protocol: crate::terminal::ipc::PROTOCOL_VERSION,
         path,
         products,
+        holders_readable: true,
+        holders: Vec::new(),
     })
 }
 

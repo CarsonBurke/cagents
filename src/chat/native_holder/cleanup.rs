@@ -62,6 +62,36 @@ pub(super) fn publish(
     save(&path, &receipt)
 }
 
+pub(crate) fn publish_actor_close(
+    record: &Record,
+    proof: &HostSessionProof,
+    source: &crate::chat::Session,
+    lineage: &[crate::chat::Session],
+    paired_holder: Option<&Record>,
+) -> Result<(), String> {
+    let receipt = Receipt {
+        record: record.clone(),
+        proof: proof.clone(),
+        sources: lineage
+            .iter()
+            .chain(std::iter::once(source))
+            .map(source_digest)
+            .collect::<Result<_, _>>()?,
+        paired_closed: paired_holder.is_none(),
+        paired_holder: paired_holder.cloned(),
+    };
+    save(&path(record.terminal, &record.holder)?, &receipt)
+}
+
+pub(crate) fn actor_close_proved(
+    record: &Record,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
+    consume(record.terminal, &record.holder, true, |receipt| {
+        receipt.record == *record && receipt.proof == *proof
+    })
+}
+
 fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
     let parent = path
         .parent()
@@ -145,11 +175,11 @@ pub(super) struct Startup {
 impl Startup {
     pub fn consume(&self) -> Result<bool, String> {
         consume(self.terminal, &self.holder, false, |receipt| {
-            receipt.record.version == 3
+            matches!(receipt.record.version, 3 | 4)
                 && receipt.record.terminal == self.terminal
                 && receipt.record.holder == self.holder
                 && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
+                && crate::daemon::holder_registry::record_application_matches(&receipt.record)
                 && receipt.record.boot == self.proof.boot_id
                 && receipt.proof == self.proof
         })
@@ -188,6 +218,7 @@ fn consume(
     if retain {
         return Ok(true);
     }
+    crate::chat::runtime::remove_actor_final_snapshot(&receipt.record)?;
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -263,11 +294,11 @@ fn find_source(
         let holder = Process { pid, start };
         let mut matched = None;
         let complete = consume(source.id, &holder, true, |receipt| {
-            if receipt.record.version == 3
+            if matches!(receipt.record.version, 3 | 4)
                 && receipt.record.terminal == source.id
                 && receipt.record.holder == holder
                 && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
+                && crate::daemon::holder_registry::record_application_matches(&receipt.record)
                 && receipt.record.boot == proof.boot_id
                 && receipt.proof.boot_id == proof.boot_id
                 && receipt.proof.is_complete()

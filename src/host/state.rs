@@ -275,6 +275,10 @@ pub(crate) struct HostState {
     model_watchers: BTreeSet<ClientId>,
     client_pids: BTreeMap<ClientId, u32>,
     pub(super) notifications: Option<super::notifications::Handle>,
+    pub(super) native_actor_restarts:
+        BTreeMap<TerminalId, super::chat::retained_actor::PreparedRestart>,
+    pub(super) native_actor_outcomes: Option<super::chat::retained_actor::Broker>,
+    pub(super) native_actor_startups: BTreeMap<TerminalId, super::chat::retained_actor::Startup>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
     notification_activation:
@@ -285,6 +289,8 @@ pub(crate) struct HostState {
     pub(super) inventory_generation: u64,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
+    pub(super) chat_transition_gates: BTreeMap<TerminalId, std::sync::Weak<Mutex<()>>>,
+    pub(super) chat_restarts: BTreeMap<TerminalId, super::chat::restart::Restart>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
@@ -340,6 +346,9 @@ impl HostState {
             model_watchers: BTreeSet::new(),
             client_pids: BTreeMap::new(),
             notifications: None,
+            native_actor_restarts: BTreeMap::new(),
+            native_actor_outcomes: None,
+            native_actor_startups: BTreeMap::new(),
             notification_closed: BTreeSet::new(),
             notification_watchers: BTreeMap::new(),
             notification_activation: BTreeMap::new(),
@@ -349,6 +358,8 @@ impl HostState {
             inventory_generation: 0,
             shutdown_capabilities: VecDeque::new(),
             chats: BTreeMap::new(),
+            chat_transition_gates: BTreeMap::new(),
+            chat_restarts: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
@@ -1131,6 +1142,32 @@ impl HostState {
         self.detach(0, source.id)
     }
 
+    /// Typed native recovery may inspect this authenticated current worker
+    /// before its durable native-console association has been installed.
+    pub(super) fn native_terminal_projection(
+        &self,
+        id: TerminalId,
+    ) -> Result<TerminalSession, String> {
+        let terminal = self
+            .terminals
+            .get(&id)
+            .ok_or("The native console worker is unavailable")?;
+        if terminal.handle.is_completed() || !self.proof().is_complete() {
+            return Err(
+                "The native console worker completed or its current ownership is unavailable"
+                    .into(),
+            );
+        }
+        let proof = self.proof();
+        let mut current = terminal.session.clone();
+        current.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        Ok(current)
+    }
+
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
@@ -1874,12 +1911,11 @@ fn prepare_upgrade_with_carry_policy(
         // A durable native holder also keeps its paired terminal alive. Its
         // exact environment remains only in the two holders' private memory.
         let carries = |id: &TerminalId, record: &TerminalRecord| {
-            (state.chats.get(id).is_some_and(|chat| {
-                matches!(
-                    chat.handle.native_continuity(),
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
-            }) || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
+            (state
+                .chats
+                .get(id)
+                .is_some_and(|chat| chat.handle.native_continuity().retains_provider())
+                || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
                 && holders.is_some()
         };
         let carried = state
@@ -1934,13 +1970,10 @@ fn prepare_upgrade_with_carry_policy(
             }
             let mut source = record.session.clone();
             source.native_continuity = record.handle.native_continuity();
-            if matches!(
-                source.native_continuity,
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+            if source.native_continuity.retains_provider() {
                 source.launch.session_id = record.handle.confirmed_session_id();
-                crate::chat::protocol::align_resume_identity(&mut source.launch)
-                    .map_err(upgrade_error)?;
+                // The issued recipe is immutable. Only the separate effective
+                // launch below may adopt the provider-confirmed resume identity.
             }
             let mut launch = source.launch.clone();
             launch.session_id = record.handle.confirmed_session_id();
@@ -1951,7 +1984,12 @@ fn prepare_upgrade_with_carry_policy(
             // final conversation.
             super::super::chat::protocol::align_resume_identity(&mut launch)
                 .map_err(upgrade_error)?;
-            if launch.terminal_recipe().is_none() {
+            if launch.terminal_recipe().is_none()
+                && !matches!(
+                    source.native_continuity,
+                    crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+                )
+            {
                 return Err(upgrade_error(format!(
                     "Native chat {} has no exact resumable conversation; wait for provider initialization or close it explicitly",
                     source.id
@@ -1970,10 +2008,7 @@ fn prepare_upgrade_with_carry_policy(
                 .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
                 && state.terminals.contains_key(&source.id)
-                && !matches!(
-                    source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+                && !source.native_continuity.retains_provider()
             {
                 if source.proof.as_ref() != Some(state.proof())
                     || source
@@ -2283,10 +2318,7 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
-            let durable = matches!(
-                handle.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            );
+            let durable = handle.native_continuity().retains_provider();
             if durable {
                 handle.preserve_for_restart()?;
             } else {
@@ -2661,12 +2693,11 @@ fn restore_upgrade_from(
         return Ok(Vec::new());
     };
     checkpoint.validate()?;
-    if checkpoint.chats.iter().any(|chat| {
-        !matches!(
-            chat.source.native_continuity,
-            crate::chat::NativeContinuity::Durable { .. }
-        )
-    }) {
+    if checkpoint
+        .chats
+        .iter()
+        .any(|chat| !chat.source.native_continuity.retains_provider())
+    {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
             store.path.display()
@@ -2678,10 +2709,7 @@ fn restore_upgrade_from(
     for chat in &checkpoint.chats {
         // A private holder authenticates the exact still-running server. Its
         // presence is the purpose of adoption, not permission to relaunch it.
-        if matches!(
-            chat.source.native_continuity,
-            crate::chat::NativeContinuity::Durable { .. }
-        ) {
+        if chat.source.native_continuity.retains_provider() {
             continue;
         }
         let terminal = TerminalSession {
@@ -2720,10 +2748,7 @@ fn restore_upgrade_from(
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
             if super::chat::owns_codex_listener(&chat.source)
-                && !matches!(
-                    chat.source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+                && !chat.source.native_continuity.retains_provider()
             {
                 super::chat::restore_upgrade(host, chat)?;
             }
@@ -2753,11 +2778,7 @@ fn restore_upgrade_from(
         // checkpoint, but their authenticated holders retain the final screen.
         // Restore those receipts before requiring a native pair to match.
         if checkpoint.chats.iter().any(|chat| {
-            chat.source.terminal.is_some()
-                && matches!(
-                    chat.source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+            chat.source.terminal.is_some() && chat.source.native_continuity.retains_provider()
         }) {
             restore_orphaned_holders(host)?;
         }
@@ -2767,10 +2788,7 @@ fn restore_upgrade_from(
         // thread's rollout, is that conversation's problem to report, not a
         // reason to keep every other session and the daemon itself down.
         for chat in &checkpoint.chats {
-            if !matches!(
-                chat.source.native_continuity,
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+            if !chat.source.native_continuity.retains_provider() {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -3197,10 +3215,7 @@ fn close_failed_restore(
         )
     };
     for chat in chats {
-        if matches!(
-            chat.native_continuity(),
-            crate::chat::NativeContinuity::Durable { .. }
-        ) {
+        if chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()?;
         } else {
             chat.close()?;

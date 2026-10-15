@@ -30,11 +30,15 @@ pub(super) use automations::Claimed;
 mod execution;
 mod lineage;
 mod mailbox;
+mod native_actor;
+mod native_actor_retirement;
 mod navigation;
+pub(super) use native_actor::NativeActorEvent;
+pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 16;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -622,6 +626,12 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 12 {
         mailbox::migrate_attention(db)?;
+    }
+    if version < 15 {
+        native_actor::migrate(db)?;
+    }
+    if version < 16 {
+        native_actor_retirement::migrate(db)?;
     }
     Ok(())
 }

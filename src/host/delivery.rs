@@ -101,6 +101,7 @@ fn chat_page(message: &ServerMessage) -> bool {
         message,
         ServerMessage::Response {
             response: ServerResponse::ChatAttached { .. }
+                | ServerResponse::ChatRestarted { .. }
                 | ServerResponse::ChatSnapshot { .. }
                 | ServerResponse::ChatUpdate { .. }
                 | ServerResponse::ChatListed { .. }
@@ -108,6 +109,7 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatProviderExitOutput { .. }
         }
     )
 }
@@ -507,6 +509,7 @@ mod tests {
                 chat_id,
                 state,
                 generation,
+                outcome: None,
             };
             queue.push(envelope.clone()).unwrap();
         }

@@ -1,4 +1,3 @@
-#[cfg(feature = "host")]
 pub(crate) mod holder_registry;
 #[cfg(feature = "host")]
 pub(crate) mod owned_children;
@@ -184,7 +183,6 @@ pub(crate) enum PlatformError {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimePaths {
-    #[cfg(feature = "host")]
     pub(crate) directory: PathBuf,
     pub(crate) socket: PathBuf,
     pub(crate) lock: PathBuf,
@@ -200,7 +198,6 @@ impl RuntimePaths {
         Ok(Self {
             socket: directory.join(SOCKET_FILE_NAME),
             lock: directory.join("cagentsd.lock"),
-            #[cfg(feature = "host")]
             directory,
         })
     }
@@ -1047,7 +1044,6 @@ mod tests {
         RuntimePaths {
             socket: directory.join(SOCKET_FILE_NAME),
             lock: directory.join("cagentsd.lock"),
-            #[cfg(feature = "host")]
             directory,
         }
     }

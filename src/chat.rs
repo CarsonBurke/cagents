@@ -5,8 +5,13 @@ use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
+pub mod notification;
 pub mod presentation;
 pub mod pricing;
+mod restart;
+pub use restart::RestartReceipt;
+pub mod annotations;
+pub mod turn_outcomes;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -22,6 +27,11 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(feature = "host")]
+pub(crate) mod stderr_log;
+#[cfg(any(feature = "ui", feature = "host"))]
+#[path = "chat/protocol/terminal_output.rs"]
+pub(crate) mod terminal_output;
 
 /// Whether a provider-level failure requires the reader to renew the login.
 /// Only explicit authentication failures qualify: a bare HTTP 401 can describe
@@ -479,6 +489,21 @@ pub enum NativeContinuity {
     Durable {
         provider_version: String,
     },
+    /// The exact Claude stream reducer, Store and pipes belong to a retained
+    /// actor. Its provider may not have published a session ID yet. This shape
+    /// never grants adoption authority; the host authenticates the helper.
+    RetainedClaudeActor {
+        protocol: u32,
+    },
+}
+
+impl NativeContinuity {
+    pub fn retains_provider(&self) -> bool {
+        matches!(
+            self,
+            Self::Durable { .. } | Self::RetainedClaudeActor { .. }
+        )
+    }
 }
 
 /// Account recovery changes only account selection. It never changes the
@@ -563,6 +588,48 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
             let mut normalized = new.clone();
             normalized.continuity = old.continuity.clone();
             &normalized == old
+        }
+        _ => false,
+    }
+}
+
+/// The proof-only transition of an exact retained Claude actor before it has
+/// named a conversation. This shape check grants no ownership: callers must
+/// resolve authenticated helper lineage and verify the attached snapshot.
+/// Keep ordinary thread-bearing upgrade and save predicates strict.
+pub fn is_unnamed_retained_claude_recovery(source: &Session, replacement: &Session) -> bool {
+    let Some((old, new)) = source.proof.as_ref().zip(replacement.proof.as_ref()) else {
+        return false;
+    };
+    if !matches!(
+        source.native_continuity,
+        NativeContinuity::RetainedClaudeActor { protocol: 1 }
+    ) || source.native_continuity != replacement.native_continuity
+        || !source.has_valid_native_continuity()
+        || !replacement.has_valid_native_continuity()
+        || !old.is_complete()
+        || !new.is_complete()
+        || old == new
+        || old.boot_id != new.boot_id
+        || source.id != replacement.id
+        || source.launch != replacement.launch
+        || source.launch.session_id.is_some()
+        || replacement.launch.session_id.is_some()
+        || source.owned_codex_listener != replacement.owned_codex_listener
+    {
+        return false;
+    }
+    match (&source.terminal, &replacement.terminal) {
+        (None, None) => true,
+        (Some(previous), Some(next))
+            if previous.id == source.id
+                && next.id == source.id
+                && previous.continuity.live_proof().as_ref() == Some(old)
+                && next.continuity.live_proof().as_ref() == Some(new) =>
+        {
+            let mut normalized = next.clone();
+            normalized.continuity = previous.continuity.clone();
+            normalized == *previous
         }
         _ => false,
     }
@@ -667,6 +734,20 @@ impl Session {
     pub fn has_valid_native_continuity(&self) -> bool {
         match &self.native_continuity {
             NativeContinuity::ReconnectOnly => true,
+            NativeContinuity::RetainedClaudeActor { protocol } => {
+                *protocol == 1
+                    && self.launch.provider == Provider::Claude
+                    && self.owned_codex_listener.is_none()
+                    && self
+                        .proof
+                        .as_ref()
+                        .is_some_and(crate::model::HostSessionProof::is_complete)
+                    && self
+                        .launch
+                        .session_id
+                        .as_ref()
+                        .is_none_or(|id| uuid::Uuid::parse_str(id).is_ok())
+            }
             NativeContinuity::Durable { provider_version } => {
                 self.owns_codex_listener()
                     && self
@@ -693,7 +774,7 @@ impl Session {
         let (Some(old), Some(new)) = (&previous.terminal, &self.terminal) else {
             return false;
         };
-        matches!(previous.native_continuity, NativeContinuity::Durable { .. })
+        previous.native_continuity.retains_provider()
             && self.native_continuity == previous.native_continuity
             && self.has_valid_native_continuity()
             && previous
@@ -859,6 +940,10 @@ impl PromptSuggestion {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Bounded live-turn metadata; excluded from transcript and wire snapshots.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub notification_preview: std::sync::Arc<notification::Preview>,
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
     /// advance this with their monotonic clock instead of comparing timestamps
     /// from two machines. Absent only in older data and synthetic snapshots.
@@ -874,6 +959,8 @@ pub struct Snapshot {
     /// work finished. Historical imports without an observed turn have no time.
     #[serde(default)]
     pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub outcome: Option<crate::agent::ActivityOutcome>,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,
@@ -900,6 +987,8 @@ pub struct Snapshot {
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub provider_exit: Option<ProviderExitDiagnostic>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
     #[serde(default)]
@@ -944,6 +1033,28 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Qualified terminal results joined only to this transcript window.
+    #[serde(default)]
+    pub turn_outcomes: std::sync::Arc<turn_outcomes::TurnOutcomeProjection>,
+}
+
+/// Readable provider failure with a separately expandable bounded stderr tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitDiagnostic {
+    pub summary: String,
+    /// Last 64 KiB of readable stderr, independent of retained-log availability.
+    pub output: String,
+    #[serde(default)]
+    pub log: Option<ProviderExitLog>,
+}
+
+/// Opaque retained diagnostic identity. Full output is loaded only on demand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitLog {
+    pub id: String,
+    pub bytes: u64,
+    /// Raw bytes beyond the per-session disk cap or lost after a write failure.
+    pub omitted: u64,
 }
 
 /// When a provider takes a message it is holding.
@@ -1079,6 +1190,16 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
                 item_id,
                 role,
                 thinking,
+                delta,
+            }],
+            Event::InputDelta {
+                id: item_id,
+                offset,
+                delta,
+            } => vec![Event::SubagentInputDelta {
+                id: id.into(),
+                item_id,
+                offset,
                 delta,
             }],
             Event::OutputDelta {
@@ -1917,6 +2038,19 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
+    /// Append tool input at its exact byte offset without rewriting prior chunks.
+    ProviderExit(ProviderExitDiagnostic),
+    InputDelta {
+        id: String,
+        offset: usize,
+        delta: String,
+    },
+    SubagentInputDelta {
+        id: String,
+        item_id: String,
+        offset: usize,
+        delta: String,
+    },
     /// An append to a tracked command/tool output, never an authoritative rewrite.
     OutputDelta {
         id: String,
@@ -2052,10 +2186,163 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// An explicit maintenance boundary, separate from prompt completion.
+    /// A generic idle status cannot release accepted prompt admission.
+    Compaction {
+        active: bool,
+    },
+    /// Delayed results notify their original turn without settling current work.
+    PastTurnFinished {
+        key: Option<String>,
+        outcome: crate::notifications::Kind,
+    },
+    /// Exact historical ownership/results; never authority over current activity.
+    TurnOutcome(turn_outcomes::TurnUpdate),
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_claude_shape_is_typed_and_never_relaxes_codex_durability() {
+        use super::*;
+        let mut session = Session {
+            id: crate::model::TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            terminal: None,
+            owned_codex_listener: None,
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "host".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "actor-owner".into(),
+            }),
+            native_continuity: NativeContinuity::RetainedClaudeActor { protocol: 1 },
+        };
+        assert!(
+            session.has_valid_native_continuity(),
+            "an unnamed issued actor can persist before its first provider result"
+        );
+        assert!(
+            !session.is_unstarted(),
+            "an installed actor is never an empty draft"
+        );
+        let mut next = session.clone();
+        next.proof.as_mut().unwrap().host_incarnation = "successor".into();
+        assert!(is_unnamed_retained_claude_recovery(&session, &next));
+        assert!(
+            !is_upgrade_recovery(&session, &next),
+            "ordinary named-thread predicate remains strict"
+        );
+        for field in 0..8 {
+            let mut wrong = next.clone();
+            match field {
+                0 => wrong.proof.as_mut().unwrap().boot_id = "other-boot".into(),
+                1 => wrong.proof = session.proof.clone(),
+                2 => {
+                    wrong
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other".into());
+                }
+                3 => wrong.launch.recipe.arguments.push("--other-option".into()),
+                4 => wrong.launch.recipe.working_directory = "/other".into(),
+                5 => wrong.launch.session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+                6 => wrong.native_continuity = NativeContinuity::ReconnectOnly,
+                _ => wrong.id = crate::model::TerminalId::new(),
+            }
+            assert!(
+                !is_unnamed_retained_claude_recovery(&session, &wrong),
+                "unnamed proof transition changed field {field}"
+            );
+        }
+
+        assert_eq!(
+            postcard::from_bytes::<Session>(&postcard::to_stdvec(&session).unwrap()).unwrap(),
+            session
+        );
+        session.launch.session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        assert!(session.has_valid_native_continuity());
+        for field in 0..5 {
+            let mut changed = session.clone();
+            match field {
+                0 => changed.proof = None,
+                1 => changed.proof.as_mut().unwrap().host_incarnation = "".into(),
+                2 => changed.launch.provider = Provider::Codex,
+                3 => {
+                    changed.native_continuity =
+                        NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                }
+                _ => changed.launch.session_id = Some("not-an-exact-claude-uuid".into()),
+            }
+            assert!(
+                !changed.has_valid_native_continuity(),
+                "changed retained actor shape field {field}"
+            );
+        }
+        session.native_continuity = NativeContinuity::Durable {
+            provider_version: "claude-stream-json/actor-v1".into(),
+        };
+        assert!(
+            !session.has_valid_native_continuity(),
+            "Codex numeric listener contract remains separate"
+        );
+    }
+
+    #[test]
+    fn terminal_provider_outcomes_and_diagnostics_round_trip_without_losing_reason() {
+        use crate::agent::ActivityOutcome;
+        for outcome in [
+            ActivityOutcome::Succeeded,
+            ActivityOutcome::Cancelled,
+            ActivityOutcome::Failed {
+                reason: "Provider exited with status 3: authentication failed".into(),
+            },
+            ActivityOutcome::Interrupted {
+                reason: "Provider exited with status 0 before its final result".into(),
+            },
+        ] {
+            let snapshot = super::Snapshot {
+                outcome: Some(outcome),
+                provider_exit: Some(super::ProviderExitDiagnostic {
+                    summary: "Provider exited with status 3. Restart session to continue.".into(),
+                    output: "First diagnostic\nAuthentication failed\n".into(),
+                    log: None,
+                }),
+                ..Default::default()
+            };
+            let binary = postcard::to_stdvec(&snapshot).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<super::Snapshot>(&binary).unwrap(),
+                snapshot
+            );
+            let json = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(
+                serde_json::from_value::<super::Snapshot>(json).unwrap(),
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_json_defaults_absent_provider_outcome_and_diagnostic() {
+        let mut legacy = serde_json::to_value(super::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("outcome");
+        legacy.as_object_mut().unwrap().remove("provider_exit");
+        let restored: super::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(restored.outcome.is_none());
+        assert!(restored.provider_exit.is_none());
+    }
+
     #[test]
     fn request_kind_roundtrips_and_legacy_json_requires_explicit_approval() {
         let legacy = serde_json::json!({"id":"request","title":"Prompt","description":"","fields":[],"actions":[]});

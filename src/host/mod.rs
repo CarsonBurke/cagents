@@ -3,6 +3,7 @@ mod agent_execution;
 mod automations;
 mod chat;
 mod client;
+mod deferred;
 mod delivery;
 pub(crate) mod descriptor_limit;
 mod lock;
@@ -243,11 +244,20 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
+    if let Err(error) = chat::retained_actor::reconcile_startup_losses(&host) {
+        // The holder keeps its unacknowledged loss and refuses new input;
+        // another failed store must not dispose of unrelated live sessions.
+        tracing::warn!(%error, "retained actor loss remains pending durable reconciliation");
+    }
+    let retained_runs = chat::retained_actor::retained_runs(&host);
     if let Ok(registry) = agent_execution::registry(&host) {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs(crate::chat::now_ms().unwrap_or(0))
+            .interrupt_unproven_agent_runs_except(
+                crate::chat::now_ms().unwrap_or(0),
+                &retained_runs,
+            )
             .map_err(io::Error::other)?;
     }
     let _agent_activity = activity::Monitor::start(&host)?;
@@ -433,15 +443,18 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         // A committed upgrade transfers ownership, including when the final
         // checkpoint write fails. Explicit Stop/Close still tears down the
         // provider; exiting the upgrading daemon must not undo preservation.
-        let closed = if upgrading
-            && matches!(
-                chat.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+        let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
             chat.close()
         };
+        let closed = closed.and_then(|()| {
+            if upgrading {
+                Ok(())
+            } else {
+                chat::retained_actor::finish_close(host, &chat, &session)
+            }
+        });
         match closed {
             Ok(()) if !upgrading => {
                 // Ordinary shutdown proved this exact provider stopped. Retire

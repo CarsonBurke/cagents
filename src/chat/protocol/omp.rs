@@ -115,6 +115,9 @@ struct Omp {
     expected_session: Option<String>,
     session_id: Option<String>,
     state_request: Option<String>,
+    compaction_request: Option<String>,
+    compaction_probe: Option<String>,
+    compaction_active: bool,
     history_request: Option<String>,
     requests: HashMap<String, String>,
     chunks: HashMap<String, Chunk>,
@@ -127,6 +130,7 @@ struct Omp {
     child_requests: HashMap<String, String>,
     subscribed: bool,
     subscription_request: Option<String>,
+    child_presented: Option<std::time::Instant>,
     children_request: Option<String>,
     child_loaded: std::collections::HashSet<String>,
     child_buffer: HashMap<String, Vec<Value>>,
@@ -238,6 +242,11 @@ impl Omp {
         let id = format!("cagents-{}", self.sequence);
         if kind == "get_state" {
             self.state_request = Some(id.clone());
+            // Every replacement is issued after the compact ACK too. Keep
+            // the completion phase while the latest-state fence advances.
+            if let Some(probe) = self.compaction_probe.as_mut() {
+                *probe = id.clone();
+            }
             if let Some((probe, _)) = self
                 .execution
                 .as_mut()
@@ -349,12 +358,22 @@ impl Omp {
         self.read_child(id, step);
     }
     fn child_content(&mut self, frame: Value) -> Result<Step, String> {
+        self.child_content_at(frame, std::time::Instant::now())
+    }
+    fn child_content_at(&mut self, frame: Value, now: std::time::Instant) -> Result<Step, String> {
         // The subscription includes the authoritative partial message. Reapply
         // that full item after history hydration instead of appending a delta
         // that may already be included in the snapshot.
         if text(&frame, "type") == "message_update"
             && frame["assistantMessageEvent"]["partial"].is_object()
         {
+            if self
+                .child_presented
+                .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(50))
+            {
+                return Ok(Step::default());
+            }
+            self.child_presented = Some(now);
             return Ok(Step {
                 events: self
                     .message_items(&frame["assistantMessageEvent"]["partial"])
@@ -796,7 +815,14 @@ impl Adapter for Omp {
             }
             Command::SetFastMode { .. } => return Err("Fast mode is not advertised by this OMP connection".into()),
             Command::SetPermissionMode{..} => return Err("OMP approval policy is configured at launch; use its settings command to change policy.".into()),
-            Command::Compact => step.writes.push(self.request("compact")),
+            Command::Compact => {
+                if self.busy || self.compaction_active {return Err("OMP compaction requires an idle conversation".into());}
+                let request=self.request("compact");
+                self.compaction_request=request["id"].as_str().map(str::to_owned);
+                self.compaction_active=true;
+                step.events.push(Event::Compaction {active:true});
+                step.writes.push(request);
+            },
             Command::ResumeAfterLogin { .. } => return Err("Live login verification is available for Codex chats".into()),
             Command::Refresh => return Ok(self.refresh()),
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
@@ -808,6 +834,61 @@ impl Adapter for Omp {
             Command::Slash{command} => {let mut request=self.request("prompt");request["message"]=command.into();step.writes.push(request);}
         }
         Ok(step)
+    }
+    fn decode(&self, bytes: &[u8]) -> Result<Value, serde_json::Error> {
+        #[derive(serde::Deserialize)]
+        struct Header {
+            #[serde(rename = "type", default)]
+            kind: String,
+            #[serde(rename = "assistantMessageEvent", default)]
+            event: Option<Delta>,
+            #[serde(default)]
+            message: Option<Message>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Delta {
+            #[serde(rename = "type", default)]
+            kind: String,
+            #[serde(default)]
+            delta: String,
+            #[serde(rename = "contentIndex", default)]
+            index: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Message {
+            #[serde(default)]
+            role: String,
+            #[serde(default)]
+            timestamp: Option<Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Kind {
+            #[serde(rename = "type", default)]
+            kind: String,
+        }
+        let kind: Kind = serde_json::from_slice(bytes)?;
+        if kind.kind != "message_update" {
+            return serde_json::from_slice(bytes);
+        }
+        let header: Header = serde_json::from_slice(bytes)?;
+        if header.kind == "message_update"
+            && let Some(event) = header.event
+            && matches!(event.kind.as_str(), "text_delta" | "thinking_delta")
+        {
+            let message = header
+                .message
+                .map(|message| {
+                    let mut value = json!({"role": message.role});
+                    if let Some(timestamp) = message.timestamp {
+                        value["timestamp"] = timestamp;
+                    }
+                    value
+                })
+                .unwrap_or(Value::Null);
+            return Ok(json!({"type":"message_update", "message": message,
+                "assistantMessageEvent":{"type":event.kind,"delta":event.delta,"contentIndex":event.index}}));
+        }
+        serde_json::from_slice(bytes)
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
@@ -942,6 +1023,7 @@ impl Adapter for Omp {
                 // Only the current state request and current page may mutate the view.
                 let pending = match text(&frame, "command") {
                     "get_state" => Some(&mut self.state_request),
+                    "compact" => Some(&mut self.compaction_request),
                     "get_messages_page" => Some(&mut self.history_request),
                     "get_subagents" => Some(&mut self.children_request),
                     "set_subagent_subscription" => Some(&mut self.subscription_request),
@@ -955,6 +1037,11 @@ impl Adapter for Omp {
                     *pending = None;
                 }
                 if frame["success"].as_bool() != Some(true) {
+                    if text(&frame, "command") == "compact" {
+                        self.compaction_active = false;
+                        self.compaction_probe = None;
+                        step.events.push(Event::Compaction { active: false });
+                    }
                     // The conversation takes commands only once these have
                     // answered, so one that fails leaves it never ready; it
                     // ends with the reason rather than waiting on nothing.
@@ -1036,6 +1123,14 @@ impl Adapter for Omp {
                             step.events.push(Event::Ready(false));
                         }
                         self.session_id = Some(id.into());
+                        if self.compaction_probe.as_deref() == frame["id"].as_str()
+                            && data["isCompacting"].as_bool() == Some(false)
+                            && data["isStreaming"].as_bool() == Some(false)
+                        {
+                            self.compaction_probe = None;
+                            self.compaction_active = false;
+                            step.events.push(Event::Compaction { active: false });
+                        }
                         if let Some(text) = self.branch_draft.take() {
                             step.events.push(Event::Composer { text });
                         }
@@ -1227,7 +1322,11 @@ impl Adapter for Omp {
                             .map(|n| (n * 1_000_000.0) as u64);
                         step.events.push(Event::Usage(self.usage.clone()));
                     }
-                    "set_model" | "set_thinking_level" | "compact" => step = self.refresh(),
+                    "compact" => {
+                        step = self.refresh();
+                        self.compaction_probe = self.state_request.clone();
+                    }
+                    "set_model" | "set_thinking_level" => step = self.refresh(),
                     "prompt" if data["agentInvoked"].as_bool() == Some(false) => {
                         step = self.refresh();
                         self.finish_execution(
@@ -1390,6 +1489,17 @@ impl Adapter for Omp {
                 });
             }
             "agent_start" | "auto_compaction_start" => {
+                if text(&frame, "type") == "auto_compaction_start" {
+                    self.compaction_active = true;
+                    // A new provider boundary supersedes every earlier ACK
+                    // and idle probe, even when maintenance was already active.
+                    self.compaction_request = None;
+                    self.compaction_probe = None;
+                    let probe = self.request("get_state");
+                    self.compaction_probe = probe["id"].as_str().map(str::to_owned);
+                    step.writes.push(probe);
+                    step.events.push(Event::Compaction { active: true });
+                }
                 if text(&frame, "type") == "agent_start" {
                     step.events.push(Event::TurnStarted);
                     self.turn_outcome = None;
@@ -1442,6 +1552,12 @@ impl Adapter for Omp {
                 };
                 self.busy = false;
                 step = self.refresh();
+                if text(&frame, "type") == "auto_compaction_end" {
+                    self.compaction_active = false;
+                    self.compaction_request = None;
+                    self.compaction_probe = None;
+                    step.events.push(Event::Compaction { active: false });
+                }
                 if finished
                     && let Some(execution) = self
                         .execution
@@ -1758,6 +1874,46 @@ fn answer_value(answers: &[Answer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_decode_skips_redundant_partial_tree() {
+        let mut adapter = Omp::default();
+        let line = serde_json::to_vec(&json!({"type":"message_update", "message":{"role":"assistant","timestamp":123}, "assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"small","partial":{"content":[{"text":"x".repeat(1024 * 1024)}]}}})).unwrap();
+        let decoded = adapter.decode(&line).unwrap();
+        assert!(decoded["assistantMessageEvent"].get("partial").is_none());
+        assert!(decoded.to_string().len() < 300);
+        let result = adapter.receive(decoded).unwrap();
+        assert!(
+            matches!(&result.events[..], [Event::TextDelta { id, delta, .. }] if id == "assistant:123:0" && delta == "small")
+        );
+    }
+
+    #[test]
+    fn child_partial_updates_are_throttled_and_completion_is_authoritative() {
+        let mut adapter = Omp::default();
+        let update = |text: &str| json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta","partial":{"role":"assistant","timestamp":1,"content":[{"type":"text","text":text}]}}});
+        let now = std::time::Instant::now();
+        assert!(
+            !adapter
+                .child_content_at(update("a"), now)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(
+            adapter
+                .child_content_at(update("ab"), now + std::time::Duration::from_millis(1))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let later = adapter
+            .child_content_at(update("abc"), now + std::time::Duration::from_millis(51))
+            .unwrap();
+        assert!(later.events.iter().any(|event| matches!(event,Event::Item(Item{content:ItemContent::Text{text,..},..}) if text=="abc")));
+        let end = adapter.child_content(json!({"type":"message_end","message":{"role":"assistant","timestamp":1,"content":[{"type":"text","text":"abcd"}]}})).unwrap();
+        assert!(end.events.iter().any(|event| matches!(event, Event::Item(Item { content:ItemContent::Text { text, .. }, .. }) if text == "abcd")));
+    }
 
     #[test]
     fn branching_restores_the_selected_prompt_after_the_confirmed_session_reset() {
@@ -2530,6 +2686,138 @@ mod tests {
                 "the compacted session's {expected} is never asked for: {kinds:?}"
             );
         }
+    }
+
+    #[test]
+    fn compaction_completion_requires_its_own_boundary_or_post_ack_idle_probe() {
+        let mut adapter = Omp {
+            ready: true,
+            session_id: Some("same".into()),
+            ..Default::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
+        assert!(
+            requested
+                .events
+                .contains(&Event::Compaction { active: true })
+        );
+        let old = adapter.request("get_state");
+        let unrelated=adapter.receive(json!({"type":"response","id":old["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            !unrelated
+                .events
+                .contains(&Event::Compaction { active: false }),
+            "an idle query issued before the compact acknowledgement cannot finish maintenance"
+        );
+        let acknowledged=adapter.receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}})).unwrap();
+        assert!(
+            !acknowledged
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        let probe = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        let completed=adapter.receive(json!({"type":"response","id":probe["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
+        let started = adapter
+            .receive(json!({"type":"auto_compaction_start"}))
+            .unwrap();
+        assert!(started.events.contains(&Event::Compaction { active: true }));
+        let ended = adapter
+            .receive(json!({"type":"auto_compaction_end"}))
+            .unwrap();
+        assert!(ended.events.contains(&Event::Compaction { active: false }));
+        assert!(
+            !ended
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
+    }
+
+    #[test]
+    fn post_ack_compaction_probe_survives_a_superseding_refresh() {
+        let mut adapter = Omp {
+            ready: true,
+            session_id: Some("same".into()),
+            ..Default::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
+        let acknowledged=adapter.receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}})).unwrap();
+        let old = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        let refreshed = adapter.command(Command::Refresh).unwrap();
+        let current = refreshed
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        assert_ne!(old["id"], current["id"]);
+        let old=adapter.receive(json!({"type":"response","id":old["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            old.events.is_empty(),
+            "superseded state replies remain fenced"
+        );
+        let current=adapter.receive(json!({"type":"response","id":current["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            current
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(!adapter.compaction_active);
+    }
+
+    #[test]
+    fn a_new_compaction_start_rejects_an_earlier_idle_probe() {
+        let mut adapter = Omp {
+            ready: true,
+            session_id: Some("same".into()),
+            ..Default::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
+        let acknowledged=adapter.receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}})).unwrap();
+        let old = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        let started = adapter
+            .receive(json!({"type":"auto_compaction_start"}))
+            .unwrap();
+        let current = started
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        assert_ne!(old["id"], current["id"]);
+        let old=adapter.receive(json!({"type":"response","id":old["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(old.events.is_empty());
+        assert!(
+            adapter.compaction_active,
+            "pre-start idle metadata cannot end later maintenance"
+        );
+        let completed=adapter.receive(json!({"type":"response","id":current["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
     }
 
     #[test]
