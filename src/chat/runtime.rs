@@ -2844,14 +2844,16 @@ impl Actor {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let idle = state.generation == generation
                         && self.update_readiness(&state) == UpdateReadiness::Idle;
-                    if idle {
-                        self.stop.store(true, Ordering::Release);
-                    }
-                    let _ = reply.send(if idle {
-                        Ok(())
+                    // A scalar idle observation cannot fence autonomous
+                    // backend/subagent work beginning after the final read.
+                    // Preserve this live owner until a provider implements an
+                    // actual conditional-close barrier or the user explicitly
+                    // stops the complete session.
+                    let _ = reply.send(Err(if idle {
+                        "This provider cannot prove quiescent ownership for automatic replacement. Stop the session explicitly before restarting it.".into()
                     } else {
-                        Err("Provider state changed before conditional idle close".into())
-                    });
+                        "Provider state changed before conditional idle close".into()
+                    }));
                     continue;
                 }
                 ActorCommand::CloseIfRevision {revision} => {
