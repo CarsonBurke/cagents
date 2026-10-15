@@ -90,6 +90,8 @@ impl Inspection {
     }
     fn validate_with_clock(&self, now: impl Fn() -> Instant) -> Result<(), String> {
         if now() >= self.expires || self.connection.upgrade().is_none() { return Err(REFRESH.into()); }
+        #[cfg(test)]
+        before_validation_for_test();
         self.validate_requested_names()?;
         self.physical.validate()?;
         let snapshot = RepositoryService::system("git")
@@ -102,6 +104,18 @@ impl Inspection {
         if now() >= self.expires || self.connection.upgrade().is_none() { return Err(REFRESH.into()); }
         Ok(())
     }
+}
+
+// One-shot and thread-local: only the explicitly instrumented actual request
+// pauses, after census and before the first actor fence. No production hook.
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn before_validation_for_test() {
+    let hook = VALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook { hook(); }
 }
 
 pub(super) fn inspect(host: &SharedHost, client: ClientId, repository: &Path, path: &Path) -> Result<Reply, String> {
@@ -147,6 +161,8 @@ pub(super) fn take(host: &SharedHost, client: ClientId, token: uuid::Uuid, repos
 
 #[cfg(test)]
 mod tests {
+    mod private_runtime;
+    mod live_actor_tests;
     use super::*;
     use crate::{model::{BootId, HostIncarnation, HostSessionId, HostSessionProof}, terminal_ipc::{ClientRequest, ServerResponse}, worktree_control::{Operation, SessionStopConsent}};
 
