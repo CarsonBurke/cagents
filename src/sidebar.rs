@@ -2168,6 +2168,7 @@ fn change_file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
             depth: entry.depth,
             directory: entry.directory,
             ignored: false,
+            status: None,
         }
     }).collect()
 }
