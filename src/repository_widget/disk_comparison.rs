@@ -125,6 +125,7 @@ mod tests {
         let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
         document.external_version = Some(crate::editor_reload::Version { text: "disk".into(), content_hash: blake3::hash(b"disk"), source: document.source.clone(), markdown: false, mapping: Default::default(), restoration: None });
         document.conflict = true;
+        document.error = Some("File changed on disk".into());
         runtime
     }
     async fn completion(task: Task<RepositoryAction>) -> RepositoryAction {
