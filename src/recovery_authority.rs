@@ -34,8 +34,12 @@ impl Drop for ContextInner {
         // Keep charged capacity until the actual native guards have closed.
         // Never hold the budget mutex across a producer's guard destructor.
         drop(self.guard.take());
-        let mut used = self.budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        used.contexts -= 1; used.descriptors -= self.descriptors;
+        let mut used = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        used.contexts -= 1;
+        used.descriptors -= self.descriptors;
     }
 }
 /// Pre-effect ownership of an exact cleanup lease. No path-based reacquisition
@@ -52,8 +56,14 @@ impl RecoveryContext {
         if used.contexts >= MAX_RECOVERY_CONTEXTS || total > MAX_RECOVERY_CONTEXT_DESCRIPTORS {
             return Err("Recovery cleanup-lease capacity is exhausted. Resolve earlier recovery before changing files.".into());
         }
-        used.contexts += 1; used.descriptors = total; drop(used);
-        Ok(Self(Arc::new(ContextInner { guard: Some(Box::new(guard)), descriptors, budget })))
+        used.contexts += 1;
+        used.descriptors = total;
+        drop(used);
+        Ok(Self(Arc::new(ContextInner {
+            guard: Some(Box::new(guard)),
+            descriptors,
+            budget,
+        })))
     }
     /// Reserve before producer effects. The resulting unresolved leaf owns
     /// this exact pre-acquired context until success or its final owner drop.
