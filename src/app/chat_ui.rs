@@ -1500,6 +1500,7 @@ pub(super) struct Runtime {
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
     turn_outcome_markers: HashMap<String, outcomes::Marker>,
+    turn_outcome_source: std::sync::Weak<chat::turn_outcomes::TurnOutcomeProjection>,
     cache: HashMap<String, CachedItem>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
@@ -2072,6 +2073,7 @@ impl Runtime {
             source_clock: None,
             finished_stamp: None,
             turn_outcome_markers: HashMap::new(),
+            turn_outcome_source: std::sync::Weak::new(),
             connection,
             queued: None,
             followups: Vec::new(),
@@ -2143,12 +2145,19 @@ impl Runtime {
         runtime.refresh();
         runtime
     }
+    /// Memory eviction must invalidate the projection source as well as rows:
+    /// revealing the same Snapshot Arc still needs to rebuild its markers.
+    pub(super) fn release_turn_outcome_presentation(&mut self) {
+        self.turn_outcome_markers.clear();
+        self.turn_outcome_source = std::sync::Weak::new();
+    }
+
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
         self.cache.clear();
         self.turns.clear();
-        self.turn_outcome_markers.clear();
+        self.release_turn_outcome_presentation();
         self.selected_subagent = None;
         self.subagent_scroll.clear();
         self.page_request = None;
@@ -2296,6 +2305,7 @@ impl Runtime {
             self.later_asked = None;
         }
         if self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
+            && self.turn_outcome_source.as_ptr() == Arc::as_ptr(&snapshot.turn_outcomes)
         {
             return;
         }
@@ -2578,13 +2588,14 @@ impl Runtime {
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
         }
-        if !Arc::ptr_eq(&snapshot.turn_outcomes, &self.snapshot.turn_outcomes)
+        if self.turn_outcome_source.as_ptr() != Arc::as_ptr(&snapshot.turn_outcomes)
             || snapshot.session_id != self.snapshot.session_id
             || snapshot.items.len() != self.snapshot.items.len()
             || snapshot.items.first().map(|item| &item.id) != self.snapshot.items.first().map(|item| &item.id)
             || snapshot.items.last().map(|item| &item.id) != self.snapshot.items.last().map(|item| &item.id)
         {
             self.turn_outcome_markers = outcomes::project(&snapshot);
+            self.turn_outcome_source = Arc::downgrade(&snapshot.turn_outcomes);
         }
         self.snapshot = snapshot;
         images::sync(self);

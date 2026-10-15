@@ -1,6 +1,6 @@
 //! Durable terminal markers attach only to explicit, visible item bindings.
 use crate::{agent::ActivityOutcome, chat};
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::{Hash, Hasher}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Tone {
@@ -9,11 +9,12 @@ pub(super) enum Tone {
     Failed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Marker {
     pub label: String,
     pub detail: String,
     pub tone: Tone,
+    pub signature: u64,
 }
 
 impl Marker {
@@ -39,7 +40,9 @@ impl Marker {
             detail.push_str(" · ");
             detail.push_str(reason);
         }
-        Self { label, detail, tone }
+        let mut hasher = std::hash::DefaultHasher::new();
+        (&label, &detail, tone).hash(&mut hasher);
+        Self { label, detail, tone, signature: hasher.finish() }
     }
 }
 
