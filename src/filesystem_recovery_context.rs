@@ -94,15 +94,31 @@ impl FilesystemRecoveryContext {
 mod tests {
     use super::*;
     use crate::fs_safety::RecoveryRegistryCheck;
-    fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Arc<Root>, Arc<RecoveryPlacement>, Arc<Option<Protection>>) {
-        let directory = tempfile::tempdir().unwrap(); let runtime = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source"); let outside = directory.path().join("recovery");
-        std::fs::create_dir(&source).unwrap(); std::fs::create_dir(&outside).unwrap();
-        let source = Arc::new(Root::open(&source).unwrap()); let outside = Arc::new(Root::open(&outside).unwrap());
-        // The complete isolated fixture topology is static. This callback is
-        // test-only, never an intake policy for real registered projects.
-        let placement = RecoveryPlacement::acquire(outside, source.clone(), Arc::from([source.clone()]), RecoveryRegistryCheck::new(Arc::new(|| Ok(())), 0)).unwrap();
-        let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false).unwrap()));
+    fn fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<Root>,
+        Arc<RecoveryPlacement>,
+        Arc<Option<Protection>>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let outside = directory.path().join("recovery");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let source = Arc::new(Root::open(&source).unwrap());
+        let outside = Arc::new(Root::open(&outside).unwrap());
+        // Use the same owned bounded enrollment lease as actual producer
+        // fixtures; callback-only predicate observations cannot reserve work.
+        drop(outside);
+        let issued = super::fixtures::fixture_context(&source).unwrap();
+        let placement = issued.placement().clone();
+        drop(issued);
+        let protection = Arc::new(Some(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false)
+                .unwrap(),
+        ));
         (directory, runtime, source, placement, protection)
     }
     #[test]
@@ -117,6 +133,27 @@ mod tests {
         authority.retry().unwrap(); assert!(authority.is_resolved());
         drop(crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), true).unwrap());
     }
+    #[test]
+    fn callback_only_placement_cannot_reserve_factory_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source");
+        let outside_path = directory.path().join("outside");
+        std::fs::create_dir(&source_path).unwrap();
+        std::fs::create_dir(&outside_path).unwrap();
+        let source = Arc::new(Root::open(&source_path).unwrap());
+        let outside = Arc::new(Root::open(&outside_path).unwrap());
+        // An isolated static observation suffices for inspecting placement,
+        // but does not provide the owned enrollment needed before effects.
+        let placement = RecoveryPlacement::acquire(outside, source.clone(), Arc::from([source.clone()]),
+            RecoveryRegistryCheck::new(Arc::new(|| Ok(())), 0)).unwrap();
+        let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false).unwrap()));
+        let context = FilesystemRecoveryContext::new(&source, protection, placement).unwrap();
+        assert!(context.reserve_directory().is_err());
+        assert!(std::fs::read_dir(outside_path).unwrap().next().is_none());
+        assert!(std::fs::read_dir(source_path).unwrap().next().is_none());
+    }
+
     #[test]
     fn a_different_source_or_missing_actual_lease_refuses_before_any_effect() {
         let (directory, _runtime, source, placement, protection) = fixture();
