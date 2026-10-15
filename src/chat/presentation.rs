@@ -302,9 +302,9 @@ mod tests {
         let retained_catalogs = Catalogs::of(&previous).retain(&mut metadata);
         let update = Presentation { base_generation: 1, file_changes_unchanged: false,
             retained_catalogs, metadata, order: vec![], changes: vec![], children: vec![] };
-        let wire = serde_json::to_vec(&update).unwrap();
+        let wire = postcard::to_stdvec(&update).unwrap();
         assert!(wire.len() < 4096, "unchanged catalog leaked into a body publication");
-        let decoded: Presentation = serde_json::from_slice(&wire).unwrap();
+        let decoded: Presentation = postcard::from_bytes(&wire).unwrap();
         let installed = decoded.apply(&previous).unwrap();
         assert!(std::sync::Arc::ptr_eq(&previous.commands, &installed.commands));
         assert!(std::sync::Arc::ptr_eq(&previous.skills, &installed.skills));
