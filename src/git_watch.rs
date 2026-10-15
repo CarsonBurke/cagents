@@ -441,7 +441,12 @@ impl Project {
                     change.worktrees.insert(worktree.id);
                     let name = path.file_name();
                     change.metadata = true;
-                    change.membership |= name.is_some_and(|name| name == "HEAD");
+                    // Index publication can turn tracked paths into untracked
+                    // paths without a content event (git rm --cached). Ref and
+                    // operation metadata alone retain the complete cached count.
+                    change.untracked |= name.is_some_and(|name| name == "index");
+                    change.membership |=
+                        name.is_some_and(|name| name == "HEAD" || name == "config.worktree");
                     change.topology |= path
                         .file_name()
                         .is_some_and(|name| name == "locked" || name == "gitdir");
@@ -1068,12 +1073,20 @@ mod tests {
         assert_eq!(change.worktrees, BTreeSet::from([linked.id]));
         assert!(!change.membership);
         assert!(change.metadata);
+        assert!(change.untracked);
         assert!(!change.topology);
+        let config = project
+            .change(&modified(linked.git_dir.join("config.worktree")))
+            .unwrap();
+        assert!(config.membership);
+        assert_eq!(config.worktrees, BTreeSet::from([linked.id]));
         let change = project
             .change(&modified(project.common_dir.join("refs/heads/main")))
             .unwrap();
         assert_eq!(change.worktrees, BTreeSet::from([first.id]));
         assert!(change.metadata);
+        assert!(!change.untracked);
+        assert!(!change.membership);
         assert!(!change.topology);
         assert_eq!(
             project

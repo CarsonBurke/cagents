@@ -708,7 +708,7 @@ fn read_local_with_plan(
         // coalesced status process. Tracked-only writes do not rescan untracked
         // trees; the bounded topology fallback repairs incomplete watch coverage.
         let include_untracked =
-            change.topology || change.membership || change.metadata || change.untracked;
+            change.topology || change.membership || change.untracked;
         let current = match git.status_projection(
             &record.path,
             include_untracked,
@@ -1049,6 +1049,30 @@ mod tests {
         )
         .unwrap();
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn index_publication_refreshes_untracked_count_without_a_content_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let snapshot = fixture(&root);
+        let id = snapshot.worktrees[0].0.id;
+        git(&root, &["rm", "--cached", "tracked.txt"]);
+        let (next, _) = read_local(
+            ProjectId::new(),
+            snapshot,
+            git_watch::Change {
+                worktrees: [id].into(),
+                metadata: true,
+                untracked: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let status = next.worktrees[0].1.as_ref().unwrap();
+        assert_eq!(status.dirty.untracked, 1);
+        assert!(!status.untracked_omitted);
     }
 
     #[test]
