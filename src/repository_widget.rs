@@ -712,6 +712,7 @@ pub enum RepositoryAction {
         result: Result<crate::editor::BinaryPreview, FileIoError>,
     },
     ConfiguredFileLoaded { identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, indentation: crate::editor_indent::Overrides, root: Option<crate::editor::FileRootIdentity> },
+    EditorRootRebound { identity: AsyncIdentity, source: PathBuf, ticket: u64, previous: crate::editor::FileRootIdentity, result: Result<crate::editor::FileRootIdentity, String> },
     OpenWorkingFileLocation {
         identity: AsyncIdentity,
         line: usize,
@@ -1000,6 +1001,7 @@ impl RepositoryAction {
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
             | Self::ConfiguredFileLoaded { identity, .. }
+            | Self::EditorRootRebound { identity, .. }
             | Self::DiskMetadata { identity, .. }
             | Self::ComparisonMetadata { identity, .. }
             | Self::DiskLoaded { identity, .. }
@@ -1050,6 +1052,9 @@ struct EditorDocument {
     saved_presence_id: u64,
     next_presence_id: u64,
     undo_root: Option<crate::editor::FileRootIdentity>,
+    root_unbound: bool,
+    root_error: Option<String>,
+    root_rebind_ticket: u64,
     restorations: std::collections::BTreeMap<u64, Arc<FileRestoration>>,
     captured_presence_ids: std::collections::BTreeSet<u64>,
     markdown: bool,
@@ -1156,6 +1161,9 @@ impl EditorDocument {
             saved_presence_id: 0,
             next_presence_id: 0,
             undo_root: None,
+            root_unbound: false,
+            root_error: None,
+            root_rebind_ticket: 0,
             restorations: std::collections::BTreeMap::new(),
             captured_presence_ids: std::collections::BTreeSet::new(),
             markdown,
@@ -3732,12 +3740,42 @@ impl RepositoryRuntime {
         Task::batch([diff, files])
     }
 
+    /// Called after an explicit relocation updates the descriptor/generation.
+    /// Keep the same document and admitted save ticket, but stop outside reads
+    /// until a worker proves the new path is the original physical directory.
+    pub(crate) fn rebind_editor_root_after_relocation(&mut self, card: CardId) -> Task<RepositoryAction> {
+        self.undo_lru = crate::editor_navigation::UndoLru::default();
+        self.locations = crate::editor_navigation::Locations::default();
+        self.pending_jump_origin = None; self.window_jump_origin = None;
+        self.disk_poll = None; self.disk_stamp = None; self.disk_comparison = None;
+        let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
+        document.root_unbound = true;
+        document.root_error = Some("Verifying the located checkout before observing or saving this buffer.".into());
+        let Some(previous) = document.undo_root.clone() else {
+            document.root_error = Some("The original editor root is unavailable. Your buffer was kept; reopen the located file before saving.".into());
+            return Task::none();
+        };
+        document.root_rebind_ticket = document.root_rebind_ticket.wrapping_add(1).max(1);
+        let ticket = document.root_rebind_ticket;
+        let source = document.source.clone(); let path = document.path.clone();
+        let identity = self.current_identity(card, path);
+        let worktree = identity.worktree.clone(); let held = previous.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || held.rebind_same_directory(&worktree))
+                .await.map_err(|error| format!("Editor relocation worker failed: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            RepositoryAction::EditorRootRebound { identity, source, ticket, previous, result }
+        })
+    }
+
+    fn editor_root_unbound(&self) -> bool { matches!(&self.document, DocumentState::Editable(document) if document.root_unbound) }
+
     /// One descriptor metadata probe per second; unchanged files are never
     /// serialized or re-read. The source stamp includes inode/ctime so atomic
     /// replacement and no-op touches are distinguished by the later hash.
     pub fn refresh_open_document(&mut self, card: CardId) -> Task<RepositoryAction> {
         let DocumentState::Editable(document) = &self.document else { return Task::none(); };
-        if self.is_read_only_source() || document.workspace_edit.is_some() || document.active_save.is_some() || self.disk_poll.is_some() { return Task::none(); }
+        if self.is_read_only_source() || document.root_unbound || document.workspace_edit.is_some() || document.active_save.is_some() || self.disk_poll.is_some() { return Task::none(); }
         let source = document.source.clone();
         let identity = self.current_identity(card, document.path.clone());
         let worktree = identity.worktree.clone(); let path = identity.path.clone();
@@ -3752,13 +3790,13 @@ impl RepositoryRuntime {
     pub fn has_editable_document(&self) -> bool { matches!(&self.document, DocumentState::Editable(_)) }
 
     fn has_live_comparison(&self) -> bool {
-        !self.directory_only && self.selected.is_some()
+        !self.directory_only && !self.editor_root_unbound() && self.selected.is_some()
             && (self.has_editable_document() || self.source_surface == SourceSurface::Diff)
             && !matches!(self.diff_basis, DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })
     }
 
     pub fn observes_open_sources(&self) -> bool {
-        !self.is_read_only_source() && !self.workspace_edit_pending() && (self.has_editable_document() || self.has_live_comparison())
+        !self.is_read_only_source() && !self.editor_root_unbound() && !self.workspace_edit_pending() && (self.has_editable_document() || self.has_live_comparison())
     }
 
     /// Shared document and Git-metadata fallback for both editor frontends.
@@ -3831,6 +3869,7 @@ impl RepositoryRuntime {
     /// Called by the shared Git watcher after index/ref changes. Immutable
     /// history comparisons retain their object identities and mounted model.
     pub fn refresh_open_comparison(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.editor_root_unbound() { return Task::none(); }
         if self.comparison_refresh_pending() { self.comparison_refresh_queued = true; return Task::none(); }
         self.comparison_refresh_queued = false;
         if let DiffBasis::MergeBaseToHead { base_ref, .. } = &self.diff_basis {
@@ -5108,7 +5147,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &self.document else { return None; };
         Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
             text: document.content.text().into(), version: document.lsp_version, protocol_version: None,
-            writable: document.present && !self.is_saving() && !self.is_read_only_source(),
+            writable: document.present && !document.root_unbound && !self.is_saving() && !self.is_read_only_source(),
         }))
     }
 
@@ -5118,7 +5157,7 @@ impl RepositoryRuntime {
         if self.is_read_only_source() { return Err("Dependency sources are read-only".into()); }
         self.flush_lsp_change();
         let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
-        if !document.present || document.active_save.is_some() || document.workspace_edit.is_some()
+        if !document.present || document.root_unbound || document.active_save.is_some() || document.workspace_edit.is_some()
             || Some(document.lsp_version) != plan.version || !content_matches(&document.content, &plan.before) {
             return Err("An edited buffer changed after the preview was prepared".into());
         }
@@ -5890,7 +5929,7 @@ impl RepositoryRuntime {
         self.editor_focus_target(card)?;
         self.lsp_document()?;
         self.cursor_position()?;
-        if self.is_saving() || (feature != EditorLanguageFeature::Signature && (self.is_read_only_source() || !self.desired_file_present())) { return None; }
+        if self.editor_root_unbound() || self.is_saving() || (feature != EditorLanguageFeature::Signature && (self.is_read_only_source() || !self.desired_file_present())) { return None; }
         let action = match feature {
             EditorLanguageFeature::Rename => EditorLspAction::Rename,
             EditorLanguageFeature::FormatDocument => EditorLspAction::Format { selection: false },
@@ -5959,7 +5998,7 @@ impl RepositoryRuntime {
 
     pub fn can_save(&self) -> bool {
         if self.is_read_only_source() { return false; }
-        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none() && document.workspace_edit.is_none())
+        matches!(&self.document, DocumentState::Editable(document) if !document.root_unbound && (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none() && document.workspace_edit.is_none())
     }
 
     fn can_discard_edits(&self) -> bool {
@@ -6041,6 +6080,7 @@ impl RepositoryRuntime {
             DocumentState::Editable(document) if document.durability_warning.is_some() => {
                 "Durability warning"
             }
+            DocumentState::Editable(document) if document.root_unbound => "Located editor unavailable",
             DocumentState::Editable(document) if document.error.is_some() => "Save failed",
             DocumentState::Editable(_) if self.is_dirty() => "Unsaved changes",
             DocumentState::Editable(_) => "Editable",
@@ -6052,9 +6092,7 @@ impl RepositoryRuntime {
         };
         let (document_error, conflict) = match &self.document {
             DocumentState::Editable(document) => (
-                document
-                    .error
-                    .clone()
+                document.root_error.clone().or_else(|| document.error.clone())
                     .or_else(|| document.durability_warning.clone()),
                 document.conflict,
             ),
@@ -6216,9 +6254,7 @@ impl RepositoryRuntime {
 
     pub fn save_error(&self) -> Option<&str> {
         match &self.document {
-            DocumentState::Editable(document) => document
-                .error
-                .as_deref()
+            DocumentState::Editable(document) => document.root_error.as_deref().or(document.error.as_deref())
                 .or(document.durability_warning.as_deref()),
             _ => None,
         }
@@ -6294,7 +6330,7 @@ impl RepositoryRuntime {
             DocumentState::Editable(document)
                 if self.auto_save
                     && document.dirty
-                    && document.active_save.is_none() && document.workspace_edit.is_none()
+                    && document.active_save.is_none() && document.workspace_edit.is_none() && !document.root_unbound
                     && !document.conflict
                     && !document.external_check_pending
                     && document.error.is_none()
@@ -6513,7 +6549,18 @@ impl RepositoryRuntime {
         ) {
             self.toolbar_overflow_open = false;
         }
+        if self.editor_root_unbound() && matches!(&action, RepositoryAction::DiskMetadata { .. } | RepositoryAction::DiskLoaded { .. } | RepositoryAction::DiskComparisonLoaded { .. } | RepositoryAction::KeepMine { .. } | RepositoryAction::Reload { .. }) { return Task::none(); }
         match action {
+            RepositoryAction::EditorRootRebound { identity, source, ticket, previous, result } => {
+                if !self.accepts_selected(&identity) { return Task::none(); }
+                let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
+                if document.source != source || document.root_rebind_ticket != ticket || document.undo_root.as_ref() != Some(&previous) { return Task::none(); }
+                match result {
+                    Ok(root) => { document.undo_root = Some(root); document.root_unbound = false; document.root_error = None; }
+                    Err(error) => { document.root_error = Some(error); }
+                }
+                Task::none()
+            }
             RepositoryAction::ConfiguredFileLoaded { identity, result, indentation, root } => {
                 let current = self.accepts_selected(&identity);
                 if current { self.undo_lru.validate_root(&identity.path, root.as_ref()); }
@@ -8919,7 +8966,7 @@ impl RepositoryRuntime {
         }
         if let DocumentState::Editable(document) = &mut self.document
             && !document.dirty && document.active_save.is_none() && document.durability_warning.is_none()
-            && document.workspace_edit.is_none() && !document.conflict && !document.external_check_pending && document.error.is_none() && !document.external_deleted
+            && document.workspace_edit.is_none() && !document.root_unbound && !document.conflict && !document.external_check_pending && document.error.is_none() && !document.external_deleted
             && (document.undo_root.is_some() || (document.saved_present && document.history.retained_presence_ids().next().is_none())) {
             self.undo_lru.insert(document.path.clone(), crate::editor_navigation::SavedUndo {
                 source: document.source.clone(), disk_hash: document.disk_hash,
@@ -11064,15 +11111,13 @@ fn editable_document_view<'a>(
         ])).padding(space::M).into());
     }
 
-    if let Some(error) = document
-        .error
-        .as_ref()
-        .filter(|_| document.external_version.is_none() && !document.external_deleted)
+    if let Some(error) = document.root_error.as_ref().or(document.error.as_ref()
+        .filter(|_| document.external_version.is_none() && !document.external_deleted))
         .or(document.durability_warning.as_ref())
     {
         let mut actions: Vec<Element<'a, RepositoryAction>> =
             vec![crate::design::body(error).width(Length::Fill).into()];
-        if document.conflict || document.durability_warning.is_some() {
+        if !document.root_unbound && (document.conflict || document.durability_warning.is_some()) {
             actions.push(
                 icon_button(Icon::Refresh, "Reload file from disk")
                     .on_press_maybe(
@@ -13977,6 +14022,39 @@ mod tests {
         assert!(!runtime.can_step_editor_history(false));
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.editor_text().as_deref(), Some("outside edit"));
+    }
+
+    #[tokio::test]
+    async fn explicit_relocation_rebinds_the_same_root_without_losing_an_admitted_save() {
+        use cosmic::iced::futures::StreamExt;
+        let directory = tempfile::tempdir().unwrap(); let old = directory.path().join("old"); let moved = directory.path().join("moved");
+        std::fs::create_dir(&old).unwrap(); std::fs::write(old.join("a.rs"), "before").unwrap();
+        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "before");
+        runtime.descriptor.worktree = old.clone(); runtime.standalone = true; runtime.set_auto_save(false);
+        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        let saved = runtime.editor_text().unwrap(); let task = runtime.request_save(card, false);
+        let mut stream = iced::runtime::task::into_stream(task).unwrap();
+        let completion = loop { if let iced::runtime::Action::Output(action) = stream.next().await.expect("save completion") { break action; } };
+        assert!(runtime.is_saving());
+        std::fs::rename(&old, &moved).unwrap(); runtime.descriptor.worktree = moved.clone(); runtime.generation += 1;
+        let rebind = runtime.rebind_editor_root_after_relocation(card);
+        assert!(!runtime.observes_open_sources());
+        drop(runtime.update(completion));
+        assert!(!runtime.is_saving(), "the exact admitted ticket settles despite descriptor generation changing");
+        assert_eq!(std::fs::read_to_string(moved.join("a.rs")).unwrap(), saved);
+        finish_navigation_task(&mut runtime, rebind).await;
+        assert!(runtime.observes_open_sources()); assert!(runtime.save_error().is_none());
+        assert!(runtime.can_step_editor_history(false));
+        // Locate may accept a replacement clone as a project. That does not
+        // give its files authority over the already-mounted original buffer.
+        std::fs::create_dir(&old).unwrap(); std::fs::write(old.join("a.rs"), "clone").unwrap();
+        runtime.descriptor.worktree = old; runtime.generation += 1;
+        let rebind = runtime.rebind_editor_root_after_relocation(card); finish_navigation_task(&mut runtime, rebind).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some(saved.as_str()));
+        assert!(!runtime.observes_open_sources()); assert!(runtime.save_error().is_some());
+        assert!(!runtime.workspace_edit_snapshot().unwrap().1.writable);
+        assert!(!runtime.is_saving());
     }
 
     #[tokio::test]
