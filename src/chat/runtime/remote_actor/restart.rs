@@ -15,7 +15,8 @@ impl RemoteActor {
         // exact request only queries/adopts the existing helper receipt.
         let receipt:RestartReceipt=self.call("restart",serde_json::to_value(request).map_err(|error|error.to_string())?)?;
         if matches!(&receipt.state,RestartState::Acknowledged(Ok(_))) {
-            if let Some(state)=self.call::<Option<Resident>>("state",json!([self.state().changed]))? {*self.0.state.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(state);}
+            if let Some(state)=self.call::<Option<Resident>>("state",json!([self.state().changed]))? {self.publish_resident(state);}
+            if self.0.stop.load(Ordering::Acquire) {return Ok(receipt);}
             *self.0.environment.lock().unwrap_or_else(|p|p.into_inner())=self.call("execution_environment",Value::Null)?;
             (self.0.notify)(Update::Observed {generation:self.state().generation});(self.0.notify)(Update::Presentation);
         }

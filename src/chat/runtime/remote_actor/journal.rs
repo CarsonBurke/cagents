@@ -219,6 +219,8 @@ impl Journal {
     pub fn next_input(&self)->Result<u64,String> {self.number("input_sequence")?.checked_add(1).ok_or("Input sequence exhausted".into())}
     pub fn acknowledged(&self)->Result<u64,String> {self.number("outcome_ack")}
     pub fn latest(&self)->Result<u64,String> {Ok(self.outcome_latest)}
+    #[cfg(test)]
+    pub fn fail_input_storage(&self) {self.db.execute_batch("DROP TABLE inputs").unwrap();}
     pub fn restart(&self,id:uuid::Uuid,hash:&[u8;32])->Result<Option<super::restart::RestartState>,String> {
         let row:Option<(Vec<u8>,Vec<u8>)>=self.db.query_row("SELECT hash,state FROM restarts WHERE id=?1",[id.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error|error.to_string())?;
         row.map(|(stored,state)| {if stored.as_slice()!=hash {return Err("Restart identity was already used for a different launch".into());}serde_json::from_slice(&state).map_err(|error|error.to_string())}).transpose()
