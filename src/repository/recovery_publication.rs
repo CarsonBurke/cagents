@@ -39,9 +39,10 @@ pub(super) fn create_blob_file(root: &fs_safety::Root) -> Result<Arc<fs::File>, 
 struct Holding {
     publication: fs_safety::DirectoryPublication,
     parent: fs_safety::Root,
-    slot: Option<RecoverySlot>,
     files: Vec<Arc<fs::File>>,
     context: FilesystemRecoveryContext,
+    // Native owners above close before their creation/private charge releases.
+    slot: Option<RecoverySlot>,
 }
 
 fn remember_directory_error(
@@ -76,7 +77,7 @@ impl Holding {
             original_parent,
         )
         .map_err(|error| remember_directory_error(recovery, error))?;
-        let (publication, context, slot, parent, _private_metadata) = directory.into_parts();
+        let (publication, parent, _private_metadata, context, slot) = directory.into_parts();
         // SAME pre-effect admission and parent survive factory errors; success
         // uses its already enrolled original700 inode without cloning/reopening.
         Ok(Self {

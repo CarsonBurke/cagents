@@ -806,12 +806,13 @@ struct RecoveryDirectoryFrontier {
 struct OwnedRecoveryDirectory {
     publication: fs_safety::DirectoryPublication,
     mode: u32,
-    slot: Option<crate::recovery_authority::RecoverySlot>,
     mode_installed: bool,
     temporary_installed: bool,
     pending_mode: Option<RecoveryModeTransition>,
     sync_file: Option<fs::File>,
     context: crate::filesystem_recovery_context::FilesystemRecoveryContext,
+    // The preopened sync FD and original directory close before this charge.
+    slot: Option<crate::recovery_authority::RecoverySlot>,
 }
 /// A chmod may succeed before a subsequent metadata read fails. Retain the
 /// intended transition before that effect so retry recognizes its exact
