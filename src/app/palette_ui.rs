@@ -119,25 +119,17 @@ fn same_palette_entry(left: &Message, right: &Message) -> bool {
             Message::Palette(Action::MovePaneToChannel(rc, rt)),
         ) => lc == rc && lt == rt,
         (
-            Message::Sidebar(SidebarAction::OpenWorktree {
-                worktree_id: left, ..
-            }),
-            Message::Sidebar(SidebarAction::OpenWorktree {
-                worktree_id: right, ..
-            }),
-        ) => left == right,
+            Message::Sidebar(SidebarAction::OpenWorktree { project_id: lp, worktree_id: left, path: lpath }),
+            Message::Sidebar(SidebarAction::OpenWorktree { project_id: rp, worktree_id: right, path: rpath }),
+        ) => lp == rp && left == right && lpath == rpath,
         (
             Message::Sidebar(SidebarAction::OpenChannel { channel_id: left }),
             Message::Sidebar(SidebarAction::OpenChannel { channel_id: right }),
         ) => left == right,
         (
-            Message::Sidebar(SidebarAction::OpenRepository {
-                project_id: left, ..
-            }),
-            Message::Sidebar(SidebarAction::OpenRepository {
-                project_id: right, ..
-            }),
-        ) => left == right,
+            Message::Sidebar(SidebarAction::OpenRepository { project_id: left, repository: lpath }),
+            Message::Sidebar(SidebarAction::OpenRepository { project_id: right, repository: rpath }),
+        ) => left == right && lpath == rpath,
         _ => {
             let pane = |message: &Message| match message {
                 Message::Palette(Action::FocusPane(id))
@@ -3215,6 +3207,43 @@ mod tests {
             Some(0),
             "an explicit navigation event chooses the next live result"
         );
+    }
+
+    #[test]
+    fn enter_refuses_same_id_workspace_targets_after_their_paths_change() {
+        for folder in [false, true] {
+            let mut app = settings_focus_fixture();
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            if folder { app.sidebar_model.projects[0].kind = ProjectKind::Folder; }
+            drop(app.update_palette(Action::Open));
+            drop(app.update_palette(Action::Query("#".into())));
+            let entries = app.palette_entries();
+            let project = app.sidebar_model.projects[0].id;
+            let worktree = app.sidebar_model.projects[0].worktrees[0].id;
+            let index = entries.iter().position(|(_, _, message)| match message {
+                Message::Sidebar(SidebarAction::OpenRepository { project_id, .. }) => folder && *project_id == project,
+                Message::Sidebar(SidebarAction::OpenWorktree { worktree_id, .. }) => !folder && *worktree_id == worktree,
+                _ => false,
+            }).unwrap();
+            app.select_palette_entry(index, &entries);
+            if folder { app.sidebar_model.projects[0].repository = "/relocated-project".into(); }
+            else { app.sidebar_model.projects[0].worktrees[0].path = "/relocated-worktree".into(); }
+            let refreshed = app.palette_entries();
+            assert!(refreshed.iter().any(|(_, _, message)| match message {
+                Message::Sidebar(SidebarAction::OpenRepository { project_id, repository }) => folder && *project_id == project && repository == Path::new("/relocated-project"),
+                Message::Sidebar(SidebarAction::OpenWorktree { worktree_id, path, .. }) => !folder && *worktree_id == worktree && path == Path::new("/relocated-worktree"),
+                _ => false,
+            }), "the same logical ID still exists with a replacement path");
+            assert!(app.palette_selection_index(&refreshed).is_none());
+            let active = app.active_workspace.clone();
+            let before = app.settings.palette_recents.clone();
+            drop(app.update_palette(Action::Submit));
+            assert!(app.palette.is_open());
+            assert_eq!(app.active_workspace, active, "never dispatch the captured obsolete filesystem path");
+            assert_eq!(app.settings.palette_recents, before);
+            assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("selected result")));
+        }
     }
 
     #[test]
