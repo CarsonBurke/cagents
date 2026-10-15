@@ -1539,6 +1539,14 @@ impl HostState {
         Ok(())
     }
 
+    /// The failed-native-start fixture must prove ordinary resident maps cannot
+    /// mask the startup-only guard, without exposing production ownership data.
+    #[cfg(test)]
+    pub(super) fn ordinary_inventory_empty_for_test(&self) -> bool {
+        self.spawning.is_empty() && self.chat_spawning.is_empty()
+            && self.chats.is_empty() && self.terminals.is_empty()
+    }
+
     fn inventory_count(&mut self) -> u64 {
         let mut count = (self.spawning.len() + self.chat_spawning.len()) as u64;
         for record in self.chats.values_mut() {
