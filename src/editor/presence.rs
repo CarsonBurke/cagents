@@ -2,8 +2,9 @@
 use super::*;
 use std::{ffi::OsString, os::unix::fs::{MetadataExt}, sync::Arc};
 
-/// The removed inode stays open so restoring the buffer retains its access
-/// rules, attributes and exact permissions without keeping a second text copy.
+/// A private unlinked metadata template retains the removed file's access
+/// rules and attributes without sharing later changes through a hard link or
+/// keeping a second text copy.
 #[derive(Debug)]
 pub struct FileRestoration {
     source: File,
@@ -132,25 +133,49 @@ fn remove_document_file(
         if !same_inode(&before, &after) || version(&before) != version(&after) || blake3::hash(&bytes) != expected_hash {
             return Err(FileIoError::Io("The file contents changed while Revert acquired it.".into()));
         }
-        fs_safety::unlink_within(&holding, acquired_name).map_err(resolve_error)
+        let (template, template_name) = fs_safety::create_temporary_in(&holding, 0o600).map_err(resolve_error)?;
+        let capture = (|| {
+            fs_safety::copy_ownership(&held, &template).map_err(io_error)?;
+            fs_safety::copy_access_acl(&held, &template).map_err(io_error)?;
+            template.set_permissions(original.permissions()).map_err(io_error)?;
+            fs_safety::copy_access_acl(&held, &template).map_err(io_error)?;
+            let lost = fs_safety::copy_extended_attributes(&held, &template);
+            if !lost.is_empty() {
+                return Err(FileIoError::Io(format!("Could not retain file metadata for Undo: {}", lost.join(", "))));
+            }
+            template.sync_all().map_err(io_error)?;
+            let captured = held.metadata().map_err(io_error)?;
+            if version(&before) != version(&captured) {
+                return Err(FileIoError::Io("The source metadata changed while Revert captured it.".into()));
+            }
+            Ok(())
+        })();
+        // The descriptor, not a discoverable temporary name, owns the metadata.
+        fs_safety::unlink_within(&holding, &template_name).map_err(resolve_error)?;
+        capture?;
+        fs_safety::unlink_within(&holding, acquired_name).map_err(resolve_error)?;
+        Ok(template)
     })();
-    if let Err(error) = verify {
-        let restored = fs_safety::rename_new_between(&holding, acquired_name, parent, name);
-        let location = if restored.is_ok() {
-            let _ = fs_safety::remove_directory_within(parent, &holding_name);
-            "The acquired file was put back without replacing newer work.".to_owned()
-        } else {
-            format!("The acquired file is preserved at {}; newer destination contents were left intact.", holding.path().join(acquired_name).display())
-        };
-        return Err(FileIoError::Io(format!("{error} {location}")));
-    }
+    let template = match verify {
+        Ok(template) => template,
+        Err(error) => {
+            let restored = fs_safety::rename_new_between(&holding, acquired_name, parent, name);
+            let location = if restored.is_ok() {
+                let _ = fs_safety::remove_directory_within(parent, &holding_name);
+                "The acquired file was put back without replacing newer work.".to_owned()
+            } else {
+                format!("The acquired file is preserved at {}; newer destination contents were left intact.", holding.path().join(acquired_name).display())
+            };
+            return Err(FileIoError::Io(format!("{error} {location}")));
+        }
+    };
     let cleanup = fs_safety::remove_directory_within(parent, &holding_name);
     let durability = match cleanup {
         Ok(()) => sync_durability(parent),
         Err(error) => SaveDurability::Unconfirmed { error: format!("The file was removed; could not remove empty holding directory {}: {error}", holding.path().display()) },
     };
     Ok(SaveOutcome::Absent {
-        restoration: Arc::new(FileRestoration { source, permissions: original.permissions() }),
+        restoration: Arc::new(FileRestoration { source: template, permissions: original.permissions() }),
         durability,
     })
 }
@@ -172,9 +197,11 @@ mod tests {
         let original = "#!/bin/sh\r\necho original";
         fs::write(root.join(path), original).unwrap();
         fs::set_permissions(root.join(path), Permissions::from_mode(0o751)).unwrap();
+        fs::hard_link(root.join(path), root.join("outside-link")).unwrap();
         let SaveOutcome::Absent { restoration, .. } = save_document_file(root, path, "", blake3::hash(original.as_bytes()), false, removal()).unwrap() else { panic!("removed"); };
         assert!(!root.join(path).exists());
-        assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(root).unwrap().count(), 1);
+        fs::set_permissions(root.join("outside-link"), Permissions::from_mode(0o600)).unwrap();
         let restore = PresenceSave { expected_present: false, desired_present: true, expected_mode: None, restoration: Some(restoration.clone()) };
         assert!(matches!(save_document_file(root, path, original, blake3::hash(b""), false, restore.clone()).unwrap(), SaveOutcome::Saved { .. }));
         assert_eq!(fs::read(root.join(path)).unwrap(), original.as_bytes());
