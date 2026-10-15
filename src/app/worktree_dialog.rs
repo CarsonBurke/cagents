@@ -1367,6 +1367,7 @@ mod tests {
         isolated_git(files.path(), &["init", "--template=", "-b", "main"]);
         let source = WorktreeCreationSource::new(crate::repository::WorktreeAuthority::capture(files.path()).unwrap());
         let clone = source.clone();
+        let (recovery_root, recovery_common) = source.recovery_roots().unwrap();
         assert_eq!(source.id(), clone.id());
         for _ in 0..64 { drop(source.link_token(&CancellationToken::new()).unwrap()); }
         let token = CancellationToken::new();
@@ -1377,6 +1378,9 @@ mod tests {
         assert!(token.is_cancelled());
         assert!(!source.is_available());
         assert!(source.service().is_err());
+        assert!(source.recovery_roots().is_err(), "retired actors cannot start new placement intake");
+        assert!(recovery_root.metadata().unwrap().is_dir(), "already admitted cleanup retains its own original root");
+        assert!(recovery_common.metadata().unwrap().is_dir());
         let later = CancellationToken::new();
         assert!(source.link_token(&later).is_err());
         assert!(later.is_cancelled());
