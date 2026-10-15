@@ -6,6 +6,8 @@
 //! straightforward to test with a fake executor.
 
 mod worktree_setup_intent;
+pub(crate) mod worktree_setup_execution;
+pub use worktree_setup_execution::SetupExecutionReservation;
 pub use worktree_setup_intent::{
     WorktreeSetupCreationIdentity, WorktreeSetupGuard, WorktreeSetupIntent, WorktreeSetupPlan,
     worktree_setup_marker_matches,

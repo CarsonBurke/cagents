@@ -40,6 +40,9 @@ pub struct TerminalConfig {
     /// authority must survive loss of its daemon; never part of a recipe.
     #[cfg(feature = "host")]
     pub setup_execution_lease: Option<std::sync::Arc<std::fs::File>>,
+    /// Private original-admin reservation; only a proved family may clear it.
+    #[cfg(feature = "host")]
+    pub setup_execution_disposition: Option<crate::repository::SetupExecutionReservation>,
 }
 
 impl Default for TerminalConfig {
@@ -63,6 +66,8 @@ impl Default for TerminalConfig {
             holder_recovery: None,
             #[cfg(feature = "host")]
             setup_execution_lease: None,
+            #[cfg(feature = "host")]
+            setup_execution_disposition: None,
         }
     }
 }

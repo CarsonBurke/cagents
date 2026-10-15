@@ -50,7 +50,7 @@ pub struct WorktreeSetupCreationIdentity {
 
 const CREATION_MARKER: &str = "cagents-setup-creation";
 
-fn read_creation_marker(admin: &crate::fs_safety::Root) -> io::Result<Option<OperationId>> {
+pub(super) fn read_creation_marker(admin: &crate::fs_safety::Root) -> io::Result<Option<OperationId>> {
     let mut file = match crate::fs_safety::open_beneath(admin, Path::new(CREATION_MARKER)) {
         Ok(file) => file,
         Err(error) if error.is_not_found() => return Ok(None),
@@ -114,7 +114,7 @@ pub(super) fn record_creation_identity(
 ) -> io::Result<()> {
     use std::io::Write;
     match read_creation_marker(admin)? {
-        Some(existing) if existing == creation => return Ok(()),
+        Some(existing) if existing == creation => return super::worktree_setup_execution::initialize(admin, creation),
         Some(_) => {
             return Err(io::Error::other(
                 "Worktree creation identity belongs to another generation",
@@ -137,7 +137,8 @@ pub(super) fn record_creation_identity(
                 if error.is_already_exists() && read_creation_marker(admin)? == Some(creation) => {}
             Err(error) => return Err(io::Error::other(error)),
         }
-        crate::fs_safety::sync_directory(admin)
+        crate::fs_safety::sync_directory(admin)?;
+        super::worktree_setup_execution::initialize(admin, creation)
     })();
     let _ = crate::fs_safety::unlink_within(admin, &temporary);
     result
@@ -331,6 +332,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 "Setup creation lease identity changed".into(),
             ));
         }
+        let admin = journal.admin_dir.as_ref().ok_or_else(||StoreError::InvalidState("Setup has no original administrative identity".into()))?;
+        super::worktree_setup_execution::require_quiescent(admin, creation_id, &lease)
+            .map_err(|error|StoreError::InvalidState(error.to_string()))?;
         Ok(WorktreeSetupGuard {
             store,
             creation_id,
@@ -558,6 +562,9 @@ mod tests {
         fs::create_dir_all(&journal.common_dir).unwrap();
         let lease = worktree_lease(&journal.lease_path, true).unwrap();
         journal.lease_identity = Some(lease_file_identity(&lease).unwrap());
+        let admin = journal.admin_dir.as_ref().unwrap();
+        fs::create_dir_all(admin).unwrap();
+        record_creation_identity(&crate::fs_safety::Root::open(admin).unwrap(), journal.request.operation_id).unwrap();
         drop(lease);
         let first = StateStore::open(
             root.path().join("first.sqlite3"),

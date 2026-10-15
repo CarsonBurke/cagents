@@ -42,6 +42,14 @@ preserved on a rescue branch. `--delete-branch` runs Git's safe `branch -d` afte
 removal. It never force-deletes an unmerged branch; if Git refuses, the result
 explains that the worktree was removed and its branch retained.
 
+Setup recovery also requires a durable disposition for the previous run. A
+missing holder or a free setup lock does not prove its child processes ended.
+If the holder was lost before it recorded complete descendant cleanup, Resume
+and Skip keep the checkout interrupted and preserve the current intent. Resolve
+the retained terminal ownership before trying again. Some early startup errors
+can leave this outcome unknown even when no child was observed; they do not
+silently grant permission to repeat a shell command.
+
 ## JSON version 1
 
 Every result uses the ordinary CLI `{ "ok", "command", "data" }` envelope.

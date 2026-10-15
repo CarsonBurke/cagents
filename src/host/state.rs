@@ -3469,7 +3469,8 @@ pub(super) fn verify_worktree_setup_generation(
 /// skip cannot authorize an older pending pane after this check.
 fn worktree_setup_run_guard(
     recipe: &crate::model::LaunchRecipe,
-) -> Result<(crate::persistence::WorktreeOperationGuard, fs::File), ProtocolError> {
+    terminal: TerminalId,
+) -> Result<(crate::persistence::WorktreeOperationGuard, fs::File, crate::repository::SetupExecutionReservation), ProtocolError> {
     let invalid =
         |detail: String| ProtocolError::new(ProtocolErrorCode::InvalidRequest, detail, false);
     let creation = recipe
@@ -3582,7 +3583,9 @@ fn worktree_setup_run_guard(
             "The checkout generation changed before setup execution".into(),
         ));
     }
-    Ok((guard, execution_lease))
+    let reservation = crate::repository::worktree_setup_execution::reserve(&admin, creation, run, terminal, &execution_lease)
+        .map_err(|error|invalid(error.to_string()))?;
+    Ok((guard, execution_lease, reservation))
 }
 
 /// Starts a terminal's worker, spawning its process or, given `adoption`,
@@ -3766,7 +3769,7 @@ fn start_terminal_view_owned(
     };
     let setup_run_guard =
         if adoption.is_none() && crate::upgrade::is_worktree_setup_recipe(&session.launch) {
-            match worktree_setup_run_guard(&session.launch) {
+            match worktree_setup_run_guard(&session.launch, terminal_id) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     shared
@@ -3779,14 +3782,15 @@ fn start_terminal_view_owned(
         } else {
             None
         };
-    let (setup_run_guard, setup_execution_lease) = setup_run_guard
-        .map_or((None, None), |(database, lease)| {
-            (Some(database), Some(lease))
+    let (setup_run_guard, setup_execution_lease, setup_execution_disposition) = setup_run_guard
+        .map_or((None, None, None), |(database, lease, reservation)| {
+            (Some(database), Some(lease), Some(reservation))
         });
     let setup_execution_lease = setup_execution_lease.map(Arc::new);
     let weak = Arc::downgrade(shared);
     let config = TerminalConfig {
         setup_execution_lease: setup_execution_lease.clone(),
+        setup_execution_disposition,
         agent_authority,
         columns: options.columns,
         rows: options.rows,

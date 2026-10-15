@@ -1328,3 +1328,83 @@ fn superseded_pending_setup_cannot_start_after_an_explicit_skip() {
     assert!(!path.join("unauthorized-setup").exists());
     assert!(client.list().unwrap().is_empty());
 }
+
+#[test]
+fn killed_setup_holder_with_surviving_children_cannot_authorize_resume_after_restart() {
+    use cagents::{device_service, model::OperationId, worktree_control::{Operation, Reply}};
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    struct Pinned(File);
+    impl Pinned {
+        fn open(pid: i32) -> Self {
+            let fd=unsafe {libc::syscall(libc::SYS_pidfd_open,pid,0)};
+            assert!(fd>=0,"pin owned fixture process: {}",std::io::Error::last_os_error());
+            Self(unsafe {File::from_raw_fd(fd as i32)})
+        }
+        fn signal(&self, signal: i32) {assert_eq!(unsafe {libc::syscall(libc::SYS_pidfd_send_signal,self.0.as_raw_fd(),signal,std::ptr::null::<libc::siginfo_t>(),0)},0);}
+        fn exited(&self, timeout: i32) -> bool {
+            let mut item=libc::pollfd{fd:self.0.as_raw_fd(),events:libc::POLLIN,revents:0};
+            unsafe {libc::poll(&mut item,1,timeout)>0}
+        }
+    }
+    impl Drop for Pinned {fn drop(&mut self){let _=unsafe {libc::syscall(libc::SYS_pidfd_send_signal,self.0.as_raw_fd(),libc::SIGKILL,std::ptr::null::<libc::siginfo_t>(),0)};}}
+    let mut fixture=Fixture::new();
+    let project=fixture.root.path().join("project");
+    fs::create_dir(project.join(".cagents")).unwrap();
+    let script=r#"import pathlib,subprocess,time
+child=subprocess.Popen(["/usr/bin/python3","-c","import signal,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); time.sleep(600)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+pathlib.Path("survivor").write_text(str(child.pid))
+with pathlib.Path("setup-starts").open("a") as output: output.write("started\n")
+time.sleep(600)
+"#;
+    let command=format!("exec /usr/bin/python3 -c '{script}'");
+    let configuration=project.join(".cagents/worktree.toml");
+    fs::write(&configuration,format!("setup = {}\n",serde_json::to_string(&command).unwrap())).unwrap();
+    let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
+    cagents::worktree_setup::trust(&project,&plan,&cagents::repository::CancellationToken::new()).unwrap();
+    let created=fixture.cli(&["worktree","create","lost-holder"]);
+    let path=std::path::PathBuf::from(created["worktree"]["path"].as_str().unwrap());
+    let terminal=created["setup"]["terminal"]["id"].as_str().unwrap();
+    let run:OperationId=created["setup"]["run_id"].as_str().unwrap().parse().unwrap();
+    let deadline=Instant::now()+Duration::from_secs(10);
+    while !path.join("survivor").exists() || !path.join("setup-starts").exists() {
+        assert!(Instant::now()<deadline,"owned setup did not start: {created}");thread::sleep(Duration::from_millis(10));
+    }
+    let survivor=Pinned::open(fs::read_to_string(path.join("survivor")).unwrap().parse().unwrap());
+    let runtime=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    let record:Value=serde_json::from_slice(&fs::read(runtime.join("holders").join(format!("{terminal}.json"))).unwrap()).unwrap();
+    let root=Pinned::open(record["root"]["pid"].as_i64().unwrap() as i32);
+    let holder=Pinned::open(record["holder"]["pid"].as_i64().unwrap() as i32);
+    holder.signal(libc::SIGKILL);
+    assert!(holder.exited(5000));
+    assert!(!survivor.exited(0),"fixture must retain the escaped child after holder loss");
+    assert!(!root.exited(0));
+    fixture.daemon.kill().unwrap();fixture.daemon.wait().unwrap();
+    let log=std::fs::OpenOptions::new().create(true).append(true).open(fixture.root.path().join("restarted-daemon.log")).unwrap();
+    fixture.daemon=Fixture::command(fixture.root.path(),Path::new(env!("CARGO_BIN_EXE_cagentsd"))).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
+    let deadline=Instant::now()+Duration::from_secs(15);
+    while !fixture.output(&["daemon","status"]).status.success() {
+        assert!(fixture.daemon.try_wait().unwrap().is_none(),"restart unexpectedly exited");
+        assert!(Instant::now()<deadline,"restart did not become ready");thread::sleep(Duration::from_millis(20));
+    }
+    let before=fixture.setup_intent(&path);
+    let mut client=cagents::control::ControlClient::connect(&runtime.join(cagents::terminal_ipc::SOCKET_FILE_NAME)).unwrap();
+    assert!(client.list().unwrap().is_empty(),"restart must demonstrate absence of resident actors, not a live-session refusal");
+    // A new reviewed plan would copy .env and run a second terminal if the
+    // missing holder's free flock were incorrectly accepted as cleanup proof.
+    fs::write(project.join(".env"),"must not be copied\n").unwrap();
+    fs::write(&configuration,"copy = [\".env\"]\nsetup = \"printf duplicate >> setup-starts\"\n").unwrap();
+    let updated=cagents::worktree_setup::load(&project).unwrap().unwrap();
+    for skip in [false,true] {
+        let error=client.device_operation(device_service::Operation::Worktree{operation:Operation::ResumeSetup{
+            repository:project.clone(),path:path.clone(),expected_run_id:Some(run),expected_plan_fingerprint:Some(updated.fingerprint.clone()),trust:true,skip,
+        }}).expect_err("lost holder and surviving tools must keep setup interrupted");
+        assert!(error.to_string().contains("family cleanup"),"{error}");
+        assert_eq!(fixture.setup_intent(&path),before,"refusal cannot advance or skip the current intent");
+        assert!(!path.join(".env").exists());
+        assert_eq!(fs::read_to_string(path.join("setup-starts")).unwrap(),"started\n");
+        assert!(!survivor.exited(0));
+    }
+    let device_service::Reply::Worktree(Reply::SetupIntent {intent,..})=client.device_operation(device_service::Operation::Worktree{operation:Operation::SetupIntent{repository:project,path:path.clone()}}).unwrap() else {panic!("wrong retained intent");};
+    assert_eq!(serde_json::from_str::<Value>(&intent).unwrap(),before);
+}
