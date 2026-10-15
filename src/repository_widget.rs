@@ -6316,6 +6316,7 @@ impl RepositoryRuntime {
         let caret = text_editor::Position { line, column };
         if self.blocks_navigation() && self.selected_path() != Some(path.as_path()) { return Task::none(); }
         self.pending_source_location = None;
+        self.pending_scalar_location = None;
         self.record_location_jump(crate::editor_navigation::Location { path: path.clone(), cursor: text_editor::Cursor { position: caret, selection: None }, scroll: text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 } });
         let selection = (selection_bytes > 0).then_some(text_editor::Position { line, column: column.saturating_add(selection_bytes) });
         if self.selected_path() == Some(path.as_path())
@@ -12245,6 +12246,26 @@ mod tests {
         finish_navigation_task(&mut runtime, task).await;
         let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
         assert_eq!(document.content.cursor().position.line, document.content.line_count() - 1);
+    }
+
+    #[tokio::test]
+    async fn newer_source_or_native_location_supersedes_a_pending_scalar_column() {
+        for source in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("mixed.rs"), "😀abcde\rcontinued\nsecond\nthird\n").unwrap();
+            let card = CardId::new();
+            let path = PathBuf::from("mixed.rs");
+            let mut runtime = RepositoryRuntime::new_directory(RepositoryView { project: ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: None });
+            let first = runtime.update(RepositoryAction::OpenLocation { card, path: path.clone(), line: 0, column: 5 });
+            assert!(runtime.pending_scalar_location.is_some());
+            let latest = if source { runtime.open_source_file_location(card, path, 2) }
+                else { runtime.open_file_location(card, path, 2, 1, 0) };
+            assert!(runtime.pending_scalar_location.is_none());
+            finish_navigation_task(&mut runtime, first).await;
+            finish_navigation_task(&mut runtime, latest).await;
+            let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
+            assert_eq!(document.content.cursor().position, if source { text_editor::Position { line: 3, column: 0 } } else { text_editor::Position { line: 2, column: 1 } });
+        }
     }
 
     #[tokio::test]
