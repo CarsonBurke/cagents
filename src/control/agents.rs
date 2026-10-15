@@ -428,11 +428,28 @@ impl ControlClient {
         let deadline = Instant::now() + timeout;
         let mut replies = Vec::with_capacity(runs.len());
         for run in runs {
-            replies.push(self.agent_before(
-                authority.clone(),
-                Operation::Run(*run),
-                Some(deadline),
-            )?);
+            match self.agent_before(authority.clone(), Operation::Run(*run), Some(deadline)) {
+                Ok(reply) => {
+                    let ready =
+                        matches!(&reply, Reply::Status { run, .. } if run.state.wait_ready());
+                    replies.push(reply);
+                    if any && ready {
+                        return Ok(Waited {
+                            replies,
+                            timed_out: false,
+                            messages: Vec::new(),
+                        });
+                    }
+                }
+                Err(error) if is_timeout_error(&error) => {
+                    return Ok(Waited {
+                        replies,
+                        timed_out: true,
+                        messages: Vec::new(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
         }
         let ready =
             |reply: &Reply| matches!(reply, Reply::Status { run, .. } if run.state.wait_ready());
@@ -1016,8 +1033,16 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
+            if statuses.is_empty() && timed_out {
+                human = "Wait timed out before any run status was available".into();
+            }
             human.push_str(&arrived_lines(&messages));
             let mut data = wait_data(&statuses, any, timed_out, ended_by);
+            data["unresolved_runs"] = json!(
+                runs.iter()
+                    .filter(|id| !statuses.iter().any(|(_, run)| run.id == **id))
+                    .collect::<Vec<_>>()
+            );
             if !messages.is_empty() {
                 data["messages"] = json!(messages);
             }
@@ -1157,7 +1182,10 @@ fn submitted(
             timed_out,
             messages,
         } = waited;
-        let (agent, run) = status_reply(replies.remove(0))?;
+        let (agent, run) = match replies.pop() {
+            Some(reply) => status_reply(reply)?,
+            None => (accepted.agent, accepted.run),
+        };
         human = status_lines(&agent, &run, timed_out, show);
         human.push_str(&arrived_lines(&messages));
         data["agent"] = json!(agent);
@@ -1729,6 +1757,79 @@ mod tests {
             drop(client);
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn stalled_initial_wait_read_returns_timeout_without_inventing_a_run() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (run_id, _) = running();
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let waited = client
+            .wait_agents(
+                Authority::default(),
+                &[run_id],
+                false,
+                false,
+                Duration::from_millis(25),
+            )
+            .unwrap();
+        assert!(waited.timed_out);
+        assert!(waited.replies.is_empty());
+        let data = wait_data(&[], false, waited.timed_out, waited.ended_by());
+        assert_eq!(
+            CommandOutput {
+                command: "agent.wait",
+                data,
+                human: String::new()
+            }
+            .exit_code(),
+            ExitCode::from(3)
+        );
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn any_wait_returns_the_first_ready_initial_status_without_querying_later_runs() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (run_id, mut response) = running();
+        let Reply::Status { run, .. } = &mut response else {
+            panic!("expected status");
+        };
+        run.state = crate::agent_execution::State::Succeeded;
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            answer(
+                &mut server_stream,
+                |request| matches!(request, ClientRequest::Agent { operation: Operation::Run(id), .. } if *id == run_id),
+                ServerResponse::Agent(response),
+            );
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let waited = client
+            .wait_agents(
+                Authority::default(),
+                &[run_id, RunId::new()],
+                true,
+                false,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!waited.timed_out);
+        assert_eq!(waited.replies.len(), 1);
+        assert_eq!(waited.ended_by(), "runs");
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]
