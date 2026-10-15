@@ -52,6 +52,7 @@ struct BoundLoadUpdate {
     path: PathBuf,
     status: Option<StatusSnapshot>,
     head: Option<GitHubRepoKey>,
+    operation: Option<crate::repository::GitOperationObservation>,
     error: Option<String>,
     read: u64,
 }
@@ -284,6 +285,7 @@ impl State {
             if let Some(previous) = reload.bound.get(&key.worktree_id) {
                 update.status = previous.status.clone();
                 update.head = previous.head.clone();
+                update.operation = previous.operation.clone();
             } else if let Some(previous) = &reload.previous {
                 update.status = previous
                     .worktrees
@@ -291,6 +293,7 @@ impl State {
                     .find(|(record, _)| record.id == key.worktree_id)
                     .and_then(|(_, status)| status.clone());
                 update.head = previous.heads.get(&key.worktree_id).cloned();
+                update.operation = previous.operations.get(&key.worktree_id).cloned();
             }
         }
         reload.bound.insert(key.worktree_id, update);
@@ -308,6 +311,7 @@ impl State {
             repository: repository.clone(),
             worktrees: display_worktrees(&loaded.worktrees),
             heads: loaded.head_repositories.clone(),
+            operations: loaded.operations.clone(),
             status_errors: loaded.status_order.errors.clone(),
             status_reads: loaded.status_order.reads.clone(),
             status_updates: loaded
@@ -416,11 +420,15 @@ impl State {
                 } else {
                     snapshot.heads.remove(&id);
                 }
+                if let Some(operation) = update.operation {
+                    snapshot.operations.insert(id, operation);
+                }
                 snapshot.status_reads.insert(id, update.read);
             }
         }
         loaded.worktrees = snapshot.worktrees;
         loaded.head_repositories = snapshot.heads;
+        loaded.operations = snapshot.operations;
         loaded.status_order.reads = snapshot.status_reads;
         loaded.status_order.errors = snapshot.status_errors;
     }
@@ -456,6 +464,7 @@ impl State {
                     path: key.canonical_path.clone(),
                     status: Some(status.display_summary()),
                     head: head_repository.cloned(),
+                    operation: Some(operation.clone()),
                     error: None,
                     read,
                 },
@@ -528,6 +537,7 @@ impl State {
                     path: key.canonical_path.clone(),
                     status: None,
                     head: None,
+                    operation: None,
                     error: Some(error.to_owned()),
                     read,
                 },
@@ -740,6 +750,7 @@ impl Cagents {
                     .status_order
                     .errors
                     .keys()
+                    .chain(loaded.operations.iter().filter_map(|(id, operation)| operation.is_err().then_some(id)))
                     .map(|id| (*id, Instant::now()))
                     .collect(),
             },
