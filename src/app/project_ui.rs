@@ -619,12 +619,12 @@ impl Cagents {
     }
 
     fn project_has_unsaved_editors(&self, project: ProjectId) -> bool {
-        if self.project_has_editor_recovery(project) { return true; }
-        let scope = self.project_session_scope(project);
-        self.cards.iter().any(|(id, runtime)| {
-            matches!(runtime, CardRuntime::Repository(editor)
-                if editor.blocks_navigation()
-                    && self.card_state(*id).is_some_and(|card| self.project_owns_card(project, card, &scope)))
+        self.project_cards(project).into_iter().any(|card| {
+            self.card_has_editor_recovery(card) || match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime.blocks_navigation(),
+                Some(CardRuntime::PullRequests(pane)) => pane.runtime.blocks_navigation(),
+                _ => false,
+            }
         })
     }
 
@@ -2950,7 +2950,7 @@ mod tests {
 
     #[test]
     fn late_project_and_worktree_completion_preserve_an_admitted_editor_write() {
-        for worktree_completion in [false,true] {
+        for (worktree_completion,pull_request) in [(false,false),(false,true),(true,false),(true,true)] {
             let repository=PathBuf::from("/pending-write-project");
             let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
             let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
@@ -2960,7 +2960,15 @@ mod tests {
             runtime.descriptor.project=project;runtime.descriptor.repository=repository.clone();runtime.descriptor.worktree=linked.path.clone();
             app.card_state_mut(card).unwrap().kind=CardKind::Repository(runtime.descriptor.clone());
             assert!(runtime.is_saving());
-            app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));
+            if pull_request {
+                let view=crate::model::PullRequestView{repository:repository.clone(),selected_number:None,file_panel_width:None,file_panel_collapsed:None};
+                let mut pane=app.pull_request_pane(&view);pane.runtime=runtime;
+                app.card_state_mut(card).unwrap().kind=CardKind::PullRequests(view);
+                app.cards.insert(card,CardRuntime::PullRequests(Box::new(pane)));
+            } else {
+                app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));
+            }
+            assert!(app.project_has_unsaved_editors(project));
             if worktree_completion {
                 let target=app.project_target(project,Some(linked.id)).unwrap();
                 drop(app.handle_project_action(Action::Deleted{target,result:Ok(())}));

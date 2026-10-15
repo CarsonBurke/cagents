@@ -114,7 +114,7 @@ impl Cagents {
             .project(project)
             .is_some_and(|project| project.missing)
     }
-    fn project_cards(&self, id: ProjectId) -> HashSet<CardId> {
+    pub(super) fn project_cards(&self, id: ProjectId) -> HashSet<CardId> {
         let Some(project) = self.sidebar_model.project(id) else {
             return HashSet::new();
         };
