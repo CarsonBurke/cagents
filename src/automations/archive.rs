@@ -24,21 +24,8 @@ impl ArchivedPaneReadiness {
                 archive.agent.origin,
                 crate::agent_execution::Origin::Automation { .. }
             )
-            || archive.agent.spec.provider != session.launch.provider
-            || session
-                .proof
-                .as_ref()
-                .is_none_or(|proof| !proof.is_complete())
-            || !archive
-                .agent
-                .session
-                .as_ref()
-                .is_some_and(|saved| saved.same_process(&HostedSession::Chat(session.clone())))
-            || session
-                .launch
-                .session_id
-                .as_ref()
-                .is_some_and(|id| snapshot.session_id.as_ref() != Some(id))
+            || !native_descriptor_matches(&archive.agent,session)
+            || archive.agent.session.as_ref().and_then(|saved|match saved {HostedSession::Chat(saved)=>saved.launch.session_id.as_ref(),_=>None})!=snapshot.session_id.as_ref()
             || !snapshot.exited
             || snapshot.ready
             || snapshot.busy
@@ -90,12 +77,30 @@ impl ArchivedPaneReadiness {
     }
 }
 
+pub(crate) fn native_descriptor_matches(agent:&crate::agent_execution::Agent,current:&Session)->bool {
+    let Some(HostedSession::Chat(saved))=&agent.session else {return false;};
+    let Some(thread)=saved.launch.session_id.as_deref().filter(|thread|!thread.trim().is_empty()) else {return false;};
+    if agent.spec.provider!=current.launch.provider || saved.id!=current.id
+        || saved.proof!=current.proof || !current.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete)
+        || saved.launch.provider!=current.launch.provider || saved.launch.recipe!=current.launch.recipe
+        || saved.owned_codex_listener!=current.owned_codex_listener || saved.native_continuity!=current.native_continuity
+        || current.launch.session_id.as_deref().is_some_and(|current|current!=thread) {return false;}
+    if saved.terminal==current.terminal {return true;}
+    // Only the exact paired console issued by this same closed owner can be
+    // learned from None or added for the local read-only presentation.
+    let console_matches=|terminal:&crate::model::TerminalSession|agent.console.as_ref()==Some(terminal)
+        && terminal.id==saved.id && terminal.launch.arguments==["agent".to_owned(),"console".to_owned(),agent.id.to_string()]
+        && terminal.continuity.live_proof().as_ref()==saved.proof.as_ref();
+    match (&saved.terminal,&current.terminal) {
+        (None,Some(terminal))|(Some(terminal),None)=>console_matches(terminal),
+        _=>false,
+    }
+}
+
 fn closed_pane_matches(agent:&crate::agent_execution::Agent,kind:&crate::model::CardKind)->bool {
     if !agent.closed || !matches!(agent.origin,crate::agent_execution::Origin::Automation {..}) {return false;}
     match kind {
-        crate::model::CardKind::Chat(current)=>current.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete)
-            && agent.session.as_ref().is_some_and(|saved|saved.same_process(&HostedSession::Chat(current.clone())))
-            && match &agent.session {Some(HostedSession::Chat(saved))=>saved.launch.session_id.is_none() || current.launch.session_id.is_none() || saved.launch.session_id==current.launch.session_id,_=>false},
+        crate::model::CardKind::Chat(current)=>native_descriptor_matches(agent,current),
         crate::model::CardKind::Terminal(current)=>agent.console.as_ref().is_some_and(|original| {
             let Some(HostedSession::Chat(native))=&agent.session else {return false;};
             if original.id!=native.id || !original.continuity.live_proof().is_some_and(|proof|proof.is_complete() && native.proof.as_ref()==Some(&proof)) {return false;}
@@ -136,12 +141,8 @@ pub fn inspect_completed_automation_pane(database:&std::path::Path,registry:&std
     if claim.is_some_and(|id|id!=expected) {return Err("The source archive binding changed".into());}
     let existence:Existence=serde_json::from_str(&existence).map_err(|_|"The source pane existence is invalid")?;
     let workspace_existence:Existence=serde_json::from_str(&workspace_existence).map_err(|_|"The source workspace existence is invalid")?;
-    let content=content.as_deref().ok_or("The source automation descriptor exceeds its inspection limit")?;
-    let saved=match tag.as_str() {
-        "chat"=>CardKind::Chat(serde_json::from_str(content).map_err(|_|"The source native descriptor is invalid")?),
-        "terminal"=>CardKind::Terminal(serde_json::from_str(content).map_err(|_|"The source terminal descriptor is invalid")?),
-        _=>return if claim.is_some() {Err("The claimed archive pane changed kind".into())} else {Ok(None)},
-    };
+    let saved=crate::persistence::read_migration_session_at(&tx,card,&tag,content.as_deref())
+        .map_err(|_|"The source automation descriptor is invalid or exceeds its inspection limit")?;
     if !existence.is_open() || !workspace_existence.is_open() || &saved!=kind {return Err("The source automation pane changed".into());}
     match std::fs::symlink_metadata(registry) {
         Err(error) if error.kind()==std::io::ErrorKind::NotFound && claim.is_none()=>return Ok(None),
@@ -265,6 +266,7 @@ mod tests {
             boot_id: crate::model::BootId::new("archive-boot"),
             host_incarnation: crate::model::HostIncarnation::new("archive-incarnation"),
         });
+        session.launch.session_id=Some("confirmed-archive-thread".into());
         let record = Agent {
             name: None,
             id: agent,
@@ -294,6 +296,7 @@ mod tests {
             closed: true,
         };
         let snapshot = Snapshot {
+            session_id:session.launch.session_id.clone(),
             exited: true,
             read_only_reason: Some("Completed scheduled conversation".into()),
             ..Default::default()
@@ -323,6 +326,16 @@ mod tests {
         let unissued_session = unissued_session.clone();
         assert!(ArchivedPaneReadiness::qualify(id, &unissued_session, &unissued).is_err());
         assert!(ArchivedPaneReadiness::qualify(id, &changed, &archive).is_err());
+        let mut stale=session.clone();stale.launch.session_id=None;
+        assert!(ArchivedPaneReadiness::qualify(id,&stale,&archive).is_ok(),"stale None learns only the canonical confirmed thread");
+        let mut wrong_thread=archive.clone();wrong_thread.snapshot.session_id=Some("different-confirmed-thread".into());
+        assert!(ArchivedPaneReadiness::qualify(id,&stale,&wrong_thread).is_err());
+        let mut listener=session.clone();listener.owned_codex_listener=Some(crate::chat::OwnedCodexListener {socket:"/invented/control.sock".into(),allocator:session.proof.clone().unwrap()});
+        assert!(ArchivedPaneReadiness::qualify(id,&listener,&archive).is_err());
+        let mut continuity=session.clone();continuity.native_continuity=crate::chat::NativeContinuity::Durable {provider_version:"invented".into()};
+        assert!(ArchivedPaneReadiness::qualify(id,&continuity,&archive).is_err());
+        let mut paired=session.clone();paired.terminal=Some(crate::model::TerminalSession {id:session.id,owned_codex_listener:None,recovery_origin:None,predecessor:None,launch:session.launch.recipe.clone(),transcript_path:None,resume_hint:None,continuity:crate::model::TerminalContinuity::RelaunchAvailable {recipe:session.launch.recipe.clone(),last_exit:None}});
+        assert!(ArchivedPaneReadiness::qualify(id,&paired,&archive).is_err());
         for field in 0..5 {
             let mut invalid = archive.clone();
             match field {
@@ -442,17 +455,25 @@ mod tests {
         };
         let mut terminal_archive=archive.clone();terminal_archive.agent.console=Some(terminal.clone());
         let model=Connection::open(&registry).unwrap();model.execute("UPDATE agents SET record=?1",[serde_json::to_string(&terminal_archive.agent).unwrap()]).unwrap();drop(model);
-        let write_terminal=|terminal:&crate::model::TerminalSession|{
-            let source=Connection::open(&window).unwrap();source.execute("UPDATE cards SET kind_tag='terminal',content_json=?1",[serde_json::to_string(terminal).unwrap()]).unwrap();
-        };
+        let terminal_window=directory.path().join("normalized-terminal.sqlite3");
+        let store=crate::persistence::StateStore::open(&terminal_window,crate::model::BootId::new("archive-boot")).unwrap();
+        let mut workspace=crate::model::WorkspaceState::default();
+        workspace.cards.push(crate::model::CardState {id:card,generation:0,title:"Original scheduled console".into(),width_fraction:0.6,existence:crate::model::Existence::Open,exposure:crate::model::Exposure::Offscreen,residency:crate::model::Residency::Cold,kind:CardKind::Terminal(terminal.clone())});
+        let mut receipt=store.save_workspace(&workspace,crate::persistence::SnapshotBase {workspace:0,cards:&Default::default()}).unwrap();
+        let actual=Connection::open(&terminal_window).unwrap();
+        let content:Option<String>=actual.query_row("SELECT content_json FROM cards WHERE card_id=?1",[card.to_string()],|row|row.get(0)).unwrap();
+        assert!(content.is_none(),"production Terminal descriptors use normalized rows");drop(actual);
+        assert!(inspect_completed_automation_pane(&terminal_window,&legacy,card,&CardKind::Terminal(terminal.clone())).unwrap().is_none(),"an ordinary baseline terminal with NULL content is not an archive");
         for ended in [false,true] {
             if ended {terminal.continuity=crate::model::TerminalContinuity::Exited {last_exit:crate::model::TerminalExit {code:Some(0),signal:None,occurred_at_unix_ms:1}};}
-            write_terminal(&terminal);
-            let before=(std::fs::read(&window).unwrap(),std::fs::read(&registry).unwrap());
-            assert!(inspect_completed_automation_pane(&window,&registry,card,&CardKind::Terminal(terminal.clone())).unwrap().unwrap().matches_terminal(id,&terminal));
-            assert_eq!(before,(std::fs::read(&window).unwrap(),std::fs::read(&registry).unwrap()));
+            workspace.cards[0].kind=CardKind::Terminal(terminal.clone());
+            receipt=store.save_workspace(&workspace,crate::persistence::SnapshotBase {workspace:receipt.generation,cards:&receipt.card_generations}).unwrap();
+            let before=(std::fs::read(&terminal_window).unwrap(),std::fs::read(&registry).unwrap());
+            assert!(inspect_completed_automation_pane(&terminal_window,&registry,card,&CardKind::Terminal(terminal.clone())).unwrap().unwrap().matches_terminal(id,&terminal));
+            assert_eq!(before,(std::fs::read(&terminal_window).unwrap(),std::fs::read(&registry).unwrap()));
         }
-        terminal.launch.working_directory="/explicit-replacement".into();write_terminal(&terminal);
-        assert!(inspect_completed_automation_pane(&window,&registry,card,&CardKind::Terminal(terminal.clone())).unwrap().is_none(),"canonical card identity cannot authorize a replacement descriptor");
+        terminal.launch.working_directory="/explicit-replacement".into();
+        let actual=Connection::open(&terminal_window).unwrap();actual.execute("UPDATE terminal_recipes SET recipe_json=?1 WHERE card_id=?2",params![serde_json::to_string(&terminal.launch).unwrap(),card.to_string()]).unwrap();drop(actual);
+        assert!(inspect_completed_automation_pane(&terminal_window,&registry,card,&CardKind::Terminal(terminal.clone())).unwrap().is_none(),"canonical card identity cannot authorize a replacement descriptor");
     }
 }
