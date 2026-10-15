@@ -15315,8 +15315,6 @@ mod tests {
                     boot_id: proof.boot_id,
                     host_incarnation: proof.host_incarnation,
                 };
-            } else {
-                replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
             }
             let snapshot = Snapshot {
                 session_id: replacement.launch.session_id.clone(),

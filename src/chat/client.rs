@@ -2471,10 +2471,19 @@ mod tests {
         };
         assert_eq!(session, restored);
 
+        let mut wrong_thread = restored.clone();
+        wrong_thread.launch.session_id = Some("different-known-thread".into());
+        let (outcome, _) = negotiate(
+            &live,
+            saved.clone(),
+            ServerMessage::Response {
+                response: ServerResponse::UpgradeChatResolved { session: wrong_thread },
+            },
+        );
+        assert!(outcome.is_err(), "a confirmed replacement cannot change a saved known thread");
+
         // A replacement for a different chat proves nothing about this one.
-        // The conversation identifier deliberately is not part of that
-        // comparison: the daemon reports the conversation its restarted writer
-        // actually holds, which is the answer being asked for.
+        // A known conversation identifier remains part of its exact source.
         let mut other = restored.clone();
         other.id = TerminalId::new();
         let (outcome, _) = negotiate(
@@ -2614,7 +2623,7 @@ mod tests {
     #[test]
     fn upgrade_provenance_requires_the_exact_attached_descriptor_and_confirmation() {
         for mismatch in 0..3 {
-            let source = omp_card(Some("prior-conversation"), Some(host_proof("prior")));
+            let source = omp_card(Some(CONVERSATION), Some(host_proof("prior")));
             let mut resolved = source.clone();
             resolved.proof = Some(host_proof("live"));
             resolved.launch.session_id = Some(CONVERSATION.into());

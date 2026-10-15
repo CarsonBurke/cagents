@@ -545,6 +545,7 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
         || old == new
         || source.id != replacement.id
         || source.launch.provider != replacement.launch.provider
+        || source.launch.session_id != replacement.launch.session_id
         || !upgrade_recipe_matches(source, replacement)
         || source.owned_codex_listener != replacement.owned_codex_listener
         || (source.native_continuity != replacement.native_continuity

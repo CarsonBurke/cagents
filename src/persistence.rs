@@ -7665,15 +7665,19 @@ mod tests {
         lane.save(&store, &workspace).unwrap();
 
         // Restarting the same provider conversation with its issued recipe
-        // remains an ordinary save; only cross-proof ID rotation needs a CAS.
+        // remains an ordinary save; an explicit upgrade still preserves its known ID.
         source.proof.as_mut().unwrap().host_incarnation = "second-daemon".into();
         workspace.cards[0].kind = CardKind::Chat(source.clone());
         lane.save(&store, &workspace).unwrap();
         let mut replacement = source.clone();
         replacement.proof.as_mut().unwrap().host_incarnation = "third-daemon".into();
-        replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
-        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
+        let mut wrong_thread = replacement.clone();
+        wrong_thread.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+        workspace.cards[0].kind = CardKind::Chat(wrong_thread.clone());
         assert!(lane.save(&store, &workspace).is_err());
+        assert!(store.rebind_chat_upgrade(card, &source, &wrong_thread).is_err());
+        assert_eq!(store.load_card(card, None).unwrap().unwrap().kind, CardKind::Chat(source.clone()));
+        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
         for altered in 0..8 {
             let mut refused = replacement.clone();
             match altered {
