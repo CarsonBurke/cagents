@@ -1,11 +1,11 @@
-//! Custody for the one blocked-stdin whole-session Stop fixture.
+//! Original process custody for the whole-session Stop fixtures.
 //! No numeric PID lookup can create cleanup authority here.
 use super::Handle;
 use std::{
     io::Write,
     os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -15,6 +15,9 @@ struct Capture {
     reply: crossbeam_channel::Sender<Result<OwnedFd, String>>,
 }
 static CAPTURE: OnceLock<Mutex<Option<Capture>>> = OnceLock::new();
+// Keep the one-shot original-spawn capture exclusive even in the default
+// parallel test harness. This lock never enters production or actor threads.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Called immediately after the original ChildGuard captures its own pidfd,
 /// before scope enrollment or actor handoff. Other fixture roots are ignored.
@@ -37,6 +40,7 @@ pub(super) fn capture(root: &Path, identity: &OwnedFd) {
 }
 
 pub(super) struct Custody {
+    _serial: MutexGuard<'static, ()>,
     directory: Option<tempfile::TempDir>,
     ticket: uuid::Uuid,
     captured: crossbeam_channel::Receiver<Result<OwnedFd, String>>,
@@ -49,6 +53,7 @@ impl Custody {
         directory: tempfile::TempDir,
         release: crossbeam_channel::Sender<()>,
     ) -> Self {
+        let serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let ticket = uuid::Uuid::new_v4();
         let (reply, captured) = crossbeam_channel::bounded(1);
         let mut slot = CAPTURE
@@ -65,6 +70,7 @@ impl Custody {
             reply,
         });
         Self {
+            _serial: serial,
             directory: Some(directory),
             ticket,
             captured,

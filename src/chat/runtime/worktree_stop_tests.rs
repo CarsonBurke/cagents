@@ -163,14 +163,16 @@ fn whole_session_stop_preempts_saturated_commands_and_blocked_provider_stdin() {
 #[test]
 fn whole_session_stop_checks_actor_identity_then_fences_all_later_work() {
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let (release, _unused) = crossbeam_channel::bounded(1);
+    let mut custody = whole_stop_fixture::Custody::arm(directory, release);
     let spec = ProcessSpec {
-        execution: Some(observed_fixture_directory(directory.path())),
+        execution: Some(observed_fixture_directory(custody.root())),
         messages: None,
         unset_environment: Default::default(),
         transport: TransportSpec::JsonLines,
         program: "/bin/cat".into(),
         arguments: Vec::new(),
-        working_directory: directory.path().into(),
+        working_directory: custody.root().into(),
         environment: BTreeMap::new(),
     };
     let mut initial = Step {
@@ -179,6 +181,8 @@ fn whole_session_stop_checks_actor_identity_then_fences_all_later_work() {
     };
     let store = preflight(&spec, &mut initial).unwrap();
     let handle = Handle::start(spec, Box::new(Quiet), initial, store, None, |_| {}).unwrap();
+    custody.own(&handle);
+    custody.observe_original_root();
     until(&handle, |state| state.ready);
     let observed = handle.close_observation();
     assert!(
