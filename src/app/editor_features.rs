@@ -461,7 +461,11 @@ impl Cagents {
                 if let Some(reason) = &item.disabled { self.feature_failure(operation.card, reason.clone()); return Some(Task::none()); }
                 operation.command = item.command.clone();
                 if let Some(edit) = &item.edit { Some(self.prepare_editor_workspace_edit(operation, edit.clone())) }
-                else { if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); } Some(Task::none()) }
+                else {
+                    if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); }
+                    else { self.feature_failure(operation.card, "The server returned no edits or command for this code action"); }
+                    Some(Task::none())
+                }
             }
             LspEvent::SignatureHelp { request, doc, help, .. } => {
                 let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
@@ -642,7 +646,7 @@ impl Cagents {
                 let Some(mut operation) = self.editor_operation(card, LspEditKind::CodeAction) else { return Task::none(); };
                 if operation.version != version || item.disabled.is_some() { self.feature_failure(card, "This code action is no longer available"); return Task::none(); }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.set_editor_code_actions(&[]); }
-                if item.needs_resolve {
+                if item.needs_resolve && self.lsp.capabilities(operation.doc).code_action_resolve {
                     let request = self.lsp.request_resolve_code_action(operation.doc, item);
                     self.editor_features.requests.insert(request, operation);
                     return Task::none();
@@ -650,7 +654,7 @@ impl Cagents {
                 operation.command = item.command;
                 if let Some(edit) = item.edit { self.prepare_editor_workspace_edit(operation, edit) }
                 else if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); Task::none() }
-                else { Task::none() }
+                else { self.feature_failure(card, "The server returned no edits or command for this code action"); Task::none() }
             }
             Action::Signature(card, trigger) => {
                 let Some(doc) = self.lsp_document(card) else { return Task::none(); };
