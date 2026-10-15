@@ -323,9 +323,9 @@ mod tests {
         let spec=ProcessSpec { execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:Default::default() };
         let mut adapter:Box<dyn Adapter>=Box::new(ResetAdapter);
         let mut initial=adapter.initialize().unwrap();
-        let mut store=super::super::preflight(&spec,&mut initial).unwrap();
+        let mut store=crate::chat::runtime::preflight(&spec,&mut initial).unwrap();
         populate(&mut store);
-        let handle=super::super::Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();
+        let handle=crate::chat::runtime::Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();
         let baseline=handle.snapshot(None).unwrap();
         assert!(!baseline.items.is_empty());
         let token=baseline.source_incarnation.unwrap();

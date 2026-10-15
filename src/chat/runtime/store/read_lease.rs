@@ -238,8 +238,8 @@ mod tests {
         let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:Default::default()};
         let (observed,received)=crossbeam_channel::bounded(1);
         let mut initial=Step {events:vec![Event::Ready(true)],..Step::default()};
-        let store=super::super::preflight(&spec,&mut initial).unwrap();
-        let handle=super::super::Handle::start(spec,Box::new(Controls(observed)),initial,store,None,|_|{}).unwrap();
+        let store=crate::chat::runtime::preflight(&spec,&mut initial).unwrap();
+        let handle=crate::chat::runtime::Handle::start(spec,Box::new(Controls(observed)),initial,store,None,|_|{}).unwrap();
         {
             let store=handle.0.store.lock().unwrap();
             let hook=RollbackFault::install(&store);
