@@ -59,7 +59,10 @@ fn setting_input<'a>(
     if let Some(error) = error {
         input = input.error(error);
     }
-    setting_field(label, detail, input.into()).keywords(value).keywords(field.config_key()).error(error)
+    setting_field(label, detail, input.into())
+        .keywords(value)
+        .keywords(field.config_key())
+        .error(error)
 }
 
 fn setting_stepper<'a>(
@@ -107,7 +110,11 @@ fn settings_choice<'a>(
     choices: impl IntoIterator<Item = (&'static str, &'static str, bool)>,
 ) -> Setting<'a, Message> {
     let choices: Vec<_> = choices.into_iter().collect();
-    let keywords = choices.iter().map(|(label, value, _)| format!("{label} {value}")).collect::<Vec<_>>().join(" ");
+    let keywords = choices
+        .iter()
+        .map(|(label, value, _)| format!("{label} {value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let buttons: Vec<Element<'a, Message>> = choices
         .into_iter()
         .map(|(choice, value, selected)| {
@@ -142,7 +149,9 @@ fn settings_choice<'a>(
             .spacing(space::XS)
             .width(Length::Fill)
             .into(),
-    ).keywords(keywords).keywords(field.config_key())
+    )
+    .keywords(keywords)
+    .keywords(field.config_key())
 }
 
 /// One provider's default-account choice: the accounts it has, each marked
@@ -1344,11 +1353,9 @@ fn settings_layout<'a>(
     } else {
         let categories = widget::scrollable(
             widget::container(
-                widget::column::with_children(
-                    SettingsCategory::ALL
-                        .into_iter()
-                        .map(|item| category_button(item, selected_category(category, query), refused(item))),
-                )
+                widget::column::with_children(SettingsCategory::ALL.into_iter().map(|item| {
+                    category_button(item, selected_category(category, query), refused(item))
+                }))
                 .spacing(space::XS)
                 .width(Length::Fill),
             )
@@ -1408,11 +1415,21 @@ fn settings_layout<'a>(
         );
     }
     if let Some(error) = context.reload_error {
-        results.insert(0, widget::column::with_children(vec![
-            design::body(format!("Could not reload settings.toml. Your working settings remain active. {error}"))
-                .class(cosmic::theme::Text::Custom(design::destructive_text)).into(),
-            crate::ui_controls::button::secondary("Open file").on_press(Message::OpenSettingsFile { reveal: false }).into(),
-        ]).spacing(space::S).into());
+        results.insert(
+            0,
+            widget::column::with_children(vec![
+                design::body(format!(
+                    "Could not reload settings.toml. Your working settings remain active. {error}"
+                ))
+                .class(cosmic::theme::Text::Custom(design::destructive_text))
+                .into(),
+                crate::ui_controls::button::secondary("Open file")
+                    .on_press(Message::OpenSettingsFile { reveal: false })
+                    .into(),
+            ])
+            .spacing(space::S)
+            .into(),
+        );
     }
     let mut header = vec![
         design::heading(if searching {
@@ -1424,12 +1441,24 @@ fn settings_layout<'a>(
         .into(),
     ];
     header.extend(save_status(feedback, invalid.len()));
-    if !searching && !matches!(category, SettingsCategory::Accounts | SettingsCategory::About) {
-        header.push(crate::ui_controls::button::secondary("Reset category")
-            .on_press(Message::ResetSettingsCategory(category)).into());
+    if !searching
+        && !matches!(
+            category,
+            SettingsCategory::Accounts | SettingsCategory::About
+        )
+    {
+        header.push(
+            crate::ui_controls::button::secondary("Reset category")
+                .on_press(Message::ResetSettingsCategory(category))
+                .into(),
+        );
     }
     if context.can_undo {
-        header.push(crate::ui_controls::button::secondary("Undo reset").on_press(Message::UndoSettingsReset).into());
+        header.push(
+            crate::ui_controls::button::secondary("Undo reset")
+                .on_press(Message::UndoSettingsReset)
+                .into(),
+        );
     }
     let header = widget::container(
         widget::container(
@@ -1622,7 +1651,9 @@ fn shortcut_input<'a>(
         widget::column::with_children(children)
             .spacing(space::XS)
             .into(),
-    ).keywords(value).keywords(field.config_key())
+    )
+    .keywords(value)
+    .keywords(field.config_key())
 }
 
 impl Cagents {
@@ -1630,16 +1661,34 @@ impl Cagents {
         let Some(error) = self.settings_reload_error.as_deref() else {
             return iced::widget::Space::new().height(Length::Shrink).into();
         };
-        widget::container(widget::row::with_children(vec![
-            widget::column::with_children(vec![
-                design::heading("Could not reload settings.toml; your working settings are still active.").into(),
-                design::caption(error.lines().next().unwrap_or(error)).wrapping(iced::widget::text::Wrapping::Word).into(),
-            ]).spacing(space::XS).width(Length::Fill).into(),
-            crate::ui_controls::button::secondary("Open file")
-                .on_press_maybe((!self.modal_is_open()).then_some(Message::OpenSettingsFile { reveal: false })).into(),
-        ]).spacing(space::M).align_y(Alignment::Center))
-            .padding(space::M).width(Length::Fill)
-            .class(cosmic::theme::Container::Dialog(false)).into()
+        widget::container(
+            widget::row::with_children(vec![
+                widget::column::with_children(vec![
+                    design::heading(
+                        "Could not reload settings.toml; your working settings are still active.",
+                    )
+                    .into(),
+                    design::caption(error.lines().next().unwrap_or(error))
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .width(Length::Fill)
+                .into(),
+                crate::ui_controls::button::secondary("Open file")
+                    .on_press_maybe(
+                        (!self.modal_is_open())
+                            .then_some(Message::OpenSettingsFile { reveal: false }),
+                    )
+                    .into(),
+            ])
+            .spacing(space::M)
+            .align_y(Alignment::Center),
+        )
+        .padding(space::M)
+        .width(Length::Fill)
+        .class(cosmic::theme::Container::Dialog(false))
+        .into()
     }
 }
 
@@ -1650,8 +1699,15 @@ mod search_tests {
     fn settings_search_finds_real_controls_by_key_choice_caption_and_chord() {
         let app = super::super::tests::context_inspector_test_app(false);
         let invalid = HashMap::new();
-        let context = SettingsContext { feedback: None, reload_error: None, can_undo: false,
-            invalid: &invalid, accounts: vec![], updates: app.update_summary(), testing_notification: false };
+        let context = SettingsContext {
+            feedback: None,
+            reload_error: None,
+            can_undo: false,
+            invalid: &invalid,
+            accounts: vec![],
+            updates: app.update_summary(),
+            testing_notification: false,
+        };
         for (category, query) in [
             (SettingsCategory::General, "focus_follows_mouse"),
             (SettingsCategory::General, "hover"),
@@ -1659,14 +1715,21 @@ mod search_tests {
             (SettingsCategory::Keyboard, "ctrl+t"),
         ] {
             let result = settings_category_controls(category, &app.settings_draft, &context)
-                .into_iter().any(|group| group.view(category.label(), query).is_some());
+                .into_iter()
+                .any(|group| group.view(category.label(), query).is_some());
             assert!(result, "{query} should match {}", category.label());
         }
     }
 
     #[test]
     fn search_deselects_category_navigation() {
-        assert_eq!(selected_category(SettingsCategory::Appearance, "font"), None);
-        assert_eq!(selected_category(SettingsCategory::Appearance, ""), Some(SettingsCategory::Appearance));
+        assert_eq!(
+            selected_category(SettingsCategory::Appearance, "font"),
+            None
+        );
+        assert_eq!(
+            selected_category(SettingsCategory::Appearance, ""),
+            Some(SettingsCategory::Appearance)
+        );
     }
 }
