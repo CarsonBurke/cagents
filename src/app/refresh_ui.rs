@@ -373,7 +373,7 @@ impl Cagents {
         let primary_checkout = self
             .project_ui
             .primary_checkout_roots
-            .get(&canonical)
+            .get(expected_repository.as_ref().unwrap_or(&canonical))
             .cloned();
         let path = known_checkout.map_or(path, |(checkout, _)| checkout);
         cosmic::task::future(async move {
