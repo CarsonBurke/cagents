@@ -203,6 +203,12 @@ pub(super) fn subscriptions(runtime:&Runtime)->Vec<Subscription<Message>> {
     runtime.changes_find.query.as_ref().filter(|_|runtime.visible.load(Ordering::Relaxed))
         .map(|request|vec![Subscription::run_with(request.clone(),stream)]).unwrap_or_default()
 }
+/// Explicit fixture drain of the production worker stream and completion
+/// action. This never changes the production scheduler or auto-runs in new().
+#[cfg(test)]
+pub(super) fn fixture_stream(runtime:&Runtime)->Option<Pin<Box<dyn iced::futures::Stream<Item=Message>+Send>>> {
+    runtime.changes_find.query.as_ref().map(stream)
+}
 pub(super) fn complete(runtime:&mut Runtime,id:u64,ready:Ready) {
     let Some(result)=ready.0.0.lock().unwrap_or_else(|error|error.into_inner()).take() else {return;};
     let current=Scope::current(runtime);
