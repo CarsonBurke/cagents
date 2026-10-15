@@ -261,11 +261,7 @@ impl ReviewInputBarrier {
             shared.native_review = None;
         }
     }
-    pub(crate) fn confirm_review(
-        &self,
-        previous: Option<uuid::Uuid>,
-        current: Option<uuid::Uuid>,
-    ) {
+    pub(crate) fn confirm_review(&self, previous: Option<uuid::Uuid>, current: Option<uuid::Uuid>) {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if shared.closing {
             return;
