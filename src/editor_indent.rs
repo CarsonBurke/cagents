@@ -77,23 +77,59 @@ impl Indentation {
     }
 
     pub fn unit(self) -> String {
-        if self.tabs {
-            "\t".into()
-        } else {
-            " ".repeat(self.size as usize)
-        }
+        self.addition("")
     }
 
-    pub fn outdent_bytes(self, line: &str) -> usize {
-        if line.starts_with('\t') {
-            1
-        } else {
-            line.bytes()
-                .take(self.size as usize)
-                .take_while(|byte| *byte == b' ')
-                .count()
-        }
+    fn columns(self, prefix: &str) -> usize {
+        let width = usize::from(self.tab_width.max(1));
+        prefix.bytes().fold(0, |column, byte| {
+            if byte == b'\t' {
+                column + width - column % width
+            } else {
+                column + 1
+            }
+        })
     }
+
+    /// Add one indentation level at the existing prefix's actual tab stop.
+    pub fn addition(self, prefix: &str) -> String {
+        let mut column = self.columns(prefix);
+        let target = column + usize::from(self.size);
+        let width = usize::from(self.tab_width.max(1));
+        let mut added = String::new();
+        while column < target {
+            let next = column + width - column % width;
+            if self.tabs && next <= target {
+                added.push('\t');
+                column = next;
+            } else {
+                added.push(' ');
+                column += 1;
+            }
+        }
+        added
+    }
+
+    /// Replace only the suffix needed to remove one visual indentation level.
+    /// A tab straddling the target column becomes spaces; earlier bytes survive.
+    pub fn outdent(self, prefix: &str) -> (usize, String) {
+        let target = self.columns(prefix).saturating_sub(usize::from(self.size));
+        let width = usize::from(self.tab_width.max(1));
+        let mut column = 0;
+        for (index, byte) in prefix.bytes().enumerate() {
+            let next = if byte == b'\t' {
+                column + width - column % width
+            } else {
+                column + 1
+            };
+            if next > target {
+                return (index, " ".repeat(target - column));
+            }
+            column = next;
+        }
+        (prefix.len(), String::new())
+    }
+
 }
 
 /// Reads at most 64 KiB per directory and never follows a configuration link
@@ -117,10 +153,12 @@ pub fn read(worktree: &Path, path: &Path) -> Overrides {
         if text
             .lines()
             .take_while(|line| !line.trim_start().starts_with('['))
-            .any(|line| {
-                line.trim().eq_ignore_ascii_case("root = true")
-                    || line.trim().eq_ignore_ascii_case("root=true")
-            })
+            .filter_map(|line| line.split_once('='))
+            .filter(|(key, _)| key.trim().eq_ignore_ascii_case("root"))
+            .map(|(_, value)| value.trim())
+            .filter(|value| value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false"))
+            .last()
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
         {
             result = Overrides::default();
         }
@@ -394,6 +432,49 @@ mod tests {
         );
         assert_eq!(Indentation::detect("", 4, config).size, 4);
         assert_eq!((config.size, config.tab_width), (None, None));
+    }
+
+    #[test]
+    fn editorconfig_root_trims_key_and_value_and_uses_the_last_pair() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("src")).unwrap();
+        std::fs::write(directory.path().join(".editorconfig"),
+            "[*]\nindent_style=tab\nindent_size=8\n").unwrap();
+        for root in ["root =true", "root= true", " ROOT\t=\tTrUe ", "root=false\nroot= true"] {
+            std::fs::write(directory.path().join("src/.editorconfig"),
+                format!("{root}\n[*]\ntab_width=2\n")).unwrap();
+            let config = read(directory.path(), Path::new("src/a.rs"));
+            assert_eq!(config.tabs, None, "{root:?}");
+            assert_eq!(config.size, None, "{root:?}");
+            assert_eq!(config.tab_width, Some(2));
+        }
+        for root in ["root=true\nroot=false", "root=true # not an inline comment"] {
+            std::fs::write(directory.path().join("src/.editorconfig"),
+                format!("{root}\n[*]\ntab_width=2\n")).unwrap();
+            assert_eq!(read(directory.path(), Path::new("src/a.rs")).size, Some(8));
+        }
+    }
+
+    #[test]
+    fn tab_indentation_levels_use_both_size_and_tab_stops() {
+        for (size, width, first, second) in [
+            (8, 4, "\t\t", "\t\t"),
+            (4, 3, "\t ", "\t  "),
+            (4, 8, "    ", "\t"),
+        ] {
+            let indentation = Indentation { tabs: true, size, tab_width: width };
+            assert_eq!(indentation.unit(), first);
+            assert_eq!(indentation.addition(first), second);
+            let twice = format!("{first}{second}");
+            let (start, suffix) = indentation.outdent(&twice);
+            let once = format!("{}{suffix}", &twice[..start]);
+            assert_eq!(indentation.columns(&once), usize::from(size));
+            let (start, suffix) = indentation.outdent(&once);
+            assert_eq!(format!("{}{suffix}", &once[..start]), "");
+        }
+        let indentation = Indentation { tabs: true, size: 4, tab_width: 8 };
+        let (start, suffix) = indentation.outdent("\t\t");
+        assert_eq!(format!("{}{suffix}", &"\t\t"[..start]), "\t    ");
     }
 
     #[test]

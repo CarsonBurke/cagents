@@ -1292,34 +1292,31 @@ where
         {
             // Type over an existing closer, still applying the blank-line
             // dedentation contract when a paired closer follows Enter.
-            let remove = if ")]}".contains(character) {
+            let (start, replacement) = if ")]}".contains(character) {
                 let indentation = self.0.get_mut().indentation;
                 self.with_line(cursor.position.line, |line, _| {
                     let before = &line[..cursor.position.column];
                     if before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
-                        indentation.outdent_bytes(before)
+                        indentation.outdent(before)
                     } else {
-                        0
+                        (cursor.position.column, String::new())
                     }
                 })
-                .unwrap_or(0)
+                .unwrap_or((cursor.position.column, String::new()))
             } else {
-                0
+                (cursor.position.column, String::new())
             };
-            if remove > 0 {
+            if start < cursor.position.column {
                 self.replace_range_recorded(
-                    Position {
-                        line: cursor.position.line,
-                        column: cursor.position.column - remove,
-                    },
+                    Position { line: cursor.position.line, column: start },
                     cursor.position,
-                    "",
+                    &replacement,
                 );
             }
             self.set_cursor(Cursor {
                 position: Position {
                     line: cursor.position.line,
-                    column: cursor.position.column - remove + character.len_utf8(),
+                    column: start + replacement.len() + character.len_utf8(),
                 },
                 selection: None,
             });
@@ -1390,8 +1387,16 @@ where
         let anchor = cursor.selection.unwrap_or(cursor.position);
         let indentation = self.0.get_mut().indentation;
         if !outdent && anchor.line == cursor.position.line {
+            let unit = self.with_line(cursor.position.line, |line, _| {
+                let before = &line[..cursor.position.column.min(line.len())];
+                if before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+                    indentation.addition(before)
+                } else {
+                    indentation.unit()
+                }
+            }).unwrap_or_else(|| indentation.unit());
             return self
-                .perform_edit(Edit::Paste(Arc::new(indentation.unit())))
+                .perform_edit(Edit::Paste(Arc::new(unit)))
                 .map(|recorded| recorded.change)
                 .into_iter()
                 .collect();
@@ -1406,42 +1411,36 @@ where
         if last > first && high.column == 0 {
             last -= 1;
         }
-        let unit = indentation.unit();
         let mut shifts = Vec::new();
         let mut changes = Vec::new();
         for line in (first..=last).rev() {
-            let removed = if outdent {
-                self.with_line(line, |text, _| indentation.outdent_bytes(text))
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            if outdent && removed == 0 {
-                continue;
-            }
-            let start = Position { line, column: 0 };
+            let Some((start, end, replacement)) = self.with_line(line, |text, _| {
+                let end = text.bytes().take_while(|byte| matches!(byte, b' ' | b'\t')).count();
+                let prefix = &text[..end];
+                if outdent {
+                    let (start, replacement) = indentation.outdent(prefix);
+                    (start, end, replacement)
+                } else {
+                    (end, end, indentation.addition(prefix))
+                }
+            }) else { continue; };
+            if start == end && replacement.is_empty() { continue; }
             if let Some(change) = self.replace_range_recorded(
-                start,
-                Position {
-                    line,
-                    column: removed,
-                },
-                if outdent { "" } else { &unit },
+                Position { line, column: start },
+                Position { line, column: end },
+                &replacement,
             ) {
                 changes.push(change);
             }
-            shifts.push((
-                line,
-                if outdent {
-                    -(removed as isize)
-                } else {
-                    unit.len() as isize
-                },
-            ));
+            shifts.push((line, start, end, replacement.len()));
         }
         let map = |mut position: Position| {
-            if let Some((_, shift)) = shifts.iter().find(|(line, _)| *line == position.line) {
-                position.column = position.column.saturating_add_signed(*shift);
+            if let Some((_, start, end, added)) = shifts.iter().find(|(line, ..)| *line == position.line) {
+                if position.column >= *end {
+                    position.column = position.column - *end + *start + *added;
+                } else if position.column > *start {
+                    position.column = *start + (position.column - *start).min(*added);
+                }
             }
             position
         };
@@ -1478,7 +1477,7 @@ where
                 };
                 let mut result = leading.clone();
                 if closer.is_some() {
-                    result.push_str(&indentation.unit());
+                    result.push_str(&indentation.addition(&leading));
                 }
                 let paired = cursor.selection.is_none()
                     && closer.is_some()
@@ -1513,25 +1512,26 @@ where
             return false;
         }
         let indentation = self.0.get_mut().indentation;
-        let remove = self
+        let (start, mut replacement) = self
             .with_line(cursor.position.line, |line, _| {
                 let before = &line[..cursor.position.column.min(line.len())];
                 if before.is_empty() || !before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
-                    0
+                    (cursor.position.column, String::new())
                 } else {
-                    indentation.outdent_bytes(before)
+                    indentation.outdent(before)
                 }
             })
-            .unwrap_or(0);
-        if remove == 0 {
+            .unwrap_or((cursor.position.column, String::new()));
+        if start == cursor.position.column {
             return false;
         }
         // One replacement, so dedentation and the typed closer undo together.
-        let start = Position {
-            line: cursor.position.line,
-            column: cursor.position.column.saturating_sub(remove),
-        };
-        self.replace_range_recorded(start, cursor.position, &closer.to_string());
+        replacement.push(closer);
+        self.replace_range_recorded(
+            Position { line: cursor.position.line, column: start },
+            cursor.position,
+            &replacement,
+        );
         true
     }
 
@@ -5980,6 +5980,56 @@ mod tests {
         content.perform_edit(Edit::Unindent).unwrap();
         assert_eq!(content.text(), "x");
         assert_eq!(content.cursor().position.column, 0);
+    }
+
+    #[test]
+    fn distinct_indent_size_and_tab_width_apply_to_tab_enter_and_closers() {
+        for (size, width, unit) in [(8, 4, "\t\t"), (4, 3, "\t "), (4, 8, "    ")] {
+            let policy = crate::editor_indent::Indentation { tabs: true, size, tab_width: width };
+            let mut tab: Content = Content::with_text("");
+            tab.configure_indentation(policy);
+            tab.perform_edit(Edit::Indent).unwrap();
+            assert_eq!(tab.text(), unit);
+            let mut paired: Content = Content::with_text("{}");
+            paired.configure_indentation(policy);
+            paired.set_cursor(Cursor { position: Position { line: 0, column: 1 }, selection: None });
+            paired.perform_edit(Edit::Enter).unwrap();
+            assert_eq!(paired.text(), format!("{{\n{unit}\n}}"));
+            // A typed closer at the indented empty line removes exactly one level.
+            paired.perform_edit(Edit::Insert('}')).unwrap();
+            assert_eq!(paired.text(), "{\n}\n}");
+            // Type-over uses the same visual level while preserving the existing closer.
+            let mut over: Content = Content::with_text(&format!("{unit}}}"));
+            over.configure_indentation(policy);
+            over.set_cursor(Cursor { position: Position { line: 0, column: unit.len() }, selection: None });
+            over.perform_edit(Edit::Insert('}')).unwrap();
+            assert_eq!(over.text(), "}");
+            assert_eq!(over.cursor().position.column, 1);
+        }
+    }
+
+    #[test]
+    fn partial_tab_outdent_is_prefix_only_and_one_grouped_undo() {
+        use history::{History, Replay};
+        let original = format!("\t\t{}\n\t\tsecond", "x".repeat(64 * 1024));
+        let mut content: Content = Content::with_text(&original);
+        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 4, tab_width: 8 });
+        let before = Cursor { position: Position { line: 1, column: 8 }, selection: Some(Position { line: 0, column: 1 }) };
+        content.set_cursor(before);
+        let changes = content.indent_recorded(true);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|change| change.removed == "\t" && change.inserted == "    "));
+        assert!(content.text().starts_with("\t    x"));
+        assert_eq!(content.cursor().position.column, 11);
+        assert_eq!(content.cursor().selection, before.selection);
+        let mut history = History::default();
+        history.record_group(changes, before, content.cursor(), Instant::now());
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), original);
+        assert_eq!(content.cursor(), before);
+        assert_eq!(history.undo(&mut content), Replay::Empty);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert!(content.text().starts_with("\t    x"));
     }
 
     #[test]
