@@ -118,7 +118,7 @@ fn configure_remote_fixture(fixture: &Fixture, failing_ssh: bool) {
         .path()
         .join("config")
         .join(cagents::instance::STORAGE_NAME);
-    fs::create_dir_all(config).unwrap();
+    fs::create_dir_all(&config).unwrap();
     fs::write(config.join("devices.json"),serde_json::to_vec(&serde_json::json!({"devices":[{"name":"fixture","host":"fixture-host","executable":fixture.cli}]})).unwrap()).unwrap();
     let ssh = fixture.root.path().join("bin/ssh");
     fs::write(&ssh,if failing_ssh {"#!/bin/sh\nprintf 'genuine ssh failure\\n' >&2\nexit 255\n"} else {"#!/bin/sh\nset -eu\nlast=''\nfor arg do last=$arg; done\nprintf '%s\\n' \"$last\" >> \"$HOME/../ssh-calls\"\nexec /bin/sh -c \"$last\"\n"}).unwrap();
