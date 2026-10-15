@@ -3,7 +3,7 @@
 //! this optional metadata operation is unsupported or unresponsive.
 use super::*;
 use crate::chat::annotations::OriginalUpdate;
-use crate::chat::protocol::original_proof::{self,AcceptedPromptProof,ClaudeProofs};
+use crate::chat::protocol::original_proof::{self,ClaudeProofs};
 use std::collections::{BTreeMap,BTreeSet};
 use std::time::{Duration,Instant};
 
@@ -26,7 +26,6 @@ pub(super) struct Originals {
     policy:Option<(String,String)>,
     owned:BTreeSet<String>,
     started:BTreeSet<String>,
-    accepted:BTreeMap<String,AcceptedPromptProof>,
     init:Option<Value>,
     confirmed_session:Option<String>,
     latest_started:Option<String>,
@@ -41,8 +40,14 @@ impl Claude {
             waiting.bytes=waiting.bytes.saturating_add(encoded_len(&frame)?);waiting.frames.push(frame);return Ok(vec![]);
         }
         let Some(command)=command else{return Ok(vec![frame]);};
+        if self.originals.owned.len()>=64 && let Some(oldest)=self.originals.owned.iter().next().cloned(){
+            // The durable intent retains unknown acceptance for lifecycle
+            // cleanup. Retiring only the bounded resident join cannot grant
+            // metadata authority or delete potentially consumed input.
+            self.originals.proofs.cancel(&oldest);self.originals.applied.remove(&oldest);self.originals.started.remove(&oldest);self.originals.owned.remove(&oldest);
+        }
         if self.originals.proofs.submit(&command,&command,self.originals.confirmed_session.as_deref()).is_err(){return Ok(vec![frame]);}
-        if self.originals.owned.len()<64{self.originals.owned.insert(command.clone());}
+        self.originals.owned.insert(command.clone());
         // Read optional metadata first. Failure to allocate this optional RPC
         // cannot prevent dispatch of the user's already validated prompt.
         let read=match self.control(json!({"subtype":"get_settings"})) {Ok(read)=>read,Err(_)=>return Ok(vec![frame])};
@@ -77,7 +82,7 @@ impl Claude {
     pub(super) fn original_observe(&mut self,frame:&Value,step:&Step){
         if frame["type"]=="conversation_reset" {
             if let Some(waiting)=self.originals.waiting.take(){self.controls.remove(&waiting.request);self.originals.updates.push(OriginalUpdate::Rejected{command_id:waiting.command});}
-            self.originals.proofs=ClaudeProofs::default();self.originals.applied.clear();self.originals.accepted.clear();self.originals.init=None;self.originals.policy=None;self.originals.owned.clear();self.originals.started.clear();self.originals.confirmed_session=None;self.originals.latest_started=None;self.originals.revision=self.originals.revision.wrapping_add(1);return;
+            self.originals.proofs=ClaudeProofs::default();self.originals.applied.clear();self.originals.init=None;self.originals.policy=None;self.originals.owned.clear();self.originals.started.clear();self.originals.confirmed_session=None;self.originals.latest_started=None;self.originals.revision=self.originals.revision.wrapping_add(1);return;
         }
         // The enclosing receive path already validated this actual provider
         // identity against the connection. Launch --session-id is not evidence.
@@ -124,7 +129,7 @@ impl Claude {
                     // After started/completed, cancellation can mean a failed
                     // turn whose delayed user echo must retain its original.
                     if self.originals.owned.contains(command) && !self.originals.started.contains(command){
-                        self.originals.applied.remove(command);self.originals.accepted.remove(command);self.originals.owned.remove(command);
+                        self.originals.applied.remove(command);self.originals.owned.remove(command);
                         self.originals.updates.push(OriginalUpdate::Rejected{command_id:command.to_owned()});
                     }
                 },_=>{},
@@ -135,18 +140,13 @@ impl Claude {
         }
         let aliases=if frame["type"]=="user"{step.events.iter().filter_map(|event|match event{Event::Item(item) if item.role==Role::User=>Some(item.id.clone()),_=>None}).collect::<Vec<_>>()}else{vec![]};
         if let Some(proof)=self.originals.proofs.observe(frame,&aliases,self.originals.confirmed_session.as_deref()){
-            if self.originals.accepted.len()<64{self.originals.accepted.insert(proof.command_id.clone(),proof);}
-        }
-        let ready=self.originals.accepted.iter().filter_map(|(id,proof)|{
-            let (applied,revision)=self.originals.applied.get(id)?;
-            if *revision!=self.originals.revision{return None;}
-            let _=proof;
-            Some((id.clone(),applied.clone()))
-        }).collect::<Vec<_>>();
-        for (id,settings) in ready{
-            let proof=self.originals.accepted.remove(&id).unwrap();self.originals.applied.remove(&id);self.originals.started.remove(&id);self.originals.owned.remove(&id);
-            self.originals.updates.push(OriginalUpdate::Settings{command_id:id.clone(),settings});
-            self.originals.updates.push(OriginalUpdate::Accepted{command_id:id,session_id:proof.session_id,user_id:proof.user_id,turn_id:proof.turn_id,aliases:proof.aliases});
+            self.originals.owned.remove(&proof.command_id);self.originals.started.remove(&proof.command_id);
+            // Settings are immutable at dispatch. Once this exact join is
+            // complete, absent/stale samples can never become eligible later.
+            if let Some((settings,revision))=self.originals.applied.remove(&proof.command_id) && revision==self.originals.revision{
+                self.originals.updates.push(OriginalUpdate::Settings{command_id:proof.command_id.clone(),settings});
+                self.originals.updates.push(OriginalUpdate::Accepted{command_id:proof.command_id,session_id:proof.session_id,user_id:proof.user_id,turn_id:proof.turn_id,aliases:proof.aliases});
+            }
         }
     }
 }
@@ -205,6 +205,16 @@ mod tests {
     #[test]
     fn missing_policy_before_dispatch_cannot_be_filled_from_a_later_init(){
         let mut adapter=Claude{ready:true,..Claude::default()};adapter.original_command(Some("command".into()));let read=adapter.command(prompt("original",PromptMode::Send)).unwrap();adapter.receive(settings_reply(&read.writes[0])).unwrap();adapter.receive(init()).unwrap();adapter.receive(started("command")).unwrap();adapter.receive(user("command")).unwrap();assert!(adapter.take_original_updates().iter().all(|update|!matches!(update,OriginalUpdate::Settings{..}|OriginalUpdate::Accepted{..})));
+    }
+
+    #[test]
+    fn more_than_64_unknown_turns_do_not_disable_later_qualified_capture(){
+        let mut adapter=adapter();adapter.receive(init()).unwrap();
+        for n in 0..80{
+            let id=format!("unknown-{n}");adapter.original_command(Some(id.clone()));adapter.command(prompt("original",PromptMode::Send)).unwrap();adapter.originals.waiting.as_mut().unwrap().deadline=Instant::now();assert_eq!(adapter.maintenance().unwrap().writes.len(),1);
+            adapter.receive(started(&id)).unwrap();adapter.receive(user(&id)).unwrap();adapter.receive(json!({"type":"result","subtype":"success","session_id":"00000000-0000-4000-8000-000000000001","is_error":false,"result":"done"})).unwrap();adapter.take_original_updates();
+        }
+        adapter.original_command(Some("qualified".into()));let read=adapter.command(prompt("eligible",PromptMode::Send)).unwrap();adapter.receive(settings_reply(&read.writes[0])).unwrap();adapter.receive(started("qualified")).unwrap();adapter.receive(user("qualified")).unwrap();assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Accepted{command_id,..} if command_id=="qualified")));
     }
 
 }
