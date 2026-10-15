@@ -13118,7 +13118,6 @@ impl Application for Cagents {
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
             .set_worktree_sort(app.settings.worktree_sort);
-        let protections = app.sync_worktree_protections();
         app.sidebar_state
             .set_show_worktree_changes_icons(app.settings.show_worktree_changes_icons);
         // `view` lays the strip out against the width `Workspace` holds, which
@@ -13167,6 +13166,9 @@ impl Application for Cagents {
         }
         app.worktree_selection.initialize_runtimes = true;
         let scope = app.restore_worktree_scope();
+        // Ownership includes every restored descriptor before a background
+        // snapshot is allowed to certify this window for cleanup.
+        let protections = app.sync_worktree_protections();
         // Closed/exited replacements can still owe a lost durable acknowledgement.
         for card in &app.durable.cards {
             let terminal = match &card.kind {
