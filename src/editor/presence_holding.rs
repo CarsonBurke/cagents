@@ -99,7 +99,7 @@ impl PresenceHolding {
             fs_safety::DirectoryCreation::Published(receipt) => receipt,
             fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io("The editor staging name already exists and was preserved.".into())),
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {
-                let message = format!("Editor staging ownership could not be verified; the entry was preserved: {reason}");
+                let message = format!("Editor staging ownership could not be verified; the entry was preserved: {reason}. Diagnostic original spelling (not verified location): {}", directory.path().display());
                 let authority = slot.retain(message.clone(), move || {
                     // Ownership was never established. Never chmod/delete or
                     // adopt a replacement from a diagnostic public spelling.
