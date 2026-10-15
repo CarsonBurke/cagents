@@ -2,6 +2,7 @@
 //! Dialog payloads remain in their owning feature modules; entries without a
 //! live payload are removed before they can block the workspace.
 use super::*;
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Modal {
