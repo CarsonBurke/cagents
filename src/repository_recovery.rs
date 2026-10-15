@@ -100,8 +100,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        let root = fs_safety::Root::open(&request.worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let root = self.captured_worktree_root(&request.worktree)?;
         let directory = root
             .metadata()
             .map_err(|error| ValidationError::Io(error.to_string()))?;
@@ -176,8 +175,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let _protection = crate::worktree_cleanup::protect(worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        let root = fs_safety::Root::open(worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let root = self.captured_worktree_root(worktree)?;
         let directory = root
             .metadata()
             .map_err(|error| ValidationError::Io(error.to_string()))?;
@@ -461,8 +459,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let _protection = crate::worktree_cleanup::protect(&recovery.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        let root = fs_safety::Root::open(&recovery.worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let root = self.captured_worktree_root(&recovery.worktree)?;
         let directory = root
             .metadata()
             .map_err(|error| ValidationError::Io(error.to_string()))?;

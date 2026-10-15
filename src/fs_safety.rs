@@ -156,7 +156,7 @@ impl Root {
         std::fs::read_dir(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
     }
 
-    fn descriptor(&self) -> RawFd {
+    pub(crate) fn descriptor(&self) -> RawFd {
         self.directory.as_raw_fd()
     }
 }

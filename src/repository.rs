@@ -18,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod authority;
+pub use authority::{WorktreeAuthority, WorktreeExecutor};
 mod browse_reveal;
 mod ignore_path;
 pub use browse_reveal::include as include_revealed_path;
@@ -3821,6 +3823,7 @@ pub enum RepositoryError {
 pub struct RepositoryService<E = SystemProcessExecutor> {
     git: PathBuf,
     executor: Arc<E>,
+    authority: Option<WorktreeAuthority>,
 }
 
 impl RepositoryService<SystemProcessExecutor> {
@@ -3834,6 +3837,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Self {
             git: git.into(),
             executor,
+            authority: None,
         }
     }
 
@@ -6106,7 +6110,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     );
                 }
             };
-            let root = match fs_safety::Root::open(&request.worktree) {
+            let root = match captured_root.try_clone() {
                 Ok(root) => root,
                 Err(error) => {
                     return discard_failures(
@@ -6187,6 +6191,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         let index = parse_path_line(&output.stdout, "index_path")?;
+        let index = self.captured_worktree_path(&index)?;
         GitFileLock::acquire(&index).map_err(|reason| ValidationError::Io(reason).into())
     }
 
