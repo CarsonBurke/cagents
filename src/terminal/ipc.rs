@@ -694,6 +694,14 @@ pub enum ServerMessage {
         incarnation: uuid::Uuid,
         generation: u64,
     },
+    /// Sticky contradiction between two actually issued equal-clock tokens.
+    /// This bounded invalidation is never coalesced or superseded by a scalar.
+    ChatSourceAuthorityConflict {
+        chat_id: TerminalId,
+        generation: u64,
+        original: uuid::Uuid,
+        conflicting: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

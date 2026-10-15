@@ -120,6 +120,9 @@ pub(crate) enum Update {
     /// its own exact RunId-bearing Execution update.
     PastAttention(crate::notifications::Evidence),
     SourceAuthority {incarnation:uuid::Uuid,generation:u64},
+    /// Two actually issued identities at the same clock permanently revoke
+    /// this attachment, even if a newer scalar was observed first.
+    SourceAuthorityConflict {generation:u64,original:uuid::Uuid,conflicting:uuid::Uuid},
 }
 
 #[derive(Clone)]
@@ -140,6 +143,32 @@ impl Handle {
     pub(crate) fn source_authority(&self)->Option<SourceAuthority> {
         *self.0.source_authority.lock().unwrap_or_else(|p|p.into_inner())
     }
+    #[cfg(test)]
+    pub(crate) fn deny_source_release_for_test(&self) {
+        self.0.store.lock().unwrap().deny_source_release_for_test();
+    }
+    /// Local Store clocks cannot issue a contradiction. Remote facades retain
+    /// and expose exact contradictions received from a helper.
+    pub(crate) fn source_authority_conflict(&self)->Option<SourceAuthority> {None}
+    fn refresh_source_authority(&self) {
+        let authority={
+            let mut store=self.0.store.lock().unwrap_or_else(|p|p.into_inner());
+            let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
+            store.publish_source_authority(&mut state);
+            store.source_authority()
+        };
+        if let Some(authority)=authority {
+            let changed={
+                let mut cached=self.0.source_authority.lock().unwrap_or_else(|p|p.into_inner());
+                if cached.is_some_and(|old|old.generation>authority.generation) || *cached==Some(authority) {false}
+                else {*cached=Some(authority);true}
+            };
+            if changed {
+                self.0.source_dirty.store(true,Ordering::Release);
+                self.wake();
+            }
+        }
+    }
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -151,6 +180,7 @@ struct Inner {
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
+    source_dirty: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -324,6 +354,7 @@ impl Handle {
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
         let source_authority = Arc::new(Mutex::new(None));
+        let source_dirty = Arc::new(AtomicBool::new(false));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -337,6 +368,7 @@ impl Handle {
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
             source_authority: source_authority.clone(),
+            source_dirty: source_dirty.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -384,6 +416,8 @@ impl Handle {
                     state,
                     confirmed_session,
                     source_authority,
+                    source_dirty,
+                    source_notified: None,
                     store,
                     visible,
                     observe_next,
@@ -610,6 +644,11 @@ impl Handle {
                     usage,
                 ) {
                     (actor.notify)(Update::Execution { run, update });
+                }
+                // A read can invalidate authority while the actor is already
+                // draining. Flush its exact latest pair before final EOF.
+                if let Err(error)=actor.publish_source_authority() {
+                    tracing::warn!(reason=%super::protocol::preview(error.as_bytes(),1024),"Final source authority publication failed");
                 }
                 actor.publish_activity();
                 completed.store(native_closed && direct_closed, Ordering::Release);
@@ -879,11 +918,9 @@ impl Handle {
         if !matches!(command,Command::LoadFileChanges {..}|Command::LoadFileChangePatches {..}) {
             return Ok(None);
         }
-        self.0
-            .store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .file_query(command)
+        let result={self.0.store.lock().unwrap_or_else(|p|p.into_inner()).file_query(command)};
+        self.refresh_source_authority();
+        result
     }
     pub(crate) fn provider_exit_output(
         &self,
@@ -918,21 +955,17 @@ impl Handle {
         &self,
         query: super::cache::SourceQuery,
     ) -> Result<super::cache::SourcePage, super::cache::SourceError> {
-        self.0
-            .store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .source_page(query)
+        let result={self.0.store.lock().unwrap_or_else(|p|p.into_inner()).source_page(query)};
+        self.refresh_source_authority();
+        result
     }
     pub(crate) fn raw_source_query(
         &self,
         query: super::cache::raw::RawSourceQuery,
     ) -> Result<super::cache::raw::RawSourcePage, super::cache::SourceError> {
-        self.0
-            .store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .raw_source_page(query)
+        let result={self.0.store.lock().unwrap_or_else(|p|p.into_inner()).raw_source_page(query)};
+        self.refresh_source_authority();
+        result
     }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
@@ -944,6 +977,11 @@ impl Handle {
             .clone()
     }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
+        let result=self.snapshot_inner(after);
+        self.refresh_source_authority();
+        result
+    }
+    fn snapshot_inner(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         store.publish_source_authority(&mut state);
@@ -1000,6 +1038,11 @@ impl Handle {
         chat_id: crate::model::TerminalId,
         after: Option<u64>,
     ) -> Option<crate::terminal_ipc::ServerResponse> {
+        let result=self.presentation_inner(chat_id,after);
+        self.refresh_source_authority();
+        result
+    }
+    fn presentation_inner(&self,chat_id:crate::model::TerminalId,after:Option<u64>)->Option<crate::terminal_ipc::ServerResponse> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         store.publish_source_authority(&mut state);
@@ -1884,6 +1927,8 @@ struct Actor {
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
+    source_dirty: Arc<AtomicBool>,
+    source_notified: Option<SourceAuthority>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -2350,6 +2395,7 @@ impl Actor {
         result
     }
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
+        if self.source_dirty.swap(false,Ordering::AcqRel) {self.publish_source_authority()?;}
         for _ in 0..64 {
             // Backpressure applies to queued bytes, not to the mere existence of a
             // queued write: a provider that reads stdin only between turns keeps
@@ -2642,7 +2688,7 @@ impl Actor {
     }
     fn step(&mut self, step: Step) -> Result<(), String> {
         self.apply_step(step, None)?;
-        if self.source_authority.lock().unwrap_or_else(|p|p.into_inner()).is_none() {
+        if self.source_dirty.swap(false,Ordering::AcqRel) || self.source_notified.is_none() {
             self.publish_source_authority()?;
         }
         Ok(())
@@ -2654,11 +2700,13 @@ impl Actor {
             store.publish_source_authority(&mut state);
             store.source_authority().ok_or("Source authority could not be ordered")?
         };
-        let changed={
-            let mut published=self.source_authority.lock().unwrap_or_else(|p|p.into_inner());
-            if *published==Some(authority) {false} else {*published=Some(authority);true}
+        let authority={
+            let mut cached=self.source_authority.lock().unwrap_or_else(|p|p.into_inner());
+            if cached.is_none_or(|old|old.generation<=authority.generation) {*cached=Some(authority);}
+            cached.expect("actual Store authority was cached")
         };
-        if changed {
+        if self.source_notified!=Some(authority) {
+            self.source_notified=Some(authority);
             (self.notify)(Update::SourceAuthority {incarnation:authority.incarnation,generation:authority.generation});
         }
         Ok(())

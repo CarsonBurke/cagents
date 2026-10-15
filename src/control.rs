@@ -1566,6 +1566,7 @@ impl ControlClient {
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
             | ServerMessage::ChatSourceAuthority { chat_id, .. }
+            | ServerMessage::ChatSourceAuthorityConflict { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             message => return Err(message),
         }
@@ -1762,6 +1763,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatObserved { .. }
         | ServerMessage::ChatActivity { .. }
         | ServerMessage::ChatSourceAuthority { .. }
+        | ServerMessage::ChatSourceAuthorityConflict { .. }
         | ServerMessage::TerminalCreated { .. }
         | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::ChatAccountUsage { .. }
@@ -1784,6 +1786,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatObserved { .. } => "chat_observed",
         ServerMessage::ChatActivity { .. } => "chat_activity",
         ServerMessage::ChatSourceAuthority { .. } => "chat_source_authority",
+        ServerMessage::ChatSourceAuthorityConflict { .. } => "chat_source_authority_conflict",
         ServerMessage::TerminalObserved { .. } => "terminal_observed",
         ServerMessage::TerminalCreated { .. } => "terminal_created",
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",

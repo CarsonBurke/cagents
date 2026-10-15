@@ -183,6 +183,23 @@ impl Store {
 }
 
 #[cfg(test)]
+impl Store {
+    pub(in crate::chat::runtime) fn deny_source_release_for_test(&self) {
+        let fault=super::read_lease::RollbackFault::install(self);
+        assert!(self.with_source_read(|e|e,|_|Ok::<_,String>(())).is_err());
+        drop(fault);
+        self.db.execute_batch("ROLLBACK").unwrap();
+    }
+    pub(crate) fn refuse_source_reset_for_test(&self,intent:bool) {
+        self.db.execute_batch(if intent {
+            "CREATE TRIGGER refuse_hidden_reset BEFORE UPDATE ON transcript_reset_schema WHEN NEW.pending=1 BEGIN SELECT RAISE(FAIL,'intent denied');END;"
+        } else {
+            "CREATE TRIGGER refuse_hidden_reset BEFORE DELETE ON items BEGIN SELECT RAISE(FAIL,'body clear denied');END;"
+        }).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::chat::{Command, ToolStatus, FileChange, ChangeKind};

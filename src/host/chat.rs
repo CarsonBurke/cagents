@@ -468,6 +468,9 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
             Update::SourceAuthority {incarnation,generation} => ServerMessage::ChatSourceAuthority {
                 chat_id:id,incarnation:*incarnation,generation:*generation,
             },
+            Update::SourceAuthorityConflict {generation,original,conflicting} => ServerMessage::ChatSourceAuthorityConflict {
+                chat_id:id,generation:*generation,original:*original,conflicting:*conflicting,
+            },
             Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
             &Update::Observed { generation } if !visible => {
                 let observation = record.observations.entry(client).or_default();
@@ -516,6 +519,26 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
         })
     {
         record.handle.observe_next_update();
+    }
+}
+/// Replay only exact resident authority. This is safe under HostLock: the
+/// getter neither opens Store nor invokes a callback, and delivery is bounded.
+fn seed_source_authority(state:&HostState,id:TerminalId) {
+    let Some(record)=state.chats.get(&id) else {return;};
+    let Some(authority)=record.handle.source_authority() else {return;};
+    let conflict=record.handle.source_authority_conflict();
+    for client in record.subscribers.keys() {
+        let Some(delivery)=state.clients.get(client) else {continue;};
+        let _=delivery.push(ServerEnvelope {
+            version:PROTOCOL_VERSION,request_id:None,proof:state.proof().clone(),
+            message:ServerMessage::ChatSourceAuthority {chat_id:id,incarnation:authority.incarnation,generation:authority.generation},
+        });
+        if let Some(conflict)=conflict {
+            let _=delivery.push(ServerEnvelope {
+                version:PROTOCOL_VERSION,request_id:None,proof:state.proof().clone(),
+                message:ServerMessage::ChatSourceAuthorityConflict {chat_id:id,generation:conflict.generation,original:authority.incarnation,conflicting:conflict.incarnation},
+            });
+        }
     }
 }
 fn session_snapshot(record: &Record) -> ServerResponse {
@@ -805,7 +828,9 @@ fn start_with_execution(
                     after_generation: record.handle.observe_next_update(),
                     ..Observation::default()
                 });
-            return Ok(session_snapshot(record));
+            let response=session_snapshot(record);
+            seed_source_authority(&state,session.id);
+            return Ok(response);
         }
     }
     if !execution_environment.0.is_empty() && (source.is_some() || session.terminal.is_some()) {
@@ -924,7 +949,9 @@ fn start_with_execution(
                     },
                 );
             }
-            return Ok(session_snapshot(record));
+            let response=session_snapshot(record);
+            seed_source_authority(&state,session.id);
+            return Ok(response);
         }
     }
     // All adapter validation happens before a source terminal can be changed.
@@ -1391,6 +1418,7 @@ fn start_with_execution(
         let response = session_snapshot(&record);
         record.handle.commit_native_installation();
         state.chats.insert(id, record);
+        seed_source_authority(&state,id);
         if let Some(context) = &execution {
             context.installed();
         }
@@ -1990,9 +2018,27 @@ pub(super) fn process(
     client: ClientId,
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
-    super::agent_execution::interactive(host, client, request, |request| {
+    // Readers can revoke authority after the actor completed. Replaying the
+    // cached pair after dispatch (including a failed read) reaches every
+    // attached hidden subscriber without synchronously calling back from a
+    // Handle read while HostLock may be held.
+    let target=match &request {
+        ClientRequest::ChatAttach {session} | ClientRequest::ChatStart {session,..}
+        | ClientRequest::ChatStartSelected {session,..}=>Some(session.id),
+        ClientRequest::ChatCommand {chat_id,..}|ClientRequest::ChatRead {chat_id,..}
+        |ClientRequest::ChatVisibility {chat_id,..}=>Some(*chat_id),
+        _=>None,
+    };
+    let result=super::agent_execution::interactive(host, client, request, |request| {
         process_inner(host, client, request)
-    })
+    });
+    if let Some(id)=target {
+        let state=host.lock().unwrap_or_else(|p|p.into_inner());
+        if state.chats.get(&id).is_some_and(|record|record.subscribers.contains_key(&client)) {
+            seed_source_authority(&state,id);
+        }
+    }
+    result
 }
 
 fn process_inner(
@@ -2295,13 +2341,7 @@ fn process_inner(
             record
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
-            // An actor/helper can seed before its host Record is installed.
-            // Replay its exact cached pair without any source/body read.
-            let authority=record.handle.source_authority();
             drop(state);
-            if let Some(authority)=authority {
-                changed(&Arc::downgrade(host),chat_id,Update::SourceAuthority {incarnation:authority.incarnation,generation:authority.generation});
-            }
             if visible {
                 changed(&Arc::downgrade(host), chat_id, Update::Presentation);
             }
@@ -4900,6 +4940,92 @@ done
     }
 
     #[test]
+    fn hidden_source_authority_reaches_framed_eof_after_actual_store_failure() {
+        for (intent,completed_reader) in [(false,false),(true,false),(false,true)] {
+            struct ResetAdapter;
+            impl Adapter for ResetAdapter {
+                fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+                fn command(&mut self,_:Command)->Result<Step,String> {
+                    Ok(Step {events:vec![Event::Reset {reason:"hidden reset".into()}],..Step::default()})
+                }
+                fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+            }
+            let proof=HostSessionProof {host_session_id:HostSessionId::new("hidden-authority"),boot_id:BootId::new("boot"),host_incarnation:HostIncarnation::new("incarnation")};
+            let host=Arc::new(HostLock::new(HostState::new(proof.clone())));
+            let id=TerminalId::new();
+            let recipe=LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:BTreeMap::new(),unset_environment:Default::default()};
+            let spec=ProcessSpec::from(&recipe);
+            let mut initial=Step {events:vec![Event::Ready(true),Event::Item(chat::Item {
+                id:"private".into(),role:chat::Role::Assistant,
+                content:chat::ItemContent::Text {text:"old private body".into(),thinking:false,phase:chat::Phase::Final},at:Some(1),started_at:Some(1),
+            })],..Step::default()};
+            let store=chat::runtime::preflight(&spec,&mut initial).unwrap();
+            if !completed_reader {store.refuse_source_reset_for_test(intent);}
+            let (sent,seeded)=crossbeam_channel::bounded(4);
+            let weak=Arc::downgrade(&host);
+            let handle=Handle::start(spec,Box::new(ResetAdapter),initial,store,None,move |update| {
+                changed(&weak,id,update.clone());
+                if let Update::SourceAuthority {incarnation,generation}=update {let _=sent.try_send((incarnation,generation));}
+            }).unwrap();
+            let original=seeded.recv_timeout(Duration::from_secs(2)).unwrap();
+            let session=Session {id,launch:chat::Launch {provider:Provider::Claude,recipe,session_id:None},proof:Some(proof.clone()),terminal:None,native_continuity:Default::default(),owned_codex_listener:None};
+            let queues={
+                let mut state=host.lock().unwrap();
+                let queues=[state.register_client(1),state.register_client(2)];
+                state.chats.insert(id,Record {execution_instance:uuid::Uuid::new_v4(),console_recipe:None,paired_terminal:None,session:session.clone(),handle:handle.clone(),source_process:None,subscribers:BTreeMap::from([(1,false),(2,false)]),observations:BTreeMap::new(),completion_observed:false,returning_terminal:false});
+                queues
+            };
+            // No ChatVisibility request or post-failure snapshot is used.
+            let attached=process(&host,1,ClientRequest::ChatAttach {session}).unwrap();
+            assert!(matches!(&attached,ServerResponse::ChatAttached {snapshot,..} if !snapshot.items.is_empty()));
+            for queue in &queues {
+                assert!(matches!(queue.pop().unwrap().message,ServerMessage::ChatSourceAuthority {incarnation,generation,..} if (incarnation,generation)==original));
+            }
+            let revoked=if completed_reader {
+                handle.close().unwrap();
+                // Actual SQLITE_DENY on ROLLBACK permanently poisons this
+                // completed Store. No live actor remains to emit the scalar.
+                handle.deny_source_release_for_test();
+                let response=process(&host,1,ClientRequest::ChatCommand {chat_id:id,command:Command::LoadSource {query:chat::cache::SourceQuery {
+                    source:chat::cache::SourceKey {agent_id:None,source_id:"private".into()},offset:0,limit:64,expected_epoch:None,until:None,
+                }}}).unwrap();
+                assert!(matches!(response,ServerResponse::ChatSource {result:Err(_),..}));
+                let pair=handle.source_authority().unwrap();
+                (pair.incarnation,pair.generation)
+            } else {
+                assert!(process(&host,1,ClientRequest::ChatCommand {chat_id:id,command:Command::Interrupt}).is_err());
+                seeded.recv_timeout(Duration::from_secs(2)).unwrap()
+            };
+            assert_ne!(revoked.0,original.0);
+            assert!(revoked.1>original.1);
+            for queue in queues {
+                queue.close_after_drain();
+                let (mut writer,mut reader)=std::os::unix::net::UnixStream::pair().unwrap();
+                reader.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let sender=std::thread::spawn(move || {
+                    let mut codec=crate::terminal_ipc::FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES);
+                    while let Some(frame)=queue.pop() {codec.write(&mut writer,&frame.wire()).unwrap();}
+                });
+                let mut codec=crate::terminal_ipc::FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES);
+                let mut seen=false;
+                while let Some(frame)=codec.read::<ServerEnvelope>(&mut reader).unwrap() {
+                    assert_eq!(frame.proof,proof);
+                    match frame.message {
+                        ServerMessage::ChatSourceAuthority {incarnation,generation,..}=> {
+                            assert_eq!((incarnation,generation),revoked);seen=true;
+                        }
+                        ServerMessage::ChatActivity {..}|ServerMessage::ChatObserved {..}=>{}
+                        other=>panic!("hidden reset hydrated a body: {other:?}"),
+                    }
+                }
+                assert!(seen,"real actor Reset failure must revoke before framed EOF");
+                sender.join().unwrap();
+            }
+            let _=handle.close();
+        }
+    }
+
+    #[test]
     fn delayed_producer_callback_after_rearm_is_fenced_without_reads() {
         acknowledgement_race(false);
     }
@@ -5035,7 +5161,7 @@ done
             while let Some(envelope) = queue.pop() {
                 match envelope.message {
                     ServerMessage::ChatObserved { epoch, .. } => epochs.push(epoch),
-                    ServerMessage::ChatActivity { .. } => {}
+                    ServerMessage::ChatActivity { .. } | ServerMessage::ChatSourceAuthority {..} => {}
                     other => panic!("hidden acknowledgement requested presentation: {other:?}"),
                 }
             }

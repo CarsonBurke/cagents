@@ -296,6 +296,7 @@ impl Actor {
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
         loop {
+            if self.source_dirty.swap(false,Ordering::AcqRel) {self.publish_source_authority()?;}
             if self.stop.load(Ordering::Acquire)
                 && self
                     .native_holder

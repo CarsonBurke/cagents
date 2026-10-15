@@ -30,3 +30,44 @@ impl Store {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn same_store_replacement_keeps_exact_pair_then_fences_final_generation() {
+        let mut store=Store::new().unwrap();
+        let mut old=crate::chat::Snapshot::default();
+        store.publish_source_authority(&mut old);
+        let pair=store.source_authority().unwrap();
+        old.generation=900;
+        store.note_source_generation_floor(old.generation);
+        let mut replacement=crate::chat::Snapshot::default();
+        store.publish_source_authority(&mut replacement);
+        assert_eq!(store.source_authority(),Some(pair));
+        assert!(replacement.generation>=900);
+        store.source_incarnation=uuid::Uuid::new_v4();
+        store.publish_source_authority(&mut replacement);
+        let next=store.source_authority().unwrap();
+        assert_ne!(next.incarnation,pair.incarnation);
+        assert!(next.generation>900);
+    }
+    #[test]
+    fn repeated_failed_resets_each_issue_a_strictly_newer_exact_token() {
+        let mut store=Store::new().unwrap();
+        let mut state=crate::chat::Snapshot::default();
+        store.publish_source_authority(&mut state);
+        let initial=store.source_authority().unwrap();
+        store.refuse_source_reset_for_test(true);
+        let mut previous=initial;
+        for _ in 0..3 {
+            assert!(store.apply(Event::Reset {reason:"refused but invalidated".into()}).is_err());
+            store.publish_source_authority(&mut state);
+            let pair=store.source_authority().unwrap();
+            assert_ne!(pair.incarnation,previous.incarnation);
+            assert!(pair.generation>previous.generation);
+            assert_eq!(state.source_incarnation,Some(pair.incarnation));
+            previous=pair;
+        }
+    }
+}

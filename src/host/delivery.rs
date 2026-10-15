@@ -215,7 +215,7 @@ impl DeliveryQueue {
     /// draining it, so the peer can tell "I fell behind" from "the daemon
     /// died" instead of observing a bare EOF.
     pub(crate) fn push(&self, message: impl Into<Outbound>) -> Result<(), DeliveryError> {
-        let message = message.into();
+        let mut message = message.into();
         let mut state = self
             .state
             .lock()
@@ -267,9 +267,16 @@ impl DeliveryQueue {
                             if generation<old_generation || incarnation==old {
                                 return Ok(());
                             }
-                            // Equal clocks with conflicting identities must
-                            // reach the receiver's fail-closed conflict gate;
-                            // never silently replace away the contradiction.
+                            // Preserve the exact contradiction as an explicit
+                            // noncoalescible invalidation. A later scalar may
+                            // replace the old scalar slot, but cannot erase
+                            // this conflict or hide it behind a newer clock.
+                            if let ServerMessage::ChatSourceAuthority {chat_id,..}=&message.message {
+                                message.message=ServerMessage::ChatSourceAuthorityConflict {
+                                    chat_id:*chat_id,generation:*generation,
+                                    original:*old,conflicting:*incarnation,
+                                };
+                            }
                         }
                     }
                 },
@@ -405,6 +412,54 @@ mod tests {
                 generation,
             },
         }
+    }
+
+    fn source_authority(chat_id:TerminalId,incarnation:uuid::Uuid,generation:u64)->ServerEnvelope {
+        let mut envelope=redraw(chat_id,generation);
+        envelope.message=ServerMessage::ChatSourceAuthority {chat_id,incarnation,generation};
+        envelope
+    }
+
+    #[test]
+    fn source_authority_conflict_survives_a_newer_coalesced_scalar() {
+        let queue=DeliveryQueue::new(1,4);
+        let id=TerminalId::new();
+        let a=uuid::Uuid::new_v4();
+        let b=uuid::Uuid::new_v4();
+        let c=uuid::Uuid::new_v4();
+        queue.push(source_authority(id,a,10)).unwrap();
+        queue.push(source_authority(id,b,10)).unwrap();
+        queue.push(source_authority(id,c,20)).unwrap();
+        assert!(matches!(queue.pop().unwrap().message,ServerMessage::ChatSourceAuthority {incarnation,generation:20,..} if incarnation==c));
+        assert!(matches!(queue.pop().unwrap().message,ServerMessage::ChatSourceAuthorityConflict {original,conflicting,generation:10,..} if original==a && conflicting==b));
+        assert!(queue.state.lock().unwrap().messages.is_empty());
+    }
+
+    #[test]
+    fn explicit_old_source_conflict_survives_a_higher_watermark() {
+        let queue=DeliveryQueue::new(1,4);
+        let id=TerminalId::new();
+        queue.push(source_authority(id,uuid::Uuid::new_v4(),20)).unwrap();
+        let mut conflict=source_authority(id,uuid::Uuid::new_v4(),10);
+        conflict.message=ServerMessage::ChatSourceAuthorityConflict {
+            chat_id:id,generation:10,original:uuid::Uuid::new_v4(),conflicting:uuid::Uuid::new_v4(),
+        };
+        queue.push(conflict).unwrap();
+        queue.push(source_authority(id,uuid::Uuid::new_v4(),21)).unwrap();
+        assert!(matches!(queue.pop().unwrap().message,ServerMessage::ChatSourceAuthority {generation:21,..}));
+        assert!(matches!(queue.pop().unwrap().message,ServerMessage::ChatSourceAuthorityConflict {generation:10,..}));
+    }
+
+    #[test]
+    fn source_authority_overflow_is_an_explicit_fatal_queue_error() {
+        let queue=DeliveryQueue::new(1,1);
+        let id=TerminalId::new();
+        let mut reply=redraw(id,1);
+        reply.message=ServerMessage::Response {response:ServerResponse::Accepted};
+        queue.push(reply).unwrap();
+        assert_eq!(queue.push(source_authority(id,uuid::Uuid::new_v4(),2)),Err(DeliveryError::Full));
+        assert!(matches!(queue.pop().unwrap().message,ServerMessage::Error(error) if error.code==ProtocolErrorCode::QueueFull));
+        assert!(queue.pop().is_none());
     }
 
     #[test]
