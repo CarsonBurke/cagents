@@ -133,6 +133,7 @@ fn directory_error(error: fs_safety::RecoveryDirectoryError) -> FileIoError {
 struct Holding {
     parent: Root,
     publication: fs_safety::DirectoryPublication,
+    private_metadata: fs::Metadata,
     // Keep authenticated file identities alive with an unresolved holding.
     // This producer retains at most four file FDs plus the receipt's bounded
     // directory handles, below MAX_RECOVERY_DESCRIPTORS (16).
@@ -154,13 +155,14 @@ impl Holding {
         let directory = fs_safety::prepare_recovery_directory_with_owner(
             admission, &name, || false, owner,
         ).map_err(directory_error)?;
-        let (publication, (parent, source), _private_metadata, context, slot) = directory.into_parts();
+        let (publication, (parent, source), private_metadata, context, slot) = directory.into_parts();
         // The factory established actual owner-only700 on this retained inode
         // and enrolled it before returning. Use its receipt directly, without
         // another fallible descriptor clone or a fresh mode baseline.
         Ok(Self {
             parent,
             publication,
+            private_metadata,
             context,
             slot: Some(slot),
             files: vec![source],
@@ -168,6 +170,11 @@ impl Holding {
         })
     }
     fn root(&self) -> &Root { self.publication.directory() }
+    fn validate_payload(&self) -> io::Result<()> {
+        fs_safety::verify_recovery_directory_private(self.root(), &self.private_metadata)?;
+        self.context.validate_payload_root(self.root())?;
+        fs_safety::verify_recovery_directory_private(self.root(), &self.private_metadata)
+    }
     fn keep_file(&mut self, file: File) -> Result<File, FileIoError> {
         match file.try_clone() {
             Ok(retained) => {
@@ -184,7 +191,7 @@ impl Holding {
     }
     fn remove_empty(&mut self, _parent: &Root) -> Result<(), FileIoError> {
         if !self.publication.is_removed() {
-            self.context.validate_payload_root(self.root()).map_err(io_error)?;
+            self.validate_payload().map_err(io_error)?;
             self.publication.cleanup_empty().map_err(resolve_error)?;
         } else {
             self.context.placement().validate().map_err(io_error)?;
@@ -205,7 +212,7 @@ impl Holding {
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
         if !self.publication.is_removed() {
-            self.context.validate_payload_root(self.root()).map_err(|error|error.to_string())?;
+            self.validate_payload().map_err(|error|error.to_string())?;
             self.publication.resolve_recovery().map_err(|error|error.to_string())?;
             // Unknown private contents remain retained for explicit resolution.
             self.publication.cleanup_empty().map_err(|error|error.to_string())?;
@@ -344,7 +351,7 @@ fn publish_in_holding(
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
-    holding.context.validate_payload_root(holding.root()).map_err(io_error)?;
+    holding.validate_payload().map_err(io_error)?;
     let (temporary, temporary_name) = match fs_safety::create_temporary_in(holding.root(), 0o600) {
         Ok(value) => value,
         Err(error) => {
@@ -360,7 +367,9 @@ fn publish_in_holding(
     let prepare = (|| {
         fs_safety::copy_ownership(destination, &temporary).map_err(io_error)?;
         fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
+        holding.validate_payload().map_err(io_error)?;
         temporary.write_all(bytes).map_err(io_error)?;
+        holding.validate_payload().map_err(io_error)?;
         temporary.set_permissions(permissions).map_err(io_error)?;
         fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
         let lost = fs_safety::copy_extended_attributes(destination, &temporary);
@@ -368,6 +377,7 @@ fn publish_in_holding(
         // create_temporary_in deliberately returns O_WRONLY. Authenticate a
         // separate no-follow read descriptor against that exact written inode
         // before hashing; cloning the write-only FD would fail with EBADF.
+        holding.validate_payload().map_err(io_error)?;
         let readable = fs_safety::open_beneath(holding.root(), Path::new(&temporary_name))
             .map_err(resolve_error)?;
         let written = temporary.metadata().map_err(io_error)?;
@@ -400,7 +410,7 @@ fn publish_in_holding(
         }
     };
     let previous = OsStr::new("previous");
-    if let Err(error) = holding.context.validate_payload_root(holding.root()) {
+    if let Err(error) = holding.validate_payload() {
         return Err(clean_before_acquire(parent, holding, &temporary_name,
             readable_temporary.as_ref().unwrap_or(&temporary), temporary_baseline.as_ref(), io_error(error)));
     }
@@ -434,7 +444,7 @@ fn publish_in_holding(
             readable_temporary.as_ref().unwrap_or(&temporary),
             temporary_baseline.as_ref(),
         )?;
-        holding.context.validate_payload_root(holding.root()).map_err(io_error)?;
+        holding.validate_payload().map_err(io_error)?;
         fs_safety::rename_new_between(holding.root(), &temporary_name, parent, name.as_os_str())
             .map_err(resolve_error)?;
         Ok((acquired, acquired_version))
@@ -456,7 +466,7 @@ fn publish_in_holding(
                         "The acquired entry was replaced; unknown recovery entry retained.".into(),
                     ));
                 }
-                holding.context.validate_payload_root(holding.root()).map_err(io_error)?;
+                holding.validate_payload().map_err(io_error)?;
                 fs_safety::rename_new_between(holding.root(), previous, parent, name.as_os_str())
                     .map_err(resolve_error)
             })();
@@ -500,7 +510,7 @@ fn publish_in_holding(
             ));
         }
         baseline.verify(&acquired, true)?;
-        holding.context.validate_payload_root(holding.root()).map_err(io_error)?;
+        holding.validate_payload().map_err(io_error)?;
         fs_safety::unlink_within(holding.root(), previous).map_err(resolve_error)?;
         holding.remove_empty(parent)
     })();
@@ -556,7 +566,7 @@ fn remove_temporary(
     file: &File,
     baseline: Option<&SaveBaseline>,
 ) -> Result<(), FileIoError> {
-    holding.context.validate_payload_root(holding.root()).map_err(io_error)?;
+    holding.validate_payload().map_err(io_error)?;
     verify_temporary(holding, name, file, baseline)?;
     fs_safety::unlink_within(holding.root(), name).map_err(resolve_error)
 }
@@ -643,6 +653,32 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .find(|path| path.is_dir())
             .unwrap()
+    }
+
+    #[test]
+    fn save_refuses_changed_holding_permissions_without_publish_or_permission_repair() {
+        let (directory, root) = fixture();
+        let result = hook_save(&root, || {
+            fs::set_permissions(holding(directory.path()), fs::Permissions::from_mode(0o711))
+        }, false);
+        let error = result.unwrap_err();
+        let authority = error.recovery_authority().expect("changed H retains exact original owners").clone();
+        let private = holding(directory.path());
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
+        assert_eq!(fs::metadata(&private).unwrap().mode() & 0o7777, 0o711);
+        assert!(authority.retry().is_err(), "cleanup may not trust the changed private boundary");
+        assert_eq!(fs::metadata(&private).unwrap().mode() & 0o7777, 0o711);
+        // Explicit fixture repair of the SAME original inode restores the
+        // cached policy; no replacement or new metadata baseline is adopted.
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        for entry in fs::read_dir(&private).unwrap() {
+            let entry = entry.unwrap(); assert!(entry.file_type().unwrap().is_file());
+            fs::remove_file(entry.path()).unwrap();
+        }
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert!(!private.exists());
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
     }
 
     #[test]
