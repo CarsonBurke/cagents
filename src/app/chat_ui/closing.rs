@@ -111,6 +111,12 @@ impl Cagents {
         }) && self.chat_return_session(dialog.card).as_ref() == Some(&dialog.source.session)
             && self.pane_close_decision_current(dialog.card, dialog.batch)
     }
+    pub(in crate::app) fn chat_close_backing_current(&self) -> bool {
+        self.chat_ui
+            .close_dialog
+            .as_ref()
+            .is_some_and(|dialog| self.chat_close_source_matches(dialog))
+    }
     pub(in crate::app) fn reconcile_chat_close_backing_state(&mut self) {
         if self
             .chat_ui
@@ -924,10 +930,62 @@ mod tests {
                 "changed identity {changed}"
             );
             assert!(app.cards.contains_key(&card));
-            assert!(
-                app.chat_ui.close_dialog.is_none(),
-                "stale consent must be retired"
-            );
+            assert!(app.chat_ui.close_dialog.is_some(), "rejected input has no prelude effects");
+            drop(app.update(Message::DismissStatus));
+            assert!(app.chat_ui.close_dialog.is_none(), "the next lifecycle update retires stale backing");
+        }
+    }
+
+    #[test]
+    fn invalid_upper_owned_escape_cannot_cancel_a_surviving_lower_dialog() {
+        for invalidate_batch in [false, true] {
+            let (mut app, card, _directory) = fixture();
+            write(&mut app, card, "keep original prompt", true);
+            app.settings_reset_confirm = true;
+            drop(app.finish_modal_update(Task::none()));
+            let batch = if invalidate_batch {
+                let _delivery = queued(app.close_cards_in_order(vec![card]));
+                app.pane_close_batch_for(card)
+            } else {
+                None
+            };
+            drop(app.request_chat_tab_close_for(card, batch));
+            drop(app.finish_modal_update(Task::none()));
+            assert_eq!(app.top_modal(), Some(modal_ui::Modal::ChatClose));
+            // Obtain the owner from the real mounted dialog output. Keyboard
+            // transport uses the same envelope; native Popover routing is
+            // additionally covered by the final keyboard integration fixture.
+            let Message::ModalSurface { target, .. } = emitted_confirm(&app) else {
+                panic!("mounted dialog must stamp its owner");
+            };
+            let escape = || Message::KeyEvent {
+                event: keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+                },
+                captured: false,
+            };
+            if invalidate_batch {
+                app.stop_pane_close_batch(batch);
+            } else {
+                let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else { panic!("chat"); };
+                session.launch.session_id = Some("replacement-thread".into());
+            }
+            let revision = app.modal_surface_target(modal_ui::Modal::ChatClose);
+            assert_eq!(target, revision, "source invalidation does not change the surface generation");
+            drop(app.update(Message::ModalSurface { target, message: Box::new(escape()) }));
+            assert!(app.settings_reset_confirm, "old upper Escape must not be reinterpreted for the lower dialog");
+            assert!(app.chat_ui.close_dialog.is_some(), "stale input is rejected before cleanup");
+            drop(app.finish_modal_update(Task::none()));
+            assert!(app.chat_ui.close_dialog.is_none());
+            assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
+            let target = app.modal_surface_target(modal_ui::Modal::SettingsReset);
+            drop(app.update(Message::ModalSurface { target, message: Box::new(escape()) }));
+            assert!(!app.settings_reset_confirm, "fresh lower-owned Escape still closes its own dialog");
+            assert!(app.card_state(card).unwrap().existence.is_open());
         }
     }
 

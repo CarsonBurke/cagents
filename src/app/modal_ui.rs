@@ -307,9 +307,22 @@ impl Cagents {
         }
     }
 
+    /// Backing identity is independent of stack visibility and generation: a
+    /// lifecycle update may replace a source without replacing its UI payload.
+    fn modal_backing_current(&self, modal: Modal) -> bool {
+        match modal {
+            Modal::ChatClose => self.chat_close_backing_current(),
+            Modal::DirtyClose => self.dirty_repository_close.as_ref().is_some_and(|close| {
+                matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(_)))
+            }),
+            _ => true,
+        }
+    }
+
     pub(super) fn admit_modal_surface_message(&self, message: Message) -> Option<Message> {
         match message {
             Message::ModalSurface { target, message } => (!self.update_prepared
+                && self.modal_backing_current(target.modal)
                 && self.top_modal() == Some(target.modal)
                 && self.modal_instance(target.modal) == target.instance
                 && self.modal_stack.focus_revision.load(Ordering::Relaxed) == target.revision
@@ -360,7 +373,7 @@ impl Cagents {
         active!(Discard, self.sidebar_state.pending_discard().is_some());
         active!(SettingsReset, self.settings_reset_confirm);
         active!(TerminalClose, self.terminal_close_dialog_visible());
-        active!(ChatClose, self.chat_ui.close_dialog.is_some());
+        active!(ChatClose, self.chat_close_backing_current());
         active!(Update, self.update_ui.confirmation.is_some());
         active!(Health, self.daemon_health_ui.confirmation);
         active!(Recovery, self.session_recovery.open());
@@ -399,6 +412,7 @@ impl Cagents {
         }
     }
     pub(super) fn finish_modal_update(&mut self, task: Task<Message>) -> Task<Message> {
+        self.reconcile_modal_backing_state();
         let active = self.active_modals();
         // Learn the reader's choice before an opening handler suppresses it.
         // A startup/direct-handler payload without a prior frame must not
