@@ -114,6 +114,28 @@ impl Project {
         changed: &BTreeSet<WorktreeId>,
         upstreams: &BTreeMap<WorktreeId, String>,
     ) -> Result<Self, String> {
+        Self::read_changed_with_inventory_limit(
+            id,
+            common_dir,
+            records,
+            cancellation,
+            previous,
+            changed,
+            upstreams,
+            watch_budget().min(100_000),
+        )
+    }
+
+    fn read_changed_with_inventory_limit(
+        id: ProjectId,
+        common_dir: PathBuf,
+        records: &[WorktreeRecord],
+        cancellation: &CancellationToken,
+        previous: Option<&Self>,
+        changed: &BTreeSet<WorktreeId>,
+        upstreams: &BTreeMap<WorktreeId, String>,
+        inventory_limit: usize,
+    ) -> Result<Self, String> {
         let git = RepositoryService::system("git");
         let mut worktrees = Vec::new();
         let mut planning_failure = None;
@@ -145,26 +167,51 @@ impl Project {
                 let git_dir = git
                     .git_dir(&record.path, cancellation)
                     .map_err(|error| error.to_string())?;
-                let files = git
-                    .watch_files(&record.path, cancellation)
-                    .map_err(|error| error.to_string())?;
+                let mut worktree_polling = network_filesystem(&record.path)
+                    .map_err(|error| error.to_string())?
+                    .then(|| "network or FUSE filesystem may omit native change events".to_owned());
+                let files = match git.watch_files_projection(
+                    &record.path,
+                    inventory_limit,
+                    cancellation,
+                ) {
+                    Ok(files) => {
+                        if files.listing_truncated {
+                            // The independent census below still covers every
+                            // nonignored directory within the watch budget.
+                            // Force-tracked children beyond this prefix need
+                            // the explicit, quiet periodic fallback.
+                            worktree_polling
+                                .get_or_insert_with(|| "directory watch limit reached".into());
+                        }
+                        files
+                    }
+                    Err(error) => {
+                        if cancellation.is_cancelled() {
+                            return Err("watch planning cancelled".into());
+                        }
+                        worktree_polling = Some(error.to_string());
+                        crate::repository::WorkingFiles::default()
+                    }
+                };
                 // ls-files lists files, not empty directories. An agent can
                 // create a folder long before its first file, so discover those
                 // too. Git collapses ignored build trees before the filesystem
                 // walk; force-tracked ancestors remain in the file-derived set.
-                let ignored = git
-                    .ignored_files(&record.path, &files.paths, cancellation)
-                    .map_err(|error| error.to_string())?;
-                let mut worktree_polling = network_filesystem(&record.path)
-                    .map_err(|error| error.to_string())?
-                    .then(|| "network or FUSE filesystem may omit native change events".to_owned());
+                let ignored = git.ignored_files_with_limit(
+                    &record.path,
+                    &files.paths,
+                    Some(inventory_limit),
+                    cancellation,
+                );
 
                 let mut directories = BTreeSet::from([record.path.clone()]);
                 for file in files.paths {
                     let path = record.path.join(file.as_path());
                     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-                        worktree_polling =
-                            Some("submodule contents require a periodic local Git check".into());
+                        worktree_polling.get_or_insert_with(|| {
+                            "submodule contents require a periodic local Git check".into()
+                        });
                     }
 
                     let mut parent = path.parent();
@@ -174,11 +221,35 @@ impl Project {
                         parent = directory.parent();
                     }
                 }
-                let (empty_directories, incomplete) =
-                    content_directories(&record.path, &ignored.ignored_directories, cancellation)?;
-                directories.extend(empty_directories);
-                if incomplete {
-                    worktree_polling = Some("directory watch limit reached".into());
+                match ignored {
+                    Ok(ignored) if !ignored.listing_truncated => {
+                        match content_directories(
+                            &record.path,
+                            &ignored.ignored_directories,
+                            cancellation,
+                        ) {
+                            Ok((content, incomplete)) => {
+                                directories.extend(content);
+                                if incomplete {
+                                    worktree_polling.get_or_insert_with(|| {
+                                        "directory watch limit reached".into()
+                                    });
+                                }
+                            }
+                            Err(error) => worktree_polling = Some(error),
+                        }
+                    }
+                    Ok(_) => {
+                        // Without complete ignore classification, descending
+                        // could walk an ignored build tree. Keep the verified
+                        // inventory/root/admin coverage and poll the rest.
+                        worktree_polling
+                            .get_or_insert_with(|| "directory watch limit reached".into());
+                    }
+                    Err(error) => worktree_polling = Some(error.to_string()),
+                }
+                if cancellation.is_cancelled() {
+                    return Err("watch planning cancelled".into());
                 }
                 Ok(Worktree {
                     id: record.id,
@@ -1277,6 +1348,126 @@ mod tests {
             );
             assert!(registrations.desired.len() <= all_metadata + spare);
         }
+    }
+
+    #[test]
+    fn capped_inventory_keeps_native_directory_and_admin_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(root)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::create_dir_all(root.join("z/nested")).unwrap();
+        std::fs::create_dir_all(root.join("target/deep/ignored")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("a.txt"), "prefix\n").unwrap();
+        let outside = root.join("z/nested/outside.txt");
+        std::fs::write(&outside, "outside prefix\n").unwrap();
+        let git = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let inventory = git.watch_files_projection(root, 1, &cancellation).unwrap();
+        assert!(inventory.listing_truncated);
+        assert!(!inventory.paths.iter().any(|path| root.join(path.as_path()) == outside));
+        let records = git.list_worktrees(root, &cancellation).unwrap();
+        let common = git.common_dir(root, &cancellation).unwrap();
+        let id = ProjectId::new();
+        let plan = Project::read_changed_with_inventory_limit(
+            id,
+            common.clone(),
+            &records,
+            &cancellation,
+            None,
+            &records.iter().map(|record| record.id).collect(),
+            &BTreeMap::new(),
+            1,
+        ).unwrap();
+        assert_eq!(plan.worktrees.len(), 1);
+        assert!(plan.worktrees[0].directories.contains(&root.join("z/nested")));
+        assert!(!plan.worktrees[0].directories.contains(&root.join("target")));
+        assert!(plan.metadata_paths().contains_key(&common));
+        assert_eq!(plan.polling.as_deref(), Some("directory watch limit reached"));
+        let registrations = Registrations::within(
+            &BTreeMap::from([(id, Arc::new(plan.clone()))]),
+            watch_budget(),
+        );
+        assert!(registrations.desired.contains_key(&root.join("z/nested")));
+        assert!(registrations.desired.contains_key(&common));
+        let monitor = Monitor::start().unwrap();
+        monitor.configure(vec![Arc::new(plan)]);
+        wait_for(&monitor, id, |change| change.coverage.is_some());
+        std::fs::write(&outside, "changed outside prefix\n").unwrap();
+        wait_for(&monitor, id, |change| change.worktrees.contains(&records[0].id));
+        std::fs::write(common.join("index"), "metadata event only\n").unwrap();
+        wait_for(&monitor, id, |change| change.metadata && change.worktrees.contains(&records[0].id));
+    }
+
+    #[test]
+    fn incomplete_ignored_inventory_does_not_descend_build_trees() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(root)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        for name in ["ignored-a", "ignored-b"] {
+            std::fs::create_dir_all(root.join(name).join("deep/ignored")).unwrap();
+            std::fs::write(root.join(name).join("deep/ignored/output"), "build\n").unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "ignored-a/\nignored-b/\n").unwrap();
+        let git = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let records = git.list_worktrees(root, &cancellation).unwrap();
+        let plan = Project::read_changed_with_inventory_limit(
+            ProjectId::new(),
+            git.common_dir(root, &cancellation).unwrap(),
+            &records,
+            &cancellation,
+            None,
+            &records.iter().map(|record| record.id).collect(),
+            &BTreeMap::new(),
+            1,
+        ).unwrap();
+        assert_eq!(plan.worktrees.len(), 1);
+        assert_eq!(plan.worktrees[0].directories, BTreeSet::from([root.to_owned()]));
+        assert_eq!(plan.polling.as_deref(), Some("directory watch limit reached"));
+    }
+
+    #[test]
+    fn unreadable_index_keeps_initial_root_and_admin_watches() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(root)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::write(root.join(".git/index"), "not an index\n").unwrap();
+        let git = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let records = git.list_worktrees(root, &cancellation).unwrap();
+        let common = git.common_dir(root, &cancellation).unwrap();
+        let plan = Project::read_changed(
+            ProjectId::new(),
+            common.clone(),
+            &records,
+            &cancellation,
+            None,
+            &records.iter().map(|record| record.id).collect(),
+            &BTreeMap::new(),
+        ).unwrap();
+        assert_eq!(plan.worktrees.len(), 1);
+        assert!(plan.worktrees[0].directories.contains(root));
+        assert!(plan.metadata_paths().contains_key(&common));
+        assert!(plan.polling.is_some());
     }
 
     #[test]
