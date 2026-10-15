@@ -189,7 +189,7 @@ impl CellMetrics {
         } else {
             1.0
         };
-        let family = intern_family(family);
+        let family = resolved_family(family);
         let key = (font_size.to_bits(), scale_factor.to_bits(), family);
         let mut measured = MEASURED
             .lock()
@@ -337,12 +337,35 @@ fn font(family: &'static str, key: Face) -> Font {
 /// nothing. The set of families a user types is bounded in practice.
 pub(crate) fn monospace_font(family: &str) -> Font {
     font(
-        intern_family(family),
+        resolved_family(family),
         Face {
             bold: false,
             italic: false,
         },
     )
+}
+
+/// A missing named face must resolve explicitly to generic monospace. A named
+/// family does not carry a fallback family in iced's shaping attributes.
+fn resolved_family(family: &str) -> &'static str {
+    static RESOLVED: LazyLock<Mutex<HashMap<String, &'static str>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let family = family.trim();
+    if family.is_empty() {
+        return "";
+    }
+    let mut resolved = RESOLVED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&existing) = resolved.get(family) {
+        return existing;
+    }
+    let installed = crate::design::installed_font_families(false)
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(family));
+    let name = installed.map_or("", |name| intern_family(name));
+    resolved.insert(family.to_owned(), name);
+    name
 }
 
 fn intern_family(family: &str) -> &'static str {
@@ -1626,7 +1649,7 @@ impl<Message> TerminalWidget<Message> {
     /// separators, for one - has to be named here: the generic monospace family
     /// resolves to whatever the system prefers, which need not cover them.
     pub fn font_family(mut self, family: &str) -> Self {
-        self.font_family = intern_family(family);
+        self.font_family = resolved_family(family);
         self
     }
 
@@ -4985,6 +5008,15 @@ mod tests {
             "",
             "a family that names nothing must fall back to the system monospace"
         );
+    }
+
+    #[test]
+    fn settings_missing_named_font_uses_monospace_for_editor_and_terminal_metrics() {
+        let requested = "Cagents Missing Font Fixture 6C1B";
+        assert_eq!(monospace_font(requested).family, cosmic::iced::font::Family::Monospace);
+        assert_eq!(resolved_family(requested), "");
+        assert_eq!(CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, requested).family, "");
+        assert_eq!(resolved_family("  Cagents Missing Font Fixture 6C1B  "), "");
     }
 
     #[test]
