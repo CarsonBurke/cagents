@@ -6748,7 +6748,13 @@ impl RepositoryRuntime {
                         Some(model) => RenderedDiff::Text { model: Arc::new(model), old_label: "Disk".into(), new_label: "Unsaved buffer".into() },
                         None => RenderedDiff::Error("Could not compare the buffer and disk. Your edits have been kept.".into()),
                     });
-                    if let DiffState::Ready(_, layout) = &mut state {
+                    if let DiffState::Ready(content, layout) = &mut state {
+                        // Disk comparison is a distinct source. Keep all of its
+                        // context visible (and virtualized), without controls
+                        // whose reveal state belongs to the repository basis.
+                        if let RenderedDiff::Text { model, .. } = content {
+                            layout.set_folding(model, false);
+                        }
                         let typography = self.diff_typography();
                         layout.set_row_heights(typography.line_height, typography.fold_height());
                     }
@@ -9357,6 +9363,9 @@ impl RepositoryRuntime {
         fold: usize,
         expansion: FoldExpansion,
     ) -> Task<RepositoryAction> {
+        // A queued repository fold action cannot mutate its hidden layout
+        // while the independently unfolded disk source is on screen.
+        if self.disk_comparison.is_some() { return Task::none(); }
         // The reader is acting on what is on screen, not on a position that
         // was still waiting to be placed.
         self.pending_diff_anchor = None;
@@ -16464,6 +16473,75 @@ mod tests {
                     assert!((offsets.total_height() - height).abs() < 0.1);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn disk_comparison_is_unfolded_and_rejects_a_rendered_repository_fold_action() {
+        use cosmic::iced::advanced::Shell;
+        let renderer = headless_renderer();
+        let before = (0..80).map(|line| format!("line {line}\n")).collect::<String>();
+        let after = before.replace("line 40\n", "changed 40\n");
+        let card = CardId::new();
+        let (mut runtime, identity) = working_diff_runtime(card, &before, &after);
+        drop(runtime.take_lsp_intents());
+        let model = runtime.diff_model().unwrap();
+        let folded = runtime.diff_layout().unwrap().folded(runtime.diff_mode);
+        let DisplayRow::Fold { fold, rows: hidden } = folded.row(0) else { panic!("repository context is folded"); };
+        let emitted = {
+            let mut element = diff_fold_row(card, &runtime, model,
+                DiffFold { fold, hidden, discussions: 0 }, runtime.diff_typography().gutter_width(80), 1000.0);
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = iced::Rectangle::with_size(iced::Size::new(1000.0, 300.0));
+            let node = element.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()));
+            let point = {
+                let accessible = element.as_widget().a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+                let button = accessible.root().iter().chain(accessible.children())
+                    .find(|entry| entry.node().label().is_some_and(|label| label.starts_with("Show all ")))
+                    .expect("a real repository fold control is mounted");
+                let bounds = button.node().bounds().unwrap();
+                iced::Point::new(((bounds.x0 + bounds.x1) / 2.0) as f32, ((bounds.y0 + bounds.y1) / 2.0) as f32)
+            };
+            let mut messages = Vec::new();
+            for event in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
+                element.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node),
+                    mouse::Cursor::Available(point), &renderer, &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages), &viewport);
+            }
+            assert_eq!(messages.len(), 1);
+            messages.pop().unwrap()
+        };
+        assert!(matches!(emitted, RepositoryAction::ExpandDiffFold { .. }));
+        let hidden_layout = runtime.diff_layout().unwrap().clone();
+        let DocumentState::Editable(document) = &mut runtime.document else { panic!("editor"); };
+        let revision = document.revision;
+        let disk_hash = blake3::hash(before.as_bytes());
+        document.external_version = Some(crate::editor_reload::Version {
+            text: before.clone(), content_hash: disk_hash, source: identity.path.clone(), markdown: false,
+            mapping: crate::editor_reload::LineMap::between(&after, &before), restoration: None,
+        });
+        drop(runtime.update(RepositoryAction::CompareDisk { card }));
+        drop(runtime.update(RepositoryAction::DiskComparisonLoaded { identity, revision, disk_hash,
+            model: Some(crate::diff_view::build_diff(&before, &after)) }));
+        drop(runtime.update(emitted));
+        let Some(DiffState::Ready(_, repository_layout)) = runtime.diff_state(&DiffBasis::IndexToWorktree) else { panic!("hidden Git source"); };
+        assert_eq!(repository_layout, &hidden_layout, "an emitted repository fold action cannot retarget another source");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            runtime.diff_mode = mode;
+            let model = runtime.diff_model().unwrap();
+            let layout = runtime.diff_layout().unwrap();
+            assert_eq!(layout.folded(mode).len(), model.row_count(mode));
+            for row in 0..model.row_count(mode) { assert_eq!(layout.folded(mode).row(row), DisplayRow::Code(row)); }
+            let mut surface = diff_surface(card, &runtime, None);
+            let mut tree = Tree::new(surface.as_widget());
+            let node = surface.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 350.0)));
+            let accessible = surface.as_widget().a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+            assert!(!accessible.root().iter().chain(accessible.children()).filter_map(|entry| entry.node().label())
+                .any(|label| label.starts_with("Show all ") || label.starts_with("Expand ")),
+                "disk context has no misleading fold controls");
         }
     }
 
