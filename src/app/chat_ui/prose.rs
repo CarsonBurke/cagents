@@ -1237,16 +1237,9 @@ pub(super) fn chunk_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
         }
         // Prefer a source whitespace boundary near the cap. A giant token is
         // still bounded and wraps with the same glyph fallback as short prose.
-        if end < text.len()
-            && let Some((at, ch)) = text[start..end]
-                .char_indices()
-                .rev()
-                .find(|(_, ch)| ch.is_whitespace())
-        {
-            let boundary = start + at + ch.len_utf8();
-            if boundary >= start + BYTES / 2 {
-                end = boundary;
-            }
+        if end < text.len() && let Some((at, grapheme)) = text[start..end].grapheme_indices(true).rev().find(|(_, grapheme)| grapheme.chars().all(char::is_whitespace)) {
+            let boundary = start + at + grapheme.len();
+            if boundary >= start + BYTES / 2 { end = boundary; }
         }
         ranges.push(start..end);
         start = end;
@@ -1581,13 +1574,10 @@ mod tests {
     #[test]
     fn chunk_boundaries_preserve_complete_graphemes() {
         use unicode_segmentation::UnicodeSegmentation;
-        for seam in ["e\u{301}", "👩‍💻", "🇨🇦", "\r\n"] {
-            let source = format!("{}{seam}{}", "a".repeat(2047), "z".repeat(4096));
-            let boundaries: HashSet<_> = source
-                .grapheme_indices(true)
-                .map(|(at, _)| at)
-                .chain(std::iter::once(source.len()))
-                .collect();
+        for seam in ["e\u{301}", "👩‍💻", "🇨🇦", "\r\n", " \u{301}"] {
+            let source = format!("{}{seam}{}", "a".repeat(if seam.starts_with(' ') { 1500 } else { 2047 }), "z".repeat(4096));
+            let boundaries: HashSet<_> = source.grapheme_indices(true)
+                .map(|(at, _)| at).chain(std::iter::once(source.len())).collect();
             let ranges = chunk_ranges(&source);
             assert_eq!(
                 ranges
