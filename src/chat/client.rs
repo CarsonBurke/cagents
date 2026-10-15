@@ -3014,10 +3014,10 @@ mod tests {
                     None,
                     ServerResponse::ChatSnapshot {
                         chat_id,
-                        snapshot: Snapshot {
+                        snapshot: Some(Snapshot {
                             generation,
                             ..Default::default()
-                        },
+                        }),
                     },
                 );
                 let end = (offset + 256 * 1024).min(raw.len());
