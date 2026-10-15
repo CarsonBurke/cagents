@@ -44,17 +44,17 @@ struct ReaderState {
 }
 
 impl Memory {
-    pub fn clear(&self) {
-        *self.0.borrow_mut() = Anchor::default();
+    pub fn clear(&self) { *self.0.borrow_mut() = Anchor::default(); }
+    pub fn retain_children(&self, children: &[chat::Subagent]) {
+        let mut state = self.0.borrow_mut();
+        let active = state.active.and_then(|index| state.contexts.get(index)).map(|context| context.subagent.clone());
+        state.contexts.retain(|context| context.subagent.as_ref().is_none_or(|id| children.iter().any(|child| &child.id == id)));
+        state.active = active.and_then(|active| state.contexts.iter().position(|context| context.subagent == active));
+        if state.reported.as_ref().is_some_and(|report| report.subagent.as_ref().is_some_and(|id| !children.iter().any(|child| &child.id == id))) {
+            state.reported = None;
+        }
     }
-    pub fn retained_rows(&self) -> usize {
-        self.0
-            .borrow()
-            .contexts
-            .iter()
-            .map(|context| context.rows.len())
-            .sum()
-    }
+    pub fn retained_rows(&self) -> usize { self.0.borrow().contexts.iter().map(|context| context.rows.len()).sum() }
 }
 
 pub(super) fn transcript_observed<'a>(
