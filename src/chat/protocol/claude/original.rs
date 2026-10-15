@@ -150,6 +150,9 @@ impl Claude {
         let mut step = Step::default();
         self.retract(&json!(ids), &mut step)?;
         for id in &ids {
+            // This exact local frame was never written. Retire independent
+            // accepted-input proof too; a late echo cannot bind an aborted turn.
+            self.turn_inputs.discard_undispatched(id);
             self.submissions.remove(id);
             self.queued.retain(|queued| queued.id != *id);
         }
@@ -717,6 +720,7 @@ mod tests {
             adapter
                 .command(prompt("separate queued input", PromptMode::Queue))
                 .unwrap();
+            let queued_id=adapter.queued.last().unwrap().id.clone();
             let aborted = if closing {
                 adapter.discard_undispatched().unwrap().unwrap()
             } else {
@@ -750,6 +754,12 @@ mod tests {
                 update,
                 OriginalUpdate::Latest { .. } | OriginalUpdate::Accepted { .. }
             )));
+            for id in ["never-dispatched",queued_id.as_str()] {
+                let a=adapter.receive(user(id)).unwrap();let b=adapter.receive(started(id)).unwrap();
+                let bound:Vec<_>=a.events.iter().chain(&b.events).filter_map(|event|match event{Event::TurnOutcome(crate::chat::turn_outcomes::TurnUpdate::Bind{identity,..})=>Some(identity.id.as_str()),_=>None}).collect();
+                if id=="never-dispatched" || closing {assert!(bound.is_empty());}
+                else {assert!(bound.iter().all(|bound|*bound==id));assert!(!bound.is_empty());}
+            }
         }
     }
 
