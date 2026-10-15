@@ -586,6 +586,7 @@ impl Cagents {
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
+        self.reconcile_project_close_instances();
         let relocated = self.recover_shared_project_relocations();
         let closed = self
             .workspace_model
