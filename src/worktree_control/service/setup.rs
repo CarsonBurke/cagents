@@ -176,6 +176,14 @@ mod preparation_contracts {
     use super::*;
     #[test]
     fn superseded_skip_refuses_old_preparation_before_copying_files() {
+        if std::env::var_os("CAGENTS_SETUP_PREPARATION_TEST").is_none() {
+            let fixture=tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","worktree_control::service::setup::preparation_contracts::superseded_skip_refuses_old_preparation_before_copying_files","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",fixture.path()).env("XDG_RUNTIME_DIR",fixture.path()).env("XDG_DATA_HOME",fixture.path().join("data")).env("XDG_CONFIG_HOME",fixture.path().join("config"))
+                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null").env("CAGENTS_SETUP_PREPARATION_TEST","1").output().unwrap();
+            assert!(output.status.success(),"isolated setup authority contract failed: {output:?}");return;
+        }
+
         let root=tempfile::tempdir().unwrap();let primary=root.path().join("project");std::fs::create_dir(&primary).unwrap();
         let cancel=CancellationToken::new();
         let git=|arguments:&[&str]| {

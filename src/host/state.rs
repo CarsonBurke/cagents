@@ -4205,6 +4205,14 @@ mod tests {
 
     #[test]
     fn saved_setup_recipes_require_reviewed_start_and_do_not_replay_on_restore() {
+        if std::env::var_os("CAGENTS_SETUP_HOST_POLICY_TEST").is_none() {
+            let fixture=tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","host::state::tests::saved_setup_recipes_require_reviewed_start_and_do_not_replay_on_restore","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",fixture.path()).env("XDG_RUNTIME_DIR",fixture.path()).env("XDG_DATA_HOME",fixture.path().join("data")).env("XDG_CONFIG_HOME",fixture.path().join("config"))
+                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null").env("CAGENTS_SETUP_HOST_POLICY_TEST","1").output().unwrap();
+            assert!(output.status.success(),"isolated host setup policy failed: {output:?}");return;
+        }
+
         use crate::workspace_model::views::{Pane,Scope};
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
         let repository=directory.path().to_owned();

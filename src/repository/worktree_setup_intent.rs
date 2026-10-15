@@ -406,6 +406,14 @@ mod tests {
 
     #[test]
     fn guarded_setup_transitions_share_the_original_lease_across_copied_stores() {
+        if std::env::var_os("CAGENTS_SETUP_GUARD_TEST").is_none() {
+            let fixture=tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","repository::worktree_setup_intent::tests::guarded_setup_transitions_share_the_original_lease_across_copied_stores","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",fixture.path()).env("XDG_RUNTIME_DIR",fixture.path()).env("XDG_DATA_HOME",fixture.path().join("data")).env("XDG_CONFIG_HOME",fixture.path().join("config"))
+                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null").env("CAGENTS_SETUP_GUARD_TEST","1").output().unwrap();
+            assert!(output.status.success(),"isolated setup authority contract failed: {output:?}");return;
+        }
+
         let root=tempfile::tempdir().unwrap();let mut request=request(root.path());
         let original=intent(&request);request.setup_intent=Some(original.clone());let mut journal=journal(request);
         fs::create_dir_all(&journal.common_dir).unwrap();
