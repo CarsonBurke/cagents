@@ -12664,7 +12664,17 @@ mod tests {
         let target = runtime.target;
         let parent = runtime.session.id;
         let mut snapshot = (*runtime.snapshot).clone();
-        snapshot.subagents.push(chat::Subagent { model: None, waiting: false, detail: String::new(), id: "child".into(), kind: "fixture".into(), description: "Child transcript".into(), status: chat::ToolStatus::Succeeded, background: false, items: vec![] });
+        snapshot.subagents.push(chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            id: "child".into(),
+            kind: "fixture".into(),
+            description: "Child transcript".into(),
+            status: chat::ToolStatus::Succeeded,
+            background: false,
+            items: vec![],
+        });
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         app.refresh_ui.focused = true;
         drop(app.sync_visible_attention());
@@ -12675,14 +12685,35 @@ mod tests {
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
         drop(app.sync_visible_attention());
         app.sync_notification_presence();
-        assert_eq!(Arc::as_ptr(&app.durable), unchanged, "child transcript selection changes no durable pane identity");
+        assert_eq!(
+            Arc::as_ptr(&app.durable),
+            unchanged,
+            "child transcript selection changes no durable pane identity"
+        );
         assert_eq!(app.notification_ui.focused_session_for_test(), None);
         let id = uuid::Uuid::new_v4();
-        drop(app.update(Message::NotificationUi(crate::app::notification_ui::Action::Snapshot(crate::notifications::Snapshot { notices: vec![crate::notifications::Notice {
-            id, event: crate::notifications::Event { target: crate::notifications::Target::Session(parent), source_session: Some(parent), provider: Some(Provider::Claude), directory: Some("/tmp".into()), destination: None,
-                evidence: crate::notifications::Evidence { key: "parent-waiting-behind-child".into(), kind: crate::notifications::Kind::Waiting } },
-            delivered: true, acknowledged: false, window: None,
-        }], diagnostic: None }))));
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Snapshot(crate::notifications::Snapshot {
+                notices: vec![crate::notifications::Notice {
+                    id,
+                    event: crate::notifications::Event {
+                        target: crate::notifications::Target::Session(parent),
+                        source_session: Some(parent),
+                        provider: Some(Provider::Claude),
+                        directory: Some("/tmp".into()),
+                        destination: None,
+                        evidence: crate::notifications::Evidence {
+                            key: "parent-waiting-behind-child".into(),
+                            kind: crate::notifications::Kind::Waiting,
+                        },
+                    },
+                    delivered: true,
+                    acknowledged: false,
+                    window: None,
+                }],
+                diagnostic: None,
+            }),
+        )));
         assert!(app.sidebar_state.has_card_update(card));
         assert!(!app.notification_ui.acknowledged_for_test(id));
         drop(app.update(Message::ChatUi(Action::SelectSubagent(target, None))));
@@ -12691,10 +12722,19 @@ mod tests {
         assert_eq!(app.durable.focused, app.workspace.focused());
         let resize = app.workspace.resize_viewport(1200.0);
         drop(app.apply_viewport(resize, true, false));
-        assert!(app.sidebar_state.has_card_update(card), "an unrelated viewport update cannot bypass visible dwell");
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: stale_epoch }));
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "an unrelated viewport update cannot bypass visible dwell"
+        );
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: stale_epoch,
+        }));
         assert!(app.sidebar_state.has_card_update(card));
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: current_epoch }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: current_epoch,
+        }));
         assert!(!app.sidebar_state.has_card_update(card));
     }
 

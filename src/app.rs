@@ -16442,12 +16442,7 @@ impl Application for Cagents {
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([
-                    refresh,
-                    self.flush_document_tone(),
-                    accounts,
-                    shared,
-                ])
+                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
