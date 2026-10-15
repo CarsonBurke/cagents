@@ -35,6 +35,13 @@ fn issued_directory(source: &HostedSession) -> &Path {
         HostedSession::Terminal(session) => &session.launch.working_directory,
     }
 }
+fn same_issued_launch(a: &HostedSession, b: &HostedSession) -> bool {
+    match (a, b) {
+        (HostedSession::Chat(a), HostedSession::Chat(b)) => a.id == b.id && a.launch.provider == b.launch.provider && a.launch.recipe == b.launch.recipe,
+        (HostedSession::Terminal(a), HostedSession::Terminal(b)) => a.id == b.id && a.launch == b.launch,
+        _ => false,
+    }
+}
 
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
@@ -150,7 +157,7 @@ impl Registry {
         let Some(first) = retained.first() else { return Ok(()); };
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         let Some(mut location) = read(&tx, first.id())? else { return Ok(()); };
-        if successor.id() != first.id() || retained.iter().any(|source| source.id() != first.id())
+        if !same_issued_launch(&location.source, successor) || successor.id() != first.id() || retained.iter().any(|source| source.id() != first.id())
             || !retained.iter().any(|source| location.source.same_process(source))
         { return Err("Authenticated holder sources do not prove this session directory successor".into()); }
         // A process proof can change during authenticated adoption, while the
@@ -171,6 +178,9 @@ impl Registry {
     pub(crate) fn bind_session_location(&mut self, source: &HostedSession, previous: Option<&HostedSession>, directory: &Path, approved: DirectoryIdentity) -> Result<(), String> {
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         let old = read(&tx, source.id())?;
+        if old.as_ref().is_some_and(|location| !same_issued_launch(&location.source, source)) {
+            return Err("A session directory binding cannot change its original issued launch".into());
+        }
         if old.as_ref().is_some_and(|location| !location.source.same_process(source)
             && previous.is_none_or(|previous| !location.source.same_process(previous))) {
             return Err("A different original session still owns this directory binding".into());

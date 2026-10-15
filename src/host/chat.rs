@@ -705,6 +705,7 @@ fn start(
         execution_environment,
         None,
         None,
+        &[],
     )
 }
 
@@ -724,6 +725,7 @@ pub(super) fn start_execution(
         Default::default(),
         Some(context),
         None,
+        &[],
     )
 }
 
@@ -751,6 +753,7 @@ fn start_with_execution(
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     mut execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
+    retained_sources: &[crate::agent_execution::HostedSession],
 ) -> Result<ServerResponse, ProtocolError> {
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
@@ -919,8 +922,13 @@ fn start_with_execution(
     // deliberately not reauthorized; its transport is checked below instead.
     let binding_source = crate::agent_execution::HostedSession::Chat(session.clone());
     let binding_registry = host.lock().unwrap_or_else(|p| p.into_inner()).execution_registry.clone();
-    let operational_binding = binding_registry.as_ref().map(|registry| registry.lock().unwrap_or_else(|p| p.into_inner())
-        .session_location(&binding_source)).transpose().map_err(unavailable)?.flatten();
+    let operational_binding = binding_registry.as_ref().map(|registry| {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        registry.session_location(&binding_source).or_else(|error| {
+            if retained_sources.is_empty() { Err(error) } else { registry.retained_session_location(retained_sources) }
+        })
+    }).transpose().map_err(unavailable)?.flatten();
+    let previous_binding_source = operational_binding.as_ref().map(|binding| binding.source.clone()).unwrap_or_else(|| binding_source.clone());
     if let Some(binding) = &operational_binding {
         if let Some(reason) = &binding.refusal { return Err(unavailable(reason.clone())); }
         let approved = binding.approved.ok_or_else(|| unavailable("The original conversation has no proven directory; recover its exact provider or close it before restarting"))?;
@@ -1399,7 +1407,7 @@ fn start_with_execution(
             let registry = host.lock().unwrap_or_else(|p| p.into_inner()).execution_registry.clone();
             if let Some(registry) = registry {
                 let result = registry.lock().unwrap_or_else(|p| p.into_inner())
-                    .bind_session_location(&crate::agent_execution::HostedSession::Chat(session.clone()), Some(&binding_source), &operational_directory, identity);
+                    .bind_session_location(&crate::agent_execution::HostedSession::Chat(session.clone()), Some(&previous_binding_source), &operational_directory, identity);
                 if let Err(reason) = result { let _ = handle.close(); return Err(unavailable(reason)); }
             }
         }
@@ -2907,6 +2915,8 @@ pub(super) fn restore_upgrade(
     } else {
         None
     };
+    let retained_sources = saved.previous_sources.iter().map(|previous| crate::agent_execution::HostedSession::Chat(previous.source.clone()))
+        .chain(std::iter::once(crate::agent_execution::HostedSession::Chat(saved.source.clone()))).collect::<Vec<_>>();
     let response = start_with_execution(
         host,
         0,
@@ -2917,6 +2927,7 @@ pub(super) fn restore_upgrade(
         Default::default(),
         None,
         restart_launch,
+        &retained_sources,
     )
     .map_err(|error| error.message)?;
     let id = match response {
