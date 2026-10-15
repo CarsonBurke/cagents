@@ -54,11 +54,14 @@ pub(crate) struct Allowance {
 }
 
 fn identifier(value: &Value) -> Result<String, String> {
-    let value = value.as_str().ok_or("Provider identifier is not a string")?;
+    identifier_str(value.as_str().ok_or("Provider identifier is not a string")?).map(str::to_owned)
+}
+
+fn identifier_str(value: &str) -> Result<&str, String> {
     if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.chars().any(char::is_control) {
         return Err("Provider identifier is empty, oversized or contains control characters".into());
     }
-    Ok(value.to_owned())
+    Ok(value)
 }
 
 fn optional_time(value: Option<&Value>) -> Result<Option<u64>, String> {
@@ -106,14 +109,14 @@ pub(crate) fn parse_codex(account: &Value, limits: &Value, observed_at_ms: u64) 
             let buckets = value.as_object().ok_or("Provider allowance buckets are malformed")?;
             if buckets.len() > MAX_BUCKETS { return Err("Provider allowance bucket limit exceeded".into()); }
             for (name, bucket) in buckets {
-                identifier(&Value::String(name.clone()))?;
+                identifier_str(name)?;
                 take_bucket(name, bucket)?;
             }
         }
         None => {
             let bucket = limits.get("rateLimits").ok_or("Provider did not return plan allowance")?;
             let name = bucket.get("limitId").and_then(Value::as_str).unwrap_or("codex");
-            identifier(&Value::String(name.into()))?;
+            identifier_str(name)?;
             take_bucket(name, bucket)?;
         }
     }
@@ -252,6 +255,12 @@ mod tests {
     #[test]
     fn malformed_and_oversized_provider_fields_fail_before_any_decision() {
         let (account, mut limits) = fixture();
+        limits["rateLimitsByLimitId"] = json!({"x".repeat(MAX_IDENTIFIER_BYTES+1):{}});
+        assert!(parse_codex(&account, &limits, 1000).is_err());
+        limits.as_object_mut().unwrap().remove("rateLimitsByLimitId");
+        limits["rateLimits"]["limitId"] = json!("x".repeat(MAX_IDENTIFIER_BYTES+1));
+        assert!(parse_codex(&account, &limits, 1000).is_err());
+        limits["rateLimits"].as_object_mut().unwrap().remove("limitId");
         limits["rateLimitResetCredits"]["availableCount"] = json!(-1);
         assert!(parse_codex(&account, &limits, 1000).is_err());
         limits["rateLimitResetCredits"] = json!({"availableCount":2,"credits":[{"id":"same"},{"id":"same"}]});
