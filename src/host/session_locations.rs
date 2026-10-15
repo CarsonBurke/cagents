@@ -191,8 +191,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let old = directory.path().join("original"); std::fs::create_dir(&old).unwrap();
         let moved = directory.path().join("located");
+        // Fixture provider supports native stdin and an observable interactive
+        // handoff without invoking any installed or paid agent.
+        let program = directory.path().join("omp");
+        std::fs::write(&program, "#!/bin/sh\nif [ \"$1\" = --fixture-native ]; then exec /bin/cat; fi\npwd -P > handoff.marker\nexec /bin/cat\n").unwrap();
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap(); }
         let proof = HostSessionProof { host_session_id: HostSessionId::new("session-location-test"), boot_id: crate::daemon::read_boot_id().unwrap(), host_incarnation: HostIncarnation::new("original") };
-        let source = chat::Session { id: TerminalId::new(), launch: chat::Launch { provider: Provider::Omp, recipe: LaunchRecipe { program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new(), unset_environment: Default::default() }, session_id: Some("22222222-0000-4000-8000-000000000001".into()) }, proof: Some(proof.clone()), terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
+        let source = chat::Session { id: TerminalId::new(), launch: chat::Launch { provider: Provider::Omp, recipe: LaunchRecipe { program: program.to_string_lossy().into_owned(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new(), unset_environment: Default::default() }, session_id: Some("22222222-0000-4000-8000-000000000001".into()) }, proof: Some(proof.clone()), terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
         let context = match context_mode {
             0 => Some(Arc::new(chat::protocol::ExecutionContext::capture(&old).unwrap())),
             1 => None,
@@ -200,7 +205,7 @@ mod tests {
         };
         let original_context = context.clone();
         let identity = context.as_ref().and_then(|context| context.directory_identity().unwrap());
-        let spec = ProcessSpec { execution: context, messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new() };
+        let spec = ProcessSpec { execution: context, messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: program.to_string_lossy().into_owned(), arguments: vec!["--fixture-native".into()], working_directory: old.clone(), environment: BTreeMap::new() };
         std::fs::write(old.join("relative.txt"), "original provider file").unwrap();
         let mut initial = Step { events: vec![chat::Event::Ready(true), chat::Event::Session { id: source.launch.session_id.clone().unwrap(), title: None }, chat::Event::Item(chat::Item { id: "relative-edit".into(), role: chat::Role::Assistant, started_at: None, at: None, content: chat::ItemContent::Changes { changes: vec![chat::FileChange { path: "relative.txt".into(), kind: chat::ChangeKind::Updated, diff: "@@ -1 +1 @@\n-old\n+new\n".into() }], status: chat::ToolStatus::Succeeded } })], ..Default::default() };
         let store = runtime::preflight(&spec, &mut initial).unwrap();
@@ -318,25 +323,58 @@ mod tests {
         impl Drop for OwnedTerminal { fn drop(&mut self) { let _ = self.0.shutdown(); } }
         let owner = OwnedTerminal(fixture.host.lock().unwrap().terminals[&terminal.id].handle.clone());
         let holder = owner.0.holder_identity().expect("actual registered holder");
+        // A shell can leave its issued launch directory. Its current subdir
+        // proves no authority over the whole mapped root; retain it and report
+        // the refusal while an independently provable terminal still moves.
+        let child = fixture.old.join("child"); std::fs::create_dir(&child).unwrap();
+        let mut changed_cwd = terminal.clone(); changed_cwd.id = TerminalId::new();
+        changed_cwd.launch.program = "/bin/sh".into();
+        changed_cwd.launch.arguments = vec!["-c".into(), "cd child && exec cat".into()];
+        changed_cwd.continuity = crate::model::TerminalContinuity::RelaunchAvailable { recipe: changed_cwd.launch.clone(), last_exit: None };
+        let changed_descriptor = super::super::state::spawn_terminal(&fixture.host, 1, changed_cwd.clone(), Default::default()).unwrap();
+        let changed_owner = OwnedTerminal(fixture.host.lock().unwrap().terminals[&changed_cwd.id].handle.clone());
+        let changed_holder = changed_owner.0.holder_identity().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while std::fs::read_link(format!("/proc/{}/cwd", changed_holder.root.pid)).unwrap() != child {
+            assert!(Instant::now() < deadline, "terminal did not enter its child working directory");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         {
             let mut state = fixture.host.lock().unwrap();
             assert!(matches!(state.terminals[&terminal.id].session.continuity, crate::model::TerminalContinuity::RelaunchAvailable { .. }));
             let view = state.read_model().unwrap().views[0].clone();
             state.edit_model(1, ModelEdit::ChangeView { scope: view.scope, expected_revision: view.revision, operation: uuid::Uuid::new_v4(), change: crate::workspace_model::views::Change::Insert { pane: Pane { id: CardId::new(), title: "Registered terminal".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.5, kind: CardKind::Terminal(descriptor.session.clone()), scope: Some(fixture.old.clone()) }, before: None } }).unwrap();
+            let view = state.read_model().unwrap().views[0].clone();
+            state.edit_model(1, ModelEdit::ChangeView { scope: view.scope, expected_revision: view.revision, operation: uuid::Uuid::new_v4(), change: crate::workspace_model::views::Change::Insert { pane: Pane { id: CardId::new(), title: "Shell in child directory".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.5, kind: CardKind::Terminal(changed_descriptor.session.clone()), scope: Some(fixture.old.clone()) }, before: None } }).unwrap();
         }
         std::fs::rename(&fixture.old, &fixture.moved).unwrap();
         std::fs::create_dir(&fixture.old).unwrap();
         let model = locate(&fixture);
-        assert!(model.session_location_refusals.is_empty());
+        assert_eq!(model.session_location_refusals.len(), 1);
+        assert_eq!(model.session_location_refusals[0].session, changed_cwd.id);
+        assert!(model.session_location_refusals[0].reason.contains("different directory"));
         let state = fixture.host.lock().unwrap();
         assert!(state.terminals[&terminal.id].handle.same_worker(&owner.0));
         assert_eq!(state.terminals[&terminal.id].session.launch, terminal.launch);
         assert_eq!(state.terminals[&terminal.id].handle.holder_identity().unwrap(), holder);
         assert!(holder.root.is_current());
         assert!(!owner.0.is_completed());
+        assert!(!changed_owner.0.is_completed());
+        assert!(changed_holder.root.is_current());
         drop(state);
         let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
         assert_eq!(registry.lock().unwrap().session_location(&HostedSession::Terminal(descriptor.session)).unwrap().unwrap().directory, fixture.moved);
+        let response = super::super::client::process_request(&fixture.host, 1, ClientRequest::ChatReturnTerminal { chat_id: fixture.source.id }).unwrap().0;
+        let ServerResponse::ChatTerminal { session: replacement, .. } = response else { panic!("expected exact terminal handoff") };
+        let replacement_owner = OwnedTerminal(fixture.host.lock().unwrap().terminals[&replacement.id].handle.clone());
+        assert_eq!(replacement.launch.working_directory, fixture.moved);
+        assert_eq!(fixture.source.launch.recipe.working_directory, fixture.old);
+        let marker = fixture.moved.join("handoff.marker");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.exists() { assert!(Instant::now() < deadline, "terminal handoff did not run in its pinned directory"); std::thread::sleep(Duration::from_millis(10)); }
+        assert_eq!(std::fs::read_to_string(marker).unwrap().trim(), fixture.moved.to_str().unwrap());
+        assert!(!fixture.old.join("handoff.marker").exists());
+        assert!(!replacement_owner.0.is_completed());
     }
 
     #[test]
