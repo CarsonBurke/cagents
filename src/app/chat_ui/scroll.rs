@@ -19,7 +19,7 @@ pub(super) fn transcript<'a>(
     follow_end: bool,
     items: Vec<(Id, &'a str)>,
 ) -> Element<'a, Message> {
-    transcript_impl(content.into(), target, subagent, anchors, follow_end, items, None, Memory::default())
+    transcript_impl(content.into(), target, subagent, anchors, follow_end, items, None, Memory::default(), false)
 }
 
 pub(super) type Observations = Rc<std::cell::RefCell<HashMap<Option<String>, Scroll>>>;
@@ -37,13 +37,13 @@ impl Memory {
 
 pub(super) fn transcript_observed<'a>(
     content: impl Into<Element<'a, Message>>, target: Target, subagent: Option<&'a str>,
-    anchors: Vec<(usize, &'a str)>, follow_end: bool, items: Vec<(Id, &'a str)>, observations: Observations, memory: Memory,
+    anchors: Vec<(usize, &'a str)>, follow_end: bool, items: Vec<(Id, &'a str)>, observations: Observations, memory: Memory, find_open: bool,
 ) -> Element<'a, Message> {
-    transcript_impl(content.into(), target, subagent, anchors, follow_end, items, Some(observations), memory)
+    transcript_impl(content.into(), target, subagent, anchors, follow_end, items, Some(observations), memory, find_open)
 }
 
 fn transcript_impl<'a>(content: Element<'a, Message>, target: Target, subagent: Option<&'a str>,
-    anchors: Vec<(usize, &'a str)>, follow_end: bool, items: Vec<(Id, &'a str)>, observations: Option<Observations>, memory: Memory,
+    anchors: Vec<(usize, &'a str)>, follow_end: bool, items: Vec<(Id, &'a str)>, observations: Option<Observations>, memory: Memory, find_open: bool,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
@@ -67,6 +67,7 @@ fn transcript_impl<'a>(content: Element<'a, Message>, target: Target, subagent: 
         items,
         observations,
         memory,
+        find_open,
     })
 }
 
@@ -83,6 +84,7 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         items: Vec::new(),
         observations: None,
         memory: Memory::default(),
+        find_open: false,
     })
 }
 
@@ -197,6 +199,7 @@ impl Operation for ItemBounds<'_> {
 }
 
 struct Anchored<'a> {
+    find_open: bool,
     captured: Option<Rc<Cell<bool>>>,
     target: Option<Target>,
     content: Element<'a, Message>,
@@ -848,7 +851,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .as_ref()
                 .is_some_and(|captured| captured.get());
             let gesture = navigation_input(before.0, top, scroll, wheel, child_captured);
-            if gesture && let Some(target) = self.target {
+            if self.find_open && gesture && let Some(target) = self.target {
                 shell.publish(action(Action::FindNavigationInput(target)));
             }
             let user_input = gesture || anchor.pending_input;
@@ -1005,7 +1008,7 @@ mod tests {
             ["first", "middle", "last"].into_iter().map(|id|
                 item(id, widget::Space::new().height(500).width(Length::Fill))).collect::<Vec<_>>()),
             target, None, vec![], true,
-            ["first", "middle", "last"].into_iter().map(|id| (item_id(id), id)).collect(), observations.clone(), memory.clone());
+            ["first", "middle", "last"].into_iter().map(|id| (item_id(id), id)).collect(), observations.clone(), memory.clone(), false);
         let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
         {
             let mut element = make();
@@ -1032,7 +1035,7 @@ mod tests {
         let source: Arc<str> = line.repeat(5000).into();
         let byte = line.len() * 1500;
         let text = prose::code_text(source, Arc::from([]), design::TEXT_BODY.into(), iced::Font::MONOSPACE,
-            target, None, Some(selectable_prose::Logical { identity, start: 0 }));
+            target, None, Some(selectable_prose::Logical { identity, start: 0, paint: None }));
         let mut element = transcript(widget::column::with_children(vec![
             widget::Space::new().height(10000).into(), item("answer", text)]), target, None, vec![], true, vec![]);
         let mut tree = Tree::new(&element);
@@ -1084,7 +1087,7 @@ mod tests {
         let observations: Observations = Default::default();
         let target = Target { card: CardId::new(), generation: 0 };
         let make = |height| transcript_observed(widget::Space::new().height(height).width(Length::Fill),
-            target, None, vec![], true, vec![], observations.clone(), Memory::default());
+            target, None, vec![], true, vec![], observations.clone(), Memory::default(), false);
         let bounds = Rectangle::with_size(Size::new(400.0, 400.0));
         let limits = layout::Limits::new(Size::ZERO, bounds.size());
         let mut element = make(100.0);

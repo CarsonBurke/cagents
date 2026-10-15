@@ -710,8 +710,6 @@ impl Scroll {
     /// reader has already asked for from the one they are asking for now.
     pub(super) fn from_top(self) -> f32 { self.from_top }
 
-    pub(super) fn bottom_offset(self) -> f32 { (self.travel() - self.from_top).max(0.0) }
-
     pub(super) fn content(self) -> f32 {
         self.content
     }
@@ -1609,6 +1607,7 @@ impl Runtime {
                     .collect(),
                 self.observed_scroll.clone(),
                 self.scroll_memory.clone(),
+                self.find.is_some(),
             ),
             target,
             self.selected_subagent.as_deref(),

@@ -269,3 +269,41 @@ mod fragment_tests {
         assert_eq!(paint.fragment(8,2048,2048),(Vec::new(),None));
     }
 }
+
+#[cfg(test)]
+mod rendered_tests {
+    use super::*;
+    use crate::{agent::Provider,chat::{Item,ItemContent,Role,Phase,ToolStatus,CommandAction}};
+    fn input(content:ItemContent) -> Input {
+        Input {item:Arc::new(Item {id:"rendered-item".into(),role:Role::Assistant,content,at:None,started_at:None}),
+            revision:1,turn:"turn".into(),growing:false}
+    }
+    #[test]
+    fn markdown_matches_plain_prose_and_fenced_code_in_render_order() {
+        let input=input(ItemContent::Text {text:"## Heading\n\nA **needle** and inline `code`.\n\n```text\nneedle\n```\n".into(),thinking:false,phase:Phase::Final});
+        let document=document(&input,Provider::Claude);let generation=AtomicU64::new(1);
+        let mut index=Index::default();let matches=index.search(&[document.clone()],"needle",1,&generation).unwrap();
+        assert_eq!(matches.len(),2);
+        assert_ne!(matches[0].identity,matches[1].identity);
+        for found in matches {
+            let block=document.blocks.iter().find(|block|block.identity==found.identity).unwrap();
+            assert_eq!(&block.text[found.range],"needle");
+            assert!(!block.text.contains("**"));
+        }
+    }
+    #[test]
+    fn displayed_command_label_and_directory_remain_searchable() {
+        let input=input(ItemContent::Command {label:"Verify RELEASE".into(),command:"true".into(),working_directory:"/Workspace/Project".into(),
+            output:"done".into(),action:CommandAction::Run,status:ToolStatus::Succeeded,exit_code:Some(0),duration_ms:None});
+        let mut worker=Worker::default();let generation=AtomicU64::new(1);
+        let label=worker.search(&[input],Provider::Claude,"release",1,&generation).unwrap();
+        assert_eq!(label.len(),1);
+        assert_eq!(label[0].identity,crate::app::chat_ui::selection::logical_identity("rendered-item",&[3,0]));
+    }
+    #[test]
+    fn obsolete_query_cancels_inside_one_large_block() {
+        let mut checks=0;
+        let result=super::super::matched_ranges_cancellable(&"x".repeat(300_000),"absent",usize::MAX,|| {checks+=1;checks<4});
+        assert!(result.is_none());assert_eq!(checks,4);
+    }
+}
