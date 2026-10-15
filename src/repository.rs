@@ -692,14 +692,15 @@ pub struct SnapshotCache {
     admin: BTreeMap<PathBuf, Option<FileIdentity>>,
 }
 
-/// Read a small Git control file without waiting for FIFO/device producers or
-/// following a replaced final symlink. Missing optional files are distinct from
+/// Read a small Git control file without waiting for FIFO/device producers.
+/// Git permits locator symlinks; follow them but require the opened target to
+/// be a bounded regular file. Missing optional files remain distinct from
 /// malformed or unreadable metadata; a failed prepass must not certify a cache.
 fn read_git_metadata_file(path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(file) => file,
@@ -756,7 +757,7 @@ impl PublicationDependencies {
 /// Resolve administrative metadata locally, including linked worktree gitfiles.
 fn local_git_dir(worktree: &Path) -> io::Result<Option<PathBuf>> {
     let path = worktree.join(".git");
-    match fs::symlink_metadata(&path) {
+    match fs::metadata(&path) {
         Ok(metadata) if metadata.is_dir() => return Ok(Some(path)),
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -9241,7 +9242,9 @@ mod tests {
             for case in [
                 "gitfile-fifo",
                 "commondir-fifo",
-                "gitfile-symlink",
+                "gitfile-symlink-fifo",
+                "commondir-symlink-fifo",
+                "gitfile-symlink-device",
                 "gitfile-oversize",
             ] {
                 let root = evidence.join(case);
@@ -9253,10 +9256,19 @@ mod tests {
                         fs::create_dir(&marker).unwrap();
                         fifo(&marker.join("commondir"));
                     }
-                    "gitfile-symlink" => {
+                    "gitfile-symlink-fifo" => {
                         let target = root.join("locator");
-                        fs::write(&target, "gitdir: metadata\n").unwrap();
+                        fifo(&target);
                         std::os::unix::fs::symlink(target, &marker).unwrap();
+                    }
+                    "commondir-symlink-fifo" => {
+                        fs::create_dir(&marker).unwrap();
+                        let target = root.join("locator");
+                        fifo(&target);
+                        std::os::unix::fs::symlink(target, marker.join("commondir")).unwrap();
+                    }
+                    "gitfile-symlink-device" => {
+                        std::os::unix::fs::symlink("/dev/null", &marker).unwrap();
                     }
                     _ => fs::write(&marker, vec![b'x'; 4097]).unwrap(),
                 }
@@ -9335,6 +9347,67 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+        }
+
+        #[cfg(feature = "ui")]
+        #[test]
+        fn snapshot_metadata_symlink_layouts_remain_git_compatible() {
+            const TEST: &str = "repository::tests::git_contracts::snapshot_metadata_symlink_layouts_remain_git_compatible";
+            if !crate::git_watch::tests::fixture_isolated(TEST) {
+                return;
+            }
+            use std::os::unix::fs::symlink;
+            for layout in ["directory", "gitfile", "commondir"] {
+                let directory = tempfile::tempdir().unwrap();
+                let primary = directory.path().join("primary");
+                fs::create_dir(&primary).unwrap();
+                let private = directory.path().join("private");
+                if layout == "gitfile" {
+                    git(&primary, &["init", "--template=", "-b", "main",
+                        "--separate-git-dir", private.to_str().unwrap()]);
+                } else {
+                    git(&primary, &["init", "--template=", "-b", "main"]);
+                }
+                fs::write(primary.join("file"), "base\n").unwrap();
+                git(&primary, &["add", "file"]);
+                git(&primary, &["commit", "-m", "base"]);
+                let root = if layout == "commondir" {
+                    let linked = directory.path().join("linked");
+                    git(&primary, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+                    let admin = PathBuf::from(String::from_utf8(git_output(&linked, &["rev-parse", "--absolute-git-dir"])).unwrap().trim());
+                    fs::rename(admin.join("commondir"), admin.join("common-target")).unwrap();
+                    symlink("common-target", admin.join("commondir")).unwrap();
+                    linked
+                } else {
+                    if layout == "directory" {
+                        fs::rename(primary.join(".git"), &private).unwrap();
+                        symlink("../private", primary.join(".git")).unwrap();
+                    } else {
+                        fs::rename(primary.join(".git"), directory.path().join("git-locator")).unwrap();
+                        symlink("../git-locator", primary.join(".git")).unwrap();
+                    }
+                    primary
+                };
+                fs::write(root.join("file"), "first\n").unwrap();
+                let executor = Arc::new(RecordingExecutor::default());
+                let service = RepositoryService::new("git", executor.clone());
+                let cancel = CancellationToken::new();
+                let status = service.status(&root, &cancel).unwrap();
+                assert_eq!(status.dirty.unstaged, 1, "Git accepts {layout}");
+                let options = SnapshotOptions::default();
+                let mut cache = SnapshotCache::default();
+                let first = service.snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap().unwrap();
+                assert_eq!(first.status.dirty, status.dirty, "{layout}");
+                assert_eq!(measured(&first, "file", ChangeArea::Unstaged), (Some(1), Some(1)), "{layout}");
+                executor.commands.lock().unwrap().clear();
+                assert!(service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().is_none(), "{layout}");
+                assert_eq!(executor.commands.lock().unwrap().len(), 1, "{layout}: unchanged runs only status");
+                fs::write(root.join("file"), "second\nline\n").unwrap();
+                let changed = service.snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap().unwrap();
+                assert_eq!(measured(&changed, "file", ChangeArea::Unstaged), (Some(2), Some(1)), "{layout}: missed-event content repair");
+            }
         }
 
         #[test]
