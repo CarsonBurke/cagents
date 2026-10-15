@@ -408,27 +408,47 @@ mod tests {
             Ok(Step::default())
         }
         fn receive(&mut self, frame: serde_json::Value) -> Result<Step, String> {
-            let mut events = vec![chat::Event::Status { busy: false, detail: "Fixture turn complete".into() }];
+            let mut events = vec![chat::Event::Status {
+                busy: false,
+                detail: "Fixture turn complete".into(),
+            }];
             if let Some(id) = frame.get("session").and_then(serde_json::Value::as_str) {
-                events.push(chat::Event::Session { id: id.into(), title: None });
+                events.push(chat::Event::Session {
+                    id: id.into(),
+                    title: None,
+                });
             }
-            Ok(Step { events, ..Default::default() })
+            Ok(Step {
+                events,
+                ..Default::default()
+            })
         }
         fn command(&mut self, command: chat::Command) -> Result<Step, String> {
             if matches!(&command, chat::Command::Interrupt) {
-                return Ok(Step { events: vec![chat::Event::Status { busy: false, detail: "Fixture interrupted".into() }], ..Default::default() });
+                return Ok(Step {
+                    events: vec![chat::Event::Status {
+                        busy: false,
+                        detail: "Fixture interrupted".into(),
+                    }],
+                    ..Default::default()
+                });
             }
             if matches!(&command, chat::Command::Prompt { text, .. } if text == "__fixture_new_thread")
             {
                 return Ok(Step {
                     // Conversation confirmation must originate from an actual
                     // provider frame, not a locally prepared command event.
-                    writes: vec![serde_json::json!({"session":"44444444-0000-4000-8000-000000000004"})],
+                    writes: vec![
+                        serde_json::json!({"session":"44444444-0000-4000-8000-000000000004"}),
+                    ],
                     ..Default::default()
                 });
             }
             self.calls.lock().unwrap().push(self.directory.clone());
-            Ok(Step { writes: vec![serde_json::json!({"idle":true})], ..Default::default() })
+            Ok(Step {
+                writes: vec![serde_json::json!({"idle":true})],
+                ..Default::default()
+            })
         }
         fn command_for_run(
             &mut self,
