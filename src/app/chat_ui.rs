@@ -36,6 +36,7 @@ mod thumbnails;
 mod tool_text;
 mod turn;
 mod turn_actions;
+mod originals;
 mod view;
 
 pub(super) fn prune_pasted_images() {
@@ -158,6 +159,7 @@ pub enum Action {
     CancelQueued(Target),
     Switch(CardId),
     Ready(Target, Ready),
+    OriginalReady(Target,u64,Option<AccountId>,u64,originals::Reply),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
@@ -317,6 +319,7 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::OriginalReady(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::Wake(..)
@@ -483,6 +486,7 @@ pub(super) struct State {
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
     recovery_drafts: HashMap<CardId, turn_actions::Prompt>,
+    original_epoch: u64,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -511,6 +515,7 @@ impl Default for State {
             retiring: HashSet::new(),
             drafts: HashMap::new(),
             recovery_drafts: HashMap::new(),
+            original_epoch: 0,
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -2275,6 +2280,7 @@ impl Runtime {
     }
     fn refresh(&mut self) {
         self.refresh_session();
+        self.sync_original();
         if !self.visible.load(Ordering::Relaxed) {
             return;
         }
@@ -2598,6 +2604,7 @@ impl Runtime {
         }
         self.recovery.observe(&snapshot);
         self.snapshot = snapshot;
+        self.sync_original();
         images::sync(self);
         self.refresh_find();
     }
@@ -2679,6 +2686,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        self.sync_original();
         images::sync(self);
         self.present()
     }
@@ -4626,6 +4634,7 @@ impl Cagents {
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
+                subscriptions.extend(self.original_subscription(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
@@ -6140,6 +6149,7 @@ impl Cagents {
                 }
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
             }
+            Action::OriginalReady(target,id,account,epoch,reply)=>return self.original_ready(target,id,account,epoch,reply),
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
                 let Some(result) = result else {
@@ -6358,7 +6368,7 @@ impl Cagents {
                         }
                         if let Some(prompt)=self.chat_ui.recovery_drafts.remove(&target.card)
                             && let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.load_recovery_prompt(prompt,"Editing this prompt continues the new branch.");
+                            runtime.load_recovery_prompt(Arc::try_unwrap(prompt).unwrap_or_else(|shared|(*shared).clone()),"Editing this prompt continues the new branch.");
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
@@ -17126,32 +17136,52 @@ mod tests {
             assert_eq!(chat_runtime(&app, card).failures, recorded);
         }
     }
+    fn original_fixture(user:&str,text:&str,attachments:Vec<chat::annotations::OriginalAttachment>)->chat::annotations::OriginalPrompt {
+        use chat::annotations::{OriginalPrompt,OriginalSettings,Setting};
+        OriginalPrompt {user_id:user.into(),turn_id:"turn".into(),text_bytes:text.len(),attachments,
+            settings:OriginalSettings {model:Setting::Unsupported,reasoning:Setting::Unsupported,fast:Setting::Unsupported,permission:Setting::Unsupported}}
+    }
+    fn original_result(app:&mut Cagents,card:CardId,value:originals::Value) {
+        let runtime=match app.cards.get_mut(&card).unwrap() {CardRuntime::Chat(runtime)=>runtime,_=>panic!("chat")};
+        runtime.sync_original();let target=runtime.target;let id=runtime.recovery.originals.query_id_for_test();
+        drop(app.handle_chat_ui(Action::OriginalReady(target,id,None,0,originals::Reply::fixture(Ok(value)))));
+    }
+    fn original_metadata(app:&mut Cagents,card:CardId,original:chat::annotations::OriginalPrompt,text:&str) {
+        let session=chat_runtime(app,card).snapshot.session_id.clone().unwrap();
+        let mut end=text.len().min(4);while !text.is_char_boundary(end) {end-=1;}
+        let page=chat::annotations::OriginalPage {session_id:session,original,offset:0,next_offset:end,text:text[..end].into(),complete:end==text.len()};
+        original_result(app,card,originals::Value::Metadata(page));
+    }
     #[test]
     fn failed_turn_retry_preserves_prompt_and_attachments_and_dispatches_once() {
         let mut app=crate::app::tests::context_inspector_test_app(false);
         let card=live_chat(&mut app,Some(KNOWN_THREAD));
         let target=chat_runtime(&app,card).target;
-        let prompt=Command::Prompt {text:"error".into(),attachments:vec![Attachment {path:"/tmp/image.png".into()}],mode:PromptMode::Send};
         let runtime=app.chat_runtime_mut(target).unwrap();
         let mut snapshot=(*runtime.snapshot).clone();
         snapshot.items=vec![Arc::new(chat::Item {id:"user".into(),role:chat::Role::User,started_at:None,at:None,
             content:ItemContent::Text {text:"error".into(),thinking:false,phase:chat::Phase::Final}})];
+        snapshot.capabilities.original_retry=true;
         snapshot.error=Some("API Error: 529 Overloaded... try again.".into());
-        runtime.recovery.submitting(&Snapshot::default(),&prompt);
         show_chat_snapshot_for_test(&mut app,card,snapshot);
+        let original=original_fixture("actual-user","error",vec![chat::annotations::OriginalAttachment {
+            original_path:"/user/image.png".into(),path:"/private/immutable.png".into(),bytes:123,sha256:[7;32]}]);
+        original_metadata(&mut app,card,original.clone(),"error");
         let runtime=app.chat_runtime_mut(target).unwrap();
-        assert_eq!(runtime.retry_user_for_error("API Error: 529 Overloaded... try again.",Some("user")),Some("user".into()));
-        assert!(runtime.retry_user_for_error("401 invalid API key",Some("user")).is_none());
-        drop(app.handle_chat_ui(Action::RetryTurn(target,"user".into())));
+        assert_eq!(runtime.retry_user_for_error("API Error: 529 Overloaded... try again.",None),Some("actual-user".into()));
+        assert!(runtime.retry_user_for_error("401 invalid API key",None).is_none());
+        assert!(runtime.recovery.submitted.is_none(),"eligibility retains metadata rather than full input text");
+        drop(app.handle_chat_ui(Action::RetryTurn(target,"actual-user".into())));
         let runtime=chat_runtime(&app,card);
-        assert_eq!(runtime.recovery.commands.front(),Some(&prompt));
+        assert!(runtime.recovery.commands.is_empty(),"UI never sends a guessed settings/prompt sequence");
         let dispatched=runtime.pending.as_ref().unwrap().id;
-        drop(app.handle_chat_ui(Action::RetryTurn(target,"user".into())));
+        assert_eq!(runtime.recovery.retried,Some((runtime.snapshot.turn_generation,"actual-user".into())));
+        drop(app.handle_chat_ui(Action::RetryTurn(target,"actual-user".into())));
         assert_eq!(chat_runtime(&app,card).pending.as_ref().unwrap().id,dispatched);
         settle(&mut app,card,Ok(()));
-        assert!(chat_runtime(&app,card).recovery.commands.is_empty());
-        drop(app.handle_chat_ui(Action::RetryTurn(target,"user".into())));
+        drop(app.handle_chat_ui(Action::RetryTurn(target,"actual-user".into())));
         assert!(chat_runtime(&app,card).pending.is_none(),"an ACK without a new turn cannot replay twice");
+        assert_eq!(original.attachments[0].path,PathBuf::from("/private/immutable.png"));
     }
 
     #[test]
@@ -17170,8 +17200,13 @@ mod tests {
             show_chat_snapshot_for_test(&mut app,card,snapshot);
             let runtime=app.chat_runtime_mut(target).unwrap();
             runtime.session.launch.provider=provider;
+            let original=original_fixture("actual-user","Original prompt",vec![]);
+            original_metadata(&mut app,card,original.clone(),"Original prompt");
+            let runtime=app.chat_runtime_mut(target).unwrap();
             assert!(runtime.can_edit_prompt(&runtime.snapshot.items[0]));
             drop(app.handle_chat_ui(Action::EditPrompt(target,"turn/user".into())));
+            original_result(&mut app,card,originals::Value::Text(chat::original::OriginalText {
+                session_id:KNOWN_THREAD.into(),original,text:"Original prompt".into()}));
             let runtime=chat_runtime(&app,card);
             if provider == Provider::Claude {
                 assert_eq!(runtime.composer.text().trim_end(),"Original prompt");

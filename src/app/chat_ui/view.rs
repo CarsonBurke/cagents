@@ -1736,6 +1736,7 @@ impl Runtime {
         }
         let mut attachment_chips = Vec::new();
         for (index, attachment) in self.attachments.iter().enumerate() {
+            let display_path=self.attachment_display_path(attachment);
             let chip = widget::row::with_children(vec![
                 if let Some(handle) = self.thumbnails.handle(&attachment.path) {
                     iced::widget::image(handle.clone())
@@ -1749,12 +1750,7 @@ impl Runtime {
                 crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
                     "Pasted image".to_owned()
                 } else {
-                    attachment
-                        .path
-                        .file_name()
-                        .unwrap_or(attachment.path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
+                    display_path.file_name().unwrap_or(display_path.as_os_str()).to_string_lossy().into_owned()
                 })
                 .width(Length::Fill)
                 .into(),
@@ -1770,7 +1766,7 @@ impl Runtime {
             attachment_chips.push(
                 widget::tooltip(
                     chip,
-                    design::caption(attachment.path.display().to_string()),
+                    design::caption(display_path.display().to_string()),
                     widget::tooltip::Position::Top,
                 )
                 .into(),
@@ -3575,11 +3571,8 @@ impl Runtime {
         for attachment in &queued.attachments {
             rows.push(
                 design::caption(
-                    attachment
-                        .path
-                        .file_name()
-                        .unwrap_or(attachment.path.as_os_str())
-                        .to_string_lossy(),
+                    self.attachment_display_path(attachment).file_name()
+                        .unwrap_or(self.attachment_display_path(attachment).as_os_str()).to_string_lossy(),
                 )
                 .into(),
             );

@@ -8,7 +8,29 @@ pub(super) struct Prompt {
     prior_user_id: Option<String>,
     pub text: String,
     pub attachments: Vec<Attachment>,
+    pub attachment_labels: HashMap<PathBuf,PathBuf>,
+    pub account_hint: Option<AccountId>,
+    /// Retained history input, not an independently edited composer draft.
+    pub origin_backend: bool,
     pub settings: Settings,
+}
+
+impl Prompt {
+    pub(super) fn from_original(value:chat::original::OriginalText)->Option<Self> {
+        use chat::annotations::Setting;
+        if value.text.len()!=value.original.text_bytes || !value.original.settings.is_exact() {return None;}
+        let original=value.original;
+        let model=match original.settings.model {
+            Setting::Value(model)=>Some((model,match original.settings.reasoning {Setting::Value(reasoning)=>Some(reasoning),Setting::Unsupported=>None,_=>return None})),
+            Setting::Unsupported=>None,_=>return None,
+        };
+        let fast=match original.settings.fast {Setting::Value(value)=>Some(value),Setting::Unsupported=>None,_=>return None};
+        let permission=match original.settings.permission {Setting::Value(value)=>Some(value),Setting::Unsupported=>None,_=>return None};
+        let attachment_labels=original.attachments.iter().map(|attachment|(attachment.path.clone(),attachment.original_path.clone())).collect();
+        let attachments=original.attachments.into_iter().map(|attachment|Attachment {path:attachment.path}).collect();
+        Some(Self {user_id:Some(original.user_id),prior_user_id:None,text:value.text,attachments,attachment_labels,account_hint:None,origin_backend:true,
+            settings:Settings {model,fast,permission,exact:true}})
+    }
 }
 
 #[derive(Clone,Debug,PartialEq,Eq)]
@@ -31,6 +53,8 @@ impl Settings {
 #[derive(Default)]
 pub(super) struct State {
     pub submitted: Option<Prompt>,
+    pub originals: originals::State,
+    pub attachment_labels: HashMap<PathBuf,PathBuf>,
     /// Each failed generation can be retried once until provider output proves
     /// a new turn began. An ACK alone is not that proof.
     pub retried: Option<(u64, String)>,
@@ -45,7 +69,7 @@ pub(super) struct State {
     pub recoverable_users: HashSet<String>,
     pub branch_draft: Option<Prompt>,
     pub branch_session: Option<String>,
-    pub prepared_prompt: Option<Prompt>,
+    pub prepared_prompt: Option<Arc<Prompt>>,
 }
 
 impl State {
@@ -53,7 +77,8 @@ impl State {
     /// An explicitly prepared composer draft is reader input, not replay proof.
     pub fn connection_replaced(&mut self) {
         let prepared_prompt=self.prepared_prompt.take();
-        *self=Self {prepared_prompt,..Self::default()};
+        let attachment_labels=std::mem::take(&mut self.attachment_labels);
+        *self=Self {prepared_prompt,attachment_labels,..Self::default()};
         if self.prepared_prompt.is_some() {
             self.notice=Some("A prepared prompt is available after you send or clear your current draft.".into());
         }
@@ -64,7 +89,7 @@ impl State {
         self.submitted = Some(Prompt {
             user_id: None,
             prior_user_id: latest_user(snapshot).map(|item| item.id.clone()),
-            text: text.clone(), attachments: attachments.clone(),
+            text: text.clone(), attachments: attachments.clone(), attachment_labels:self.attachment_labels.clone(),account_hint:None,origin_backend:false,
             settings,
         });
     }
@@ -108,7 +133,8 @@ impl State {
 
     pub fn for_user(&self, snapshot: &Snapshot, id: &str) -> Option<Prompt> {
         if let Some(submitted) = self.submitted.as_ref().filter(|prompt| prompt.user_id.as_deref() == Some(id)) {
-            return Some(submitted.clone());
+            let mut prompt=submitted.clone();prompt.origin_backend=true;
+            return Some(prompt);
         }
         let index = snapshot.items.iter().position(|item| item.id == id && item.role == chat::Role::User)?;
         let ItemContent::Text { text, thinking:false, .. } = &snapshot.items[index].content else { return None; };
@@ -131,7 +157,7 @@ impl State {
                 _ => {},
             }
         }
-        Some(Prompt { user_id:Some(id.into()), prior_user_id:None, text:text.clone(), attachments,
+        Some(Prompt { user_id:Some(id.into()), prior_user_id:None, text:text.clone(), attachments,attachment_labels:HashMap::new(),account_hint:None,origin_backend:true,
             settings:Settings::capture(snapshot) })
     }
 
@@ -283,7 +309,7 @@ mod tests {
         state.observe(&snapshot);
         assert!(state.begin_retry(&snapshot,"u"));
         state.inflight=Some(1);
-        state.prepared_prompt=state.submitted.clone();
+        state.prepared_prompt=state.submitted.clone().map(Arc::new);
         state.connection_replaced();
         assert!(state.submitted.is_none());assert!(state.commands.is_empty());assert!(state.inflight.is_none());
         assert!(state.retried.is_none());assert!(state.prepared_prompt.is_some());
@@ -297,9 +323,11 @@ impl Runtime {
     /// Resident recovery data is deliberately separate from hydrated transcript
     /// bodies. Attachment paths are retained; file bytes remain on disk.
     pub(super) fn recovery_retained_bytes(&self)->(usize,usize) {
-        let prompts=self.recovery.submitted.iter().chain(self.recovery.branch_draft.iter()).chain(self.recovery.prepared_prompt.iter());
+        let prompts=self.recovery.submitted.iter().chain(self.recovery.branch_draft.iter()).chain(self.recovery.prepared_prompt.iter().map(Arc::as_ref));
         let (mut text,mut paths)=prompts.fold((0,0),|(text,paths),prompt| (
-            text+prompt.text.len(),paths+prompt.attachments.iter().map(|attachment|attachment.path.as_os_str().len()).sum::<usize>()));
+            text+prompt.text.len(),paths+prompt.attachments.iter().map(|attachment|attachment.path.as_os_str().len()).sum::<usize>()
+                +prompt.attachment_labels.iter().map(|(path,label)|path.as_os_str().len()+label.as_os_str().len()).sum::<usize>()));
+        paths+=self.recovery.attachment_labels.iter().map(|(path,label)|path.as_os_str().len()+label.as_os_str().len()).sum::<usize>();
         for command in &self.recovery.commands {
             if let Command::Prompt {text:body,attachments,..}=command {
                 text+=body.len();paths+=attachments.iter().map(|attachment|attachment.path.as_os_str().len()).sum::<usize>();
@@ -308,28 +336,29 @@ impl Runtime {
         (text,paths)
     }
 
-    fn recovery_available(&self) -> bool {
+    pub(super) fn recovery_available(&self) -> bool {
         self.snapshot.ready && !self.snapshot.busy && !self.snapshot.exited
             && self.snapshot.read_only_reason.is_none() && !self.snapshot.has_later
             && !self.disconnected && self.pending.is_none() && self.queued.is_none()
             && self.selected_subagent.is_none() && self.recovery.commands.is_empty()
+            && self.snapshot.queued_messages.is_empty() && self.followups.is_empty()
     }
 
     pub(super) fn retry_user_for_error(&self, message: &str, anchor: Option<&str>) -> Option<String> {
         if !self.recovery_available() || !retriable(message)
             || self.snapshot.error.as_deref() != Some(message) { return None; }
-        let user = latest_user(&self.snapshot)?;
-        if let Some(anchor) = anchor {
-            let user_index = self.snapshot.items.iter().position(|item|item.id == user.id)?;
-            let turn = self.turns.iter().find(|turn|turn.key == anchor)?;
-            if !turn.prompt.iter().copied().chain(turn.steps.iter().map(|step|step.index))
-                .chain(turn.prose.iter().map(|prose|prose.index)).any(|index|index >= user_index) { return None; }
+        let user=self.original_retry_user()?;
+        if self.recovery.retried.as_ref()==Some(&(self.snapshot.turn_generation,user.into())) {return None;}
+        if let Some(anchor)=anchor {
+            // Old equal error strings cannot acquire a current-turn Retry.
+            let latest=self.failures.iter().rfind(|(_,error)|error==message)?;
+            if latest.0.as_deref()!=Some(anchor) {return None;}
         }
-        self.recovery.retry_available(&self.snapshot,&user.id).then(||user.id.clone())
+        Some(user.into())
     }
 
     pub(super) fn edit_supported(&self,item:&chat::Item)->bool {
-        item.role == chat::Role::User && self.recovery.recoverable_users.contains(&item.id)
+        item.role == chat::Role::User && !self.recovery.originals.editing()
             && (self.session.launch.provider == Provider::Claude
                 || branch_point(self.session.launch.provider,&self.snapshot,item).is_some())
     }
@@ -344,8 +373,8 @@ impl Runtime {
     pub(super) fn retry_for_assistant(&self,item:&chat::Item)->Option<String> {
         if !self.recovery_available() || item.role != chat::Role::Assistant
             || self.recovery.last_assistant.as_deref() != Some(item.id.as_str()) {return None;}
-        let user=self.recovery.assistant_user.as_ref()?;
-        self.recovery.retry_available(&self.snapshot,user).then(||user.clone())
+        let user=self.original_retry_user()?;
+        (self.recovery.retried.as_ref()!=Some(&(self.snapshot.turn_generation,user.into()))).then(||user.into())
     }
 
     fn edit_prompt(&self, id: &str) -> Option<(Prompt, Option<String>)> {
@@ -359,13 +388,17 @@ impl Runtime {
         Some((prompt,branch))
     }
 
+    pub(super) fn attachment_display_path<'a>(&'a self,attachment:&'a Attachment)->&'a Path {
+        self.recovery.attachment_labels.get(&attachment.path).map_or(attachment.path.as_path(),PathBuf::as_path)
+    }
     pub(super) fn load_recovery_prompt(&mut self, prompt: Prompt, notice: &str) {
         if !self.recovery_composer_empty() {
-            self.recovery.prepared_prompt=Some(prompt);
+            self.recovery.prepared_prompt=Some(Arc::new(prompt));
             self.recovery.notice=Some("The branch is ready. Send or clear your current draft before loading its prompt.".into());
             return;
         }
         self.replace_draft(text_editor::Content::with_text(&prompt.text));
+        self.recovery.attachment_labels=prompt.attachment_labels;
         self.replace_attachments(prompt.attachments);
         self.recovery.notice=Some(notice.into());
     }
@@ -393,25 +426,11 @@ impl Cagents {
     }
 
     pub(super) fn retry_chat_turn(&mut self, target: Target, user_id: &str) -> Task<Message> {
-        let Some(runtime)=self.chat_runtime_mut(target) else { return Task::none(); };
-        if !runtime.recovery_available() || !runtime.recovery.begin_retry(&runtime.snapshot,user_id) {
-            return Task::none();
-        }
-        self.dispatch_chat_recovery(target)
+        self.begin_original_retry(target,user_id)
     }
 
     pub(super) fn edit_chat_prompt(&mut self, target: Target, id: &str) -> Task<Message> {
-        let Some(runtime)=self.chat_runtime_mut(target) else { return Task::none(); };
-        let Some((prompt,branch))=runtime.edit_prompt(id) else { return Task::none(); };
-        if let Some(branch)=branch {
-            runtime.recovery.branch_draft=Some(prompt);
-            runtime.recovery.branch_session=runtime.snapshot.session_id.clone();
-            runtime.fork_requested=runtime.session.launch.provider == Provider::Codex;
-            return self.chat_send(target,Command::Branch {id:Some(branch)},false);
-        }
-        runtime.load_recovery_prompt(prompt,"Editing this prompt sends a new turn in this Claude conversation.");
-        iced::widget::operation::focus(card_control_id(target.card,"chat-composer"))
-            .map(cosmic::Action::App)
+        self.begin_original_edit(target,id)
     }
 }
 

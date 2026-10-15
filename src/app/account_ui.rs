@@ -4056,6 +4056,10 @@ impl Cagents {
         if !self.account_ui.removing.insert(id.clone()) {
             return Task::none();
         }
+        // This legacy managed-home action physically deletes files; linked
+        // removal only forgets the filing. The unified lifecycle integration
+        // repeats this guard at Removed.delete_requested for late results.
+        if !linked {self.invalidate_originals_for_account(&id);}
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let remove_id = id.clone();
