@@ -713,7 +713,8 @@ impl Cagents {
                         self.device_ui.output.clear();
                         self.device_ui.worktree_output.clear();
                         self.device_ui.panel = Panel::Files;
-                        let edit = crate::workspace_model::ModelEdit::ReopenProject {
+                        let edit = crate::workspace_model::ModelEdit::VisitProject {
+                            reopen: true,
                             checkout,
                             primary_checkout,
                             repository: key,

@@ -13444,10 +13444,23 @@ impl Application for Cagents {
                 );
                 let mut task = Task::none();
                 match result {
-                    Ok(loaded) => {
+                    Ok(mut loaded) => {
                         if self.project_ui.closed.contains(&loaded.project.repository) {
                             self.repository_generations.remove(&project_id);
                             return Task::none();
+                        }
+                        // Filesystem discovery names a new project, but a
+                        // completed read cannot rename an existing one. Use
+                        // the latest shared name after the read, including a
+                        // rename observed while it was running.
+                        let known_name = self.workspace_model
+                            .project(&loaded.project.repository)
+                            .map(|project| project.name.clone())
+                            .or_else(|| self.sidebar_model.projects.iter()
+                                .find(|project| project.repository == loaded.project.repository)
+                                .map(|project| project.name.clone()));
+                        if let Some(name) = &known_name {
+                            loaded.project.name.clone_from(name);
                         }
                         let pr_request = if let GitHubAvailability::Ready {
                             repository_key,
@@ -13498,6 +13511,9 @@ impl Application for Cagents {
                                         }))
                             })
                         {
+                            if known_name.is_some() {
+                                existing.name.clone_from(&loaded.project.name);
+                            }
                             // A load of that project which began after this
                             // one lists the repository more recently, whether
                             // it has landed yet or not, and it is also how a
