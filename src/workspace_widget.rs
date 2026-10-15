@@ -82,6 +82,8 @@ pub enum GlobalShortcut {
     SettingsAccounts,
     SettingsNotifications,
     SettingsAbout,
+    EndConversation,
+
     EditorUndo,
     EditorRedo,
     EditorCut,
@@ -175,6 +177,8 @@ impl GlobalShortcut {
             Self::SettingsAccounts => "settings_accounts",
             Self::SettingsNotifications => "settings_notifications",
             Self::SettingsAbout => "settings_about",
+            Self::EndConversation => "end_conversation",
+
             Self::EditorUndo => "editor_undo",
             Self::EditorRedo => "editor_redo",
             Self::EditorCut => "editor_cut",
@@ -319,6 +323,7 @@ pub struct CommandContext {
     pub pane_revealable: bool,
     pub pane_cloneable: bool,
     pub can_fork: bool,
+    pub can_end_conversation: bool,
     pub chat_account: bool,
     pub chat_model: bool,
     pub chat_permissions: bool,
@@ -400,6 +405,7 @@ impl ShortcutDescriptor {
         let pane = context.pane_index.is_some();
         match self.action {
             GlobalShortcut::NewWorktree => context.active_git_project,
+            GlobalShortcut::EndConversation => context.can_end_conversation,
             GlobalShortcut::MarkAllRead => context.has_unread,
             GlobalShortcut::NextAttention | GlobalShortcut::PreviousAttention => context.has_attention,
             GlobalShortcut::CycleWorkspace(_) => context.can_cycle_workspace,
@@ -905,6 +911,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
+        action: GlobalShortcut::EndConversation,
+        label: "Close conversation…",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+
+    ShortcutDescriptor {
         action: GlobalShortcut::EditorUndo,
         label: "Undo",
         repeatable: true,
@@ -1013,6 +1026,8 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::SettingsAccounts => &shortcuts.settings_accounts,
         GlobalShortcut::SettingsNotifications => &shortcuts.settings_notifications,
         GlobalShortcut::SettingsAbout => &shortcuts.settings_about,
+        GlobalShortcut::EndConversation => &shortcuts.end_conversation,
+
         GlobalShortcut::EditorUndo => &shortcuts.editor_undo,
         GlobalShortcut::EditorRedo => &shortcuts.editor_redo,
         GlobalShortcut::EditorCut => &shortcuts.editor_cut,

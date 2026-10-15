@@ -2864,6 +2864,8 @@ pub enum SettingsField {
     ShortcutSettingsAccounts,
     ShortcutSettingsNotifications,
     ShortcutSettingsAbout,
+    ShortcutEndConversation,
+
     ShortcutEditorUndo,
     ShortcutEditorRedo,
     ShortcutEditorCut,
@@ -2879,7 +2881,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 83] = [
+    const SHORTCUTS: [Self; 84] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2954,6 +2956,8 @@ impl SettingsField {
         Self::ShortcutSettingsAccounts,
         Self::ShortcutSettingsNotifications,
         Self::ShortcutSettingsAbout,
+        Self::ShortcutEndConversation,
+
         Self::ShortcutEditorUndo,
         Self::ShortcutEditorRedo,
         Self::ShortcutEditorCut,
@@ -3042,6 +3046,8 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => "Open settings: Accounts",
             Self::ShortcutSettingsNotifications => "Open settings: Notifications",
             Self::ShortcutSettingsAbout => "Open settings: About",
+            Self::ShortcutEndConversation => "Close conversation…",
+
             Self::ShortcutEditorUndo => "Undo in editor",
             Self::ShortcutEditorRedo => "Redo in editor",
             Self::ShortcutEditorCut => "Cut in editor",
@@ -3189,6 +3195,7 @@ impl SettingsField {
             | Self::ShortcutSettingsAccounts
             | Self::ShortcutSettingsNotifications
             | Self::ShortcutSettingsAbout
+            | Self::ShortcutEndConversation
             | Self::ShortcutEditorUndo
             | Self::ShortcutEditorRedo
             | Self::ShortcutEditorCut
@@ -3294,6 +3301,8 @@ struct ShortcutDraft {
     settings_accounts: String,
     settings_notifications: String,
     settings_about: String,
+    end_conversation: String,
+
     editor_undo: String,
     editor_redo: String,
     editor_cut: String,
@@ -3388,6 +3397,8 @@ impl ShortcutDraft {
             settings_accounts: settings::format_chords(&shortcuts.settings_accounts),
             settings_notifications: settings::format_chords(&shortcuts.settings_notifications),
             settings_about: settings::format_chords(&shortcuts.settings_about),
+            end_conversation: settings::format_chords(&shortcuts.end_conversation),
+
             editor_undo: settings::format_chords(&shortcuts.editor_undo),
             editor_redo: settings::format_chords(&shortcuts.editor_redo),
             editor_cut: settings::format_chords(&shortcuts.editor_cut),
@@ -3694,6 +3705,8 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.settings_notifications = value
             }
             SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
+            SettingsField::ShortcutEndConversation => self.keyboard_shortcuts.end_conversation = value,
+
             SettingsField::ShortcutEditorUndo => self.keyboard_shortcuts.editor_undo = value,
             SettingsField::ShortcutEditorRedo => self.keyboard_shortcuts.editor_redo = value,
             SettingsField::ShortcutEditorCut => self.keyboard_shortcuts.editor_cut = value,
@@ -3936,6 +3949,11 @@ fn settings_update(
             next.keyboard_shortcuts.settings_about = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutEndConversation => {
+            next.keyboard_shortcuts.end_conversation = settings::parse_chords(value);
+            Ok(())
+        }
+
         SettingsField::ShortcutEditorUndo => {
             next.keyboard_shortcuts.editor_undo = settings::parse_chords(value);
             Ok(())

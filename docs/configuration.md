@@ -205,6 +205,8 @@ The `settings_general`, `settings_appearance`, `settings_terminal`,
 `settings_links`, `settings_keyboard`, `settings_native_chat`, `settings_editor`,
 `settings_accounts`, `settings_notifications`, and `settings_about` commands
 open the corresponding Settings section. These commands also start unbound.
+`end_conversation` ends a native conversation through its existing confirmation
+flow and starts unbound. Closing a pane tab can instead hide its conversation.
 
 Native code-buffer actions are separately configurable as
 `keyboard_shortcuts.editor_undo` (`Ctrl+Z`), `editor_redo` (`Ctrl+Shift+Z`,

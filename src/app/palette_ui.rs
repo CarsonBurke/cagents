@@ -1016,6 +1016,7 @@ impl Cagents {
                     && !self.project_ui.deleting_card(state)
             }),
             can_fork: card.and_then(|id| self.chat_fork_target(id)).is_some(),
+            can_end_conversation: state.is_some_and(|state| state.existence.is_open() && matches!(state.kind, CardKind::Chat(_))),
             chat_account: card.is_some_and(|id| self.chat_control_available(id, Command::ChatAccount)),
             chat_model: card.is_some_and(|id| self.chat_control_available(id, Command::ChatModel)),
             chat_permissions: card.is_some_and(|id| self.chat_control_available(id, Command::ChatPermissions)),
@@ -1060,6 +1061,7 @@ impl Cagents {
             Command::RenamePane => Message::ChromeUi(chrome_ui::Action::Rename(id)),
             Command::ClonePane => Message::ChromeUi(chrome_ui::Action::Clone(id)),
             Command::CloseFocusedCard => Message::CloseCard(id),
+            Command::EndConversation => Message::ChatClose(chat_ui::closing::Action::End(id)),
             Command::CloseOtherPanes => Message::ChromeUi(chrome_ui::Action::CloseOthers(id)),
             Command::ClosePanesToRight => Message::ChromeUi(chrome_ui::Action::CloseToRight(id)),
             Command::CopyPath => Message::ChromeUi(chrome_ui::Action::CopyPath(id)),
@@ -1221,7 +1223,8 @@ impl Cagents {
             | Command::EditorCut
             | Command::EditorCopy
             | Command::EditorPaste
-            | Command::EditorSelectAll => self.run_registered_command(command),
+            | Command::EditorSelectAll
+            | Command::EndConversation => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -1426,6 +1429,8 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => Some(Command::SettingsAccounts),
             Self::ShortcutSettingsNotifications => Some(Command::SettingsNotifications),
             Self::ShortcutSettingsAbout => Some(Command::SettingsAbout),
+            Self::ShortcutEndConversation => Some(Command::EndConversation),
+
             Self::ShortcutEditorUndo => Some(Command::EditorUndo),
             Self::ShortcutEditorRedo => Some(Command::EditorRedo),
             Self::ShortcutEditorCut => Some(Command::EditorCut),
@@ -1545,6 +1550,8 @@ impl ShortcutDraft {
                 self.settings_notifications.as_str(),
             ),
             (Command::SettingsAbout, self.settings_about.as_str()),
+            (Command::EndConversation, self.end_conversation.as_str()),
+
             (Command::EditorUndo, self.editor_undo.as_str()),
             (Command::EditorRedo, self.editor_redo.as_str()),
             (Command::EditorCut, self.editor_cut.as_str()),
@@ -1929,6 +1936,22 @@ mod tests {
         assert!(
             matches!(entries[0].2, Message::Sidebar(SidebarAction::OpenWorktree { worktree_id: id, .. }) if id == worktree_id)
         );
+    }
+
+    #[test]
+    fn palette_end_conversation_keeps_recovery_available_without_a_ready_runtime() {
+        let mut app = settings_focus_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        drop(app.new_native_chat(crate::chat::Provider::Codex, Some(directory.path().into())));
+        let card = app.workspace.focused().unwrap();
+        for runtime in [CardRuntime::Loading, CardRuntime::Failed("fixture startup failure".into())] {
+            app.cards.insert(card, runtime);
+            assert!(app.pane_command_available(card, Command::EndConversation));
+            assert!(matches!(app.pane_command_message(card, Command::EndConversation), Some(Message::ChatClose(chat_ui::closing::Action::End(id))) if id == card));
+            assert!(!app.pane_command_available(card, Command::ForkConversation));
+        }
+        app.card_state_mut(card).unwrap().kind = CardKind::Settings;
+        assert!(!app.pane_command_available(card, Command::EndConversation));
     }
 
     #[test]
