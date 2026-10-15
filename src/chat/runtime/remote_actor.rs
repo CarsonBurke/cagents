@@ -2468,6 +2468,9 @@ extern "C" fn serve_if_requested() {
     }
     let control = unsafe { UnixStream::from_raw_fd(fd) };
     let result = (|| {
+        // Startup control and the pinned directory intentionally survived the
+        // helper exec. They belong to this helper, never its provider children.
+        crate::daemon::seal_inherited_descriptors().map_err(|error|error.to_string())?;
         let startup: Startup = receive(&control, Duration::from_secs(30))?;
         authorize(
             &control,
@@ -2862,6 +2865,51 @@ done"#;
         );
         release.send(()).unwrap();
         finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn helper_restores_descriptor_seal_before_any_provider_exec() {
+        const CHILD:&str="CAGENTS_ACTOR_DESCRIPTOR_SEAL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated=tempfile::tempdir_in("/var/tmp").unwrap();
+            let test=thread::current().name().unwrap().to_owned();
+            let output=ChildCommand::new(std::env::current_exe().unwrap()).args(["--exact",&test,"--nocapture"])
+                .env(CHILD,"1").env("XDG_RUNTIME_DIR",isolated.path()).env("XDG_DATA_HOME",isolated.path().join("data"))
+                .env("XDG_CONFIG_HOME",isolated.path().join("config")).env("XDG_CACHE_HOME",isolated.path().join("cache"))
+                .env("HOME",isolated.path().join("home")).env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
+            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut source=chat::native_holder::fixture_source();
+        source.launch.provider=crate::agent::Provider::Claude;source.launch.session_id=None;
+        source.launch.recipe=crate::model::LaunchRecipe {program:"/bin/sleep".into(),arguments:vec!["600".into()],working_directory:root.path().into(),
+            environment:BTreeMap::from([("HOME".into(),root.path().to_string_lossy().into_owned()),("CLAUDE_CONFIG_DIR".into(),root.path().join("claude").to_string_lossy().into_owned())]),unset_environment:Default::default()};
+        source.owned_codex_listener=None;source.terminal=None;source.native_continuity=chat::NativeContinuity::ReconnectOnly;
+        source.proof.as_mut().unwrap().boot_id=crate::daemon::read_boot_id().unwrap();
+        let paths=crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
+        let context=Arc::new(ExecutionContext::capture(root.path()).unwrap());
+        let mut spec=ProcessSpec::from(&source.launch.recipe);spec.execution=Some(context.clone());
+        // This execs the real retained-helper entry and its real provider
+        // spawning path. Omitting the entry seal leaks both inherited FDs.
+        let actor=RemoteActor::spawn(spec,source,BTreeMap::new(),|_|{}).unwrap();
+        struct Owner(RemoteActor);
+        impl Drop for Owner {fn drop(&mut self) {let _=self.0.close();let _=self.0.finish_close();}}
+        let owner=Owner(actor);let actor=&owner.0;actor.commit_installation().unwrap();
+        let provider=actor.state().provider_process.clone().unwrap();
+        assert!(provider.is_current());
+        let inherited=std::fs::read_dir(format!("/proc/{}/fd",provider.pid)).unwrap().filter_map(|entry| {
+            let path=entry.unwrap().path();match std::fs::read_link(path) {
+                Ok(target)=>Some(target),
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>None,
+                Err(error)=>panic!("Cannot inspect exact fixture provider FD: {error}"),
+            }
+        }).collect::<Vec<_>>();
+        actor.close().unwrap();actor.finish_close().unwrap();
+        assert!(!provider.is_current());
+        assert!(!inherited.iter().any(|target|target.to_string_lossy().starts_with("socket:[")),"provider exec must not inherit the private helper startup control socket");
+        assert!(!inherited.iter().any(|target|target==root.path()),"provider exec must not retain the helper's approved-directory FD");
+        assert!(context.directory_descriptor().unwrap().metadata().unwrap().is_dir(),"the caller's approved pin remains usable");
     }
 
     #[test]
