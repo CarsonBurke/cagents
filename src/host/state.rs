@@ -649,6 +649,28 @@ impl HostState {
         }
     }
 
+    pub(super) fn announce_worktrees_changed(&self, repository: &std::path::Path) {
+        for client in &self.model_watchers {
+            if let Some(delivery) = self.clients.get(client) {
+                let _ = delivery.push(Outbound::broadcast(&self.proof, ServerMessage::WorktreesChanged { repository: repository.to_path_buf() }));
+            }
+        }
+    }
+
+    pub(super) fn worktree_live_sessions(&self, path: &std::path::Path) -> Vec<TerminalId> {
+        let mut sessions = BTreeSet::new();
+        for (id, record) in &self.terminals {
+            if !record.handle.is_completed() && record.current_directory().starts_with(path) { sessions.insert(*id); }
+        }
+        for (id, record) in &self.chats {
+            if record.handle.owns_work() && record.session.launch.recipe.working_directory.starts_with(path) { sessions.insert(*id); }
+        }
+        for (id, session) in &self.chat_spawning {
+            if session.launch.recipe.working_directory.starts_with(path) { sessions.insert(*id); }
+        }
+        sessions.into_iter().collect()
+    }
+
     /// Tells every observing client except `creator` that a terminal now
     /// exists.
     ///

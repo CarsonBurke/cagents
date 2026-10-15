@@ -398,6 +398,9 @@ pub(super) fn process_request(
             | ClientRequest::DeviceOperation {
                 operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
+            | ClientRequest::DeviceOperation {
+                operation: crate::device_service::Operation::Worktree { operation: crate::worktree_control::Operation::Remove { .. } }
+            }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
@@ -405,6 +408,18 @@ pub(super) fn process_request(
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Worktree { operation } } => {
+            let repository=operation.repository().to_path_buf();
+            let mutates=operation.mutates();
+            let result=crate::worktree_control::service::execute(operation, |path| {
+                Ok(host.lock().unwrap_or_else(|p|p.into_inner()).worktree_live_sessions(path))
+            });
+            // A later setup/branch failure can follow a committed Git mutation.
+            // Refresh on either outcome so a retained worktree is never hidden.
+            if mutates { host.lock().unwrap_or_else(|p|p.into_inner()).announce_worktrees_changed(&repository); }
+            let reply=result.map_err(|message|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false))?;
+            Ok((ServerResponse::DeviceOperation { reply:crate::device_service::Reply::Worktree(reply) },Vec::new(),false))
+        }
         ClientRequest::DeviceOperation { operation } => {
             if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
                 let account =

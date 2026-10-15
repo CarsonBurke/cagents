@@ -21,14 +21,14 @@ fn entry(service: &Service, record: &WorktreeRecord, primary: bool, cancellation
     })
 }
 
-pub(crate) fn execute(operation: Operation) -> Result<Reply,String> {
+pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Result<Vec<crate::model::TerminalId>,String>) -> Result<Reply,String> {
     let cancellation = CancellationToken::new();
     let service = RepositoryService::system("git");
     match operation {
         Operation::List { repository } => {
             let records = service.list_worktrees(&repository,&cancellation).map_err(|error|error.to_string())?;
             let worktrees = records.iter().enumerate().filter(|(_,record)|!record.bare)
-                .map(|(index,record)|entry(&service,record,index==0,&cancellation)).collect::<Result<Vec<_>,_>>()?;
+                .map(|(index,record)| { let mut entry=entry(&service,record,index==0,&cancellation)?; entry.live_sessions=live_sessions(&record.path)?; Ok(entry) }).collect::<Result<Vec<_>,String>>()?;
             Ok(Reply::Listed { worktrees })
         }
         Operation::Create { repository,branch,base,linear,no_setup } => {
@@ -61,6 +61,8 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply,String> {
                 .ok_or("No matching worktree; use an exact branch or worktree path")?;
             if index==0||record.bare { return Err("The primary worktree cannot be removed".into()); }
             if record.lock.locked { return Err("The worktree is locked; unlock it before removing it".into()); }
+            let sessions=live_sessions(&record.path)?;
+            if !sessions.is_empty() { return Err(format!("{} live session(s) use this worktree; close them before removing it",sessions.len())); }
             let safety=service.worktree_safety(&record.path,&cancellation).map_err(|error|error.to_string())?;
             if safety.requires_confirmation()&&!force {
                 return Err(format!("Worktree contains {} modified, {} untracked, {} notable ignored file(s), {} unpushed and {} detached-only commit(s); pass --force to confirm discarding this work",safety.modified,safety.untracked,safety.notable_ignored.len(),safety.unpushed_commits,safety.detached_only_commits));

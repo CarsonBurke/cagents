@@ -1,5 +1,5 @@
 use super::*;
-use crate::{agent::Provider,worktree_control::{self,Operation,Reply}};
+use crate::{agent::Provider,worktree_control::{Operation,Reply}};
 
 #[derive(Debug, Subcommand)]
 pub enum WorktreeCommand {

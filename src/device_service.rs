@@ -6,7 +6,6 @@ use std::path::PathBuf;
 pub const MAX_TEXT_BYTES: u64 = 512 * 1024;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
-    Worktree { operation: crate::worktree_control::Operation },
     Home,
     /// Optional cleanup is authorized only by the daemon lifecycle fence.
     RemoveMergedWorktree {
@@ -61,6 +60,7 @@ pub enum Operation {
         root: PathBuf,
         operation: GitOperation,
     },
+    Worktree { operation: crate::worktree_control::Operation },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -81,7 +81,6 @@ pub struct Entry {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
-    Worktree(crate::worktree_control::Reply),
     Home {
         path: PathBuf,
         shell: String,
@@ -114,6 +113,7 @@ pub enum Reply {
     SavedUnconfirmed {
         error: String,
     },
+    Worktree(crate::worktree_control::Reply),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -171,7 +171,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
-        Operation::Worktree { operation } => crate::worktree_control::service::execute(operation).map(Reply::Worktree),
+        Operation::Worktree { .. } => Err("Worktree control requires the daemon lifecycle fence".into()),
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }

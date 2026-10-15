@@ -447,6 +447,11 @@ pub enum ControlError {
 }
 
 /// A bounded, synchronous client for the current cagents daemon protocol.
+pub enum WorkspaceModelEvent {
+    Edited { sequence: u64, edit: ModelEdit },
+    WorktreesChanged { repository: PathBuf },
+}
+
 pub struct ControlClient {
     stream: UnixStream,
     proof: HostSessionProof,
@@ -460,6 +465,7 @@ pub struct ControlClient {
     /// Shared-model edges that arrived while a correlated response was pending,
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<(u64, ModelEdit)>,
+    observed_worktrees: VecDeque<PathBuf>,
     observed_notifications: VecDeque<crate::notifications::Update>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
@@ -576,6 +582,7 @@ impl ControlClient {
             next_request_id: client.next_request_id,
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
+            observed_worktrees: VecDeque::new(),
             observed_notifications: VecDeque::new(),
             attached_chats: BTreeSet::new(),
         })
@@ -795,8 +802,19 @@ impl ControlClient {
     /// polling: a timeout expiring mid-frame would desynchronize the stream, and
     /// a subscribed connection issues no further requests.
     pub fn next_workspace_model_edit(&mut self) -> Result<(u64, ModelEdit), ControlError> {
+        loop {
+            if let WorkspaceModelEvent::Edited { sequence, edit } = self.next_workspace_model_update()? {
+                return Ok((sequence, edit));
+            }
+        }
+    }
+
+    pub fn next_workspace_model_update(&mut self) -> Result<WorkspaceModelEvent, ControlError> {
+        if let Some(repository) = self.observed_worktrees.pop_front() {
+            return Ok(WorkspaceModelEvent::WorktreesChanged { repository });
+        }
         if let Some(edge) = self.observed_model.pop_front() {
-            return Ok(edge);
+            return Ok(WorkspaceModelEvent::Edited { sequence: edge.0, edit: edge.1 });
         }
         self.stream
             .set_read_timeout(None)
@@ -806,8 +824,9 @@ impl ControlClient {
             self.validate_pinned_envelope(&envelope)?;
             match envelope.message {
                 ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                    return Ok((sequence, edit));
+                    return Ok(WorkspaceModelEvent::Edited { sequence, edit });
                 }
+                ServerMessage::WorktreesChanged { repository } => return Ok(WorkspaceModelEvent::WorktreesChanged { repository }),
                 // The daemon is about to close this connection. Reporting it as
                 // a closed connection is what makes a watcher reconnect and
                 // resynchronize against the successor's registry.
@@ -1554,6 +1573,11 @@ impl ControlClient {
             ServerMessage::WorkspaceModelEdited { sequence, edit } => {
                 self.observed_model.push_back((sequence, edit));
             }
+            ServerMessage::WorktreesChanged { repository } => {
+                if !self.observed_worktrees.contains(&repository) {
+                    self.observed_worktrees.push_back(repository);
+                }
+            }
             ServerMessage::NotificationsChanged => {
                 if !self
                     .observed_notifications
@@ -1768,6 +1792,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatObserved { .. }
         | ServerMessage::ChatActivity { .. }
         | ServerMessage::TerminalCreated { .. }
+        | ServerMessage::WorktreesChanged { .. }
         | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::NotificationsChanged
@@ -1791,6 +1816,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::TerminalObserved { .. } => "terminal_observed",
         ServerMessage::TerminalCreated { .. } => "terminal_created",
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
+        ServerMessage::WorktreesChanged { .. } => "worktrees_changed",
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",

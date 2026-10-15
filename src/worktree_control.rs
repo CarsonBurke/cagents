@@ -66,7 +66,7 @@ pub fn delete_branch(
         .map_err(|error| error.to_string())?;
     let records = RepositoryService::system("git").list_worktrees(repository, cancellation)
         .map_err(|error| error.to_string())?;
-    if let Some(record) = records.iter().find(|record| record.branch.as_deref() == Some(&branch.full_ref())) {
+    if let Some(record) = records.iter().find(|record| record.branch.as_deref() == Some(branch.full_ref().as_str())) {
         return Err(format!("Branch {} is checked out at {}", branch.as_str(), record.path.display()));
     }
     let command = CommandSpec::new("git").cwd(repository)
