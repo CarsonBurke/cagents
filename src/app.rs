@@ -2609,7 +2609,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusAttention(_)
         | Message::MovePaneToChannel { .. }
         | Message::PaneDropToChannel { .. }
-        | Message::TerminalReviewMode { .. }
+        | Message::TerminalReviewMode { active: true, .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
         | Message::ResizeCardFinished(_)
@@ -2774,7 +2774,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::FocusCard(_)
             | Message::Palette(palette_ui::Action::FocusPane(_))
             | Message::FocusAttention(_)
-            | Message::TerminalReviewMode { .. }
+            | Message::TerminalReviewMode { active: true, .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
                 event: WorkspaceViewportEvent::PointerFocused(_)
@@ -19590,6 +19590,7 @@ impl Application for Cagents {
                     if self.terminal_review_card == Some(card) {
                         self.set_terminal_review_owner(None);
                     }
+                    self.terminal_review_input.flush_orphans(self.terminal_review_card.is_some());
                     Task::none()
                 }
             }
@@ -21199,6 +21200,11 @@ impl Application for Cagents {
             Message::RefreshUi(action) => {
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
+                    // Also covers an evicted Review widget and a first local
+                    // entry whose callback has not yet established an owner.
+                    self.set_terminal_review_owner(None);
+                    self.terminal_review_input.end_window_review();
+                    self.terminal_review_input.flush_orphans(false);
                     self.tab_history.finish(self.workspace.focused());
                     // Losing the window is not a choice of workspace, and the
                     // release that would have made one never arrives.
@@ -28394,6 +28400,69 @@ mod tests {
         assert_eq!(app.terminal_review_revision, revision);
         drop(app.update(Message::TerminalReviewMode { card, terminal: current_attachment, active: false }));
         assert_eq!(app.terminal_review_card, None);
+    }
+
+    #[test]
+    fn terminal_review_focus_exit_is_lifecycle_admitted_and_pairs_held_input() {
+        for prepared in [false, true] {
+            let (mut app, card, _directory) = live_agent_app("review-focus-exit");
+            let (surface, peer) = crate::terminal::TerminalHeldKeyTestPeer::connect();
+            app.cards.insert(card, CardRuntime::Terminal(surface.clone()));
+            let mut mounted = crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
+            peer.next(crate::terminal::KeyAction::Press);
+            peer.ack(true);
+            mounted.wait_for_press_admission();
+            app.set_terminal_review_owner(Some(card));
+            mounted.enter_review();
+            let callbacks = mounted.exit_review_through_native_focus_publication();
+            app.update_prepared = prepared;
+            app.settings_reset_confirm = !prepared;
+            for active in callbacks {
+                let message = Message::TerminalReviewMode { card, terminal: surface.attachment_id(), active };
+                assert!(!user_workspace_message_blocked_while_modal(&message));
+                assert!(!user_message_blocked_during_update(&message));
+                assert!(!workspace_navigation_blocked_during_save(&message));
+                drop(app.update(message));
+            }
+            assert_eq!(app.terminal_review_card, None);
+            mounted.acknowledge_review_exit(app.terminal_review_revision);
+            peer.next(crate::terminal::KeyAction::Release);
+            mounted.wait_key_pairs((0, 1));
+            peer.ack(true);
+            mounted.wait_key_pairs((0, 0));
+            let on = Message::TerminalReviewMode { card, terminal: surface.attachment_id(), active: true };
+            assert!(user_workspace_message_blocked_while_modal(&on));
+            drop(app.update(on));
+            assert_eq!(app.terminal_review_card, None, "blocked workspace cannot re-enter Review");
+        }
+    }
+
+    #[test]
+    fn terminal_review_main_window_blur_releases_evicted_owner_but_foreign_blur_does_not() {
+        let (mut app, card, _directory) = live_agent_app("review-evicted-blur");
+        let (surface, peer) = crate::terminal::TerminalHeldKeyTestPeer::connect();
+        app.cards.insert(card, CardRuntime::Terminal(surface.clone()));
+        let mut mounted = crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
+        peer.next(crate::terminal::KeyAction::Press);
+        peer.ack(true);
+        mounted.wait_for_press_admission();
+        app.set_terminal_review_owner(Some(card));
+        mounted.enter_review();
+        drop(mounted); // No widget remains to publish its local blur exit.
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::unique(), false))));
+        assert_eq!(app.terminal_review_card, Some(card));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, false))));
+        assert_eq!(app.terminal_review_card, None);
+        peer.next(crate::terminal::KeyAction::Release);
+        peer.ack(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.terminal_review_input.pending_counts() != (0, 0) {
+            assert!(std::time::Instant::now() < deadline, "original worker release was not accepted");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(app.terminal_review_input.take_failures().is_empty());
     }
 
     fn busy_chat_snapshot() -> crate::chat::Snapshot {
