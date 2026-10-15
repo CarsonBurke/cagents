@@ -13082,7 +13082,7 @@ mod tests {
         original.source_surface = SourceSurface::Diff;
         load_fresh_diff(&mut original, card, two_change_model());
         original.set_external_editors(vec![crate::sidebar::SidebarEditor { id: "chosen".into(), name: "Chosen".into(), icon: "editor".into() }]);
-        for label in ["Stage file changes", "Open in Chosen"] {
+        for label in ["Stage", "Open in Chosen"] {
             let emitted = click_native_repository_control(selected_file_toolbar(card, &original).unwrap(), label);
             let RepositoryAction::CapturedCommand { target, action } = emitted else { panic!("native file action retains displayed source"); };
             assert!(original.resolve_captured_command(&target, *action.clone()).is_some());
