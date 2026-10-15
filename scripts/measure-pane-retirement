@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Private native 500-terminal lifecycle fixture for #1088; not a benchmark result.
+
+prepare a new disk-backed directory, start an owned compositor in the printed
+runtime, then run the development runner here. In another terminal call batch
+20 times with count25 and that runner's matched CLI. Every batch waits for actual
+UI persistence adoption before CLI process-close, then sends Ctrl+W through the
+explicit PRIVATE Wayland socket until those exact card IDs commit closed.
+
+Terminal CLI close ends a hosted process; the native pane close is additionally
+required to exercise durable card retirement. Never count process inventory as
+proof of UI adoption or pane retirement. Record source/build/settings, native
+screenshots and input receipts. Restart the private UI and compare first-frame
+startup plus writer/no-op flush measurements against a fresh profile built with
+the same executable, viewport and renderer. This helper's census is ownership
+proof only; it does not measure startup or flush latency.
+
+run owns both campaign locks. Do not nest it under build-queue or another flock.
+The batch action must run while that private runner owns those locks.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import subprocess
+import time
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+MARKER = '.pane-retirement-fixture-v1'
+
+
+def write_json(path, value):
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    temporary.replace(path)
+
+
+def environment(root):
+    if not (root / MARKER).is_file():
+        raise SystemExit('prepare this private fixture first')
+    env = dict(os.environ)
+    original_home = Path.home()
+    runtime = Path('/var/tmp') / ('pane-retirement-' + str(os.getuid()) + '-' + hashlib.sha256(os.fsencode(root)).hexdigest()[:12])
+    runtime.mkdir(mode=0o700, exist_ok=True)
+    if runtime.is_symlink() or runtime.stat().st_uid != os.getuid():
+        raise SystemExit('private runtime has unsafe ownership')
+    runtime.chmod(0o700)
+    for key in ('CAGENTS_AGENT_AUTHORITY', 'CAGENTS_ACCOUNT_HOMES', 'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'DISPLAY', 'WAYLAND_DISPLAY'):
+        env.pop(key, None)
+    env.setdefault('CARGO_HOME', str(original_home / '.cargo'))
+    env.setdefault('RUSTUP_HOME', str(original_home / '.rustup'))
+    env.update(HOME=str(root / 'home'), XDG_RUNTIME_DIR=str(runtime),
+               XDG_DATA_HOME=str(root / 'data'), XDG_CONFIG_HOME=str(root / 'config'),
+               XDG_CACHE_HOME=str(root / 'cache'), XDG_STATE_HOME=str(root / 'state'),
+               CODEX_HOME=str(root / 'home/.codex'), CLAUDE_CONFIG_DIR=str(root / 'home/.claude'))
+    return env
+
+
+def private_display(env, value):
+    if value is None:
+        raise SystemExit('supply --wayland-socket bound by the fixture-owned compositor')
+    socket = value.resolve(strict=True)
+    if not socket.is_relative_to(Path(env['XDG_RUNTIME_DIR'])) or not stat.S_ISSOCK(socket.stat().st_mode):
+        raise SystemExit('refusing a display outside the private runtime')
+    env['WAYLAND_DISPLAY'] = str(socket)
+
+
+def database(root, supplied):
+    paths = [supplied.resolve(strict=True)] if supplied else list((root / 'data').rglob('sessions.sqlite3'))
+    if len(paths) != 1 or not paths[0].resolve().is_relative_to(root / 'data'):
+        raise SystemExit('need one explicit --database inside this private data directory')
+    return paths[0].resolve()
+
+
+def cards(path):
+    with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=5) as db:
+        rows = db.execute('SELECT c.card_id,c.existence_json,t.terminal_id FROM cards c LEFT JOIN terminal_recipes t ON t.card_id=c.card_id').fetchall()
+        return {card: {'terminal': terminal, 'closed': isinstance((value := json.loads(existence)), dict) and 'closed' in value} for card, existence, terminal in rows}
+
+
+def wait_for(description, predicate, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(.1)
+    raise SystemExit('timed out waiting for ' + description)
+
+
+def call(cli, env, root, arguments):
+    cli = cli.resolve(strict=True)
+    if not all((cli.parent / name).is_file() for name in ('cagents-ui', 'cagentsd')):
+        raise SystemExit('supply the matched development executable directory')
+    result = subprocess.run([str(cli), '--json', *arguments], env=env, capture_output=True, text=True, timeout=90)
+    with (root / 'cli.jsonl').open('a') as log:
+        log.write(json.dumps({'arguments': arguments, 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}) + '\n')
+    result.check_returncode()
+    value = json.loads(result.stdout)
+    return value.get('data', value)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('action', choices=('prepare', 'environment', 'run', 'batch', 'census'))
+    parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--cli', type=Path)
+    parser.add_argument('--database', type=Path)
+    parser.add_argument('--wayland-socket', type=Path)
+    parser.add_argument('--count', type=int, default=25)
+    parser.add_argument('--batch', type=int, default=1)
+    parser.add_argument('--fresh-daemon', action='store_true')
+    parser.add_argument('--build-lock', type=Path, default=Path.home() / '.cache/cagents-issue-build.lock')
+    args = parser.parse_args()
+    root = args.root.resolve()
+    if root in (Path('/'), Path.home(), REPOSITORY) or root.is_relative_to('/run') or root.is_relative_to('/dev/shm'):
+        parser.error('choose a new dedicated disk-backed fixture directory')
+    if args.action == 'prepare':
+        root.mkdir(parents=True, exist_ok=False, mode=0o700)
+        (root / MARKER).touch(mode=0o600)
+        for name in ('home', 'data', 'config', 'cache', 'state', 'project'):
+            (root / name).mkdir(mode=0o700)
+        settings = root / 'config/cagents-development/settings.toml'
+        settings.parent.mkdir()
+        settings.write_text('schema_version = 3\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 260.0\ninspector_width = 380.0\ncheck_for_updates = false\nfocus_follows_mouse = false\nconfirm_terminal_close = false\ndefault_column_fraction = 1.0\ndefault_native_pane_fraction = 1.0\nui_scale = 1.0\n')
+        settings.chmod(0o600)
+        subprocess.run(['git', 'init', '--quiet', str(root / 'project')], env=environment(root), check=True)
+        write_json(root / 'terminals.json', [])
+        print(json.dumps({'root': str(root), 'runtime': environment(root)['XDG_RUNTIME_DIR']}))
+        return
+    env = environment(root)
+    if args.action == 'environment':
+        print(json.dumps({key: env[key] for key in ('HOME', 'XDG_RUNTIME_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME')}, indent=2))
+        return
+    if args.action == 'run':
+        private_display(env, args.wayland_socket)
+        env['CARGO_BUILD_JOBS'] = '2'
+        if not env.get('CARGO_TARGET_DIR'):
+            raise SystemExit('set CARGO_TARGET_DIR to the coordinated warmed build cache before run')
+        args.build_lock.parent.mkdir(parents=True, exist_ok=True)
+        native_lock = args.build_lock.parent / 'cagents-native-ui.lock'
+        with native_lock.open('a') as native, args.build_lock.open('a') as build:
+            fcntl.flock(native, fcntl.LOCK_EX)
+            fcntl.flock(build, fcntl.LOCK_EX)
+            command = [str(REPOSITORY / 'scripts/run-development'), '--browserless', '--debug', '--log-file', str(root / 'ui.log')]
+            if args.fresh_daemon:
+                command.append('--fresh-daemon')
+            raise SystemExit(subprocess.call(command, cwd=REPOSITORY, env=env))
+    path = database(root, args.database)
+    ledger_path = root / 'terminals.json'
+    ledger = json.loads(ledger_path.read_text())
+    if args.action == 'batch':
+        if not args.cli or not args.cli.is_absolute() or not 1 <= args.count <= 25 or args.batch < 1:
+            parser.error('batch needs absolute matched --cli, positive --batch and count1..25')
+        if any(entry['batch'] == args.batch for entry in ledger):
+            raise SystemExit('batch already exists; never silently repeat terminal creation')
+        private_display(env, args.wayland_socket)
+        call(args.cli, env, root, ['project', 'open', str(root / 'project')])
+        new = []
+        for index in range(args.count):
+            value = call(args.cli, env, root, ['terminal', 'spawn', '--cwd', str(root / 'project'), '--', '/bin/sh', '-c', 'exec sleep 3600'])
+            entry = {'batch': args.batch, 'terminal_id': value['terminal']['session']['id']}
+            ledger.append(entry)
+            new.append(entry)
+            write_json(ledger_path, ledger)
+        terminal_ids = {entry['terminal_id'] for entry in new}
+        def adopted():
+            found = {row['terminal']: card for card, row in cards(path).items() if row['terminal'] in terminal_ids and not row['closed']}
+            return found if found.keys() == terminal_ids else None
+        adopted_cards = wait_for('all minted terminals to become durable UI cards', adopted)
+        for entry in new:
+            entry['card_id'] = adopted_cards[entry['terminal_id']]
+        write_json(ledger_path, ledger)
+        for entry in new:
+            call(args.cli, env, root, ['terminal', 'close', entry['terminal_id']])
+        owned = {entry['card_id'] for entry in ledger if 'card_id' in entry}
+        def remaining():
+            current = cards(path)
+            foreign = {card for card, row in current.items() if not row['closed']} - owned
+            if foreign:
+                raise SystemExit('private workspace has unrelated open cards; refusing keyboard close')
+            with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as db:
+                tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                guards = {row[0] for row in db.execute('SELECT card_id FROM closed_cards')} if 'closed_cards' in tables else set()
+            missing = set(adopted_cards.values()) - current.keys() - guards
+            if missing:
+                raise SystemExit('adopted card disappeared without durable closed authority')
+            return {card for card in adopted_cards.values() if card in current and not current[card]['closed']}
+        while before := remaining():
+            subprocess.run(['wtype', '-M', 'ctrl', '-k', 'w', '-m', 'ctrl'], env=env, check=True, timeout=10)
+            wait_for('one actual pane-close commit (focus the private terminal strip first)', lambda: len(remaining()) < len(before), timeout=30)
+        for entry in new:
+            entry['closed_committed'] = True
+        write_json(ledger_path, ledger)
+        print(json.dumps({'batch': args.batch, 'adopted_and_closed': len(new), 'total_committed': sum(bool(row.get('closed_committed')) for row in ledger)}))
+    else:
+        current = cards(path)
+        owned = {entry.get('card_id') for entry in ledger}
+        with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            guards = db.execute('SELECT count(*) FROM closed_cards').fetchone()[0] if 'closed_cards' in tables else None
+        print(json.dumps({'minted': len(ledger), 'durable_adoption_proved': sum('card_id' in row for row in ledger), 'closed_committed': sum(bool(row.get('closed_committed')) for row in ledger), 'owned_heavy_rows': sum(card in owned for card in current), 'owned_open_rows': sum(card in owned and not row['closed'] for card, row in current.items()), 'permanent_guards': guards, 'timing_evidence': 'external native startup and writer/benchmark receipts still required'}))
+
+
+if __name__ == '__main__':
+    main()
