@@ -47,7 +47,9 @@ pub fn selected_content(
     for row in &model.inline_rows {
         match row.kind {
             DiffRowKind::Context => {
-                result.push_str(old.get(row.old_line?.checked_sub(1)? as usize)?)
+                let line = if undo { new.get(row.new_line?.checked_sub(1)? as usize)? }
+                    else { old.get(row.old_line?.checked_sub(1)? as usize)? };
+                result.push_str(line);
             }
             DiffRowKind::Deletion => {
                 let line = row.old_line?;
@@ -312,6 +314,33 @@ mod tests {
             "first\nkeep\nTHIRD\n"
         );
     }
+    #[test]
+    fn undoing_selected_hunk_preserves_unselected_ignored_whitespace() {
+        let before = (0..80).map(|line| format!("    line {line}\n")).collect::<String>();
+        let after = before.replace("    ","\t").replace("line 20\n","changed 20\n").replace("line 60\n","changed 60\n");
+        let model = crate::diff_view::build_document_diff_with_options(before.as_str(),&after,std::path::Path::new("ignored.rs"),crate::settings::EditorSyntaxTheme::Auto,true,&crate::repository::CancellationToken::new()).unwrap();
+        for mode in [DiffMode::Inline,DiffMode::Split] {
+            let start = model.change_starts(mode)[0];
+            let end = match mode {
+                DiffMode::Inline => model.inline_rows.iter().skip(start).position(|row| row.kind == DiffRowKind::Context).map_or(model.inline_rows.len(),|offset| start+offset),
+                DiffMode::Split => model.split_rows.iter().skip(start).position(|row| row.kind == DiffRowKind::Context).map_or(model.split_rows.len(),|offset| start+offset),
+            };
+            let selected = selected_content(&model,&after,mode,start..end,false).unwrap();
+            assert_eq!(selected,before.replace("    line 20\n","\tchanged 20\n"));
+            let undo = selected_content(&model,&after,mode,start..end,true).unwrap();
+            let expected = after.replace("changed 20\n","line 20\n");
+            assert_eq!(undo,expected);
+            let temp = tempfile::tempdir().unwrap();
+            git(temp.path(),&["init","-q"],None);
+            fs::write(temp.path().join("ignored.rs"),&after).unwrap();
+            git(temp.path(),&["add","ignored.rs"],None);
+            let patch = unified_patch(&RepoPath::parse("ignored.rs").unwrap(),Some(&after),Some(&undo));
+            git(temp.path(),&["apply","--cached","--check","-"],Some(&patch));
+            git(temp.path(),&["apply","--cached","-"],Some(&patch));
+            assert_eq!(git(temp.path(),&["show",":ignored.rs"],None),expected.as_bytes());
+        }
+    }
+
     #[test]
     fn selected_hunk_patch_applies_to_index_without_staging_other_hunks() {
         let before = (0..50)
