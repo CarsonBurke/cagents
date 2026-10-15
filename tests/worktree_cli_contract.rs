@@ -152,6 +152,10 @@ fn project_ids_resolve_from_window_storage_without_migrating_it() {
 #[test]
 fn linear_context_is_committed_with_the_created_worktree() {
     let fixture=Fixture::new();
+    let denied=fixture.output(&["worktree","create","invalid-link","--linear","not-a-ticket","--no-setup"]);
+    assert!(!denied.status.success());
+    assert!(!fixture.root.path().join("project/managed/invalid-link").exists());
+    assert!(fixture.git(&fixture.root.path().join("project"),&["branch","--list","invalid-link"]).is_empty());
     let data=fixture.cli(&["worktree","create","linked","--linear","ENG-123","--no-setup"]);
     let path=Path::new(data["worktree"]["path"].as_str().unwrap());
     assert_eq!(cagents::linear::context::resolve_at(path).unwrap().issue_id,"ENG-123");

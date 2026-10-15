@@ -49,6 +49,7 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
             Ok(Reply::Listed { worktrees })
         }
         Operation::Create { repository,branch,base,linear,no_setup } => {
+            let linear=linear.map(|issue|crate::linear::issue_reference(&issue)).transpose().map_err(|error|error.to_string())?;
             let records=service.list_worktrees(&repository,&cancellation).map_err(|error|error.to_string())?;
             let primary=records.first().filter(|record|!record.bare).map(|record|record.path.clone()).ok_or("A non-bare primary checkout is required")?;
             let setup_plan=if no_setup {None} else {crate::worktree_setup::load(&primary).map_err(|error|error.to_string())?};
