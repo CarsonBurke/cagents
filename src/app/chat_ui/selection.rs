@@ -1392,7 +1392,7 @@ mod tests {
         body: &str,
         change: impl FnOnce(&mut Vec<markdown::Item>),
     ) -> Element<'static, Message> {
-        let cached = CachedItem::new(
+        let mut cached = CachedItem::new(
             &ItemContent::Text {
                 text: body.to_owned(),
                 thinking: false,
@@ -1400,6 +1400,11 @@ mod tests {
             },
             crate::settings::EditorSyntaxTheme::Auto,
         );
+        cached.item = Some(Arc::new(chat::Item {
+            id: "selection-fixture".into(), role: chat::Role::Assistant,
+            content: ItemContent::Text { text: body.into(), thinking: false, phase: chat::Phase::Final },
+            started_at: None, at: None,
+        }));
         let mut items = cached.markdown.items().to_vec();
         change(&mut items);
         prose::items_for_test(
@@ -1582,33 +1587,34 @@ mod tests {
         let body = (0..128)
             .map(|index| format!("| H{index} | B |\n|---|---|\n| V{index} | W |\n\n"))
             .collect::<String>();
-        let mut element = rendered_markdown(&body, |_| {});
+        let content = markdown::Content::parse(&body);
+        let mut builder = Catalog::builder();
+        builder.markdown("selection-fixture", &[0], content.items());
+        let catalog = builder.finish();
+        assert_eq!(catalog.search_blocks().len(), 512, "all128 tables retain all four logical cells");
+        let mut element = Element::new(Selection {
+            content: rendered_markdown(&body, |_| {}), catalog: Some(catalog),
+            bookmark: None, context: None, click_clock: iced::time::Instant::now,
+        });
         let mut tree = Tree::new(element.as_widget());
-        let read = read_rendered(&mut element, &mut tree);
-        let last = read.blocks.len() - 1;
-        let ranges = read
-            .ranges(
-                Endpoint {
-                    identity: read.blocks[0].identity,
-                    byte: 0,
-                },
-                Endpoint {
-                    identity: read.blocks[last].identity,
-                    byte: 1,
-                },
-            )
-            .unwrap();
-        // The clipboard formatter receives one index shared by all table chunks.
-        let values = read.table_values(&ranges);
-        assert_eq!(values.len(), 128);
-        assert_eq!(values.values().map(HashMap::len).sum::<usize>(), 512);
-        assert_eq!(
-            read.copy(&ranges),
-            (0..128)
-                .map(|index| format!("H{index}\tB\nV{index}\tW"))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        );
+        let mounted = read_rendered(&mut element, &mut tree);
+        assert!(!mounted.tables.is_empty() && mounted.tables.len() < 128,
+            "copy must not require constructing every offscreen table");
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(600.0, 2000.0));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()));
+        ACTIVE.store(tree.state.downcast_ref::<State>().identity, Ordering::Relaxed);
+        let mut clipboard = ClipboardText::default();
+        for key in ["a", "c"] {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(&mut tree, &command(key), Layout::new(&node),
+                mouse::Cursor::Unavailable, &renderer, &mut clipboard,
+                &mut Shell::new(&mut messages), &viewport);
+        }
+        assert_eq!(clipboard.0,
+            (0..128).map(|index| format!("H{index}\tB\nV{index}\tW"))
+                .collect::<Vec<_>>().join("\n\n"));
     }
 
     #[test]
