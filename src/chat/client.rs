@@ -76,16 +76,23 @@ struct Wire {
     stream: UnixStream,
     codec: FrameCodec,
 }
-type Pending = Arc<
-    Mutex<
-        BTreeMap<
-            u64,
-            crossbeam_channel::Sender<
-                Result<Option<crate::terminal_ipc::TerminalHandoffReceipt>, String>,
-            >,
-        >,
-    >,
->;
+type CommandResult = Result<Option<crate::terminal_ipc::TerminalHandoffReceipt>, String>;
+#[derive(Clone)]
+enum PendingKind {
+    Command,
+    Close,
+    Handoff(Arc<crate::terminal_ipc::ChatSourceBinding>),
+}
+struct PendingReply {
+    kind: PendingKind,
+    sender: crossbeam_channel::Sender<CommandResult>,
+}
+impl PendingReply {
+    fn try_send(&self, result: CommandResult) -> Result<(), crossbeam_channel::TrySendError<CommandResult>> {
+        self.sender.try_send(result)
+    }
+}
+type Pending = Arc<Mutex<BTreeMap<u64, PendingReply>>>;
 type FilePending =
     Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::FileChangeReply, String>>>>>;
 /// A daemon timestamp paired with local receipt time. It survives delayed UI
@@ -1144,22 +1151,39 @@ impl ClientHandle {
                 };
                 if envelope.version != PROTOCOL_VERSION || envelope.proof != proof { break "Chat daemon identity/version changed; refusing replacement".into(); }
                 if matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::ChatClosed { .. } | ServerResponse::ChatTerminal { .. } }) {
-                    let (chat_id, final_snapshot, terminal) = match envelope.message {
-                        ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id, snapshot } } => (chat_id, snapshot, None),
-                        ServerMessage::Response { response: ServerResponse::ChatTerminal { chat_id, session, receipt, snapshot } } => {
-                            if receipt.terminal.session != session || receipt.source.id != chat_id || receipt.operation.is_nil() || receipt.source_execution_instance.is_nil() || receipt.terminal.execution_instance.is_nil() || receipt.source.proof.as_ref() != Some(&proof) || receipt.terminal.session.continuity.live_proof().as_ref() != Some(&proof) { break "Daemon returned inconsistent terminal handoff authority".into(); }
+                    // Authentication of the daemon alone is not correlation to
+                    // this original native intent. A late/cancelled response
+                    // has no authority to publish a snapshot or close this actor.
+                    let Some(request) = envelope.request_id else { continue; };
+                    let Some(kind) = pending.lock().unwrap_or_else(|p|p.into_inner()).get(&request).map(|reply|reply.kind.clone()) else { continue; };
+                    let (chat_id, final_snapshot, terminal) = match (envelope.message, kind) {
+                        (ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id, snapshot } }, PendingKind::Close) => (chat_id, snapshot, None),
+                        (ServerMessage::Response { response: ServerResponse::ChatTerminal { chat_id, session, receipt, snapshot } }, PendingKind::Handoff(expected)) => {
+                            if receipt.terminal.session != session || receipt.source.id != chat_id || !valid_handoff_receipt(&receipt, &expected, &proof) {
+                                break "Daemon returned inconsistent terminal handoff authority".into();
+                            }
+                            // A newer positive publication on this same actor
+                            // cannot be overwritten by an older operation. None
+                            // is normal after exact retirement; the receipt's
+                            // own canonical post-pair binding is also explicit.
+                            if source_binding.lock().unwrap_or_else(|p|p.into_inner()).as_ref().is_some_and(|current|
+                                current != expected.as_ref() && receipt.retained_binding.as_ref() != Some(current)) {
+                                break "Native backend changed before terminal handoff publication".into();
+                            }
                             (chat_id, snapshot, Some(receipt))
                         },
-                        _ => unreachable!(),
+                        _ => break "Daemon returned a close or handoff for another pending command".into(),
                     };
                     if chat_id!=id { break "Daemon closed a different chat".into(); }
+                    // Claim only the same still-pending request after complete
+                    // source/backend/actor validation. Timeout may have removed
+                    // it while validation ran; then no payload is published.
+                    let Some(reply) = pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request) else { continue; };
                     if terminal.is_some() && !final_snapshot.exited {
                         // A shared-server CLI is another view, not a closed
                         // native actor. Keep this connection and pending work.
                         *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
-                        if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
-                            let _ = reply.try_send(Ok(terminal));
-                        }
+                        let _ = reply.try_send(Ok(terminal));
                         wake(Wake::Changed);
                         continue;
                     }
@@ -1172,9 +1196,10 @@ impl ClientHandle {
                     alive.store(false,Ordering::Release);
                     let _=visibility_stop.try_send(());
                     let _=reader_stream.shutdown(Shutdown::Both);
+                    let _=reply.try_send(Ok(terminal));
                     let replies=std::mem::take(&mut *pending.lock().unwrap_or_else(|p|p.into_inner()));
-                    for (request,reply) in replies {
-                        let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
+                    for (_,reply) in replies {
+                        let _=reply.try_send(Err("Chat was explicitly closed".into()));
                     }
                     for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
                     wake(Wake::Changed);
@@ -1413,7 +1438,12 @@ impl ClientHandle {
             if pending.len() >= 64 {
                 return Err("Chat client command capacity reached".into());
             }
-            pending.insert(id, reply);
+            let kind = match &request {
+                ClientRequest::ChatReturnTerminal { expected, .. } => PendingKind::Handoff(Arc::new(expected.clone())),
+                ClientRequest::ChatClose { .. } | ClientRequest::ChatCloseSession { .. } => PendingKind::Close,
+                _ => PendingKind::Command,
+            };
+            pending.insert(id, PendingReply { kind, sender: reply });
         }
         let result = transmit(&self.inner.wire, &self.inner.proof, id, request).and_then(|()| {
             response
@@ -2153,6 +2183,181 @@ mod tests {
         receipt.source.launch.session_id = Some("another".into());
         assert!(!valid_handoff_receipt(&receipt, &binding, &handoff_proof()));
     }
+
+    #[derive(Clone, Copy)]
+    enum ReaderCase { Completed, Shared, Late, Backend, Actor, Thread, ForeignProof, WrongKind, CurrentConflict, CurrentNone, Close }
+
+    // In-process framed peer only: finite socket/latch/reply deadlines and an
+    // armed socket shutdown guard cover assertion paths. No child/provider or
+    // daemon is started, and no raw pthread join can block the fixture caller.
+    // The strict outer test guardian separately proves final thread quiescence.
+    struct ReaderPeer {
+        socket: UnixStream,
+        release: crossbeam_channel::Sender<()>,
+        done: crossbeam_channel::Receiver<()>,
+        settled: bool,
+        workers: Vec<JoinHandle<()>>,
+    }
+    impl Drop for ReaderPeer {
+        fn drop(&mut self) {
+            let _ = self.release.try_send(());
+            let _ = self.socket.shutdown(Shutdown::Both);
+            if !self.settled && self.done.recv_timeout(Duration::from_secs(6)).is_err() {
+                eprintln!("Framed handoff peer did not acknowledge shutdown; outer guardian retains quiescence obligation");
+            }
+            // JoinHandle destruction detaches; a bounded fixture never calls
+            // join based only on is_finished or a message from before TLS exit.
+            self.workers.clear();
+        }
+    }
+    fn reader_case(case: ReaderCase) {
+        let proof = handoff_proof();
+        let source = omp_card(Some("original"), Some(proof.clone()));
+        let binding = crate::terminal_ipc::ChatSourceBinding {
+            source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4(),
+        };
+        let terminal = handoff_terminal();
+        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(terminal.id, terminal.launch.clone(), None);
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let receipt = crate::terminal_ipc::TerminalHandoffReceipt {
+            operation: uuid::Uuid::new_v4(), source: source.clone(), source_execution_instance: binding.execution_instance,
+            source_binding: binding.clone(), retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor,
+        };
+        assert!(valid_handoff_receipt(&receipt, &binding, &proof));
+        assert!(receipt.terminal.session.continuity.live_proof().is_none());
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let socket = server.try_clone().unwrap();
+        let (release, released) = crossbeam_channel::bounded(1);
+        let (done, completed) = crossbeam_channel::bounded(1);
+        let (wake, wakes) = crossbeam_channel::unbounded();
+        let sent_binding = binding.clone(); let sent_receipt = receipt.clone(); let sent_proof = proof.clone();
+        let worker = thread::spawn(move || {
+            struct Done(crossbeam_channel::Sender<()>);
+            impl Drop for Done { fn drop(&mut self) { let _ = self.0.try_send(()); } }
+            let _done = Done(done);
+            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            handoff_reply(&mut server, &mut codec, Some(connect.request_id), &sent_proof,
+                ServerMessage::Response { response: ServerResponse::Connected { proof: sent_proof.clone(), resumed: vec![] } });
+            let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            handoff_reply(&mut server, &mut codec, Some(attach.request_id), &sent_proof,
+                ServerMessage::Response { response: ServerResponse::ChatAttached {
+                    session: sent_binding.source.clone(), execution_instance: sent_binding.execution_instance,
+                    binding: Some(sent_binding.clone()), snapshot: Snapshot { generation: 1, session_id: Some("original".into()), ..Default::default() },
+                } });
+            let request = loop {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                if matches!(request.request, ClientRequest::ChatReturnTerminal {..} | ClientRequest::ChatCommand {..} | ClientRequest::ChatClose {..}) { break request; }
+                handoff_reply(&mut server, &mut codec, Some(request.request_id), &sent_proof,
+                    ServerMessage::Response { response: ServerResponse::Accepted });
+            };
+            if matches!(case, ReaderCase::Late) {
+                handoff_reply(&mut server, &mut codec, Some(request.request_id + 1000), &sent_proof,
+                    ServerMessage::Response { response: ServerResponse::ChatTerminal {
+                        chat_id: sent_binding.source.id, session: sent_receipt.terminal.session.clone(), receipt: sent_receipt.clone(),
+                        snapshot: Snapshot { generation: 99, exited: true, ..Default::default() },
+                    } });
+                handoff_reply(&mut server, &mut codec, None, &sent_proof,
+                    ServerMessage::ChatActivity { chat_id: sent_binding.source.id, state: ActivityState::Waiting, generation: 10, outcome: None });
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            if matches!(case, ReaderCase::CurrentConflict | ReaderCase::CurrentNone) {
+                let mut newer = sent_binding.clone(); newer.backend = uuid::Uuid::new_v4();
+                handoff_reply(&mut server, &mut codec, None, &sent_proof,
+                    ServerMessage::Response { response: ServerResponse::ChatSnapshot {
+                        chat_id: sent_binding.source.id, execution_instance: sent_binding.execution_instance,
+                        binding: matches!(case, ReaderCase::CurrentConflict).then_some(newer),
+                        snapshot: Some(Snapshot { generation: 2, session_id: Some("original".into()), ..Default::default() }),
+                    } });
+            }
+            let mut response = sent_receipt;
+            match case {
+                ReaderCase::Backend => response.source_binding.backend = uuid::Uuid::new_v4(),
+                ReaderCase::Actor => { response.source_execution_instance = uuid::Uuid::new_v4(); response.source_binding.execution_instance = response.source_execution_instance; },
+                ReaderCase::Thread => response.source.launch.session_id = Some("another".into()),
+                ReaderCase::ForeignProof => response.terminal.session.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+                    host_session_id: sent_proof.host_session_id.clone(), boot_id: sent_proof.boot_id.clone(),
+                    host_incarnation: crate::model::HostIncarnation::new("another"),
+                },
+                _ => {},
+            }
+            let snapshot = Snapshot { generation: 77, session_id: Some("original".into()), exited: !matches!(case, ReaderCase::Shared), ..Default::default() };
+            let response = if matches!(case, ReaderCase::Close) {
+                ServerResponse::ChatClosed { chat_id: sent_binding.source.id, snapshot }
+            } else { ServerResponse::ChatTerminal { chat_id: sent_binding.source.id, session: response.terminal.session.clone(), receipt: response, snapshot } };
+            handoff_reply(&mut server, &mut codec, Some(request.request_id), &sent_proof, ServerMessage::Response { response });
+            if matches!(case, ReaderCase::Shared) {
+                loop {
+                    let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    let command = matches!(request.request, ClientRequest::ChatCommand { .. });
+                    handoff_reply(&mut server, &mut codec, Some(request.request_id), &sent_proof,
+                        ServerMessage::Response { response: ServerResponse::Accepted });
+                    if command { break; }
+                }
+                let _ = released.recv_timeout(Duration::from_secs(5));
+            }
+        });
+        let mut peer = ReaderPeer { socket, release, done: completed, settled: false, workers: vec![worker] };
+        let handle = ClientHandle::connect_on(client, source, Intent::Attach, Some(proof), false, None, None,
+            move |event| { let _ = wake.send(event); }).unwrap();
+        assert_eq!(handle.source_binding(), Some(binding.clone()));
+        let requester = handle.clone(); let expected = binding.clone();
+        let (result, reply) = crossbeam_channel::bounded(1);
+        peer.workers.push(thread::spawn(move || {
+            let response = match case {
+                ReaderCase::WrongKind => requester.request(ClientRequest::ChatCommand { chat_id: expected.source.id,
+                    command: Command::SetModel { model: "original".into(), reasoning: None } }).map(|()|None),
+                ReaderCase::Close => requester.request(ClientRequest::ChatClose { chat_id: expected.source.id }).map(|()|None),
+                _ => requester.return_terminal(expected).map(Some),
+            };
+            let _ = result.try_send(response);
+        }));
+        if matches!(case, ReaderCase::Late) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match wakes.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
+                    Wake::Activity => break,
+                    Wake::Disconnected(reason) => panic!("uncorrelated final payload must not close the actor: {reason}"),
+                    _ => {},
+                }
+            }
+            assert_eq!(handle.snapshot().generation, 1, "late response cannot publish its final payload");
+            assert!(handle.inner.alive.load(Ordering::Acquire));
+            peer.release.try_send(()).unwrap();
+        }
+        let result = reply.recv_timeout(Duration::from_secs(5)).expect("actual reader must resolve the matched request");
+        if matches!(case, ReaderCase::Backend | ReaderCase::Actor | ReaderCase::Thread | ReaderCase::ForeignProof | ReaderCase::WrongKind | ReaderCase::CurrentConflict) {
+            assert!(result.is_err(), "invalid receipt must not become a return success");
+            assert_eq!(handle.snapshot().generation, if matches!(case, ReaderCase::CurrentConflict) { 2 } else { 1 }, "invalid final payload must not replace the current snapshot");
+        } else {
+            assert_eq!(result.unwrap(), if matches!(case, ReaderCase::Close) { None } else { Some(receipt) });
+            assert_eq!(handle.snapshot().generation, 77);
+            assert_eq!(handle.inner.alive.load(Ordering::Acquire), matches!(case, ReaderCase::Shared));
+            if matches!(case, ReaderCase::Shared) {
+                handle.request(ClientRequest::ChatCommand { chat_id: binding.source.id,
+                    command: Command::SetModel { model: "still-alive".into(), reasoning: None } }).unwrap();
+                assert!(handle.inner.alive.load(Ordering::Acquire));
+            }
+        }
+        let _ = peer.release.try_send(());
+        peer.done.recv_timeout(Duration::from_secs(6)).expect("finite actual peer completion");
+        peer.settled = true;
+    }
+
+    #[test]
+    fn handoff_reader_accepts_completed_receipt_without_live_continuity() { reader_case(ReaderCase::Completed); reader_case(ReaderCase::CurrentNone); }
+    #[test]
+    fn handoff_reader_refuses_wrong_source_actor_and_request_kind_before_final_payload() {
+        for case in [ReaderCase::Backend, ReaderCase::Actor, ReaderCase::Thread, ReaderCase::ForeignProof, ReaderCase::WrongKind, ReaderCase::CurrentConflict] { reader_case(case); }
+    }
+    #[test]
+    fn handoff_reader_ignores_uncorrelated_final_payload_until_exact_request() { reader_case(ReaderCase::Late); }
+    #[test]
+    fn handoff_reader_preserves_shared_server_and_later_command_admission() { reader_case(ReaderCase::Shared); }
+    #[test]
+    fn handoff_reader_preserves_correlated_chat_close() { reader_case(ReaderCase::Close); }
 
     #[test]
     fn typed_handoff_ack_transmits_the_complete_operation_and_preserves_refusals() {
