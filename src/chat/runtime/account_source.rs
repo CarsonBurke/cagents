@@ -43,13 +43,17 @@ pub(crate) struct CapturedAccountSource {
     scope: LaunchAccountScope,
     source_session: TerminalId,
     receipt: StoreSourceReceipt,
+    expires: Instant,
 }
 impl CapturedAccountSource {
     pub(crate) fn scope(&self) -> &LaunchAccountScope { &self.scope }
     pub(crate) fn source_session(&self) -> TerminalId { self.source_session }
+    /// The original capture/admission budget, never renewed by queue/codec hops.
+    pub(crate) fn expires(&self) -> Instant { self.expires }
     pub(crate) fn native_namespace(&self) -> SessionNamespace { SessionNamespace::Unconfirmed }
     /// Only a codec factory taking this opaque pairing may use its parts. The
-    /// factory must still admit/revalidate the namespace, source, FD and epoch.
+    /// factory must still admit/revalidate the namespace, source, FD and epoch,
+    /// using expires() captured before consuming these parts (never a new TTL).
     pub(crate) fn into_parts(self) -> (LaunchAccountScope, TerminalId, SessionNamespace, StoreSourceReceipt) {
         (self.scope, self.source_session, SessionNamespace::Unconfirmed, self.receipt)
     }
@@ -150,7 +154,7 @@ impl PendingAccountSource {
         check_owner(&store)?;
         drop(store); // capture_export_source also explicitly ended its snapshot.
         scope.revalidate()?;
-        let proof = CapturedAccountSource { scope: scope.clone(), source_session: session, receipt };
+        let proof = CapturedAccountSource { scope: scope.clone(), source_session: session, receipt, expires };
         // Account alias metadata allocation also belongs to the original budget.
         if Instant::now() >= expires { return Err("Account source capture deadline expired".into()); }
         Ok(proof)
@@ -275,7 +279,9 @@ mod tests {
         let source_id = source.id;
         assert!(source.launch.recipe.environment.is_empty(), "issued recipe is not actual account evidence");
         let handle = start(spec, source, None).unwrap();
-        let proof = handle.capture_account_source(expires()).unwrap();
+        let original_deadline = expires();
+        let proof = handle.capture_account_source(original_deadline).unwrap();
+        assert_eq!(proof.expires(), original_deadline, "codec admission must not create a fresh budget");
         assert_eq!(proof.scope().canonical_home, actual.canonicalize().unwrap());
         assert_eq!(proof.source_session(), source_id);
         assert_eq!(proof.native_namespace(), SessionNamespace::Unconfirmed,
