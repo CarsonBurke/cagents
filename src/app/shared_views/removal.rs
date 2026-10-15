@@ -10,11 +10,17 @@ pub(in crate::app) struct RemovalSource {
     execution_instance: Option<uuid::Uuid>,
     observed_chat: Option<crate::chat::Session>,
     archived_local: Option<CardKind>,
+    operation: uuid::Uuid,
 }
 impl RemovalSource {
     /// Set only by the initial private-readiness/canonical-source admission.
     /// This never confers provider or terminal teardown authority.
     pub(in crate::app) fn is_archived_automation(&self)->bool {self.archived_local.is_some()}
+    /// Minted with the original source before local retirement/publication.
+    /// This ID is a readonly lookup reference, never a readiness capability.
+    pub(in crate::app) fn archived_membership_operation(&self)->Option<uuid::Uuid> {
+        self.is_archived_automation().then_some(self.operation)
+    }
     pub(super) fn change(&self) -> Change {
         if self.is_archived_automation() {
             return Change::RemoveArchivedAutomationSource {registry:self.registry,repository:self.repository.clone(),before:self.before.clone()};
@@ -161,6 +167,7 @@ impl Cagents {
             execution_instance: self.terminal_worker_for_shared_removal(card),
             observed_chat: self.chat_return_session(card),
             archived_local,
+            operation:uuid::Uuid::new_v4(),
         };
         if !source.current(model) {
             return Err("The shared pane source is no longer authoritative.".into());
@@ -242,7 +249,7 @@ mod cleanup_projection_tests {
         let launch=LaunchRecipe {program:"fixture".into(),arguments:vec![],working_directory:"/repo".into(),environment:Default::default(),unset_environment:Default::default()};
         let terminal=TerminalSession {id:TerminalId::new(),launch:launch.clone(),transcript_path:None,resume_hint:None,owned_codex_listener:None,recovery_origin:None,predecessor:None,continuity:TerminalContinuity::RelaunchAvailable {recipe:launch.clone(),last_exit:None}};
         let closed=crate::chat::Session {id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe:launch,session_id:Some("original".into())},proof:None,terminal:Some(terminal.clone()),owned_codex_listener:None,native_continuity:Default::default()};
-        let source=RemovalSource {registry:uuid::Uuid::new_v4(),repository:"/repo".into(),scope:Scope::Worktree {repository:"/repo".into(),path:"/repo".into()},before:Pane {id:CardId::new(),title:"CLI".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,kind:CardKind::Terminal(terminal),scope:None},execution_instance:Some(uuid::Uuid::new_v4()),observed_chat:Some(closed.clone()),archived_local:None};
+        let source=RemovalSource {registry:uuid::Uuid::new_v4(),repository:"/repo".into(),scope:Scope::Worktree {repository:"/repo".into(),path:"/repo".into()},before:Pane {id:CardId::new(),title:"CLI".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,kind:CardKind::Terminal(terminal),scope:None},execution_instance:Some(uuid::Uuid::new_v4()),observed_chat:Some(closed.clone()),archived_local:None,operation:uuid::Uuid::new_v4()};
         let wire=source.change();let projected=source.clone().after_observed_chat_cleanup(&closed).unwrap();
         assert!(projected.observed_chat.is_none());assert_eq!(projected.change(),wire);
         let mut replacement=closed.clone();replacement.launch.session_id=Some("replacement".into());assert!(source.clone().after_observed_chat_cleanup(&replacement).is_none());
