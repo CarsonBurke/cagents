@@ -57,7 +57,7 @@ pub(super) fn require_no_unhosted_owners(host: &SharedHost, reservation: &Reserv
                 // An installed flag without a matching HostState owner never
                 // exempts this helper from orphan ownership attribution.
                 Kind::Native if crate::chat::runtime::Handle::is_remote_record(&record) => {
-                    crate::chat::runtime::Handle::inspect_remote(&record, proof.clone()).and_then(|inspection| {
+                    crate::chat::runtime::Handle::inspect_remote_until(&record, proof.clone(), deadline).and_then(|inspection| {
                         if inspection.identity.record != record || inspection.source.id != record.terminal {
                             return Err("Retained actor returned another holder identity".into());
                         }
