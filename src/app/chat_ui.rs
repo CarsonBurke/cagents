@@ -17772,7 +17772,10 @@ mod tests {
         let card=live_chat(&mut app,Some(KNOWN_THREAD)); // Unknown live identity refuses preflight.
         assert!(app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).is_err());
         assert_eq!(app.account_history_revocation_epoch(Provider::Codex),0);
-        close_chat(&mut app,card);
+        let target=chat_runtime(&app,card).target;
+        let handle=chat_runtime(&app,card).handle().unwrap().clone();
+        handle.replace_snapshot_for_test(Snapshot{ready:true,exited:true,..Snapshot::default()});
+        app.chat_runtime_mut(target).unwrap().refresh();
         app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
         assert_eq!(app.account_history_revocation_epoch(Provider::Codex),1);
         assert_eq!(app.account_history_revocation_epoch(Provider::Claude),0);
