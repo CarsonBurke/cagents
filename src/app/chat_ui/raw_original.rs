@@ -192,13 +192,17 @@ pub(super) fn complete(runtime:&mut Runtime,source:SourceKey,field:RawSourceFiel
     entry.revision=next_revision();state.revision=state.revision.wrapping_add(1);
 }
 fn label(field:RawSourceField)->&'static str {match field {RawSourceField::ToolInput=>"Original tool input",RawSourceField::CommandCall=>"Original command details"}}
-fn representation(value:RawRepresentation)->&'static str {match value {RawRepresentation::StreamJson=>"Captured streamed JSON",RawRepresentation::CanonicalJson=>"Captured parsed input (JSON)",RawRepresentation::CommandMetadataJson=>"Captured command projection (JSON)"}}
+fn representation(value:RawRepresentation)->&'static str {match value {RawRepresentation::StreamJson=>"Original streamed JSON",RawRepresentation::CanonicalJson=>"Input received as parsed JSON",RawRepresentation::CommandMetadataJson=>"Recorded command details (JSON)"}}
 pub(super) fn detail(runtime:&Runtime,item:&str)->Element<'static,Message> {
     let mut rows=Vec::new();let target=runtime.target;
     if let Some(error)=&runtime.raw_original.restore_error {rows.push(design::caption(error.clone()).into());}
     for field in [RawSourceField::ToolInput,RawSourceField::CommandCall] {
         let Some(key)=runtime.raw_original.key(item,field) else {continue;};let entry=&runtime.raw_original.entries[&key];
-        rows.push(widget::button::text(format!("{} {}",if entry.opened {"▾"} else {"▸"},label(field)))
+        rows.push(widget::button::custom(widget::row::with_children(vec![
+                widget::icon(Icon::handle(if entry.opened {Icon::PanDown} else {Icon::PanEnd})).size(design::COMPACT_ICON_SIZE).into(),
+                design::caption(label(field)).into(),
+            ]).spacing(step::GAP_XS).align_y(Alignment::Center))
+            .name(label(field)).class(crate::ui_controls::control_style(entry.opened,None))
             .on_press(action(Action::RawOriginalToggle(target,item.into(),field))).into());
         if !entry.opened {continue;}
         rows.push(design::caption(format!("{} · {}",entry.part.metadata.tool_name,representation(entry.part.metadata.representation))).into());
