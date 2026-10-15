@@ -1633,6 +1633,80 @@ mod tests {
     }
 
     #[test]
+    fn codex_view_retains_exact_unknown_start_and_native_owner_through_pressure_until_family_proof() {
+        let exact=std::thread::current().name().unwrap().to_owned();
+        if runtime::isolated_backend_contract(&exact) {return;}
+        use crate::terminal::TerminalStartDisposition as Disposition;
+        let fixture=fixture_provider(0,Provider::Codex);
+        let id=fixture.source.id;
+        let paths=crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease=crate::daemon::HostLease::acquire(&paths,fixture.source.proof.as_ref().unwrap()).unwrap();
+        {let mut state=fixture.host.lock().unwrap();state.register_client(1);state.enable_holder_recovery();}
+        let expected=super::super::chat::source_binding::fixture_binding(&fixture.host,id);
+        let before=fixture.host.lock().unwrap().chats[&id].session.clone();
+        let native=fixture.handle.provider_process().unwrap();
+        let recipe=before.launch.terminal_recipe().expect("actual confirmed Codex CLI resume recipe");
+        std::fs::write(&fixture.source.launch.recipe.program,
+            "#!/bin/sh\nprintf '%s\n' \"$$\" >> codex-view-spawns\nexec /bin/cat\n").unwrap();
+        let starts=|count:usize| {
+            let deadline=Instant::now()+Duration::from_secs(3);
+            loop {
+                let pids=std::fs::read_to_string(fixture.old.join("codex-view-spawns")).unwrap_or_default().lines()
+                    .map(|line|line.parse::<i32>().unwrap()).collect::<Vec<_>>();
+                if pids.len()>=count {assert_eq!(pids.len(),count);return pids;}
+                assert!(Instant::now()<deadline,"actual Codex view did not start");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        fixture.host.lock().unwrap().native_sources.lose_next_return_start_reply_for_test();
+        let mut retained=None;
+        TerminalHandle::with_blocked_holder_cleanup_for_test(|| {
+            let error=super::super::chat::codex_terminal_view_with(&fixture.host,1,id,&fixture.handle,
+                before.clone(),recipe.clone(),||{}).unwrap_err();
+            assert!(error.message.contains("exited before startup completed"),"{error:?}");
+            let attempt=fixture.host.lock().unwrap().native_sources.pair_attempt_for_test(id).unwrap();
+            assert_eq!(attempt.disposition(),Disposition::Unknown);
+            assert_eq!(attempt.terminal_id(),id);
+            let owner=attempt.holder_record().unwrap();
+            assert_eq!(starts(1),vec![owner.root.pid]);
+            assert!(native.is_current() && !fixture.handle.is_completed(),"native server must survive failed view start");
+            fixture.host.lock().unwrap().native_sources.pressure_for_test();
+            let error=super::super::chat::process(&fixture.host,1,
+                ClientRequest::ChatReturnTerminal {chat_id:id,expected:expected.clone()}).unwrap_err();
+            assert!(error.message.contains("previous CLI view start is unconfirmed"),"{error:?}");
+            let same=fixture.host.lock().unwrap().native_sources.pair_attempt_for_test(id).unwrap();
+            assert_eq!(same.id(),attempt.id()); assert_eq!(same.worker_instance(),attempt.worker_instance());
+            assert_eq!(same.session(),attempt.session());
+            assert_eq!(starts(1).len(),1);
+            assert!(native.is_current() && !fixture.handle.is_completed());
+            assert!(fixture.host.lock().unwrap().terminals.is_empty(),"unpublished owner is retained by its ticket");
+            retained=Some((attempt,owner));
+        });
+        let (attempt,owner)=retained.unwrap();
+        let deadline=Instant::now()+Duration::from_secs(10);
+        while attempt.retry_cleanup()!=Disposition::FamilySettled {
+            assert!(Instant::now()<deadline,"exact first CLI family still unconfirmed: {attempt:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!owner.root.is_current() && !owner.holder.is_current());
+        let response=super::super::chat::process(&fixture.host,1,
+            ClientRequest::ChatReturnTerminal {chat_id:id,expected:expected.clone()}).unwrap();
+        let ServerResponse::ChatTerminal {receipt,..}=response else {panic!("missing exact Codex view receipt");};
+        assert_eq!(receipt.source_binding,expected);
+        assert_eq!(receipt.terminal.session.id,id);
+        assert_ne!(Some(receipt.terminal.execution_instance),attempt.worker_instance());
+        let worker=fixture.host.lock().unwrap().terminals[&id].handle.clone();
+        struct Close(TerminalHandle);
+        impl Drop for Close {fn drop(&mut self){let _=self.0.shutdown();}}
+        let _cleanup=Close(worker.clone());
+        assert_eq!(starts(2).len(),2);
+        assert!(native.is_current() && !fixture.handle.is_completed(),"positive pair retry must retain the original native process");
+        {let state=fixture.host.lock().unwrap();state.validate_terminal_handoff_receipt(&receipt).unwrap();
+            assert_eq!(state.terminals.len(),1);assert!(state.chats[&id].paired_terminal.as_ref().unwrap().same_worker(&worker));}
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn console_pair_claim_preserves_the_exact_operation_across_lost_disposition_reply() {
         let exact = std::thread::current()
             .name()

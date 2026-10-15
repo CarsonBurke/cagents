@@ -42,6 +42,12 @@ struct PendingHandoff {
     created_pair: Option<uuid::Uuid>,
     backend_closed: bool,
     returned: Option<ReturnTarget>,
+    pair_start: Option<PairStart>,
+}
+#[derive(Clone)]
+struct PairStart {
+    source: crate::model::TerminalSession,
+    attempt: Option<crate::terminal::TerminalStartAttempt>,
 }
 #[derive(Clone)]
 struct ReturnTarget {
@@ -209,6 +215,10 @@ impl History {
             .as_ref()?
             .attempt
             .clone()
+    }
+    #[cfg(test)]
+    pub(in crate::host) fn pair_attempt_for_test(&self, id: TerminalId) -> Option<crate::terminal::TerminalStartAttempt> {
+        self.entries.get(&id)?.pending_handoff.as_ref()?.pair_start.as_ref()?.attempt.clone()
     }
     #[cfg(test)]
     pub(in crate::host) fn pressure_for_test(&mut self) {
@@ -614,6 +624,73 @@ pub(super) fn restore_created_pair(
     Ok(())
 }
 
+pub(super) fn has_pending_pair_start(host: &SharedHost, expected: &ChatSourceBinding) -> bool {
+    let state=host.lock().unwrap_or_else(|p|p.into_inner());
+    state.native_sources.entries.get(&expected.source.id).and_then(|entry|entry.pending_handoff.as_ref())
+        .is_some_and(|pending|pending.intent==*expected && pending.pair_start.is_some() && !pending.backend_closed)
+}
+
+/// A Codex view keeps its native backend alive. Its terminal-start ticket
+/// therefore lives alongside the native claim rather than backend_closed.
+/// Reconcile before another prior-console effect, without IO under HostLock.
+pub(super) fn reconcile_pair_start(host: &SharedHost, id: TerminalId, continuation: &Continuation) -> Result<(), ProtocolError> {
+    use crate::terminal::TerminalStartDisposition as Disposition;
+    let target = {
+        let state=host.lock().unwrap_or_else(|p|p.into_inner());
+        let pending=state.native_sources.entries.get(&id).and_then(|entry|entry.pending_handoff.as_ref())
+            .filter(|pending| !pending.backend_closed && pending.token==continuation.claim
+                && pending.owner.same_actor(&continuation.handle) && pending.witness==continuation.witness)
+            .ok_or_else(||unavailable("The exact native-alive handoff operation changed"))?;
+        pending.pair_start.clone()
+    };
+    let Some(target)=target else {return Ok(());};
+    let Some(attempt)=target.attempt else {return Ok(());};
+    let disposition=match attempt.disposition() {Disposition::Unknown=>attempt.retry_cleanup(),other=>other};
+    match disposition {
+        Disposition::Pending|Disposition::Unknown => Err(unavailable("The exact previous CLI view start is unconfirmed; no second view was started")),
+        Disposition::Published => {
+            let (_,worker)=attempt.published().ok_or_else(||unavailable("The exact published CLI view is busy; no replacement was started"))?;
+            remember_created_pair(host,id,continuation,&worker)
+        },
+        Disposition::NoProvider|Disposition::FamilySettled => {
+            let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+            let pending=state.native_sources.entries.get_mut(&id).and_then(|entry|entry.pending_handoff.as_mut())
+                .filter(|pending| !pending.backend_closed && pending.token==continuation.claim
+                    && pending.owner.same_actor(&continuation.handle) && pending.witness==continuation.witness)
+                .ok_or_else(||unavailable("The exact CLI view operation changed during cleanup"))?;
+            let current=pending.pair_start.as_mut().filter(|current|current.source==target.source
+                && current.attempt.as_ref().is_some_and(|current|current.id()==attempt.id()))
+                .ok_or_else(||unavailable("The exact CLI view attempt changed during cleanup"))?;
+            // Retain its exact immutable recipe/ID after positive cleanup.
+            current.attempt=None;
+            Ok(())
+        },
+    }
+}
+
+pub(super) fn mark_pair_start(host: &SharedHost, id: TerminalId, continuation: &Continuation, source: crate::model::TerminalSession) -> Result<crate::terminal::TerminalStartAttempt,ProtocolError> {
+    let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+    #[cfg(test)]
+    let lose_start_reply=std::mem::take(&mut state.native_sources.lose_next_return_start_reply);
+    let pending=state.native_sources.entries.get_mut(&id).filter(|entry|entry.instance==continuation.instance)
+        .and_then(|entry|entry.pending_handoff.as_mut())
+        .filter(|pending| !pending.backend_closed && pending.token==continuation.claim
+            && pending.owner.same_actor(&continuation.handle) && pending.witness==continuation.witness)
+        .ok_or_else(||unavailable("The exact native-alive handoff operation changed before start"))?;
+    if source.id!=id || pending.created_pair.is_some() || pending.original_pair.is_some() {
+        return Err(unavailable("The prior CLI owner still requires exact cleanup before another start"));
+    }
+    let target=pending.pair_start.get_or_insert_with(||PairStart {source:source.clone(),attempt:None});
+    if target.source!=source || target.attempt.is_some() {
+        return Err(unavailable("The exact previous CLI view recipe or start remains retained; no replacement was started"));
+    }
+    let attempt=crate::terminal::TerminalStartAttempt::new(source);
+    #[cfg(test)]
+    if lose_start_reply {attempt.lose_worker_start_reply_for_test();}
+    target.attempt=Some(attempt.clone());
+    Ok(attempt)
+}
+
 pub(super) fn remember_created_pair(
     host: &SharedHost,
     id: TerminalId,
@@ -621,6 +698,9 @@ pub(super) fn remember_created_pair(
     worker: &crate::terminal::TerminalHandle,
 ) -> Result<(), ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.terminals.get(&id).is_none_or(|record|!record.handle.same_worker(worker)) {
+        return Err(unavailable("The exact created CLI view is no longer resident"));
+    }
     let pending = state
         .native_sources
         .entries
@@ -633,6 +713,11 @@ pub(super) fn remember_created_pair(
         .ok_or_else(|| {
             unavailable("The claimed handoff changed before recording its new worker")
         })?;
+    if pending.pair_start.as_ref().and_then(|target|target.attempt.as_ref()).is_none_or(|attempt|
+        attempt.worker_instance()!=Some(worker.execution_instance())
+            || attempt.published().is_none_or(|(_,published)|!published.same_worker(worker))) {
+        return Err(unavailable("The created CLI view has no matching exact published start ticket"));
+    }
     pending.created_pair = Some(worker.execution_instance());
     Ok(())
 }
@@ -663,6 +748,12 @@ pub(super) fn remember_released_pair(
     }
     pending.original_pair = None;
     pending.created_pair = None;
+    if pending.pair_start.as_ref().and_then(|target| target.attempt.as_ref())
+        .is_some_and(|attempt| attempt.worker_instance() == Some(instance)) {
+        // Caller reached this point only after this exact worker's positive
+        // cleanup and native source rollback. Another target never clears it.
+        pending.pair_start = None;
+    }
     Ok(())
 }
 
@@ -728,6 +819,7 @@ pub(super) fn claim_continuation(
                     created_pair: None,
                     backend_closed: false,
                     returned: continuation.returned.clone(),
+                    pair_start: None,
                 });
             }
         }
@@ -1220,6 +1312,7 @@ pub(in crate::host) fn capture_pending_close(
         validate_proof(source.proof.as_ref(), state.proof())?;
         if pending.original_pair.is_some()
             || pending.created_pair.is_some()
+            || pending.pair_start.is_some()
             || pending
                 .returned
                 .as_ref()
@@ -1291,6 +1384,7 @@ pub(in crate::host) fn release_pending_close(
             && current.backend_closed
             && current.original_pair.is_none()
             && current.created_pair.is_none()
+            && current.pair_start.is_none()
             && current
                 .returned
                 .as_ref()

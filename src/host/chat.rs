@@ -1941,6 +1941,7 @@ fn codex_terminal_view_captured(
             .expect("pending requires captured intent");
         let mut continuation = source_binding::continuation(host, pending)?;
         source_binding::claim_continuation(host, intent, pending, &mut continuation)?;
+        source_binding::reconcile_pair_start(host, chat_id, &continuation)?;
         source_binding::restore_created_pair(host, client, intent)?;
     }
     let (issued_source, source_instance, source_binding) = {
@@ -2230,7 +2231,8 @@ fn codex_terminal_view_captured(
         resume_hint: None,
         transcript_path: None,
     };
-    let spawned = super::state::spawn_terminal_view_owned_at_directory(
+    let attempt=source_binding::mark_pair_start(host, chat_id, &continuation, terminal.clone())?;
+    let spawned = super::state::spawn_terminal_view_owned_at_directory_attempt(
         host,
         client,
         terminal,
@@ -2241,10 +2243,12 @@ fn codex_terminal_view_captured(
         Some(handle.execution_environment()),
         true,
         execution,
+        &attempt,
     );
     let (descriptor, paired_terminal) = match spawned {
         Ok(pair) => pair,
-        Err(error) => {
+        Err(failure) => {
+            let error=failure.error;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(record) = state
                 .chats
@@ -3455,6 +3459,7 @@ fn process_inner(
             ))?;
             if session.launch.provider == Provider::Codex
                 && (session.terminal.is_some()
+                    || source_binding::has_pending_pair_start(host, &expected)
                     || session
                         .launch
                         .recipe
