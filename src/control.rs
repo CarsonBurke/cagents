@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod created_root_rights;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(feature = "host", feature = "ui")))]
 pub(crate) mod created_journal_io;
 
 use std::{
