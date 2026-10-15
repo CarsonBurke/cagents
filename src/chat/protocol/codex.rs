@@ -1123,13 +1123,21 @@ impl Codex {
     /// A native snapshot and its clipping/terminal decoder state have the same
     /// owner. Replacement starts a new decoder and installs the window produced
     /// by parsing THAT snapshot. History only seeds an absent active item.
-    fn track_snapshot_item(&mut self,value:&Value,item:&Item,window:Option<OutputWindow>,replace:bool) {
-        if self.tracks(value,item) {
+    fn track_snapshot_item(
+        &mut self,
+        value: &Value,
+        item: &Item,
+        window: Option<OutputWindow>,
+        replace: bool,
+    ) {
+        if self.tracks(value, item) {
             if replace || !self.active_items.contains_key(&item.id) {
                 self.output_streams.remove(&item.id);
                 self.output_windows.remove(&item.id);
-                if let Some(window)=window {self.output_windows.insert(item.id.clone(),window);}
-                self.active_items.insert(item.id.clone(),item.clone());
+                if let Some(window) = window {
+                    self.output_windows.insert(item.id.clone(), window);
+                }
+                self.active_items.insert(item.id.clone(), item.clone());
             }
         } else {
             self.active_items.remove(&item.id);
@@ -1217,13 +1225,15 @@ impl Codex {
                         self.discover_child(id, &metadata, step)?;
                     }
                 }
-                let mut windows=BTreeMap::new();
-                let parsed=parse_item_with_windows(value,!active,turn_id,|id,window| {windows.insert(id.to_owned(),window);})?;
+                let mut windows = BTreeMap::new();
+                let parsed = parse_item_with_windows(value, !active, turn_id, |id, window| {
+                    windows.insert(id.to_owned(), window);
+                })?;
                 for item in parsed {
                     if active && self.busy {
                         // Completed history releases an unseen completion;
                         // live history cannot replace a more recent stream.
-                        self.track_snapshot_item(value,&item,windows.remove(&item.id),false);
+                        self.track_snapshot_item(value, &item, windows.remove(&item.id), false);
                     }
                     items.push(item);
                 }
@@ -1947,7 +1957,9 @@ impl Adapter for Codex {
                     error["message"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| "The provider reported an error without a readable message".into())
+                        .unwrap_or_else(|| {
+                            "The provider reported an error without a readable message".into()
+                        })
                 );
                 step.events
                     .push(if matches!(pending, Pending::History { .. }) {
@@ -2825,11 +2837,18 @@ impl Adapter for Codex {
                     self.turn = self.busy.then(|| turn_id.to_owned());
                 }
                 for value in array(turn, "items")? {
-                    let mut windows=BTreeMap::new();
-                    let parsed=parse_item_with_windows(value,method=="turn/completed",turn_id,|id,window| {windows.insert(id.to_owned(),window);})?;
+                    let mut windows = BTreeMap::new();
+                    let parsed = parse_item_with_windows(
+                        value,
+                        method == "turn/completed",
+                        turn_id,
+                        |id, window| {
+                            windows.insert(id.to_owned(), window);
+                        },
+                    )?;
                     for item in parsed {
                         if method == "turn/started" {
-                            self.track_snapshot_item(value,&item,windows.remove(&item.id),true);
+                            self.track_snapshot_item(value, &item, windows.remove(&item.id), true);
                         }
                         step.events.push(Event::Item(item));
                     }
@@ -2897,15 +2916,27 @@ impl Adapter for Codex {
                         self.discover_child(id, &value["agentsStates"][id], &mut step)?;
                     }
                 }
-                let mut windows=BTreeMap::new();
-                let parsed=parse_item_with_windows(&params["item"],done,string(params,"turnId")?,|id,window| {windows.insert(id.to_owned(),window);})?;
+                let mut windows = BTreeMap::new();
+                let parsed = parse_item_with_windows(
+                    &params["item"],
+                    done,
+                    string(params, "turnId")?,
+                    |id, window| {
+                        windows.insert(id.to_owned(), window);
+                    },
+                )?;
                 for item in parsed {
                     if done {
                         self.active_items.remove(&item.id);
                         self.output_streams.remove(&item.id);
                         self.output_windows.remove(&item.id);
                     } else {
-                        self.track_snapshot_item(&params["item"],&item,windows.remove(&item.id),true);
+                        self.track_snapshot_item(
+                            &params["item"],
+                            &item,
+                            windows.remove(&item.id),
+                            true,
+                        );
                     }
                     step.events.push(Event::Item(item));
                 }
@@ -3084,9 +3115,10 @@ impl Adapter for Codex {
                     .as_str()
                     .or_else(|| params["summary"].as_str())
                     .filter(|text| !text.trim().is_empty());
-                let mut message = summary
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| "Codex reported a configuration warning; check the provider log for details".into());
+                let mut message = summary.map(str::to_owned).unwrap_or_else(|| {
+                    "Codex reported a configuration warning; check the provider log for details"
+                        .into()
+                });
                 if summary.is_some() {
                     for key in ["details", "path"] {
                         if let Some(text) = params[key].as_str().filter(|text| !text.is_empty()) {
@@ -3457,9 +3489,14 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
     Ok(changes)
 }
 fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String> {
-    parse_item_with_windows(value,done,turn,|_,_| {})
+    parse_item_with_windows(value, done, turn, |_, _| {})
 }
-fn parse_item_with_windows(value:&Value,done:bool,turn:&str,mut parsed_window:impl FnMut(&str,OutputWindow))->Result<Vec<Item>,String> {
+fn parse_item_with_windows(
+    value: &Value,
+    done: bool,
+    turn: &str,
+    mut parsed_window: impl FnMut(&str, OutputWindow),
+) -> Result<Vec<Item>, String> {
     let scoped_id = item_key(turn, string(value, "id")?);
     let id = scoped_id.as_str();
     let kind = string(value, "type")?;
@@ -3738,7 +3775,7 @@ fn parse_item_with_windows(value:&Value,done:bool,turn:&str,mut parsed_window:im
         other => tool(other.into(), String::new(), value.to_string()),
     };
     for item in &mut items {
-        let mut window=OutputWindow::default();
+        let mut window = OutputWindow::default();
         let bytes = item.content.byte_len();
         let limit = if matches!(&item.content, ItemContent::Image { path, .. } if path.starts_with("data:image/"))
         {
@@ -3759,8 +3796,11 @@ fn parse_item_with_windows(value:&Value,done:bool,turn:&str,mut parsed_window:im
         if item.content.byte_len() > limit {
             return Err("Codex item exceeds native client size bound".into());
         }
-        if matches!(&item.content,ItemContent::Tool {..}|ItemContent::Command {..}) {
-            parsed_window(&item.id,window);
+        if matches!(
+            &item.content,
+            ItemContent::Tool { .. } | ItemContent::Command { .. }
+        ) {
+            parsed_window(&item.id, window);
         }
     }
     Ok(items)
@@ -3987,79 +4027,100 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 mod tests {
     use super::*;
 
-    fn output_window_command(output:&str)->Value {
+    fn output_window_command(output: &str) -> Value {
         json!({"id":"window-cmd","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":output})
     }
-    fn output_window_started(output:&str)->Value {
+    fn output_window_started(output: &str) -> Value {
         json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"window-turn","item":output_window_command(output)}})
     }
-    fn output_window_delta(delta:&str)->Value {
+    fn output_window_delta(delta: &str) -> Value {
         json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"window-turn","itemId":"window-cmd","delta":delta}})
     }
-    fn large_window_output()->String {
-        format!("first🦀\n{}last🦀\n","middle🦀\n".repeat(MAX_ITEM_BYTES/8))
+    fn large_window_output() -> String {
+        format!(
+            "first🦀\n{}last🦀\n",
+            "middle🦀\n".repeat(MAX_ITEM_BYTES / 8)
+        )
     }
-    fn assert_window_accounting(adapter:&Codex,source:&str) {
-        let key=item_key("window-turn","window-cmd");
-        let item=adapter.active_items.get(&key).unwrap();
-        let ItemContent::Command {output,..}=&item.content else {panic!("missing command");};
-        let window=adapter.output_windows.get(&key).unwrap();
-        assert!(window.omitted>0);
-        let marker=format!("\n[... {} bytes omitted ...]\n",window.omitted);
-        assert!(output.contains(&marker));assert!(output.starts_with("first🦀\n"));
+    fn assert_window_accounting(adapter: &Codex, source: &str) {
+        let key = item_key("window-turn", "window-cmd");
+        let item = adapter.active_items.get(&key).unwrap();
+        let ItemContent::Command { output, .. } = &item.content else {
+            panic!("missing command");
+        };
+        let window = adapter.output_windows.get(&key).unwrap();
+        assert!(window.omitted > 0);
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        assert!(output.contains(&marker));
+        assert!(output.starts_with("first🦀\n"));
         assert!(source.ends_with(output.rsplit_once(&marker).unwrap().1));
-        assert_eq!(source.len(),output.len()-marker.len()+window.omitted);
-        assert!(item.content.byte_len()<=MAX_ITEM_BYTES);
+        assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+        assert!(item.content.byte_len() <= MAX_ITEM_BYTES);
     }
     #[test]
     fn repeated_native_started_replaces_clipped_window_and_partial_decoder_together() {
-        for whole_turn in [false,true] {
-            let mut adapter=adapter();adapter.busy=true;
+        for whole_turn in [false, true] {
+            let mut adapter = adapter();
+            adapter.busy = true;
             adapter.receive(output_window_started("")).unwrap();
-            let source=large_window_output();
+            let source = large_window_output();
             adapter.receive(output_window_delta(&source)).unwrap();
-            assert_window_accounting(&adapter,&source);
+            assert_window_accounting(&adapter, &source);
             adapter.receive(output_window_delta("\u{1b}[")).unwrap();
-            let key=item_key("window-turn","window-cmd");
+            let key = item_key("window-turn", "window-cmd");
             assert!(adapter.output_streams.contains_key(&key));
-            let replacement="short🦀";
-            let frame=if whole_turn {json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(replacement)]}}})}
-                else {output_window_started(replacement)};
+            let replacement = "short🦀";
+            let frame = if whole_turn {
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(replacement)]}}})
+            } else {
+                output_window_started(replacement)
+            };
             adapter.receive(frame).unwrap();
             assert!(!adapter.output_streams.contains_key(&key));
-            let window=adapter.output_windows.get(&key).unwrap();assert_eq!((window.omitted,window.head),(0,0));
-            let delta="31m-tail🦀";
-            let step=adapter.receive(output_window_delta(delta)).unwrap();
+            let window = adapter.output_windows.get(&key).unwrap();
+            assert_eq!((window.omitted, window.head), (0, 0));
+            let delta = "31m-tail🦀";
+            let step = adapter.receive(output_window_delta(delta)).unwrap();
             assert!(step.events.iter().any(|event|matches!(event,Event::OutputDelta {offset,delta:seen,..} if *offset==replacement.len() && seen==delta)));
-            assert!(matches!(&adapter.active_items[&key].content,ItemContent::Command {output,..} if output==&format!("{replacement}{delta}")));
+            assert!(
+                matches!(&adapter.active_items[&key].content,ItemContent::Command {output,..} if output==&format!("{replacement}{delta}"))
+            );
         }
     }
     #[test]
     fn native_started_snapshot_retains_original_clipping_accounting_for_next_delta() {
-        let mut adapter=adapter();adapter.busy=true;
-        let mut source=large_window_output();
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let mut source = large_window_output();
         adapter.receive(output_window_started(&source)).unwrap();
-        assert_window_accounting(&adapter,&source);
-        let delta="new-tail🦀\n";source.push_str(delta);
+        assert_window_accounting(&adapter, &source);
+        let delta = "new-tail🦀\n";
+        source.push_str(delta);
         adapter.receive(output_window_delta(delta)).unwrap();
-        assert_window_accounting(&adapter,&source);
+        assert_window_accounting(&adapter, &source);
     }
     #[test]
     fn active_history_hydration_retains_clipping_window_without_replacing_live_owner() {
-        for existing in [false,true] {
-            let mut adapter=adapter();adapter.busy=true;
-            let mut source=large_window_output();
+        for existing in [false, true] {
+            let mut adapter = adapter();
+            adapter.busy = true;
+            let mut source = large_window_output();
             if existing {
                 adapter.receive(output_window_started("")).unwrap();
                 adapter.receive(output_window_delta(&source)).unwrap();
             }
-            let mut step=Step::default();
-            let page_output=if existing {"older page must not replace the current stream"} else {&source};
+            let mut step = Step::default();
+            let page_output = if existing {
+                "older page must not replace the current stream"
+            } else {
+                &source
+            };
             adapter.page(&json!({"data":[{"id":"window-turn","status":"inProgress","items":[output_window_command(page_output)]}],"nextCursor":null}),&mut step,false).unwrap();
-            assert_window_accounting(&adapter,&source);
-            let delta="history-followed-by-tail🦀\n";source.push_str(delta);
+            assert_window_accounting(&adapter, &source);
+            let delta = "history-followed-by-tail🦀\n";
+            source.push_str(delta);
             adapter.receive(output_window_delta(delta)).unwrap();
-            assert_window_accounting(&adapter,&source);
+            assert_window_accounting(&adapter, &source);
         }
     }
 
