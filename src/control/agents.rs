@@ -1548,7 +1548,7 @@ mod tests {
             assert!(read_frame::<ClientEnvelope>(&mut server_stream).unwrap().is_none(), "stale consent must not inspect a replacement or replay any operation");
         });
         let mut session = Session { authority: Authority::default(), connection: Some((ControlClient::from_stream(client_stream).unwrap(), "/fixture".into())), summaries: None };
-        let error = session.repair_stale_presentation(agent).unwrap_err();
+        let error = session.repair_stale_presentation(agent).err().unwrap();
         assert!(error.message.contains("The observed presentation changed"));
         drop(session); server.join().unwrap();
     }
