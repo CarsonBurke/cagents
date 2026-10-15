@@ -998,6 +998,101 @@ mod presentation_tests {
     }
 
     #[test]
+    fn actual_mixed_and_all_failed_group_headers_mount_outcome_counts() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        for (all_failed, summary, glyph) in [
+            (false, "Ran 5 commands · 4 ok · 1 failed", None),
+            (true, "Ran 5 commands · 5 failed", Some(ToolStatus::Failed)),
+        ] {
+            let items = (0..5)
+                .map(|index| {
+                    Arc::new(chat::Item {
+                        id: format!("command-{index}"),
+                        role: chat::Role::Assistant,
+                        started_at: None,
+                        at: None,
+                        content: ItemContent::Command {
+                            label: format!("Run checks for module {index}"),
+                            command: format!("cargo test --lib module_{index}"),
+                            working_directory: "/project".into(),
+                            action: chat::CommandAction::Run,
+                            status: if all_failed || index == 4 {
+                                ToolStatus::Failed
+                            } else {
+                                ToolStatus::Succeeded
+                            },
+                            exit_code: Some(if all_failed || index == 4 { 1 } else { 0 }),
+                            duration_ms: None,
+                            output: String::new(),
+                        },
+                    })
+                })
+                .collect();
+            let session = fresh_chat_session(
+                Provider::Claude,
+                TerminalId::new(),
+                "/project".into(),
+                &Account::system(Provider::Claude),
+                false,
+            )
+            .unwrap();
+            let handle = Arc::new(ClientHandle::fixture(
+                session.clone(),
+                Snapshot {
+                    ready: true,
+                    items,
+                    ..Snapshot::default()
+                },
+            ));
+            let runtime = Runtime::new(
+                Target {
+                    card: CardId::new(),
+                    generation: 1,
+                },
+                session,
+                Connection::Live(handle),
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            let turn = &runtime.turns[0];
+            assert_eq!(turn.summary, summary);
+            assert_eq!(
+                turn.glyph(),
+                glyph,
+                "the actual mounted group must use the relevant outcome glyph"
+            );
+            let spans = summary_spans(&turn.summary);
+            assert!(spans.last().unwrap().color.is_some());
+            assert!(
+                spans[..spans.len() - 1]
+                    .iter()
+                    .all(|span| span.color.is_none())
+            );
+            let mut element = runtime.step_strip(turn, Vec::new);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(956.0, 700.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert!(
+                accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node.node().label() == Some(summary)),
+                "the actual group header exposes its complete outcome summary"
+            );
+        }
+    }
+
+    #[test]
     fn mixed_summary_colors_only_the_failed_count() {
         let spans = summary_spans("Ran 5 commands · 4 ok · 1 failed");
         assert_eq!(
