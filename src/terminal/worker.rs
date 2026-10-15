@@ -6381,6 +6381,40 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_session_stop_preserves_input_and_does_not_publish_teardown() {
+        // These are admission controls only. Real old-helper compatibility is
+        // exercised separately against an actual protocol-4 holder image.
+        for capability in [None, Some(false)] {
+            let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+            if let Some(capability) = capability {
+                published.family_cleanup_capable.set(capability).unwrap();
+            }
+            let (commands, receiver) = command_channel(1);
+            let (_events, event_receiver) = crossbeam_channel::unbounded();
+            let handle = TerminalHandle {
+                inner: Arc::new(HandleInner {
+                    commands,
+                    events: event_receiver,
+                    published: published.clone(),
+                    worker: Arc::new(Mutex::new(None)),
+                }),
+            };
+            let refusal = handle.fence_session_stop(
+                published.execution_instance,
+                Instant::now() + Duration::from_secs(1),
+            ).err().expect("missing cleanup capability must refuse before teardown");
+            assert!(refusal.contains("cannot confirm whole-session cleanup"));
+            assert!(!published.input_order.lock().unwrap().closing);
+            assert!(published.priority_close.lock().unwrap().is_none());
+            handle.input(b"still admitted").unwrap();
+            let Ok(Command::OrderedInput { input, .. }) = receiver.try_recv() else {
+                panic!("refusal must leave ordinary input admitted in its original order");
+            };
+            assert!(matches!(*input, Command::Input(ref bytes) if bytes == b"still admitted"));
+        }
+    }
+
+    #[test]
     fn shutdown_bypasses_a_saturated_input_queue_and_coalesced_wake() {
         let (mut worker, events) = capture_worker();
         let expected = worker.current_size;
@@ -6398,7 +6432,7 @@ mod tests {
                 commands,
                 events,
                 published: Arc::clone(&worker.published),
-                worker: Mutex::new(None),
+                worker: Arc::new(Mutex::new(None)),
             }),
         };
         assert!(handle.inner.commands.is_full());
