@@ -13972,12 +13972,10 @@ impl Application for Cagents {
                 // file opens in a repository card with normal save/LSP/close
                 // ownership, and its native coordinates are clamped on load.
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&destination) {
-                    tasks.push(repository_task(runtime.open_file_location(
+                    tasks.push(repository_task(runtime.open_source_file_location(
                         destination,
                         identity.path,
                         line,
-                        0,
-                        0,
                     )));
                 }
                 if let Ok(update) = self.workspace.focus(destination) {
