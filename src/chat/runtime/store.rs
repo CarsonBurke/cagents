@@ -77,7 +77,7 @@ pub(crate) struct Store {
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
-    pending_child_source: Option<(String, String, String)>,
+    pending_child_source: Option<source::PendingChildSource>,
     pub(super) source_revision: u64,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
@@ -1145,7 +1145,7 @@ impl Store {
                     break 'records;
                 }
                 if kind=="text" {
-                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false});
+                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
                 }
                 if self
                     .changed
