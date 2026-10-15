@@ -568,12 +568,15 @@ pub(super) fn process_request(
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
     if let ClientRequest::CloseProjectGuarded { project, sessions } = &request {
+        ensure_control_open(host)?;
+        let accounts = super::project_removal::prepare_account_admission(host, project)?;
         let reservation = {
-            let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
+            let _admission = try_scoped_control_write(&gate)?;
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
-            super::project_removal::reserve(host, project, sessions)?
+            super::project_removal::reserve(host, project, sessions, &accounts)?
         };
+        accounts.verify()?;
         let result = super::project_removal::remove(
             host,
             client_id,
@@ -640,16 +643,19 @@ pub(super) fn process_request(
             false,
         ));
     }
-    // The reservation outlives all provider probes. Only installing it and
-    // committing each registry change take the short control writer.
+    // The reservation outlives provider probes and registry effects. Observe
+    // slow storage off global admission; installation alone uses a short
+    // writer with exact account/project map comparisons.
     if let ClientRequest::DeviceOperation {
         operation: crate::device_service::Operation::AccountLifecycle { operation },
     } = &request {
         let reservation = {
-            let _writer = try_scoped_control_write(&gate)?;
-            ensure_control_open(host)?;
-            super::agent_execution::terminals::admit(host, client_id, &request)?;
-            super::project_removal::admit(host, &request)?;
+            {
+                let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+                ensure_control_open(host)?;
+                super::agent_execution::terminals::admit(host, client_id, &request)?;
+                super::project_removal::admit(host, &request)?;
+            }
             let accounts = crate::account::remote::affected_accounts(operation)
                 .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
             super::account_lifecycle::Reservation::install(host, &accounts)?

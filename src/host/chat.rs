@@ -5365,43 +5365,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn native_account_admission_uses_the_pinned_operational_directory_before_provider_start() {
-        const CHILD: &str = "CAGENTS_NATIVE_ACCOUNT_ADMISSION_FIXTURE";
-        if std::env::var_os(CHILD).is_none() {
-            let root = tempfile::Builder::new().prefix("cagents-native-account-")
-                .tempdir_in("/var/tmp").unwrap();
-            for name in ["home", "config", "data", "cache", "runtime"] {
-                std::fs::create_dir(root.path().join(name)).unwrap();
-            }
-            let log = root.path().join("test.log");
-            let output = std::fs::File::create(&log).unwrap();
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "host::chat::tests::native_account_admission_uses_the_pinned_operational_directory_before_provider_start", "--nocapture"])
-                .env_clear().env(CHILD, root.path())
-                .env("HOME", root.path().join("home"))
-                .env("XDG_CONFIG_HOME", root.path().join("config"))
-                .env("XDG_DATA_HOME", root.path().join("data"))
-                .env("XDG_CACHE_HOME", root.path().join("cache"))
-                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
-                .env("PATH", "/usr/bin:/bin").env("SHELL", "/bin/sh")
-                .stdout(output.try_clone().unwrap()).stderr(output).spawn().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let status = loop {
-                if let Some(status) = child.try_wait().unwrap() { break status; }
-                if Instant::now() >= deadline {
-                    let _ = child.kill(); let _ = child.wait();
-                    panic!("native admission fixture timed out: {}", root.keep().display());
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            let evidence = std::fs::read_to_string(&log).unwrap();
-            if !status.success() {
-                panic!("native admission fixture failed: {}\n{evidence}", root.keep().display());
-            }
-            assert!(evidence.contains("1 passed; 0 failed"), "{evidence}");
-            return;
-        }
+        if chat::runtime::isolated_backend_contract("host::chat::tests::native_account_admission_uses_the_pinned_operational_directory_before_provider_start") { return; }
         use std::os::unix::fs::PermissionsExt;
-        let root = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = home.parent().unwrap().to_owned();
         let issued = root.join("issued");
         let operational = root.join("operational");
         std::fs::create_dir_all(&issued).unwrap();
@@ -5420,11 +5387,7 @@ mod tests {
         })));
         host.lock().unwrap().register_client(1);
         let account = crate::account::Account::linked(Provider::Codex, uuid::Uuid::new_v4(), profile.clone());
-        let gate = host.lock().unwrap().control_gate.clone();
-        let _reservation = {
-            let _writer = super::super::client::try_scoped_control_write(&gate).unwrap();
-            super::super::account_lifecycle::Reservation::install(&host, &[account]).unwrap()
-        };
+        let _reservation = super::super::account_lifecycle::Reservation::install(&host, &[account]).unwrap();
         for relative in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME", "absolute-reserved"] {
             let mut environment = BTreeMap::from([
                 ("HOME".into(), root.join("home").display().to_string()),

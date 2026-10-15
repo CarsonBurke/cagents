@@ -873,7 +873,7 @@ impl Store {
         started_at: u64,
         create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
     ) -> io::Result<(Uuid, PathBuf)> {
-        self.create_pending_with_mode(homes, provider, started_at, create, false)
+        self.create_pending_with_mode(homes, provider, started_at, create, false, |_| Ok(()))
     }
 
     #[cfg(feature = "host")]
@@ -884,7 +884,17 @@ impl Store {
         started_at: u64,
         create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
     ) -> io::Result<(Uuid, PathBuf)> {
-        self.create_pending_with_mode(homes, provider, started_at, create, true)
+        self.create_pending_with_mode(homes, provider, started_at, create, true, |_| Ok(()))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_create_pending_reserved(
+        &self, reservation: &crate::host::AccountReservation, homes: &Homes,
+        provider: Provider, started_at: u64,
+        create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        self.create_pending_with_mode(homes, provider, started_at, create, true,
+            |registry| reservation.verify_registry(registry).map_err(io::Error::other))
     }
 
     fn create_pending_with_mode(
@@ -894,6 +904,7 @@ impl Store {
         started_at: u64,
         create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
         nonblocking: bool,
+        validate: impl FnOnce(&Registry) -> io::Result<()>,
     ) -> io::Result<(Uuid, PathBuf)> {
         let _lifecycle = if nonblocking { homes.try_lifecycle_lock()? } else { homes.lifecycle_lock()? };
         let _lock = if nonblocking { self.try_lock()? } else { self.lock()? };
@@ -904,6 +915,7 @@ impl Store {
                 "the accounts were saved by a newer cagents",
             ));
         }
+        validate(&registry)?;
         let (key, home) = create()?;
         registry.begin(provider, key, started_at);
         registry.version = VERSION;
@@ -961,7 +973,7 @@ impl Store {
         account: Registered,
         system: &[(Provider, Identity)],
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
-        self.register_pending_with_mode(homes, account, system, false)
+        self.register_pending_with_mode(homes, account, system, false, |_| Ok(()))
     }
 
     #[cfg(feature = "host")]
@@ -971,7 +983,16 @@ impl Store {
         account: Registered,
         system: &[(Provider, Identity)],
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
-        self.register_pending_with_mode(homes, account, system, true)
+        self.register_pending_with_mode(homes, account, system, true, |_| Ok(()))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_register_pending_reserved(
+        &self, reservation: &crate::host::AccountReservation, homes: &Homes,
+        account: Registered, system: &[(Provider, Identity)],
+    ) -> io::Result<(Registry, Result<(), AccountId>)> {
+        self.register_pending_with_mode(homes, account, system, true,
+            |registry| reservation.verify_registry(registry).map_err(io::Error::other))
     }
 
     fn register_pending_with_mode(
@@ -980,9 +1001,11 @@ impl Store {
         account: Registered,
         system: &[(Provider, Identity)],
         nonblocking: bool,
+        validate: impl FnOnce(&Registry) -> io::Result<()>,
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
         let _lifecycle = if nonblocking { homes.try_lifecycle_lock()? } else { homes.lifecycle_lock()? };
         self.update_checked_with_mode(|registry| {
+            validate(registry)?;
             if registry.find(account.key).is_some_and(|existing| {
                 existing.provider == account.provider && existing.linked_home.is_none()
             }) {
@@ -1030,6 +1053,17 @@ impl Store {
     #[cfg(feature = "host")]
     pub(crate) fn try_update<T>(&self, change: impl FnOnce(&mut Registry) -> T) -> io::Result<(Registry, T)> {
         self.update_checked_with_mode(|registry| Ok(change(registry)), true)
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_update_reserved<T>(
+        &self, reservation: &crate::host::AccountReservation,
+        change: impl FnOnce(&mut Registry) -> T,
+    ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_mode(|registry| {
+            reservation.verify_registry(registry).map_err(io::Error::other)?;
+            Ok(change(registry))
+        }, true)
     }
 
     /// The registry as it stands. A missing file is an empty registry; a

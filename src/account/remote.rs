@@ -83,7 +83,14 @@ pub(crate) fn affected_accounts(operation: &Operation) -> Result<Vec<super::Acco
     if provider.is_some_and(|provider| !super::Account::PROVIDERS.contains(provider)) {
         return Err("Omp manages its own logins".into());
     }
-    Ok(affected_account(operation)?.into_iter().collect())
+    let mut accounts: Vec<_> = affected_account(operation)?.into_iter().collect();
+    // Register reads the pending home and probes System for duplicate login
+    // identity. Reserve both before either probe; an idempotent completed
+    // registration has no probe and therefore needs no System reservation.
+    if let Operation::Register { provider, .. } = operation {
+        if !accounts.is_empty() { accounts.push(super::Account::system(*provider)); }
+    }
+    Ok(accounts)
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -144,7 +151,7 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
                 .ok_or("The provider CLI is not installed on this device")?;
             let system = Account::system(provider).resolved_home();
             let (key, home) = reservation.commit(|| store
-                .try_create_pending(&homes, provider, now, || {
+                .try_create_pending_reserved(reservation, &homes, provider, now, || {
                     homes.create_with_config(
                         provider,
                         system.as_deref(),
@@ -189,13 +196,13 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
             let system = Account::system(provider).resolved_home();
             let (registry, result) = reservation.commit(|| {
                 let _lifecycle = homes.try_lifecycle_lock()?;
-                store.try_update(|registry| registry.link(provider, key, path, system.as_deref(), Some(&homes), now))
+                store.try_update_reserved(reservation, |registry| registry.link(provider, key, path, system.as_deref(), Some(&homes), now))
             })?;
             let key = result?;
             serde_json::to_value((registry, key)).map_err(|error| error.to_string())
         }
         Operation::Register { provider, key } => {
-            let registry = store.load().map_err(|error| error.to_string())?;
+            let registry = store.try_load().map_err(|error| error.to_string())?;
             // A transport interruption can lose a successful reply. Retrying
             // the same pending key must not delete or replace that login.
             if registry.find(key).is_some_and(|registered| {
@@ -232,7 +239,7 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
                 return Err("The provider needs this account to sign in again".into());
             }
             if !probe::confirms_login(identity.as_ref(), snapshot.status) {
-                let (registry, ()) = reservation.commit(|| store.try_update(|registry| registry.abandon(key)))?;
+                let (registry, ()) = reservation.commit(|| store.try_update_reserved(reservation, |registry| registry.abandon(key)))?;
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
                     .map_err(|error| error.to_string());
             }
@@ -260,7 +267,7 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
                     .and_then(|identity| identity.organization.clone()),
                 added_at: now,
             };
-            let (registry, registered) = reservation.commit(|| store.try_register_pending(&homes, managed, &system_identity))?;
+            let (registry, registered) = reservation.commit(|| store.try_register_pending_reserved(reservation, &homes, managed, &system_identity))?;
             let settled = match registered {
                 Ok(()) => Settled::Registered {
                     registry,
@@ -268,7 +275,7 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
                     snapshot: Some(snapshot),
                 },
                 Err(existing) => {
-                    let (registry, ()) = reservation.commit(|| store.try_update(|registry| registry.abandon(key)))?;
+                    let (registry, ()) = reservation.commit(|| store.try_update_reserved(reservation, |registry| registry.abandon(key)))?;
                     Settled::Duplicate {
                         existing,
                         registry: Some(registry),
@@ -278,7 +285,7 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
             serde_json::to_value(settled).map_err(|error| error.to_string())
         }
         Operation::Abandon { provider, key } => {
-            let registry = store.load().map_err(|error| error.to_string())?;
+            let registry = store.try_load().map_err(|error| error.to_string())?;
             if !registry
                 .pending()
                 .iter()
@@ -286,12 +293,12 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
             {
                 return Err("This pending sign-in changed on the device".into());
             }
-            let (registry, ()) = reservation.commit(|| store.try_update(|registry| registry.abandon(key)))?;
+            let (registry, ()) = reservation.commit(|| store.try_update_reserved(reservation, |registry| registry.abandon(key)))?;
             serde_json::to_value(Settled::Abandoned(Some(registry)))
                 .map_err(|error| error.to_string())
         }
         Operation::Remove { id } => {
-            let registry = store.load().map_err(|error| error.to_string())?;
+            let registry = store.try_load().map_err(|error| error.to_string())?;
             let account = registry
                 .accounts(Some(&homes))
                 .into_iter()
@@ -301,7 +308,7 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
                 .registry_key()
                 .ok_or("System accounts cannot be removed")?;
             let (registry, error) = if account.is_linked() {
-                let (registry, removed) = reservation.commit(|| store.try_update(|registry| registry.unregister(key)))?;
+                let (registry, removed) = reservation.commit(|| store.try_update_reserved(reservation, |registry| registry.unregister(key)))?;
                 removed.ok_or("The linked account registration changed before it could be forgotten")?;
                 (registry, None)
             } else {
@@ -367,46 +374,26 @@ mod tests {
 
     #[test]
     fn host_lifecycle_creates_isolated_login_and_never_deletes_linked_files() {
-        const CHILD: &str = "CAGENTS_REMOTE_ACCOUNT_TEST";
-        // Match the repository's synthetic credential fixtures; the guard
-        // forbids naming provider credential files in production sources.
+        if crate::chat::runtime::isolated_backend_contract("account::remote::tests::host_lifecycle_creates_isolated_login_and_never_deletes_linked_files") { return; }
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = home.parent().unwrap().to_owned();
         let credential_file = ["auth", ".json"].concat();
-        if std::env::var_os(CHILD).is_none() {
-            use std::os::unix::fs::PermissionsExt;
-            let directory = tempfile::tempdir().unwrap();
-            let root = directory.path();
-            std::fs::create_dir_all(root.join("home/.codex")).unwrap();
-            std::fs::create_dir_all(root.join("bin")).unwrap();
-            std::fs::write(
-                root.join("home/.codex").join(&credential_file),
-                "fixture-private-login",
-            )
-            .unwrap();
-            let shell = root.join("bin/shell");
-            std::fs::write(&shell, "#!/bin/sh\nexec /bin/sh -c \"$2\"\n").unwrap();
-            let codex = root.join("bin/codex");
-            std::fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
-            for program in [&shell, &codex] {
-                std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
-            }
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "account::remote::tests::host_lifecycle_creates_isolated_login_and_never_deletes_linked_files", "--nocapture"])
-                .env_clear().env(CHILD, root).env("HOME", root.join("home"))
-                .env("SHELL", shell).env("PATH", format!("{}:/usr/bin:/bin", root.join("bin").display()))
-                .env("XDG_CONFIG_HOME", root.join("config")).env("XDG_DATA_HOME", root.join("data"))
-                .env("XDG_RUNTIME_DIR", root).output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
+        std::fs::create_dir_all(root.join("home/.codex")).unwrap();
+        std::fs::create_dir(root.join("bin")).unwrap();
+        std::fs::write(root.join("home/.codex").join(&credential_file), "fixture-private-login").unwrap();
+        let codex = root.join("bin/codex");
+        std::fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shell_path = format!("export PATH='{}:/usr/bin:/bin'\n", root.join("bin").display());
+        for name in [".bashrc", ".zshrc"] { std::fs::write(home.join(name), &shell_path).unwrap(); }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let search = runtime.block_on(crate::account::probe::search_path());
+        assert_eq!(crate::account::probe::find_executable("codex", search.as_deref()), Some(codex), "Never invoke an installed provider");
         use crate::account::{
             home::Homes,
             registry::{Registry, Store},
         };
-        let root = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
         let value = execute(Operation::Create {
             provider: Provider::Codex,
             copy_codex_config: false,
@@ -462,6 +449,7 @@ mod tests {
             key: created.key,
         };
         assert!(affected_account(&operation).unwrap().is_none());
+        assert!(affected_accounts(&operation).unwrap().is_empty(), "idempotent Register does not probe System");
         let settled: Settled = serde_json::from_value(execute(operation).unwrap()).unwrap();
         assert!(matches!(settled, Settled::Registered { .. }));
         assert!(

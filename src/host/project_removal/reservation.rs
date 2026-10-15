@@ -208,6 +208,20 @@ fn busy() -> ProtocolError {
     )
 }
 
+/// Cached immutable project roots and exact reservation tokens. Account
+/// admission observes/pins these roots off the writer, then compares tokens
+/// in its short installation cut; this is a conflict fence, not deletion proof.
+pub(crate) fn account_basis(host: &SharedHost) -> (std::collections::BTreeSet<uuid::Uuid>, Vec<PathBuf>) {
+    let entries = entries(host);
+    let entries = entries.lock().unwrap_or_else(|p| p.into_inner());
+    (entries.keys().copied().collect(), entries.values().flat_map(|scope| scope.roots.iter().cloned()).collect())
+}
+
+pub(crate) fn prepare_account_admission(host: &SharedHost, project: &ProjectInstance) -> Result<super::super::account_lifecycle::ProjectAdmission, ProtocolError> {
+    let scope = prepare(host, project)?;
+    super::super::account_lifecycle::ProjectAdmission::prepare(host, &scope.roots)
+}
+
 /// Build the same logical/protected ownership boundary for inventory and final
 /// reservation. This read grants no cleanup authority and installs no lease.
 fn prepare(host:&SharedHost,project:&ProjectInstance)->Result<ReservedProject,ProtocolError> {
@@ -381,8 +395,9 @@ pub(super) fn require_no_startup_owners(host:&SharedHost,project:&ProjectInstanc
 }
 
 /// Caller holds short exclusive control admission. No slow teardown occurs here.
-pub(crate) fn reserve(host:&SharedHost,project:&ProjectInstance,selected:&[SessionClose])->Result<Reservation,ProtocolError> {
+pub(crate) fn reserve(host:&SharedHost,project:&ProjectInstance,selected:&[SessionClose], accounts: &super::super::account_lifecycle::ProjectAdmission)->Result<Reservation,ProtocolError> {
     let mut reserved=prepare(host,project)?;
+    accounts.check(host, &reserved.roots)?;
     // Another Git project may own external linked roots absent from this
     // snapshot. In that case only explicit shared membership can authorize
     // teardown; a guessed path prefix must never broaden ownership.
