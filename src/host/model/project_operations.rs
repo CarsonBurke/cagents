@@ -158,6 +158,22 @@ fn read(db: &Connection, operation: Uuid) -> Result<Option<Obligation>, String> 
     }).transpose()
 }
 
+/// Read the original bounded journal through the caller's actual transaction.
+/// Recovery admission composes here, without opening a second connection or
+/// reconstructing scope/roots from a new request. This grants no write/effect.
+pub(crate) fn load_in(tx:&rusqlite::Transaction<'_>,operation:Uuid)->Result<Option<Obligation>,String> {
+    if operation.is_nil() {return Err("Project operation identity is required".into());}
+    read(tx,operation)
+}
+fn pending(db:&Connection)->Result<Vec<Obligation>,String> {
+    let ids=db.prepare("SELECT operation FROM project_operation_obligations WHERE phase NOT IN ('resolved','aborted') ORDER BY rowid LIMIT 65").map_err(|error|error.to_string())?
+        .query_map([],|row|row.get::<_,String>(0)).map_err(|error|error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(|error|error.to_string())?;
+    if ids.len()>MAX_PENDING {return Err("Project operation custody exceeds its pending limit; ordinary affected mutations remain unavailable".into());}
+    ids.into_iter().map(|id|read(db,id.parse::<Uuid>().map_err(|error|error.to_string())?)?.ok_or("A pending operation disappeared".into())).collect()
+}
+pub(crate) fn pending_in(tx:&rusqlite::Transaction<'_>)->Result<Vec<Obligation>,String> {pending(tx)}
+
 impl Registry {
     pub(crate) fn project_operation(&self, operation: Uuid) -> Result<Option<Obligation>, String> {
         if operation.is_nil() {return Err("Project operation identity is required".into());}
@@ -209,11 +225,7 @@ impl Registry {
     /// Startup uses these as negative scopes only. No factory or path-based
     /// recreation of the original in-memory prepared phase is permitted.
     pub(crate) fn pending_project_operations(&self)->Result<Vec<Obligation>,String> {
-        let ids=self.db.prepare("SELECT operation FROM project_operation_obligations WHERE phase NOT IN ('resolved','aborted') ORDER BY rowid LIMIT 65").map_err(|error|error.to_string())?
-            .query_map([],|row|row.get::<_,String>(0)).map_err(|error|error.to_string())?
-            .collect::<rusqlite::Result<Vec<_>>>().map_err(|error|error.to_string())?;
-        if ids.len()>MAX_PENDING {return Err("Project operation custody exceeds its pending limit; ordinary affected mutations remain unavailable".into());}
-        ids.into_iter().map(|id|read(&self.db,id.parse::<Uuid>().map_err(|error|error.to_string())?)?.ok_or("A pending operation disappeared".into())).collect()
+        pending(&self.db)
     }
 }
 
@@ -285,6 +297,9 @@ mod tests {
         let tx=registry.db.transaction().unwrap();
         tx.execute("DELETE FROM projects WHERE repository='/project'",[]).unwrap();
         model_committed(&tx,operation,&request,&edit).unwrap();
+        assert_eq!(load_in(&tx,operation).unwrap().unwrap().phase,Phase::ModelCommitted);
+        assert_eq!(pending_in(&tx).unwrap()[0].phase,Phase::ModelCommitted);
+        assert!(load_in(&tx,Uuid::nil()).is_err());
         tx.rollback().unwrap();
         assert!(registry.model().unwrap().project(Path::new("/project")).is_some());
         assert_eq!(registry.project_operation(operation).unwrap().unwrap().phase,Phase::PendingCommit);
