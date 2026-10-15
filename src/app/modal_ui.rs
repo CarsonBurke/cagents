@@ -1455,6 +1455,28 @@ mod tests {
     }
 
     #[test]
+    fn dirty_close_tab_starts_at_the_actual_native_focused_button() {
+        for (backwards, expected) in [(false, DirtyCloseControl::Cancel),
+            (true, DirtyCloseControl::Discard)] {
+            let mut app = app();
+            let card = app.workspace.focused().unwrap();
+            app.cards.insert(card, CardRuntime::Repository(Box::new(
+                RepositoryRuntime::dirty_fixture(card))));
+            drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
+            drop(app.finish_modal_update(Task::none()));
+            let save = dirty_close_control_id(card, DirtyCloseControl::Save);
+            assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(),
+                iced::widget::operation::focus(save.clone()).map(cosmic::Action::App)), Some(save));
+            assert_eq!(app.dirty_repository_close.as_ref().unwrap().focused, DirtyCloseControl::Cancel,
+                "native/accessibility focus can move independently of the custom cycle");
+            let task = app.cycle_dirty_close_focus(backwards);
+            assert_eq!(app.dirty_repository_close.as_ref().unwrap().focused, expected);
+            assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task),
+                Some(dirty_close_control_id(card, expected)));
+        }
+    }
+
+    #[test]
     fn dirty_close_open_and_retry_keep_the_focused_control_on_cancel() {
         let mut app = app();
         let card = app.workspace.focused().unwrap();

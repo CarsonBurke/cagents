@@ -11917,6 +11917,7 @@ impl Cagents {
     }
 
     fn cycle_dirty_close_focus(&mut self, backwards: bool) -> Task<Message> {
+        let observed = self.modal_stack.focus_snapshot(modal_ui::Modal::DirtyClose).get();
         let Some(close) = self.dirty_repository_close.as_mut() else {
             return Task::none();
         };
@@ -11931,6 +11932,12 @@ impl Cagents {
             self.cards.get(&close.card),
             Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes()
         );
+        if let Some(id) = observed
+            && let Some(control) = [DirtyCloseControl::Cancel, DirtyCloseControl::Discard, DirtyCloseControl::Save]
+                .into_iter().find(|control| dirty_close_control_id(close.card, *control) == id)
+        {
+            close.focused = control;
+        }
         close.focused = next_dirty_close_control(close.focused, backwards, saving, discardable);
         let target = dirty_close_control_id(close.card, close.focused);
         self.modal_focus(target)
