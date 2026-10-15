@@ -288,9 +288,24 @@ mod tests {
     #[test]
     fn uncertain_payload_enrollment_retains_live_original_until_same_lease_accepts_retry() {
         use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
-        struct Lease { payload: Mutex<Option<Root>>, uncertain: Arc<AtomicBool> }
+        #[derive(Default)]
+        struct Creation { sealed: bool, inflight: usize }
+        struct Admission(Arc<Mutex<Creation>>);
+        impl Drop for Admission {
+            fn drop(&mut self) {
+                let mut state = self.0.lock().unwrap();
+                state.inflight = state.inflight.checked_sub(1).expect("one original creation guard");
+            }
+        }
+        struct Lease { payload: Mutex<Option<Root>>, uncertain: Arc<AtomicBool>, creation: Arc<Mutex<Creation>> }
         impl fs_safety::RecoveryRegistrationLease for Lease {
             fn validate(&self) -> io::Result<()> { Ok(()) }
+            fn begin_payload_creation(&self) -> io::Result<Arc<dyn Send + Sync>> {
+                let mut state = self.creation.lock().map_err(|_| io::Error::other("fixture creation state poisoned"))?;
+                if state.sealed { return Err(io::Error::other("fixture lease is retiring")); }
+                state.inflight = state.inflight.checked_add(1).ok_or_else(|| io::Error::other("fixture creation count exhausted"))?;
+                Ok(Arc::new(Admission(self.creation.clone())))
+            }
             fn descriptor_budget(&self) -> usize { 1 }
             fn register_payload(&self, root: &Root) -> io::Result<()> {
                 let mut payload = self.payload.lock().unwrap();
@@ -303,17 +318,25 @@ mod tests {
         let tree = tempfile::tempdir().unwrap(); let runtime = tempfile::tempdir().unwrap();
         fs::create_dir(tree.path().join("source")).unwrap(); fs::create_dir(tree.path().join("outside")).unwrap();
         let source = Arc::new(Root::open(&tree.path().join("source")).unwrap()); let outside = Arc::new(Root::open(&tree.path().join("outside")).unwrap());
-        let uncertain = Arc::new(AtomicBool::new(true)); let lease = Arc::new(Lease { payload: Mutex::new(None), uncertain: uncertain.clone() }); let weak = Arc::downgrade(&lease);
+        let creation = Arc::new(Mutex::new(Creation::default()));
+        let uncertain = Arc::new(AtomicBool::new(true)); let lease = Arc::new(Lease { payload: Mutex::new(None), uncertain: uncertain.clone(), creation: creation.clone() }); let weak = Arc::downgrade(&lease);
         let placement = fs_safety::RecoveryPlacement::acquire(outside, source.clone(), Arc::from([source.clone()]), fs_safety::RecoveryRegistryCheck::from_lease(lease.clone())).unwrap();
         let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false).unwrap()));
         let context = FilesystemRecoveryContext::new(&source, protection, placement).unwrap();
         let error = match PresenceHolding::create_in_context(&source, std::ffi::OsStr::new("file"), &context) { Err(error) => error, Ok(_) => panic!("unknown handoff must refuse payload effects") };
         let authority = error.recovery_authority().expect("unknown registration keeps its original live holding").clone();
         let original = lease.payload.lock().unwrap().as_ref().unwrap().try_clone().unwrap();
+        assert_eq!(creation.lock().unwrap().inflight, 1, "unknown handoff keeps the original slot's guard");
+        creation.lock().unwrap().sealed = true;
+        let before = context.placement().directory().read_dir().unwrap().count();
+        assert!(PresenceHolding::create_in_context(&source, std::ffi::OsStr::new("second"), &context).is_err());
+        assert_eq!(context.placement().directory().read_dir().unwrap().count(), before, "sealed admission refuses before mkdir");
         drop(lease); drop(context); drop(error);
         assert!(weak.upgrade().is_some()); assert!(original.metadata().unwrap().nlink() > 0); assert!(original.read_dir().unwrap().next().is_none());
         assert!(authority.retry().is_err()); assert!(original.metadata().unwrap().nlink() > 0, "local cleanup cannot erase an unknown handoff");
+        assert_eq!(creation.lock().unwrap().inflight, 1, "failed retry keeps that same creation admission");
         uncertain.store(false, Ordering::Release); authority.retry().unwrap(); assert!(authority.is_resolved());
+        assert_eq!(creation.lock().unwrap().inflight, 0, "only actual resolution releases the guard");
         assert_eq!(original.metadata().unwrap().nlink(), 0); assert!(weak.upgrade().is_none());
     }
 
