@@ -3982,14 +3982,24 @@ impl Actor {
         }
     }
     fn publish_current_attention(&self, evidence: crate::notifications::Evidence) {
-        let content = self.state.lock().unwrap_or_else(|p| p.into_inner())
+        let content = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .notification_content(evidence.kind);
-        (self.notify)(Update::AttentionContext { evidence, content: Some(content) });
+        (self.notify)(Update::AttentionContext {
+            evidence,
+            content: Some(content),
+        });
     }
     fn apply(&mut self, event: Event) {
         self.apply_with_attention(event, None);
     }
-    fn apply_with_attention(&mut self, event: Event, content: Option<crate::notifications::Content>) {
+    fn apply_with_attention(
+        &mut self,
+        event: Event,
+        content: Option<crate::notifications::Content>,
+    ) {
         if matches!(&event, Event::PastTurnFinished { .. }) {
             if let Some(evidence) = self.attention.apply(&event) {
                 (self.notify)(Update::PastAttention(evidence));
@@ -4949,71 +4959,179 @@ fn trim_subagent(agent: &mut Subagent) {
 mod tests {
     #[test]
     fn final_provider_proof_survives_a_pending_transcript_flush_failure() {
-        struct FinalFrame { run: Option<crate::model::RunId> }
+        struct FinalFrame {
+            run: Option<crate::model::RunId>,
+        }
         impl Adapter for FinalFrame {
-            fn initialize(&mut self) -> Result<Step, String> { Ok(Step { events: vec![Event::Ready(true)], ..Default::default() }) }
-            fn command(&mut self, _: Command) -> Result<Step, String> { Err("use a correlated run".into()) }
-            fn command_for_run(&mut self, run: crate::model::RunId, _: Command) -> Result<Step, String> {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("use a correlated run".into())
+            }
+            fn command_for_run(
+                &mut self,
+                run: crate::model::RunId,
+                _: Command,
+            ) -> Result<Step, String> {
                 self.run = Some(run);
-                Ok(Step { writes: vec![serde_json::json!({"final":true})], events: vec![
-                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Started { key: "confirmed-provider-turn".into() } },
-                    Event::TurnStarted,
-                ] })
+                Ok(Step {
+                    writes: vec![serde_json::json!({"final":true})],
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Started {
+                                key: "confirmed-provider-turn".into(),
+                            },
+                        },
+                        Event::TurnStarted,
+                    ],
+                })
             }
             fn receive(&mut self, frame: Value) -> Result<Step, String> {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
-                Ok(Step { writes: Vec::new(), events: vec![
-                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Scope },
-                    Event::TextDelta { id: "answer".into(), role: Role::Assistant, thinking: false, delta: "Partial response".into() },
-                    // Store flushes the pending delta here and fails. The
-                    // remaining typed provider proof must still be processed.
-                    Event::TurnSettled,
-                    Event::Item(crate::chat::Item { id: "answer".into(), role: Role::Assistant, started_at: None, at: None,
-                        content: ItemContent::Text { text: "Exact final response".into(), thinking: false, phase: Phase::Final } }),
-                    Event::Usage(Default::default()),
-                    Event::TurnFinished { key: Some("confirmed-provider-turn".into()), outcome: crate::notifications::Kind::Succeeded },
-                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Settled },
-                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } },
-                ] })
+                Ok(Step {
+                    writes: Vec::new(),
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Scope,
+                        },
+                        Event::TextDelta {
+                            id: "answer".into(),
+                            role: Role::Assistant,
+                            thinking: false,
+                            delta: "Partial response".into(),
+                        },
+                        // Store flushes the pending delta here and fails. The
+                        // remaining typed provider proof must still be processed.
+                        Event::TurnSettled,
+                        Event::Item(crate::chat::Item {
+                            id: "answer".into(),
+                            role: Role::Assistant,
+                            started_at: None,
+                            at: None,
+                            content: ItemContent::Text {
+                                text: "Exact final response".into(),
+                                thinking: false,
+                                phase: Phase::Final,
+                            },
+                        }),
+                        Event::Usage(Default::default()),
+                        Event::TurnFinished {
+                            key: Some("confirmed-provider-turn".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Settled,
+                        },
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Finished {
+                                outcome: crate::notifications::Kind::Succeeded,
+                            },
+                        },
+                    ],
+                })
             }
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(),
-            transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(),
-            working_directory: directory.path().into(), environment: BTreeMap::new() };
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
         let mut adapter: Box<dyn Adapter> = Box::new(FinalFrame { run: None });
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (updates, receiver) = crossbeam_channel::unbounded();
-        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| { let _ = updates.send(update); }).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = updates.send(update);
+        })
+        .unwrap();
         until(&handle, |state| state.ready);
         handle.0.store.lock().unwrap().refuse_writes_for_test();
         let run = crate::model::RunId::new();
-        handle.command_for_run(run, Command::Prompt { text: "One accepted prompt".into(), attachments: Vec::new(), mode: crate::chat::PromptMode::Send }).unwrap();
+        handle
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "One accepted prompt".into(),
+                    attachments: Vec::new(),
+                    mode: crate::chat::PromptMode::Send,
+                },
+            )
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_completed() {
-            assert!(Instant::now() < deadline, "failed frame must settle its original worker");
+            assert!(
+                Instant::now() < deadline,
+                "failed frame must settle its original worker"
+            );
             thread::sleep(Duration::from_millis(10));
         }
         handle.close().unwrap();
         let updates = receiver.try_iter().collect::<Vec<_>>();
-        let finished = updates.iter().filter_map(|update| match update {
-            Update::Execution { run: actual, update: crate::agent_execution::Update::Finished { state, result } } if *actual == run => Some((state, result)),
-            _ => None,
-        }).collect::<Vec<_>>();
-        assert_eq!(finished.len(), 1, "the cache failure cannot synthesize a second terminal outcome: {updates:?}");
+        let finished = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::Execution {
+                    run: actual,
+                    update: crate::agent_execution::Update::Finished { state, result },
+                } if *actual == run => Some((state, result)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finished.len(),
+            1,
+            "the cache failure cannot synthesize a second terminal outcome: {updates:?}"
+        );
         assert_eq!(*finished[0].0, crate::agent_execution::State::Succeeded);
         assert_eq!(finished[0].1.text, "Exact final response");
-        let evidence = updates.iter().filter_map(|update| match update { Update::Attention(evidence) | Update::AttentionContext { evidence, .. } => Some(evidence), _ => None }).collect::<Vec<_>>();
-        assert_eq!(evidence.len(), 1, "known success must not be replaced by a cache-error failure alert");
+        let evidence = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::Attention(evidence) | Update::AttentionContext { evidence, .. } => {
+                    Some(evidence)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evidence.len(),
+            1,
+            "known success must not be replaced by a cache-error failure alert"
+        );
         assert_eq!(evidence[0].kind, crate::notifications::Kind::Succeeded);
-        let content = updates.iter().find_map(|update| match update {
-            Update::AttentionContext { evidence, content } if evidence.kind == crate::notifications::Kind::Succeeded => content.as_ref(),
-            _ => None,
-        }).expect("the same pre-storage frame projection must enrich success after cache failure");
+        let content = updates
+            .iter()
+            .find_map(|update| match update {
+                Update::AttentionContext { evidence, content }
+                    if evidence.kind == crate::notifications::Kind::Succeeded =>
+                {
+                    content.as_ref()
+                }
+                _ => None,
+            })
+            .expect(
+                "the same pre-storage frame projection must enrich success after cache failure",
+            );
         assert_eq!(content.preview, "Exact final response");
-        assert!(handle.failure().is_some(), "the transcript I/O failure remains visible independently of provider success");
+        assert!(
+            handle.failure().is_some(),
+            "the transcript I/O failure remains visible independently of provider success"
+        );
     }
 
     // Fake adapters carry a test-owned operational contract. Production only
@@ -5054,16 +5172,29 @@ mod tests {
                 &mut indices,
                 Event::TurnFinished { key: None, outcome },
             );
-            assert_eq!(state.requests.len(),1);
+            assert_eq!(state.requests.len(), 1);
             assert!(state.waiting);
-            assert_eq!(state.activity(),ActivityState::Waiting);
+            assert_eq!(state.activity(), ActivityState::Waiting);
             assert!(state.outcome.is_some());
-            apply_event(&mut state,&mut indices,Event::RequestResolved {id:"pending".into()});
-            apply_event(&mut state,&mut indices,Event::Waiting(false));
-            apply_event(&mut state,&mut indices,Event::Status {busy:false,detail:String::new()});
-            assert_eq!(state.activity(),ActivityState::Idle);
-            apply_event(&mut state,&mut indices,Event::TurnStarted);
-            assert_eq!(state.activity(),ActivityState::Idle);
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::RequestResolved {
+                    id: "pending".into(),
+                },
+            );
+            apply_event(&mut state, &mut indices, Event::Waiting(false));
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::Status {
+                    busy: false,
+                    detail: String::new(),
+                },
+            );
+            assert_eq!(state.activity(), ActivityState::Idle);
+            apply_event(&mut state, &mut indices, Event::TurnStarted);
+            assert_eq!(state.activity(), ActivityState::Idle);
         }
         let mut state = waiting();
         apply_event(
@@ -5627,13 +5758,22 @@ mod tests {
     }
 
     #[test]
-    fn actual_claude_late_interrupt_and_supersession_keep_new_turn_scalar_and_attention_authority() {
+    fn actual_claude_late_interrupt_and_supersession_keep_new_turn_scalar_and_attention_authority()
+    {
         struct Driver {
-            claude: Box<dyn Adapter>, interrupts: Vec<String>, ack: usize, result: usize, accepted: bool,
+            claude: Box<dyn Adapter>,
+            interrupts: Vec<String>,
+            ack: usize,
+            result: usize,
+            accepted: bool,
         }
         impl Adapter for Driver {
-            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
-            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
             fn command(&mut self, command: Command) -> Result<Step, String> {
                 let mut step = match command {
                     command @ Command::Prompt { .. } => self.claude.command(command)?,
@@ -5673,25 +5813,56 @@ mod tests {
                 initial.writes.clear();
                 assert!(initial.events.contains(&Event::Ready(true)));
                 let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-                let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(),
-                    transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(),
-                    working_directory: directory.path().into(), environment: BTreeMap::new() };
+                let spec = ProcessSpec {
+                    execution: None,
+                    messages: None,
+                    unset_environment: Default::default(),
+                    transport: TransportSpec::JsonLines,
+                    program: "/bin/cat".into(),
+                    arguments: Vec::new(),
+                    working_directory: directory.path().into(),
+                    environment: BTreeMap::new(),
+                };
                 let store = preflight(&spec, &mut initial).unwrap();
                 let (send, receive) = crossbeam_channel::unbounded();
-                let handle = LocalHandle::start(spec, Box::new(Driver { claude, interrupts: Vec::new(), ack: 0, result: 0, accepted }), initial, store, None,
-                    move |update| { let _ = send.send(update); }).unwrap();
+                let handle = LocalHandle::start(
+                    spec,
+                    Box::new(Driver {
+                        claude,
+                        interrupts: Vec::new(),
+                        ack: 0,
+                        result: 0,
+                        accepted,
+                    }),
+                    initial,
+                    store,
+                    None,
+                    move |update| {
+                        let _ = send.send(update);
+                    },
+                )
+                .unwrap();
                 until(&handle, |state| state.ready);
-                let prompt = |text: &str| Command::Prompt { text: text.into(), attachments: Vec::new(), mode: super::super::PromptMode::Send };
+                let prompt = |text: &str| Command::Prompt {
+                    text: text.into(),
+                    attachments: Vec::new(),
+                    mode: super::super::PromptMode::Send,
+                };
                 handle.command(prompt("turn A")).unwrap();
                 handle.command(Command::Interrupt).unwrap();
                 handle.command(Command::Compact).unwrap(); // Native result A, before ACK.
                 handle.command(prompt("turn B")).unwrap();
-                handle.command(Command::SetFastMode { enabled: true }).unwrap();
+                handle
+                    .command(Command::SetFastMode { enabled: true })
+                    .unwrap();
                 let before = handle.snapshot(None).unwrap();
                 assert!(before.outcome.is_none());
                 assert_eq!(before.activity(), ActivityState::Waiting);
-                if supersede { handle.command(Command::Interrupt).unwrap(); }
-                else { handle.command(Command::RefreshPermissions).unwrap(); }
+                if supersede {
+                    handle.command(Command::Interrupt).unwrap();
+                } else {
+                    handle.command(Command::RefreshPermissions).unwrap();
+                }
                 let after = handle.snapshot(None).unwrap();
                 assert_eq!(after.turn_generation, before.turn_generation);
                 assert_eq!(after.outcome, before.outcome);
@@ -5699,17 +5870,29 @@ mod tests {
                 assert_eq!(after.requests, before.requests);
                 assert_eq!(after.activity(), ActivityState::Waiting);
                 let updates = receive.try_iter().collect::<Vec<_>>();
-                let old_outcome = if !supersede && accepted { crate::notifications::Kind::Cancelled } else { crate::notifications::Kind::Succeeded };
+                let old_outcome = if !supersede && accepted {
+                    crate::notifications::Kind::Cancelled
+                } else {
+                    crate::notifications::Kind::Succeeded
+                };
                 assert_eq!(updates.iter().filter(|update| matches!(update, Update::PastAttention(evidence) if evidence.key=="claude:A" && evidence.kind==old_outcome)).count(), 1);
                 assert!(!updates.iter().any(|update| matches!(update, Update::Attention(evidence) | Update::AttentionContext { evidence, .. } if evidence.key=="claude:A")), "old proof must not replace current B journal/desktop attention");
-                handle.command(Command::SetFastMode { enabled: false }).unwrap();
+                handle
+                    .command(Command::SetFastMode { enabled: false })
+                    .unwrap();
                 handle.command(Command::Compact).unwrap(); // Native result B.
                 if supersede {
                     handle.command(Command::RefreshPermissions).unwrap(); // Late ignored A ACK.
                     handle.command(Command::RefreshPermissions).unwrap(); // Exact B ACK.
                 }
-                assert_eq!(handle.snapshot(None).unwrap().outcome,
-                    Some(if supersede && accepted { crate::agent::ActivityOutcome::Cancelled } else { crate::agent::ActivityOutcome::Succeeded }));
+                assert_eq!(
+                    handle.snapshot(None).unwrap().outcome,
+                    Some(if supersede && accepted {
+                        crate::agent::ActivityOutcome::Cancelled
+                    } else {
+                        crate::agent::ActivityOutcome::Succeeded
+                    })
+                );
                 handle.close().unwrap();
             }
         }
@@ -5942,8 +6125,11 @@ mod tests {
         assert_eq!(state.subagents[0].status, ToolStatus::Running);
         apply_event(&mut state, &mut indices, Event::Exited { code: Some(3) });
         assert_eq!(state.items[0].content.status(), Some(ToolStatus::Running));
-        assert_eq!(state.subagents[1].status, ToolStatus::Running,
-            "provider exit alone has no per-item remote/delegated completion authority");
+        assert_eq!(
+            state.subagents[1].status,
+            ToolStatus::Running,
+            "provider exit alone has no per-item remote/delegated completion authority"
+        );
     }
 
     #[test]
@@ -7360,7 +7546,6 @@ mod tests {
                 .is_err()
         );
     }
-
 
     #[test]
     fn prompt_suggestion_metadata_cannot_survive_a_turn_session_or_process_boundary() {
@@ -9696,8 +9881,19 @@ mod tests {
             vec![text("echo", "hello world world")]
         );
     }
-    fn independent_websocket_command()->Item {
-        Item {id:"background-process".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"exec_command".into(),input:"long-running independent process".into(),output:String::new(),status:ToolStatus::Running}}
+    fn independent_websocket_command() -> Item {
+        Item {
+            id: "background-process".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "exec_command".into(),
+                input: "long-running independent process".into(),
+                output: String::new(),
+                status: ToolStatus::Running,
+            },
+        }
     }
     struct WebSocketFixture;
     impl Adapter for WebSocketFixture {
@@ -9716,8 +9912,16 @@ mod tests {
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             let mut step = Echo.receive(frame.clone())?;
-            if frame["background"]==true {step.events.push(Event::Item(independent_websocket_command()));}
-            if frame["cancelled"]==true {step.events.push(Event::TurnFinished {key:Some("fixture-turn".into()),outcome:crate::notifications::Kind::Cancelled});}
+            if frame["background"] == true {
+                step.events
+                    .push(Event::Item(independent_websocket_command()));
+            }
+            if frame["cancelled"] == true {
+                step.events.push(Event::TurnFinished {
+                    key: Some("fixture-turn".into()),
+                    outcome: crate::notifications::Kind::Cancelled,
+                });
+            }
             step.events.push(Event::Status {
                 busy: frame["busy"].as_bool().unwrap_or(false),
                 detail: String::new(),
@@ -9775,7 +9979,9 @@ mod tests {
             );
             socket
                 .send(Message::Text(
-                    json!({"text": "hello", "busy": true,"background":true}).to_string().into(),
+                    json!({"text": "hello", "busy": true,"background":true})
+                        .to_string()
+                        .into(),
                 ))
                 .unwrap();
             socket
@@ -9811,7 +10017,9 @@ mod tests {
         })
         .unwrap();
         until(&handle, |snapshot| {
-            snapshot.busy && unstamped(&snapshot.items) == vec![text("echo", "hello"),independent_websocket_command()]
+            snapshot.busy
+                && unstamped(&snapshot.items)
+                    == vec![text("echo", "hello"), independent_websocket_command()]
         });
         pong_received.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(
@@ -9856,10 +10064,16 @@ mod tests {
         let snapshot = handle.snapshot(None).unwrap();
         assert!(snapshot.exited);
         assert!(!snapshot.busy);
-        assert_eq!(snapshot.outcome,Some(crate::agent::ActivityOutcome::Cancelled));
+        assert_eq!(
+            snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Cancelled)
+        );
         assert_eq!(
             unstamped(&snapshot.items),
-            vec![text("echo", "hello stopped"),independent_websocket_command()],
+            vec![
+                text("echo", "hello stopped"),
+                independent_websocket_command()
+            ],
             "disconnecting this unowned server connection cannot invent background process completion"
         );
     }
@@ -10056,17 +10270,23 @@ mod tests {
     #[test]
     fn owned_holder_cleanup_does_not_claim_remote_mcp_item_completion() {
         const ROLE: &str = "CAGENTS_REMOTE_ITEM_AUTHORITY_TEST";
-        const TEST: &str = "chat::runtime::tests::owned_holder_cleanup_does_not_claim_remote_mcp_item_completion";
+        const TEST: &str =
+            "chat::runtime::tests::owned_holder_cleanup_does_not_claim_remote_mcp_item_completion";
         match std::env::var(ROLE).as_deref() {
             Ok("server") => {
                 let listener = std::os::unix::net::UnixListener::bind(
                     std::env::var_os("CAGENTS_REMOTE_ITEM_SOCKET").unwrap(),
-                ).unwrap();
+                )
+                .unwrap();
                 let (stream, _) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
                 let mut socket = tungstenite::accept(stream).unwrap();
                 while let Ok(message) = socket.read() {
-                    if matches!(message, tungstenite::Message::Close(_)) { break; }
+                    if matches!(message, tungstenite::Message::Close(_)) {
+                        break;
+                    }
                 }
                 return;
             }
@@ -10081,51 +10301,133 @@ mod tests {
                     .env("XDG_CONFIG_HOME", directory.path().join("config"))
                     .env("XDG_CACHE_HOME", directory.path().join("cache"))
                     .env("CAGENTS_LOCAL_DEBUG", "0")
-                    .output().unwrap();
-                assert!(output.status.success(), "stdout={} stderr={}",
-                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 return;
             }
         }
         let mut source = super::super::native_holder::fixture_source();
         let boot = crate::daemon::read_boot_id().unwrap();
         source.proof.as_mut().unwrap().boot_id = boot.clone();
-        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id = boot;
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
-        let _lease = crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        let _lease =
+            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
         let spec = ProcessSpec {
-            execution: None, messages: None, unset_environment: Default::default(),
-            transport: TransportSpec::OwnedUnixWebSocket { socket: socket.clone() },
-            program: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: socket.clone(),
+            },
+            program: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             arguments: vec!["--exact".into(), TEST.into(), "--nocapture".into()],
             working_directory: directory.path().into(),
-            environment: BTreeMap::from([(ROLE.into(), "server".into()),
-                ("CAGENTS_REMOTE_ITEM_SOCKET".into(), socket.to_string_lossy().into_owned())]),
+            environment: BTreeMap::from([
+                (ROLE.into(), "server".into()),
+                (
+                    "CAGENTS_REMOTE_ITEM_SOCKET".into(),
+                    socket.to_string_lossy().into_owned(),
+                ),
+            ]),
         };
-        let remote = Item { id: "mcp-job-outside-local-family".into(), role: Role::Assistant,
-            started_at: None, at: None, content: ItemContent::Tool {
-                name: "mcp__external__long_job".into(), input: "{}".into(), output: String::new(),
+        let remote = Item {
+            id: "mcp-job-outside-local-family".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "mcp__external__long_job".into(),
+                input: "{}".into(),
+                output: String::new(),
                 status: ToolStatus::Running,
-            }};
+            },
+        };
         let mut initial = Echo.initialize().unwrap();
-        initial.events.extend([Event::TurnStarted, Event::Status { busy: true, detail: "Remote job reported".into() }, Event::Item(remote.clone())]);
+        initial.events.extend([
+            Event::TurnStarted,
+            Event::Status {
+                busy: true,
+                detail: "Remote job reported".into(),
+            },
+            Event::Item(remote.clone()),
+        ]);
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = LocalHandle::start_owned(spec, Box::new(Echo), initial, store, source.clone(), BTreeMap::new(), None, |_| {}).unwrap();
-        until(&handle, |state| state.busy && state.items.iter().any(|item| item.id == remote.id));
-        let root = crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
+        let handle = LocalHandle::start_owned(
+            spec,
+            Box::new(Echo),
+            initial,
+            store,
+            source.clone(),
+            BTreeMap::new(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+        until(&handle, |state| {
+            state.busy && state.items.iter().any(|item| item.id == remote.id)
+        });
+        let root =
+            crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native)
+                .unwrap();
         let record = crate::daemon::holder_registry::evidence(
             &crate::daemon::holder_registry::socket(&root, source.id),
             crate::daemon::holder_registry::Kind::Native,
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert!(record.root.is_current());
-        handle.close_until(Instant::now() + Duration::from_secs(10)).unwrap();
-        assert!(!record.root.is_current(), "the actual owned provider family must have closed");
-        assert_eq!(handle.snapshot(None).unwrap().items.iter().find(|item| item.id == remote.id).unwrap().content, remote.content,
-            "local family cleanup cannot manufacture a terminal result for an unbound external tool");
-        assert_eq!(handle.0.store.lock().unwrap().window().unwrap().items.iter().find(|item| item.id == remote.id).unwrap().content, remote.content,
-            "canonical source and resident projection must preserve the same last native item status");
+        handle
+            .close_until(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        assert!(
+            !record.root.is_current(),
+            "the actual owned provider family must have closed"
+        );
+        assert_eq!(
+            handle
+                .snapshot(None)
+                .unwrap()
+                .items
+                .iter()
+                .find(|item| item.id == remote.id)
+                .unwrap()
+                .content,
+            remote.content,
+            "local family cleanup cannot manufacture a terminal result for an unbound external tool"
+        );
+        assert_eq!(
+            handle
+                .0
+                .store
+                .lock()
+                .unwrap()
+                .window()
+                .unwrap()
+                .items
+                .iter()
+                .find(|item| item.id == remote.id)
+                .unwrap()
+                .content,
+            remote.content,
+            "canonical source and resident projection must preserve the same last native item status"
+        );
     }
 
     #[test]
@@ -10256,7 +10558,10 @@ mod tests {
                 assert!(!record.root.is_current());
                 continue;
             }
-            handle.fixture_retained_native_holder(holder, "Native teardown remains unconfirmed".into());
+            handle.fixture_retained_native_holder(
+                holder,
+                "Native teardown remains unconfirmed".into(),
+            );
             assert!(
                 handle
                     .close_until(Instant::now() + Duration::from_secs(2))

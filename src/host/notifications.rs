@@ -3,8 +3,8 @@
 mod batching;
 mod journal;
 mod withdrawals;
-use withdrawals::Withdrawals;
 use journal::Journal;
+use withdrawals::Withdrawals;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -187,12 +187,19 @@ impl Handle {
 
     /// Receipt confirms the FULL journal transaction, never merely enqueueing.
     /// Callers wait outside HostState and keep helper outbox entries on error.
-    pub(in crate::host) fn record_committed(&self, event: Event) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+    pub(in crate::host) fn record_committed(
+        &self,
+        event: Event,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
         event.validate()?;
         let (receipt, result) = std::sync::mpsc::channel();
         let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
-        if pending.stopped { return Err("Notification journal is stopping; outcome remains unacknowledged".into()); }
-        if pending.committed_events.len() >= MAX_PENDING { return Err("Notification commit queue is full; outcome remains unacknowledged".into()); }
+        if pending.stopped {
+            return Err("Notification journal is stopping; outcome remains unacknowledged".into());
+        }
+        if pending.committed_events.len() >= MAX_PENDING {
+            return Err("Notification commit queue is full; outcome remains unacknowledged".into());
+        }
         pending.committed_events.push_back((event, receipt));
         drop(pending);
         let _ = self.0.wake.try_send(());
@@ -873,15 +880,22 @@ async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>
 }
 
 fn record_attention_committed_policy(
-    journal:&mut Journal,mut event:Event,suppressed:bool,
-    receipt:Option<std::sync::mpsc::Sender<Result<(),String>>>,policy:&Preferences,
-)->Result<Option<Notice>,String> {
-    if !policy.message_previews {event.content=None;}
-    record_attention_committed(journal,event,suppressed,receipt)
+    journal: &mut Journal,
+    mut event: Event,
+    suppressed: bool,
+    receipt: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+    policy: &Preferences,
+) -> Result<Option<Notice>, String> {
+    if !policy.message_previews {
+        event.content = None;
+    }
+    record_attention_committed(journal, event, suppressed, receipt)
 }
 
 fn record_attention_committed(
-    journal: &mut Journal, event: Event, suppressed: bool,
+    journal: &mut Journal,
+    event: Event,
+    suppressed: bool,
     receipt: Option<std::sync::mpsc::Sender<Result<(), String>>>,
 ) -> Result<Option<crate::notifications::Notice>, String> {
     let result = journal.record(event, suppressed);
@@ -898,37 +912,91 @@ mod tests {
 
     #[test]
     fn private_default_strips_ordinary_and_receipted_actor_and_automation_events_before_commit() {
-        for previews in [false,true] {
-            let directory=tempfile::tempdir().unwrap();let path=directory.path().join("privacy.sqlite3");
-            let mut journal=Journal::open(&path).unwrap();
-            let policy=Preferences {message_previews:previews,..Default::default()};
-            for path in ["ordinary","retained","automation"] {
-                let mut event=Event::session(TerminalId::new(),crate::agent::Provider::Claude,"/repo".into(),
-                    crate::notifications::Evidence {key:path.into(),kind:crate::notifications::Kind::Succeeded});
-                if path=="automation" {event.target=Target::AgentRun(crate::model::RunId::new());}
-                event.content=Some(crate::notifications::Content {conversation:"Private conversation".into(),preview:"Private response".into(),request:None});
-                let original=event.clone();
-                let (receipt,result)=std::sync::mpsc::channel();
-                let receipt=(path!="ordinary").then_some(receipt);
-                let notice=record_attention_committed_policy(&mut journal,event,false,receipt,&policy).unwrap().unwrap();
-                if path!="ordinary" {assert_eq!(result.recv().unwrap(),Ok(()));}
-                assert_eq!(notice.event.evidence,original.evidence);
-                assert_eq!(notice.event.target,original.target);
-                assert_eq!(notice.event.content.is_some(),previews);
+        for previews in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("privacy.sqlite3");
+            let mut journal = Journal::open(&path).unwrap();
+            let policy = Preferences {
+                message_previews: previews,
+                ..Default::default()
+            };
+            for path in ["ordinary", "retained", "automation"] {
+                let mut event = Event::session(
+                    TerminalId::new(),
+                    crate::agent::Provider::Claude,
+                    "/repo".into(),
+                    crate::notifications::Evidence {
+                        key: path.into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                );
+                if path == "automation" {
+                    event.target = Target::AgentRun(crate::model::RunId::new());
+                }
+                event.content = Some(crate::notifications::Content {
+                    conversation: "Private conversation".into(),
+                    preview: "Private response".into(),
+                    request: None,
+                });
+                let original = event.clone();
+                let (receipt, result) = std::sync::mpsc::channel();
+                let receipt = (path != "ordinary").then_some(receipt);
+                let notice =
+                    record_attention_committed_policy(&mut journal, event, false, receipt, &policy)
+                        .unwrap()
+                        .unwrap();
+                if path != "ordinary" {
+                    assert_eq!(result.recv().unwrap(), Ok(()));
+                }
+                assert_eq!(notice.event.evidence, original.evidence);
+                assert_eq!(notice.event.target, original.target);
+                assert_eq!(notice.event.content.is_some(), previews);
             }
             drop(journal);
-            let mut reopened=Journal::open(&path).unwrap();
-            let notices=reopened.list().unwrap();assert_eq!(notices.len(),3);
-            assert!(notices.iter().all(|notice|notice.event.content.is_some()==previews));
+            let mut reopened = Journal::open(&path).unwrap();
+            let notices = reopened.list().unwrap();
+            assert_eq!(notices.len(), 3);
+            assert!(
+                notices
+                    .iter()
+                    .all(|notice| notice.event.content.is_some() == previews)
+            );
             if previews {
-                let before=notices.iter().map(|notice|(notice.id,notice.acknowledged)).collect::<Vec<_>>();
-                let mut snapshot=Snapshot {notices,diagnostic:None};let mut withdrawals=Withdrawals::default();
-                revoke_previews(&mut snapshot,&mut withdrawals);
+                let before = notices
+                    .iter()
+                    .map(|notice| (notice.id, notice.acknowledged))
+                    .collect::<Vec<_>>();
+                let mut snapshot = Snapshot {
+                    notices,
+                    diagnostic: None,
+                };
+                let mut withdrawals = Withdrawals::default();
+                revoke_previews(&mut snapshot, &mut withdrawals);
                 reopened.clear_content().unwrap();
-                assert!(snapshot.notices.iter().all(|notice|notice.event.content.is_none()));
-                assert_eq!(snapshot.notices.iter().map(|notice|(notice.id,notice.acknowledged)).collect::<Vec<_>>(),before);
-                assert!(snapshot.notices.iter().all(|notice|withdrawals.contains(&batching::desktop_id(&notice.event.target))));
-                assert!(reopened.list().unwrap().iter().all(|notice|notice.event.content.is_none()));
+                assert!(
+                    snapshot
+                        .notices
+                        .iter()
+                        .all(|notice| notice.event.content.is_none())
+                );
+                assert_eq!(
+                    snapshot
+                        .notices
+                        .iter()
+                        .map(|notice| (notice.id, notice.acknowledged))
+                        .collect::<Vec<_>>(),
+                    before
+                );
+                assert!(snapshot.notices.iter().all(|notice| {
+                    withdrawals.contains(&batching::desktop_id(&notice.event.target))
+                }));
+                assert!(
+                    reopened
+                        .list()
+                        .unwrap()
+                        .iter()
+                        .all(|notice| notice.event.content.is_none())
+                );
             }
         }
     }
@@ -940,25 +1008,55 @@ mod tests {
             let mut journal = Journal::open(&directory.path().join("scheduler.sqlite3")).unwrap();
             let (shared, _) = shared();
             let handle = Handle(shared.clone());
-            let mut event = Event::session(TerminalId::new(), crate::agent::Provider::Claude,
-                "/repo".into(), crate::notifications::Evidence {
+            let mut event = Event::session(
+                TerminalId::new(),
+                crate::agent::Provider::Claude,
+                "/repo".into(),
+                crate::notifications::Evidence {
                     key: "scheduler-private-content".into(),
                     kind: crate::notifications::Kind::AutomationSkipped,
-                });
-            event.target = Target::Automation { id: Uuid::new_v4(), name: "Fixture".into(), reason: "No capacity".into() };
+                },
+            );
+            event.target = Target::Automation {
+                id: Uuid::new_v4(),
+                name: "Fixture".into(),
+                reason: "No capacity".into(),
+            };
             event.content = Some(crate::notifications::Content {
-                conversation: "Private conversation".into(), preview: "Private response".into(), request: None,
+                conversation: "Private conversation".into(),
+                preview: "Private response".into(),
+                request: None,
             });
             handle.record(event.clone());
             assert!(handle.take_automation_receipts().is_empty());
-            let queued = shared.pending.lock().unwrap().automation_events.pop_front().unwrap();
+            let queued = shared
+                .pending
+                .lock()
+                .unwrap()
+                .automation_events
+                .pop_front()
+                .unwrap();
             let (reply, result) = std::sync::mpsc::channel();
-            let policy = Preferences { message_previews: previews, ..Default::default() };
-            let notice = journal_event_with_actor_receipt(&mut journal, &Arc::downgrade(&shared),
-                queued, false, Some(reply), &policy).unwrap().unwrap();
+            let policy = Preferences {
+                message_previews: previews,
+                ..Default::default()
+            };
+            let notice = journal_event_with_actor_receipt(
+                &mut journal,
+                &Arc::downgrade(&shared),
+                queued,
+                false,
+                Some(reply),
+                &policy,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
             assert_eq!(notice.event.content.is_some(), previews);
-            assert_eq!(handle.take_automation_receipts(), BTreeSet::from([event.evidence.key]));
+            assert_eq!(
+                handle.take_automation_receipts(),
+                BTreeSet::from([event.evidence.key])
+            );
             assert_eq!(journal.list().unwrap()[0].event.content.is_some(), previews);
         }
     }
@@ -976,7 +1074,11 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         );
-        event.content=Some(crate::notifications::Content {conversation:"Original turn".into(),preview:"Immutable response captured before daemon replacement".into(),request:None});
+        event.content = Some(crate::notifications::Content {
+            conversation: "Original turn".into(),
+            preview: "Immutable response captured before daemon replacement".into(),
+            request: None,
+        });
         let receipt = handle.record_committed(event.clone()).unwrap();
         assert!(
             matches!(
@@ -1761,7 +1863,6 @@ mod tests {
             "new delivery must follow withdrawal, otherwise cleanup would delete its replacement"
         );
     }
-
 }
 
 /// Return scheduler receipts only after SQLite has committed the exact evidence.
@@ -1773,19 +1874,30 @@ fn journal_event(
     event: Event,
     suppressed: bool,
 ) -> Result<Option<Notice>, String> {
-    journal_event_with_actor_receipt(journal,shared,event,suppressed,None,&Preferences::default())
+    journal_event_with_actor_receipt(
+        journal,
+        shared,
+        event,
+        suppressed,
+        None,
+        &Preferences::default(),
+    )
 }
 fn journal_event_with_actor_receipt(
-    journal: &mut journal::Journal, shared: &Weak<Shared>, event: Event, suppressed: bool,
-    actor_receipt: Option<std::sync::mpsc::Sender<Result<(),String>>>,
+    journal: &mut journal::Journal,
+    shared: &Weak<Shared>,
+    event: Event,
+    suppressed: bool,
+    actor_receipt: Option<std::sync::mpsc::Sender<Result<(), String>>>,
     policy: &Preferences,
-)->Result<Option<Notice>,String> {
+) -> Result<Option<Notice>, String> {
     let receipt = matches!(
         &event.target,
         Target::Automation { .. } | Target::AutomationProposal { .. }
     )
     .then(|| event.evidence.key.clone());
-    let result = record_attention_committed_policy(journal,event,suppressed,actor_receipt,policy);
+    let result =
+        record_attention_committed_policy(journal, event, suppressed, actor_receipt, policy);
     if result.is_ok()
         && let Some(key) = receipt
         && let Some(core) = shared.upgrade()
@@ -2059,9 +2171,22 @@ async fn run(
                 withdraw_notice(&mut withdrawals, notice);
             }
         }
-        for (event,actor_receipt) in pending.events.into_values().map(|event|(event,None))
-            .chain(pending.committed_events.into_iter().map(|(event,receipt)|(event,Some(receipt))))
-            .chain(pending.automation_events.into_iter().map(|event|(event,None)))
+        for (event, actor_receipt) in pending
+            .events
+            .into_values()
+            .map(|event| (event, None))
+            .chain(
+                pending
+                    .committed_events
+                    .into_iter()
+                    .map(|(event, receipt)| (event, Some(receipt))),
+            )
+            .chain(
+                pending
+                    .automation_events
+                    .into_iter()
+                    .map(|event| (event, None)),
+            )
         {
             if stopped(&shared) {
                 return;
@@ -2077,7 +2202,14 @@ async fn run(
                 &event.target,
                 Target::Automation { .. } | Target::AutomationProposal { .. }
             );
-            let recorded = journal_event_with_actor_receipt(journal, &shared, event, suppressed,actor_receipt,&policy);
+            let recorded = journal_event_with_actor_receipt(
+                journal,
+                &shared,
+                event,
+                suppressed,
+                actor_receipt,
+                &policy,
+            );
             if recorded.is_ok()
                 && automation
                 && let Some(host) = host.upgrade()

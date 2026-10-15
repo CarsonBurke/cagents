@@ -1851,7 +1851,11 @@ mod tests {
 
     #[test]
     fn turn_outcomes_preserve_native_tool_status_and_never_rewrite_bodies() {
-        for outcome in [crate::notifications::Kind::Cancelled,crate::notifications::Kind::Failed,crate::notifications::Kind::Succeeded] {
+        for outcome in [
+            crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed,
+            crate::notifications::Kind::Succeeded,
+        ] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let mut store = Store::at(directory.path().into()).unwrap();
             let input = "retained input".repeat(1000);
