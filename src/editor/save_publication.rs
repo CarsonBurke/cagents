@@ -32,13 +32,18 @@ fn full_version(m: &fs::Metadata) -> ((u64, u32, u32, u32, i64, i64), i64, i64) 
 pub(super) struct SaveBaseline {
     metadata: fs::Metadata,
     attributes: BTreeMap<OsString, Vec<u8>>,
-    hash: Option<blake3::Hash>,
+    hash: blake3::Hash,
     hash_limit: u64,
 }
 impl SaveBaseline {
     pub(super) fn capture(file: &File, hash: Option<blake3::Hash>) -> Result<Self, FileIoError> {
         let metadata = file.metadata().map_err(io_error)?;
         let attributes = fs_safety::content_attributes(file).map_err(io_error)?;
+        // Forced Save ignores the old loaded hash, not a concurrent writer.
+        // Capture the current descriptor's coherent bytes instead. Streaming
+        // uses fixed memory and stops at this observed length plus one byte.
+        let hash_limit = if hash.is_some() { MAX_EDITABLE_FILE_BYTES } else { metadata.len() };
+        let hash = match hash { Some(hash) => hash, None => hash_file(file, hash_limit)? };
         let after = file.metadata().map_err(io_error)?;
         if !same_file(&metadata, &after) || full_version(&metadata) != full_version(&after) {
             return Err(changed());
@@ -47,7 +52,7 @@ impl SaveBaseline {
             metadata,
             attributes,
             hash,
-            hash_limit: MAX_EDITABLE_FILE_BYTES,
+            hash_limit,
         })
     }
     pub(super) fn ensure_initial(&self, metadata: &fs::Metadata) -> Result<(), FileIoError> {
@@ -70,33 +75,28 @@ impl SaveBaseline {
         if attributes != self.attributes {
             return Err(changed());
         }
-        if let Some(expected) = self.hash {
-            let mut reader = file.try_clone().map_err(io_error)?;
-            reader.rewind().map_err(io_error)?;
-            let mut hasher = blake3::Hasher::new();
-            let mut remaining = self.hash_limit;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let capacity = (remaining.min(buffer.len() as u64 - 1) + 1) as usize;
-                let count = reader.read(&mut buffer[..capacity]).map_err(io_error)?;
-                if count == 0 {
-                    break;
-                }
-                if count as u64 > remaining {
-                    return Err(changed());
-                }
-                remaining -= count as u64;
-                hasher.update(&buffer[..count]);
-            }
-            if hasher.finalize() != expected {
-                return Err(changed());
-            }
-        }
+        if hash_file(file, self.hash_limit)? != self.hash { return Err(changed()); }
         if full_version(&before) != full_version(&file.metadata().map_err(io_error)?) {
             return Err(changed());
         }
         Ok(())
     }
+}
+fn hash_file(file: &File, limit: u64) -> Result<blake3::Hash, FileIoError> {
+    let mut reader = file.try_clone().map_err(io_error)?;
+    reader.rewind().map_err(io_error)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = limit;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let capacity = (remaining.min(buffer.len() as u64 - 1) + 1) as usize;
+        let count = reader.read(&mut buffer[..capacity]).map_err(io_error)?;
+        if count == 0 { break; }
+        if count as u64 > remaining { return Err(changed()); }
+        remaining -= count as u64;
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize())
 }
 fn changed() -> FileIoError {
     FileIoError::Io("The save target identity, contents or access metadata changed.".into())
@@ -482,6 +482,23 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), b"late");
             assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
         }
+    }
+
+    #[test]
+    fn save_acquisition_forced_save_fences_current_bytes_after_acquire_even_with_restored_mtime() {
+        let (dir, root) = fixture();
+        let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
+        let baseline = SaveBaseline::capture(&source, None).unwrap();
+        let modified = source.metadata().unwrap().modified().unwrap();
+        let error = publish_with_hooks(&root, Path::new("file"), &source, b"mine", source.metadata().unwrap().permissions(), &baseline,
+            || Ok(()), |_, private| {
+                let path = private.path().join("previous");
+                fs::write(&path, b"late")?;
+                File::options().write(true).open(path)?.set_times(fs::FileTimes::new().set_modified(modified))
+            }, |_, _| panic!("changed acquired contents must never publish"), fs_safety::sync_directory).unwrap_err();
+        assert!(error.to_string().contains("restored without replacing"), "{error}");
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"late");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

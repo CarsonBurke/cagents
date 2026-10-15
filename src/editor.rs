@@ -1109,7 +1109,8 @@ pub(crate) fn save_file_at_with_hooks(
             "The destination changed while opening the save target.".into(),
         ));
     }
-    // A forced save skips the content baseline. An ordinary save
+    // A forced save replaces the loaded baseline with a coherent digest of
+    // the current disk file; acquisition still fences later changes. An ordinary save
     // bounds the read the way `load_file` does rather than reading whatever is
     // there now: this worktree is shared with coding agents, so the
     // destination can have been replaced by a file far larger than the editor
