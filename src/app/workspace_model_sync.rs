@@ -2144,6 +2144,7 @@ mod tests {
             pending_automation_proposals: Vec::new(),
             pending_automation_proposal_count: 0,
             automation_proposal_sequence: 0,
+            automation_archive_sequence: 0,
         }
     }
 

@@ -189,6 +189,10 @@ pub struct WorkspaceModel {
     pub headless_automation_agents: Vec<crate::model::AgentId>,
     #[serde(default)]
     pub archived_automation_agents: Vec<crate::agent_execution::Agent>,
+    /// Archive availability and canonical display changes only. Live run state
+    /// transitions never invalidate a destination's bounded discovery cursor.
+    #[serde(default)]
+    pub automation_archive_sequence: u64,
     /// Exact global count and proposal-only change clock. Unrelated execution
     /// edits do not reset explicit paging or refetch a consent dialog.
     #[serde(default)]

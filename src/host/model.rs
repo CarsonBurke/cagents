@@ -24,6 +24,7 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod automation_archive_clock;
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -34,7 +35,7 @@ mod navigation;
 mod terminal_owners;
 mod views;
 
-pub(super) const SCHEMA_VERSION: u32 = 13;
+pub(super) const SCHEMA_VERSION: u32 = 14;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -198,6 +199,7 @@ impl Registry {
                 .pending_automation_proposals_page(None, crate::automations::PROPOSAL_PAGE_SIZE)?,
             pending_automation_proposal_count: self.pending_automation_proposal_count()?,
             automation_proposal_sequence: self.automation_proposal_sequence()?,
+            automation_archive_sequence: self.automation_archive_sequence()?,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
             identity,
@@ -631,6 +633,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 13 {
         migrate_automation_extensions(db)?;
+    }
+    if version < 14 {
+        automation_archive_clock::migrate(db)?;
     }
     Ok(())
 }

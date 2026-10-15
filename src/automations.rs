@@ -110,7 +110,7 @@ pub enum Request {
     ArchivedAgents {
         scope: agent_execution::Placement,
         identity: Uuid,
-        sequence: u64,
+        archive_sequence: u64,
         after: Option<AgentId>,
         limit: usize,
     },
@@ -151,7 +151,7 @@ pub enum Response {
 pub struct ArchiveAgentPage {
     pub scope: agent_execution::Placement,
     pub identity: Uuid,
-    pub sequence: u64,
+    pub archive_sequence: u64,
     pub proof: crate::model::HostSessionProof,
     pub agents: Vec<agent_execution::Agent>,
     pub next: Option<AgentId>,

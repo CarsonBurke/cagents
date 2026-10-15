@@ -4032,6 +4032,7 @@ mod tests {
                 pending_automation_proposals: Vec::new(),
                 pending_automation_proposal_count: 0,
                 automation_proposal_sequence: 0,
+                automation_archive_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4291,6 +4292,7 @@ mod tests {
                 pending_automation_proposals: Vec::new(),
                 pending_automation_proposal_count: 0,
                 automation_proposal_sequence: 0,
+                automation_archive_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4359,6 +4361,7 @@ mod tests {
                 pending_automation_proposals: Vec::new(),
                 pending_automation_proposal_count: 0,
                 automation_proposal_sequence: 0,
+                automation_archive_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4488,6 +4491,7 @@ mod tests {
                         pending_automation_proposals: Vec::new(),
                         pending_automation_proposal_count: 0,
                         automation_proposal_sequence: 0,
+                        automation_archive_sequence: 0,
                     },
                 ),
             )
@@ -4554,6 +4558,7 @@ mod tests {
             pending_automation_proposals: Vec::new(),
             pending_automation_proposal_count: 0,
             automation_proposal_sequence: 0,
+            automation_archive_sequence: 0,
         }
     }
 

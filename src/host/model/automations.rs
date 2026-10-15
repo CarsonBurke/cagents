@@ -101,20 +101,20 @@ impl Registry {
         &self,
         scope: crate::agent_execution::Placement,
         identity: Uuid,
-        sequence: u64,
+        archive_sequence: u64,
         after: Option<crate::model::AgentId>,
         limit: usize,
         proof: crate::model::HostSessionProof,
     ) -> Result<crate::automations::ArchiveAgentPage, String> {
-        let (current_identity, current_sequence): (String, u64) = self
+        let (current_identity, current_archive_sequence): (String, u64) = self
             .db
             .query_row(
-                "SELECT identity,sequence FROM metadata WHERE key=0",
+                "SELECT identity,automation_archive_sequence FROM metadata WHERE key=0",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| error.to_string())?;
-        if current_identity != identity.to_string() || current_sequence != sequence {
+        if current_identity != identity.to_string() || current_archive_sequence != archive_sequence {
             return Err(
                 "The workspace changed during saved-result discovery; retry its current model"
                     .into(),
@@ -185,7 +185,7 @@ impl Registry {
         Ok(crate::automations::ArchiveAgentPage {
             scope,
             identity,
-            sequence,
+            archive_sequence,
             proof,
             agents,
             next: more.then_some(last).flatten(),
@@ -463,10 +463,13 @@ impl Registry {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub(crate) fn prune_automation_history(&mut self, now_ms: u64) -> Result<(), String> {
+    pub(crate) fn prune_automation_history(&mut self, now_ms: u64) -> Result<bool, String> {
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let before:u64=tx.query_row("SELECT automation_archive_sequence FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
         prune_history(&tx, now_ms, None)?;
-        tx.commit().map_err(|error| error.to_string())
+        let after:u64=tx.query_row("SELECT automation_archive_sequence FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(before!=after)
     }
 
     pub(crate) fn headless_automation_agents(&self) -> Result<Vec<crate::model::AgentId>, String> {
@@ -4806,6 +4809,10 @@ mod tests {
             retained_agents.push(saved);
         }
         let first = first.unwrap();
+        let unrelated = registry.submit_agent(&crate::agent_execution::Origin::User,&crate::agent_execution::Submit {
+            name:None,destination:crate::agent_execution::Destination::New(definition.agent.clone()),prompt:"Unrelated concurrent work".into(),idempotency_key:Uuid::new_v4().to_string(),
+        },3000).unwrap();
+        let mut noisy = registry.update_agent_run(unrelated.run.id,unrelated.run.revision,crate::agent_execution::Update::Started {provider_key:"unrelated-turn".into()},3001).unwrap();
         let model = registry.model().unwrap();
         assert!(!model.archived_automation_agents.is_empty());
         assert!(model.archived_automation_agents.len() <= ARCHIVED_AGENT_PUSH_ROWS);
@@ -4839,7 +4846,7 @@ mod tests {
             .archived_automation_agents_page(
                 first.placement.clone(),
                 model.identity,
-                model.sequence,
+                model.automation_archive_sequence,
                 None,
                 64,
                 proof.clone(),
@@ -4850,11 +4857,17 @@ mod tests {
         let mut after = None;
         let mut seen = std::collections::HashSet::new();
         loop {
+            // A real unrelated run transition occurs between every page. It
+            // advances model watches while preserving archive cursor authority.
+            let update=if noisy.state==crate::agent_execution::State::Waiting {crate::agent_execution::Update::Resumed} else {crate::agent_execution::Update::Waiting};
+            noisy=registry.update_agent_run(noisy.id,noisy.revision,update,3002).unwrap();
+            assert!(registry.execution_sequence().unwrap()>model.sequence);
+            assert_eq!(registry.automation_archive_sequence().unwrap(),model.automation_archive_sequence);
             let page = registry
                 .archived_automation_agents_page(
                     worktree.clone(),
                     model.identity,
-                    model.sequence,
+                    model.automation_archive_sequence,
                     after,
                     64,
                     proof.clone(),
@@ -4884,23 +4897,19 @@ mod tests {
             )
             .is_ok()
         );
-        registry
-            .db
-            .execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
-            .unwrap();
-        assert!(
-            registry
-                .archived_automation_agents_page(
-                    first.placement,
-                    model.identity,
-                    model.sequence,
-                    None,
-                    64,
-                    proof
-                )
-                .is_err(),
-            "a changed view/model must restart discovery before using its old cursor"
-        );
+        let original_scope=first.placement.clone();
+        registry.apply(&ModelEdit::SeedView {scope:worktree.clone(),panes:vec![crate::workspace_model::views::Pane {
+            id:crate::model::CardId::from_uuid(first.id.as_uuid()),title:"Moved saved result".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,kind:crate::model::CardKind::Chat(session.clone()),scope:None,
+        }],closed:vec![]}).unwrap();
+        assert!(registry.automation_archive_sequence().unwrap()>model.automation_archive_sequence);
+        assert!(registry.archived_automation_agents_page(original_scope.clone(),model.identity,model.automation_archive_sequence,None,64,proof.clone()).is_err(),"a real canonical display move invalidates the old cursor");
+        let moved=registry.model().unwrap();
+        assert_eq!(moved.agent_view_scope(&first),Some(&worktree));
+        assert!(registry.archived_automation_agents_page(original_scope,model.identity,moved.automation_archive_sequence,None,64,proof.clone()).unwrap().agents.is_empty(),"moved saved result cannot recreate its old destination");
+        registry.db.execute("DELETE FROM automation_snapshots WHERE agent=?1",[first.id.to_string()]).unwrap();
+        assert!(registry.automation_archive_sequence().unwrap()>moved.automation_archive_sequence);
+        assert!(registry.archived_automation_agents_page(first.placement.clone(),model.identity,moved.automation_archive_sequence,None,64,proof).is_err(),"actual snapshot retirement invalidates prior archive discovery authority");
+        assert!(registry.archived_automation_conversation(first.id).is_err());
     }
 
     #[test]
@@ -4921,7 +4930,7 @@ mod tests {
         let Some(crate::agent_execution::HostedSession::Chat(session)) = &agent.session else {
             unreachable!()
         };
-        let error = registry.archived_automation_agents_page(agent.placement.clone(),model.identity,model.sequence,None,64,session.proof.clone().unwrap()).unwrap_err();
+        let error = registry.archived_automation_agents_page(agent.placement.clone(),model.identity,model.automation_archive_sequence,None,64,session.proof.clone().unwrap()).unwrap_err();
         assert!(error.contains("descriptor exceeds"), "{error}");
     }
 
@@ -4982,7 +4991,7 @@ mod tests {
             .archived_automation_agents_page(
                 agent.placement.clone(),
                 model.identity,
-                model.sequence,
+                model.automation_archive_sequence,
                 None,
                 64,
                 proof,
