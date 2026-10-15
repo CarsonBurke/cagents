@@ -4164,7 +4164,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 continue;
             }
             let reference = String::from_utf8_lossy(record[0]).into_owned();
-            let oid = Oid::parse_object(&String::from_utf8_lossy(record[1]))?;
+            let oid = Oid::parse_object(String::from_utf8_lossy(record[1]).into_owned())
+                .map_err(|error| RepositoryError::InvalidOutput {
+                    field: "stash object id",
+                    reason: error.to_string(),
+                })?;
             entries.push(StashEntry {
                 reference,
                 oid,
