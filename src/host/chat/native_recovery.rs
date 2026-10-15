@@ -79,6 +79,7 @@ pub(super) fn restore(
     client: ClientId,
     source: &Session,
 ) -> Result<ServerResponse, String> {
+    super::super::session_locations::observer_registry(host)?;
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
@@ -172,6 +173,7 @@ fn restore_authenticated(
     record: registry::Record,
     recovery: chat::native_holder::Recovery,
 ) -> Result<ServerResponse, String> {
+    super::super::session_locations::observer_registry(host)?;
     let mut retained: Vec<_> = recovery
         .previous_sources
         .iter()

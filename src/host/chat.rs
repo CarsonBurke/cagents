@@ -853,6 +853,7 @@ fn start_with_execution(
     retained_sources: &[crate::agent_execution::HostedSession],
     execution_directory: Option<&std::path::Path>,
 ) -> Result<ServerResponse, ProtocolError> {
+    super::session_locations::observer_registry(host).map_err(unavailable)?;
     let requested_source = session.clone();
     retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
     if restart_launch.is_none()
