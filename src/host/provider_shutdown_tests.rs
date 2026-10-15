@@ -1,11 +1,11 @@
 //! Actual private holder/receipt failure through the provider shutdown caller.
 //! This exercises local lifecycle ownership, not a real provider conversation.
 use super::*;
-use std::os::unix::fs::OpenOptionsExt;
 use crate::{
     model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
     terminal::{TerminalConfig, TerminalHandle},
 };
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs::File,
     os::fd::{AsRawFd, FromRawFd},
@@ -26,35 +26,63 @@ impl TestChild {
     fn spawn(command: &mut Command) -> io::Result<Self> {
         let reservation = crate::daemon::child_reaper::reserve()?;
         let child = command.spawn()?;
-        let mut owner = Self { child: Some(child), pin: None, reservation: Some(reservation), signal_allowed: false };
+        let mut owner = Self {
+            child: Some(child),
+            pin: None,
+            reservation: Some(reservation),
+            signal_allowed: false,
+        };
         let pid = owner.child.as_ref().unwrap().id() as i32;
         let before = crate::daemon::holder_registry::Process::read(pid)?;
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 { return Err(io::Error::last_os_error()); }
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
         owner.pin = Some(unsafe { File::from_raw_fd(fd as i32) });
-        if crate::daemon::holder_registry::Process::read(pid)? != before { return Err(io::Error::other("fixture child changed before pidfd capture")); }
+        if crate::daemon::holder_registry::Process::read(pid)? != before {
+            return Err(io::Error::other(
+                "fixture child changed before pidfd capture",
+            ));
+        }
         // A retained original Child plus a live kernel-child pidfd establishes
         // authority; no late numeric PID is used for cancellation or waiting.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        if unsafe { libc::waitid(libc::P_PIDFD, fd as libc::id_t, &raw mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG) } != 0 {
+        if unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd as libc::id_t,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        } != 0
+        {
             return Err(io::Error::last_os_error());
         }
         owner.signal_allowed = true;
         Ok(owner)
     }
     fn status(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        let status = self.child.as_mut().expect("original fixture child is owned").try_wait()?;
+        let status = self
+            .child
+            .as_mut()
+            .expect("original fixture child is owned")
+            .try_wait()?;
         if status.is_some() {
-            self.child.take(); self.pin.take(); self.reservation.take();
+            self.child.take();
+            self.pin.take();
+            self.reservation.take();
         }
         Ok(status)
     }
 }
 impl Drop for TestChild {
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else { return; };
-        if matches!(child.try_wait(), Ok(Some(_))) { return; }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
         let reservation = self.reservation.take().expect("reserved before spawn");
         reservation.quarantine();
         let Some(pin) = self.pin.take() else {
@@ -62,11 +90,22 @@ impl Drop for TestChild {
             return;
         };
         if !self.signal_allowed {
-            reservation.preserve_suspended(child, Some(pin), "fixture pidfd kernel-child verification failed");
+            reservation.preserve_suspended(
+                child,
+                Some(pin),
+                "fixture pidfd kernel-child verification failed",
+            );
             return;
         }
-        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pin.as_raw_fd(), libc::SIGKILL,
-            std::ptr::null::<libc::siginfo_t>(), 0); }
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pin.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
         // Never block the test thread in wait(). Failed transfer retains every
         // original object in its preallocated suspended slot.
         if let Err((error, child, pin, reservation)) = reservation.retain(child, pin) {
@@ -78,20 +117,38 @@ impl Drop for TestChild {
 struct FixtureDirectory(Option<tempfile::TempDir>);
 impl Drop for FixtureDirectory {
     fn drop(&mut self) {
-        if let Some(directory) = self.0.take() { directory.keep(); }
+        if let Some(directory) = self.0.take() {
+            directory.keep();
+        }
     }
 }
 const LOG_LIMIT: usize = 1024 * 1024;
-struct Captured<R> { pipe: R, log: File, bytes: Vec<u8>, truncated: bool }
+struct Captured<R> {
+    pipe: R,
+    log: File,
+    bytes: Vec<u8>,
+    truncated: bool,
+}
 impl<R: io::Read + AsRawFd> Captured<R> {
     fn new(pipe: R, path: &Path) -> io::Result<Self> {
         let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        if flags < 0
+            || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
             return Err(io::Error::last_os_error());
         }
-        let log = fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path)?;
-        Ok(Self { pipe, log, bytes: Vec::new(), truncated: false })
+        let log = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        Ok(Self {
+            pipe,
+            log,
+            bytes: Vec::new(),
+            truncated: false,
+        })
     }
     fn drain(&mut self) -> io::Result<()> {
         use io::{Read, Write};
@@ -108,13 +165,15 @@ impl<R: io::Read + AsRawFd> Captured<R> {
                     self.truncated |= kept != count;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
         }
         Ok(())
     }
-    fn text(&self) -> std::borrow::Cow<'_, str> { String::from_utf8_lossy(&self.bytes) }
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes)
+    }
 }
 
 fn session(id: u128, root: &Path) -> TerminalSession {
@@ -177,7 +236,12 @@ fn start_time(pid: u32) -> io::Result<String> {
 fn original_is_current(expected: &crate::daemon::holder_registry::Process) -> bool {
     match crate::daemon::holder_registry::Process::read(expected.pid) {
         Ok(actual) => actual == *expected,
-        Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => false,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            false
+        }
         Err(error) => panic!("inspect the pinned original fixture process: {error}"),
     }
 }
@@ -191,37 +255,88 @@ fn private_runtime(test: &str) -> Option<std::path::PathBuf> {
             fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut child = TestChild::spawn(Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--test-threads=1", "--color=never"])
-            .env_clear().env(ROOT, &root)
-            .env("HOME", root.join("home"))
-            .env("XDG_RUNTIME_DIR", root.join("run"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env("PATH", "/usr/bin:/bin")
-            .stdout(Stdio::piped()).stderr(Stdio::piped())).unwrap();
-        let mut stdout = Captured::new(child.child.as_mut().unwrap().stdout.take().unwrap(), &root.join("test.stdout")).unwrap();
-        let mut stderr = Captured::new(child.child.as_mut().unwrap().stderr.take().unwrap(), &root.join("test.stderr")).unwrap();
+        let mut child = TestChild::spawn(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--test-threads=1", "--color=never"])
+                .env_clear()
+                .env(ROOT, &root)
+                .env("HOME", root.join("home"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env("PATH", "/usr/bin:/bin")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
+        let mut stdout = Captured::new(
+            child.child.as_mut().unwrap().stdout.take().unwrap(),
+            &root.join("test.stdout"),
+        )
+        .unwrap();
+        let mut stderr = Captured::new(
+            child.child.as_mut().unwrap().stderr.take().unwrap(),
+            &root.join("test.stderr"),
+        )
+        .unwrap();
         let status = loop {
-            stdout.drain().unwrap(); stderr.drain().unwrap();
-            if let Some(status) = child.status().unwrap() { break Some(status); }
-            if Instant::now() >= deadline { break None; }
-            thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(5)));
+            stdout.drain().unwrap();
+            stderr.drain().unwrap();
+            if let Some(status) = child.status().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5)),
+            );
         };
         // If timed out, Drop signals only the prevalidated original pidfd and
         // transfers the original Child into its already-reserved reaper slot.
         // No blocking wait or unbounded reader-thread join follows a deadline.
         drop(child);
-        stdout.drain().unwrap(); stderr.drain().unwrap();
+        stdout.drain().unwrap();
+        stderr.drain().unwrap();
         let output = stdout.text();
-        assert!(status.is_some_and(|status| status.success()),
-            "private provider shutdown failed or exceeded30s; retained {}:\n{}\n{}", root.display(), output, stderr.text());
-        assert!(!stdout.truncated && !stderr.truncated, "fixture output exceeded bounded logs at {}", root.display());
-        assert_eq!(output.lines().filter(|line| *line == "running 1 test").count(), 1, "{output}");
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "private provider shutdown failed or exceeded30s; retained {}:\n{}\n{}",
+            root.display(),
+            output,
+            stderr.text()
+        );
+        assert!(
+            !stdout.truncated && !stderr.truncated,
+            "fixture output exceeded bounded logs at {}",
+            root.display()
+        );
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| *line == "running 1 test")
+                .count(),
+            1,
+            "{output}"
+        );
         let passed = format!("test {test} ... ok");
-        assert_eq!(output.lines().filter(|line| *line == passed).count(), 1, "{output}");
-        assert_eq!(output.lines().filter(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")).count(), 1, "{output}");
+        assert_eq!(
+            output.lines().filter(|line| *line == passed).count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line
+                    .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"))
+                .count(),
+            1,
+            "{output}"
+        );
         // Keep the bounded private artifacts until the external strict wrapper
         // independently proves whole-family settlement; Child exit alone does
         // not establish that every fixture descendant has finished.
@@ -654,7 +769,9 @@ fn two_contended_provider_owners_do_not_starve_a_healthy_chat_or_terminal() {
                     || error.raw_os_error() == Some(libc::ESRCH) => {}
             Err(error) => panic!("inspect the healthy terminal root: {error}"),
         }
-        assert!(original_is_current(&first_record.root) && original_is_current(&second_record.root));
+        assert!(
+            original_is_current(&first_record.root) && original_is_current(&second_record.root)
+        );
         drop(release_first);
         drop(release_second);
     });
@@ -712,32 +829,55 @@ fn semantic_batch_keeps_more_sources_than_its_ticket_capacity() {
     );
 }
 
-
 #[test]
 fn fixture_child_drop_reaps_only_the_original_and_preserves_its_neighbor() {
     const TEST: &str = "host::provider_shutdown_tests::fixture_child_drop_reaps_only_the_original_and_preserves_its_neighbor";
-    let Some(root) = private_runtime(TEST) else { return; };
+    let Some(root) = private_runtime(TEST) else {
+        return;
+    };
     assert!(!crate::daemon::child_reaper::has_outstanding_ownership());
-    let spawn = || TestChild::spawn(Command::new("/bin/sleep").arg("60")
-        .env_clear().current_dir(&root).stdin(Stdio::null())
-        .stdout(Stdio::null()).stderr(Stdio::null())).unwrap();
+    let spawn = || {
+        TestChild::spawn(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .env_clear()
+                .current_dir(&root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap()
+    };
     let original = spawn();
     let neighbor = spawn();
-    let first = crate::daemon::holder_registry::Process::read(original.child.as_ref().unwrap().id() as i32).unwrap();
-    let other = crate::daemon::holder_registry::Process::read(neighbor.child.as_ref().unwrap().id() as i32).unwrap();
+    let first =
+        crate::daemon::holder_registry::Process::read(original.child.as_ref().unwrap().id() as i32)
+            .unwrap();
+    let other =
+        crate::daemon::holder_registry::Process::read(neighbor.child.as_ref().unwrap().id() as i32)
+            .unwrap();
     assert!(original_is_current(&first) && original_is_current(&other));
     drop(original);
     let deadline = Instant::now() + Duration::from_secs(5);
     while original_is_current(&first) {
-        assert!(Instant::now() < deadline, "the exact original Child was not reaped");
-        assert!(original_is_current(&other), "fixture cleanup touched its neighboring owner");
+        assert!(
+            Instant::now() < deadline,
+            "the exact original Child was not reaped"
+        );
+        assert!(
+            original_is_current(&other),
+            "fixture cleanup touched its neighboring owner"
+        );
         thread::sleep(Duration::from_millis(5));
     }
     assert!(original_is_current(&other));
     drop(neighbor);
     let deadline = Instant::now() + Duration::from_secs(5);
     while original_is_current(&other) || crate::daemon::child_reaper::has_outstanding_ownership() {
-        assert!(Instant::now() < deadline, "fixture cleanup still owns an original child or reservation");
+        assert!(
+            Instant::now() < deadline,
+            "fixture cleanup still owns an original child or reservation"
+        );
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -747,7 +887,9 @@ fn fixture_output_overflow_is_bounded_and_cannot_count_as_a_passing_oracle() {
     use io::Write;
     use std::os::unix::net::UnixStream;
     const TEST: &str = "host::provider_shutdown_tests::fixture_output_overflow_is_bounded_and_cannot_count_as_a_passing_oracle";
-    let Some(root) = private_runtime(TEST) else { return; };
+    let Some(root) = private_runtime(TEST) else {
+        return;
+    };
     let (reader, mut writer) = UnixStream::pair().unwrap();
     writer.set_nonblocking(true).unwrap();
     let path = root.join("overflow.log");
@@ -756,17 +898,25 @@ fn fixture_output_overflow_is_bounded_and_cannot_count_as_a_passing_oracle() {
     let mut sent = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
     while sent < LOG_LIMIT + bytes.len() {
-        assert!(Instant::now() < deadline, "bounded fixture capture made no progress");
+        assert!(
+            Instant::now() < deadline,
+            "bounded fixture capture made no progress"
+        );
         match writer.write(&bytes) {
             Ok(count) => sent += count,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => panic!("write fixture overflow: {error}"),
         }
         capture.drain().unwrap();
     }
     drop(writer);
     capture.drain().unwrap();
-    assert!(capture.truncated, "excess output must refuse fixture success");
+    assert!(
+        capture.truncated,
+        "excess output must refuse fixture success"
+    );
     assert_eq!(capture.bytes.len(), LOG_LIMIT);
     assert_eq!(fs::metadata(path).unwrap().len(), LOG_LIMIT as u64);
 }
