@@ -19897,6 +19897,7 @@ impl Application for Cagents {
                         }
                     }
                     SidebarAction::RefreshWorktree { key } => {
+                        self.retry_failed_initial_git_reader(&key);
                         if self.source_control_is_bound(&key) {
                             if let Some(source) = self.sidebar_model.source_control.as_mut() {
                                 source.ignored_directory_errors.clear();

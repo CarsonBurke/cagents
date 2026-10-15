@@ -65,6 +65,10 @@ impl Binding {
         }
         Ok(())
     }
+    pub(super) fn initial_capture_failed(&self) -> bool {
+        self.read_source.is_none() && matches!(self.initial_reader.get(), Some(Err(_)))
+    }
+
     /// Pure retirement, including a capture which has not completed yet.
     pub(super) fn invalidate(&self) {
         self.retired.store(true, std::sync::atomic::Ordering::Release);

@@ -28,10 +28,26 @@ impl Cagents {
             .map(|pending| pending.binding.clone())
     }
 
+    /// An explicit retry can replace an actor which never captured an
+    /// authority or produced any displayed bytes. A qualified reader is never
+    /// rebound this way, including after a physical validation failure.
+    pub(super) fn retry_failed_initial_git_reader(&mut self, key: &ActiveWorktreeKey) {
+        let Some(old) = self.refresh_ui.source_binding.as_ref()
+            .filter(|binding| binding.key == *key && binding.initial_capture_failed()) else { return; };
+        old.invalidate();
+        self.cancel_source_read();
+        let binding = git_binding::Binding::new(key.clone());
+        if let Some(model) = self.sidebar_model.source_control.as_mut().filter(|model| model.key == *key) {
+            model.set_command_binding_id(binding.id);
+        }
+        self.refresh_ui.source_binding = Some(binding);
+    }
+
     /// Initialize the original scope off thread before constructing a runtime
     /// or issuing its first read. Concurrent panel/pane reads share one capture.
     pub(super) fn start_repository_reader(&mut self, card: CardId, view: RepositoryView) -> Task<Message> {
         let Some(key) = self.repository_view_key(&view) else { return Task::none(); };
+        self.retry_failed_initial_git_reader(&key);
         let binding = self.refresh_ui.source_binding.as_ref().filter(|binding| binding.key == key).cloned()
             .or_else(|| self.retained_runtime_git_binding(&key))
             .or_else(|| self.pending_runtime_git_binding(&key))
@@ -277,6 +293,39 @@ mod tests {
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!() };
         assert_eq!(runtime.descriptor, view);
         assert!(runtime.git_read_source().unwrap().same_source(&original));
+    }
+
+    #[tokio::test]
+    async fn actual_retry_after_initial_capture_failure_mints_a_new_unqualified_actor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        git_binding::tests::init(&root, "original\n");
+        let (source_app, key) = git_binding::tests::app_for(&root);
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_model = source_app.sidebar_model;
+        let view = RepositoryView { project: key.project_id, repository: root.clone(),
+            worktree: root.clone(), selected_file: Some("file.txt".into()) };
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(view.clone());
+        let binding = git_binding::Binding::new(key.clone());
+        let failed_actor = binding.id;
+        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(binding.id);
+        app.refresh_ui.source_binding = Some(binding);
+        std::fs::rename(root.join(".git"), directory.path().join("parked-git")).unwrap();
+        let opening = app.attach_repository_pane(card, view);
+        let failed = worker(opening).await;
+        assert!(matches!(&failed, Message::RepositoryReaderReady { result: Err(_), .. }));
+        drop(app.update(failed));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        assert!(app.refresh_ui.source_binding.as_ref().unwrap().initial_capture_failed());
+        std::fs::rename(directory.path().join("parked-git"), root.join(".git")).unwrap();
+        let retry = app.update(Message::RetryCard(card));
+        assert_ne!(app.refresh_ui.source_binding.as_ref().unwrap().id, failed_actor);
+        let ready = worker(retry).await;
+        drop(app.update(ready));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!() };
+        assert_ne!(runtime.git_read_source().unwrap().id(), failed_actor);
+        assert!(runtime.git_read_source().unwrap().is_available());
     }
 
     #[test]
