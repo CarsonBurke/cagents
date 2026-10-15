@@ -124,20 +124,11 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
-        if self.remove_dialog.is_some() {
-            return widget::Id::new("dialog.project.remove.confirm");
-        }
-        widget::Id::new(
-            if self
-                .dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.blocker.is_some())
-            {
-                "dialog.project.close"
-            } else {
-                "dialog.project.confirm"
-            },
-        )
+        widget::Id::new(if self.remove_dialog.is_some() {
+            "dialog.project.remove.cancel"
+        } else {
+            "dialog.project.close"
+        })
     }
 }
 
@@ -1741,6 +1732,7 @@ impl Cagents {
                     }),
                     super::dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Cancel")
+                            .id(widget::Id::new("dialog.project.remove.cancel"))
                             .on_press(Message::ProjectUi(Action::Dismiss)),
                         crate::ui_controls::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
@@ -2338,6 +2330,27 @@ mod tests {
             .iter()
             .flat_map(|project| &project.worktrees)
             .find(|worktree| worktree.id == id)
+    }
+
+    #[test]
+    fn project_and_worktree_deletion_start_on_cancel_and_enter_keeps_them() {
+        for remove in [false,true] {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+            let linked = SidebarWorktree::from_durable(WorktreeId::new(),repository.join("worktrees/topic"),Some("topic".into()));
+            let (mut app,_directory,project) = deletable_app(&repository,&linked,&primary);
+            let opening = app.handle_project_action(Action::Command {project_id:project,worktree_id:(!remove).then_some(linked.id),command:if remove {ProjectCommand::Remove} else {ProjectCommand::Delete}});
+            let cancel = widget::Id::new(if remove {"dialog.project.remove.cancel"} else {"dialog.project.close"});
+            assert_eq!(super::super::tests::focused_element(app.project_dialog_view().unwrap(),opening),Some(cancel.clone()));
+            let message = super::super::dialog_ui::tests::enter_control(app.project_dialog_view().unwrap(),cancel);
+            assert!(matches!(message,Message::ProjectUi(Action::Dismiss)));
+            drop(app.update(message));
+            assert!(!app.project_ui.modal_open());
+            assert!(app.sidebar_model.project(project).is_some());
+            assert!(row(&app,linked.id).is_some());
+            assert!(app.project_ui.removing.is_empty());
+            assert!(app.project_ui.deletions.is_empty());
+        }
     }
 
     #[test]
