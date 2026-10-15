@@ -770,7 +770,7 @@ mod tests {
             boot_id: crate::daemon::read_boot_id().unwrap(),
             host_incarnation: HostIncarnation::new("original"),
         };
-        let source = chat::Session {
+        let source = chat::Session { archive_report: None,
             id: TerminalId::new(),
             launch: chat::Launch {
                 provider,

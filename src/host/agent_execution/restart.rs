@@ -468,7 +468,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        let session = chat::Session {
+        let session = chat::Session { archive_report: None,
             id,
             launch: chat::Launch {
                 provider: crate::agent::Provider::Claude,

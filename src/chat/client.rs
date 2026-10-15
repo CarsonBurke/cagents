@@ -2113,7 +2113,7 @@ mod tests {
     #[test]
     fn completed_handoff_retains_exact_operation_proof_without_a_live_continuity_claim() {
         let terminal = handoff_terminal();
-        let source = Session {
+        let source = Session { archive_report: None,
             id: TerminalId::new(),
             proof: Some(handoff_proof()),
             launch: crate::chat::Launch {
@@ -2157,7 +2157,7 @@ mod tests {
     #[test]
     fn typed_handoff_ack_transmits_the_complete_operation_and_preserves_refusals() {
         let terminal = handoff_terminal();
-        let source = Session {
+        let source = Session { archive_report: None,
             id: TerminalId::new(),
             proof: Some(handoff_proof()),
             launch: crate::chat::Launch {

@@ -2263,7 +2263,7 @@ mod tests {
     #[test]
     fn retained_claude_shape_is_typed_and_never_relaxes_codex_durability() {
         use super::*;
-        let mut session = Session {
+        let mut session = Session { archive_report: None,
             id: crate::model::TerminalId::new(),
             launch: Launch {
                 provider: Provider::Claude,

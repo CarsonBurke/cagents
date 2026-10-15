@@ -475,7 +475,7 @@ mod tests {
         let instance = uuid::Uuid::new_v4();
         let session = {
             let mut state = fixture.host.lock().unwrap();
-            let session = chat::Session {
+            let session = chat::Session { archive_report: None,
                 id,
                 launch: chat::Launch {
                     provider: Provider::Claude,
@@ -1002,7 +1002,7 @@ mod tests {
             let mut recipe = LaunchRecipe::shell(root.clone()).unwrap();
             recipe.program = "claude".into();
             recipe.arguments = vec!["--resume".into(), thread.clone()];
-            let source = chat::Session {
+            let source = chat::Session { archive_report: None,
                 id: crate::model::TerminalId::new(),
                 launch: Launch {
                     provider: Provider::Claude,
@@ -1191,7 +1191,7 @@ mod tests {
         let id = crate::model::TerminalId::new();
         let source = {
             let mut state = fixture.host.lock().unwrap();
-            let source = chat::Session {
+            let source = chat::Session { archive_report: None,
                 id,
                 launch: chat::Launch {
                     provider: Provider::Claude,

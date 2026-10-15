@@ -1164,7 +1164,7 @@ mod removal_source_tests {
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let session = crate::chat::Session {
+        let session = crate::chat::Session { archive_report: None,
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,

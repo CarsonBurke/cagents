@@ -2262,7 +2262,7 @@ mod tests {
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let source = crate::chat::Session {
+        let source = crate::chat::Session { archive_report: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Omp,

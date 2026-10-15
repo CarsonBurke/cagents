@@ -2342,7 +2342,7 @@ mod tests {
         for same_chat_id in [false, true] {
             let (mut app, channel, _, mut pane) = removal_fixture();
             let recipe = LaunchRecipe::shell(PathBuf::from("/repo")).unwrap();
-            let chat = crate::chat::Session {
+            let chat = crate::chat::Session { archive_report: None,
                 id: TerminalId::new(),
                 launch: crate::chat::Launch {
                     provider: crate::agent::Provider::Claude,

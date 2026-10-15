@@ -5199,7 +5199,7 @@ mod tests {
             unset_environment: ["CLAUDE_CONFIG_DIR".into()].into(),
         };
         let spec = ProcessSpec::from(&recipe);
-        let source = super::super::Session {
+        let source = super::super::Session { archive_report: None,
             id: crate::model::TerminalId::new(),
             proof: None,
             terminal: None,

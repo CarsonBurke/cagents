@@ -2733,7 +2733,7 @@ mod tests {
             environment: BTreeMap::new(),
             unset_environment: Default::default(),
         };
-        let source = chat::Session {
+        let source = chat::Session { archive_report: None,
             id: identity.record.terminal,
             launch: chat::Launch {
                 provider: crate::agent::Provider::Claude,
@@ -3507,7 +3507,7 @@ done"#;
     }
     #[test]
     fn published_source_retains_issued_recipe_and_exact_account_identity() {
-        let source = chat::Session {
+        let source = chat::Session { archive_report: None,
             id: crate::model::TerminalId::new(),
             launch: chat::Launch {
                 provider: crate::agent::Provider::Claude,

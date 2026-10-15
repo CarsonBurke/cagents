@@ -211,7 +211,7 @@ fn provider_shutdown_failure_is_reported_while_healthy_owners_are_reaped() {
     let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
     let id = TerminalId::from_uuid(Uuid::from_u128(1));
     let socket = root.join(format!("cagents-codex-{id}/control.sock"));
-    let source = Session {
+    let source = Session { archive_report: None,
         id,
         launch: Launch {
             provider: crate::agent::Provider::Codex,

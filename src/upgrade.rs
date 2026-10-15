@@ -1795,7 +1795,7 @@ mod tests {
         let store = Store::open(directory.path()).unwrap();
         let mut checkpoint = checkpoint(directory.path());
         checkpoint.terminals.clear();
-        let source = crate::chat::Session {
+        let source = crate::chat::Session { archive_report: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,

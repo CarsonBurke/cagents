@@ -722,9 +722,19 @@ mod tests {
             panic!("draft chat");
         };
         runtime.session.launch.session_id = Some("saved-conversation".into());
+        // These metadata tests deliberately record the selector; an inherited
+        // account cannot reuse the provider-conversation metadata namespace.
+        let variable = crate::account::home_variable(runtime.session.launch.provider).unwrap();
+        runtime.session.launch.recipe.environment.insert(variable.into(), "/fixture/recorded-close-account".into());
+        runtime.session.launch.recipe.unset_environment.remove(variable);
+        for variable in crate::account::credential_overrides(runtime.session.launch.provider) {
+            runtime.session.launch.recipe.environment.remove(*variable);
+            runtime.session.launch.recipe.unset_environment.insert((*variable).into());
+        }
+        let issued = runtime.session.clone();
         if let Some(state) = app.card_state_mut(card) {
             if let CardKind::Chat(session) = &mut state.kind {
-                session.launch.session_id = Some("saved-conversation".into());
+                *session = issued;
             }
         }
         (app, card, directory)

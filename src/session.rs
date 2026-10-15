@@ -3338,7 +3338,7 @@ mod tests {
             let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
                 unreachable!()
             };
-            let chat = |provider: crate::agent::Provider, id: TerminalId| crate::chat::Session {
+            let chat = |provider: crate::agent::Provider, id: TerminalId| crate::chat::Session { archive_report: None,
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 id,
@@ -5480,7 +5480,7 @@ mod tests {
         let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
             unreachable!()
         };
-        let chat = |session_id: Option<&str>| crate::chat::Session {
+        let chat = |session_id: Option<&str>| crate::chat::Session { archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),

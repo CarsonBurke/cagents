@@ -706,7 +706,7 @@ mod tests {
     };
 
     fn source(directory: &Path) -> HostedSession {
-        HostedSession::Chat(Session {
+        HostedSession::Chat(Session { archive_report: None,
             id: TerminalId::new(),
             launch: Launch {
                 provider: Provider::Omp,

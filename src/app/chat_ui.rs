@@ -7201,7 +7201,7 @@ impl Cagents {
                                 return Task::none();
                             }
                             let unrestricted = bypasses_approvals(&recipe);
-                            let fresh = chat::Session {
+                            let fresh = chat::Session { archive_report: None,
                                 native_continuity: Default::default(),
                                 owned_codex_listener: None,
                                 id: crate::model::TerminalId::new(),

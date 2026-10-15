@@ -3344,7 +3344,7 @@ mod tests {
                 paired_terminal: None,
                 handoff_receipt: None,
                 source_binding: None,
-                session: chat::Session {
+                session: chat::Session { archive_report: None,
                     native_continuity: Default::default(),
                     owned_codex_listener: None,
                     id: chat_id,
@@ -3528,7 +3528,7 @@ mod tests {
         let chat_id=TerminalId::new();
         host.lock().unwrap().chats.insert(chat_id,super::super::chat::Record {
             execution_instance:uuid::Uuid::nil(),console_recipe:None,paired_terminal:None,
-            session:chat::Session {native_continuity:Default::default(),owned_codex_listener:None,id:chat_id,launch:chat::Launch {provider:Provider::Claude,recipe,session_id:None},proof:Some(proof.clone()),terminal:None},
+            session:chat::Session { archive_report: None,native_continuity:Default::default(),owned_codex_listener:None,id:chat_id,launch:chat::Launch {provider:Provider::Claude,recipe,session_id:None},proof:Some(proof.clone()),terminal:None},
             handle:handle.clone(),source_process:None,subscribers:BTreeMap::from([(1,false)]),observations:BTreeMap::new(),completion_observed:false,returning_terminal:false,
         });
         let (mut stream,server_stream)=UnixStream::pair().unwrap();

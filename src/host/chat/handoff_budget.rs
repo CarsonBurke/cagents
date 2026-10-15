@@ -69,7 +69,7 @@ mod tests {
             environment: BTreeMap::from([("ESCAPED".into(), "\u{1}".repeat(60 * 1024))]),
             unset_environment: Default::default(),
         };
-        let source = Session {
+        let source = Session { archive_report: None,
             id: TerminalId::new(),
             proof: Some(proof),
             launch: chat::Launch {

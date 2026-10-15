@@ -516,7 +516,7 @@ for line in sys.stdin:
         };
         let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
         host.lock().unwrap().register_client(1);
-        let mut source = Session {
+        let mut source = Session { archive_report: None,
             id: TerminalId::new(),
             launch: chat::Launch {
                 provider: crate::agent::Provider::Omp,

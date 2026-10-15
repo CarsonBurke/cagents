@@ -266,7 +266,7 @@ mod tests {
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new("daemon"),
         };
-        let source = chat::Session {
+        let source = chat::Session { archive_report: None,
             id: TerminalId::new(),
             launch: chat::Launch {
                 provider: Provider::Claude,
@@ -442,7 +442,7 @@ mod tests {
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new("daemon"),
         };
-        let source = chat::Session {
+        let source = chat::Session { archive_report: None,
             id: TerminalId::new(),
             launch: chat::Launch {
                 provider: Provider::Claude,

@@ -131,7 +131,7 @@ mod tests {
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        let source = Session {
+        let source = Session { archive_report: None,
             id,
             launch: super::super::Launch {
                 provider: crate::agent::Provider::Claude,

@@ -188,7 +188,7 @@ mod tests {
             repository: "/project/.git".into(),
             ordinal: 7,
         };
-        let source = crate::chat::Session {
+        let source = crate::chat::Session { archive_report: None,
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,

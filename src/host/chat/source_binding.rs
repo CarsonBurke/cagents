@@ -1316,7 +1316,7 @@ mod tests {
         Owner(handle)
     }
     fn source(path: &std::path::Path) -> Session {
-        Session {
+        Session { archive_report: None,
             id: TerminalId::new(),
             proof: Some(HostSessionProof {
                 host_session_id: "binding-test".into(),

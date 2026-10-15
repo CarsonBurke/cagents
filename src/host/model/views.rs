@@ -1436,7 +1436,7 @@ mod tests {
                 },
             };
             let source = if native_chat {
-                HostedSession::Chat(crate::chat::Session {
+                HostedSession::Chat(crate::chat::Session { archive_report: None,
                     id: terminal.id,
                     launch: crate::chat::Launch {
                         provider: Provider::Claude,
@@ -1606,7 +1606,7 @@ mod tests {
                 },
             };
             let live = if native_chat {
-                HostedSession::Chat(crate::chat::Session {
+                HostedSession::Chat(crate::chat::Session { archive_report: None,
                     id: terminal.id,
                     launch: crate::chat::Launch {
                         provider: Provider::Claude,
