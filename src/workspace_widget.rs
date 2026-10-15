@@ -3854,7 +3854,7 @@ mod tests {
             if matches!(
                 event,
                 Event::Keyboard(keyboard::Event::KeyPressed { .. })
-                    | Event::InputMethod(cosmic::iced::input_method::Event::Commit(_))
+                    | Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit(_))
             ) {
                 shell.publish(Some(self.0));
             }
@@ -3936,7 +3936,7 @@ mod tests {
         let mut shell = Shell::new(&mut messages);
         element.as_widget_mut().update(
             &mut tree,
-            &Event::InputMethod(cosmic::iced::input_method::Event::Commit(
+            &Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit(
                 "sidebar-only".into(),
             )),
             Layout::new(&node),
@@ -3996,7 +3996,7 @@ mod tests {
             );
             for event in [
                 Event::Keyboard(key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false)),
-                Event::InputMethod(cosmic::iced::input_method::Event::Commit("input".into())),
+                Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit("input".into())),
             ] {
                 let mut messages = Vec::new();
                 let mut shell = Shell::new(&mut messages);
