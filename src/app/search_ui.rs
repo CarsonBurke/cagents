@@ -513,7 +513,9 @@ impl Cagents {
                     .height(design::DENSE_ROW_HEIGHT)
                     .padding([space::XS, space::S])
                     .on_press_maybe(
-                        enabled.then(|| state.result_target(index)).flatten()
+                        enabled
+                            .then(|| state.result_target(index))
+                            .flatten()
                             .map(|target| Message::ProjectSearch(Action::OpenResult(target))),
                     ),
             ));
@@ -619,22 +621,44 @@ mod tests {
         runtime.descriptor.selected_file = None;
         let navigation = runtime.navigation();
         app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
-        app.search_ui.root = Some(root.clone()); app.search_ui.generation = 41;
-        app.search_ui.matches.push(project_search::Match { path: "original.rs".into(), line: 0, column: 0, length: 1, snippet: "a".into(), highlight: 0..1 });
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.search_ui.root = Some(root.clone());
+        app.search_ui.generation = 41;
+        app.search_ui.matches.push(project_search::Match {
+            path: "original.rs".into(),
+            line: 0,
+            column: 0,
+            length: 1,
+            snippet: "a".into(),
+            highlight: 0..1,
+        });
         let held = app.search_ui.result_target(0).unwrap();
         app.context_tab = ContextTab::Search;
         drop(app.update_project_search(Action::Query("replacement".into())));
         let generation = app.search_ui.generation;
-        drop(app.update_project_search(Action::Progress { generation, root, progress: Progress::Batch(vec![project_search::Match { path: "replacement.rs".into(), ..held.matched.clone() }]) }));
+        drop(app.update_project_search(Action::Progress {
+            generation,
+            root,
+            progress: Progress::Batch(vec![project_search::Match {
+                path: "replacement.rs".into(),
+                ..held.matched.clone()
+            }]),
+        }));
         assert_eq!(app.search_ui.matches[0].path, Path::new("replacement.rs"));
         app.status = None;
         drop(app.update_project_search(Action::OpenResult(held)));
         drop(app.update_project_search(Action::Submit(41)));
-        assert!(app.status.is_none(), "a stale activation must not even reach the current editor guard");
-        let CardRuntime::Repository(runtime) = &app.cards[&card] else { panic!("original editor"); };
+        assert!(
+            app.status.is_none(),
+            "a stale activation must not even reach the current editor guard"
+        );
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+            panic!("original editor");
+        };
         assert_eq!(runtime.navigation(), navigation);
-        assert!(runtime.is_dirty()); assert!(app.pending_panel_open.is_none());
+        assert!(runtime.is_dirty());
+        assert!(app.pending_panel_open.is_none());
     }
 
     #[test]
