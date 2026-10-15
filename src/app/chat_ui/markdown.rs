@@ -58,6 +58,9 @@ pub struct Content {
 
 #[derive(Debug, Clone)]
 struct Section {
+    // One raw CommonMark unit may produce several display items (images
+    // surrounded by text). Rebuild the whole unit exactly once.
+    items: usize,
     content: String,
     references: HashSet<ReferenceLabel>,
 }
@@ -155,34 +158,24 @@ impl Content {
 
         // Re-parse the unfinished source, including a table whose next row
         // was not yet recognizable at the preceding publication boundary.
-        for (item, source, references) in parse_with(&mut self.state, input, Some(input_origin)) {
+        let mut last_unit_items = 0;
+        for (unit, source, references) in parse_with(&mut self.state, input, Some(input_origin)) {
             let start = source.as_ptr().addr() - input.as_ptr().addr();
-            if matches!(&item, Item::Table { .. }) {
+            if matches!(unit.as_slice(), [Item::Table { .. }]) {
                 table_tail = Some((self.items.len(), start));
             } else if table_tail.is_some() {
                 let prefix = input[..start].strip_suffix('\n').unwrap_or(&input[..start]);
-                let separated = prefix
-                    .rsplit('\n')
-                    .next()
-                    .is_some_and(|line| line.trim().is_empty());
-                if separated || !matches!(&item, Item::Paragraph(_)) {
-                    table_tail = None;
-                }
+                let separated = prefix.rsplit('\n').next().is_some_and(|line| line.trim().is_empty());
+                if separated || !matches!(unit.as_slice(), [Item::Paragraph(_)]) { table_tail = None; }
             }
             if !references.is_empty() {
-                let _ = self.incomplete.insert(
-                    self.items.len(),
-                    Section {
-                        content: source.to_owned(),
-                        references,
-                    },
-                );
+                self.incomplete.insert(self.items.len(), Section { items: unit.len(), content: source.to_owned(), references });
             }
-
-            self.items.push(item);
+            last_unit_items = unit.len();
+            self.items.extend(unit);
         }
 
-        self.reparse_items = usize::from(self.items.len() > previous_index);
+        self.reparse_items = last_unit_items;
         if self.reparse_items == 0 {
             // Definitions and metadata can consume raw source without
             // producing a widget. Keep that tail, but do not remove a prior
@@ -233,44 +226,24 @@ impl Content {
             let old_tail = previous_index;
             let mut sections = std::mem::take(&mut self.incomplete);
             let mut rebuilt = Vec::with_capacity(self.items.len());
-            for (index, item) in std::mem::take(&mut self.items).into_iter().enumerate() {
+            let mut old_items = std::mem::take(&mut self.items).into_iter().enumerate();
+            while let Some((index, item)) = old_items.next() {
                 let section = sections.remove(&index);
-                if index < old_tail
-                    && section.as_ref().is_some_and(|section| {
-                        section
-                            .references
-                            .iter()
-                            .any(|label| changed.contains(label))
-                    })
-                {
+                if index < old_tail && section.as_ref().is_some_and(|section| section.references.iter().any(|label| changed.contains(label))) {
                     let section = section.unwrap();
-                    #[cfg(test)]
-                    {
-                        self.parsed_bytes += section.content.len();
-                    }
-                    let mut state = State {
-                        references: self.state.references.clone(),
-                        ..State::default()
-                    };
+                    for _ in 1..section.items { old_items.next().expect("complete raw unit items"); }
+                    #[cfg(test)] { self.parsed_bytes += section.content.len(); }
+                    let mut state = State { references: self.state.references.clone(), ..State::default() };
                     let before = rebuilt.len();
-                    for (item, source, references) in parse_with(&mut state, &section.content, None)
-                    {
+                    for (unit, source, references) in parse_with(&mut state, &section.content, None) {
                         if !references.is_empty() {
-                            self.incomplete.insert(
-                                rebuilt.len(),
-                                Section {
-                                    content: source.to_owned(),
-                                    references,
-                                },
-                            );
+                            self.incomplete.insert(rebuilt.len(), Section { items: unit.len(), content: source.to_owned(), references });
                         }
-                        rebuilt.push(item);
+                        rebuilt.extend(unit);
                     }
-                    previous_index = previous_index + rebuilt.len() - before - 1;
+                    previous_index = previous_index + rebuilt.len() - before - section.items;
                 } else {
-                    if let Some(section) = section {
-                        self.incomplete.insert(rebuilt.len(), section);
-                    }
+                    if let Some(section) = section { self.incomplete.insert(rebuilt.len(), section); }
                     rebuilt.push(item);
                 }
             }
@@ -837,7 +810,7 @@ fn parse_with<'a>(
     mut state: impl BorrowMut<State> + 'a,
     markdown: &'a str,
     origin: Option<usize>,
-) -> impl Iterator<Item = (Item, &'a str, HashSet<ReferenceLabel>)> + 'a {
+) -> impl Iterator<Item = (Vec<Item>, &'a str, HashSet<ReferenceLabel>)> + 'a {
     enum Scope {
         List(List),
         Quote(Vec<Item>),
@@ -921,34 +894,37 @@ fn parse_with<'a>(
     let references = state.borrow().references.clone();
 
     let produced_references = reference_labels.clone();
-    let produce = move |state: &mut State, stack: &mut Vec<Scope>, item, source: Range<usize>| {
+    let inline_items = Rc::new(RefCell::new(Vec::new()));
+    let produce_batch = Rc::new(move |state: &mut State, stack: &mut Vec<Scope>, items: Vec<Item>, source: Range<usize>| {
+        if items.is_empty() { return None; }
         if let Some(scope) = stack.last_mut() {
-            match scope {
-                Scope::List(list) => {
-                    list.bullets.last_mut().expect("item context").push(item);
-                }
-                Scope::Quote(items) => {
-                    items.push(item);
-                }
-                Scope::Table { current, .. } => {
-                    current.push(item);
+            for item in items {
+                match &mut *scope {
+                    Scope::List(list) => list.bullets.last_mut().expect("item context").push(item),
+                    Scope::Quote(items) => items.push(item),
+                    Scope::Table { current, .. } => current.push(item),
                 }
             }
-
             None
         } else {
             state.leftover = markdown[source.start..].to_owned();
-            if let Some(origin) = origin {
-                state.leftover_origin = origin + source.start;
-            }
-
-            Some((
-                item,
-                &markdown[source.start..source.end],
-                produced_references.take(),
-            ))
+            if let Some(origin) = origin { state.leftover_origin = origin + source.start; }
+            Some((items, &markdown[source.start..source.end], produced_references.take()))
+        }
+    });
+    let produce = {
+        let inline_items = inline_items.clone(); let produce_batch = produce_batch.clone();
+        move |state: &mut State, stack: &mut Vec<Scope>, item: Item, source: Range<usize>| {
+            let mut items = inline_items.take(); items.push(item); produce_batch(state, stack, items, source)
         }
     };
+    let flush_inline = {
+        let inline_items = inline_items.clone(); let produce_batch = produce_batch.clone();
+        move |state: &mut State, stack: &mut Vec<Scope>, source: Range<usize>| {
+            produce_batch(state, stack, inline_items.take(), source)
+        }
+    };
+    let mut inline_heading = None;
 
     let parser = parser.into_offset_iter();
 
@@ -956,6 +932,8 @@ fn parse_with<'a>(
     #[allow(clippy::drain_collect)]
     parser.filter_map(move |(event, source)| match event {
         pulldown_cmark::Event::Start(tag) => match tag {
+            pulldown_cmark::Tag::Heading { level, .. } if !metadata => { inline_heading = Some(level); None }
+            pulldown_cmark::Tag::Paragraph if !metadata => { inline_heading = None; None }
             pulldown_cmark::Tag::Strong if !metadata => {
                 strong = true;
                 None
@@ -988,6 +966,13 @@ fn parse_with<'a>(
                 id,
                 ..
             } if !metadata => {
+                if !spans.is_empty() {
+                    let text = Text::new(spans.drain(..).collect());
+                    inline_items.borrow_mut().push(match inline_heading {
+                        Some(level) => Item::Heading(level, text),
+                        None => Item::Paragraph(text),
+                    });
+                }
                 let definition = if id.is_empty() {
                     None
                 } else {
@@ -1089,12 +1074,11 @@ fn parse_with<'a>(
             _ => None,
         },
         pulldown_cmark::Event::End(tag) => match tag {
-            pulldown_cmark::TagEnd::Heading(level) if !metadata => produce(
-                state.borrow_mut(),
-                &mut stack,
-                Item::Heading(level, Text::new(spans.drain(..).collect())),
-                source,
-            ),
+            pulldown_cmark::TagEnd::Heading(level) if !metadata => {
+                inline_heading = None;
+                if spans.is_empty() { flush_inline(state.borrow_mut(), &mut stack, source) }
+                else { produce(state.borrow_mut(), &mut stack, Item::Heading(level, Text::new(spans.drain(..).collect())), source) }
+            }
             pulldown_cmark::TagEnd::Strong if !metadata => {
                 strong = false;
                 None
@@ -1113,7 +1097,7 @@ fn parse_with<'a>(
             }
             pulldown_cmark::TagEnd::Paragraph if !metadata => {
                 if spans.is_empty() {
-                    None
+                    flush_inline(state.borrow_mut(), &mut stack, source)
                 } else {
                     produce(
                         state.borrow_mut(),
@@ -1125,7 +1109,7 @@ fn parse_with<'a>(
             }
             pulldown_cmark::TagEnd::Item if !metadata => {
                 if spans.is_empty() {
-                    None
+                    flush_inline(state.borrow_mut(), &mut stack, source)
                 } else {
                     produce(
                         state.borrow_mut(),
@@ -1168,7 +1152,8 @@ fn parse_with<'a>(
                 let state = state.borrow_mut();
                 let _ = state.images.insert(url.clone());
 
-                produce(state, &mut stack, Item::Image { url, title, alt }, source)
+                inline_items.borrow_mut().push(Item::Image { url, title, alt });
+                None
             }
             pulldown_cmark::TagEnd::CodeBlock if !metadata => {
                 code_block = false;
@@ -1215,9 +1200,11 @@ fn parse_with<'a>(
                         state.borrow_mut(),
                         &mut stack,
                         Item::Paragraph(Text::new(spans.drain(..).collect())),
-                        source,
+                        source.clone(),
                     );
                 }
+
+                let _ = flush_inline(state.borrow_mut(), &mut stack, source.clone());
 
                 let Scope::Table {
                     alignment,
@@ -1569,6 +1556,10 @@ mod tests {
 
     #[test]
     fn reference_definitions_match_full_prefixes_without_losing_prior_items_or_targets() {
+        assert_eq!(native_outline(Content::parse("before ![alt](/i) after").items()),
+            vec!["paragraph before ", "image /i  alt", "paragraph  after"]);
+        assert_eq!(native_outline(Content::parse("# before ![alt](/i) after").items()),
+            vec!["heading H1 before ", "image /i  alt", "heading H1  after"]);
         for source in [
             "![alternative](https://example.com/a.png \"title\")\n\n[label][ref]\n\n[ref]: https://example.com\n",
             "[label][ref]\n\n[ref]: https://example.com \"growing title\"\n",
@@ -1577,6 +1568,10 @@ mod tests {
             "[label][ref]\n\n[ref]: <https://example.com>\n",
             "![alt][img]\n\n[img]: /one \"caption\"\n\n[img]: /two\n",
             "before ![alt][img] after\n\n[img]: /image.png\n",
+            "# before ![alt][img] after\n\n[img]: /image.png\n",
+            "before ![one][img] between ![two][img] after\n\n[img]: /image.png\n",
+            "- before ![alt][img] after\n\n[img]: /image.png\n",
+            "| H |\n|---|\n| before ![alt][img] after |\n\n[img]: /image.png\n",
             "- [label][ref]\n\n| H |\n|---|\n| [label][ref] |\n\n[ref]: /destination\n",
         ] {
             let mut streamed = Content::new();
