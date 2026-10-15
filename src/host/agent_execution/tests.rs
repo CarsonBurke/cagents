@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
+#[cfg(target_os = "linux")]
+mod indexed_codex_refusal;
 
 use super::*;
 use crate::{
@@ -1941,6 +1943,15 @@ fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_owner_refuses_only_the_exact_indexed_codex_decision_after_its_run_settles() {
+    owned_late_decision::run(
+        "an_owner_refuses_only_the_exact_indexed_codex_decision_after_its_run_settles",
+        indexed_codex_refusal::body,
+    );
 }
 
 #[test]

@@ -948,8 +948,10 @@ fn control(
     {
         return Err("A person took this agent over; its controls are theirs".into());
     }
-    let declines = matches!(&command, Control::Answer { action, .. } if chat::declines(action));
-    if run.state.is_terminal() && !declines {
+    let settled = run.state.is_terminal();
+    // Refusal safety belongs to the actor's exact pending provider decision,
+    // not to an opaque action ID observed outside that actor.
+    if settled && !matches!(&command, Control::Answer { .. }) {
         return Err(format!(
             "The agent has no active run; its latest is {:?}",
             run.state
@@ -988,11 +990,15 @@ fn control(
                     answer.field
                 ));
             }
-            handle.command(Command::Answer {
-                request_id: request_id.clone(),
-                action,
-                answers,
-            })?;
+            if settled {
+                handle.refuse_request(request_id.clone(), action, answers)?;
+            } else {
+                handle.command(Command::Answer {
+                    request_id: request_id.clone(),
+                    action,
+                    answers,
+                })?;
+            }
             Some(request_id)
         }
     };

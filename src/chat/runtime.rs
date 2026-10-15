@@ -45,6 +45,11 @@ enum ActorCommand {
         run: Option<crate::model::RunId>,
         command: Command,
     },
+    RefuseAnswer {
+        request_id: String,
+        action: String,
+        answers: Vec<super::Answer>,
+    },
     CloseIfIdle {
         generation: u64,
     },
@@ -618,6 +623,17 @@ impl Handle {
         response
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+    }
+
+    /// The host has proved ownership of a settled run. Only the actor's exact
+    /// pending provider choice may prove that this answer authorizes no work.
+    pub(crate) fn refuse_request(
+        &self,
+        request_id: String,
+        action: String,
+        answers: Vec<super::Answer>,
+    ) -> Result<(), String> {
+        self.ownership_command(ActorCommand::RefuseAnswer { request_id, action, answers })
     }
 
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
@@ -1913,6 +1929,17 @@ impl Actor {
             }
             let (run, command) = match command {
                 ActorCommand::Provider { run, command } => (run, command),
+                ActorCommand::RefuseAnswer { request_id, action, answers } => {
+                    if self.execution.active().is_some() {
+                        let _ = reply.send(Err("A managed run became active before the settled-run refusal".into()));
+                        continue;
+                    }
+                    if !self.adapter.answer_declines(&request_id, &action) {
+                        let _ = reply.send(Err("The agent has no active run; this pending decision does not refuse work".into()));
+                        continue;
+                    }
+                    (None, Command::Answer { request_id, action, answers })
+                }
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
                         .native_holder
@@ -2038,7 +2065,7 @@ impl Actor {
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::UpdatePermissionSettings { .. } => true,
-                Command::Answer { action, .. } => !super::declines(action),
+                Command::Answer { request_id, action, .. } => !self.adapter.answer_declines(request_id, action),
                 _ => false,
             };
             if authorizes_work
