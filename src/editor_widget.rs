@@ -1073,13 +1073,15 @@ where
         internal.editor.set_tab_width(indentation.tab_width);
     }
 
-    fn indent(&mut self, outdent: bool) {
+    fn indent(&mut self, outdent: bool) { self.indent_recorded(outdent); }
+
+    /// Prefix-only changes keep a large selected block out of undo storage.
+    pub fn indent_recorded(&mut self, outdent: bool) -> Vec<TextChange> {
         let cursor = self.cursor();
         let anchor = cursor.selection.unwrap_or(cursor.position);
         let indentation = self.0.get_mut().indentation;
         if !outdent && anchor.line == cursor.position.line {
-            self.perform(Action::Edit(Edit::Paste(Arc::new(indentation.unit()))));
-            return;
+            return self.perform_edit(Edit::Paste(Arc::new(indentation.unit()))).map(|recorded| recorded.change).into_iter().collect();
         }
         let first = cursor.position.line.min(anchor.line);
         let mut last = cursor.position.line.max(anchor.line);
@@ -1087,11 +1089,12 @@ where
         if last > first && high.column == 0 { last -= 1; }
         let unit = indentation.unit();
         let mut shifts = Vec::new();
+        let mut changes = Vec::new();
         for line in (first..=last).rev() {
             let removed = if outdent { self.with_line(line, |text, _| indentation.outdent_bytes(text)).unwrap_or(0) } else { 0 };
             if outdent && removed == 0 { continue; }
             let start = Position { line, column: 0 };
-            self.replace_range_recorded(start, Position { line, column: removed }, if outdent { "" } else { &unit });
+            if let Some(change) = self.replace_range_recorded(start, Position { line, column: removed }, if outdent { "" } else { &unit }) { changes.push(change); }
             shifts.push((line, if outdent { -(removed as isize) } else { unit.len() as isize }));
         }
         let map = |mut position: Position| {
@@ -1101,6 +1104,7 @@ where
             position
         };
         self.set_cursor(Cursor { position: map(cursor.position), selection: cursor.selection.map(map) });
+        changes
     }
 
     fn enter(&mut self) {
