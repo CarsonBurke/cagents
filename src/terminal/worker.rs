@@ -685,15 +685,18 @@ impl Drop for HandleInner {
 /// A stalled worker cannot indefinitely hold daemon shutdown or a last-handle
 /// drop. Escalation uses the original root pidfd; detaching never claims exit.
 fn join_worker_bounded(worker: JoinHandle<()>, published: &PublishedState) -> bool {
-    let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+    join_worker_until(worker, published, std::time::Instant::now() + WORKER_JOIN_TIMEOUT, true)
+}
+
+fn join_worker_until(worker: JoinHandle<()>, published: &PublishedState, deadline: std::time::Instant, escalate: bool) -> bool {
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
     if !worker.is_finished() {
-        if let Some(pidfd) = published.shutdown_pidfd.get() {
+        if escalate && let Some(pidfd) = published.shutdown_pidfd.get() {
             let _ = close_processes::signal(pidfd, libc::SIGKILL);
         }
-        tracing::error!("terminal worker exceeded shutdown deadline; root escalation requested");
+        tracing::error!(escalate, "terminal worker exceeded lifecycle join deadline");
         return false;
     }
     worker.join().is_ok()
@@ -1151,20 +1154,23 @@ impl TerminalHandle {
     /// terminal's processes. On failure its processes stay here, though a
     /// full-screen program's display may need redrawing.
     ///
-    /// This waits for the worker's answer however long it takes, as shutdown
-    /// does: every step of a carry is bounded, and a caller that stopped
-    /// waiting could not tell a terminal left here from one already carried.
+    /// Every queue, reply and cleanup wait is bounded. A timed-out reply is
+    /// reported as an unknown carry outcome; it never authorizes killing a
+    /// terminal that may already belong to a successor.
     pub(crate) fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
         let (reply, result) = crossbeam_channel::bounded(1);
         self.send_command(Command::Carry { socket, reply })
             .map_err(|error| error.to_string())?;
         let carried = result
-            .recv()
-            .map_err(|_| "the terminal ended before it could be carried".to_owned())??;
-        if let Ok(mut worker) = self.inner.worker.lock()
-            && let Some(worker) = worker.take()
-        {
-            let _ = worker.join();
+            .recv_timeout(WORKER_JOIN_TIMEOUT * 2)
+            .map_err(|_| "terminal carry outcome is unknown after its deadline".to_owned())??;
+        let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+        if let Some(worker) = self.take_worker_until(deadline).map_err(|error| error.to_string())? {
+            if !join_worker_until(worker, &self.inner.published, deadline, false) {
+                return Err("terminal carry cleanup exceeded its deadline".into());
+            }
+        } else if !self.is_completed() {
+            return Err("terminal carry cleanup is already being joined".into());
         }
         Ok(carried)
     }
@@ -1222,19 +1228,16 @@ impl TerminalHandle {
         }
         if outcome == TerminalCloseResult::Closed {
             // Completion is not reported until the owner has released its PTY.
-            match self.inner.worker.lock() {
-                Ok(mut worker) => {
-                    if let Some(worker) = worker.take() {
-                        if worker.join().is_err() {
-                            return TerminalCloseResult::Unknown(
-                                "Terminal worker failed during close".into(),
-                            );
-                        }
+            let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+            match self.take_worker_until(deadline) {
+                Ok(Some(worker)) => {
+                    if !join_worker_until(worker, &self.inner.published, deadline, true) {
+                        return TerminalCloseResult::Unknown("Terminal worker did not finish close within its deadline".into());
                     }
                 }
-                Err(_) => {
-                    return TerminalCloseResult::Unknown("Terminal worker unavailable".into());
-                }
+                Ok(None) if self.is_completed() => {},
+                Ok(None) => return TerminalCloseResult::Unknown("Terminal worker is already closing".into()),
+                Err(error) => return TerminalCloseResult::Unknown(error.to_string()),
             }
         }
         outcome
@@ -1248,13 +1251,12 @@ impl TerminalHandle {
 
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
         self.request_shutdown();
-        if let Ok(mut worker) = self.inner.worker.lock()
-            && let Some(worker) = worker.take()
+        let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+        if let Some(worker) = self.take_worker_until(deadline)?
             && worker.thread().id() != thread::current().id()
+            && !join_worker_until(worker, &self.inner.published, deadline, true)
         {
-            if !join_worker_bounded(worker, &self.inner.published) {
-                return Err(TerminalSendError::Closed);
-            }
+            return Err(TerminalSendError::Closed);
         }
         if self.is_completed() {
             self.release_completed_holder();
@@ -1331,19 +1333,32 @@ impl TerminalHandle {
         if self
             .send_command(Command::PreserveForRestart(reply))
             .is_ok()
-            && let Ok(result) = result.recv()
+            && let Ok(result) = result.recv_timeout(WORKER_JOIN_TIMEOUT * 2)
         {
             result?;
         }
-        if let Ok(mut worker) = self.inner.worker.lock()
-            && let Some(worker) = worker.take()
-        {
-            worker
-                .join()
-                .map_err(|_| "terminal worker failed while preserving its holder")?;
+        let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+        if let Some(worker) = self.take_worker_until(deadline).map_err(|error| error.to_string())? {
+            if !join_worker_until(worker, &self.inner.published, deadline, false) {
+                return Err("terminal worker exceeded its preserve deadline".into());
+            }
+        } else if !self.is_completed() {
+            return Err("terminal preservation is already being joined".into());
         }
         self.preserve_completed_for_restart();
         Ok(())
+    }
+
+    fn take_worker_until(&self, deadline: std::time::Instant) -> Result<Option<JoinHandle<()>>, TerminalSendError> {
+        loop {
+            match self.inner.worker.try_lock() {
+                Ok(mut worker) => return Ok(worker.take()),
+                Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner().take()),
+                Err(std::sync::TryLockError::WouldBlock) => {},
+            }
+            if std::time::Instant::now() >= deadline { return Err(TerminalSendError::Closed); }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
@@ -1393,8 +1408,11 @@ impl TerminalHandle {
     fn send_command(&self, command: Command) -> Result<(), TerminalSendError> {
         self.inner
             .commands
-            .send(command)
-            .map_err(|_| TerminalSendError::Closed)
+            .send_timeout(command, WORKER_JOIN_TIMEOUT)
+            .map_err(|error| match error {
+                crossbeam_channel::SendTimeoutError::Timeout(_) => TerminalSendError::Full,
+                crossbeam_channel::SendTimeoutError::Disconnected(_) => TerminalSendError::Closed,
+            })
     }
 }
 
@@ -3069,7 +3087,10 @@ impl Worker {
     }
 
     fn interrupt_input(&mut self) {
-        let pending = !self.pending_input.is_empty();
+        let mut readiness = libc::pollfd { fd: self.writer.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+        let writable = unsafe { libc::poll(&mut readiness, 1, 0) } > 0
+            && readiness.revents & libc::POLLOUT != 0;
+        let pending = !self.pending_input.is_empty() || !writable;
         self.pending_input.clear();
         while let Ok(command) = self.commands.try_recv() {
             if !is_pty_input(&command) { self.retained_commands.push_back(command); }
@@ -5655,6 +5676,68 @@ mod tests {
         let started = std::time::Instant::now();
         handle.shutdown().unwrap();
         assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn interrupt_bypasses_kernel_only_input_backpressure() {
+        let (mut worker, _) = capture_worker_for(shell_session(
+            "stty -echo -icanon; trap 'exit 0' INT; echo ready; while :; do echo tick; sleep 0.05; done"
+        ).launch);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            if let PtyMessage::Bytes(bytes) = &message && bytes.windows(5).any(|word| word == b"ready") {
+                worker.handle_pty_message(Some(message));
+                break;
+            }
+            worker.handle_pty_message(Some(message));
+        }
+        let mut accepted = 0;
+        while accepted < 1024 * 1024 {
+            match worker.writer.write(&[b'x'; 1024]) {
+                Ok(0) => break,
+                Ok(count) => accepted += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+                Err(error) => panic!("fill PTY: {error}"),
+            }
+        }
+        assert!(accepted > 0 && accepted < 1024 * 1024);
+        assert!(worker.pending_input.is_empty(), "all accepted bytes are already inside the kernel");
+        let mut ready = libc::pollfd { fd: worker.writer.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut ready, 1, 0) }, 0);
+        worker.interrupt_input();
+        assert!(worker.child.exited_within(Duration::from_secs(3)).unwrap(), "Ctrl+C was trapped behind kernel-only input");
+        worker.run();
+    }
+
+    #[test]
+    fn concurrent_checked_close_cannot_hold_shutdown_behind_its_join() {
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let completion = Arc::clone(&published);
+        let (commands, receiver) = command_channel(1);
+        let (_events, event_receiver) = crossbeam_channel::unbounded();
+        let (release, blocked) = crossbeam_channel::bounded::<()>(1);
+        let (ready, observed) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            let Command::CloseChecked { reply, .. } = receiver.recv().unwrap() else { panic!("expected close"); };
+            reply.send(super::super::ipc::TerminalCloseResult::Closed).unwrap();
+            ready.send(()).unwrap();
+            let _ = blocked.recv();
+            completion.completed.store(true, Ordering::Release);
+        });
+        let handle = TerminalHandle { inner: Arc::new(HandleInner {
+            commands, events: event_receiver, published, worker: Mutex::new(Some(worker)),
+        }) };
+        let closing = handle.clone();
+        let closer = thread::spawn(move || closing.close_checked(true));
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        assert_eq!(handle.shutdown(), Err(TerminalSendError::Closed));
+        assert!(started.elapsed() < Duration::from_millis(500), "shutdown waited on a lock held by join");
+        release.send(()).unwrap();
+        assert_eq!(closer.join().unwrap(), super::super::ipc::TerminalCloseResult::Closed);
     }
 
     #[test]
