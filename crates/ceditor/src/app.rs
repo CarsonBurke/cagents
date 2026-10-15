@@ -5353,11 +5353,7 @@ mod tests {
         let task = app.load_checkout_journal();
         run_tasks(&mut app, task);
         assert!(app.checkout_journal.is_some(), "{:?}", app.notice);
-        app.begin_checkout(CheckoutTarget {
-            repository: root.to_path_buf(),
-            number: 17,
-            head: cagents::repository::Oid::parse(&original).unwrap(),
-        });
+        app.begin_checkout(CheckoutTarget::read_only(root.to_path_buf(), 17, cagents::repository::Oid::parse(&original).unwrap()));
         drop(app.update(Message::Checkout(checkout::Action::Destination(
             destination.display().to_string(),
         ))));
@@ -5417,11 +5413,7 @@ mod tests {
                 "journal path is not writable".into(),
             )))),
         );
-        app.begin_checkout(cagents::pull_request_review::CheckoutTarget {
-            repository: PathBuf::from("/review"),
-            number: 1,
-            head: cagents::repository::Oid::parse(&"a".repeat(40)).unwrap(),
-        });
+        app.begin_checkout(cagents::pull_request_review::CheckoutTarget::read_only(PathBuf::from("/review"), 1, cagents::repository::Oid::parse(&"a".repeat(40)).unwrap()));
         assert_eq!(
             app.checkout_error.as_deref(),
             Some("journal path is not writable")

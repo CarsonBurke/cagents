@@ -188,6 +188,7 @@ pub struct WorktreeDialog {
     repository: PathBuf,
     draft: WorktreeDraft,
     advanced: bool,
+    checkout_notice: Option<String>,
     resolving: Option<Resolution>,
     error: Option<WorktreeInputError>,
     /// The failed creation this dialog reopened. Its row stays until this
@@ -196,11 +197,14 @@ pub struct WorktreeDialog {
 }
 
 impl WorktreeDialog {
+    pub(super) fn set_checkout_notice(&mut self, notice: String) { self.checkout_notice = Some(notice); }
+
     pub fn new(project_id: ProjectId, repository: PathBuf, draft: WorktreeDraft) -> Self {
         Self {
             project_id,
             repository,
             advanced: draft.uses_options(),
+            checkout_notice: None,
             draft,
             resolving: None,
             error: None,
@@ -509,6 +513,7 @@ impl Cagents {
             .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))
             .into(),
         ];
+        if let Some(notice) = &dialog.checkout_notice { rows.insert(1, design::caption(notice).into()); }
         if dialog.advanced {
             rows.push(field(
                 "Base branch (optional)",
