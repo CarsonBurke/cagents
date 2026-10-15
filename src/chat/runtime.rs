@@ -2923,10 +2923,18 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             use crate::{agent::ActivityOutcome, notifications::Kind};
             match outcome {
                 Kind::Cancelled => {
+                    state.requests.clear();
+                    state.waiting=false;
+                    state.busy=false;
                     let all = state.capabilities.interrupt_stops_background;
                     finish_snapshot_work(state, ToolStatus::Stopped, all);
                 }
-                Kind::Failed => finish_snapshot_work(state, ToolStatus::Failed, false),
+                Kind::Failed => {
+                    state.requests.clear();
+                    state.waiting=false;
+                    state.busy=false;
+                    finish_snapshot_work(state, ToolStatus::Failed, false);
+                },
                 _ => {}
             }
             state.outcome = match outcome {
@@ -3356,12 +3364,15 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             if fatal {
                 state.prompt_suggestion = None;
                 state.busy = false;
+                state.waiting=false;
+                state.requests.clear();
                 state.history_loading = false;
             }
         }
         Event::Exited { .. } => {
             state.prompt_suggestion = None;
             state.exited = true;
+            state.requests.clear();
             state.waiting = false;
             state.busy = false;
             state.ready = false;
@@ -3857,6 +3868,30 @@ mod tests {
         assert!(!diagnostic.summary.to_lowercase().contains("tungstenite"));
         assert!(!diagnostic.summary.to_lowercase().contains("inspect"));
         assert_eq!(diagnostic.output,stderr,"saved readable output must remain faithful to provider diagnostics");
+    }
+
+    #[test]
+    fn terminal_failure_and_cancel_do_not_retain_live_approval_waiting() {
+        let waiting=||Snapshot {ready:true,busy:true,waiting:true,requests:vec![super::super::Request {kind:super::super::RequestKind::Approval,id:"pending".into(),title:"Approve tool".into(),description:String::new(),fields:Vec::new(),actions:Vec::new()}],..Default::default()};
+        for outcome in [crate::notifications::Kind::Cancelled,crate::notifications::Kind::Failed] {
+            let mut state=waiting();
+            let mut indices=BTreeMap::new();
+            assert_eq!(state.activity(),ActivityState::Waiting);
+            apply_event(&mut state,&mut indices,Event::TurnFinished {key:None,outcome});
+            assert!(state.requests.is_empty());
+            assert!(!state.waiting);
+            assert_eq!(state.activity(),ActivityState::Idle);
+            assert!(state.outcome.is_some());
+            apply_event(&mut state,&mut indices,Event::TurnStarted);
+            assert_eq!(state.activity(),ActivityState::Idle,"an old approval must not revive when a later prompt clears its terminal outcome");
+        }
+        let mut state=waiting();
+        apply_event(&mut state,&mut BTreeMap::new(),Event::Error {message:"Provider failed".into(),fatal:true});
+        assert!(state.requests.is_empty()); assert!(!state.waiting);
+        let mut state=waiting();
+        apply_event(&mut state,&mut BTreeMap::new(),Event::Exited {code:Some(3)});
+        assert!(state.requests.is_empty()); assert!(!state.waiting);
+        assert_eq!(state.activity(),ActivityState::Unknown);
     }
 
     #[test]
