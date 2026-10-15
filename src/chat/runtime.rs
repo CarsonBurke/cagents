@@ -1938,6 +1938,10 @@ impl Actor {
                         context.verify_directory(&directory)?;
                         if self.working_directory == directory { return Ok(()); }
                         self.adapter.relocate_directory(&directory)?;
+                        if let Err(error) = self.store.lock().unwrap_or_else(|p| p.into_inner()).relocate_file_directory(&directory) {
+                            let _ = self.adapter.relocate_directory(&self.working_directory);
+                            return Err(error);
+                        }
                         self.working_directory = directory;
                         Ok(())
                     })();
