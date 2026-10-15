@@ -133,6 +133,7 @@ struct CloseState {
     actor_id: uuid::Uuid,
     revision: u64,
     admitted_work: bool,
+    unobserved_native: bool,
     working_directory: std::path::PathBuf,
 }
 
@@ -317,7 +318,7 @@ impl Handle {
             ..Snapshot::default()
         }));
         let visible = Arc::new(AtomicBool::new(false));
-        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,working_directory:spec.working_directory.clone()}));
+        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,unobserved_native:false,working_directory:spec.working_directory.clone()}));
         let observe_next = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
@@ -555,6 +556,7 @@ impl Handle {
                 let code = status.and_then(|status| status.code());
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
                     if preserve_holder {
+                        actor.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native=true;
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
@@ -563,6 +565,7 @@ impl Handle {
                     {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
+                        actor.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native=true;
                         false
                     } else {
                         true
@@ -764,17 +767,15 @@ impl Handle {
         let owns_work=self.owns_work();
         let state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
         let close=self.0.close_state.lock().unwrap_or_else(|p|p.into_inner());
-        let activity=if (close.admitted_work || !state.queued.is_empty()) && !state.exited {ActivityState::Working} else {state.activity()};
-        CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready,exited:state.exited,completed:self.is_completed(),closing:self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire),owns_work,working_directory:close.working_directory.clone()}
+        let activity=if close.unobserved_native {ActivityState::Unknown} else if (close.admitted_work || !state.queued.is_empty()) && !state.exited {ActivityState::Working} else {state.activity()};
+        CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready&&!close.unobserved_native,exited:state.exited&&!close.unobserved_native,completed:self.is_completed(),closing:!close.unobserved_native&&(self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire)),owns_work:owns_work||close.unobserved_native,working_directory:close.working_directory.clone()}
     }
 
     /// The actor compares consent with all earlier admitted commands before
     /// fencing further work. Call outside HostLock; joining may take time.
     pub(crate) fn close_if_revision(&self, revision:u64) -> Result<(),String> {
         if self.is_completed() {
-            let detached=self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner()).is_some();
-            let retained=self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner()).is_some();
-            if detached || retained {
+            if self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native {
                 return Err("Retained provider work is not observed by this actor; reattach the session before confirming close".into());
             }
             if self.close_observation().close_revision!=revision {return Err("Provider work changed before conditional close".into());}
@@ -1285,6 +1286,8 @@ impl Handle {
                 detached.take();
             }
         }
+        let unobserved_native=self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner()).is_some() || self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner()).is_some();
+        self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native=unobserved_native;
         if self.is_completed() {
             return Ok(());
         }
@@ -3835,6 +3838,27 @@ mod tests {
         until(&handle,|state|state.turn_generation>consent.turn_generation);
         assert!(handle.close_if_revision(consent.close_revision).is_err());
         handle.close_if_revision(handle.close_observation().close_revision).unwrap();
+    }
+
+    #[test]
+    fn unobserved_native_ownership_stays_visible_without_waiting_for_holder_io() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);handle.close().unwrap();
+        // Model the resident ownership marker published by retained teardown.
+        handle.0.close_state.lock().unwrap().unobserved_native=true;
+        let holder_io=handle.0.retained_native.lock().unwrap();
+        let observer=handle.clone();let (send,receive)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move||{send.send(observer.close_observation()).unwrap();});
+        let observation=receive.recv_timeout(Duration::from_secs(1));
+        drop(holder_io);worker.join().unwrap();
+        let observation=observation.expect("resident census must not acquire the holder's IO mutex");
+        assert!(observation.completed && observation.owns_work);
+        assert_eq!(observation.activity,ActivityState::Unknown);
+        assert!(!observation.ready && !observation.exited && !observation.closing);
+        assert!(handle.close_if_revision(observation.close_revision).unwrap_err().contains("reattach"));
+        handle.0.close_state.lock().unwrap().unobserved_native=false;
     }
 
     #[test]
