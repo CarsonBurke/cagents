@@ -3990,8 +3990,19 @@ impl Actor {
             )
             .then(|| event.clone());
             let is_reset = matches!(&event, Event::Reset { .. });
-            if is_reset && self.state.lock().unwrap_or_else(|p| p.into_inner()).generation > u64::MAX - 2 {
-                frame_error.get_or_insert_with(|| "Reset was refused before source mutation because its generation is exhausted".into());
+            let exhausted_generation = (frame_error.is_none() && is_reset)
+                .then(|| self.state.lock().unwrap_or_else(|p| p.into_inner()).generation)
+                .filter(|generation| *generation > u64::MAX - 2);
+            if let Some(generation) = exhausted_generation {
+                let error = {
+                    let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+                    store.note_source_generation_floor(generation);
+                    store.exhaust_source_clock()
+                };
+                frame_error = Some(error);
+                // The common failed-Reset publication below sends the actual
+                // cause before draining this frame's known semantic proof.
+                // No replacement epoch/token or Snapshot generation is minted.
             }
             let mut cache_failed_now = false;
             let events = if frame_error.is_some() {
@@ -5428,6 +5439,59 @@ mod tests {
         assert!(latest.0.store.lock().unwrap().source_authority_observer().ptr_eq(&Arc::downgrade(&latest.0)),
             "an older failed publication cannot overwrite a newer real shared-Store owner");
         latest.close().unwrap();
+    }
+
+    #[test]
+    fn exhausted_reset_publishes_actual_loss_before_same_frame_success_without_rotating_source() {
+        struct ResetThenSuccess;
+        impl Adapter for ResetThenSuccess {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {events:vec![Event::Ready(true), Event::TurnStarted], ..Step::default()})
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {events:vec![
+                    Event::Reset {reason:"cannot allocate another ordered source".into()},
+                    Event::TurnFinished {key:Some("exact provider completion".into()), outcome:crate::notifications::Kind::Succeeded},
+                ], ..Step::default()})
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        for failed_revoke in [false, true] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let recipe = crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:vec![],working_directory:root.path().into(),environment:Default::default(),unset_environment:Default::default()};
+            let spec = ProcessSpec::from(&recipe);
+            let mut adapter: Box<dyn Adapter> = Box::new(ResetThenSuccess);
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let (send, receive) = crossbeam_channel::unbounded();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {let _ = send.send(update);}).unwrap();
+            until(&handle, |state| state.ready);
+            let before = handle.source_authority().unwrap();
+            {
+                let mut store = handle.0.store.lock().unwrap();
+                store.note_source_generation_floor(u64::MAX);
+                if failed_revoke { store.fail_source_revocation_for_test(); }
+            }
+            handle.0.state.lock().unwrap().generation = u64::MAX;
+            assert!(handle.command(Command::Refresh).is_err());
+            handle.close().unwrap();
+            let cause = if failed_revoke {super::super::SourceAuthorityUnavailableCause::RevocationFailed}
+                else {super::super::SourceAuthorityUnavailableCause::ClockExhausted};
+            assert_eq!(handle.source_authority_unavailable(), Some(cause));
+            assert!(handle.source_authority().is_none());
+            assert_eq!(handle.0.store.lock().unwrap().source_incarnation, before.incarnation,
+                "capacity refusal must precede token/epoch rotation");
+            let updates = receive.try_iter().collect::<Vec<_>>();
+            let loss = updates.iter().position(|update| matches!(update,
+                Update::SourceAuthorityUnavailable {cause: actual} if *actual == cause)).expect("actual clock/revocation loss was not published");
+            let success = updates.iter().position(|update| matches!(update,
+                Update::AttentionContext {evidence, ..} | Update::Attention(evidence)
+                    if evidence.kind == crate::notifications::Kind::Succeeded)).expect("known provider completion was suppressed by cache loss");
+            assert!(loss < success, "source loss must precede the immutable semantic remainder");
+            assert!(!updates.iter().any(|update| matches!(update,
+                Update::SourceAuthority {incarnation, ..} if *incarnation != before.incarnation)),
+                "unavailable attachment cannot publish a fabricated replacement pair");
+        }
     }
 
     #[test]
