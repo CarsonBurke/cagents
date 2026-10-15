@@ -672,6 +672,7 @@ pub struct SnapshotCache {
         Vec<RemoteRefRecord>,
         Vec<RemoteHead>,
     )>,
+    publication_config: BTreeMap<String, String>,
     control_metadata: Option<ControlMetadata>,
     lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
     observed: BTreeMap<RepoPath, Option<FileIdentity>>,
@@ -859,6 +860,14 @@ impl SnapshotCache {
         })
     }
 
+    /// The publication remote proven by the last successful snapshot read.
+    /// This display identity never grants permission to mutate a worktree.
+    pub fn publication_remote(&self) -> Option<&RemoteRecord> {
+        let branch = self.last_status.as_ref()?.branch()?;
+        let (_, remotes, ..) = self.metadata.as_ref()?;
+        select_branch_remote(remotes, &self.publication_config, branch)
+    }
+
     /// Ignored-folder expansion is independent of porcelain status. Observe
     /// its directory membership too, so the slow fallback repairs missed events.
     pub fn observe_browse(&mut self, worktree: &Path, files: &WorkingFiles) {
@@ -893,6 +902,7 @@ impl SnapshotCache {
         self.dirty = true;
         if metadata {
             self.metadata = None;
+            self.publication_config.clear();
             self.control_metadata = None;
             self.fsmonitor_checked = false;
         }
@@ -2888,6 +2898,23 @@ pub fn parse_remote_config(output: &[u8]) -> Result<Vec<RemoteRecord>, GitParseE
     Ok(remotes.into_values().collect())
 }
 
+/// Keep cached snapshot and direct branch lookups on the same selection policy.
+fn select_branch_remote<'a>(
+    remotes: &'a [RemoteRecord],
+    values: &BTreeMap<String, String>,
+    branch: &str,
+) -> Option<&'a RemoteRecord> {
+    let selected = values
+        .get(&format!("branch.{branch}.pushremote"))
+        .or_else(|| values.get("remote.pushdefault"))
+        .or_else(|| values.get(&format!("branch.{branch}.remote")));
+    match selected {
+        Some(name) => remotes.iter().find(|remote| remote.name == *name),
+        None => remotes.iter().find(|remote| remote.name == "origin")
+            .or_else(|| (remotes.len() == 1).then(|| &remotes[0])),
+    }
+}
+
 /// Parses a NUL-delimited path list, deduplicated and sorted.
 ///
 /// `git ls-files -c` prints one line per index stage, so an unmerged path
@@ -4356,7 +4383,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             };
             let output = self.run_checked(&files_command, cancellation)?;
             let files = invalid_output(parse_working_files(&output.stdout), output)?;
-            let remotes = self.remotes(worktree, cancellation)?;
+            let (remotes, publication_config) = self.publication_configuration(worktree, cancellation)?;
+            cache.publication_config = publication_config;
             let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
             let refs = invalid_output(parse_refs(&output.stdout), output)?;
             cache.metadata = Some((files, remotes, refs.local, refs.remote, refs.remote_heads));
@@ -6230,6 +6258,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         branch: &ValidatedBranchName,
         cancellation: &CancellationToken,
     ) -> Result<Option<RemoteRecord>, RepositoryError> {
+        let (remotes, config) = self.publication_configuration(worktree, cancellation)?;
+        Ok(select_branch_remote(&remotes, &config, branch.as_str()).cloned())
+    }
+
+    fn publication_configuration(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<RemoteRecord>, BTreeMap<String, String>), RepositoryError> {
         let command = self.git_read(
             worktree,
             ["config", "-z", "--get-regexp", r"^(remote|branch)\."],
@@ -6237,29 +6274,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let output = self.run(&command, cancellation)?;
         if !output.success {
             return if output.exit_code == Some(1) {
-                Ok(None)
+                Ok((Vec::new(), BTreeMap::new()))
             } else {
                 Err(git_failure(&command, output).into())
             };
         }
-        let config = String::from_utf8_lossy(&output.stdout).into_owned();
-        let remotes = invalid_output(parse_remote_config(&output.stdout), output)?;
-        let values: BTreeMap<_, _> = config
+        let values = String::from_utf8_lossy(&output.stdout)
             .split('\0')
             .filter_map(|entry| entry.split_once('\n'))
+            .filter(|(key, _)| *key == "remote.pushdefault"
+                || (key.starts_with("branch.") && (key.ends_with(".pushremote") || key.ends_with(".remote"))))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
-        let selected = values
-            .get(format!("branch.{}.pushremote", branch.as_str()).as_str())
-            .or_else(|| values.get("remote.pushdefault"))
-            .or_else(|| values.get(format!("branch.{}.remote", branch.as_str()).as_str()));
-        Ok(match selected {
-            Some(name) => remotes.into_iter().find(|remote| remote.name == *name),
-            None => remotes
-                .iter()
-                .find(|remote| remote.name == "origin")
-                .cloned()
-                .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone())),
-        })
+        let remotes = invalid_output(parse_remote_config(&output.stdout), output)?;
+        Ok((remotes, values))
     }
 
     fn branch_config(
@@ -7973,6 +8001,49 @@ mod tests {
                 .is_some()
         );
         assert_eq!(executor.commands.lock().unwrap().len(), 17);
+    }
+
+    #[test]
+    fn snapshot_publication_remote_matches_direct_selection_without_an_extra_process() {
+        let branch = ValidatedBranchName::parse("main").unwrap();
+        for (config, expected) in [
+            ("remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0branch.main.pushremote\nfork\0", Some("fork")),
+            ("remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0branch.main.pushremote\norigin\0branch.main.pushremote\nfork\0", Some("fork")),
+            ("remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0remote.pushdefault\nfork\0branch.main.remote\norigin\0", Some("fork")),
+            ("remote.origin.url\nhttps://github.com/old/repo.git\0branch.main.pushremote\n.\0", None),
+            ("remote.origin.url\nhttps://github.com/old/repo.git\0branch.main.pushremote\nmissing\0", None),
+            ("remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0", Some("origin")),
+            ("remote.fork.url\nhttps://github.com/new/repo.git\0", Some("fork")),
+            ("remote.first.url\nhttps://github.com/first/repo.git\0remote.second.url\nhttps://github.com/second/repo.git\0", None),
+            ("", None),
+        ] {
+            let direct = fake_service(vec![success(config.as_bytes())])
+                .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new())
+                .unwrap();
+            let status = b"# branch.oid (initial)\0# branch.head main\0";
+            let mut outputs = (0..8).map(|_| success(b"")).collect::<Vec<_>>();
+            outputs[1] = success(status);
+            outputs[5] = success(config.as_bytes());
+            outputs.push(success(status));
+            let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+            let service = RepositoryService::new("git", executor.clone());
+            let mut cache = SnapshotCache::default();
+            let cancel = CancellationToken::new();
+            let root = Path::new("/snapshot-publication-test");
+            assert!(service.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+            assert_eq!(cache.publication_remote().map(|remote| remote.name.as_str()), expected);
+            assert_eq!(cache.publication_remote(), direct.as_ref());
+            assert_eq!(executor.commands.lock().unwrap().len(), 8);
+            assert!(service.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
+            assert_eq!(cache.publication_remote(), direct.as_ref());
+            assert_eq!(executor.commands.lock().unwrap().len(), 9,
+                "unchanged publication proof must use only the existing status process");
+        }
+        let config = "remote.origin.url\nhttps://github.com/first/repo.git\0remote.origin.url\nhttps://github.com/second/repo.git\0remote.origin.pushurl\nhttps://github.com/push-first/repo.git\0remote.origin.pushurl\nhttps://github.com/push-second/repo.git\0";
+        let direct = fake_service(vec![success(config.as_bytes())])
+            .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new()).unwrap().unwrap();
+        assert_eq!(direct.fetch_url.as_deref(), Some("https://github.com/first/repo.git"));
+        assert_eq!(direct.push_url.as_deref(), Some("https://github.com/push-first/repo.git"));
     }
 
     #[test]

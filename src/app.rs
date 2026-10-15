@@ -3989,6 +3989,7 @@ pub struct SourceControlRead {
     prepared: Option<Box<(RepositorySnapshot, SourceControlModel)>>,
     status: StatusSnapshot,
     operation: Option<crate::repository::GitOperationKind>,
+    head_repository: Option<GitHubRepoKey>,
     read: u64,
 }
 
@@ -11290,10 +11291,15 @@ impl Cagents {
                 let (status, operation) = cache.row_status().ok_or_else(|| {
                     "successful source-control read did not expose display status".to_owned()
                 })?;
+                let head_repository = cache.publication_remote().and_then(|remote| {
+                    remote.push_url.as_deref().or(remote.fetch_url.as_deref())
+                        .and_then(crate::github::remote_repository_key)
+                });
                 let mut read = SourceControlRead {
                     prepared: None,
                     status: status.clone(),
                     operation,
+                    head_repository,
                     read: status_read,
                 };
                 let Some(mut snapshot) = snapshot else {
@@ -16785,9 +16791,9 @@ impl Application for Cagents {
                 // generation. Watcher scalar updates do not restart it under
                 // continuous writes; only row/cache facts use the shared order.
                 if let Ok(read) = &result
-                    && self.refresh_ui.git.accept_bound_status(&key, &read.status, read.operation, read.read)
+                    && self.refresh_ui.git.accept_bound_status(&key, &read.status, read.operation, read.head_repository.as_ref(), read.read)
                 {
-                    let head_repository = self.refresh_ui.git.cached_head_repository(&key);
+                    let head_repository = read.head_repository.clone();
                     if let Some(worktree) = self.sidebar_model.projects.iter_mut()
                         .find(|project| project.id == key.project_id)
                         .and_then(|project| project.worktrees.iter_mut().find(|worktree| worktree.id == key.worktree_id))

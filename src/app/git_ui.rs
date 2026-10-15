@@ -198,6 +198,7 @@ impl State {
         key: &ActiveWorktreeKey,
         status: &StatusSnapshot,
         operation: Option<crate::repository::GitOperationKind>,
+        head_repository: Option<&GitHubRepoKey>,
         read: u64,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(&key.project_id) else {
@@ -218,12 +219,6 @@ impl State {
         else {
             return false;
         };
-        let previous_head = (record.branch.clone(), record.detached);
-        let previous_upstream = cached.as_ref().and_then(|previous| match &previous.tracking {
-            crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream.clone()),
-            crate::repository::TrackingState::Unknown { upstream } => upstream.clone(),
-            crate::repository::TrackingState::NoUpstream => None,
-        });
         *cached = Some(status.display_summary());
         apply_status_head(record, status);
         let upstream = match &status.tracking {
@@ -231,9 +226,11 @@ impl State {
             crate::repository::TrackingState::Unknown { upstream } => upstream.as_deref(),
             crate::repository::TrackingState::NoUpstream => None,
         };
-        if previous_head != (record.branch.clone(), record.detached) || previous_upstream.as_deref() != upstream {
-            // A bound status proves the new head, not its GitHub fork identity.
-            // A retained sibling refresh must not revive an old PR attachment.
+        // The worker selected this fork from the same successful snapshot's
+        // configuration. Authoritative None also revokes an old attachment.
+        if let Some(repository) = head_repository {
+            entry.snapshot.heads.insert(key.worktree_id, repository.clone());
+        } else {
             entry.snapshot.heads.remove(&key.worktree_id);
         }
         let routed = entry
@@ -258,9 +255,6 @@ impl State {
         true
     }
 
-    pub(super) fn cached_head_repository(&self, key: &ActiveWorktreeKey) -> Option<GitHubRepoKey> {
-        self.entries.get(&key.project_id)?.snapshot.heads.get(&key.worktree_id).cloned()
-    }
 
     pub fn forget(&mut self, project: ProjectId) {
         if let Some(entry) = self.entries.remove(&project)
@@ -1378,13 +1372,88 @@ mod tests {
         Message::SourceControlLoaded {
             key: key.clone(),
             request,
-            result: Ok(SourceControlRead {
+            result: Ok(SourceControlRead { head_repository: None,
                 prepared: Some(Box::new((snapshot, model))),
                 status,
                 operation,
                 read,
             }),
         }
+    }
+
+    #[test]
+    fn bound_worker_reconciles_selected_fork_after_missed_config_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let baseline = fixture(&root);
+        git(&root, &["remote", "add", "origin", "https://github.com/old-fork/repo.git"]);
+        git(&root, &["remote", "add", "retained-old", "https://github.com/old-fork/repo.git"]);
+        git(&root, &["remote", "add", "fork", "https://github.com/new-fork/repo.git"]);
+        git(&root, &["config", "branch.main.pushremote", "origin"]);
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: baseline.worktrees[0].0.id,
+            canonical_path: root.clone(),
+        };
+        let old = GitHubRepoKey::new("github.com", None, "old-fork", "repo").unwrap();
+        let new = GitHubRepoKey::new("github.com", None, "new-fork", "repo").unwrap();
+        let mut app = app_with_status_snapshot(baseline, &key);
+        fn load(app: &mut Cagents, key: &ActiveWorktreeKey) -> Message {
+            super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()))
+        }
+        let first = load(&mut app, &key);
+        assert!(matches!(&first, Message::SourceControlLoaded { result: Ok(read), .. }
+            if read.prepared.is_some() && read.head_repository.as_ref() == Some(&old)));
+        drop(app.update(first));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+        app.sidebar_model.projects[0].worktrees[0].pull_request_state = Some(sidebar::WorktreePullRequestState::Open);
+        let delayed_watch = app.refresh_ui.git.entries[&key.project_id].snapshot.clone();
+
+        // No Changed message: the bound fallback must notice repository config.
+        // The old repository remains another remote, so set membership is insufficient.
+        git(&root, &["config", "branch.main.pushremote", "fork"]);
+        let changed = load(&mut app, &key);
+        assert!(matches!(&changed, Message::SourceControlLoaded { result: Ok(read), .. }
+            if read.prepared.is_some() && read.head_repository.as_ref() == Some(&new)));
+        drop(app.update(changed));
+        let row = &app.sidebar_model.projects[0].worktrees[0];
+        assert_eq!(row.branch.as_deref(), Some("main"));
+        assert_eq!(row.head_repository.as_ref(), Some(&new));
+        assert!(row.pull_request_state.is_none(), "old fork PR must be revoked");
+        drop(app.update(Message::GitUi(Action::Read { project: key.project_id, generation: 9,
+            result: Ok((delayed_watch, None)) })));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&new));
+        assert_eq!(app.refresh_ui.git.entries[&key.project_id].snapshot.heads.get(&key.worktree_id), Some(&new));
+
+        app.sidebar_model.projects[0].worktrees[0].pull_request_state = Some(sidebar::WorktreePullRequestState::Open);
+        let unchanged = load(&mut app, &key);
+        assert!(matches!(&unchanged, Message::SourceControlLoaded { result: Ok(read), .. }
+            if read.prepared.is_none() && read.head_repository.as_ref() == Some(&new)));
+        drop(app.update(unchanged));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].pull_request_state,
+            Some(sidebar::WorktreePullRequestState::Open), "unchanged selected fork retains its PR");
+
+        // URL changes with identical branch, upstream and selected remote also matter.
+        git(&root, &["remote", "set-url", "fork", "https://github.com/third-fork/repo.git"]);
+        let changed_url = load(&mut app, &key);
+        drop(app.update(changed_url));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, "third-fork");
+        assert!(app.sidebar_model.projects[0].worktrees[0].pull_request_state.is_none());
+        for selected in [".", "missing"] {
+            app.sidebar_model.projects[0].worktrees[0].pull_request_state = Some(sidebar::WorktreePullRequestState::Open);
+            git(&root, &["config", "branch.main.pushremote", selected]);
+            let local = load(&mut app, &key);
+            assert!(matches!(&local, Message::SourceControlLoaded { result: Ok(read), .. } if read.head_repository.is_none()));
+            drop(app.update(local));
+            assert!(app.sidebar_model.projects[0].worktrees[0].head_repository.is_none());
+            assert!(app.sidebar_model.projects[0].worktrees[0].pull_request_state.is_none());
+        }
+        git(&root, &["config", "branch.main.pushremote", "fork"]);
+        git(&root, &["remote", "set-url", "fork", root.to_str().unwrap()]);
+        let local = load(&mut app, &key);
+        assert!(matches!(&local, Message::SourceControlLoaded { result: Ok(read), .. } if read.head_repository.is_none()));
+        drop(app.update(local));
+        assert!(app.sidebar_model.projects[0].worktrees[0].head_repository.is_none());
     }
 
     #[test]
@@ -1639,7 +1708,7 @@ mod tests {
             let bound_message = Message::SourceControlLoaded {
                 key: key.clone(),
                 request: 7,
-                result: Ok(SourceControlRead {
+                result: Ok(SourceControlRead { head_repository: None,
                     status: prepared.status.display_summary(),
                     operation: prepared.operation.as_ref().map(|operation| operation.kind),
                     read: status_read,
@@ -1951,7 +2020,7 @@ mod tests {
         drop(app.update(Message::SourceControlLoaded {
             key: key.clone(),
             request: 7,
-            result: Ok(SourceControlRead {
+            result: Ok(SourceControlRead { head_repository: None,
                 prepared: None,
                 status,
                 operation: None,
@@ -1966,7 +2035,7 @@ mod tests {
             "unchanged proof must not clone/rebuild coverage"
         );
         drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: 7,
-            result: Ok(SourceControlRead { prepared: None, status: stale_status, operation: None, read: read.saturating_sub(1) }) }));
+            result: Ok(SourceControlRead { head_repository: None, prepared: None, status: stale_status, operation: None, read: read.saturating_sub(1) }) }));
         assert_eq!(app.sidebar_model.projects[0].worktrees[0].label(), "learned",
             "an older accepted-generation callback cannot rewind the visible head");
         drop(app.update(Message::GitUi(Action::Read { project, generation: 9, result: Ok((delayed_watch, None)) })));
@@ -2160,7 +2229,7 @@ mod tests {
         drop(app.update(Message::SourceControlLoaded {
             key: key.clone(),
             request: 7,
-            result: Ok(SourceControlRead {
+            result: Ok(SourceControlRead { head_repository: None,
                 prepared: None,
                 status: status.clone(),
                 operation,
