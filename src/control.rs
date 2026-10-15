@@ -4781,11 +4781,14 @@ mod tests {
             let (client, mut server) = UnixStream::pair().unwrap();
             let worker = std::thread::spawn(move || {
                 let _: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                let owned = proof("session", "boot", "incarnation");
+                let body = postcard::to_stdvec(&connected_envelope(1, owned.clone(), owned)).unwrap();
+                let prefix = (body.len() as u32).to_be_bytes();
                 let frame = if trickle_prefix {
-                    [4u32.to_be_bytes().as_slice(), b"body"].concat()
+                    [prefix.as_slice(), body.as_slice()].concat()
                 } else {
-                    server.write_all(&4u32.to_be_bytes()).unwrap();
-                    b"body".to_vec()
+                    server.write_all(&prefix).unwrap();
+                    body
                 };
                 for byte in frame {
                     if server.write_all(&[byte]).is_err() {
