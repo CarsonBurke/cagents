@@ -8540,6 +8540,8 @@ mod tests {
                 | Update::AttentionContext { .. }
                 | Update::PastAttention(_)
                 | Update::RetainedOutcomes
+                // Identity changes do not count as provider activity.
+                | Update::Identity
                 | Update::Ready
                 | Update::Execution { .. } => None,
             })
