@@ -102,7 +102,12 @@ impl PendingAccountSource {
         finish: impl FnOnce(CapturedAccountSource) -> Result<T, String>,
     ) -> Result<T, String> {
         let proof = self.capture(expires)?;
-        let result = finish(proof)?;
+        let result = finish(proof);
+        // Releasing the last Store Arc can perform canonical cleanup. Include
+        // that work before the final budget fence, while retaining an actual
+        // callback refusal ahead of a secondary deadline error.
+        drop(self);
+        let result = result?;
         if Instant::now() >= expires { return Err("Account source admission deadline expired".into()); }
         Ok(result)
     }
