@@ -9,6 +9,7 @@ pub(in crate::app) struct RegisteredChatCommand {
     pub command: RegisteredAction,
     pub target: Target,
     queued: Option<QueueEntry>,
+    first_queued: Option<TerminalId>,
     interrupt_mode: Option<String>,
     fast_mode: Option<bool>,
 }
@@ -49,7 +50,7 @@ impl Runtime {
     pub(super) fn registered_chat_request(&self, command: RegisteredAction, transitioning: bool, has_draft: bool) -> Option<RegisteredChatCommand> {
         let available = self.command_controls_available(transitioning);
         let snapshot = &self.snapshot;
-        let mut request = RegisteredChatCommand { command, target: self.target, queued: None, interrupt_mode: None, fast_mode: None };
+        let mut request = RegisteredChatCommand { command, target: self.target, queued: None, first_queued: None, interrupt_mode: None, fast_mode: None };
         let enabled = match command {
             RegisteredAction::ChatSend => available && has_draft && !snapshot.busy,
             RegisteredAction::ChatSteer => available && has_draft && snapshot.busy && snapshot.capabilities.steer,
@@ -66,7 +67,10 @@ impl Runtime {
                 if available { request.queued = self.newest_take_back(); }
                 request.queued.is_some()
             }
-            RegisteredAction::ChatCancelQueued => self.queued.is_some() && !self.pending.as_ref().is_some_and(|pending| pending.queued == Some(QueuedStep::Prompt)),
+            RegisteredAction::ChatCancelQueued => {
+                request.first_queued = self.queued.as_ref().map(|queued| queued.draft.id);
+                request.first_queued.is_some() && !self.pending.as_ref().is_some_and(|pending| pending.queued == Some(QueuedStep::Prompt))
+            },
             RegisteredAction::ChatToggleSteering => {
                 let next = if snapshot.interrupt_mode.as_deref() == Some("wait") { "immediate" } else { "wait" };
                 if available && snapshot.capabilities.interrupt_modes.iter().any(|mode| mode == next) { request.interrupt_mode = Some(next.into()); }
@@ -141,6 +145,27 @@ mod tests {
         for command in [RegisteredAction::ChatSend, RegisteredAction::ChatSteer, RegisteredAction::ChatQueue, RegisteredAction::ChatInterrupt, RegisteredAction::ChatCompact, RegisteredAction::ChatAttach] {
             assert!(app.registered_chat_request(card, command).is_none());
         }
+    }
+
+    #[test]
+    fn old_first_message_cancel_cannot_cancel_a_replacement_start_attempt() {
+        let (mut app, card, target) = app();
+        app.chat_card_runtime_mut(target).unwrap().replace_draft(text_editor::Content::with_text("first request"));
+        drop(app.start_chat_draft(target));
+        let request = app.registered_chat_request(card, RegisteredAction::ChatCancelQueued).unwrap();
+        let first = request.first_queued.unwrap();
+        assert!(matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(_))));
+        drop(app.cancel_queued(target));
+        app.chat_card_runtime_mut(target).unwrap().replace_draft(text_editor::Content::with_text("replacement request"));
+        drop(app.start_chat_draft(target));
+        let current = app.registered_chat_request(card, RegisteredAction::ChatCancelQueued).unwrap();
+        assert_eq!(current.target, request.target, "the runtime target alone does not fence starting attempts");
+        assert_ne!(current.first_queued, Some(first));
+        drop(app.update_palette(crate::app::palette_ui::Action::RunChatUser(request)));
+        assert!(matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(_))));
+        let queued = app.chat_card_runtime_mut(target).unwrap().queued.as_ref().unwrap();
+        assert_eq!(Some(queued.draft.id), current.first_queued);
+        assert_eq!(queued.text, "replacement request");
     }
 
     #[test]
