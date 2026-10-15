@@ -5615,16 +5615,19 @@ mod tests {
     #[test]
     fn every_shortcut_descriptor_has_a_unique_configurable_binding() {
         let shortcuts = KeyboardShortcuts::default();
-        let mut bindings = HashSet::new();
+        assert!(shortcuts.fault().is_none(), "defaults obey binding scope and reservation policy");
+        let mut identities = HashSet::new();
         for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
             assert!(!descriptor.label.is_empty());
+            assert!(identities.insert(descriptor.id()), "registered IDs are unique");
+            let index = KeyboardShortcuts::action_names().iter().position(|id| *id == descriptor.id()).expect("every descriptor is configurable");
             let keys = shortcut_keys(descriptor.action, &shortcuts);
-            assert!(!keys.is_empty());
+            assert_eq!(keys, shortcuts.actions()[index]);
+            if keys.is_empty() {
+                assert!(!crate::settings::shortcut_required(index), "only optional actions may start unbound");
+            }
             for chord in keys {
                 assert!(parse_shortcut(chord).is_ok());
-                // Distinct across every action, not merely within one, or a
-                // chord would dispatch to whichever descriptor came first.
-                assert!(bindings.insert(chord.clone()));
             }
             // The one-line form the dialog shows has to read back as the same
             // chords, or editing a two-chord action there would drop one.
