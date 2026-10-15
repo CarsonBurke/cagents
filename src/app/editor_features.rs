@@ -410,6 +410,109 @@ mod tests {
         assert!(!app.editor_features.publishing());
     }
 
+    async fn code_action_fixture(root: &Path) -> (Cagents, CardId, CardId, LspDocumentId, LspDocumentId) {
+        let original = "fn old() {}\n";
+        for name in ["a.rs", "b.rs", "unopened.rs"] { std::fs::write(root.join(name), original).unwrap(); }
+        let mut app = app(); let a = buffer(&mut app, root, "a.rs", original); let b = buffer(&mut app, root, "b.rs", original);
+        let a_doc = LspDocumentId(44); let b_doc = LspDocumentId(45);
+        app.lsp = LspManager::fixture_ready_code_actions(a_doc, &root.join("a.rs"), root, original).await;
+        app.lsp.fixture_open_format_on_save_document(b_doc, &root.join("b.rs"), root, original).await;
+        for (card, doc) in [(a, a_doc), (b, b_doc)] {
+            app.lsp_documents.insert(doc, card); app.lsp_contexts.entry(card).or_default().document = Some(doc);
+            if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+                runtime.set_lsp_document(Some(doc));
+                // The fixture has already delivered the initial open through
+                // the real manager; retain only later publication changes.
+                drop(runtime.take_lsp_intents()); drop(runtime.take_lsp_edits());
+            }
+        }
+        (app, a, b, a_doc, b_doc)
+    }
+
+    async fn acknowledge_code_action_command(app: &mut Cagents) {
+        let events = app.lsp.events();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = events.recv().await.expect("framed fixture remains open");
+                let done = matches!(event, LspEvent::CommandExecuted { .. });
+                drop(app.editor_feature_event(&event));
+                if done { break; }
+            }
+        }).await.expect("actual executeCommand response");
+        assert!(app.editor_features.requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_opaque_command_revalidates_actual_peer_context_on_choice() {
+        for change in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
+            let item = app.lsp.fixture_code_action(a_doc).await;
+            let version = app.lsp.document_version(a_doc).unwrap();
+            app.editor_features.code_actions.insert(a, (version, vec![item]));
+            if change == 1 || change == 2 { app.lsp.close(b_doc); }
+            if change == 2 { app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn outside() {}\n").await; }
+            if change == 3 { app.lsp.fixture_open_format_on_save_document(LspDocumentId(46), &root.path().join("unopened.rs"), root.path(), "fn old() {}\n").await; }
+            drop(app.update_editor_features(Action::ChooseCodeAction(a, 0)));
+            if change == 0 {
+                assert_eq!(app.editor_features.requests.len(), 1);
+                acknowledge_code_action_command(&mut app).await;
+            } else {
+                assert!(app.editor_features.requests.is_empty(), "stale command must not be submitted");
+                assert!(app.lsp_contexts[&a].failure.as_ref().is_some_and(|message| message.contains("command was not run")));
+            }
+            app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn command_preview_checks_unchanged_target_and_reopened_unedited_peer_before_freeze() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
+        let item = app.lsp.fixture_code_action(a_doc).await;
+        let mut operation = app.editor_operation(a, LspEditKind::CodeAction).unwrap();
+        operation.command = item.command.clone(); operation.command_context = Some(item); operation.open_files = app.editor_open_files();
+        let prepared = plan(&app, root.path(), &["a.rs"]);
+        app.lsp.close(b_doc);
+        app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn old() {}\n").await;
+        drop(app.publish_editor_workspace_edit(821, operation, prepared));
+        assert!(!app.editor_features.publishing());
+        assert_eq!(text(&app, a), "fn old() {}\n");
+        assert!(matches!(&app.cards[&a], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+        assert!(app.lsp_contexts[&a].failure.as_ref().is_some_and(|message| message.contains("no longer current")));
+        app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completed_publication_rechecks_command_before_own_version_changes() {
+        for stale_peer in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
+            let item = app.lsp.fixture_code_action(a_doc).await;
+            let mut operation = app.editor_operation(a, LspEditKind::CodeAction).unwrap();
+            operation.command = item.command.clone(); operation.command_context = Some(item); operation.open_files = app.editor_open_files();
+            let prepared = plan(&app, root.path(), &["a.rs", "unopened.rs"]);
+            let publishing = app.publish_editor_workspace_edit(822, operation, prepared);
+            assert!(app.editor_features.publishing());
+            if stale_peer {
+                app.lsp.close(b_doc);
+                app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn old() {}\n").await;
+            }
+            finish(&mut app, publishing).await;
+            assert_eq!(text(&app, a), "fn renamed() {}\n");
+            assert_eq!(std::fs::read_to_string(root.path().join("unopened.rs")).unwrap(), "fn renamed() {}\n");
+            if stale_peer {
+                assert!(app.editor_features.requests.is_empty());
+                assert!(app.lsp_contexts[&a].failure.as_ref().is_some_and(|message| message.contains("edits were applied, but the code action command was not run")));
+            } else {
+                assert!(app.lsp.document_version(a_doc).unwrap() > 1, "the action's own native edit advanced its URI version");
+                assert_eq!(app.editor_features.requests.len(), 1);
+                acknowledge_code_action_command(&mut app).await;
+            }
+            app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn emitted_peer_edit_rejects_closed_or_reopened_uri_before_preview() {
         for reopen in [false, true] {
@@ -461,7 +564,8 @@ mod tests {
         app.lsp = LspManager::fixture_ready_format_on_save(a_doc, &root.path().join("a.rs"), root.path(), original).await;
         app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), original).await;
         for (card, doc) in [(a, a_doc), (b, b_doc)] { app.lsp_documents.insert(doc, card); app.lsp_contexts.entry(card).or_default().document = Some(doc); }
-        let prepared = plan(&app, root.path(), &["a.rs", "b.rs"]); let operation = app.editor_operation(a, LspEditKind::Rename).unwrap();
+        let prepared = plan(&app, root.path(), &["a.rs", "b.rs"]); let mut operation = app.editor_operation(a, LspEditKind::Rename).unwrap();
+        operation.open_files = app.editor_open_files();
         let old_identity = app.lsp.document_incarnation(b_doc).unwrap();
         app.lsp.close(b_doc);
         app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), original).await;
