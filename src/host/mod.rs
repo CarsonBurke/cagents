@@ -449,6 +449,9 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         } else {
             chat.close()
         };
+        let closed = closed.and_then(|()| {
+            if upgrading { Ok(()) } else { chat::retained_actor::finish_close(host, &chat, &session) }
+        });
         match closed {
             Ok(()) if !upgrading => {
                 // Ordinary shutdown proved this exact provider stopped. Retire

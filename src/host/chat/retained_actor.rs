@@ -274,3 +274,66 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
     }
     Ok(())
 }
+
+/// Provider Close and helper retirement are separate. Keep its reducer/Store
+/// and final semantic journal until every required daemon write is committed.
+pub(in crate::host) fn finish_close(host: &SharedHost, handle: &Handle, requested: &Session) -> Result<(), String> {
+    let Some(identity) = handle.actor_identity() else { return Ok(()); };
+    let (proof, notifications) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (state.proof().clone(), state.notifications.clone())
+    };
+    let registry = super::super::agent_execution::registry(host)?;
+    let source = {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        match registry.agent_for_session(requested.id)?.and_then(|agent| agent.session) {
+            Some(crate::agent_execution::HostedSession::Chat(source)) => source,
+            Some(_) => return Err("The closing native actor changed execution surface".into()),
+            None => requested.clone(),
+        }
+    };
+    if !chat::native_holder::closed_source(&source, &proof)?.is_some_and(|(owner, _)| owner == identity.record) {
+        return Err("The final actor publication does not prove this exact execution descriptor closed".into());
+    }
+    let loss = handle.continuity_loss();
+    if let Some(loss) = &loss {
+        let changed = registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_loss(identity.instance, &identity.record, &source, &loss.affected_runs, &loss.reason, chat::now_ms().unwrap_or(0))?;
+        if changed { super::super::agent_execution::announce(host, &registry); }
+        handle.ack_continuity_loss(loss.id)?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let page = handle.uncommitted_outcomes()?;
+        if page.is_empty() { break; }
+        for entry in page {
+            let event = match entry.update {
+                Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
+                Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
+                _ => return Err("Closing actor journal contains an unsupported semantic event".into()),
+            };
+            let (changed, automation) = {
+                let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                let changed = registry.commit_native_actor_event(identity.instance, &identity.record, &source, entry.sequence, &event, chat::now_ms().unwrap_or(0))?;
+                let automation = registry.agent_for_session(source.id)?.is_some_and(|agent| matches!(agent.origin, crate::agent_execution::Origin::Automation { .. }));
+                (changed, automation)
+            };
+            if changed { super::super::agent_execution::announce(host, &registry); }
+            if let NativeActorEvent::Attention(evidence) = event
+                && !automation && !(loss.is_some() && evidence.kind == crate::notifications::Kind::Succeeded)
+            {
+                notifications.as_ref().ok_or("Final attention journal is unavailable; helper is retained")?
+                    .record_committed(crate::notifications::Event::session(source.id, source.launch.provider, source.launch.recipe.working_directory.clone(), evidence))?
+                    .recv_timeout(Duration::from_secs(10)).map_err(|_| "Final attention has not committed; helper is retained")??;
+            }
+            let current = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.proof() == &proof && (state.chats.get(&source.id).is_some_and(|record| record.handle.same_actor(handle))
+                    || state.native_closing.get(&source.id).is_some_and(|pending| pending.owns(&identity.record, requested)))
+            };
+            if !current { return Err("Actor close ownership changed before final acknowledgement".into()); }
+            handle.commit_retained_outcomes(entry.sequence)?;
+            if Instant::now() >= deadline { return Err("Final actor outcomes remain pending; retry its retained close".into()); }
+        }
+    }
+    handle.finish_retained_close()
+}

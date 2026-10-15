@@ -10,6 +10,12 @@ pub(in crate::host) struct NativeClose {
     paired: Option<RetainedPair>,
 }
 
+impl NativeClose {
+    pub(super) fn owns(&self, owner: &registry::Record, source: &Session) -> bool {
+        self.owner.record() == owner && self.source == *source
+    }
+}
+
 #[derive(Clone)]
 enum NativeOwner {
     Server(chat::native_holder::Detached),
@@ -213,6 +219,9 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
             state.retire_terminal(pair.holder.terminal);
         }
         chat::native_holder::confirm_pair_closed(source, &proof)?;
+        if let NativeOwner::Actor { handle, .. } = &pending.owner {
+            retained_actor::finish_close(host, handle, source)?;
+        }
         // Keep the proved owner while durable retirement is retryable. An SQL
         // failure cannot force a second Release or lose its cleanup evidence.
         retire_closed_execution(host, source, pending.owner.record(), &proof)?;
