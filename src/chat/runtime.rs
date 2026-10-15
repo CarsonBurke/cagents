@@ -5244,7 +5244,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_identity_after_initial_ready_emits_a_scalar_identity_wake() {
+    fn confirmed_identity_after_initial_ready_emits_revocation_and_publication_wakes() {
         struct LateIdentity;
         impl Adapter for LateIdentity {
             fn initialize(&mut self) -> Result<Step, String> {
@@ -5297,11 +5297,14 @@ mod tests {
         handle.command(Command::Refresh).unwrap();
         until(&handle, |state| state.session_id.is_some());
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !events
+        // The pre-reducer identity observation revokes the old backend first;
+        // the post-frame edge publishes its confirmed metadata afterward.
+        while events
             .lock()
             .unwrap()
             .iter()
-            .any(|update| matches!(update, Update::Identity))
+            .filter(|update| matches!(update, Update::Identity))
+            .count() < 2
         {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
@@ -5323,7 +5326,8 @@ mod tests {
                 .iter()
                 .filter(|update| matches!(update, Update::Identity))
                 .count(),
-            1
+            2,
+            "revocation and settled publication remain separate safety edges"
         );
         assert_eq!(
             handle.confirmed_session_id().as_deref(),
