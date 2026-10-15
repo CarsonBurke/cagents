@@ -217,14 +217,18 @@ pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, PublicationFai
     publish_unopened_with_before_file(plan, |_| {})
 }
 
-fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(usize)) -> Result<PublicationReport, PublicationFailure> {
+fn publish_unopened_with_before_file(plan: &Plan, before_file: impl FnMut(usize)) -> Result<PublicationReport, PublicationFailure> {
+    publish_unopened_with_hooks(plan, before_file, |_| Ok(()))
+}
+
+fn publish_unopened_with_hooks(plan: &Plan, mut before_file: impl FnMut(usize), mut before_publish: impl FnMut(&DocumentPlan) -> std::io::Result<()>) -> Result<PublicationReport, PublicationFailure> {
     verify_root(&plan.root)?;
     let mut report = PublicationReport { worktree: Some(plan.worktree.clone()), ..Default::default() };
     let mut published: Vec<&DocumentPlan> = Vec::new();
     for (index, document) in plan.documents.iter().filter(|document| !document.open && document.before != document.after).enumerate() {
         before_file(index);
         let saved = verify_root(&plan.root).map_err(editor::FileIoError::Io)
-            .and_then(|()| editor::save_file_at_in_context(&plan.root, &document.relative, &document.after, document.before_hash, false, &plan.recovery_context));
+            .and_then(|()| editor::save_file_at_with_hooks_in_context(&plan.root, &document.relative, &document.after, document.before_hash, false, || before_publish(document), fs_safety::sync_directory, &plan.recovery_context));
         let failure = match saved {
             Ok(SaveOutcome::Saved { durability, .. }) => {
                 report.durability(&document.relative, durability, false);
@@ -298,6 +302,36 @@ mod tests {
         assert!(offset("a😀b", LspPosition::new(0, 2), LspCoordinates::Utf16).is_err());
         assert_eq!(offset("a\r\n", LspPosition::new(1, 0), LspCoordinates::Utf16), Ok(3));
     }
+    #[test]
+    fn actual_publication_recovery_keeps_original_cleanup_lease_after_plan_drop() {
+        let directory = tempfile::tempdir().unwrap(); let runtime = tempfile::tempdir().unwrap();
+        let named = directory.path().join("worktree"); let moved = directory.path().join("original");
+        std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("a.rs"), "old").unwrap();
+        let root = Arc::new(fs_safety::Root::open(&named).unwrap());
+        let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), &named, false).unwrap();
+        let plan = prepare_at(root, Arc::new(Some(protection)), vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], &HashMap::new()).unwrap();
+        let mut private = None;
+        let report = publish_unopened_with_hooks(&plan, |_| {}, |_| {
+            let path = std::fs::read_dir(&named)?.map(|entry| entry.map(|entry| entry.path())).collect::<std::io::Result<Vec<_>>>()?.into_iter().find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(".cagents-save-"))).expect("actual publisher holding");
+            let held = fs_safety::Root::open(&path)?;
+            std::fs::write(path.join("unresolved"), "preserve")?;
+            private = Some(held); Ok(())
+        }).unwrap();
+        assert_eq!(std::fs::read(named.join("a.rs")).unwrap(), b"new");
+        let authority = report.recovery.as_ref().expect("actual cleanup refusal retains authority").clone();
+        drop(plan); drop(report);
+        std::fs::rename(&named, &moved).unwrap(); std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("foreign"), "preserve replacement").unwrap();
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).is_err());
+        assert!(authority.retry().is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).is_err());
+        fs_safety::unlink_within(private.as_ref().unwrap(), std::ffi::OsStr::new("unresolved")).unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved());
+        drop(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).unwrap());
+        assert_eq!(std::fs::read(named.join("foreign")).unwrap(), b"preserve replacement");
+        assert_eq!(std::fs::read(moved.join("a.rs")).unwrap(), b"new");
+    }
+
     #[test]
     fn multi_file_preview_fences_versions_and_publishes_unopened_files() {
         let directory = tempfile::tempdir().unwrap();
