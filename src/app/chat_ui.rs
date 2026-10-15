@@ -3590,7 +3590,7 @@ impl Cagents {
             return Task::none();
         }
         runtime.model_picker = None;
-        let moved = if runtime.session.launch.provider == provider {
+        let mut moved = if runtime.session.launch.provider == provider {
             None
         } else {
             match fresh_chat_session(
@@ -3625,6 +3625,8 @@ impl Cagents {
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
+        let launch = moved.as_mut().map_or(&mut runtime.session.launch, |session| &mut session.launch);
+        settings::agents::set_model_options(&mut launch.recipe.arguments, provider, snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref());
         runtime.snapshot = Arc::new(snapshot);
         runtime.completion.restart(true);
         if let Some(session) = &moved {
@@ -5291,11 +5293,14 @@ impl Cagents {
             .map(|model| (model, runtime.snapshot.reasoning.clone()));
         let mut session = runtime.session.clone();
         session.id = TerminalId::new();
-        crate::settings::agents::set_model_options(
-            &mut session.launch.recipe.arguments,
+        settings::AgentLaunchSettings::default().append_options(
             session.launch.provider,
-            runtime.snapshot.selected_model.as_deref(),
-            runtime.snapshot.reasoning.as_deref(),
+            &mut session.launch.recipe.arguments,
+            settings::agents::LaunchDefaults {
+                model: runtime.snapshot.selected_model.as_deref(),
+                effort: runtime.snapshot.reasoning.as_deref(),
+                permission_mode: None,
+            },
         );
         let text = runtime.composer.text();
         let resolved_text = completion::invocations(

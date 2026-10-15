@@ -302,7 +302,9 @@ Settings > Agents offers model, effort and permission choices, executable
 **Detect**, and individual argument and environment rows. A conversation's
 composer or explicit `agent spawn` options override defaults. Launch recipes
 record the executable, arguments and environment used; changing a preference
-does not rewrite existing conversations. These options apply to native UI,
+does not rewrite existing conversations. If a pinned executable or shell
+becomes unavailable, its preference and provider policy remain saved. New launches
+refuse that path until it is repaired; they do not silently switch binaries or permissions. These options apply to native UI,
 CLI agent launches and automation launches through the shared daemon policy.
 
 Environment names must start with a letter or underscore and contain only

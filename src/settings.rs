@@ -1594,11 +1594,19 @@ impl AppSettings {
             Some(_) => LinkOpenDestination::IntegratedBrowser,
         }
     }
-    pub fn validate(mut self) -> Result<Self, SettingsError> {
-        if self.default_shell.as_deref().is_some_and(|path| !agents::executable_available(path)) { return Err(SettingsError::AgentLaunch("Default shell must be an absolute path to an executable file.".into())); }
-        for (key, configuration) in &self.agents {
-            if let Some(provider) = crate::agent::Provider::ALL.into_iter().find(|provider| agents::provider_key(*provider) == key) {
-                configuration.validate(provider).map_err(SettingsError::AgentLaunch)?;
+    pub fn validate(self) -> Result<Self, SettingsError> {
+        self.validate_with_agent_launches(true)
+    }
+
+    fn validate_with_agent_launches(mut self, check_launches: bool) -> Result<Self, SettingsError> {
+        // Loading must retain pinned launch policy even if a binary disappears.
+        // New edits are validated here; each actual launch validates again.
+        if check_launches {
+            if self.default_shell.as_deref().is_some_and(|path| !agents::executable_available(path)) { return Err(SettingsError::AgentLaunch("Default shell must be an absolute path to an executable file.".into())); }
+            for (key, configuration) in &self.agents {
+                if let Some(provider) = crate::agent::Provider::ALL.into_iter().find(|provider| agents::provider_key(*provider) == key) {
+                    configuration.validate(provider).map_err(SettingsError::AgentLaunch)?;
+                }
             }
         }
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
@@ -2253,7 +2261,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         let (path, reason, error) = match decoded {
             Ok(settings) => {
                 let fault = settings.keyboard_shortcuts.fault();
-                match (settings.validate(), fault) {
+                match (settings.validate_with_agent_launches(false), fault) {
                     (Ok(settings), _) => {
                         foreign.extend(unknown.into_iter().map(|path| Foreign {
                             path,
@@ -2369,21 +2377,6 @@ fn invalid_setting(
     defaults: &toml::Value,
     error: &SettingsError,
 ) -> Option<Vec<Segment>> {
-    // Optional shell paths have no serialized default. Preserve an invalid
-    // saved value as foreign data while allowing the remaining settings to load.
-    if matches!(error, SettingsError::AgentLaunch(_))
-        && read.get("default_shell").and_then(toml::Value::as_str).is_some_and(|path| !agents::executable_available(path))
-    {
-        return Some(vec![Segment::Key("default_shell".into())]);
-    }
-    if matches!(error, SettingsError::AgentLaunch(_)) {
-        for provider in crate::agent::Provider::ALL {
-            let key = agents::provider_key(provider);
-            if read.get("agents").and_then(|agents| agents.get(key)).cloned().and_then(|entry| entry.try_into::<AgentLaunchSettings>().ok()).is_some_and(|configuration| configuration.validate(provider).is_err()) {
-                return Some(vec![Segment::Key("agents".into()), Segment::Key(key.into())]);
-            }
-        }
-    }
     let failure = error.to_string();
     read.as_table()?
         .keys()
@@ -2398,7 +2391,7 @@ fn invalid_setting(
             trial
                 .try_into::<AppSettings>()
                 .map_err(SettingsError::from)
-                .and_then(AppSettings::validate)
+                .and_then(|settings| settings.validate_with_agent_launches(false))
                 .map_or_else(|error| error.to_string() != failure, |_| true)
         })
 }

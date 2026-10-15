@@ -186,20 +186,23 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_saved_paths_preserve_other_provider_preferences() {
+    fn unavailable_saved_paths_preserve_policy_and_refuse_launch() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         let settings = super::super::AppSettings::default();
         let mut value = toml::Value::try_from(&settings).unwrap();
         value["default_shell"] = toml::Value::String(directory.path().join("missing-shell").to_string_lossy().into_owned());
         value["agents"] = toml::Value::Table(toml::Table::from_iter([
-            ("claude".into(), toml::Value::try_from(AgentLaunchSettings { executable: Some(directory.path().join("missing-provider").to_string_lossy().into_owned()), ..Default::default() }).unwrap()),
+            ("claude".into(), toml::Value::try_from(AgentLaunchSettings { executable: Some(directory.path().join("missing-provider").to_string_lossy().into_owned()), model: Some("pinned-model".into()), permission_mode: Some("plan".into()), ..Default::default() }).unwrap()),
             ("codex".into(), toml::Value::try_from(AgentLaunchSettings { model: Some("keep-model".into()), ..Default::default() }).unwrap()),
         ]));
         std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
         let loaded = super::super::load(&path).unwrap();
-        assert!(loaded.default_shell.is_none());
-        assert!(!loaded.agents.contains_key("claude"));
+        assert_eq!(loaded.default_shell.as_deref(), value.get("default_shell").and_then(toml::Value::as_str));
+        assert!(loaded.agents["claude"].validate(Provider::Claude).is_err());
+        assert_eq!(loaded.agents["claude"].model.as_deref(), Some("pinned-model"));
+        assert_eq!(loaded.agents["claude"].permission_mode.as_deref(), Some("plan"));
+        assert!(loaded.clone().validate().is_err(), "new saves must still refuse unusable launch settings");
         assert_eq!(loaded.agents["codex"].model.as_deref(), Some("keep-model"));
     }
 
@@ -226,6 +229,9 @@ mod tests {
         let explicit = crate::control::terminal_spawn_recipe(root.clone(), vec!["/bin/echo".into(), "explicit".into()]).unwrap();
         assert_eq!(explicit.program, "/bin/echo");
         assert_eq!(explicit.arguments, ["explicit"]);
+        std::fs::remove_file(&shell).unwrap();
+        assert_eq!(crate::model::login_shell(), Err(crate::model::LoginShellError::ConfiguredUnavailable));
+        assert!(crate::control::terminal_spawn_recipe(root, vec![]).is_err(), "a missing pinned shell cannot silently switch to the login shell");
     }
 
     #[test]

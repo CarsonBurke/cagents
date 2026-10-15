@@ -16138,8 +16138,8 @@ impl Application for Cagents {
             Message::DetectAgentExecutable(provider) => {
                 let previous = self.settings_draft.agents.get(&provider).and_then(|draft| draft.configuration.executable.clone());
                 cosmic::task::future(async move {
+                let search = crate::account::probe::search_path().await;
                 let path = tokio::task::spawn_blocking(move || {
-                    let search = std::env::var_os("PATH");
                     crate::account::probe::find_executable(provider.executable(), search.as_deref()).map(|path| path.to_string_lossy().into_owned())
                 }).await.ok().flatten();
                 Message::AgentExecutableDetected(provider, previous, path)
