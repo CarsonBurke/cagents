@@ -330,6 +330,7 @@ struct Claude {
     >,
     execution: Option<crate::model::RunId>,
     pending: HashMap<String, Value>,
+    decision_generations: HashMap<String,u64>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
     control_deadlines: HashMap<String, std::time::Instant>,
@@ -434,7 +435,7 @@ impl Claude {
                         && let Some((key, outcome, run)) =
                             self.deferred_attention.remove(&generation)
                     {
-                        step.events.push(Event::TurnFinished { key, outcome });
+                        self.publish_deferred_finish(generation,key,outcome,&mut step);
                         if let Some(run) = run {
                             step.events.push(Event::Execution {
                                 run,
@@ -591,10 +592,31 @@ impl Claude {
     }
     fn retire(&mut self, id: String, step: &mut Step) {
         self.pending.remove(&id);
+        self.decision_generations.remove(&id);
         step.events.push(Event::RequestResolved { id: id.clone() });
         self.retired.push_back(id);
         if self.retired.len() > 512 {
             self.retired.pop_front();
+        }
+    }
+    fn remember_decision(&mut self,id:String,raw:Value) {
+        self.decision_generations.insert(id.clone(),self.attention_generation);
+        self.pending.insert(id,raw);
+    }
+    fn retire_turn_decisions(&mut self,generation:u64,step:&mut Step) {
+        let ids=self.decision_generations.iter().filter(|(_,owner)|**owner==generation).map(|(id,_)|id.clone()).collect::<Vec<_>>();
+        for id in ids {self.retire(id,step);}
+    }
+    fn publish_deferred_finish(&mut self,generation:u64,key:Option<String>,outcome:crate::notifications::Kind,step:&mut Step) {
+        use crate::notifications::Kind;
+        if matches!(outcome,Kind::Cancelled|Kind::Failed) {self.retire_turn_decisions(generation,step);}
+        let current=generation.wrapping_add(1)==self.attention_generation
+            && self.started_generation!=Some(self.attention_generation);
+        if current {
+            self.status(!self.pending.is_empty(),"Claude turn complete",step);
+            step.events.push(Event::TurnFinished {key,outcome});
+        } else {
+            step.events.push(Event::PastTurnFinished {key,outcome});
         }
     }
     fn tool(&mut self, item: Item) {
@@ -891,7 +913,7 @@ impl Claude {
                 fields: vec![],
                 actions: vec![],
             };
-            self.pending.insert(id, raw);
+            self.remember_decision(id, raw);
             return Ok(Step {
                 events: vec![
                     Event::Request(prompt),
@@ -975,7 +997,7 @@ impl Claude {
             fields,
             actions,
         };
-        self.pending.insert(id, raw);
+        self.remember_decision(id, raw);
         Ok(Step {
             events: vec![Event::Request(event)],
             ..Step::default()
@@ -2054,6 +2076,7 @@ impl Adapter for Claude {
                 self.session_id = None;
                 self.history = None;
                 self.pending.clear();
+                self.decision_generations.clear();
                 self.retired.clear();
                 self.streams.clear();
                 self.blocks.clear();
@@ -2117,7 +2140,7 @@ impl Adapter for Claude {
                         } else {
                             outcome
                         };
-                        step.events.push(Event::TurnFinished { key, outcome });
+                        self.publish_deferred_finish(generation,key,outcome,&mut step);
                         if let Some(run) = execution {
                             step.events.push(Event::Execution {
                                 run,
@@ -2367,6 +2390,9 @@ impl Adapter for Claude {
                     } else {
                         Kind::Succeeded
                     };
+                    if matches!(outcome,Kind::Cancelled|Kind::Failed) {
+                        self.retire_turn_decisions(self.attention_generation,&mut step);
+                    }
                     let execution = self.execution.take();
                     if let Some(run) = execution {
                         step.events.push(Event::Execution {
@@ -4967,7 +4993,7 @@ impl Claude {
             fields,
             actions,
         }));
-        self.pending.insert(id, raw);
+        self.remember_decision(id, raw);
         Ok(step)
     }
     fn answer_elicitation(
@@ -5350,6 +5376,35 @@ mod tests {
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].0, id);
         assert!(replies[0].1.is_err());
+    }
+
+    #[test]
+    fn failed_turn_retires_pending_decisions_before_reporting_idle() {
+        let mut adapter=Claude {ready:true,busy:true,..Default::default()};
+        adapter.receive(json!({"type":"control_request","request_id":"old","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-old","input":{"command":"true"}}})).unwrap();
+        let failed=adapter.receive(json!({"type":"result","subtype":"error_during_execution","is_error":true})).unwrap();
+        assert!(adapter.pending.is_empty()); assert!(adapter.decision_generations.is_empty()); assert!(!adapter.busy);
+        assert!(failed.events.contains(&Event::RequestResolved {id:"old".into()}));
+        assert!(!failed.events.iter().any(|event|matches!(event,Event::Status {busy:true,..})));
+        assert!(adapter.command(Command::Prompt {text:"new prompt".into(),attachments:Vec::new(),mode:PromptMode::Send}).is_ok());
+    }
+
+    #[test]
+    fn late_interrupt_result_retires_only_its_original_decisions_and_not_the_new_turn() {
+        let mut adapter=Claude {ready:true,busy:true,..Default::default()};
+        let request=|id:&str|json!({"type":"control_request","request_id":id,"request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":format!("tool-{id}"),"input":{"command":"true"}}});
+        adapter.receive(request("old")).unwrap();
+        let interrupt=adapter.command(Command::Interrupt).unwrap();
+        let id=interrupt.writes[0]["request_id"].clone();
+        adapter.receive(json!({"type":"result","uuid":"old-result","subtype":"success","is_error":false})).unwrap();
+        let mut start=Step::default(); adapter.start_turn(&mut start);
+        adapter.receive(request("new")).unwrap();
+        let reply=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{}}})).unwrap();
+        assert!(!adapter.pending.contains_key("old")); assert!(adapter.pending.contains_key("new")); assert!(adapter.busy);
+        assert!(reply.events.contains(&Event::RequestResolved {id:"old".into()}));
+        assert!(!reply.events.contains(&Event::RequestResolved {id:"new".into()}));
+        assert!(reply.events.iter().any(|event|matches!(event,Event::PastTurnFinished {outcome:crate::notifications::Kind::Cancelled,..})));
+        assert!(!reply.events.iter().any(|event|matches!(event,Event::TurnFinished{..}|Event::Status {busy:false,..})));
     }
 
     #[test]

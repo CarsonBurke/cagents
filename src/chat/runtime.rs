@@ -1737,7 +1737,7 @@ impl TurnAttention {
             }
             Event::Reset { .. } => *self = Self::default(),
             Event::TurnSettled => self.settled = true,
-            Event::TurnFinished { key, outcome } => {
+            Event::TurnFinished { key, outcome } | Event::PastTurnFinished {key,outcome} => {
                 return Some(crate::notifications::Evidence {
                     key: key.clone().unwrap_or_else(|| self.key.clone()),
                     kind: *outcome,
@@ -2544,6 +2544,10 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        if matches!(&event,Event::PastTurnFinished {..}) {
+            if let Some(evidence)=self.attention.apply(&event) {(self.notify)(Update::Attention(evidence));}
+            return;
+        }
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
@@ -2949,7 +2953,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 _ => state.outcome.take(),
             };
         }
-        Event::TurnSettled | Event::Execution { .. } => {}
+        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished {..} => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -3892,6 +3896,41 @@ mod tests {
         apply_event(&mut state,&mut BTreeMap::new(),Event::Exited {code:Some(3)});
         assert!(state.requests.is_empty()); assert!(!state.waiting);
         assert_eq!(state.activity(),ActivityState::Unknown);
+    }
+
+    #[test]
+    fn delayed_old_turn_outcome_notifies_without_mutating_current_turn_metadata() {
+        struct LateResult;
+        impl Adapter for LateResult {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String> {
+                let events=match command {
+                    Command::SetFastMode{..}=>vec![Event::TurnStarted,Event::Status {busy:true,detail:"Working".into()},Event::Request(super::super::Request {kind:super::super::RequestKind::Approval,id:"new-approval".into(),title:"New tool".into(),description:String::new(),fields:Vec::new(),actions:Vec::new()})],
+                    Command::Compact=>vec![Event::PastTurnFinished {key:Some("old-result".into()),outcome:crate::notifications::Kind::Cancelled}],
+                    _=>return Err("Unexpected late-result fixture command".into()),
+                };
+                Ok(Step {events,..Default::default()})
+            }
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let (send,receive)=crossbeam_channel::unbounded();
+        let handle=Handle::start(spec,Box::new(LateResult),initial,store,None,move|update|{let _=send.send(update);}).unwrap();
+        until(&handle,|state|state.ready);
+        handle.command(Command::SetFastMode {enabled:true}).unwrap();
+        let before=handle.snapshot(None).unwrap();
+        handle.command(Command::Compact).unwrap();
+        let after=handle.snapshot(None).unwrap();
+        assert_eq!(after.turn_generation,before.turn_generation);
+        assert_eq!(after.requests,before.requests);
+        assert_eq!(after.outcome,before.outcome);
+        assert_eq!(after.finished_at,before.finished_at);
+        assert_eq!(after.activity(),ActivityState::Waiting);
+        assert!(receive.try_iter().any(|update|matches!(update,Update::Attention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
+        handle.close().unwrap();
     }
 
     #[test]
