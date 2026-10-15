@@ -9114,7 +9114,7 @@ fn editable_document_view<'a>(
                 &cosmic::theme::active(),
                 crate::design::TEXT_BODY,
             );
-            let copy = runtime
+            let copy: Option<Element<'_, RepositoryAction>> = runtime
                 .language
                 .hover_diagnostic
                 .as_ref()
