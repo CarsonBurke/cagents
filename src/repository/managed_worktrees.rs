@@ -28,7 +28,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut lock = GitFileLock::acquire(&exclude).map_err(ValidationError::Io)?;
         let mut bytes = match fs_safety::open_beneath(&lock.parent, Path::new("exclude")) {
             Ok(mut file) => fs_safety::read_bounded(&mut file, 4 * 1024 * 1024).map_err(|error| ValidationError::Io(error.to_string()))?,
-            Err(error) if !exclude.exists() => { let _ = error; Vec::new() },
+            Err(error) if error.is_not_found() => Vec::new(),
             Err(error) => return Err(ValidationError::Io(error.to_string()).into()),
         };
         let mut pattern = vec![b'/'];
