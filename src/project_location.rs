@@ -339,25 +339,37 @@ mod tests {
             assert_eq!(checkout_identity(root), None);
             return;
         }
-        // The parent remains bounded if a regression blocks on an unwritten
-        // FIFO. This child creates no subprocesses and is always reaped.
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        // Own the original child through every assertion/error path. The
+        // fixture has no descendants; a stalled locator is killed and reaped.
+        struct ChildOwner(std::process::Child);
+        impl Drop for ChildOwner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                loop {
+                    match self.0.wait() {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        let mut child = ChildOwner(Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "project_location::tests::checkout_identity_rejects_special_and_oversized_locators", "--nocapture"])
             .env(CHILD, "1")
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            if child.try_wait().unwrap().is_some() { break; }
-            if std::time::Instant::now() >= deadline {
-                child.kill().unwrap();
-                let output = child.wait_with_output().unwrap();
-                panic!("checkout locator inspection stalled: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            }
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() { break status; }
+            assert!(std::time::Instant::now() < deadline, "checkout locator inspection stalled");
             std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        };
+        use std::io::Read;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child.0.stdout.take().unwrap().take(64 * 1024).read_to_string(&mut stdout).unwrap();
+        child.0.stderr.take().unwrap().take(64 * 1024).read_to_string(&mut stderr).unwrap();
+        assert!(status.success(), "{stdout}{stderr}");
+        assert!(stdout.contains("1 passed; 0 failed"));
     }
 
     #[test]
