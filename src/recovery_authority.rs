@@ -25,7 +25,7 @@ impl RecoverySlot {
     }
     pub(crate) fn retain(self, description: String, retry: impl FnMut() -> Result<(), String> + Send + 'static) -> RecoveryAuthority {
         RecoveryAuthority(Arc::new(RecoveryInner {
-            description: description.chars().take(2048).collect(), resolved: AtomicBool::new(false),
+            description: description.chars().take(2048).collect(), resolved: AtomicBool::new(false), leaves: None,
             work: Mutex::new(RecoveryWork { retry: Some(Box::new(retry)), slot: Some(self) }),
         }))
     }
@@ -36,7 +36,11 @@ struct RecoveryWork {
     retry: Option<Box<dyn FnMut() -> Result<(), String> + Send>>,
     slot: Option<RecoverySlot>,
 }
-struct RecoveryInner { description: String, resolved: AtomicBool, work: Mutex<RecoveryWork> }
+struct RecoveryInner {
+    description: String, resolved: AtomicBool, work: Mutex<RecoveryWork>,
+    // A group retains only reserved leaves, never another unreserved group.
+    leaves: Option<Vec<RecoveryAuthority>>,
+}
 
 /// A producer-owned recovery operation, retained by its exact UI error/result.
 /// Clones share one payload and one budget slot; there is no Drop filesystem IO.
@@ -47,9 +51,24 @@ impl RecoveryAuthority {
     /// effect. Nested cleanup errors must not discard an earlier authority.
     pub(crate) fn combine(self, other: Self) -> Self {
         if self == other { return self; }
-        let description = format!("{}; {}", self.description(), other.description()).chars().take(2048).collect();
-        Self(Arc::new(RecoveryInner { description, resolved: AtomicBool::new(false), work: Mutex::new(RecoveryWork {
-            retry: Some(Box::new(move || { self.retry()?; other.retry() })), slot: None,
+        let mut leaves = Vec::new();
+        for authority in [&self, &other] {
+            let candidates = authority.0.leaves.as_deref().unwrap_or_else(|| std::slice::from_ref(authority));
+            for leaf in candidates {
+                if !leaf.is_resolved() && !leaves.contains(leaf) {
+                    leaves.push(leaf.clone());
+                }
+            }
+        }
+        if leaves.is_empty() { return self; }
+        if leaves.len() == 1 { return leaves.pop().unwrap(); }
+        // Every unresolved leaf owns a pre-effect reservation. Production's
+        // single shared budget bounds this flat list by MAX_RECOVERIES, even
+        // when callers repeatedly combine overlapping groups.
+        let description = leaves.iter().map(Self::description).collect::<Vec<_>>().join("; ").chars().take(2048).collect();
+        let retries = leaves.clone();
+        Self(Arc::new(RecoveryInner { description, resolved: AtomicBool::new(false), leaves: Some(leaves), work: Mutex::new(RecoveryWork {
+            retry: Some(Box::new(move || { for leaf in &retries { leaf.retry()?; } Ok(()) })), slot: None,
         }) }))
     }
     pub fn description(&self) -> &str { &self.0.description }
@@ -91,6 +110,25 @@ mod tests {
         clone.retry().unwrap(); assert!(authority.is_resolved());
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
         authority.retry().unwrap(); assert_eq!(attempts.load(Ordering::Acquire), 2);
+    }
+    #[test]
+    fn recovery_combine_flattens_and_deduplicates_repeated_overlapping_groups() {
+        let budget = Arc::new(Budget { used: AtomicUsize::new(0), limit: 2 });
+        let a = RecoverySlot::from_budget(Arc::clone(&budget)).unwrap().retain("a".into(), || Ok(()));
+        let b = RecoverySlot::from_budget(Arc::clone(&budget)).unwrap().retain("b".into(), || Ok(()));
+        let mut combined = a.clone().combine(b.clone());
+        for _ in 0..10_000 {
+            combined = combined.combine(a.clone()).combine(b.clone());
+            let leaves = combined.0.leaves.as_ref().unwrap();
+            assert_eq!(leaves.len(), 2);
+            assert!(leaves.iter().all(|leaf| leaf.0.leaves.is_none()));
+            assert_eq!(combined.description(), "a; b");
+        }
+        assert_eq!(budget.used.load(Ordering::Acquire), 2);
+        a.retry().unwrap();
+        assert_eq!(combined.combine(b.clone()), b);
+        b.retry().unwrap();
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
     #[test]
     fn editor_recovery_last_owner_drop_releases_budget_without_running_effects() {
