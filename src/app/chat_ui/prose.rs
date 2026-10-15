@@ -53,6 +53,17 @@ struct Tail {
 }
 
 impl CodeBlock {
+    /// Owned span storage and logical text bytes. Plain palettes share their
+    /// Arc; count that backing only once. Highlighter state is not estimated.
+    pub(super) fn retained_span_bytes(&self) -> usize {
+        let bytes = |spans: &Arc<[Span<'static, String>]>| {
+            spans.len() * std::mem::size_of::<Span<'static, String>>()
+                + spans.iter().map(|span| { let text: &str = span.text.as_ref(); text.len() }).sum::<usize>()
+        };
+        bytes(&self.spans[0]) + if Arc::ptr_eq(&self.spans[0], &self.spans[1]) { 0 } else { bytes(&self.spans[1]) }
+    }
+
+
     /// The font a block's paragraph is set in. Its spans name their own only
     /// where highlighting or [`monospace`] chose one, relative to this.
     pub(super) const FONT: iced::Font = iced::Font::MONOSPACE;

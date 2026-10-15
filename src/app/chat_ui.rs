@@ -1006,6 +1006,17 @@ struct CachedItem {
     coordination: Option<Box<coordination::Coordinated>>,
 }
 impl CachedItem {
+    /// Measured exposed presentation storage. Opaque iced Markdown/parser
+    /// allocations and widget/shaping trees are intentionally not estimated.
+    fn retained_bytes(&self) -> usize {
+        self.source.retained_capacity()
+            + self.blocks.values().map(prose::CodeBlock::retained_span_bytes).sum::<usize>()
+            + self.preview.retained_bytes()
+            + self.tool_input.iter().chain(self.tool_output.iter()).chain(self.patches.iter())
+                .map(tool_text::ToolText::retained_bytes).sum::<usize>()
+    }
+
+
     fn next_revision() -> u64 {
         static REVISION: AtomicU64 = AtomicU64::new(1);
         REVISION.fetch_add(1, Ordering::Relaxed)
