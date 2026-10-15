@@ -141,6 +141,12 @@ enum Command {
         reply: Sender<Option<crate::agent::Activity>>,
         deadline: std::time::Instant,
     },
+    ObserveClose { deadline: std::time::Instant, reply: Sender<Result<(u64, bool), String>> },
+    CloseIfRevision {
+        revision: u64,
+        deadline: std::time::Instant,
+        reply: Sender<Result<(), String>>,
+    },
     CloseChecked {
         allow_active: bool,
         deadline: std::time::Instant,
@@ -360,6 +366,9 @@ pub(crate) fn flush_archived_notices() {
 
 #[derive(Default)]
 struct InputOrder {
+    /// Successfully admitted input, independent of the cancellation epoch.
+    close_revision: u64,
+    closing: bool,
     generation: u64,
     interrupt_key: Option<KeyInput>,
 }
@@ -445,15 +454,18 @@ impl PublishedState {
         }
     }
 
-    fn request_interrupt(&self, key: Option<KeyInput>) {
+    fn request_interrupt(&self, key: Option<KeyInput>) -> bool {
         let mut order = self.input_order.lock().unwrap_or_else(|p| p.into_inner());
+        if order.closing { return false; }
         order.generation = order
             .generation
             .checked_add(1)
             .expect("terminal input generation exhausted");
+        order.close_revision = order.close_revision.checked_add(1).expect("terminal close revision exhausted");
         order.interrupt_key = key;
         self.interrupt_requested.store(true, Ordering::Release);
         let _ = self.capture_tx.try_send(());
+        true
     }
 
     fn request_shutdown(&self) {
@@ -1204,6 +1216,34 @@ impl TerminalHandle {
         Ok(carried)
     }
 
+    /// A bounded owner-side census; it never materializes terminal history.
+    pub(crate) fn close_observation(&self) -> Result<(u64, bool), String> {
+        if self.is_completed() {
+            let order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+            return Ok((order.close_revision, false));
+        }
+        let (reply, result) = crossbeam_channel::bounded(1);
+        self.try_command(Command::ObserveClose { deadline: std::time::Instant::now() + Duration::from_secs(3), reply }).map_err(|error| error.to_string())?;
+        result.recv_timeout(Duration::from_secs(3)).map_err(|error| error.to_string())?
+    }
+
+    /// Terminal providers currently expose no authoritative turn revision or
+    /// shell-builtin idle proof. Live work remains protected until they do.
+    pub(crate) fn close_if_revision(&self, revision: u64) -> Result<(), String> {
+        if self.is_completed() {
+            return self.shutdown().map_err(|error| error.to_string());
+        }
+        let (reply, result) = crossbeam_channel::bounded(1);
+        self.try_command(Command::CloseIfRevision {
+            revision,
+            deadline: std::time::Instant::now() + Duration::from_secs(3),
+            reply,
+        }).map_err(|error| error.to_string())?;
+        result.recv_timeout(Duration::from_secs(3)).map_err(|_| "Terminal close outcome is unconfirmed; refresh its census before retrying".to_owned())??;
+        // The owner already fenced admission and killed its pinned family.
+        self.shutdown().map_err(|error| error.to_string())
+    }
+
     /// Inspection and the close decision are one serialized PTY-owner command.
     pub(crate) fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
         use super::ipc::TerminalCloseResult;
@@ -1456,8 +1496,7 @@ impl TerminalHandle {
             }
         }
         if let Command::Interrupt(key) = command {
-            published.request_interrupt(key);
-            return Ok(());
+            return if published.request_interrupt(key) { Ok(()) } else { Err(TerminalSendError::Closed) };
         }
         if matches!(command, Command::CloseChecked { .. }) {
             let mut priority = published
@@ -1473,16 +1512,15 @@ impl TerminalHandle {
         }
         // Serialize input admission with the priority cancellation boundary.
         // Commands submitted after Ctrl+C must survive its queue drain.
-        let order = self
+        let mut order = self
             .inner
             .published
             .input_order
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let command = if matches!(
-            command,
-            Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)
-        ) {
+        let input = matches!(command, Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_));
+        if input && order.closing { return Err(TerminalSendError::Closed); }
+        let command = if input {
             Command::OrderedInput {
                 generation: order.generation,
                 input: Box::new(command),
@@ -1496,7 +1534,9 @@ impl TerminalHandle {
             .map_err(|error| match error {
                 TrySendError::Full(_) => TerminalSendError::Full,
                 TrySendError::Disconnected(_) => TerminalSendError::Closed,
-            })
+            })?;
+        if input { order.close_revision = order.close_revision.checked_add(1).expect("terminal close revision exhausted"); }
+        Ok(())
     }
 
     fn send_command(&self, command: Command) -> Result<(), TerminalSendError> {
@@ -2435,6 +2475,34 @@ impl Worker {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()),
                 );
+            }
+            Command::ObserveClose { deadline, reply } => {
+                let published = Arc::clone(&self.published);
+                let order = published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+                let observation = if order.closing {
+                    Err("Terminal is already closing".into())
+                } else {
+                    self.inspect_close(deadline)
+                        .map(|(active, _family)| (order.close_revision, active))
+                };
+                let _ = reply.send(observation);
+            }
+            Command::CloseIfRevision { revision, deadline, reply } => {
+                let published = Arc::clone(&self.published);
+                let order = published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+                let outcome = if order.closing || order.close_revision != revision {
+                    Err("Terminal input changed after close consent; refresh the worktree census".into())
+                } else {
+                    self.inspect_close(deadline).and_then(|(active, _family)| {
+                        if active { return Err("This terminal owns active work without an authoritative turn revision; close it explicitly, then refresh the worktree census".into()); }
+                        // An original shell with no child can still be running
+                        // a builtin. Process idleness is not prompt ownership.
+                        Err("This live shell has no authoritative prompt ownership proof; close it explicitly, then refresh the worktree census".into())
+                    })
+                };
+                let close = outcome.is_ok();
+                let _ = reply.send(outcome);
+                return close;
             }
             Command::CloseChecked {
                 allow_active,
@@ -6303,6 +6371,30 @@ mod tests {
         assert!(!active(&worker));
         drop(commands);
         worker.run();
+    }
+
+    #[test]
+    fn worktree_close_fence_rejects_priority_interrupt_admission() {
+        let handle = TerminalHandle::spawn(shell_session("echo FENCE_READY; sleep 600"), TerminalConfig::default(), |_| {}).unwrap();
+        wait_for_text(&handle, "FENCE_READY");
+        handle.inner.published.input_order.lock().unwrap().closing = true;
+        assert_eq!(handle.input(vec![3]), Err(TerminalSendError::Closed));
+        assert_eq!(handle.input(b"new-work".to_vec()), Err(TerminalSendError::Closed));
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn worktree_close_refuses_replaced_input_revision_and_unknown_busy_turns() {
+        let handle = TerminalHandle::spawn(shell_session("echo CONSENT_READY; sleep 600"), TerminalConfig::default(), |_| {}).unwrap();
+        wait_for_text(&handle, "CONSENT_READY");
+        let (consent, active) = handle.close_observation().unwrap();
+        assert!(active);
+        assert!(handle.close_if_revision(consent).unwrap_err().contains("authoritative turn revision"));
+        assert!(!handle.is_completed(), "refusing unknown turn ownership must preserve its process");
+        handle.input(b"queued-after-consent".to_vec()).unwrap();
+        assert!(handle.close_if_revision(consent).unwrap_err().contains("changed after close consent"));
+        assert!(!handle.is_completed());
+        handle.shutdown().unwrap();
     }
 
     #[test]
