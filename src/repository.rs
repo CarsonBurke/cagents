@@ -4638,9 +4638,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // Without an addition/deletion pair, rename detection cannot
             // change another row's count. A capped prefix cannot prove the
             // opposite half is absent, so keep its non-modification reads full.
-            let reusable = cache.numstats_ready
-                && simple
-                && !(added && deleted);
+            let reusable = cache.numstats_ready && simple && !(added && deleted);
             let mut paths = BTreeSet::new();
             let mut pending = 0usize;
             for entry in status.entries.iter_mut().filter(|entry| entry.area == area) {
@@ -7798,7 +7796,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(executor.commands.lock().unwrap().len(), 15);
+        assert_eq!(executor.commands.lock().unwrap().len(), 13);
     }
 
     #[test]
@@ -7849,7 +7847,7 @@ mod tests {
             .unwrap()
             .is_some()
         );
-        assert_eq!(executor.commands.lock().unwrap().len(), 10);
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
     }
 
     #[test]
@@ -7892,7 +7890,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(executor.commands.lock().unwrap().len(), 10);
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
     }
 
     #[test]
@@ -7929,7 +7927,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(executor.commands.lock().unwrap().len(), 11);
+        assert_eq!(executor.commands.lock().unwrap().len(), 10);
     }
 
     #[test]
