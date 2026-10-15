@@ -524,6 +524,11 @@ mod authority_tests {
         }
     }
 
+    fn recovery_sink(holding: &fs_safety::DirectoryPublication) -> Arc<fs::File> {
+        Arc::new(fs::OpenOptions::new().read(true).write(true).create_new(true)
+            .open(holding.directory().path().join("restored-blob")).unwrap())
+    }
+
     #[test]
     fn recovery_object_helper_materializes_and_hashes_only_inside_owned_holding() {
         let directory = tempfile::tempdir().unwrap();
@@ -537,7 +542,7 @@ mod authority_tests {
         let authority = WorktreeAuthority::capture(&source).unwrap();
         let holding = recovery_holding(directory.path());
         let cancel = CancellationToken::new();
-        let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+        let file = recovery_sink(&holding);
         let output = service.stream_recovery_object(&authority, &holding, &oid, &file, 14, &cancel).unwrap();
         assert!(output.stdout.is_empty());
         assert_eq!(service.hash_recovery_object(&authority, &holding, &file, &cancel).unwrap(), oid);
@@ -558,7 +563,7 @@ mod authority_tests {
         let authority = WorktreeAuthority::capture(&source).unwrap();
         for parent in [source.clone(), source.join(".git")] {
             let holding = recovery_holding(&parent);
-            let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+            let file = recovery_sink(&holding);
             service.stream_recovery_object(&authority, &holding, &oid, &file, 13, &CancellationToken::new()).unwrap();
             assert_eq!(fs::read(holding.directory().path().join("restored-blob")).unwrap(), b"private bytes");
             assert!(!source.join("restored-blob").exists());
@@ -579,7 +584,7 @@ mod authority_tests {
         fs::rename(source.join(".git"), directory.path().join("saved-metadata")).unwrap();
         fs::create_dir(source.join(".git")).unwrap();
         let oid = Oid::parse_object("a".repeat(40)).unwrap();
-        let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+        let file = recovery_sink(&holding);
         assert!(service.stream_recovery_object(&authority, &holding, &oid, &file, 1, &CancellationToken::new()).is_err());
         assert_eq!(file.metadata().unwrap().len(), 0);
         assert!(inner.0.lock().unwrap().is_empty());
@@ -611,7 +616,7 @@ mod authority_tests {
         let holding = recovery_holding(directory.path());
         let parked = directory.path().join("retained-holding");
         let service = RepositoryService::new("git", Arc::new(Delayed { source: source.clone(), parent: directory.path().to_owned(), parked: parked.clone() }));
-        let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+        let file = recovery_sink(&holding);
         service.stream_recovery_object(&authority, &holding, &oid, &file, 15, &CancellationToken::new()).unwrap();
         assert_eq!(fs::read(parked.join("restored-blob")).unwrap(), b"original object");
         assert!(!directory.path().join("holding/restored-blob").exists());
@@ -636,7 +641,7 @@ mod authority_tests {
             let parent = directory.path().join(scenario);
             fs::create_dir(&parent).unwrap();
             let holding = recovery_holding(&parent);
-            let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+            let file = recovery_sink(&holding);
             let cancellation = CancellationToken::new();
             if scenario == "cancelled" { cancellation.cancel(); }
             let expected = if scenario == "budget" { 31 } else { length as u64 };
