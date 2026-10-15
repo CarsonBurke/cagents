@@ -210,6 +210,10 @@ struct Inner {
     source_binding: Arc<Mutex<Option<crate::terminal_ipc::ChatSourceBinding>>>,
     upgrade_recovery: Option<(Session, Session)>,
     proof: HostSessionProof,
+    // Captured from this authenticated connection, never resolved from a later
+    // device selection, daemon discovery or attachment.
+    return_endpoint: Option<std::path::PathBuf>,
+    return_replay: Mutex<()>,
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
@@ -376,6 +380,44 @@ fn receive(
             Err(error.message)
         }
         _ => Err("Unexpected daemon handshake frame".into()),
+    }
+}
+
+// The same deadline is applied before EVERY partial read/write, so a peer
+// dripping one frame cannot renew the retry budget with each socket syscall.
+struct ReturnReplayIo { stream: UnixStream, deadline: Instant }
+impl ReturnReplayIo {
+    fn remaining(&self) -> io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {Err(io::Error::new(io::ErrorKind::TimedOut, "The original Return retry deadline elapsed"))} else {Ok(remaining)}
+    }
+}
+impl io::Read for ReturnReplayIo {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        io::Read::read(&mut self.stream, bytes)
+    }
+}
+impl io::Write for ReturnReplayIo {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        io::Write::write(&mut self.stream, bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        io::Write::flush(&mut self.stream)
+    }
+}
+fn return_replay_response(io: &mut ReturnReplayIo, codec: &mut FrameCodec, request: u64, proof: &HostSessionProof) -> Result<ServerResponse, String> {
+    let frame: ServerEnvelope = codec.read(io).map_err(|error| error.to_string())?.ok_or("The original Return daemon disconnected")?;
+    io.remaining().map_err(|error| error.to_string())?;
+    if frame.version != PROTOCOL_VERSION || frame.proof != *proof || !frame.proof.is_complete() || frame.request_id != Some(request) {
+        return Err("The original Return retry response changed its protocol, proof or request".into());
+    }
+    match frame.message {
+        ServerMessage::Response {response} => Ok(response),
+        ServerMessage::Error(error) => Err(error.message),
+        _ => Err("The original Return retry received an unsolicited payload".into()),
     }
 }
 
@@ -563,6 +605,8 @@ impl ClientHandle {
                 source_binding: Arc::new(Mutex::new(None)),
                 upgrade_recovery: None,
                 proof,
+                return_endpoint: None,
+                return_replay: Mutex::new(()),
                 wire: Arc::new(Mutex::new(Wire {
                     stream,
                     codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
@@ -854,6 +898,7 @@ impl ClientHandle {
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
+        let return_endpoint = stream.peer_addr().ok().and_then(|address| address.as_pathname().map(std::path::Path::to_path_buf));
         stream
             .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
             .map_err(|e| e.to_string())?;
@@ -1081,6 +1126,8 @@ impl ClientHandle {
             source_binding: source_binding.clone(),
             upgrade_recovery,
             proof: proof.clone(),
+            return_endpoint,
+            return_replay: Mutex::new(()),
             wire: wire.clone(),
             cancel,
             snapshot: snapshot.clone(),
@@ -1496,6 +1543,12 @@ impl ClientHandle {
         ) {
             return Err("Return intent has no matching authenticated native backend".into());
         }
+        // A later explicit retry may outlive the original reader. It reuses
+        // this original handle's endpoint, proof and captured intent; this
+        // call never automatically retries an ambiguous live submission.
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return self.replay_return_terminal(&expected);
+        }
         let terminal = self
             .request_response(ClientRequest::ChatReturnTerminal {
                 chat_id: self.inner.id,
@@ -1506,6 +1559,48 @@ impl ClientHandle {
             return Err("Replacement terminal has no matching daemon ownership proof".into());
         }
         Ok(terminal)
+    }
+    fn replay_return_terminal(
+        &self,
+        expected: &crate::terminal_ipc::ChatSourceBinding,
+    ) -> Result<crate::terminal_ipc::TerminalHandoffReceipt, String> {
+        let _replay = match self.inner.return_replay.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err("The original Return retry is already in progress".into()),
+        };
+        let endpoint = self.inner.return_endpoint.as_ref().ok_or("The original authenticated Return endpoint is unavailable; no retry was sent")?;
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let stream = crate::control::connect_control_socket(endpoint, Duration::from_secs(5)).map_err(|error| error.to_string())?;
+        let mut io = ReturnReplayIo { stream, deadline };
+        let mut requests = FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES);
+        let mut responses = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        requests.write(&mut io, &ClientEnvelope {
+            version:PROTOCOL_VERSION, request_id:1, proof:None,
+            request:ClientRequest::Connect {expected_host:Some(self.inner.proof.clone()), resume:Vec::new()},
+        }).map_err(|error| error.to_string())?;
+        match return_replay_response(&mut io, &mut responses, 1, &self.inner.proof)? {
+            ServerResponse::Connected {proof, resumed} if proof == self.inner.proof && resumed.is_empty() => {},
+            _ => return Err("The original Return daemon did not confirm its captured proof".into()),
+        }
+        requests.write(&mut io, &ClientEnvelope {
+            version:PROTOCOL_VERSION, request_id:2, proof:Some(self.inner.proof.clone()),
+            request:ClientRequest::ChatReturnTerminal {chat_id:self.inner.id, expected:expected.clone()},
+        }).map_err(|error| error.to_string())?;
+        // Control replay returns only the receipt. Final snapshots never
+        // replace the old attachment's cached state or mark it alive again.
+        let receipt = match return_replay_response(&mut io, &mut responses, 2, &self.inner.proof)? {
+            ServerResponse::ChatTerminal {chat_id, session, receipt, ..}
+                if chat_id == self.inner.id && session == receipt.terminal.session
+                    && valid_handoff_receipt(&receipt, expected, &self.inner.proof) => receipt,
+            _ => return Err("The original Return retry did not confirm its exact captured receipt".into()),
+        };
+        io.remaining().map_err(|error| error.to_string())?;
+        let current = self.source_binding();
+        if current.as_ref().is_some_and(|current| current != expected && receipt.retained_binding.as_ref() != Some(current)) {
+            return Err("The original Return owner changed before its retry completed".into());
+        }
+        Ok(receipt)
     }
     /// Read immutable cached edit data on this connection's own reply channel.
     /// Call off the UI thread; no watch publication or provider state is mutated.
@@ -2365,6 +2460,148 @@ mod tests {
     fn handoff_reader_preserves_shared_server_and_later_command_admission() { reader_case(ReaderCase::Shared); }
     #[test]
     fn handoff_reader_preserves_correlated_chat_close() { reader_case(ReaderCase::Close); }
+
+    #[derive(Clone, Copy)]
+    enum ReplayCase { Exact, ForeignProof, WrongBackend, Refused }
+    fn disconnected_return_replay(case: ReplayCase) {
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = directory.path().join("original.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proof = handoff_proof();
+        let source = omp_card(Some("original"), Some(proof.clone()));
+        let binding = ipc::ChatSourceBinding {source:source.clone(), execution_instance:uuid::Uuid::new_v4(), backend:uuid::Uuid::new_v4()};
+        let mut descriptor = ipc::TerminalDescriptor::relaunchable(TerminalId::new(), handoff_terminal().launch, None);
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let receipt = ipc::TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(), source:source.clone(), source_execution_instance:binding.execution_instance,
+            source_binding:binding.clone(), retained_binding:None, terminal_native_epoch:uuid::Uuid::new_v4(), terminal:descriptor};
+        let sockets = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (done, completed) = crossbeam_channel::bounded(1);
+        struct Peer { sockets:Arc<Mutex<Vec<UnixStream>>>, abort:Arc<AtomicBool>, done:crossbeam_channel::Receiver<bool>, settled:bool }
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                self.abort.store(true, Ordering::Release);
+                for socket in self.sockets.lock().unwrap_or_else(|p|p.into_inner()).iter() {let _ = socket.shutdown(Shutdown::Both);}
+                if !self.settled {let _ = self.done.recv_timeout(Duration::from_secs(6));}
+            }
+        }
+        let mut peer = Peer {sockets:sockets.clone(), abort:abort.clone(), done:completed, settled:false};
+        let original = binding.clone(); let sent_receipt = receipt.clone(); let sent_proof = proof.clone();
+        let worker = thread::spawn(move || {
+            struct Done {sender:crossbeam_channel::Sender<bool>, success:bool}
+            impl Drop for Done {fn drop(&mut self) {let _ = self.sender.try_send(self.success);}}
+            let mut finished = Done {sender:done, success:false};
+            let accept = || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        sockets.lock().unwrap().push(stream.try_clone().unwrap());
+                        return stream;
+                    },
+                    Err(error) if error.kind()==io::ErrorKind::WouldBlock => {
+                        assert!(!abort.load(Ordering::Acquire) && Instant::now()<deadline, "bounded original peer accept");
+                        thread::sleep(Duration::from_millis(2));
+                    }, Err(error) => panic!("private peer accept: {error}"),
+                }}
+            };
+            let mut first = accept(); let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect:ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
+            handoff_reply(&mut first, &mut codec, Some(connect.request_id), &sent_proof,
+                ServerMessage::Response {response:ServerResponse::Connected {proof:sent_proof.clone(), resumed:vec![]}});
+            let attach:ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
+            assert!(matches!(attach.request, ClientRequest::ChatStart {..}));
+            handoff_reply(&mut first, &mut codec, Some(attach.request_id), &sent_proof,
+                ServerMessage::Response {response:ServerResponse::ChatAttached {
+                    session:original.source.clone(), execution_instance:original.execution_instance, binding:Some(original.clone()),
+                    snapshot:Snapshot {generation:1, session_id:Some("original".into()), ..Default::default()},
+                }});
+            let submitted = loop {
+                let frame:ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
+                if matches!(frame.request, ClientRequest::ChatVisibility {..}) {continue;}
+                break frame;
+            };
+            assert!(matches!(submitted.request, ClientRequest::ChatReturnTerminal {expected, ..} if expected==original));
+            // Model the response-loss seam, not provider/family cleanup proof.
+            // Shutdown all duplicate descriptors for this original connection.
+            first.shutdown(Shutdown::Both).unwrap();
+            drop(first);
+            let mut retry = accept(); let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect:ClientEnvelope = codec.read(&mut retry).unwrap().unwrap();
+            assert!(matches!(connect.request, ClientRequest::Connect {expected_host:Some(ref expected), ref resume} if *expected==sent_proof && resume.is_empty()));
+            assert!(connect.proof.is_none());
+            let response_proof = if matches!(case,ReplayCase::ForeignProof) {host_proof("replacement-daemon")} else {sent_proof.clone()};
+            handoff_reply(&mut retry, &mut codec, Some(connect.request_id), &response_proof,
+                ServerMessage::Response {response:ServerResponse::Connected {proof:response_proof.clone(), resumed:vec![]}});
+            if matches!(case,ReplayCase::ForeignProof) {
+                assert!(codec.read::<ClientEnvelope>(&mut retry).unwrap().is_none(), "proof mismatch must send no Return/Attach/List");
+                finished.success=true;return;
+            }
+            let request:ClientEnvelope = codec.read(&mut retry).unwrap().unwrap();
+            assert_eq!(request.proof, Some(sent_proof.clone()));
+            assert!(matches!(request.request,ClientRequest::ChatReturnTerminal {chat_id, expected} if chat_id==original.source.id && expected==original), "retry must send ONLY original captured intent, without Attach/List");
+            let message = if matches!(case,ReplayCase::Refused) {
+                ServerMessage::Error(ipc::ProtocolError::new(ipc::ProtocolErrorCode::InvalidRequest,"exact original Return refused",false))
+            } else {
+                let mut receipt=sent_receipt;
+                if matches!(case,ReplayCase::WrongBackend) {receipt.source_binding.backend=uuid::Uuid::new_v4();}
+                ServerMessage::Response {response:ServerResponse::ChatTerminal {chat_id:original.source.id,
+                    session:receipt.terminal.session.clone(), receipt,
+                    snapshot:Snapshot {generation:77, exited:true, ..Default::default()}}}
+            };
+            handoff_reply(&mut retry, &mut codec, Some(request.request_id), &sent_proof, message);
+            finished.success=true;
+        });
+        let client = UnixStream::connect(&endpoint).unwrap();
+        let handle = ClientHandle::connect_on(client, source, Intent::Start, None, false, None, None, |_|{}).unwrap();
+        assert_eq!(handle.inner.return_endpoint.as_ref(), Some(&endpoint));
+        assert!(handle.return_terminal(binding.clone()).is_err(), "first request has no receipt");
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while handle.inner.alive.load(Ordering::Acquire) {assert!(Instant::now()<deadline);thread::yield_now();}
+        let result=handle.return_terminal(binding);
+        match case {
+            ReplayCase::Exact => assert_eq!(result.unwrap(),receipt),
+            ReplayCase::ForeignProof => assert!(result.unwrap_err().contains("proof")),
+            ReplayCase::WrongBackend => assert!(result.unwrap_err().contains("exact captured receipt")),
+            ReplayCase::Refused => assert_eq!(result.unwrap_err(),"exact original Return refused"),
+        }
+        assert!(!handle.inner.alive.load(Ordering::Acquire), "control replay cannot revive old attachment");
+        assert_ne!(handle.snapshot().generation,77, "replayed final payload is not installed");
+        assert_eq!(peer.done.recv_timeout(Duration::from_secs(6)),Ok(true),"actual bounded peer script must finish");
+        peer.settled=true;drop(worker);
+    }
+    #[test]
+    fn disconnected_return_replays_only_original_endpoint_proof_and_intent() {disconnected_return_replay(ReplayCase::Exact);}
+    #[test]
+    fn disconnected_return_replay_refuses_changed_proof_backend_and_host_refusal() {
+        disconnected_return_replay(ReplayCase::ForeignProof);
+        disconnected_return_replay(ReplayCase::WrongBackend);
+        disconnected_return_replay(ReplayCase::Refused);
+    }
+    #[test]
+    fn original_return_replay_deadline_is_not_renewed_by_partial_frame_bytes() {
+        let (client, mut server)=UnixStream::pair().unwrap();
+        let cancel=server.try_clone().unwrap();
+        let (done, completed)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move || {
+            for byte in [0,0,0,16,0,0,0,0] {
+                if io::Write::write_all(&mut server,&[byte]).is_err() {break;}
+                thread::sleep(Duration::from_millis(15));
+            }
+            let _=done.send(());
+        });
+        let start=Instant::now();
+        let mut io=ReturnReplayIo {stream:client,deadline:start+Duration::from_millis(40)};
+        let result=FrameCodec::new(ipc::MAX_FRAME_BYTES).read::<ServerEnvelope>(&mut io);
+        assert!(result.is_err());
+        assert!(start.elapsed()<Duration::from_millis(500));
+        let _=cancel.shutdown(Shutdown::Both);
+        assert!(completed.recv_timeout(Duration::from_secs(1)).is_ok());
+        drop(worker);
+    }
 
     #[test]
     fn typed_handoff_ack_transmits_the_complete_operation_and_preserves_refusals() {
