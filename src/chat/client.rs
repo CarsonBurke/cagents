@@ -134,6 +134,35 @@ fn valid_source_binding(binding: &crate::terminal_ipc::ChatSourceBinding, source
         && binding.source.launch.recipe == source.launch.recipe
 }
 
+fn valid_handoff_receipt(receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
+    expected: &crate::terminal_ipc::ChatSourceBinding, proof: &HostSessionProof) -> bool {
+    if !proof.is_complete() || receipt.operation.is_nil() || receipt.terminal_native_epoch.is_nil()
+        || receipt.terminal.execution_instance.is_nil() || receipt.source_binding != *expected
+        || receipt.source_execution_instance != expected.execution_instance
+        || expected.source.proof.as_ref() != Some(proof)
+        || receipt.terminal.session.continuity.live_proof().as_ref().is_some_and(|issued| issued != proof) {
+        return false;
+    }
+    let mut source = expected.source.clone();
+    if source.launch.session_id.is_some() && source.launch.session_id != receipt.source.launch.session_id { return false; }
+    source.launch.session_id = receipt.source.launch.session_id.clone();
+    source.native_continuity = receipt.source.native_continuity.clone();
+    if source != receipt.source { return false; }
+    if let Some(retained) = &receipt.retained_binding {
+        if !valid_source_binding(retained, &source, expected.execution_instance, proof)
+            || retained.source.launch.session_id != source.launch.session_id { return false; }
+        let mut post = source.clone();
+        post.native_continuity = retained.source.native_continuity.clone();
+        if retained.source != post {
+            post.terminal = Some(receipt.terminal.session.clone());
+            if retained.source != post { return false; }
+        }
+    } else if source.launch.session_id != expected.source.launch.session_id {
+        return false; // First learning requires the authenticated canonical publication.
+    }
+    true
+}
+
 struct Inner {
     id: TerminalId,
     session: Session,
@@ -1369,7 +1398,7 @@ impl ClientHandle {
                 expected: expected.clone(),
             })?
             .ok_or("Daemon did not return the exact replacement terminal")?;
-        if terminal.source_binding != expected || terminal.source_execution_instance != expected.execution_instance || terminal.terminal.session.continuity.live_proof().as_ref() != Some(&self.inner.proof) || terminal.source.id != self.inner.session.id || terminal.source.launch.provider != self.inner.session.launch.provider || terminal.source.launch.recipe != self.inner.session.launch.recipe {
+        if !valid_handoff_receipt(&terminal, &expected, &self.inner.proof) {
             return Err("Replacement terminal has no matching daemon ownership proof".into());
         }
         Ok(terminal)
@@ -1828,6 +1857,27 @@ mod tests {
                 },
             },
         );
+    }
+
+    #[test]
+    fn completed_handoff_retains_exact_operation_proof_without_a_live_continuity_claim() {
+        let terminal = handoff_terminal();
+        let source = Session { id: TerminalId::new(), proof: Some(handoff_proof()),
+            launch: crate::chat::Launch { provider: crate::agent::Provider::Omp, recipe: terminal.launch.clone(), session_id: Some("original".into()) },
+            terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
+        let binding = crate::terminal_ipc::ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
+        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(terminal.id, terminal.launch, None);
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let mut receipt = crate::terminal_ipc::TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source,
+            source_execution_instance: binding.execution_instance, source_binding: binding.clone(), retained_binding: None,
+            terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor };
+        assert!(receipt.terminal.session.continuity.live_proof().is_none());
+        assert!(valid_handoff_receipt(&receipt, &binding, &handoff_proof()));
+        receipt.terminal.execution_instance = uuid::Uuid::nil();
+        assert!(!valid_handoff_receipt(&receipt, &binding, &handoff_proof()));
+        receipt.terminal.execution_instance = uuid::Uuid::new_v4();
+        receipt.source.launch.session_id = Some("another".into());
+        assert!(!valid_handoff_receipt(&receipt, &binding, &handoff_proof()));
     }
 
     #[test]
