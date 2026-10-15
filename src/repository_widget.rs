@@ -4788,24 +4788,6 @@ impl RepositoryRuntime {
         }
     }
 
-    /// History belongs to the mounted native editor or its live working diff;
-    /// immutable commit, staged and pull-request comparisons cannot replay it.
-    pub fn can_step_editor_history(&self, redo: bool) -> bool {
-        let available = match &self.document {
-            DocumentState::Editable(document) => {
-                if redo {
-                    document.history.can_redo()
-                } else {
-                    document.history.can_undo()
-                }
-            }
-            _ => false,
-        };
-        available
-            && !self.search_mode
-            && (self.source_surface == SourceSurface::Editor || self.editable_working_diff())
-    }
-
     /// Undoes or redoes one step in the open buffer.
     fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
         // A history step edits the mounted source buffer, including while Find is open.
