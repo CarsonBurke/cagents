@@ -81,7 +81,7 @@ terminal_font_family = ""
 sidebar_width = 260.0
 inspector_width = 380.0
 default_column_fraction = 0.5
-terminal_scrollback_lines = 10000
+terminal_scrollback_mib = 16
 link_open_destination = "integrated_browser"
 link_open_gesture = "control_click"
 pull_request_open_target = "review"
@@ -159,7 +159,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `sidebar_width` | float | `260.0` | `220.0` through `420.0` |
 | `inspector_width` | float | `380.0` | `320.0` through `480.0` |
 | `default_column_fraction` | float | `0.5` | `0.25` through `1.0`. The share of the workspace a new pane takes |
-| `terminal_scrollback_lines` | integer | `10000` | `0` through `1000000` lines. Applies to terminals started after the change |
+| `terminal_scrollback_mib` | integer | `16` | Per-terminal history page budget, `0` through `1024` MiB. Allocated as output arrives; retained row count depends on width and content. Applies to newly started terminals. Previous `terminal_scrollback_lines` values migrate at 1 KiB per line, rounded up to MiB |
 | `link_open_destination` | string | `"integrated_browser"` | Where an ordinary link click opens: `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | The gesture that always opens the system browser: `"control_click"` or `"control_shift_click"`. The other gesture always opens the in-app browser |
 | `pull_request_open_target` | string | `"review"` | What opening a pull request in the sidebar does: `"review"` opens the in-app review pane, and `"link"` opens the pull request's web page as a link, using the settings above |
