@@ -1307,6 +1307,8 @@ where
             (selection.position, anchor)
         };
         let internal = self.0.get_mut();
+        internal.cursor_metrics = None;
+        internal.bracket_match = None;
         internal.pending_scroll = None;
         internal.reveal_horizontal = true;
         if end.line - start.line <= MAX_NATIVE_ROWS
@@ -5443,12 +5445,12 @@ mod tests {
 
     #[test]
     fn bracket_matching_keeps_multiline_comments_and_mixed_nesting_exact() {
-        let mut content = Content::with_text("fn f() {\n/*\n } ignored\n */\n [()]\n}");
+        let mut content: Content = Content::with_text("fn f() {\n/*\n } ignored\n */\n [()]\n}");
         content.set_cursor(Cursor { position: Position { line: 5, column: 1 }, selection: None });
         assert_eq!(content.matching_brackets(), Some((Position { line: 0, column: 7 }, Position { line: 5, column: 0 })));
         content.set_cursor(Cursor { position: Position { line: 2, column: 1 }, selection: None });
         assert_eq!(content.matching_brackets(), None);
-        let mut malformed = Content::with_text("([)]");
+        let mut malformed: Content = Content::with_text("([)]");
         malformed.set_cursor(Cursor { position: Position { line: 0, column: 0 }, selection: None });
         assert_eq!(malformed.matching_brackets(), None);
     }
