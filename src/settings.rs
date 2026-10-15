@@ -904,6 +904,12 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// Seconds to keep a language server warm after its last document closes.
+    #[serde(default = "default_lsp_idle_timeout")]
+    pub lsp_idle_timeout_seconds: u64,
+    /// Maximum admitted servers; active documents are never evicted.
+    #[serde(default = "default_lsp_max_sessions")]
+    pub lsp_max_sessions: usize,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -971,10 +977,19 @@ impl Default for AppSettings {
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
+            lsp_max_sessions: default_lsp_max_sessions(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+fn default_lsp_idle_timeout() -> u64 {
+    600
+}
+fn default_lsp_max_sessions() -> usize {
+    8
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -1709,6 +1724,16 @@ impl AppSettings {
         {
             return Err(SettingsError::Invalid(
                 "managed_worktree_directory must be a nonempty path without control characters",
+            ));
+        }
+        if !(1..=64).contains(&self.lsp_max_sessions) {
+            return Err(SettingsError::Invalid(
+                "lsp_max_sessions must be between 1 and 64",
+            ));
+        }
+        if !(1..=604800).contains(&self.lsp_idle_timeout_seconds) {
+            return Err(SettingsError::Invalid(
+                "lsp_idle_timeout_seconds must be between 1 and 604800",
             ));
         }
         self.keyboard_shortcuts.validate()?;
@@ -2807,6 +2832,24 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
+        for cap in [0, 65, usize::MAX] {
+            let settings = AppSettings {
+                lsp_max_sessions: cap,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+        for timeout in [0, 604801, u64::MAX] {
+            let settings = AppSettings {
+                lsp_idle_timeout_seconds: timeout,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
+
     #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();

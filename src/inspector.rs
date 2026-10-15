@@ -905,6 +905,7 @@ pub fn model_for_card(
 /// widget state.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LspInspectorContext {
+    pub live_servers: std::sync::Arc<[String]>,
     pub status: Option<LspStatus>,
     pub diagnostics: Vec<LspDiagnostic>,
     pub hover: Option<String>,
@@ -982,6 +983,15 @@ pub fn with_lsp(
         lsp.status.as_ref(),
         lsp.notice.as_deref(),
     ));
+    if !lsp.live_servers.is_empty() {
+        model.sections.push(Section::new(
+            "Live language servers",
+            lsp.live_servers
+                .iter()
+                .map(|server| Fact::new("Server", server))
+                .collect(),
+        ));
+    }
     model
         .sections
         .extend(diagnostics_section(card, &lsp.diagnostics));
