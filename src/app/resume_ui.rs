@@ -524,7 +524,7 @@ impl Cagents {
         .abortable();
         self.resume_ui.indexer = Some(handle);
         Some(Task::batch([
-            iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
+            self.modal_focus(focus_id()),
             indexer,
         ]))
     }
@@ -538,8 +538,7 @@ impl Cagents {
                 self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
                 self.workspace.focused().map_or_else(Task::none, |card| {
-                    iced::widget::operation::focus(self.card_keyboard_focus(card))
-                        .map(cosmic::Action::App)
+                    self.modal_focus(self.card_keyboard_focus(card))
                 })
             }
             Action::Query(query) => {
@@ -552,7 +551,7 @@ impl Cagents {
                 self.refilter_resume();
                 Task::batch([
                     self.reveal_resume_selection(),
-                    iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
+                    self.modal_focus(focus_id()),
                 ])
             }
             Action::More => {

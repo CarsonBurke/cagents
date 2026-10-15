@@ -416,7 +416,7 @@ impl Cagents {
                         .map(|card| self.card_keyboard_focus(card))
                         .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
                 });
-                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                self.modal_focus(focus)
             }
         }
     }
@@ -512,7 +512,7 @@ impl Cagents {
             chats,
             failure: self.channel_ui.failed.get(&id).cloned(),
         });
-        iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
+        self.modal_focus(State::focus_target())
     }
 
     /// The open conversations - chats and terminals - that deleting

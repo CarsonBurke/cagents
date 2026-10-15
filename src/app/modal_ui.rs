@@ -114,6 +114,12 @@ impl Stack {
     }
 
     fn focus(&self, target: widget::Id, fallback: widget::Id) -> Task<Message> {
+        self.guarded_focus(target, Some(fallback))
+    }
+    fn focus_if_present(&self, target: widget::Id) -> Task<Message> {
+        self.guarded_focus(target, None)
+    }
+    fn guarded_focus(&self, target: widget::Id, fallback: Option<widget::Id>) -> Task<Message> {
         use cosmic::iced::advanced::widget::{Operation, operation};
         struct Matched<'a>(&'a mut bool);
         impl operation::Focusable for Matched<'_> {
@@ -129,7 +135,7 @@ impl Stack {
             revision: Arc<std::sync::atomic::AtomicU64>,
             expected: u64,
             target: widget::Id,
-            fallback: widget::Id,
+            fallback: Option<widget::Id>,
             probe: bool,
             found: bool,
             inner: Box<dyn Operation<T>>,
@@ -166,16 +172,16 @@ impl Stack {
                 if !self.current() || !self.probe {
                     return operation::Outcome::None;
                 }
-                let target = if self.found {
-                    self.target.clone()
+                let Some(target) = (if self.found {
+                    Some(self.target.clone())
                 } else {
                     self.fallback.clone()
-                };
+                }) else { return operation::Outcome::None; };
                 operation::Outcome::Chain(Box::new(Self {
                     revision: Arc::clone(&self.revision),
                     expected: self.expected,
                     target: target.clone(),
-                    fallback: target.clone(),
+                    fallback: Some(target.clone()),
                     probe: false,
                     found: false,
                     inner: Box::new(operation::focusable::focus(target)),
@@ -187,7 +193,7 @@ impl Stack {
             expected: self
                 .focus_revision
                 .load(std::sync::atomic::Ordering::Acquire),
-            probe: target != fallback,
+            probe: fallback.as_ref() != Some(&target),
             found: false,
             inner: Box::new(operation::focusable::focus(target.clone())),
             target,
@@ -198,6 +204,11 @@ impl Stack {
 }
 
 impl Cagents {
+    /// Feature focus tasks share the modal revision, and cannot clear focus
+    /// when their lower dialog is hidden by the current modal tree.
+    pub(super) fn modal_focus(&self, target: widget::Id) -> Task<Message> {
+        self.modal_stack.focus_if_present(target)
+    }
     pub(super) fn active_modals(&self) -> Vec<Modal> {
         let mut result = Vec::new();
         macro_rules! active {
@@ -404,14 +415,13 @@ impl Cagents {
             if top == Modal::SettingsReset {
                 self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
                 return Some(
-                    iced::widget::operation::focus(widget::Id::new(
+                    self.modal_focus(widget::Id::new(
                         if self.settings_reset_focus_confirm {
                             "dialog.reset-settings.confirm"
                         } else {
                             "dialog.reset-settings.cancel"
                         },
-                    ))
-                    .map(cosmic::Action::App),
+                    )),
                 );
             }
             if top == Modal::TerminalClose {
@@ -614,6 +624,44 @@ mod tests {
             super::super::tests::focused_element(content, task),
             Some(current)
         );
+    }
+
+    #[test]
+    fn held_feature_open_resume_focus_cannot_steal_a_new_dialogs_focus() {
+        use cosmic::iced::futures::{FutureExt, StreamExt};
+        let mut app = app();
+        let feature = app.update_resume(resume_ui::Action::Open);
+        assert!(app.resume_ui.open);
+        let mut stream = iced::runtime::task::into_stream(feature).unwrap();
+        let action = stream.next().now_or_never().flatten().expect("opening focus ready");
+        let iced::runtime::Action::Widget(operation) = action else { panic!("feature widget focus"); };
+        drop(app.finish_modal_update(Task::none()));
+        drop(app.update_resume(resume_ui::Action::Close));
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        let current = widget::Id::new("dialog.reset-settings.confirm");
+        let content: Element<'_, Message> = widget::column::with_children(vec![
+            observed_input(Default::default(), resume_ui::focus_id()),
+            observed_input(Default::default(), current.clone()),
+        ]).into();
+        let held = iced::advanced::widget::operate(operation).map(|_| cosmic::Action::App(Message::DismissStatus));
+        let task = iced::widget::operation::focus(current.clone()).map(cosmic::Action::App).chain(held);
+        assert_eq!(super::super::tests::focused_element(content, task), Some(current));
+    }
+
+    #[test]
+    fn current_revision_lower_feature_focus_leaves_upper_focus_untouched() {
+        let mut app = app();
+        app.resume_ui.open = true;
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        let current = widget::Id::new("dialog.reset-settings.confirm");
+        let content = observed_input(Default::default(), current.clone());
+        let task = iced::widget::operation::focus(current.clone()).map(cosmic::Action::App)
+            .chain(app.modal_focus(resume_ui::focus_id()));
+        assert_eq!(super::super::tests::focused_element(content, task), Some(current));
     }
 
     #[test]

@@ -588,7 +588,7 @@ impl Cagents {
                 };
                 let focus = dialog.focus_target();
                 self.sidebar_selection_ui.dialog = Some(dialog);
-                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                self.modal_focus(focus)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::warning(error));
@@ -607,8 +607,7 @@ impl Cagents {
                 .first()
                 .filter(|target| self.visible_sidebar_rows().contains(&target.row))
                 .map_or_else(Task::none, |target| {
-                    iced::widget::operation::focus(sidebar::selection_row_focus_id(target.row))
-                        .map(cosmic::Action::App)
+                    self.modal_focus(sidebar::selection_row_focus_id(target.row))
                 });
         }
         // Revalidate every target before starting any operation. A reload may
@@ -631,7 +630,7 @@ impl Cagents {
         if dialog.error.is_some() || dialog.blocked() > 0 {
             let focus = dialog.focus_target();
             self.sidebar_selection_ui.dialog = Some(dialog);
-            return iced::widget::operation::focus(focus).map(cosmic::Action::App);
+            return self.modal_focus(focus);
         }
         let mut tasks = Vec::new();
         for target in dialog.targets {

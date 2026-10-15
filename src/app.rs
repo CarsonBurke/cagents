@@ -11810,8 +11810,7 @@ impl Cagents {
             focused,
             restore_card,
         });
-        iced::widget::operation::focus(dirty_close_control_id(card, focused))
-            .map(cosmic::Action::App)
+        self.modal_focus(dirty_close_control_id(card, focused))
     }
 
     fn close_pane_group(&mut self) -> Task<Message> {
@@ -11837,8 +11836,7 @@ impl Cagents {
             let focused = self.primary_dirty_close_control(card);
             close.focused = focused;
             self.dirty_repository_close = Some(close);
-            return iced::widget::operation::focus(dirty_close_control_id(card, focused))
-                .map(cosmic::Action::App);
+            return self.modal_focus(dirty_close_control_id(card, focused));
         }
         if let Some(card) = close.next_unresolved(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
@@ -11846,11 +11844,10 @@ impl Cagents {
             let focused = self.primary_dirty_close_control(card);
             close.focused = focused;
             self.dirty_repository_close = Some(close);
-            return iced::widget::operation::focus(dirty_close_control_id(
+            return self.modal_focus(dirty_close_control_id(
                 card,
                 focused,
-            ))
-            .map(cosmic::Action::App);
+            ));
         }
         match close.intent {
             DirtyCloseIntent::PaneGroup => self.close_pane_group(),
@@ -11878,7 +11875,7 @@ impl Cagents {
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
         });
-        iced::widget::operation::focus(restore_focus).map(cosmic::Action::App)
+        self.modal_focus(restore_focus)
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
@@ -11905,7 +11902,7 @@ impl Cagents {
         {
             return Task::none();
         }
-        iced::widget::operation::focus(pull_request_dialog_focus_id()).map(cosmic::Action::App)
+        self.modal_focus(pull_request_dialog_focus_id())
     }
 
     fn focus_context_overlay_if_exposed(&self) -> Task<Message> {
@@ -11935,8 +11932,8 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes()
         );
         close.focused = next_dirty_close_control(close.focused, backwards, saving, discardable);
-        iced::widget::operation::focus(dirty_close_control_id(close.card, close.focused))
-            .map(cosmic::Action::App)
+        let target = dirty_close_control_id(close.card, close.focused);
+        self.modal_focus(target)
     }
 
     fn utility_card(&self, kind: &CardKind) -> Option<CardId> {
@@ -12584,7 +12581,7 @@ impl Cagents {
                 |card| self.card_keyboard_focus(card),
             )
         };
-        iced::widget::operation::focus(target).map(cosmic::Action::App)
+        self.modal_focus(target)
     }
 
     fn reset_settings(&mut self) -> Task<Message> {
@@ -14240,8 +14237,7 @@ impl Application for Cagents {
                             draft: false,
                             retry_confirmation: None,
                         });
-                        iced::widget::operation::focus(pull_request_dialog_focus_id())
-                            .map(cosmic::Action::App)
+                        self.modal_focus(pull_request_dialog_focus_id())
                     }
                     SidebarAction::NewChannel { project_id } => {
                         self.handle_channel_ui(channel_ui::Action::Create(project_id))
@@ -14341,8 +14337,7 @@ impl Application for Cagents {
                     | SidebarAction::CancelDiscard => Task::none(),
                     SidebarAction::RequestDiscard { .. } => {
                         if self.sidebar_state.pending_discard().is_some() {
-                            iced::widget::operation::focus(sidebar::discard_cancel_id())
-                                .map(cosmic::Action::App)
+                            self.modal_focus(sidebar::discard_cancel_id())
                         } else {
                             Task::none()
                         }
@@ -14837,10 +14832,9 @@ impl Application for Cagents {
                     self.automation_close_generation =
                         self.automation_close_generation.wrapping_add(1);
                     self.transient_work_close = Some(window);
-                    return iced::widget::operation::focus(widget::Id::new(
+                    return self.modal_focus(widget::Id::new(
                         "dialog.transient-close.cancel",
-                    ))
-                    .map(cosmic::Action::App);
+                    ));
                 }
                 self.transient_work_close = None;
                 let dirty = self
@@ -14871,7 +14865,7 @@ impl Application for Cagents {
                     })
                 };
                 target.map_or_else(Task::none, |target| {
-                    iced::widget::operation::focus(target).map(cosmic::Action::App)
+                    self.modal_focus(target)
                 })
             }
             Message::ReturnToAutomationBeforeClose => {
@@ -14886,8 +14880,7 @@ impl Application for Cagents {
                 }
                 Task::batch([
                     self.open_automations(),
-                    iced::widget::operation::focus(crate::automation_ui::draft_editor_focus_id())
-                        .map(cosmic::Action::App),
+                    self.modal_focus(crate::automation_ui::draft_editor_focus_id()),
                 ])
             }
             Message::DiscardAutomationAndClose(generation) => {
@@ -14916,8 +14909,7 @@ impl Application for Cagents {
                 self.device_ui.open = true;
                 Task::batch([
                     self.update_device(device_ui::Action::BackToFile),
-                    iced::widget::operation::focus(device_ui::file_editor_id())
-                        .map(cosmic::Action::App),
+                    self.modal_focus(device_ui::file_editor_id()),
                 ])
             }
             Message::CloseCard(id)
@@ -15534,8 +15526,7 @@ impl Application for Cagents {
                     // title is no reason to take it away from them.
                     self.status = Some(TransientNotice::error(error.to_string()));
                     self.pull_request_dialog = Some(dialog);
-                    return iced::widget::operation::focus(pull_request_dialog_focus_id())
-                        .map(cosmic::Action::App);
+                    return self.modal_focus(pull_request_dialog_focus_id());
                 }
                 let generation = self.pull_request_dialog_generation;
                 let submit = cosmic::task::future(async move {
@@ -15985,8 +15976,7 @@ impl Application for Cagents {
                 self.settings_reset_focus_confirm = false;
                 self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
-                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.cancel"))
-                    .map(cosmic::Action::App)
+                self.modal_focus(widget::Id::new("dialog.reset-settings.cancel"))
             }
             Message::CancelResetSettings => self.close_settings_reset(),
             Message::ConfirmResetSettings => {

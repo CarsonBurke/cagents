@@ -150,7 +150,7 @@ impl Cagents {
                 self.core.set_keyboard_nav(false);
                 let generation = state.generation;
                 Task::batch([
-                    recovery_focus(0),
+                    self.modal_focus(recovery_focus_id(0)),
                     cosmic::task::future(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             let recovery = store
@@ -187,7 +187,7 @@ impl Cagents {
                     Err(error) => self.session_recovery.error = Some(error),
                 }
                 self.session_recovery.focus = 0;
-                recovery_focus(0)
+                self.modal_focus(recovery_focus_id(0))
             }
             Action::Cancel if self.session_recovery.open() && !self.session_recovery.pending => {
                 self.close_session_recovery()
@@ -202,7 +202,7 @@ impl Cagents {
                         "The refused pane changed. Cancel and review the current save notice."
                             .into(),
                     );
-                    return recovery_focus(0);
+                    return self.modal_focus(recovery_focus_id(0));
                 }
                 let snapshot = self.persistent_workspace();
                 let receipt = self
@@ -235,7 +235,7 @@ impl Cagents {
                     Err(error) => {
                         self.session_recovery.error = Some(error);
                         self.session_recovery.focus = 0;
-                        recovery_focus(0)
+                        self.modal_focus(recovery_focus_id(0))
                     }
                 }
             }
@@ -256,7 +256,7 @@ impl Cagents {
             .focused()
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-        iced::widget::operation::focus(target).map(cosmic::Action::App)
+        self.modal_focus(target)
     }
 
     pub(super) fn adopt_session_recovery_keyboard_nav(&mut self, restore: bool) -> bool {
@@ -302,7 +302,7 @@ impl Cagents {
             } else {
                 (self.session_recovery.focus + 1) % count
             };
-            return Some(recovery_focus(self.session_recovery.focus));
+            return Some(self.modal_focus(recovery_focus_id(self.session_recovery.focus)));
         }
         if *key == Named::Enter
             && !captured
@@ -373,13 +373,12 @@ impl Cagents {
     }
 }
 
-fn recovery_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(if index == 0 {
+fn recovery_focus_id(index: usize) -> widget::Id {
+    widget::Id::new(if index == 0 {
         "session-recovery.cancel"
     } else {
         "session-recovery.confirm"
-    }))
-    .map(cosmic::Action::App)
+    })
 }
 
 #[cfg(test)]

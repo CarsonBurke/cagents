@@ -470,10 +470,9 @@ impl Cagents {
             Action::Cancel => {
                 if self.browser_import.busy() {
                     self.browser_import.confirm_cancel = true;
-                    return iced::widget::operation::focus(widget::Id::new(
+                    return self.modal_focus(widget::Id::new(
                         "browser-import.cancel",
-                    ))
-                    .map(cosmic::Action::App);
+                    ));
                 } else {
                     self.browser_import.phase = Phase::Closed;
                     self.browser_import.found.clear();
@@ -481,8 +480,7 @@ impl Cagents {
             }
             Action::KeepWorking => {
                 self.browser_import.confirm_cancel = false;
-                return iced::widget::operation::focus(widget::Id::new("browser-import.cancel"))
-                    .map(cosmic::Action::App);
+                return self.modal_focus(widget::Id::new("browser-import.cancel"));
             }
             Action::ConfirmCancel => {
                 self.browser_import.cancel.store(true, Ordering::Relaxed);

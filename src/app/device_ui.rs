@@ -655,8 +655,7 @@ impl Cagents {
                         }
                         self.device_ui.panel = Panel::Files;
                         if linked {
-                            return iced::widget::operation::focus(file_editor_id())
-                                .map(cosmic::Action::App);
+                            return self.modal_focus(file_editor_id());
                         }
                     }
                     Ok(Reply::Text(text)) => {

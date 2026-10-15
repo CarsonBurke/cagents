@@ -52,7 +52,7 @@ impl Cagents {
                         .and_then(|result| result.map(Arc::new).map_err(|error| error.to_string()));
                     Message::DaemonHealthUi(Action::Prepared { generation, target })
                 });
-                Task::batch([preparation, health_focus(0)])
+                Task::batch([preparation, self.modal_focus(health_focus_id(0))])
             }
             Action::Prepared { generation, target }
                 if self.daemon_health_ui.confirmation
@@ -64,8 +64,7 @@ impl Cagents {
                     Ok(target) => state.target = Some(target),
                     Err(error) => state.error = Some(error),
                 }
-                iced::widget::operation::focus(widget::Id::new("daemon-health.cancel"))
-                    .map(cosmic::Action::App)
+                self.modal_focus(widget::Id::new("daemon-health.cancel"))
             }
             Action::Cancel
                 if self.daemon_health_ui.confirmation && !self.daemon_health_ui.restarting =>
@@ -113,7 +112,7 @@ impl Cagents {
                 }
                 if self.daemon_health_ui.confirmation {
                     self.daemon_health_ui.focus = 0;
-                    health_focus(0)
+                    self.modal_focus(health_focus_id(0))
                 } else {
                     self.daemon_health_restore_focus()
                 }
@@ -127,7 +126,7 @@ impl Cagents {
             .focused()
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-        iced::widget::operation::focus(target).map(cosmic::Action::App)
+        self.modal_focus(target)
     }
     pub(super) fn adopt_daemon_health_keyboard_nav(&mut self, restore: bool) -> bool {
         if !self.daemon_health_ui.confirmation {
@@ -169,7 +168,7 @@ impl Cagents {
             } else {
                 (self.daemon_health_ui.focus + 1) % count
             };
-            return Some(health_focus(self.daemon_health_ui.focus));
+            return Some(self.modal_focus(health_focus_id(self.daemon_health_ui.focus)));
         }
         if *key == Named::Enter
             && !captured
@@ -289,13 +288,12 @@ fn timestamp(time: std::time::SystemTime) -> String {
     unix_time_label(i64::try_from(millis).unwrap_or(i64::MAX))
 }
 
-fn health_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(if index == 1 {
+fn health_focus_id(index: usize) -> widget::Id {
+    widget::Id::new(if index == 1 {
         "daemon-health.confirm"
     } else {
         "daemon-health.cancel"
-    }))
-    .map(cosmic::Action::App)
+    })
 }
 
 #[cfg(test)]

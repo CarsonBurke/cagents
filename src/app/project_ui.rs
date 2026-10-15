@@ -1121,8 +1121,7 @@ impl Cagents {
                             blocker,
                             failure,
                         });
-                        return iced::widget::operation::focus(self.project_ui.focus_target())
-                            .map(cosmic::Action::App);
+                        return self.modal_focus(self.project_ui.focus_target());
                     }
                     ProjectCommand::Remove => {
                         let Some(project) = self.sidebar_model.project(project_id) else {
@@ -1149,8 +1148,7 @@ impl Cagents {
                                 .count(),
                             project_sessions: ProjectSessionOwnership::default(),
                         });
-                        return iced::widget::operation::focus(self.project_ui.focus_target())
-                            .map(cosmic::Action::App);
+                        return self.modal_focus(self.project_ui.focus_target());
                     }
                     ProjectCommand::Reveal => {
                         self.project_ui.dialog = None;
@@ -1600,7 +1598,7 @@ impl Cagents {
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
         });
         Task::batch([
-            iced::widget::operation::focus(focus).map(cosmic::Action::App),
+            self.modal_focus(focus),
             self.lifecycle_sweep(),
             self.sync_chrome(),
         ])

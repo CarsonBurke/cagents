@@ -227,7 +227,7 @@ impl Cagents {
             });
             if self.terminal_close.as_ref().unwrap().detail.is_some() {
                 self.core.set_keyboard_nav(false);
-                return close_focus(0);
+                return self.modal_focus(close_focus_id(0));
             }
             return self.start_terminal_close(allow_active);
         }
@@ -275,7 +275,7 @@ impl Cagents {
                     focus: 0,
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                self.modal_focus(close_focus_id(0))
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -425,13 +425,12 @@ impl Cagents {
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
-            iced::widget::operation::focus(
+            self.modal_focus(
                 self.workspace
                     .focused()
                     .map(|card| self.card_keyboard_focus(card))
                     .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
             )
-            .map(cosmic::Action::App)
         } else {
             Task::none()
         };
@@ -478,11 +477,10 @@ impl Cagents {
         if let Some(card) = card {
             let _ = self.workspace.focus(card);
         }
-        iced::widget::operation::focus(
+        self.modal_focus(
             card.map(|card| self.card_keyboard_focus(card))
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
         )
-        .map(cosmic::Action::App)
         .chain(self.next_queued_card_close())
     }
 
@@ -519,7 +517,7 @@ impl Cagents {
             self.terminal_close.as_mut().unwrap().detail =
                 Some("Terminal identity or daemon proof changed. Nothing was closed.".into());
             self.core.set_keyboard_nav(false);
-            return close_focus(0);
+            return self.modal_focus(close_focus_id(0));
         }
         if !self.terminal_close_attempts.insert(intent.terminal) {
             self.terminal_close.as_mut().unwrap().detail = Some(
@@ -527,7 +525,7 @@ impl Cagents {
                     .into(),
             );
             self.core.set_keyboard_nav(false);
-            return close_focus(0);
+            return self.modal_focus(close_focus_id(0));
         }
         self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
         let intent = self.terminal_close.as_mut().unwrap();
@@ -599,7 +597,7 @@ impl Cagents {
                 intent.active = true;
                 intent.focus = 0;
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                self.modal_focus(close_focus_id(0))
             }
             outcome => {
                 // `Stale` and a mismatched identity both mean the request was
@@ -622,7 +620,7 @@ impl Cagents {
                     ),
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                self.modal_focus(close_focus_id(0))
             }
         }
     }
@@ -639,7 +637,8 @@ impl Cagents {
         } else {
             (intent.focus + if backwards { 2 } else { 1 }) % 3
         };
-        close_focus(intent.focus)
+        let target = close_focus_id(intent.focus);
+        self.modal_focus(target)
     }
 
     pub(super) fn terminal_close_dialog(&self) -> Option<Element<'_, Message>> {
@@ -713,13 +712,12 @@ impl Cagents {
     }
 }
 
-fn close_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(match index {
+fn close_focus_id(index: usize) -> widget::Id {
+    widget::Id::new(match index {
         1 => "dialog.terminal-close.confirm",
         2 => "dialog.terminal-close.dont-ask",
         _ => "dialog.terminal-close.cancel",
-    }))
-    .map(cosmic::Action::App)
+    })
 }
 
 #[cfg(test)]
