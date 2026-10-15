@@ -24,7 +24,9 @@ to skip both copies and commands. Setup output runs in a **Worktree setup** term
 card scoped to the new worktree. Its exact plan, skip decision, copy progress and
 run identity are retained with the creation journal. Saved setup recipes are
 never automatically replayed after interruption; use explicit reviewed recovery
-in the application. A preparation or terminal failure keeps the
+in the application. Before retrying, close the previous setup terminal and any
+remaining child processes, then review the current configuration again.
+A preparation or terminal failure keeps the
 created checkout and is reported in the result. `--spawn-agent` waits up to two
 minutes for setup to succeed; if setup fails or is still running, its error names
 the retained worktree and the agent is not started.
