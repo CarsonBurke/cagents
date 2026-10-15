@@ -222,4 +222,82 @@ mod tests {
         assert!(placement.validate().is_err());
         assert!(!tree.path().join("outside/holding").exists());
     }
+
+    #[test]
+    fn recovery_self_bind_mount_child() {
+        let Some(root) = std::env::var_os("CAGENTS_TEST_RECOVERY_BIND_ROOT") else { return; };
+        // The helper may mount only in the two fresh namespaces created by its
+        // owning unshare child, never in the caller's original namespace.
+        let original_mount = std::env::var("CAGENTS_TEST_RECOVERY_MOUNT_NS").unwrap().parse::<u64>().unwrap();
+        let original_user = std::env::var("CAGENTS_TEST_RECOVERY_USER_NS").unwrap().parse::<u64>().unwrap();
+        assert_ne!(fs::metadata("/proc/self/ns/mnt").unwrap().ino(), original_mount);
+        assert_ne!(fs::metadata("/proc/self/ns/user").unwrap().ino(), original_user);
+        let case_root = PathBuf::from(root);
+        let cache = case_root.join("repo/cache");
+        let target = cache.join("self");
+        let source_name = c_path(&cache).unwrap();
+        let target_name = c_path(&target).unwrap();
+        assert_eq!(unsafe { libc::mount(source_name.as_ptr(), target_name.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) }, 0, "{}", io::Error::last_os_error());
+        struct Mount(CString);
+        impl Drop for Mount {
+            fn drop(&mut self) { unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) }; }
+        }
+        let _mount = Mount(target_name);
+        // Both operation source and proposed placement are inside the SAME
+        // bind mount, so the cross-mount admission refusal cannot mask the
+        // ancestor walk regression. Its outside known repo is reached only
+        // after the equal-device/inode, different-mount `..` edge.
+        let source = root(&target.join("edited"));
+        let candidate = root(&target.join("outside"));
+        assert_eq!(mount_identity(&source).unwrap(), mount_identity(&candidate).unwrap());
+        let outer = root(&case_root.join("repo"));
+        let result = RecoveryPlacement::acquire(candidate, source, vec![outer].into(), registry());
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("known edited or registered checkout root"));
+        eprintln!("RECOVERY_SELF_BIND_ANCESTRY_VERIFIED");
+    }
+
+    #[test]
+    fn placement_walk_does_not_stop_at_a_self_bind_mount_alias() {
+        use std::process::{Child, Command, Stdio};
+        if !Path::new("/usr/bin/unshare").is_file() {
+            eprintln!("RECOVERY_SELF_BIND_UNAVAILABLE: unshare is not installed");
+            return;
+        }
+        let tree = tempfile::tempdir().unwrap();
+        for path in ["repo", "repo/cache", "repo/cache/self", "repo/cache/edited", "repo/cache/outside"] {
+            fs::create_dir(tree.path().join(path)).unwrap();
+        }
+        struct Owner(Child);
+        impl Drop for Owner {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let stdout = tree.path().join("child.stdout");
+        let stderr = tree.path().join("child.stderr");
+        let mut child = Owner(Command::new("/usr/bin/unshare")
+            .args(["--user", "--map-root-user", "--mount", "--propagation", "private", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["fs_safety::recovery_placement::tests::recovery_self_bind_mount_child", "--exact", "--nocapture", "--test-threads=1"])
+            .env("CAGENTS_TEST_RECOVERY_BIND_ROOT", tree.path())
+            .env("CAGENTS_TEST_RECOVERY_MOUNT_NS", fs::metadata("/proc/self/ns/mnt").unwrap().ino().to_string())
+            .env("CAGENTS_TEST_RECOVERY_USER_NS", fs::metadata("/proc/self/ns/user").unwrap().ino().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+            .spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() { break status; }
+            assert!(std::time::Instant::now() < deadline, "isolated self-bind helper timed out");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let errors = fs::read_to_string(stderr).unwrap();
+        if !status.success() && errors.contains("unshare failed: Operation not permitted") {
+            eprintln!("RECOVERY_SELF_BIND_UNAVAILABLE: private user/mount namespaces denied");
+            return;
+        }
+        assert!(status.success(), "private mount helper failed: {} {errors}", fs::read_to_string(stdout).unwrap());
+        assert!(errors.contains("RECOVERY_SELF_BIND_ANCESTRY_VERIFIED"), "helper did not execute the actual bind assertion: {errors}");
+        eprintln!("RECOVERY_SELF_BIND_ANCESTRY_VERIFIED");
+    }
 }
