@@ -78,24 +78,29 @@ impl std::iter::FusedIterator for RecoveryParentCandidates {}
 /// travel together until the consumer transfers all three into its live owner.
 /// Dropping this value never removes names or claims successful cleanup.
 #[must_use = "retain the publication and its existing reservation through actual resolution"]
-pub(crate) struct RecoveryDirectory {
+pub(crate) struct RecoveryDirectory<T = ()> {
     publication: DirectoryPublication,
+    owner: T,
+    private_metadata: std::fs::Metadata,
     context: FilesystemRecoveryContext,
     slot: RecoverySlot,
 }
-impl std::fmt::Debug for RecoveryDirectory {
+impl<T> std::fmt::Debug for RecoveryDirectory<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecoveryDirectory").field("publication", &self.publication)
             .field("context", &self.context).finish_non_exhaustive()
     }
 }
-impl RecoveryDirectory {
+impl<T> RecoveryDirectory<T> {
     pub(crate) fn directory(&self) -> &Root { self.publication.directory() }
     pub(crate) fn context(&self) -> &FilesystemRecoveryContext { &self.context }
+    /// Actual held-FD observation after private setup, not mkdir's umask-applied
+    /// initial mode. Consumers must revalidate before later permission effects.
+    pub(crate) fn private_metadata(&self) -> &std::fs::Metadata { &self.private_metadata }
     /// Transfer ALL authority into the lower Holding/Undo owner. No uncharged
     /// bare-Root conversion or second reservation is provided.
-    pub(crate) fn into_parts(self) -> (DirectoryPublication, FilesystemRecoveryContext, RecoverySlot) {
-        (self.publication, self.context, self.slot)
+    pub(crate) fn into_parts(self) -> (DirectoryPublication, FilesystemRecoveryContext, RecoverySlot, T, std::fs::Metadata) {
+        (self.publication, self.context, self.slot, self.owner, self.private_metadata)
     }
 }
 
@@ -112,15 +117,17 @@ impl RecoveryDirectoryError {
     }
 }
 
-struct PendingDirectory {
+struct PendingDirectory<T> {
     publication: DirectoryPublication,
+    owner: T,
+    private_metadata: Option<std::fs::Metadata>,
     context: FilesystemRecoveryContext,
     setup_attempted: bool,
     setup_complete: bool,
     enrollment_attempted: bool,
     enrollment_confirmed: bool,
 }
-impl PendingDirectory {
+impl<T> PendingDirectory<T> {
     fn initialize_private_mode(&mut self) -> io::Result<()> {
         self.publication.retry_publication_steps().map_err(io::Error::other)?;
         let initial = self.publication.initial_metadata();
@@ -147,6 +154,7 @@ impl PendingDirectory {
         // Includes native ACL absence where that adapter is supported. This
         // wrapper does not claim Darwin placement or creation qualification.
         drop(DirectoryNamespace::acquire(self.publication.directory())?);
+        self.private_metadata = Some(checked);
         Ok(())
     }
     fn finish_setup(&mut self) -> io::Result<()> {
@@ -187,6 +195,18 @@ impl PendingDirectory {
 pub(crate) fn prepare_recovery_directory(
     admission: FilesystemRecoveryReservation, leaf: &OsStr, cancelled: impl Fn() -> bool,
 ) -> Result<RecoveryDirectory, RecoveryDirectoryError> {
+    prepare_recovery_directory_with_owner(admission, leaf, cancelled, ())
+}
+
+/// Preserve the lower producer's already-pinned source/file/parent fields in
+/// this SAME reservation on every post-effect failure. No second slot, owner
+/// registry or loss of original descriptors while returning a recovery error.
+/// On success into_parts transfers the owner together with all three guards.
+/// A consumer initializes its private-mode phase from initial UID/GID plus
+/// INTENDED700, not initial_metadata.mode(): the factory already established700.
+pub(crate) fn prepare_recovery_directory_with_owner<T: Send + 'static>(
+    admission: FilesystemRecoveryReservation, leaf: &OsStr, cancelled: impl Fn() -> bool, owner: T,
+) -> Result<RecoveryDirectory<T>, RecoveryDirectoryError> {
     if components(Path::new(leaf)).is_none_or(|parts| parts.len() != 1) {
         return Err(RecoveryDirectoryError::Rejected(io::Error::new(io::ErrorKind::InvalidInput,
             "Recovery holding requires one ordinary leaf name")));
@@ -211,6 +231,7 @@ pub(crate) fn prepare_recovery_directory(
             let recovery = slot.retain("Unverified recovery holding was left untouched".into(), move || {
                 // Preserve the observed Root and the original domain obligation.
                 // No automatic deletion/chmod or later ownership conversion.
+                let _ = &owner;
                 context.placement().validate().map_err(|e| e.to_string())?;
                 if directory.metadata().map_err(|e| e.to_string())?.nlink() == 0 {
                     return sync_directory(context.placement().directory()).map_err(|e| e.to_string());
@@ -223,6 +244,7 @@ pub(crate) fn prepare_recovery_directory(
             let cause = io::Error::other(error.to_string());
             let Some(mut preparation) = error.take_recovery() else { return Err(RecoveryDirectoryError::Rejected(cause)); };
             let recovery = slot.retain("Private holding staging requires retained cleanup".into(), move || {
+                let _ = &owner;
                 context.placement().validate().map_err(|e| e.to_string())?;
                 preparation.retry_cleanup().map_err(|e| e.to_string())?;
                 sync_directory(context.placement().directory()).map_err(|e| e.to_string())
@@ -230,7 +252,7 @@ pub(crate) fn prepare_recovery_directory(
             return Err(RecoveryDirectoryError::Retained { cause, recovery });
         }
     };
-    let mut pending = PendingDirectory { publication, context, setup_attempted: false, setup_complete: false,
+    let mut pending = PendingDirectory { publication, owner, private_metadata: None, context, setup_attempted: false, setup_complete: false,
         enrollment_attempted: false, enrollment_confirmed: false };
     let result = if cancelled() { Err(io::Error::new(io::ErrorKind::Interrupted,
         "Recovery holding creation cancelled after publication; original authority retained")) }
@@ -240,7 +262,9 @@ pub(crate) fn prepare_recovery_directory(
             move || pending.retry_failed_preparation());
         return Err(RecoveryDirectoryError::Retained { cause, recovery });
     }
-    Ok(RecoveryDirectory { publication: pending.publication, context: pending.context, slot })
+    Ok(RecoveryDirectory { publication: pending.publication, owner: pending.owner,
+        private_metadata: pending.private_metadata.expect("successful private setup records actual metadata"),
+        context: pending.context, slot })
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -298,7 +322,8 @@ mod tests {
         assert!(Arc::ptr_eq(holding.context().placement(), context.placement()));
         holding.context().validate_payload_root(holding.directory()).unwrap();
         assert_eq!(names(context.placement().directory()), [OsString::from("holding")]);
-        let (mut publication, retained, slot) = holding.into_parts();
+        let (mut publication, retained, slot, (), private) = holding.into_parts();
+        assert_eq!(private.mode() & 0o7777, 0o700);
         assert_eq!(publication.identity(), {
             let held = publication.directory().metadata().unwrap(); (held.dev(), held.ino())
         });
@@ -430,10 +455,46 @@ mod tests {
         let holding = result.unwrap();
         assert_eq!(holding.directory().metadata().unwrap().mode() & 0o7777, 0o700);
         holding.context().validate_payload_root(holding.directory()).unwrap();
-        let (mut publication, retained, _slot) = holding.into_parts();
+        let (mut publication, retained, _slot, (), private) = holding.into_parts();
+        assert_eq!(private.mode() & 0o7777, 0o700);
+        assert_eq!(publication.initial_metadata().mode() & 0o7777, 0);
         publication.cleanup_empty().unwrap(); sync_directory(retained.placement().directory()).unwrap();
         assert!(publication.is_removed());
         println!("CAGENTS_FACTORY_UMASK_BODY_COMPLETED");
+    }
+
+    #[test]
+    fn prechecked_original_file_owner_stays_in_same_slot_through_failed_factory_retry() {
+        let (source, context) = context();
+        fs::write(source.path().join("original"), b"original bytes").unwrap();
+        let owner = Arc::new(fs::File::open(source.path().join("original")).unwrap());
+        let weak = Arc::downgrade(&owner);
+        let calls = Cell::new(0);
+        let error = prepare_recovery_directory_with_owner(context.reserve_directory().unwrap(), OsStr::new("holding"), || {
+            calls.set(calls.get()+1); calls.get() == 2
+        }, owner).unwrap_err();
+        assert!(weak.upgrade().is_some(), "post-effect error must retain original file descriptor");
+        let recovery = error.recovery().unwrap();
+        fs::write(context.placement().directory().path().join("holding/partial"), b"retained").unwrap();
+        assert!(recovery.retry().is_err());
+        assert!(weak.upgrade().is_some(), "failed cleanup must keep same original owner");
+        fs::remove_file(context.placement().directory().path().join("holding/partial")).unwrap();
+        recovery.retry().unwrap(); assert!(recovery.is_resolved());
+        assert!(weak.upgrade().is_none(), "positive cleanup and sync release the retained original owner");
+    }
+
+    #[test]
+    fn successful_factory_transfers_original_owner_with_publication_context_and_slot() {
+        let (source, context) = context();
+        fs::write(source.path().join("original"), b"original bytes").unwrap();
+        let owner = Arc::new(fs::File::open(source.path().join("original")).unwrap());
+        let weak = Arc::downgrade(&owner);
+        let holding = prepare_recovery_directory_with_owner(context.reserve_directory().unwrap(), OsStr::new("holding"), || false, owner).unwrap();
+        let (mut publication, retained, slot, owner, private) = holding.into_parts();
+        assert!(weak.upgrade().is_some()); assert_eq!(owner.metadata().unwrap().len(), 14);
+        assert_eq!(private.mode() & 0o7777, 0o700);
+        publication.cleanup_empty().unwrap(); sync_directory(retained.placement().directory()).unwrap();
+        drop((publication, owner, retained, slot)); assert!(weak.upgrade().is_none());
     }
 
 }
