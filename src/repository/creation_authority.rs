@@ -125,6 +125,32 @@ pub(super) struct CreationEvidence {
 }
 
 impl CreationEvidence {
+    /// Compare the six ORIGINAL imported roles with this exact durable
+    /// creation. No Root is opened from a receipt path and no cleanup rights
+    /// or CreationSession are reconstructed here.
+    pub(super) fn validate_received_roles(
+        &self, operation: OperationId, request: &CreateWorktreeRequest,
+        common: &Path, admin: &Path, roots: &[fs_safety::Root; 6],
+    ) -> Result<(), RepositoryError> {
+        let checkout = self.checkout.as_ref().ok_or_else(|| invalid("Creation has no checkout witness"))?;
+        let private = self.admin.as_ref().ok_or_else(|| invalid("Creation has no admin witness"))?;
+        let parent = self.parent.as_ref().ok_or_else(|| invalid("Creation has no original parent witness"))?;
+        if self.operation != operation || request.operation_id != operation
+            || self.source[0].path != request.repository || self.source[2].path != common
+            || checkout.path != request.destination || private.path != admin
+            || checkout.path.parent() != Some(parent.path.as_path())
+            || !parent.path.starts_with(&self.ancestor.path)
+            || !request.managed_root.starts_with(&self.ancestor.path)
+            || !destination_within_managed_root(&request.destination, &request.managed_root)
+            || !admin.starts_with(common.join("worktrees")) || admin == common.join("worktrees")
+        { return Err(invalid("Received creation roles do not match the exact durable operation")); }
+        for (expected, root) in self.source.iter().zip(&roots[..3]) { expected.validate(root)?; }
+        checkout.validate(&roots[3])?;
+        private.validate(&roots[4])?;
+        self.source[2].validate(&roots[5])?;
+        Ok(())
+    }
+
     pub(super) fn has_published_destination(&self) -> bool { self.checkout.is_some() }
 }
 

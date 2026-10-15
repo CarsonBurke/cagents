@@ -1984,6 +1984,37 @@ impl StateStore {
         self.operation_rows(false)
     }
 
+    /// Read ONE exact creation row for an original-descriptor receiver. Refuse
+    /// oversized private payloads in SQLite before allocating/deserializing them.
+    /// This is evidence only, never a creation replay or execution permission.
+    pub(crate) fn journaled_worktree_operation(&self, id: OperationId) -> Result<Option<PendingOperation>> {
+        const PAYLOAD_LIMIT: i64 = 512 * 1024;
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let mut statement = inner.connection.prepare(
+            "SELECT entity_kind, entity_id, action, base_generation,
+                    CASE WHEN length(CAST(payload_json AS BLOB)) <= ?2 THEN payload_json END,
+                    status, created_at_unix_ms, updated_at_unix_ms
+             FROM pending_operations WHERE operation_id = ?1
+               AND length(CAST(entity_kind AS BLOB)) <= 64
+               AND length(CAST(entity_id AS BLOB)) <= 65536
+               AND length(CAST(action AS BLOB)) <= 64
+               AND length(CAST(status AS BLOB)) <= 64")?;
+        let mut rows = statement.query(params![id.to_string(), PAYLOAD_LIMIT])?;
+        let Some(row) = rows.next()? else { return Ok(None); };
+        let payload: Option<String> = row.get(4)?;
+        let payload = payload.ok_or_else(|| StoreError::InvalidState(
+            "Creation journal exceeds the bounded original-directory receiver limit".into()))?;
+        Ok(Some(PendingOperation {
+            id,
+            entity_kind: row.get(0)?, entity_id: row.get(1)?, action: row.get(2)?,
+            base_generation: i64_to_u64(row.get(3)?, "operation base generation")?,
+            payload: serde_json::from_str(&payload)?,
+            status: PendingOperationStatus::parse(&row.get::<_, String>(5)?)?,
+            created_at_unix_ms: row.get(6)?, updated_at_unix_ms: row.get(7)?,
+        }))
+    }
+
     fn operation_rows(&self, unresolved_only: bool) -> Result<Vec<PendingOperation>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
