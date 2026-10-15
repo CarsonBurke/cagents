@@ -472,6 +472,45 @@ fn concurrent_config_edit_and_dirty_write_at_effect_are_preserved() {
 }
 
 #[test]
+fn ignored_collision_created_after_census_is_preserved_at_checkout_effect() {
+    let mut fixture = Fixture::new(true);
+    let new = fixture.advance(|root| {
+        fs::write(root.join("secret"), "PR secret\n").unwrap();
+        run_git(root, &["add", "--force", "secret"]);
+    });
+    let wrapper = fixture.temporary.path().join("late-collision-git");
+    fs::write(&wrapper, r#"#!/bin/sh
+set -eu
+if [ "${CAGENTS_PR_MODE:-}" = effect ]; then
+    for argument do
+        if [ "$argument" = read-tree ]; then
+            # This runs after the additions/xargs census, immediately before
+            # the actual native checkout command. It models an ordinary build
+            # or editor creating ignored data without taking Git's locks.
+            printf 'late ignored local data\n' > "$CAGENTS_PR_WORKTREE_FD/secret"
+            printf injected > "$0.entered"
+            break
+        fi
+    done
+fi
+exec /usr/bin/git "$@"
+"#).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.service = RepositoryService::new(&wrapper, fixture.executor.clone());
+    let plan = fixture.prepare(&fixture.request(new));
+    let before_index = fs::read(fixture.root.join(".git/index")).unwrap();
+    let before_config = fs::read(fixture.root.join(".git/config")).unwrap();
+    let result = fixture.apply(&plan);
+    assert_eq!(fs::read(wrapper.with_extension("entered")).unwrap(), b"injected");
+    assert_eq!(fs::read(fixture.root.join("secret")).unwrap(), b"late ignored local data\n",
+        "a clean census must not authorize overwriting data created before checkout");
+    assert!(result.is_err(), "the late collision must withhold verified success");
+    assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+    assert_eq!(fs::read(fixture.root.join(".git/index")).unwrap(), before_index);
+    assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), before_config);
+}
+
+#[test]
 fn ignored_collision_refuses_and_preserves_original_secret() {
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| {
