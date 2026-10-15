@@ -7584,6 +7584,16 @@ pub fn git_panel<'a>(
     width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
+    git_panel_with_shortcuts(model, state, width, modal_open, default_menu_shortcuts())
+}
+
+pub fn git_panel_with_shortcuts<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    width: f32,
+    modal_open: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> Element<'a, SidebarAction> {
     worktree_panel(
         model,
         state,
@@ -7592,7 +7602,7 @@ pub fn git_panel<'a>(
         WorktreePanel::Changes,
         PanelNavigation::GitViews,
         false,
-        default_menu_shortcuts(),
+        shortcuts,
     )
 }
 

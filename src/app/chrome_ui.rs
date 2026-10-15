@@ -2658,11 +2658,12 @@ impl Cagents {
                 &self.settings.keyboard_shortcuts,
             )
             .map(Message::Sidebar),
-            ContextTab::Changes => sidebar::git_panel(
+            ContextTab::Changes => sidebar::git_panel_with_shortcuts(
                 &self.sidebar_model,
                 &self.sidebar_state,
                 width,
                 self.modal_is_open(),
+                &self.settings.keyboard_shortcuts,
             )
             .map(Message::Sidebar),
             ContextTab::PullRequest => self.pull_request_panel(width),
