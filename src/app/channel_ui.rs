@@ -463,6 +463,11 @@ impl Cagents {
                             .is_some_and(|state| state.existence.is_open())
                 })
             })
+            // A saved provider conversation still belongs to its original
+            // channel when its last pane ends. Only explicit channel deletion
+            // removes that destination; automatic empty-channel cleanup must
+            // not force resume into a newly invented channel.
+            .filter(|channel| !self.durable.conversation_channels.values().any(|id| *id == channel.id))
             .map(|channel| channel.id)
             .collect()
     }
@@ -1353,6 +1358,18 @@ mod tests {
             assert!(!app.durable.channels.iter().any(|channel| channel.id == id));
             assert!(!app.channel_ui.modal_open());
         }
+    }
+
+    #[test]
+    fn ending_a_saved_conversation_keeps_its_channel_but_explicit_deletion_still_works() {
+        let (mut app, channel, _, card) = channel_with_a_conversation();
+        Arc::make_mut(&mut app.durable).conversation_channels.insert("codex:saved-thread".into(), channel);
+        assert!(app.channels_emptied_by(&[card]).is_empty());
+        app.card_state_mut(card).unwrap().existence = Existence::Closed { tombstone: crate::model::Tombstone {
+            operation_id: None, closed_at_unix_ms: 1, reason: Some("closed by user".into()),
+        }};
+        drop(app.handle_channel_ui(Action::Delete(channel)));
+        assert!(!app.durable.channels.iter().any(|row| row.id == channel));
     }
 
     #[test]
