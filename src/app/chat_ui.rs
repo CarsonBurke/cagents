@@ -5253,9 +5253,7 @@ impl Cagents {
                 .chain(batch.interrupted).collect::<Vec<_>>();
             targets.sort();
             targets.dedup();
-            self.notices.record(TransientNotice::warning(format!(
-                "{} turns were interrupted while the daemon was disconnected. Open an affected chat to restart its session.", targets.len()
-            )).key(key).targets(targets));
+            self.notices.record(TransientNotice::warning("Turns were interrupted while the daemon was disconnected. Open an affected chat to restart its session.").key(key).targets(targets));
         }
         if !batch.failed.is_empty() {
             let key = "daemon-chat-reconnect";
@@ -5265,9 +5263,7 @@ impl Cagents {
                 .chain(batch.failed).collect::<Vec<_>>();
             targets.sort();
             targets.dedup();
-            self.notices.record(TransientNotice::warning(format!(
-                "{} chats could not reconnect automatically. Open an affected chat to retry.", targets.len()
-            )).key(key).targets(targets));
+            self.notices.record(TransientNotice::warning("Some chats could not reconnect automatically. Open an affected chat to retry.").key(key).targets(targets));
         }
         if batch.reconnected > 0 {
             self.status = Some(TransientNotice::success(format!(
