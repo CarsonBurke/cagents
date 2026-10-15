@@ -142,3 +142,104 @@ impl Drop for ReadSnapshot<'_> {
         if !self.db.is_autocommit() { let _ = self.db.execute_batch("ROLLBACK"); }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::lifetime::{self, ReaderHold, RevocationEpoch};
+    use std::{ffi::{OsStr, OsString}, os::{fd::AsRawFd, unix::ffi::OsStringExt}};
+    struct Fixture {
+        _root: tempfile::TempDir, directory: Directory, database: File,
+        proof: SourceReadProofData, epoch: RevocationEpoch, _reader: ReaderHold,
+    }
+    fn expires() -> Instant { Instant::now() + Duration::from_secs(5) }
+    impl Fixture {
+        // A synthetic supported source-marker DB tests SQLite mechanics only.
+        // It does not construct ActualStore/account/authenticated read grants.
+        fn new(non_utf8: bool) -> Self {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let parent = Directory::open(root.path()).unwrap();
+            let name = if non_utf8 { OsString::from_vec(b"cache-\xff".to_vec()) } else { "cache".into() };
+            let directory = parent.create_dir(&name).unwrap();
+            directory.create_lock(OsStr::new("transcript.sqlite")).unwrap();
+            let path = directory.current_path().unwrap();
+            let proof = SourceReadProofData { source_incarnation: Uuid::new_v4(), raw_owner_nonce: Uuid::new_v4(),
+                raw_schema: 1, reset_schema: 1, text_schema: 1 };
+            let db = Connection::open(path.join("transcript.sqlite")).unwrap();
+            db.execute_batch("PRAGMA journal_mode=DELETE;
+                CREATE TABLE raw_source_schema(singleton INTEGER PRIMARY KEY,version INTEGER NOT NULL,nonce TEXT NOT NULL);
+                CREATE TABLE transcript_reset_schema(singleton INTEGER PRIMARY KEY,version INTEGER NOT NULL,pending INTEGER NOT NULL);
+                CREATE TABLE text_source_schema(singleton INTEGER PRIMARY KEY,version INTEGER NOT NULL);
+                CREATE TABLE payload(value TEXT NOT NULL);
+                INSERT INTO payload VALUES('private body');
+                INSERT INTO transcript_reset_schema VALUES(1,1,0);
+                INSERT INTO text_source_schema VALUES(1,1);").unwrap();
+            db.execute("INSERT INTO raw_source_schema VALUES(1,1,?1)", [proof.raw_owner_nonce.to_string()]).unwrap(); drop(db);
+            let database = directory.open_file(OsStr::new("transcript.sqlite"), false).unwrap();
+            lifetime::initialize(&path).unwrap();
+            let reader = ReaderHold::acquire(&path, expires()).unwrap();
+            let epoch = RevocationEpoch::new(proof.source_incarnation).unwrap();
+            Self { _root: root, directory, database, proof, epoch, _reader: reader }
+        }
+        fn writer(&self) -> Connection {
+            let writer = Connection::open(self.directory.current_path().unwrap().join("transcript.sqlite")).unwrap();
+            writer.busy_timeout(Duration::ZERO).unwrap(); writer
+        }
+    }
+    #[test]
+    fn actual_readonly_snapshot_proves_inode_lock_and_explicit_release_including_unix_bytes() {
+        for non_utf8 in [false,true] {
+            let fixture = Fixture::new(non_utf8); let probe = fixture.epoch.probe().unwrap();
+            let snapshot = ReadSnapshot::begin(&fixture.directory, &fixture.database, &fixture.proof, &probe,
+                Coverage::Known { partial_history: true }, expires()).unwrap();
+            let context = snapshot.context().unwrap();
+            assert_eq!(context.incarnation(), fixture.proof.source_incarnation);
+            assert_eq!(context.coverage(), Coverage::Known { partial_history: true });
+            let private_body: String = context.connection().query_row("SELECT value FROM payload", [], |row| row.get(0)).unwrap();
+            assert_eq!(private_body, "private body");
+            assert!(context.connection().execute("UPDATE payload SET value='forbidden'", []).is_err());
+            let writer = fixture.writer();
+            assert!(writer.execute_batch("BEGIN IMMEDIATE; UPDATE payload SET value='new'; COMMIT").is_err(), "actual read lock must block commit");
+            writer.execute_batch("ROLLBACK").unwrap();
+            snapshot.finish().unwrap();
+            writer.execute("UPDATE payload SET value='after release'", []).unwrap();
+        }
+    }
+    #[test]
+    fn revoked_reset_or_changed_owner_and_future_text_refuse_before_context() {
+        let fixture = Fixture::new(false); let probe = fixture.epoch.probe().unwrap();
+        let writer = fixture.writer();
+        for mutation in ["UPDATE transcript_reset_schema SET pending=1", "UPDATE raw_source_schema SET nonce='00000000-0000-0000-0000-000000000000'", "UPDATE text_source_schema SET version=2"] {
+            writer.execute_batch(mutation).unwrap();
+            assert!(ReadSnapshot::begin(&fixture.directory, &fixture.database, &fixture.proof, &probe, Coverage::Unknown, expires()).is_err());
+            writer.execute("UPDATE raw_source_schema SET nonce=?1", [fixture.proof.raw_owner_nonce.to_string()]).unwrap();
+            writer.execute_batch("UPDATE transcript_reset_schema SET pending=0; UPDATE text_source_schema SET version=1").unwrap();
+        }
+    }
+    #[test]
+    fn actual_replacement_and_kernel_revocation_prevent_private_page_release() {
+        for replace in [false,true] {
+            let fixture = Fixture::new(false); let probe = fixture.epoch.probe().unwrap();
+            let snapshot = ReadSnapshot::begin(&fixture.directory, &fixture.database, &fixture.proof, &probe, Coverage::Unknown, expires()).unwrap();
+            let context = snapshot.context().unwrap();
+            assert_eq!(context.coverage(), Coverage::Unknown, "no durable completeness claim is invented");
+            let _: String = context.connection().query_row("SELECT value FROM payload", [], |row| row.get(0)).unwrap();
+            if replace {
+                let path = fixture.directory.current_path().unwrap();
+                std::fs::rename(path.join("transcript.sqlite"), path.join("old.sqlite")).unwrap();
+                fixture.directory.create_lock(OsStr::new("transcript.sqlite")).unwrap();
+            } else { fixture.epoch.revoke().unwrap(); }
+            assert!(snapshot.finish().is_err(), "caller must suppress its still-private page");
+        }
+    }
+    #[test]
+    fn bundled_nofollow_rejects_proc_route_and_owner_detects_early_release() {
+        let fixture = Fixture::new(false);
+        let proc_path = format!("/proc/self/fd/{}/transcript.sqlite", fixture.directory.fd().as_raw_fd());
+        assert!(Connection::open_with_flags(proc_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW).is_err());
+        let probe = fixture.epoch.probe().unwrap();
+        let snapshot = ReadSnapshot::begin(&fixture.directory, &fixture.database, &fixture.proof, &probe, Coverage::Unknown, expires()).unwrap();
+        snapshot.context().unwrap().connection().execute_batch("ROLLBACK").unwrap();
+        assert!(snapshot.finish().is_err(), "query code cannot claim release on the owner's behalf");
+    }
+}
