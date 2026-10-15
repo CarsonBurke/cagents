@@ -322,6 +322,42 @@ mod tests {
     }
 
     #[test]
+    fn failed_thread_binding_write_keeps_actor_output_live_and_authority_closed() {
+        let fixture = fixture(0);
+        let (instance, delivery) = {
+            let mut state = fixture.host.lock().unwrap(); let delivery = state.register_client(1);
+            let record = state.chats.get_mut(&fixture.source.id).unwrap(); record.subscribers.insert(1, true);
+            (record.execution_instance, delivery)
+        };
+        let database = rusqlite::Connection::open(fixture._directory.path().join("workspace.sqlite3")).unwrap();
+        database.execute_batch("CREATE TRIGGER reject_session_thread BEFORE UPDATE ON session_locations BEGIN SELECT RAISE(FAIL,'injected directory metadata write failure'); END;").unwrap();
+        fixture.handle.command(chat::Command::Prompt { text: "__fixture_new_thread".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap();
+        let new_thread = "44444444-0000-4000-8000-000000000004";
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fixture.handle.confirmed_session_id().as_deref() != Some(new_thread) { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10)); }
+        super::super::chat::changed_owned(&Arc::downgrade(&fixture.host), fixture.source.id, instance, runtime::Update::Presentation);
+        delivery.close_after_drain();
+        assert!(matches!(delivery.pop().map(|message| message.message), Some(crate::terminal_ipc::ServerMessage::ChatChanged { chat_id }) if chat_id == fixture.source.id));
+        assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, fixture.source);
+        let retry = fixture.host.lock().unwrap().directory_thread_retry.expect("bounded retry after persistence failure");
+        let mut current = fixture.source.clone(); current.launch.session_id = Some(new_thread.into());
+        let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
+        assert!(registry.lock().unwrap().session_location(&HostedSession::Chat(current.clone())).is_err());
+        std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+        let request = ClientRequest::EditWorkspaceModel { edit: ModelEdit::RelocateProject { relocation: Relocation { repository: fixture.old.clone(), destination: fixture.moved.clone(), old_root: fixture.old.clone(), new_root: fixture.moved.clone() } } };
+        assert!(super::super::client::process_request(&fixture.host, 1, request).is_err());
+        assert!(!fixture.handle.is_completed());
+        database.execute_batch("DROP TRIGGER reject_session_thread").unwrap();
+        super::super::chat::changed_owned(&Arc::downgrade(&fixture.host), fixture.source.id, instance, runtime::Update::Presentation);
+        assert_eq!(fixture.host.lock().unwrap().directory_thread_retry, Some(retry), "producer frames cannot hammer a failed database");
+        assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, fixture.source);
+        fixture.host.lock().unwrap().directory_thread_retry = None;
+        super::super::chat::changed_owned(&Arc::downgrade(&fixture.host), fixture.source.id, instance, runtime::Update::Presentation);
+        assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, current);
+        assert!(registry.lock().unwrap().session_location(&HostedSession::Chat(current)).unwrap().is_some());
+    }
+
+    #[test]
     fn closed_legacy_chat_id_cannot_name_a_fresh_same_recipe_actor() {
         let fixture = fixture(1);
         assert!(!fixture.host.lock().unwrap().issued_chat_ids.contains(&fixture.source.id));

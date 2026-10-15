@@ -426,7 +426,6 @@ fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uu
         if !state.chats.get(&id).is_some_and(|record| record.execution_instance == instance) { return; }
         if let Err(error) = state.observe_chat_directory_thread(id, instance) {
             tracing::warn!(%error, "cannot retain the owned provider's confirmed thread");
-            return;
         }
     }
     let proof = state.proof().clone();
