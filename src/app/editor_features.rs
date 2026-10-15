@@ -74,11 +74,12 @@ mod tests {
         let open = app.cards.iter().filter_map(|(card, runtime)| match runtime {
             CardRuntime::Repository(runtime) => runtime.workspace_edit_snapshot().map(|(path, mut snapshot)| {
                 snapshot.protocol_version = app.lsp_document(*card).and_then(|doc| app.lsp.document_version(doc));
+                snapshot.protocol_incarnation = app.lsp_document(*card).and_then(|doc| app.lsp.document_incarnation(doc));
                 (path, snapshot)
             }), _ => None,
         }).collect();
         let documents = names.iter().map(|name| workspace::DocumentEdits {
-            path: (*name).into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar,
+            path: (*name).into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar,
             edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }],
         }).collect();
         Arc::new(workspace::prepare(root, documents, &open).unwrap())
@@ -407,6 +408,71 @@ mod tests {
         }
         assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
         assert!(!app.editor_features.publishing());
+    }
+
+    #[tokio::test]
+    async fn emitted_peer_edit_rejects_closed_or_reopened_uri_before_preview() {
+        for reopen in [false, true] {
+            let root = tempfile::tempdir().unwrap(); let original = "fn old() {}\n";
+            for name in ["a.rs", "b.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+            let mut app = app(); let a = buffer(&mut app, root.path(), "a.rs", original);
+            let b = buffer(&mut app, root.path(), "b.rs", original);
+            let a_doc = LspDocumentId(44); let b_doc = LspDocumentId(45);
+            app.lsp = LspManager::fixture_ready_format_on_save(a_doc, &root.path().join("a.rs"), root.path(), original).await;
+            app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), original).await;
+            for (card, doc) in [(a, a_doc), (b, b_doc)] { app.lsp_documents.insert(doc, card); app.lsp_contexts.entry(card).or_default().document = Some(doc); }
+            let original_incarnation = app.lsp.document_incarnation(b_doc).unwrap();
+            let edit = LspWorkspaceEdit { documents: vec![LspDocumentEdits {
+                path: root.path().join("b.rs"), version: None, observed_version: app.lsp.document_version(b_doc), observed_incarnation: Some(original_incarnation.clone()), coordinates: LspCoordinates::Scalar,
+                edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }],
+            }], ..Default::default() };
+            app.lsp.close(b_doc); app.lsp_documents.remove(&b_doc); app.lsp_contexts.remove(&b); app.cards.remove(&b);
+            std::fs::write(root.path().join("b.rs"), "fn outside() {}\n").unwrap();
+            if reopen {
+                let b = buffer(&mut app, root.path(), "b.rs", "fn outside() {}\n");
+                app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn outside() {}\n").await;
+                app.lsp_documents.insert(b_doc, b); app.lsp_contexts.entry(b).or_default().document = Some(b_doc);
+                assert_eq!(app.lsp.document_version(b_doc), Some(1));
+                assert_ne!(app.lsp.document_incarnation(b_doc), Some(original_incarnation));
+            }
+            let operation = app.editor_operation(a, LspEditKind::Rename).unwrap();
+            let mut tasks = VecDeque::from([app.prepare_editor_workspace_edit(operation, edit)]);
+            while let Some(task) = tasks.pop_front() {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::EditorFeatures(action))) = action { tasks.push_back(app.update_editor_features(action)); }
+                    }
+                }
+            }
+            assert!(app.editor_features.preview.is_none() && !app.editor_features.publishing());
+            assert!(app.lsp_contexts.get(&a).unwrap().failure.is_some());
+            assert_eq!(text(&app, a), original);
+            assert_eq!(std::fs::read_to_string(root.path().join("b.rs")).unwrap(), "fn outside() {}\n");
+            app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reopened_same_version_peer_refuses_preview_publication_before_freezing() {
+        let root = tempfile::tempdir().unwrap(); let original = "fn old() {}\n";
+        for name in ["a.rs", "b.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+        let mut app = app(); let a = buffer(&mut app, root.path(), "a.rs", original); let b = buffer(&mut app, root.path(), "b.rs", original);
+        let a_doc = LspDocumentId(44); let b_doc = LspDocumentId(45);
+        app.lsp = LspManager::fixture_ready_format_on_save(a_doc, &root.path().join("a.rs"), root.path(), original).await;
+        app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), original).await;
+        for (card, doc) in [(a, a_doc), (b, b_doc)] { app.lsp_documents.insert(doc, card); app.lsp_contexts.entry(card).or_default().document = Some(doc); }
+        let prepared = plan(&app, root.path(), &["a.rs", "b.rs"]); let operation = app.editor_operation(a, LspEditKind::Rename).unwrap();
+        let old_identity = app.lsp.document_incarnation(b_doc).unwrap();
+        app.lsp.close(b_doc);
+        app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), original).await;
+        assert_eq!(app.lsp.document_version(b_doc), Some(1));
+        assert_ne!(app.lsp.document_incarnation(b_doc), Some(old_identity));
+        assert_eq!(app.editor_open_files(), operation.open_files, "card/path equality alone cannot detect the server URI lifetime change");
+        drop(app.publish_editor_workspace_edit(818, operation, prepared));
+        assert!(!app.editor_features.publishing());
+        for card in [a, b] { assert_eq!(text(&app, card), original); assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending())); }
+        for name in ["a.rs", "b.rs"] { assert_eq!(std::fs::read_to_string(root.path().join(name)).unwrap(), original); }
+        app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
     }
 
     #[test]
@@ -1404,7 +1470,7 @@ impl Cagents {
         let worktree = owner.descriptor.worktree.clone();
         operation.open_files = self.editor_open_files();
         let open_paths = operation.open_files.iter().map(|(_, path)| path.clone()).collect();
-        let documents = edit.documents.into_iter().map(|document| workspace::DocumentEdits { path: document.path, version: document.version, observed_version: document.observed_version, coordinates: document.coordinates, edits: document.edits }).collect();
+        let documents = edit.documents.into_iter().map(|document| workspace::DocumentEdits { path: document.path, version: document.version, observed_version: document.observed_version, observed_incarnation: document.observed_incarnation, coordinates: document.coordinates, edits: document.edits }).collect();
         let ticket = self.editor_features.next();
         self.editor_features.preparing.insert(ticket, operation);
         cosmic::task::future(async move {
@@ -1423,8 +1489,9 @@ impl Cagents {
                     if captured > 64 * 1024 * 1024 { return Err("The open buffers exceed the 64 MiB preview budget".into()); }
                     let Some((path, mut snapshot)) = runtime.workspace_edit_snapshot() else { return Err("Wait for the selected target to finish loading, or close its read-only view, before applying edits".into()); };
                     snapshot.protocol_version = self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc));
+                    snapshot.protocol_incarnation = self.lsp_document(*card).and_then(|doc| self.lsp.document_incarnation(doc));
                         if let Some(previous) = open.insert(path, snapshot.clone()) {
-                            if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.writable != snapshot.writable {
+                            if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.protocol_incarnation != snapshot.protocol_incarnation || previous.writable != snapshot.writable {
                                 return Err("Two open views of the same file disagree".into());
                             }
                         }
@@ -1459,6 +1526,7 @@ impl Cagents {
             None => None,
         };
         let protocol_versions: HashMap<CardId, Option<i32>> = self.cards.keys().map(|card| (*card, self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc)))).collect();
+        let protocol_incarnations: HashMap<CardId, Option<crate::lsp::LspDocumentIncarnation>> = self.cards.keys().map(|card| (*card, self.lsp_document(*card).and_then(|doc| self.lsp.document_incarnation(doc)))).collect();
         let mut matched_documents = HashSet::new();
         let mut cards = Vec::new();
         let mut failure = None;
@@ -1473,6 +1541,7 @@ impl Cagents {
                         matched_documents.insert(index);
                         if !document.open { failure = Some("A target file was opened after this preview was prepared".into()); break; }
                         if protocol_versions[card] != document.protocol_version { failure = Some("A target language-server version changed after this preview was prepared".into()); break; }
+                        if protocol_incarnations[card] != document.protocol_incarnation { failure = Some("A target language-server document was closed or reopened after this preview was prepared".into()); break; }
                         match runtime.begin_workspace_edit(ticket, document) { Ok(()) => cards.push(*card), Err(error) => { failure = Some(error); break; } }
                     }
                 }

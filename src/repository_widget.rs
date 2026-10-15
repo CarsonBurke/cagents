@@ -5213,7 +5213,7 @@ impl RepositoryRuntime {
     pub fn workspace_edit_snapshot(&self) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
         let DocumentState::Editable(document) = &self.document else { return None; };
         Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
-            text: document.content.text().into(), version: document.lsp_version, protocol_version: None,
+            text: document.content.text().into(), version: document.lsp_version, protocol_version: None, protocol_incarnation: None,
             writable: document.present && !self.is_saving() && !self.is_read_only_source(),
         }))
     }
@@ -20710,7 +20710,7 @@ mod tests {
         drop(runtime.update(RepositoryAction::ApplyMarkdownMode { card, preview: true }));
         let plan = crate::editor_workspace_edit::DocumentPlan {
             path: "/repo/README.md".into(), relative: "README.md".into(), before: before.into(), after: after.into(),
-            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: vec![], edits: vec![],
+            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), protocol_incarnation: None, open: true, open_paths: vec![], edits: vec![],
         };
         runtime.begin_workspace_edit(90, &plan).unwrap();
         runtime.finish_workspace_edit(90).unwrap();
@@ -20736,7 +20736,7 @@ mod tests {
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &before);
         let last = before.rfind("old()").unwrap();
         let plan = crate::editor_workspace_edit::DocumentPlan { path: "/repo/main.rs".into(), relative: "main.rs".into(),
-            before: before.clone().into(), after: after.clone().into(), before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: Vec::new(),
+            before: before.clone().into(), after: after.clone().into(), before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), protocol_incarnation: None, open: true, open_paths: Vec::new(),
             edits: [0, last].into_iter().map(|offset| crate::editor_workspace_edit::ResolvedEdit { range: offset..offset + 3, new_text: "new_name".into() }).collect() };
         runtime.begin_workspace_edit(51, &plan).unwrap();
         let DocumentState::Editable(document) = &runtime.document else { panic!("fixture editor"); };
@@ -20760,7 +20760,7 @@ mod tests {
         let plan = crate::editor_workspace_edit::DocumentPlan {
             path: "/repo/main.rs".into(), relative: "main.rs".into(),
             before: before.clone().into(), after: after.into(),
-            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: vec![], edits: vec![],
+            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), protocol_incarnation: None, open: true, open_paths: vec![], edits: vec![],
         };
         runtime.begin_workspace_edit(42, &plan).unwrap();
         assert!(runtime.is_saving());
@@ -21508,7 +21508,7 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", "A");
         let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
-        let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "file.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
+        let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "file.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, protocol_incarnation: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
         runtime.disk_poll = Some((77, Instant::now()));
         runtime.begin_workspace_edit(1, &plan).unwrap();
         assert!(!runtime.observes_open_sources());
