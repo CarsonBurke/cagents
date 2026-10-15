@@ -323,6 +323,7 @@ pub(super) struct Prepared {
     pub(super) bounds: iced::Size,
     pub(super) spans: Arc<[Span<'static, String>]>,
     pub(super) plain: Arc<str>,
+    unwrapped: bool,
 }
 
 impl Prepared {
@@ -356,7 +357,7 @@ impl Prepared {
         buffer.shape_until_scroll(fonts, false);
         let bounds = graphics_text::align(&mut buffer, fonts, Default::default());
         let snapshot = buffer.into_layout_snapshot().expect("complete paragraph layout");
-        Self { snapshot, bounds, spans, plain }
+        Self { snapshot, bounds, spans, plain, unwrapped: wrapping==iced::widget::text::Wrapping::None }
     }
 }
 
@@ -443,32 +444,54 @@ fn rich_font_span_metadata_and_unwrapped_horizontal_geometry_are_preserved() {
 
 pub(super) struct Projection {
     pub(super) buffer: Arc<cosmic_text::Buffer>,
-    pub(super) source_starts: Vec<usize>,
+    pub(super) source_maps: Vec<cosmic_text::ProjectedSource>,
     pub(super) top: f32,
 }
 impl Prepared {
     pub(super) fn projection(&self, top: f32, bottom: f32) -> Option<Projection> {
         let projection = self.snapshot.project(self.snapshot.visible_lines(top, bottom))?;
-        let source_starts = projection.source_starts().to_vec();
-        let top = projection.top();
-        Some(Projection { buffer: Arc::new(projection.into_buffer()), source_starts, top })
+        let source_maps = projection.source_maps().to_vec();
+        let top=projection.top();
+        Some(Projection {buffer:Arc::new(projection.into_buffer()),source_maps,top})
+    }
+    pub(super) fn projection_rect(&self, top:f32,bottom:f32,left:f32,right:f32) -> Option<Projection> {
+        let projection=self.snapshot.project_rect(self.snapshot.visible_lines(top,bottom),left,right)?;
+        let source_maps=projection.source_maps().to_vec();let top=projection.top();
+        Some(Projection {buffer:Arc::new(projection.into_buffer()),source_maps,top})
     }
     pub(super) fn hit(&self, position: iced::Point, length: usize) -> usize {
-        if position.y < 0.0 { return 0; }
-        if position.y >= self.bounds.height { return length; }
-        let Some(projection) = self.projection(position.y, position.y + 0.1) else { return 0; };
-        let Some(cursor) = projection.buffer.hit(position.x, position.y - projection.top) else { return 0; };
-        projection.source_starts.get(cursor.line).copied().unwrap_or(0).saturating_add(cursor.index).min(length)
+        if position.y < 0.0 {return 0;}
+        if position.y >= self.bounds.height {return length;}
+        // A small glyph envelope preserves exact engine caret affinity while
+        // avoiding a full million-glyph horizontal row projection per move.
+        let margin=self.snapshot.line_height(self.snapshot.visible_lines(position.y,position.y+0.1).start).unwrap_or(20.0)*4.0;
+        let projected=self.projection_rect(position.y,position.y+0.1,position.x-margin,position.x+margin);
+        let map_hit=|projection:Projection| {
+            let cursor=projection.buffer.hit(position.x,position.y-projection.top)?;
+            projection.source_maps.get(cursor.line)?.source_byte(cursor.index).map(|byte|byte.min(length))
+        };
+        projected.and_then(map_hit).or_else(|| {
+            // A short last wrapped row may end far before the pane edge.
+            // Its complete visual row is viewport-bounded; no-wrap code uses
+            // the indexed projection above and never this full-row fallback.
+            (!self.unwrapped).then(||self.projection(position.y,position.y+0.1)).flatten().and_then(map_hit)
+        }).unwrap_or(if position.x>=self.bounds.width {length} else {0})
     }
+
     pub(super) fn link(&self, position: iced::Point) -> Option<usize> {
-        let projection = self.projection(position.y, position.y + 0.1)?;
-        projection.buffer.layout_runs().find_map(|run| run.glyphs.iter().find(|glyph|
-            position.x >= glyph.x && position.x < glyph.x + glyph.w).map(|glyph| glyph.metadata))
+        let visual=self.snapshot.visible_lines(position.y,position.y+0.1);
+        for row in visual {
+            if let Some((_,glyph))=self.snapshot.glyphs_in_x(row,position.x,position.x)?.find(|(_,glyph)| {
+                let left=glyph.x.min(glyph.x+glyph.w);let right=glyph.x.max(glyph.x+glyph.w);
+                left<=position.x && position.x<right
+            }) {return Some(glyph.metadata);}
+        }
+        None
     }
     pub(super) fn byte_bounds(&self, byte: usize, length: usize) -> Option<iced::Rectangle> {
         let query = if byte == length { byte.saturating_sub(1) } else { byte };
         for visual in self.snapshot.source_visual_lines(query) {
-            for (prefix, glyph) in self.snapshot.glyphs(visual)? {
+            for (prefix, glyph) in self.snapshot.glyphs_at_byte(visual,query)? {
                 if prefix + glyph.start <= query && query < prefix + glyph.end {
                     return Some(iced::Rectangle::new(iced::Point::new(glyph.x.min(glyph.x + glyph.w), self.snapshot.line_top(visual)?),
                         iced::Size::new(glyph.w.abs(), self.snapshot.line_height(visual)?)));
@@ -489,7 +512,7 @@ pub(super) fn paint(
     use iced::advanced::text::Renderer as _;
     let translation = iced::Vector::new(position.x, position.y + projection.top);
     for run in projection.buffer.layout_runs() {
-        let Some(prefix) = projection.source_starts.get(run.line_i).copied() else { continue; };
+        let Some(source_map)=projection.source_maps.get(run.line_i) else {continue;};
         let mut start = 0;
         while let Some(first) = run.glyphs.get(start) {
             let end = start + run.glyphs[start..].iter().position(|glyph| glyph.metadata != first.metadata).unwrap_or(run.glyphs.len() - start);
@@ -531,8 +554,7 @@ pub(super) fn paint(
                 }
             };
             for glyph in run.glyphs {
-                let begin = prefix + glyph.start;
-                let finish = prefix + glyph.end;
+                let (Some(begin),Some(finish))=(source_map.source_byte(glyph.start),source_map.source_byte(glyph.end)) else {continue;};
                 let index = ranges.partition_point(|range| range.end <= begin);
                 if ranges.get(index).is_some_and(|range| range.start < finish && !range.is_empty()) {
                     let left = glyph.x.min(glyph.x + glyph.w);
@@ -732,4 +754,28 @@ fn code_flow_preserves_full_physical_line_context_without_sync_shaping() {
                 (expected.x.to_bits(),expected.y.to_bits(),expected.w.to_bits()));
         }
     }
+}
+
+#[test]
+fn horizontal_flow_projects_sparse_glyphs_and_keeps_source_hit_and_find_coordinates() {
+    let source=format!("{} ffi العربية עברית end", "office ".repeat(2000));
+    let spans=vec![Span::new(source.clone()).link("https://example.com".to_owned())];
+    let prepared=Prepared::new(&spans,iced::Pixels(16.0),iced::Font::MONOSPACE,720.0,iced::widget::text::Wrapping::None);
+    for left in [0.0,prepared.bounds.width*0.5,(prepared.bounds.width-400.0).max(0.0)] {
+        let projection=prepared.projection_rect(0.0,40.0,left-64.0,left+464.0).unwrap();
+        let run=projection.buffer.layout_runs().next().unwrap();
+        assert!(run.glyphs.len()<512,"raw display ownership follows horizontal viewport");
+        for glyph in run.glyphs {
+            let start=projection.source_maps[0].source_byte(glyph.start).unwrap();
+            let end=projection.source_maps[0].source_byte(glyph.end).unwrap();
+            let point=iced::Point::new(glyph.x+glyph.w*0.25,2.0);
+            let hit=prepared.hit(point,source.len());
+            assert!((start..=end).contains(&hit),"caret remains in original cluster {start}..{end}, got{hit}");
+            assert_eq!(prepared.link(point),Some(glyph.metadata));
+            let bounds=prepared.byte_bounds(start,source.len()).unwrap();
+            assert_eq!(bounds.x.to_bits(),glyph.x.min(glyph.x+glyph.w).to_bits());
+        }
+    }
+    let wrapped=Prepared::new(&[Span::new("short last row".to_owned())],iced::Pixels(16.0),iced::Font::DEFAULT,720.0,iced::widget::text::Wrapping::WordOrGlyph);
+    assert_eq!(wrapped.hit(iced::Point::new(700.0,2.0),14),14);
 }

@@ -529,7 +529,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if let Some(flow) = &state.flow {
             if let Some(ready) = &state.flow_ready {
                 let top = (viewport.y - layout.bounds().y).max(0.0);
-                if let Some(projection) = ready.projection(top, top + viewport.height + self.size.0 * 1.3) {
+                // LayoutGlyph exposes placed advances rather than exact ink
+                // outlines. Keep four ems of raster overscan on either edge;
+                // native font/edge fixtures qualify the supported fonts.
+                let overscan=self.size.0*4.0;
+                let left=viewport.x-layout.bounds().x-overscan;
+                let right=viewport.x+viewport.width-layout.bounds().x+overscan;
+                if let Some(projection)=ready.projection_rect(top,top+viewport.height+self.size.0*1.3,left,right) {
                     flow_layout::paint(renderer, &projection, &ready.spans, &self.matches,
                         state.anchor.min(state.end)..state.anchor.max(state.end), self.size,
                         layout.position(), theme, defaults, viewport);
