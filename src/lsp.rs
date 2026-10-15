@@ -4655,8 +4655,11 @@ impl LspManager {
     /// cannot close a replacement manager, registration, or same-key session.
     /// Surviving registrations that joined an original session are reopened
     /// with their latest immutable buffer after that old session retires.
-    pub fn remove_captured_worktree(&mut self, removal: LspWorktreeRemoval) {
-        if removal.manager != self.generation { return; }
+    /// Returns the exact IDs closed, including still-pending registrations, so
+    /// retained editor buffers can clear only their matching LSP attachment.
+    pub fn remove_captured_worktree(&mut self, removal: LspWorktreeRemoval) -> Vec<LspDocumentId> {
+        if removal.manager != self.generation { return Vec::new(); }
+        let mut closed = Vec::new();
         let mut sessions = removal.sessions;
         for (doc, owner) in removal.registrations {
             if let Some(created) = owner.created_session.lock()
@@ -4667,7 +4670,7 @@ impl LspManager {
                 .is_some_and(|reference| Arc::ptr_eq(&reference.owner, &owner))
                 || self.pending_opens.get(&doc)
                     .is_some_and(|pending| Arc::ptr_eq(&pending.owner, &owner));
-            if matches { self.close(doc); }
+            if matches { self.close(doc); closed.push(doc); }
         }
         let mut reopen = Vec::new();
         for captured in sessions {
@@ -4680,6 +4683,7 @@ impl LspManager {
             }
         }
         for key in reopen { self.reopen_documents(&key); }
+        closed
     }
 
     /// Immediate removal for callers that already hold current ownership.
@@ -4687,7 +4691,7 @@ impl LspManager {
     /// with `remove_captured_worktree`, rather than recapturing by path later.
     pub fn remove_worktree(&mut self, worktree: &Path) {
         let removal = self.capture_worktree_removal(worktree);
-        self.remove_captured_worktree(removal);
+        let _ = self.remove_captured_worktree(removal);
     }
 
     pub fn request_completion(&mut self, doc: LspDocumentId, at: LspPosition) -> LspRequestId {
@@ -6168,13 +6172,13 @@ mod tests {
             await_ready(&events, doc).await;
             let successor = manager.sessions.values().next().unwrap().clone();
             assert!(!Arc::ptr_eq(&old.retired, &successor.retired));
-            manager.remove_captured_worktree(removal.clone());
+            assert!(manager.remove_captured_worktree(removal.clone()).is_empty());
             assert!(manager.documents.contains_key(&doc));
             assert!(!successor.retired.load(Ordering::Acquire));
             assert_eq!(manager.sessions.len(), 1);
             manager.close(doc);
             manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "new registration");
-            manager.remove_captured_worktree(removal);
+            assert!(manager.remove_captured_worktree(removal).is_empty());
             let uri = &manager.documents[&doc].uri;
             assert_eq!(manager.snapshots.latest(uri).unwrap().full_text().as_ref(), "new registration");
             assert!(!successor.retired.load(Ordering::Acquire));
@@ -6204,14 +6208,14 @@ mod tests {
             let new_doc = LspDocumentId(2);
             manager.open_for_test(new_doc, &worktree.join("new.rs"), &worktree, rust_language(), 1, "new buffer");
             manager.change(new_doc, 2, &[], "newer unsaved buffer");
-            manager.remove_captured_worktree(removal.clone());
+            assert_eq!(manager.remove_captured_worktree(removal.clone()), vec![old_doc]);
             assert!(!manager.documents.contains_key(&old_doc));
             assert!(original.retired.load(Ordering::Acquire));
             await_ready(&events, new_doc).await;
             let successor = manager.sessions.values().next().unwrap().clone();
             assert!(!Arc::ptr_eq(&original.retired, &successor.retired));
             assert_eq!(manager.snapshots.latest(&manager.documents[&new_doc].uri).unwrap().full_text().as_ref(), "newer unsaved buffer");
-            manager.remove_captured_worktree(removal);
+            assert!(manager.remove_captured_worktree(removal).is_empty());
             assert!(manager.documents.contains_key(&new_doc));
             assert!(!successor.retired.load(Ordering::Acquire));
             manager.shutdown();
@@ -6238,7 +6242,7 @@ mod tests {
             await_ready(&events, new_doc).await;
             let successor = manager.sessions.values().next().unwrap().clone();
             manager.finish_discovery(old_doc, ticket, root);
-            manager.remove_captured_worktree(removal);
+            assert_eq!(manager.remove_captured_worktree(removal), vec![old_doc]);
             assert!(!manager.documents.contains_key(&old_doc));
             assert!(manager.documents.contains_key(&new_doc));
             assert!(!successor.retired.load(Ordering::Acquire));
@@ -6260,15 +6264,15 @@ mod tests {
             manager.close(doc);
             manager.open(doc, &file, &worktree, rust_language(), 1, "pending B");
             let new_ticket = manager.pending_opens[&doc].ticket;
-            manager.remove_captured_worktree(removal.clone());
+            assert!(manager.remove_captured_worktree(removal.clone()).is_empty());
             assert_eq!(manager.pending_opens[&doc].ticket, new_ticket);
             assert!(manager.finish_discovery(doc, old_ticket, worktree.clone()).is_none());
             let mut replacement = rust_manager();
             replacement.open(doc, &file, &worktree, rust_language(), 1, "other manager");
-            replacement.remove_captured_worktree(removal);
+            assert!(replacement.remove_captured_worktree(removal).is_empty());
             assert_eq!(replacement.pending_opens[&doc].text.full_text().as_ref(), "other manager");
             let current = manager.capture_worktree_removal(&worktree);
-            manager.remove_captured_worktree(current);
+            assert_eq!(manager.remove_captured_worktree(current), vec![doc]);
             assert!(manager.pending_opens.is_empty());
             assert!(manager.finish_discovery(doc, new_ticket, worktree).is_none());
             manager.shutdown();
