@@ -1840,8 +1840,7 @@ impl Runtime {
                         .width(Length::Fill),
                     move || action(Action::CloseFind(target)),
                 ),
-                design::caption(self.find_result_label())
-                .into(),
+                design::caption(self.find_result_label()).into(),
                 small_icon(
                     Icon::ChevronUp,
                     "Previous match — Shift+Enter in search",

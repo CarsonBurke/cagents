@@ -1081,17 +1081,23 @@ impl CachedItem {
         let mut hash = std::hash::DefaultHasher::new();
         self.revision.hash(&mut hash);
         if let Some(item) = &self.item
-            && let Some(paint) = self.current_find_paint() {
+            && let Some(paint) = self.current_find_paint()
+        {
             paint.signatures.get(item.id.as_str()).hash(&mut hash);
-            paint.current.as_ref().filter(|found| found.item.as_ref() == item.id)
-                .map(|found| (found.identity, found.range.start, found.range.end)).hash(&mut hash);
+            paint
+                .current
+                .as_ref()
+                .filter(|found| found.item.as_ref() == item.id)
+                .map(|found| (found.identity, found.range.start, found.range.end))
+                .hash(&mut hash);
         }
         hash.finish()
     }
 
     fn accepts_find_source(&self, proof: &find::SourceProof) -> bool {
         self.item.as_ref().is_some_and(|item| {
-            proof.external.is_none() && proof.item.as_ptr() == Arc::as_ptr(item)
+            proof.external.is_none()
+                && proof.item.as_ptr() == Arc::as_ptr(item)
                 && (Self::prose(&item.content).is_none()
                     || (!self.placeholder && proof.growing == self.find_source_growing))
         })
@@ -1101,7 +1107,8 @@ impl CachedItem {
         let paint = self.find_paint.as_ref()?;
         let item = self.item.as_ref()?;
         self.accepts_find_source(paint.sources.get(&item.id)?)
-            .then(|| paint.for_item(item)).flatten()
+            .then(|| paint.for_item(item))
+            .flatten()
     }
 
     #[cfg(test)]
@@ -3102,11 +3109,21 @@ impl Runtime {
         let Some(reveal) = &self.find_reveal else {
             return false;
         };
-        let Some(cached) = self.cache.get(reveal.found.item.as_ref()) else { return false; };
-        let Some(proof) = self.find_sources.get(reveal.found.item.as_ref()) else { return false; };
+        let Some(cached) = self.cache.get(reveal.found.item.as_ref()) else {
+            return false;
+        };
+        let Some(proof) = self.find_sources.get(reveal.found.item.as_ref()) else {
+            return false;
+        };
         if proof.growing != (self.find_growing_item() == Some(reveal.found.item.as_ref()))
-            || !self.find_source_current(reveal.found.item.as_ref(), proof) { return false; }
-        reveal.source.upgrade().zip(cached.item.as_ref())
+            || !self.find_source_current(reveal.found.item.as_ref(), proof)
+        {
+            return false;
+        }
+        reveal
+            .source
+            .upgrade()
+            .zip(cached.item.as_ref())
             .is_some_and(|(source, current)| Arc::ptr_eq(&source, current))
     }
 
@@ -3180,8 +3197,14 @@ impl Runtime {
                     worker
                         .lock()
                         .ok()?
-                        .search_with_external(&inputs, provider, &query, generation, &current, &external)
-                        .map(|matches| find::Results::with_external_revisions(matches, &inputs, scope, &external))
+                        .search_with_external(
+                            &inputs, provider, &query, generation, &current, &external,
+                        )
+                        .map(|matches| {
+                            find::Results::with_external_revisions(
+                                matches, &inputs, scope, &external,
+                            )
+                        })
                 })
                 .await
                 .ok()
@@ -3201,8 +3224,11 @@ impl Runtime {
         self.find_external.clear();
         self.find_external_complete = true;
         self.find_scope_revision = self.find_scope_revision.wrapping_add(1);
-        if self.find.is_none() { return; }
-        self.find_disclosure.restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
+        if self.find.is_none() {
+            return;
+        }
+        self.find_disclosure
+            .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         self.find_generation.fetch_add(1, Ordering::Relaxed);
         self.find_navigation = self.find_navigation.wrapping_add(1);
         self.find_locating = None;
@@ -3221,15 +3247,22 @@ impl Runtime {
     }
 
     fn find_growing_item(&self) -> Option<&str> {
-        if let Some(agent) = self.selected_subagent.as_ref()
-            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id)) {
+        if let Some(agent) = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
+        {
             return if agent.status == chat::ToolStatus::Running {
                 agent.items.last().map(|item| item.id.as_str())
-            } else { None };
+            } else {
+                None
+            };
         }
         if self.snapshot.busy {
             self.snapshot.items.last().map(|item| item.id.as_str())
-        } else { None }
+        } else {
+            None
+        }
     }
 
     fn find_inputs(&self) -> Vec<find::Input> {
@@ -3272,19 +3305,27 @@ impl Runtime {
     }
 
     fn find_source_current(&self, id: &str, proof: &find::SourceProof) -> bool {
-        if !proof.matches_external(self.find_external.get(id)) { return false; }
+        if !proof.matches_external(self.find_external.get(id)) {
+            return false;
+        }
         if proof.external.is_some() {
-            self.cache.get(id).and_then(|cached| cached.item.as_ref())
+            self.cache
+                .get(id)
+                .and_then(|cached| cached.item.as_ref())
                 .is_some_and(|item| proof.item.as_ptr() == Arc::as_ptr(item))
         } else {
-            self.cache.get(id).is_some_and(|cached| cached.accepts_find_source(proof))
+            self.cache
+                .get(id)
+                .is_some_and(|cached| cached.accepts_find_source(proof))
         }
     }
 
     fn find_paint_for(&self, item: &chat::Item) -> Option<Arc<find::Paint>> {
         let paint = self.find_paint.as_ref()?;
         let proof = paint.sources.get(&item.id)?;
-        if proof.growing != (self.find_growing_item() == Some(item.id.as_str())) { return None; }
+        if proof.growing != (self.find_growing_item() == Some(item.id.as_str())) {
+            return None;
+        }
         match self.find_external.get(&item.id) {
             Some(external) => paint.for_external_item(item, external),
             None => paint.for_item(item),
@@ -3295,11 +3336,18 @@ impl Runtime {
         use std::hash::{Hash, Hasher};
         let mut hash = std::hash::DefaultHasher::new();
         cached.render_revision().hash(&mut hash);
-        self.find_external.get(&item.id).map(|owner| owner.revision).hash(&mut hash);
+        self.find_external
+            .get(&item.id)
+            .map(|owner| owner.revision)
+            .hash(&mut hash);
         if let Some(paint) = self.find_paint_for(item) {
             paint.signatures.get(item.id.as_str()).hash(&mut hash);
-            paint.current.as_ref().filter(|found| found.item.as_ref() == item.id)
-                .map(|found| (found.identity, found.range.start, found.range.end)).hash(&mut hash);
+            paint
+                .current
+                .as_ref()
+                .filter(|found| found.item.as_ref() == item.id)
+                .map(|found| (found.identity, found.range.start, found.range.end))
+                .hash(&mut hash);
         }
         hash.finish()
     }
@@ -3307,13 +3355,24 @@ impl Runtime {
     /// Replace the selected transcript's memoized complete sidecar documents.
     /// The source owner prepares blocks off-thread and calls this after its
     /// exact source/epoch/revision checks. Missing bodies keep complete=false.
-    pub(super) fn set_find_external(&mut self, documents: HashMap<String, Arc<find::External>>, complete: bool) {
-        let valid = documents.iter().all(|(id, owner)| owner.item.as_ref() == id);
+    pub(super) fn set_find_external(
+        &mut self,
+        documents: HashMap<String, Arc<find::External>>,
+        complete: bool,
+    ) {
+        let valid = documents
+            .iter()
+            .all(|(id, owner)| owner.item.as_ref() == id);
         let changed = self.find_external.len() != documents.len()
-            || documents.iter().any(|(id, owner)| self.find_external.get(id)
-                .is_none_or(|previous| !Arc::ptr_eq(previous, owner)));
+            || documents.iter().any(|(id, owner)| {
+                self.find_external
+                    .get(id)
+                    .is_none_or(|previous| !Arc::ptr_eq(previous, owner))
+            });
         self.find_external_complete = complete && valid;
-        if !changed && valid { return; }
+        if !changed && valid {
+            return;
+        }
         self.find_external = if valid { documents } else { HashMap::new() };
         self.find_scope_revision = self.find_scope_revision.wrapping_add(1);
         self.find_generation.fetch_add(1, Ordering::Relaxed);
@@ -3334,9 +3393,23 @@ impl Runtime {
 
     fn find_result_label(&self) -> String {
         let label = if self.find_matches.is_empty() {
-            if self.find_waiting.is_some() { "Searching…".into() } else { "0 matches".into() }
-        } else { format!("{} of {} matches", self.find_index + 1, self.find_matches.len()) };
-        if self.find_external_complete { label } else { format!("{label} · Search incomplete") }
+            if self.find_waiting.is_some() {
+                "Searching…".into()
+            } else {
+                "0 matches".into()
+            }
+        } else {
+            format!(
+                "{} of {} matches",
+                self.find_index + 1,
+                self.find_matches.len()
+            )
+        };
+        if self.find_external_complete {
+            label
+        } else {
+            format!("{label} · Search incomplete")
+        }
     }
 
     fn update_find_paint(&mut self) {
@@ -3432,8 +3505,17 @@ impl Runtime {
     /// RSS. A busy captured worker is unknown, and in-flight owners are separate.
     pub(super) fn find_retained_source_bytes(&self) -> Option<(usize, usize)> {
         let worker = self.find_worker.try_lock().ok()?.text_bytes();
-        let external = self.find_external.values().map(|owner|
-            owner.blocks.iter().map(|block| block.text.len()).sum::<usize>()).sum();
+        let external = self
+            .find_external
+            .values()
+            .map(|owner| {
+                owner
+                    .blocks
+                    .iter()
+                    .map(|block| block.text.len())
+                    .sum::<usize>()
+            })
+            .sum();
         Some((worker, external))
     }
 
@@ -12077,54 +12159,124 @@ mod tests {
         let target = chat_runtime(&app, card).target;
         let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
         snapshot.generation += 1;
-        snapshot.items = vec![Arc::new(chat::Item { id: "patch-root".into(), role: chat::Role::Assistant,
-            content: ItemContent::Changes { status: chat::ToolStatus::Succeeded, changes: Vec::new() }, at: None, started_at: None })];
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "patch-root".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Changes {
+                status: chat::ToolStatus::Succeeded,
+                changes: Vec::new(),
+            },
+            at: None,
+            started_at: None,
+        })];
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
-        let document = Arc::new(find::External { item: "patch-root".into(), revision: 1,
-            blocks: vec![find::Block { identity: selection::logical_identity("patch-root", &[6, 5]), text: Arc::from("needle needle") }].into() });
+        let document = Arc::new(find::External {
+            item: "patch-root".into(),
+            revision: 1,
+            blocks: vec![find::Block {
+                identity: selection::logical_identity("patch-root", &[6, 5]),
+                text: Arc::from("needle needle"),
+            }]
+            .into(),
+        });
         let weak = Arc::downgrade(&document);
         let old_body = Arc::downgrade(&document.blocks[0].text);
         let old_blocks = Arc::downgrade(&document.blocks);
-        app.chat_runtime_mut(target).unwrap().set_find_external(HashMap::from([("patch-root".into(), document)]), false);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_external(HashMap::from([("patch-root".into(), document)]), false);
         complete_find_for_test(&mut app, target);
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.find_matches.len(), 2);
-        assert_eq!(runtime.find_retained_source_bytes(), Some((13, 13)), "logical reference classes overlap, not summed unique memory");
-        assert!(runtime.find_result_label().contains("Search incomplete"), "loaded occurrences do not imply every authoritative patch was read");
+        assert_eq!(
+            runtime.find_retained_source_bytes(),
+            Some((13, 13)),
+            "logical reference classes overlap, not summed unique memory"
+        );
+        assert!(
+            runtime.find_result_label().contains("Search incomplete"),
+            "loaded occurrences do not imply every authoritative patch was read"
+        );
         let item = &runtime.snapshot.items[0];
         let paint = runtime.find_paint_for(item).unwrap();
         let old = runtime.find_sources["patch-root"].clone();
         let revision = runtime.find_render_revision(item, &runtime.cache["patch-root"]);
-        let replacement = Arc::new(find::External { item: "patch-root".into(), revision: 2,
-            blocks: vec![find::Block { identity: selection::logical_identity("patch-root", &[6, 5]), text: Arc::from("needle") }].into() });
-        app.chat_runtime_mut(target).unwrap().set_find_external(HashMap::from([("patch-root".into(), replacement)]), true);
+        let replacement = Arc::new(find::External {
+            item: "patch-root".into(),
+            revision: 2,
+            blocks: vec![find::Block {
+                identity: selection::logical_identity("patch-root", &[6, 5]),
+                text: Arc::from("needle"),
+            }]
+            .into(),
+        });
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_external(HashMap::from([("patch-root".into(), replacement)]), true);
         let runtime = chat_runtime(&app, card);
         assert!(!runtime.find_source_current("patch-root", &old));
         assert!(runtime.find_matches.is_empty() && runtime.find_locating.is_none());
-        assert_ne!(runtime.find_render_revision(&runtime.snapshot.items[0], &runtime.cache["patch-root"]), revision);
-        assert!(paint.sources["patch-root"].external.as_ref().unwrap().upgrade().is_none());
+        assert_ne!(
+            runtime.find_render_revision(&runtime.snapshot.items[0], &runtime.cache["patch-root"]),
+            revision
+        );
+        assert!(
+            paint.sources["patch-root"]
+                .external
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .is_none()
+        );
         assert!(weak.upgrade().is_none());
-        assert!(old_body.upgrade().is_some() && old_blocks.upgrade().is_some(),
-            "the old worker cache still explicitly owns its indexed document until replacement");
+        assert!(
+            old_body.upgrade().is_some() && old_blocks.upgrade().is_some(),
+            "the old worker cache still explicitly owns its indexed document until replacement"
+        );
         complete_find_for_test(&mut app, target);
-        assert!(old_body.upgrade().is_none() && old_blocks.upgrade().is_none(),
-            "reindex replacement drops the actual old patch text and block owners");
+        assert!(
+            old_body.upgrade().is_none() && old_blocks.upgrade().is_none(),
+            "reindex replacement drops the actual old patch text and block owners"
+        );
         assert_eq!(chat_runtime(&app, card).find_matches.len(), 1);
-        assert!(!chat_runtime(&app, card).find_result_label().contains("incomplete"));
+        assert!(
+            !chat_runtime(&app, card)
+                .find_result_label()
+                .contains("incomplete")
+        );
         let weak = Arc::downgrade(&chat_runtime(&app, card).find_external["patch-root"]);
-        let body = Arc::downgrade(&chat_runtime(&app, card).find_external["patch-root"].blocks[0].text);
+        let body =
+            Arc::downgrade(&chat_runtime(&app, card).find_external["patch-root"].blocks[0].text);
         drop(app.handle_chat_ui(Action::CloseFind(target)));
-        assert!(weak.upgrade().is_none() && body.upgrade().is_none(), "CloseFind retires both sidecar and worker body owners");
-        assert_eq!(chat_runtime(&app, card).find_retained_source_bytes(), Some((0, 0)));
+        assert!(
+            weak.upgrade().is_none() && body.upgrade().is_none(),
+            "CloseFind retires both sidecar and worker body owners"
+        );
+        assert_eq!(
+            chat_runtime(&app, card).find_retained_source_bytes(),
+            Some((0, 0))
+        );
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
-        let document = Arc::new(find::External { item: "patch-root".into(), revision: 3,
-            blocks: vec![find::Block { identity: selection::logical_identity("patch-root", &[6, 5]), text: Arc::from("needle after reveal") }].into() });
+        let document = Arc::new(find::External {
+            item: "patch-root".into(),
+            revision: 3,
+            blocks: vec![find::Block {
+                identity: selection::logical_identity("patch-root", &[6, 5]),
+                text: Arc::from("needle after reveal"),
+            }]
+            .into(),
+        });
         let body = Arc::downgrade(&document.blocks[0].text);
-        app.chat_runtime_mut(target).unwrap().set_find_external(HashMap::from([("patch-root".into(), document)]), true);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_external(HashMap::from([("patch-root".into(), document)]), true);
         complete_find_for_test(&mut app, target);
         let _ = app.chat_runtime_mut(target).unwrap().set_visible(false);
-        assert!(body.upgrade().is_none(), "hidden search retires its full body owners independently of source-pool policy");
+        assert!(
+            body.upgrade().is_none(),
+            "hidden search retires its full body owners independently of source-pool policy"
+        );
     }
 
     #[test]
@@ -12134,20 +12286,45 @@ mod tests {
         let target = chat_runtime(&app, card).target;
         let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
         snapshot.generation += 1;
-        snapshot.items = vec![Arc::new(chat::Item { id: "parent-answer".into(), role: chat::Role::Assistant,
-            content: text("needle in the parent"), at: None, started_at: None })];
-        snapshot.subagents = vec![chat::Subagent { id: "disappearing-child".into(), kind: "Scout".into(),
-            description: "Empty child".into(), status: chat::ToolStatus::Succeeded, model: None,
-            waiting: false, detail: String::new(), background: true, items: Vec::new() }];
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "parent-answer".into(),
+            role: chat::Role::Assistant,
+            content: text("needle in the parent"),
+            at: None,
+            started_at: None,
+        })];
+        snapshot.subagents = vec![chat::Subagent {
+            id: "disappearing-child".into(),
+            kind: "Scout".into(),
+            description: "Empty child".into(),
+            status: chat::ToolStatus::Succeeded,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        }];
         show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
         app.chat_runtime_mut(target).unwrap().scroll = view::Scroll::new(333.0, 2000.0, 400.0);
-        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("disappearing-child".into()))));
+        drop(app.handle_chat_ui(Action::SelectSubagent(
+            target,
+            Some("disappearing-child".into()),
+        )));
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
         let (generation, scope, navigation, old) = {
             let runtime = chat_runtime(&app, card);
-            let inputs = runtime.find_inputs(); assert!(inputs.is_empty());
-            (runtime.find_generation.load(Ordering::Relaxed), runtime.find_scope_revision, runtime.find_navigation,
-                Arc::new(find::Results::with_revisions(Vec::new(), &inputs, runtime.find_scope_revision)))
+            let inputs = runtime.find_inputs();
+            assert!(inputs.is_empty());
+            (
+                runtime.find_generation.load(Ordering::Relaxed),
+                runtime.find_scope_revision,
+                runtime.find_navigation,
+                Arc::new(find::Results::with_revisions(
+                    Vec::new(),
+                    &inputs,
+                    runtime.find_scope_revision,
+                )),
+            )
         };
         snapshot.generation += 1;
         snapshot.subagents.clear(); // Parent item Arc and turn mapping are unchanged.
@@ -12158,13 +12335,22 @@ mod tests {
         assert!(runtime.find_generation.load(Ordering::Relaxed) > generation);
         assert!(runtime.find_navigation > navigation);
         assert!(runtime.find_locating.is_none() && runtime.find_reveal.is_none());
-        assert_eq!(runtime.find_origin.unwrap().from_top(), 333.0,
-            "Escape belongs to the destination parent's saved reading position");
+        assert_eq!(
+            runtime.find_origin.unwrap().from_top(),
+            333.0,
+            "Escape belongs to the destination parent's saved reading position"
+        );
         drop(app.handle_chat_ui(Action::FindIndexed(target, generation, Some(old))));
         complete_find_for_test(&mut app, target);
         assert_eq!(chat_runtime(&app, card).find_matches.len(), 1);
-        assert_eq!(chat_runtime(&app, card).find_matches[0].item.as_ref(), "parent-answer");
-        assert_eq!(chat_runtime(&app, card).find_origin.unwrap().from_top(), 333.0);
+        assert_eq!(
+            chat_runtime(&app, card).find_matches[0].item.as_ref(),
+            "parent-answer"
+        );
+        assert_eq!(
+            chat_runtime(&app, card).find_origin.unwrap().from_top(),
+            333.0
+        );
     }
 
     #[test]
@@ -12174,27 +12360,59 @@ mod tests {
         let target = chat_runtime(&app, card).target;
         let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
         snapshot.generation += 1;
-        snapshot.items = vec![Arc::new(chat::Item { id: "answer".into(), role: chat::Role::Assistant,
-            content: text("nothing matches"), at: None, started_at: None })];
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            content: text("nothing matches"),
+            at: None,
+            started_at: None,
+        })];
         show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
         let (generation, old) = {
             let runtime = chat_runtime(&app, card);
             let generation = runtime.find_generation.load(Ordering::Relaxed);
             let inputs = runtime.find_inputs();
-            let matches = runtime.find_worker.lock().unwrap().search(&inputs,
-                runtime.session.launch.provider, "needle", generation, &runtime.find_generation).unwrap();
+            let matches = runtime
+                .find_worker
+                .lock()
+                .unwrap()
+                .search(
+                    &inputs,
+                    runtime.session.launch.provider,
+                    "needle",
+                    generation,
+                    &runtime.find_generation,
+                )
+                .unwrap();
             assert!(matches.is_empty());
-            (generation, Arc::new(find::Results::with_revisions(matches, &inputs, runtime.find_scope_revision)))
+            (
+                generation,
+                Arc::new(find::Results::with_revisions(
+                    matches,
+                    &inputs,
+                    runtime.find_scope_revision,
+                )),
+            )
         };
         snapshot.generation += 1;
-        snapshot.items[0] = Arc::new(chat::Item { id: "answer".into(), role: chat::Role::Assistant,
-            content: text("needle"), at: None, started_at: None });
+        snapshot.items[0] = Arc::new(chat::Item {
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            content: text("needle"),
+            at: None,
+            started_at: None,
+        });
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         let unpublished = chat_runtime(&app, card).find_paint.clone().unwrap();
         drop(app.handle_chat_ui(Action::FindIndexed(target, generation, Some(old))));
-        assert!(Arc::ptr_eq(&unpublished, chat_runtime(&app, card).find_paint.as_ref().unwrap()),
-            "an obsolete empty result must not publish a new complete paint/result snapshot");
+        assert!(
+            Arc::ptr_eq(
+                &unpublished,
+                chat_runtime(&app, card).find_paint.as_ref().unwrap()
+            ),
+            "an obsolete empty result must not publish a new complete paint/result snapshot"
+        );
         assert!(chat_runtime(&app, card).find_dirty);
         complete_find_for_test(&mut app, target);
         assert_eq!(chat_runtime(&app, card).find_matches.len(), 1);
@@ -12203,18 +12421,42 @@ mod tests {
 
     #[test]
     fn find_new_ranges_rebuild_retained_rows_when_the_current_match_did_not_move() {
-        use iced::advanced::{Layout, layout, widget::{Operation, Tree}};
-        fn frame(app: &Cagents, card: CardId, tree: &mut Option<Tree>) -> Vec<std::ops::Range<usize>> {
-            struct Read { identity: u64, ranges: Vec<std::ops::Range<usize>> }
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        fn frame(
+            app: &Cagents,
+            card: CardId,
+            tree: &mut Option<Tree>,
+        ) -> Vec<std::ops::Range<usize>> {
+            struct Read {
+                identity: u64,
+                ranges: Vec<std::ops::Range<usize>>,
+            }
             impl Operation for Read {
-                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
-                fn custom(&mut self, _: Option<&iced::advanced::widget::Id>, _: iced::Rectangle, state: &mut dyn std::any::Any) {
-                    if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() { policy.visit = false; }
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&iced::advanced::widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                        policy.visit = false;
+                    }
                     if let Some(state) = state.downcast_ref::<selectable_prose::State>()
                         && let Some(logical) = &state.logical
                         && logical.identity == self.identity
-                        && let Some(paint) = &logical.paint {
-                        self.ranges.extend(paint.fragment(logical.identity, logical.start, state.plain.len()).0);
+                        && let Some(paint) = &logical.paint
+                    {
+                        self.ranges.extend(
+                            paint
+                                .fragment(logical.identity, logical.start, state.plain.len())
+                                .0,
+                        );
                     }
                 }
             }
@@ -12224,10 +12466,17 @@ mod tests {
             tree.diff(element.as_widget_mut());
             let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(800.0, 700.0));
             element.as_widget_mut().layout(tree, &renderer, &limits);
-            for cached in chat_runtime(app, card).cache.values() { cached.flow_cache.complete_fixture(); }
+            for cached in chat_runtime(app, card).cache.values() {
+                cached.flow_cache.complete_fixture();
+            }
             let node = element.as_widget_mut().layout(tree, &renderer, &limits);
-            let mut read = Read { identity: selection::logical_identity("answer", &[0, 0]), ranges: Vec::new() };
-            element.as_widget_mut().operate(tree, Layout::new(&node), &renderer, &mut read);
+            let mut read = Read {
+                identity: selection::logical_identity("answer", &[0, 0]),
+                ranges: Vec::new(),
+            };
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut read);
             read.ranges
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -12236,8 +12485,15 @@ mod tests {
         let target = chat_runtime(&app, card).target;
         let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
         snapshot.generation += 1;
-        snapshot.items = vec![Arc::new(chat::Item { id: "answer".into(), role: chat::Role::Assistant,
-            content: text("needle\n\nparagraph one\n\nparagraph two\n\nparagraph three\n\nparagraph four"), at: None, started_at: None })];
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            content: text(
+                "needle\n\nparagraph one\n\nparagraph two\n\nparagraph three\n\nparagraph four",
+            ),
+            at: None,
+            started_at: None,
+        })];
         show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
         complete_find_for_test(&mut app, target);
@@ -12245,19 +12501,36 @@ mod tests {
         assert_eq!(frame(&app, card, &mut tree), vec![0..6]);
         let first = chat_runtime(&app, card).find_matches[0].clone();
         snapshot.generation += 1;
-        snapshot.items[0] = Arc::new(chat::Item { id: "answer".into(), role: chat::Role::Assistant,
-            content: text("needle needle\n\nparagraph one\n\nparagraph two\n\nparagraph three\n\nparagraph four"), at: None, started_at: None });
+        snapshot.items[0] = Arc::new(chat::Item {
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            content: text(
+                "needle needle\n\nparagraph one\n\nparagraph two\n\nparagraph three\n\nparagraph four",
+            ),
+            at: None,
+            started_at: None,
+        });
         show_chat_snapshot_for_test(&mut app, card, snapshot);
-        assert!(frame(&app, card, &mut tree).is_empty(), "new prepared body must first reject the old source's paint");
+        assert!(
+            frame(&app, card, &mut tree).is_empty(),
+            "new prepared body must first reject the old source's paint"
+        );
         let parsed_revision = chat_runtime(&app, card).cache["answer"].revision;
         complete_find_for_test(&mut app, target);
         let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.find_matches[runtime.find_index], first,
-            "query, current occurrence and turn membership did not change");
-        assert_eq!(runtime.cache["answer"].revision, parsed_revision,
-            "paint publication must not pretend the parsed source changed");
-        assert_eq!(frame(&app, card, &mut tree), vec![0..6, 7..13],
-            "same native retained Tree must receive both newly accepted ranges");
+        assert_eq!(
+            runtime.find_matches[runtime.find_index], first,
+            "query, current occurrence and turn membership did not change"
+        );
+        assert_eq!(
+            runtime.cache["answer"].revision, parsed_revision,
+            "paint publication must not pretend the parsed source changed"
+        );
+        assert_eq!(
+            frame(&app, card, &mut tree),
+            vec![0..6, 7..13],
+            "same native retained Tree must receive both newly accepted ranges"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

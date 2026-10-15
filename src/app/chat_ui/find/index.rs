@@ -271,15 +271,25 @@ impl Paint {
     /// Byte ranges belong to the exact immutable source parsed by the worker.
     /// A stable item/leaf ID alone is not a rendered-source revision proof.
     pub fn for_item(self: &Arc<Self>, item: &crate::chat::Item) -> Option<Arc<Self>> {
-        self.sources.get(&item.id)
+        self.sources
+            .get(&item.id)
             .filter(|source| source.item.as_ptr() == item as *const _ && source.external.is_none())
             .filter(|_| self.signatures.contains_key(item.id.as_str()))
             .map(|_| self.clone())
     }
-    pub fn for_external_item(self: &Arc<Self>, item: &crate::chat::Item, external: &Arc<External>) -> Option<Arc<Self>> {
-        self.sources.get(&item.id)
-            .filter(|source| source.item.as_ptr() == item as *const _ && source.matches_external(Some(external)))
-            .filter(|_| external.item.as_ref() == item.id && self.signatures.contains_key(item.id.as_str()))
+    pub fn for_external_item(
+        self: &Arc<Self>,
+        item: &crate::chat::Item,
+        external: &Arc<External>,
+    ) -> Option<Arc<Self>> {
+        self.sources
+            .get(&item.id)
+            .filter(|source| {
+                source.item.as_ptr() == item as *const _ && source.matches_external(Some(external))
+            })
+            .filter(|_| {
+                external.item.as_ref() == item.id && self.signatures.contains_key(item.id.as_str())
+            })
             .map(|_| self.clone())
     }
     pub fn fragment(
@@ -334,8 +344,12 @@ impl Results {
             (found.identity, found.range.start, found.range.end)
                 .hash(item_signatures.entry(found.item.clone()).or_default());
         }
-        let signatures = Arc::new(item_signatures.into_iter()
-            .map(|(item, hash)| (item, hash.finish())).collect());
+        let signatures = Arc::new(
+            item_signatures
+                .into_iter()
+                .map(|(item, hash)| (item, hash.finish()))
+                .collect(),
+        );
         let blocks = Paint::new(0, &matches, None).blocks;
         let positions = matches
             .iter()
@@ -369,8 +383,12 @@ impl Results {
     pub fn with_revisions(matches: Vec<Match>, inputs: &[Input], scope: u64) -> Self {
         Self::with_external_revisions(matches, inputs, scope, &HashMap::new())
     }
-    pub fn with_external_revisions(matches: Vec<Match>, inputs: &[Input], scope: u64,
-        external: &HashMap<String, Arc<External>>) -> Self {
+    pub fn with_external_revisions(
+        matches: Vec<Match>,
+        inputs: &[Input],
+        scope: u64,
+        external: &HashMap<String, Arc<External>>,
+    ) -> Self {
         let mut result = Self::new(matches);
         let matched: HashSet<_> = result
             .matches
@@ -384,12 +402,21 @@ impl Results {
             .collect();
         // Negative results need source proofs too: a previously unmatched
         // item may have changed while the worker was running.
-        result.sources = Arc::new(inputs.iter()
-            .map(|input| (input.item.id.clone(), SourceProof {
-                item: Arc::downgrade(&input.item), growing: input.growing,
-                external: external.get(&input.item.id).map(Arc::downgrade),
-            }))
-            .collect());
+        result.sources = Arc::new(
+            inputs
+                .iter()
+                .map(|input| {
+                    (
+                        input.item.id.clone(),
+                        SourceProof {
+                            item: Arc::downgrade(&input.item),
+                            growing: input.growing,
+                            external: external.get(&input.item.id).map(Arc::downgrade),
+                        },
+                    )
+                })
+                .collect(),
+        );
         result.scope = scope;
         result
     }
@@ -426,8 +453,17 @@ struct CachedDocument {
 }
 impl Worker {
     pub fn text_bytes(&self) -> usize {
-        self.documents.values().map(|cached| cached.document.blocks.iter()
-            .map(|block| block.text.len()).sum::<usize>()).sum()
+        self.documents
+            .values()
+            .map(|cached| {
+                cached
+                    .document
+                    .blocks
+                    .iter()
+                    .map(|block| block.text.len())
+                    .sum::<usize>()
+            })
+            .sum()
     }
     pub fn search(
         &mut self,
@@ -437,11 +473,23 @@ impl Worker {
         generation: u64,
         current: &AtomicU64,
     ) -> Option<Vec<Match>> {
-        self.search_with_external(inputs, provider, query, generation, current, &HashMap::new())
+        self.search_with_external(
+            inputs,
+            provider,
+            query,
+            generation,
+            current,
+            &HashMap::new(),
+        )
     }
     pub fn search_with_external(
-        &mut self, inputs: &[Input], provider: crate::agent::Provider, query: &str,
-        generation: u64, current: &AtomicU64, external: &HashMap<String, Arc<External>>,
+        &mut self,
+        inputs: &[Input],
+        provider: crate::agent::Provider,
+        query: &str,
+        generation: u64,
+        current: &AtomicU64,
+        external: &HashMap<String, Arc<External>>,
     ) -> Option<Vec<Match>> {
         let present: HashSet<_> = inputs.iter().map(|input| input.item.id.as_str()).collect();
         self.documents.retain(|id, _| present.contains(id.as_str()));
@@ -451,34 +499,45 @@ impl Worker {
                 return None;
             }
             let extra = external.get(&input.item.id);
-            if extra.is_some_and(|owner| owner.item.as_ref() != input.item.id) { return None; }
+            if extra.is_some_and(|owner| owner.item.as_ref() != input.item.id) {
+                return None;
+            }
             if self.documents.get(&input.item.id).is_none_or(|cached| {
                 let same_external = match (&cached.external, extra) {
-                    (None, None) => cached.source.as_ptr() == Arc::as_ptr(&input.item)
-                        && cached.growing == input.growing,
+                    (None, None) => {
+                        cached.source.as_ptr() == Arc::as_ptr(&input.item)
+                            && cached.growing == input.growing
+                    }
                     (Some(previous), Some(current)) => previous.as_ptr() == Arc::as_ptr(current),
                     _ => false,
                 };
                 !same_external || cached.provider != provider
-            })
-            {
+            }) {
                 // A raw append can arrive while the UI still displays its old
                 // prepared prefix and keeps that prefix's layout revision.
                 // Index the actual immutable input, and invalidate the range
                 // cache independently of that lagging presentation revision.
                 self.document_revision = self.document_revision.wrapping_add(1);
-                let mut parsed = extra.map_or_else(|| document(input, provider), |owner| Document {
-                    item: input.item.id.clone(), revision: self.document_revision,
-                    turn: input.turn.clone(), blocks: owner.blocks.clone(),
-                });
+                let mut parsed = extra.map_or_else(
+                    || document(input, provider),
+                    |owner| Document {
+                        item: input.item.id.clone(),
+                        revision: self.document_revision,
+                        turn: input.turn.clone(),
+                        blocks: owner.blocks.clone(),
+                    },
+                );
                 parsed.revision = self.document_revision;
-                self.documents.insert(input.item.id.clone(), CachedDocument {
-                    source: Arc::downgrade(&input.item),
-                    growing: input.growing,
-                    provider,
-                    external: extra.map(Arc::downgrade),
-                    document: parsed,
-                });
+                self.documents.insert(
+                    input.item.id.clone(),
+                    CachedDocument {
+                        source: Arc::downgrade(&input.item),
+                        growing: input.growing,
+                        provider,
+                        external: extra.map(Arc::downgrade),
+                        document: parsed,
+                    },
+                );
             }
             let mut document = self.documents[&input.item.id].document.clone();
             document.turn.clone_from(&input.turn);
@@ -717,55 +776,111 @@ mod rendered_tests {
     fn find_geometry_only_revision_preserves_the_parsed_document_and_match_ranges() {
         let mut source = input(ItemContent::Text {
             text: "A **needle** in unchanged rich prose.".repeat(400),
-            thinking: false, phase: Phase::Final,
+            thinking: false,
+            phase: Phase::Final,
         });
         let current = AtomicU64::new(1);
         let mut worker = Worker::default();
-        let before = worker.search(std::slice::from_ref(&source), Provider::Claude, "needle", 1, &current).unwrap();
+        let before = worker
+            .search(
+                std::slice::from_ref(&source),
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+            )
+            .unwrap();
         let blocks = worker.documents[&source.item.id].document.blocks.clone();
         let ranges = worker.index.items[&source.item.id].ranges.clone();
         // FlowReady invalidates retained widget geometry, not rendered text.
         source.revision += 1;
-        let after = worker.search(std::slice::from_ref(&source), Provider::Claude, "needle", 1, &current).unwrap();
+        let after = worker
+            .search(
+                std::slice::from_ref(&source),
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+            )
+            .unwrap();
         assert_eq!(before, after);
-        assert!(Arc::ptr_eq(&blocks, &worker.documents[&source.item.id].document.blocks),
-            "geometry completion must not reparse unchanged source");
-        assert!(Arc::ptr_eq(&ranges, &worker.index.items[&source.item.id].ranges),
-            "unchanged parsed leaves reuse their indexed occurrences");
+        assert!(
+            Arc::ptr_eq(&blocks, &worker.documents[&source.item.id].document.blocks),
+            "geometry completion must not reparse unchanged source"
+        );
+        assert!(
+            Arc::ptr_eq(&ranges, &worker.index.items[&source.item.id].ranges),
+            "unchanged parsed leaves reuse their indexed occurrences"
+        );
     }
 
     #[test]
     fn find_pending_markdown_append_does_not_reuse_the_old_layout_revision_document() {
-        let source = |body: &str| input(ItemContent::Text {
-            text: body.into(), thinking: false, phase: Phase::Final,
-        });
+        let source = |body: &str| {
+            input(ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: Phase::Final,
+            })
+        };
         let current = AtomicU64::new(1);
         let mut worker = Worker::default();
         let mut old = source("a *needle");
         old.growing = true;
-        let first = worker.search(std::slice::from_ref(&old), Provider::Claude, "needle", 1, &current).unwrap();
+        let first = worker
+            .search(
+                std::slice::from_ref(&old),
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+            )
+            .unwrap();
         assert_eq!(first[0].range, 3..9);
         let mut appended = source("a *needle*");
         appended.growing = true;
-        assert_eq!(old.revision, appended.revision,
-            "the renderer still owns its old prepared-prefix revision");
-        let next = worker.search(&[appended], Provider::Claude, "needle", 1, &current).unwrap();
+        assert_eq!(
+            old.revision, appended.revision,
+            "the renderer still owns its old prepared-prefix revision"
+        );
+        let next = worker
+            .search(&[appended], Provider::Claude, "needle", 1, &current)
+            .unwrap();
         assert_eq!(next.len(), 1);
-        assert_eq!(next[0].range, 2..8,
-            "closing Markdown syntax changes rendered offsets despite raw append lineage");
+        assert_eq!(
+            next[0].range,
+            2..8,
+            "closing Markdown syntax changes rendered offsets despite raw append lineage"
+        );
     }
 
     #[test]
     fn find_image_local_path_matches_its_caption_without_indexing_hidden_payloads() {
-        for (path, count) in [("screens/needle.png", 1), ("https://images.example/needle.png", 0),
-            ("http://images.example/needle.png", 0), ("data:image/png;needle", 0), ("", 0)] {
-            let source = input(ItemContent::Image { path: path.into(), description: String::new() });
+        for (path, count) in [
+            ("screens/needle.png", 1),
+            ("https://images.example/needle.png", 0),
+            ("http://images.example/needle.png", 0),
+            ("data:image/png;needle", 0),
+            ("", 0),
+        ] {
+            let source = input(ItemContent::Image {
+                path: path.into(),
+                description: String::new(),
+            });
             let document = document(&source, Provider::Claude);
-            let mut index = Index::default(); let current = AtomicU64::new(1);
+            let mut index = Index::default();
+            let current = AtomicU64::new(1);
             let matches = index.search(&[document], "needle", 1, &current).unwrap();
-            assert_eq!(matches.len(), count, "only the actual rendered path caption is indexed: {path}");
+            assert_eq!(
+                matches.len(),
+                count,
+                "only the actual rendered path caption is indexed: {path}"
+            );
             if let Some(found) = matches.first() {
-                assert_eq!(found.identity, crate::app::chat_ui::selection::logical_identity(&source.item.id, &[9, 1]));
+                assert_eq!(
+                    found.identity,
+                    crate::app::chat_ui::selection::logical_identity(&source.item.id, &[9, 1])
+                );
                 assert_eq!(&path[found.range.clone()], "needle");
             }
         }
@@ -791,15 +906,39 @@ mod rendered_tests {
 #[cfg(test)]
 mod external_tests {
     use super::*;
-    use crate::{agent::Provider, chat::{Item, ItemContent, Role, ToolStatus}};
+    use crate::{
+        agent::Provider,
+        chat::{Item, ItemContent, Role, ToolStatus},
+    };
     fn input(id: &str) -> Input {
-        Input { item: Arc::new(Item { id: id.into(), role: Role::Assistant, at: None, started_at: None,
-            content: ItemContent::Changes { status: ToolStatus::Succeeded, changes: Vec::new() } }),
-            revision: 7, turn: format!("turn-{id}"), growing: false }
+        Input {
+            item: Arc::new(Item {
+                id: id.into(),
+                role: Role::Assistant,
+                at: None,
+                started_at: None,
+                content: ItemContent::Changes {
+                    status: ToolStatus::Succeeded,
+                    changes: Vec::new(),
+                },
+            }),
+            revision: 7,
+            turn: format!("turn-{id}"),
+            growing: false,
+        }
     }
     fn owner(id: &str, revision: u64, blocks: &[(u64, &str)]) -> Arc<External> {
-        Arc::new(External { item: id.into(), revision,
-            blocks: blocks.iter().map(|(identity, text)| Block { identity: *identity, text: Arc::from(*text) }).collect() })
+        Arc::new(External {
+            item: id.into(),
+            revision,
+            blocks: blocks
+                .iter()
+                .map(|(identity, text)| Block {
+                    identity: *identity,
+                    text: Arc::from(*text),
+                })
+                .collect(),
+        })
     }
     #[test]
     fn find_external_complete_documents_keep_original_root_file_and_leaf_order() {
@@ -807,36 +946,92 @@ mod external_tests {
         let a = owner("a", 1, &[(70, "needle.txt"), (60, "needle needle")]);
         let b = owner("b", 1, &[(61, "needle")]);
         let external = HashMap::from([("b".into(), b), ("a".into(), a.clone())]);
-        let current = AtomicU64::new(1); let mut worker = Worker::default();
-        let matches = worker.search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external).unwrap();
-        assert_eq!(matches.iter().map(|m| (m.item.as_ref(), m.identity, m.range.clone())).collect::<Vec<_>>(),
-            vec![("a", 70, 0..6), ("a", 60, 0..6), ("a", 60, 7..13), ("b", 61, 0..6)]);
-        assert!(Arc::ptr_eq(&worker.documents["a"].document.blocks, &a.blocks), "worker adopts handles without cloning whole patch text");
+        let current = AtomicU64::new(1);
+        let mut worker = Worker::default();
+        let matches = worker
+            .search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external)
+            .unwrap();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|m| (m.item.as_ref(), m.identity, m.range.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a", 70, 0..6),
+                ("a", 60, 0..6),
+                ("a", 60, 7..13),
+                ("b", 61, 0..6)
+            ]
+        );
+        assert!(
+            Arc::ptr_eq(&worker.documents["a"].document.blocks, &a.blocks),
+            "worker adopts handles without cloning whole patch text"
+        );
         let result = Results::with_external_revisions(matches, &inputs, 0, &external);
-        let paint = Arc::new(Paint { generation: 1, blocks: result.blocks, current: result.matches.first().cloned(),
-            sources: result.sources, signatures: result.signatures });
-        assert!(paint.for_item(&inputs[0].item).is_none(), "ordinary metadata cannot bypass sidecar proof");
+        let paint = Arc::new(Paint {
+            generation: 1,
+            blocks: result.blocks,
+            current: result.matches.first().cloned(),
+            sources: result.sources,
+            signatures: result.signatures,
+        });
+        assert!(
+            paint.for_item(&inputs[0].item).is_none(),
+            "ordinary metadata cannot bypass sidecar proof"
+        );
         assert!(paint.for_external_item(&inputs[0].item, &a).is_some());
-        assert!(paint.for_external_item(&inputs[0].item, &owner("a", 2, &[(60, "needle")])).is_none());
+        assert!(
+            paint
+                .for_external_item(&inputs[0].item, &owner("a", 2, &[(60, "needle")]))
+                .is_none()
+        );
     }
     #[test]
     fn find_external_same_metadata_replacement_invalidates_cached_negative_and_positive_results() {
-        let inputs = [input("a")]; let current = AtomicU64::new(1); let mut worker = Worker::default();
+        let inputs = [input("a")];
+        let current = AtomicU64::new(1);
+        let mut worker = Worker::default();
         let previous = owner("a", 1, &[(60, "no match")]);
         let mut external = HashMap::from([("a".into(), previous.clone())]);
-        let negative = worker.search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external).unwrap();
+        let negative = worker
+            .search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external)
+            .unwrap();
         assert!(negative.is_empty());
         let old = Results::with_external_revisions(negative, &inputs, 0, &external);
-        let replacement = owner("a", 2, &[(60, "needle needle")]); external.insert("a".into(), replacement.clone());
-        assert!(!old.sources["a"].matches_external(Some(&replacement)), "negative results also require current exact sidecar owner");
-        let matches = worker.search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external).unwrap();
+        let replacement = owner("a", 2, &[(60, "needle needle")]);
+        external.insert("a".into(), replacement.clone());
+        assert!(
+            !old.sources["a"].matches_external(Some(&replacement)),
+            "negative results also require current exact sidecar owner"
+        );
+        let matches = worker
+            .search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external)
+            .unwrap();
         assert_eq!(matches.len(), 2);
         let ranges = worker.index.items["a"].ranges.clone();
         let newer_metadata = [input("a")]; // Same complete source, a replacement metadata Arc.
-        worker.search_with_external(&newer_metadata, Provider::Claude, "needle", 1, &current, &external).unwrap();
-        assert!(Arc::ptr_eq(&ranges, &worker.index.items["a"].ranges), "metadata/layout churn must not reindex unchanged complete text");
+        worker
+            .search_with_external(
+                &newer_metadata,
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+                &external,
+            )
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&ranges, &worker.index.items["a"].ranges),
+            "metadata/layout churn must not reindex unchanged complete text"
+        );
         external.insert("a".into(), owner("a", 3, &[(60, "needle")]));
-        assert_eq!(worker.search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external).unwrap().len(), 1);
+        assert_eq!(
+            worker
+                .search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external)
+                .unwrap()
+                .len(),
+            1
+        );
     }
     #[test]
     fn find_external_cancelled_inflight_owner_retires_actual_body_after_worker_finishes() {
@@ -847,31 +1042,70 @@ mod external_tests {
         let external = HashMap::from([("a".into(), body)]);
         let current = Arc::new(AtomicU64::new(1));
         let worker = Arc::new(std::sync::Mutex::new(Worker::default()));
-        worker.lock().unwrap().search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external).unwrap();
+        worker
+            .lock()
+            .unwrap()
+            .search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &external)
+            .unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
-        let started = barrier.clone(); let running_worker = worker.clone(); let generation = current.clone();
+        let started = barrier.clone();
+        let running_worker = worker.clone();
+        let generation = current.clone();
         let thread = std::thread::spawn(move || {
             started.wait();
-            assert!(running_worker.lock().unwrap().search_with_external(&inputs, Provider::Claude,
-                "needle", 1, &generation, &external).is_none());
+            assert!(
+                running_worker
+                    .lock()
+                    .unwrap()
+                    .search_with_external(
+                        &inputs,
+                        Provider::Claude,
+                        "needle",
+                        1,
+                        &generation,
+                        &external
+                    )
+                    .is_none()
+            );
         });
         current.store(2, Ordering::Relaxed);
         drop(worker); // Runtime has retired its worker while a captured task still owns it.
         assert!(text.upgrade().is_some() && blocks.upgrade().is_some());
-        barrier.wait(); thread.join().unwrap();
-        assert!(text.upgrade().is_none() && blocks.upgrade().is_none(),
-            "cancellation and task completion retire full document owners, not only Weak header identity");
+        barrier.wait();
+        thread.join().unwrap();
+        assert!(
+            text.upgrade().is_none() && blocks.upgrade().is_none(),
+            "cancellation and task completion retire full document owners, not only Weak header identity"
+        );
     }
 
     #[test]
     fn find_external_wrong_root_refuses_a_document_and_proofs_hold_no_body_owner() {
-        let inputs = [input("a")]; let current = AtomicU64::new(1); let mut worker = Worker::default();
+        let inputs = [input("a")];
+        let current = AtomicU64::new(1);
+        let mut worker = Worker::default();
         let wrong = HashMap::from([("a".into(), owner("other", 1, &[(60, "needle")]))]);
-        assert!(worker.search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &wrong).is_none());
-        let body = owner("a", 1, &[(60, "needle")]); let weak = Arc::downgrade(&body);
+        assert!(
+            worker
+                .search_with_external(&inputs, Provider::Claude, "needle", 1, &current, &wrong)
+                .is_none()
+        );
+        let body = owner("a", 1, &[(60, "needle")]);
+        let weak = Arc::downgrade(&body);
         let mut external = HashMap::from([("a".into(), body)]);
         let result = Results::with_external_revisions(Vec::new(), &inputs, 0, &external);
-        external.clear(); assert!(weak.upgrade().is_none(), "result proof cannot extend hidden sidecar lifetime");
-        assert!(result.sources["a"].external.as_ref().unwrap().upgrade().is_none());
+        external.clear();
+        assert!(
+            weak.upgrade().is_none(),
+            "result proof cannot extend hidden sidecar lifetime"
+        );
+        assert!(
+            result.sources["a"]
+                .external
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .is_none()
+        );
     }
 }

@@ -11,8 +11,11 @@ pub(super) use index::{Block, External, Input, Match, Paint, Results, SourceProo
 /// Only local image paths are rendered as text. Remote URLs remain a button
 /// target and data URLs remain opaque image payloads, not searchable captions.
 pub(super) fn image_path_caption(path: &str) -> Option<&str> {
-    (!path.is_empty() && !path.starts_with("http://") && !path.starts_with("https://")
-        && !path.starts_with("data:")).then_some(path)
+    (!path.is_empty()
+        && !path.starts_with("http://")
+        && !path.starts_with("https://")
+        && !path.starts_with("data:"))
+    .then_some(path)
 }
 
 pub(super) const HIGHLIGHT_LIMIT: usize = 4096;
