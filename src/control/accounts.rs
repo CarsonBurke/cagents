@@ -65,7 +65,11 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (provider, account, refresh) = match command {
-        AccountCommand::Info {provider, account, refresh} => (provider, account, refresh),
+        AccountCommand::Info {
+            provider,
+            account,
+            refresh,
+        } => (provider, account, refresh),
         other => return reset::execute(other),
     };
     let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
@@ -240,15 +244,54 @@ mod tests {
         );
     }
     #[test]
-    fn allowance_commands_preserve_global_remote_target_and_require_explicit_redeem_authorization() {
-        let session=TerminalId::new().to_string();
-        let parsed=Cli::try_parse_from(["cagents","--device","fw16","account","allowance","--session",&session,"--json"]).unwrap();
-        assert_eq!(parsed.device.as_deref(),Some("fw16"));
-        assert!(matches!(parsed.command,TopCommand::Account {command:AccountCommand::Allowance {..}}));
-        let args=["cagents","account","redeem","--session",&session,"--provider-account","actual-account","--backend-origin","https://chatgpt.com","--credit","actual-credit"];
+    fn allowance_commands_preserve_global_remote_target_and_require_explicit_redeem_authorization()
+    {
+        let session = TerminalId::new().to_string();
+        let parsed = Cli::try_parse_from([
+            "cagents",
+            "--device",
+            "fw16",
+            "account",
+            "allowance",
+            "--session",
+            &session,
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(parsed.device.as_deref(), Some("fw16"));
+        assert!(matches!(
+            parsed.command,
+            TopCommand::Account {
+                command: AccountCommand::Allowance { .. }
+            }
+        ));
+        let args = [
+            "cagents",
+            "account",
+            "redeem",
+            "--session",
+            &session,
+            "--provider-account",
+            "actual-account",
+            "--backend-origin",
+            "https://chatgpt.com",
+            "--credit",
+            "actual-credit",
+        ];
         assert!(Cli::try_parse_from(args).is_err());
         assert!(Cli::try_parse_from(args.into_iter().chain(["--authorize"])).is_ok());
-        assert!(Cli::try_parse_from(["cagents","account","monitor","--session",&session,"--threshold","101"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cagents",
+                "account",
+                "monitor",
+                "--session",
+                &session,
+                "--threshold",
+                "101"
+            ])
+            .is_err()
+        );
     }
     #[test]
     fn human_report_keeps_unknown_context_and_plan_distinct() {

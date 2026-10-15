@@ -10,7 +10,9 @@ pub(crate) struct Read {
 
 impl Read {
     pub(crate) fn check(&self) -> Result<(), String> {
-        if Instant::now() >= self.expires { return Err("Provider allowance read timed out; the running session was kept".into()); }
+        if Instant::now() >= self.expires {
+            return Err("Provider allowance read timed out; the running session was kept".into());
+        }
         Ok(())
     }
 }
@@ -35,12 +37,33 @@ pub(crate) struct Consumed {
 impl Consume {
     /// Called only inside the reset controller after durable Ledger::begin
     /// and explicit authenticated user intent. No deserializable effect token.
-    pub(super) fn prepared(expires: Instant, expected: super::ProviderAccount, credit_id: String,
-        key: String, reconcile: bool, condition: Option<super::request::Threshold>, reply: crossbeam_channel::Sender<Result<Consumed, String>>) -> Self {
-        Self {expires, expected, credit_id, key, reconcile, condition, reply, _private:()}
+    pub(super) fn prepared(
+        expires: Instant,
+        expected: super::ProviderAccount,
+        credit_id: String,
+        key: String,
+        reconcile: bool,
+        condition: Option<super::request::Threshold>,
+        reply: crossbeam_channel::Sender<Result<Consumed, String>>,
+    ) -> Self {
+        Self {
+            expires,
+            expected,
+            credit_id,
+            key,
+            reconcile,
+            condition,
+            reply,
+            _private: (),
+        }
     }
     pub(crate) fn check(&self) -> Result<(), String> {
-        if Instant::now() >= self.expires { return Err("Reset deadline elapsed; the durable attempt must be reconciled before any retry".into()); }
+        if Instant::now() >= self.expires {
+            return Err(
+                "Reset deadline elapsed; the durable attempt must be reconciled before any retry"
+                    .into(),
+            );
+        }
         super::identifier_str(&self.expected.account_id)?;
         super::identifier_str(&self.expected.backend_origin)?;
         super::identifier_str(&self.credit_id)?;
@@ -48,7 +71,19 @@ impl Consume {
         Ok(())
     }
     #[cfg(test)]
-    pub(crate) fn fixture(expires: Instant, expected: super::ProviderAccount, reply: crossbeam_channel::Sender<Result<Consumed, String>>) -> Self {
-        Self::prepared(expires, expected, "actual-credit".into(), "d4883d22-89ad-8c5f-a577-53ada6ed3afb".into(), false, None, reply)
+    pub(crate) fn fixture(
+        expires: Instant,
+        expected: super::ProviderAccount,
+        reply: crossbeam_channel::Sender<Result<Consumed, String>>,
+    ) -> Self {
+        Self::prepared(
+            expires,
+            expected,
+            "actual-credit".into(),
+            "d4883d22-89ad-8c5f-a577-53ada6ed3afb".into(),
+            false,
+            None,
+            reply,
+        )
     }
 }

@@ -407,8 +407,17 @@ pub(super) fn process_request(
     match request {
         ClientRequest::DeviceOperation { operation } => {
             if let crate::device_service::Operation::AccountAllowance { request } = operation {
-                let report = super::account_allowance::execute(host, request).map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
-                return Ok((ServerResponse::DeviceOperation {reply:crate::device_service::Reply::AccountAllowance(report)}, Vec::new(), false));
+                let report =
+                    super::account_allowance::execute(host, request).map_err(|message| {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    })?;
+                return Ok((
+                    ServerResponse::DeviceOperation {
+                        reply: crate::device_service::Reply::AccountAllowance(report),
+                    },
+                    Vec::new(),
+                    false,
+                ));
             }
             if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
                 let account =
