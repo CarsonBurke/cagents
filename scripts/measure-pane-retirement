@@ -2,7 +2,9 @@
 """Private native 500-terminal lifecycle fixture for #1088; not a benchmark result.
 
 prepare a new disk-backed directory, start an owned compositor in the printed
-runtime, then run the development runner here. In another terminal call batch
+runtime, start a private session bus bound to unix:path=RUNTIME/bus, then run
+with explicit --wayland-socket and --dbus-address. Inherited session buses are
+always removed. Run the development runner here. In another terminal call batch
 20 times with count25 and that runner's matched CLI. Every batch waits for actual
 UI persistence adoption before CLI process-close, then sends Ctrl+W through the
 explicit PRIVATE Wayland socket until those exact card IDs commit closed.
@@ -28,6 +30,7 @@ import sqlite3
 import stat
 import subprocess
 import time
+from urllib.parse import unquote
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 MARKER = '.pane-retirement-fixture-v1'
@@ -49,7 +52,7 @@ def environment(root):
     if runtime.is_symlink() or runtime.stat().st_uid != os.getuid():
         raise SystemExit('private runtime has unsafe ownership')
     runtime.chmod(0o700)
-    for key in ('CAGENTS_AGENT_AUTHORITY', 'CAGENTS_ACCOUNT_HOMES', 'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'DISPLAY', 'WAYLAND_DISPLAY'):
+    for key in ('CAGENTS_AGENT_AUTHORITY', 'CAGENTS_ACCOUNT_HOMES', 'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'DISPLAY', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'DBUS_STARTER_ADDRESS', 'DBUS_STARTER_BUS_TYPE', 'AT_SPI_BUS_ADDRESS'):
         env.pop(key, None)
     env.setdefault('CARGO_HOME', str(original_home / '.cargo'))
     env.setdefault('RUSTUP_HOME', str(original_home / '.rustup'))
@@ -67,6 +70,18 @@ def private_display(env, value):
     if not socket.is_relative_to(Path(env['XDG_RUNTIME_DIR'])) or not stat.S_ISSOCK(socket.stat().st_mode):
         raise SystemExit('refusing a display outside the private runtime')
     env['WAYLAND_DISPLAY'] = str(socket)
+
+
+def private_bus(env, value):
+    if not value or not value.startswith('unix:path=') or ';' in value:
+        raise SystemExit('supply --dbus-address for a fixture-owned unix:path session bus')
+    fields = value.split(',')
+    if any(not item.startswith('guid=') for item in fields[1:]):
+        raise SystemExit('unsupported private bus address parameters')
+    path = Path(unquote(fields[0][len('unix:path='):])).resolve(strict=True)
+    if not path.is_relative_to(Path(env['XDG_RUNTIME_DIR'])) or not stat.S_ISSOCK(path.stat().st_mode) or path.stat().st_uid != os.getuid():
+        raise SystemExit('refusing a bus outside the fixture-owned private runtime')
+    env['DBUS_SESSION_BUS_ADDRESS'] = value
 
 
 def database(root, supplied):
@@ -111,6 +126,7 @@ def main():
     parser.add_argument('--cli', type=Path)
     parser.add_argument('--database', type=Path)
     parser.add_argument('--wayland-socket', type=Path)
+    parser.add_argument('--dbus-address')
     parser.add_argument('--count', type=int, default=25)
     parser.add_argument('--batch', type=int, default=1)
     parser.add_argument('--fresh-daemon', action='store_true')
@@ -138,6 +154,7 @@ def main():
         return
     if args.action == 'run':
         private_display(env, args.wayland_socket)
+        private_bus(env, args.dbus_address)
         env['CARGO_BUILD_JOBS'] = '2'
         if not env.get('CARGO_TARGET_DIR'):
             raise SystemExit('set CARGO_TARGET_DIR to the coordinated warmed build cache before run')
@@ -159,6 +176,7 @@ def main():
         if any(entry['batch'] == args.batch for entry in ledger):
             raise SystemExit('batch already exists; never silently repeat terminal creation')
         private_display(env, args.wayland_socket)
+        private_bus(env, args.dbus_address)
         call(args.cli, env, root, ['project', 'open', str(root / 'project')])
         new = []
         for index in range(args.count):
