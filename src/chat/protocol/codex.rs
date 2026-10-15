@@ -1478,19 +1478,6 @@ impl Codex {
 }
 
 impl Adapter for Codex {
-    fn answer_declines(&self, request_id: &str, action: &str) -> bool {
-        let Some(request) = self.requests.get(request_id) else { return false };
-        let Some(choice) = request.actions.get(action) else { return false };
-        match request.kind {
-            RequestKind::Decision | RequestKind::Elicitation => {
-                matches!(choice.as_str(), Some("decline" | "cancel"))
-            }
-            RequestKind::Permissions => {
-                action == "deny" && choice == &json!({"permissions":{},"scope":"turn"})
-            }
-            RequestKind::Questions => false,
-        }
-    }
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -5087,8 +5074,6 @@ mod tests {
         let approval = |id| json!({"id":id,"method":"item/commandExecution/requestApproval","params":{"threadId":"child-exact","turnId":"turn","itemId":"tool","availableDecisions":["accept","decline"],"command":"echo requested"}});
         let requested = adapter.receive(approval(71)).unwrap();
         assert!(requested.events.iter().any(|event| matches!(event, Event::Request(request) if request.title.starts_with("Child agent"))));
-        assert!(adapter.answer_declines("71", "decision-1"));
-        assert!(!adapter.answer_declines("71", "decision-0"));
         let resolved = adapter.receive(json!({"method":"serverRequest/resolved","params":{"threadId":"child-exact","requestId":71}})).unwrap();
         assert!(
             resolved
@@ -5100,7 +5085,6 @@ mod tests {
         let failed = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"child-exact","turn":{"id":"turn","status":"failed","error":{"message":"fixture"},"items":[]}}})).unwrap();
         assert!(failed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Failed), .. } if id == "child-exact")));
         adapter.receive(approval(72)).unwrap();
-        assert!(adapter.answer_declines("72", "decision-1"));
         let closed = adapter
             .receive(json!({"method":"thread/closed","params":{"threadId":"child-exact"}}))
             .unwrap();
@@ -5111,7 +5095,6 @@ mod tests {
                 .any(|event| matches!(event, Event::RequestResolved { id } if id == "72"))
         );
         assert!(adapter.requests.is_empty());
-        assert!(!adapter.answer_declines("72", "decision-1"));
     }
 
     #[test]
@@ -5752,34 +5735,6 @@ mod tests {
                 .iter()
                 .any(|frame| frame["method"] == "thread/turns/list")
         );
-    }
-
-    #[test]
-    fn indexed_refusal_classification_uses_the_exact_pending_choice() {
-        let mut adapter = adapter();
-        let frame = |id, decisions| json!({"id":id,"method":"item/commandExecution/requestApproval","params":{
-            "threadId":"thread-exact","turnId":"finished-turn","itemId":"tool",
-            "availableDecisions":decisions,"command":"echo requested"}});
-        adapter.receive(frame(91, json!(["accept", "decline", "cancel", {"acceptWithExecpolicyAmendment":{"execpolicyAmendment":["echo"]}}]))).unwrap();
-        let first = rpc_id(&json!(91)).unwrap();
-        assert!(!adapter.answer_declines(&first, "decision-0"));
-        assert!(adapter.answer_declines(&first, "decision-1"));
-        assert!(adapter.answer_declines(&first, "decision-2"));
-        assert!(!adapter.answer_declines(&first, "decision-3"));
-        assert!(!adapter.answer_declines(&first, "decline"), "literal decline is not offered");
-        assert!(!adapter.answer_declines("missing", "decision-1"));
-        adapter.receive(json!({"method":"serverRequest/resolved","params":{"threadId":"thread-exact","requestId":91}})).unwrap();
-        assert!(!adapter.answer_declines(&first, "decision-1"));
-        assert!(adapter.command(Command::Answer { request_id:first.clone(), action:"decision-1".into(), answers:vec![] }).is_err());
-        // Neither an index nor a label gives it refusal meaning in a new request.
-        adapter.receive(frame(92, json!(["decline", "accept"]))).unwrap();
-        let second = rpc_id(&json!(92)).unwrap();
-        assert!(adapter.answer_declines(&second, "decision-0"));
-        assert!(!adapter.answer_declines(&second, "decision-1"));
-        assert!(!adapter.answer_declines(&first, "decision-0"));
-        let refused = adapter.command(Command::Answer { request_id:second.clone(), action:"decision-0".into(), answers:vec![] }).unwrap();
-        assert_eq!(refused.writes, vec![json!({"id":92,"result":{"decision":"decline"}})]);
-        assert!(!adapter.answer_declines(&second, "decision-0"));
     }
 
     #[test]

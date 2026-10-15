@@ -216,12 +216,6 @@ pub trait Adapter: Send {
     ) -> Result<Step, String> {
         Err("This provider transport does not support correlated agent runs".into())
     }
-    /// Whether this exact pending provider choice refuses work. Opaque action
-    /// IDs must be resolved by the adapter; the default covers literal IDs.
-    /// Called only on the owning actor immediately before preparing an answer.
-    fn answer_declines(&self, _request_id: &str, action: &str) -> bool {
-        super::declines(action)
-    }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
