@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{BootId, TerminalId};
 
+mod connection;
+pub(crate) use connection::connect_until;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Kind {
     #[default]
@@ -157,9 +160,7 @@ pub(crate) fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> 
 }
 
 pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
-    with_socket_address(path, |address| {
-        std::os::unix::net::UnixStream::connect(address)
-    })
+    connect_until(path, std::time::Instant::now() + std::time::Duration::from_secs(5))
 }
 
 impl Record {
