@@ -3,8 +3,8 @@
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
 mod restart;
-pub(super) use restart::{restart_completed, restart_failure_proved};
-pub(in crate::host) use restart::PreparedRestart;
+pub(super) use self::restart::{restart_completed, restart_failure_proved};
+pub(in crate::host) use self::restart::PreparedRestart;
 use crate::host::model::NativeActorEvent;
 use std::{collections::BTreeSet, sync::{Condvar, Mutex}};
 
