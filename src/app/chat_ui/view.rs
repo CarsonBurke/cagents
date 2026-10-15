@@ -1315,7 +1315,8 @@ impl Runtime {
             {
                 builder.logical(notice_identity(None, error), Arc::from(error.as_str()));
             }
-            let catalog = builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
+            let catalog =
+                builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
             *document = Some((fingerprint, catalog));
         }
         let catalog = document.as_ref().unwrap().1.clone();
@@ -1793,12 +1794,9 @@ impl Runtime {
         }
         content.extend(self.plan_view());
         let find_bar: Element<'_, Message> = if let Some(query) = &self.find {
-                widget::row::with_children(vec![
-                    crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
+            widget::row::with_children(vec![
+                crate::interaction::focused_escape(
+                    crate::ui_controls::field::search("Find in conversation", query)
                         .id(card_control_id(target.card, "chat-find"))
                         .on_input(move |query| action(Action::Find(target, query)))
                         .on_focus(action(Action::FindFocused(target, true)))
@@ -3300,7 +3298,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -3390,14 +3393,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -3490,11 +3497,18 @@ impl Runtime {
             };
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
-            (&item.id, item.started_at.or(item.at), slot, self.expanded.contains(&item.id)).hash(&mut hasher);
+            (
+                &item.id,
+                item.started_at.or(item.at),
+                slot,
+                self.expanded.contains(&item.id),
+            )
+                .hash(&mut hasher);
             if slot == Some(turn::Slot::Thinking) {
                 // A newer turn starting does not revive old reasoning that
                 // already has a final answer or later prompt after it.
-                reasoning_finished(&self.snapshot.items, self.snapshot.busy, &item.id).hash(&mut hasher);
+                reasoning_finished(&self.snapshot.items, self.snapshot.busy, &item.id)
+                    .hash(&mut hasher);
             }
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
@@ -6394,7 +6408,10 @@ mod tests {
         runtime.forget_transcript();
         assert!(runtime.selection_document.borrow().is_none());
         assert!(runtime.selection_bookmarks.borrow().is_empty());
-        assert!(backing.upgrade().is_none(), "no orphan logical plaintext owner survives reset");
+        assert!(
+            backing.upgrade().is_none(),
+            "no orphan logical plaintext owner survives reset"
+        );
     }
 
     #[test]
@@ -6610,117 +6627,158 @@ mod tests {
         };
         let items = frame_cost::transcript(1);
         let (runtime, _handle) = frame_cost::live_runtime(&items);
-        for source in ["bounded αβ words ".repeat(300), format!("```\n{}```", "αβ item line\n".repeat(100))] {
-        let cached = CachedItem::new(&ItemContent::Text { text: source, thinking: false,
-            phase: chat::Phase::Final }, crate::settings::EditorSyntaxTheme::Auto);
-        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
-        let mut builder = selection::Catalog::builder();
-        builder.markdown(&format!("unbound-{}", cached.revision), &[0], cached.markdown.items());
-        let catalog = builder.finish();
-        let expected = catalog.search_blocks().into_iter().map(|(_, text)| text.to_string()).collect::<String>();
-        let content = scroll::transcript(prose::view(&cached, settings, runtime.target, None),
-            runtime.target, None, vec![], true, vec![]);
-        let mut element = selection::transcript_virtualized(
-            content, runtime.target, None, catalog, Default::default(),
-        );
-        let renderer = crate::app::tests::headless_renderer();
-        let mut tree = Tree::new(&element);
-        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 3000.0));
-        let mut node = element
-            .as_widget_mut()
-            .layout(&mut tree, &renderer, &limits);
-        #[derive(Default)]
-        struct ReadText(Vec<(String, iced::Rectangle)>);
-        impl Operation for ReadText {
-            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-                operate(self);
-            }
-            fn custom(
-                &mut self,
-                _: Option<&iced::advanced::widget::Id>,
-                bounds: iced::Rectangle,
-                state: &mut dyn std::any::Any,
-            ) {
-                if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
-                    self.0.push((prose.plain.to_string(), bounds));
+        for source in [
+            "bounded αβ words ".repeat(300),
+            format!("```\n{}```", "αβ item line\n".repeat(100)),
+        ] {
+            let cached = CachedItem::new(
+                &ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            let mut builder = selection::Catalog::builder();
+            builder.markdown(
+                &format!("unbound-{}", cached.revision),
+                &[0],
+                cached.markdown.items(),
+            );
+            let catalog = builder.finish();
+            let expected = catalog
+                .search_blocks()
+                .into_iter()
+                .map(|(_, text)| text.to_string())
+                .collect::<String>();
+            let content = scroll::transcript(
+                prose::view(&cached, settings, runtime.target, None),
+                runtime.target,
+                None,
+                vec![],
+                true,
+                vec![],
+            );
+            let mut element = selection::transcript_virtualized(
+                content,
+                runtime.target,
+                None,
+                catalog,
+                Default::default(),
+            );
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 3000.0));
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            #[derive(Default)]
+            struct ReadText(Vec<(String, iced::Rectangle)>);
+            impl Operation for ReadText {
+                fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                    operate(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&iced::advanced::widget::Id>,
+                    bounds: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                        self.0.push((prose.plain.to_string(), bounds));
+                    }
                 }
             }
-        }
-        let mut text = ReadText::default();
-        element.as_widget_mut().operate(
-            &mut tree,
-            iced::advanced::Layout::new(&node),
-            &renderer,
-            &mut text,
-        );
-        assert!(text.0.len() >= 2, "fixture crosses a real visual chunk seam");
-        assert_eq!(text.0.iter().map(|(text, _)| text.as_str()).collect::<String>(), expected);
-        #[derive(Default)]
-        struct ClipboardText(String);
-        impl iced::advanced::Clipboard for ClipboardText {
-            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
-                Some(self.0.clone())
-            }
-            fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
-                self.0 = contents;
-            }
-        }
-        let first = text.0.first().unwrap().1;
-        let last = text.0.last().unwrap().1;
-        let start = iced::Point::new(first.x, first.y + 3.0);
-        let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
-        let mut clipboard = ClipboardText::default();
-        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 3000.0));
-        for (event, pointer) in [
-            (
-                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-                start,
-            ),
-            (
-                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
-                end,
-            ),
-            (
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                )),
-                end,
-            ),
-            (
-                iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character("c".into()),
-                    modified_key: keyboard::Key::Character("c".into()),
-                    physical_key: keyboard::key::Physical::Unidentified(
-                        keyboard::key::NativeCode::Unidentified,
-                    ),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::CTRL,
-                    text: None,
-                    repeat: false,
-                }),
-                end,
-            ),
-        ] {
-            let mut messages = Vec::new();
-            let mut shell = iced::advanced::Shell::new(&mut messages);
-            element.as_widget_mut().update(
+            let mut text = ReadText::default();
+            element.as_widget_mut().operate(
                 &mut tree,
-                &event,
                 iced::advanced::Layout::new(&node),
-                iced::mouse::Cursor::Available(pointer),
                 &renderer,
-                &mut clipboard,
-                &mut shell,
-                &viewport,
+                &mut text,
             );
-            assert!(shell.is_event_captured());
-            if shell.is_layout_invalid() {
-                node = element
-                    .as_widget_mut()
-                    .layout(&mut tree, &renderer, &limits);
+            assert!(
+                text.0.len() >= 2,
+                "fixture crosses a real visual chunk seam"
+            );
+            assert_eq!(
+                text.0
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>(),
+                expected
+            );
+            #[derive(Default)]
+            struct ClipboardText(String);
+            impl iced::advanced::Clipboard for ClipboardText {
+                fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                    Some(self.0.clone())
+                }
+                fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+                    self.0 = contents;
+                }
             }
-        }
-        assert_eq!(clipboard.0, expected, "visual chunk seams are absent from copied logical source");
+            let first = text.0.first().unwrap().1;
+            let last = text.0.last().unwrap().1;
+            let start = iced::Point::new(first.x, first.y + 3.0);
+            let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+            let mut clipboard = ClipboardText::default();
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 3000.0));
+            for (event, pointer) in [
+                (
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                    start,
+                ),
+                (
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                    end,
+                ),
+                (
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )),
+                    end,
+                ),
+                (
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character("c".into()),
+                        modified_key: keyboard::Key::Character("c".into()),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::CTRL,
+                        text: None,
+                        repeat: false,
+                    }),
+                    end,
+                ),
+            ] {
+                let mut messages = Vec::new();
+                let mut shell = iced::advanced::Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    iced::advanced::Layout::new(&node),
+                    iced::mouse::Cursor::Available(pointer),
+                    &renderer,
+                    &mut clipboard,
+                    &mut shell,
+                    &viewport,
+                );
+                assert!(shell.is_event_captured());
+                if shell.is_layout_invalid() {
+                    node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                }
+            }
+            assert_eq!(
+                clipboard.0, expected,
+                "visual chunk seams are absent from copied logical source"
+            );
         }
     }
 
@@ -6890,8 +6948,11 @@ mod tests {
         let (mut runtime, _handle) = frame_cost::live_runtime(&items);
         let idle = fingerprints(&runtime, true);
         Arc::make_mut(&mut runtime.snapshot).busy = true;
-        assert_eq!(idle, fingerprints(&runtime, true),
-            "all fixture reasoning already has a later final answer");
+        assert_eq!(
+            idle,
+            fingerprints(&runtime, true),
+            "all fixture reasoning already has a later final answer"
+        );
     }
 
     #[test]
@@ -8202,8 +8263,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -8453,10 +8520,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(

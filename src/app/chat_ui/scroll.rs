@@ -40,22 +40,60 @@ pub(super) type Observations = Rc<std::cell::RefCell<HashMap<Option<String>, Scr
 /// Persist only reader geometry and stable row IDs across native tree eviction.
 /// No source text, widgets, fonts or shaped paragraphs are retained here.
 #[derive(Clone, Default)]
-pub(super) struct Memory(Rc<std::cell::RefCell<Anchor>>, Rc<std::cell::RefCell<block::Positions>>);
-struct ReaderState { memory: Memory, restore: bool }
+pub(super) struct Memory(
+    Rc<std::cell::RefCell<Anchor>>,
+    Rc<std::cell::RefCell<block::Positions>>,
+);
+struct ReaderState {
+    memory: Memory,
+    restore: bool,
+}
 
 impl Memory {
-    pub fn clear(&self) { *self.0.borrow_mut() = Anchor::default(); *self.1.borrow_mut() = block::Positions::default(); }
+    pub fn clear(&self) {
+        *self.0.borrow_mut() = Anchor::default();
+        *self.1.borrow_mut() = block::Positions::default();
+    }
     pub fn retain_children(&self, children: &[chat::Subagent]) {
         let mut state = self.0.borrow_mut();
-        let active = state.active.and_then(|index| state.contexts.get(index)).map(|context| context.subagent.clone());
-        state.contexts.retain(|context| context.subagent.as_ref().is_none_or(|id| children.iter().any(|child| &child.id == id)));
-        state.active = active.and_then(|active| state.contexts.iter().position(|context| context.subagent == active));
-        self.1.borrow_mut().entries.retain(|(context, _), _| context.as_ref().is_none_or(|id| children.iter().any(|child| &child.id == id)));
-        if state.reported.as_ref().is_some_and(|report| report.subagent.as_ref().is_some_and(|id| !children.iter().any(|child| &child.id == id))) {
+        let active = state
+            .active
+            .and_then(|index| state.contexts.get(index))
+            .map(|context| context.subagent.clone());
+        state.contexts.retain(|context| {
+            context
+                .subagent
+                .as_ref()
+                .is_none_or(|id| children.iter().any(|child| &child.id == id))
+        });
+        state.active = active.and_then(|active| {
+            state
+                .contexts
+                .iter()
+                .position(|context| context.subagent == active)
+        });
+        self.1.borrow_mut().entries.retain(|(context, _), _| {
+            context
+                .as_ref()
+                .is_none_or(|id| children.iter().any(|child| &child.id == id))
+        });
+        if state.reported.as_ref().is_some_and(|report| {
+            report
+                .subagent
+                .as_ref()
+                .is_some_and(|id| !children.iter().any(|child| &child.id == id))
+        }) {
             state.reported = None;
         }
     }
-    pub fn retained_rows(&self) -> usize { self.0.borrow().contexts.iter().map(|context| context.rows.len()).sum() }
+    pub fn retained_rows(&self) -> usize {
+        self.0
+            .borrow()
+            .contexts
+            .iter()
+            .map(|context| context.rows.len())
+            .sum()
+    }
 }
 
 pub(super) fn transcript_observed<'a>(
@@ -149,7 +187,10 @@ pub(super) fn block_id(target: Target, context: Option<&str>, logical: u64) -> I
     use std::hash::{Hash, Hasher};
     let mut key = std::hash::DefaultHasher::new();
     (target.generation, context, logical).hash(&mut key);
-    card_control_id(target.card, &format!("chat-block-scroll-{:016x}", key.finish()))
+    card_control_id(
+        target.card,
+        &format!("chat-block-scroll-{:016x}", key.finish()),
+    )
 }
 
 pub(super) fn steps_id(id: &str) -> Id {
@@ -250,15 +291,26 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
                     offset: travel - from_top,
                     exact: stage == 3,
                     stage,
-                    horizontal: self.horizontal.iter().rev().find_map(|(id, viewport, content)| {
-                        if stage < 2 { return None; }
-                        let center = Point::new(found.x + found.width / 2.0, found.y + found.height / 2.0);
-                        content.contains(center).then(|| HorizontalLocation {
-                            id: id.clone(),
-                            offset: (found.x - content.x - (viewport.width - found.width) / 2.0)
-                                .clamp(0.0, (content.width - viewport.width).max(0.0)),
-                        })
-                    }),
+                    horizontal: self
+                        .horizontal
+                        .iter()
+                        .rev()
+                        .find_map(|(id, viewport, content)| {
+                            if stage < 2 {
+                                return None;
+                            }
+                            let center = Point::new(
+                                found.x + found.width / 2.0,
+                                found.y + found.height / 2.0,
+                            );
+                            content.contains(center).then(|| HorizontalLocation {
+                                id: id.clone(),
+                                offset: (found.x
+                                    - content.x
+                                    - (viewport.width - found.width) / 2.0)
+                                    .clamp(0.0, (content.width - viewport.width).max(0.0)),
+                            })
+                        }),
                 }
             },
         ))
@@ -284,10 +336,15 @@ pub(super) fn locate_logical(
 }
 
 /// Reveal a far-right code glyph without moving its vertical code/transcript offset.
-pub(super) fn find_scroll_horizontal<T: Send + 'static>(location: HorizontalLocation) -> iced::Task<T> {
+pub(super) fn find_scroll_horizontal<T: Send + 'static>(
+    location: HorizontalLocation,
+) -> iced::Task<T> {
     iced::advanced::widget::operate(operation::scrollable::scroll_to(
         location.id,
-        operation::scrollable::AbsoluteOffset { x: Some(location.offset), y: None },
+        operation::scrollable::AbsoluteOffset {
+            x: Some(location.offset),
+            y: None,
+        },
     ))
 }
 
@@ -1443,68 +1500,195 @@ mod tests {
     fn logical_find_reveals_a_far_right_code_glyph_without_changing_vertical_scroll() {
         let renderer = crate::app::tests::headless_renderer();
         for byte in [400, 4000] {
-        let target = Target { card: CardId::new(), generation: 0 };
-        let identity = 9357;
-        let horizontal_id = Id::new("find-horizontal-code");
-        let source: Arc<str> = format!("{}needle", "w".repeat(byte)).into();
-        let text = prose::code_text(source, Arc::from([]), design::TEXT_BODY.into(),
-            iced::Font::MONOSPACE, target, None,
-            Some(selectable_prose::Logical {identity,start:0,paint:None}));
-        let code = widget::scrollable(widget::container(text).width(50000))
-            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
-            .id(horizontal_id.clone());
-        let mut element = transcript(widget::column::with_children(vec![
-            item("code", code), widget::Space::new().height(1000).into(),
-        ]), target, None, vec![], false, vec![]);
-        let mut tree = Tree::new(&element);
-        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
-        let mut node = element.as_widget_mut().layout(&mut tree,&renderer,&limits);
-        let mut realized = false;
-        for _ in 0..6 {
-        let found = Arc::new(std::sync::Mutex::new(None));
-        let sink = found.clone();
-        let mut locate = operation::map(LocateLogical {
-            scroll:card_control_id(target.card,"chat-transcript"),item:item_id("code"),identity,byte,
-            content:None,viewport:None,found:None,horizontal:Vec::new(),
-        },move |location|{*sink.lock().unwrap()=location;});
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut locate);
-        let _ = locate.finish();
-        let location = found.lock().unwrap().take().expect("mounted code glyph exists");
-        let horizontal = location.horizontal.expect("glyph belongs to a horizontal code viewport");
-        assert_eq!(horizontal.id,horizontal_id);
-        assert!(horizontal.offset>600.0,"far-right glyph needs horizontal realization");
-        struct Position {
-            horizontal: Id, transcript: Id, identity: u64, byte: usize,
-            x: f32, y: f32, viewport: Option<Rectangle>, glyph: Option<Rectangle>,
-        }
-        impl Operation for Position {
-            fn traverse(&mut self, visit:&mut dyn FnMut(&mut dyn Operation)){visit(self);}
-            fn scrollable(&mut self,id:Option<&Id>,viewport:Rectangle,_:Rectangle,translation:Vector,_:&mut dyn operation::Scrollable){
-                if id==Some(&self.transcript){self.y=translation.y;}
-                if id==Some(&self.horizontal){self.x=translation.x;self.viewport=Some(viewport);}
-            }
-            fn custom(&mut self,_:Option<&Id>,bounds:Rectangle,state:&mut dyn std::any::Any){
-                if let Some(prose)=state.downcast_ref::<selectable_prose::State>()
-                    && let Some(local)=prose.logical_byte_bounds(self.identity,self.byte){
-                    self.glyph=Some(Rectangle{x:bounds.x+local.x-self.x,y:bounds.y+local.y,..local});
+            let target = Target {
+                card: CardId::new(),
+                generation: 0,
+            };
+            let identity = 9357;
+            let horizontal_id = Id::new("find-horizontal-code");
+            let source: Arc<str> = format!("{}needle", "w".repeat(byte)).into();
+            let text = prose::code_text(
+                source,
+                Arc::from([]),
+                design::TEXT_BODY.into(),
+                iced::Font::MONOSPACE,
+                target,
+                None,
+                Some(selectable_prose::Logical {
+                    identity,
+                    start: 0,
+                    paint: None,
+                }),
+            );
+            let code = widget::scrollable(widget::container(text).width(50000))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    design::scrollbar(),
+                ))
+                .id(horizontal_id.clone());
+            let mut element = transcript(
+                widget::column::with_children(vec![
+                    item("code", code),
+                    widget::Space::new().height(1000).into(),
+                ]),
+                target,
+                None,
+                vec![],
+                false,
+                vec![],
+            );
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut realized = false;
+            for _ in 0..6 {
+                let found = Arc::new(std::sync::Mutex::new(None));
+                let sink = found.clone();
+                let mut locate = operation::map(
+                    LocateLogical {
+                        scroll: card_control_id(target.card, "chat-transcript"),
+                        item: item_id("code"),
+                        identity,
+                        byte,
+                        content: None,
+                        viewport: None,
+                        found: None,
+                        horizontal: Vec::new(),
+                    },
+                    move |location| {
+                        *sink.lock().unwrap() = location;
+                    },
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut locate,
+                );
+                let _ = locate.finish();
+                let location = found
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("mounted code glyph exists");
+                let horizontal = location
+                    .horizontal
+                    .expect("glyph belongs to a horizontal code viewport");
+                assert_eq!(horizontal.id, horizontal_id);
+                assert!(
+                    horizontal.offset > 600.0,
+                    "far-right glyph needs horizontal realization"
+                );
+                struct Position {
+                    horizontal: Id,
+                    transcript: Id,
+                    identity: u64,
+                    byte: usize,
+                    x: f32,
+                    y: f32,
+                    viewport: Option<Rectangle>,
+                    glyph: Option<Rectangle>,
                 }
+                impl Operation for Position {
+                    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                        visit(self);
+                    }
+                    fn scrollable(
+                        &mut self,
+                        id: Option<&Id>,
+                        viewport: Rectangle,
+                        _: Rectangle,
+                        translation: Vector,
+                        _: &mut dyn operation::Scrollable,
+                    ) {
+                        if id == Some(&self.transcript) {
+                            self.y = translation.y;
+                        }
+                        if id == Some(&self.horizontal) {
+                            self.x = translation.x;
+                            self.viewport = Some(viewport);
+                        }
+                    }
+                    fn custom(
+                        &mut self,
+                        _: Option<&Id>,
+                        bounds: Rectangle,
+                        state: &mut dyn std::any::Any,
+                    ) {
+                        if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                            && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+                        {
+                            self.glyph = Some(Rectangle {
+                                x: bounds.x + local.x - self.x,
+                                y: bounds.y + local.y,
+                                ..local
+                            });
+                        }
+                    }
+                }
+                let mut before = Position {
+                    horizontal: horizontal_id.clone(),
+                    transcript: card_control_id(target.card, "chat-transcript"),
+                    identity,
+                    byte,
+                    x: 0.0,
+                    y: 0.0,
+                    viewport: None,
+                    glyph: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut before,
+                );
+                let mut correction = operation::scrollable::scroll_to::<()>(
+                    horizontal.id,
+                    operation::scrollable::AbsoluteOffset {
+                        x: Some(horizontal.offset),
+                        y: None,
+                    },
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut correction,
+                );
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut after = Position {
+                    glyph: None,
+                    viewport: None,
+                    ..before
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after,
+                );
+                assert_eq!(
+                    after.y, before.y,
+                    "horizontal correction preserves the transcript offset"
+                );
+                let Some(glyph) = after.glyph else {
+                    continue;
+                };
+                let viewport = after.viewport.unwrap();
+                assert!(
+                    glyph.x >= viewport.x && glyph.x + glyph.width <= viewport.x + viewport.width,
+                    "highlighted glyph is visible after horizontal realization: {glyph:?}, {viewport:?}"
+                );
+                realized = true;
+                break;
             }
-        }
-        let mut before=Position{horizontal:horizontal_id.clone(),transcript:card_control_id(target.card,"chat-transcript"),identity,byte,x:0.0,y:0.0,viewport:None,glyph:None};
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut before);
-        let mut correction=operation::scrollable::scroll_to::<()>(horizontal.id,operation::scrollable::AbsoluteOffset{x:Some(horizontal.offset),y:None});
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut correction);
-        node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
-        let mut after=Position{glyph:None,viewport:None,..before};
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut after);
-        assert_eq!(after.y,before.y,"horizontal correction preserves the transcript offset");
-        let Some(glyph)=after.glyph else { continue; };let viewport=after.viewport.unwrap();
-        assert!(glyph.x>=viewport.x && glyph.x+glyph.width<=viewport.x+viewport.width,
-            "highlighted glyph is visible after horizontal realization: {glyph:?}, {viewport:?}");
-        realized = true;
-        break;
-        }
-        assert!(realized, "far-right match at byte {byte} must become an actual visible glyph");
+            assert!(
+                realized,
+                "far-right match at byte {byte} must become an actual visible glyph"
+            );
         }
     }
 
@@ -1519,127 +1703,200 @@ mod tests {
         let line = "measured source line αβ\n";
         let source: Arc<str> = line.repeat(5000).into();
         let byte = line.len() * 1500;
-        let text = prose::code_text(source, Arc::from([]), design::TEXT_BODY.into(), iced::Font::MONOSPACE,
-            target, None, Some(selectable_prose::Logical { identity, start: 0, paint: None }));
+        let text = prose::code_text(
+            source,
+            Arc::from([]),
+            design::TEXT_BODY.into(),
+            iced::Font::MONOSPACE,
+            target,
+            None,
+            Some(selectable_prose::Logical {
+                identity,
+                start: 0,
+                paint: None,
+            }),
+        );
         let mut cases = vec![(text, identity, byte)];
-        let list = format!("{}{}", "prefix\n\n".repeat(4), (0..10000).map(|index| format!("- bullet {index} target\n")).collect::<String>());
-        let table = format!("{}| First | Second |\n| --- | --- |\n{}", "prefix\n\n".repeat(4),
-            (0..10000).map(|index| format!("| row {index} | target {index} |\n")).collect::<String>());
-        for (source, path) in [(list, vec![0, 4, 9999, 0]), (table, vec![0, 4, 10000, 1, 0])] {
-            let cached = CachedItem::new(&ItemContent::Text { text: source, thinking: false,
-                phase: chat::Phase::Final }, crate::settings::EditorSyntaxTheme::Auto);
-            let identity = selection::logical_identity(&format!("unbound-{}", cached.revision), &path);
-            cases.push((prose::view(&cached,
-                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE), target, None), identity, 0));
+        let list = format!(
+            "{}{}",
+            "prefix\n\n".repeat(4),
+            (0..10000)
+                .map(|index| format!("- bullet {index} target\n"))
+                .collect::<String>()
+        );
+        let table = format!(
+            "{}| First | Second |\n| --- | --- |\n{}",
+            "prefix\n\n".repeat(4),
+            (0..10000)
+                .map(|index| format!("| row {index} | target {index} |\n"))
+                .collect::<String>()
+        );
+        for (source, path) in [
+            (list, vec![0, 4, 9999, 0]),
+            (table, vec![0, 4, 10000, 1, 0]),
+        ] {
+            let cached = CachedItem::new(
+                &ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            let identity =
+                selection::logical_identity(&format!("unbound-{}", cached.revision), &path);
+            cases.push((
+                prose::view(
+                    &cached,
+                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                    target,
+                    None,
+                ),
+                identity,
+                0,
+            ));
         }
         for (text, identity, byte) in cases {
-        let before = virtualized::constructed_rows();
-        let mut element = transcript(widget::column::with_children(vec![
-            widget::Space::new().height(10000).into(), item("answer", text),
-            widget::Space::new().height(10000).into()]), target, None, vec![], true, vec![]);
-        let mut tree = Tree::new(&element);
-        let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
-        let limits = layout::Limits::new(Size::ZERO, viewport.size());
-        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut SetBottom(f32::MAX));
-        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        let mut exact = false;
-        for _ in 0..6 {
-            let found = Arc::new(std::sync::Mutex::new(None));
-            let sink = found.clone();
-            let mut locate = operation::map(
-                LocateLogical {
-                    scroll: card_control_id(target.card, "chat-transcript"),
-                    item: item_id("answer"),
-                    identity,
-                    byte,
-                    content: None,
-                    viewport: None,
-                    found: None,
-                    horizontal: Vec::new(),
-                },
-                move |location| {
-                    *sink.lock().unwrap() = location;
-                },
+            let before = virtualized::constructed_rows();
+            let mut element = transcript(
+                widget::column::with_children(vec![
+                    widget::Space::new().height(10000).into(),
+                    item("answer", text),
+                    widget::Space::new().height(10000).into(),
+                ]),
+                target,
+                None,
+                vec![],
+                true,
+                vec![],
             );
-            element
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+            let limits = layout::Limits::new(Size::ZERO, viewport.size());
+            let mut node = element
                 .as_widget_mut()
-                .operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
-            let _ = locate.finish();
-            let location = found
-                .lock()
-                .unwrap()
-                .take()
-                .expect("offscreen descriptors remain navigable");
-            exact = location.exact;
+                .layout(&mut tree, &renderer, &limits);
             element.as_widget_mut().operate(
                 &mut tree,
                 Layout::new(&node),
                 &renderer,
-                &mut SetBottom(location.offset),
+                &mut SetBottom(f32::MAX),
             );
             node = element
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
-            if exact {
-                break;
-            }
-        }
-        assert!(
-            exact,
-            "estimate navigation converges to actual mounted glyph geometry"
-        );
-        struct Visible {
-            identity: u64,
-            byte: usize,
-            translation: Vector,
-            viewport: Option<Rectangle>,
-            glyph: Option<Rectangle>,
-        }
-        impl Operation for Visible {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn scrollable(
-                &mut self,
-                _: Option<&Id>,
-                viewport: Rectangle,
-                _: Rectangle,
-                translation: Vector,
-                _: &mut dyn operation::Scrollable,
-            ) {
-                self.translation = translation;
-                self.viewport = Some(viewport);
-            }
-            fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-                if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
-                    && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
-                {
-                    self.glyph = Some(Rectangle {
-                        x: bounds.x + local.x - self.translation.x,
-                        y: bounds.y + local.y - self.translation.y,
-                        ..local
-                    });
+            let mut exact = false;
+            for _ in 0..6 {
+                let found = Arc::new(std::sync::Mutex::new(None));
+                let sink = found.clone();
+                let mut locate = operation::map(
+                    LocateLogical {
+                        scroll: card_control_id(target.card, "chat-transcript"),
+                        item: item_id("answer"),
+                        identity,
+                        byte,
+                        content: None,
+                        viewport: None,
+                        found: None,
+                        horizontal: Vec::new(),
+                    },
+                    move |location| {
+                        *sink.lock().unwrap() = location;
+                    },
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut locate,
+                );
+                let _ = locate.finish();
+                let location = found
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("offscreen descriptors remain navigable");
+                exact = location.exact;
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut SetBottom(location.offset),
+                );
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                if exact {
+                    break;
                 }
             }
-        }
-        let mut visible = Visible {
-            identity,
-            byte,
-            translation: Vector::ZERO,
-            viewport: None,
-            glyph: None,
-        };
-        element
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
-        let glyph = visible.glyph.expect("the requested chunk is mounted");
-        let viewport = visible.viewport.unwrap();
-        assert!(glyph.y >= viewport.y && glyph.y +glyph.height <= viewport.y +viewport.height);
-        assert!((glyph.y +glyph.height /2.0 -viewport.y -viewport.height /2.0).abs() <= glyph.height +1.0,
-            "mounted match glyph is centered: {glyph:?}, {viewport:?}");
-        assert!(virtualized::constructed_rows() - before < 1500,
-            "staged navigation must not instantiate ten thousand hidden rows");
+            assert!(
+                exact,
+                "estimate navigation converges to actual mounted glyph geometry"
+            );
+            struct Visible {
+                identity: u64,
+                byte: usize,
+                translation: Vector,
+                viewport: Option<Rectangle>,
+                glyph: Option<Rectangle>,
+            }
+            impl Operation for Visible {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn scrollable(
+                    &mut self,
+                    _: Option<&Id>,
+                    viewport: Rectangle,
+                    _: Rectangle,
+                    translation: Vector,
+                    _: &mut dyn operation::Scrollable,
+                ) {
+                    self.translation = translation;
+                    self.viewport = Some(viewport);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&Id>,
+                    bounds: Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                        && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+                    {
+                        self.glyph = Some(Rectangle {
+                            x: bounds.x + local.x - self.translation.x,
+                            y: bounds.y + local.y - self.translation.y,
+                            ..local
+                        });
+                    }
+                }
+            }
+            let mut visible = Visible {
+                identity,
+                byte,
+                translation: Vector::ZERO,
+                viewport: None,
+                glyph: None,
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
+            let glyph = visible.glyph.expect("the requested chunk is mounted");
+            let viewport = visible.viewport.unwrap();
+            assert!(
+                glyph.y >= viewport.y && glyph.y + glyph.height <= viewport.y + viewport.height
+            );
+            assert!(
+                (glyph.y + glyph.height / 2.0 - viewport.y - viewport.height / 2.0).abs()
+                    <= glyph.height + 1.0,
+                "mounted match glyph is centered: {glyph:?}, {viewport:?}"
+            );
+            assert!(
+                virtualized::constructed_rows() - before < 1500,
+                "staged navigation must not instantiate ten thousand hidden rows"
+            );
         }
     }
 

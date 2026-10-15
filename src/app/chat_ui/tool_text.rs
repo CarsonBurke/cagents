@@ -60,7 +60,6 @@ impl Preview {
         self.text.capacity() + self.tail.capacity() + self.block.retained_span_bytes()
     }
 
-
     pub(super) fn update(
         previous: Option<Self>,
         content: &ItemContent,
@@ -171,9 +170,13 @@ impl Preview {
 
 impl ToolText {
     pub(super) fn retained_bytes(&self) -> usize {
-        self.text.len() + self.syntax.borrow().as_ref().map_or(0, |(_, block)| block.retained_span_bytes())
+        self.text.len()
+            + self
+                .syntax
+                .borrow()
+                .as_ref()
+                .map_or(0, |(_, block)| block.retained_span_bytes())
     }
-
 
     pub(super) fn update(previous: Option<Self>, text: &str, language: Language) -> Self {
         let language = if text.len() > CachedItem::HIGHLIGHT_LIMIT {
@@ -208,7 +211,14 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, limit.map(|height| (height, true)), target, find, None, None)
+        self.surface(
+            theme,
+            limit.map(|height| (height, true)),
+            target,
+            find,
+            None,
+            None,
+        )
     }
 
     /// Patches and read results open at their first line.
@@ -236,12 +246,24 @@ impl ToolText {
     /// `limit` is the height the text scrolls within and whether it follows
     /// its end.
     pub(super) fn view_logical_with_reader(
-        &self, theme: crate::settings::EditorSyntaxTheme, limit: Option<(f32, bool)>,
-        target: Target, find: Option<&str>, logical: selectable_prose::Logical,
-        memory: scroll::Memory, context: Option<String>,
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        limit: Option<(f32, bool)>,
+        target: Target,
+        find: Option<&str>,
+        logical: selectable_prose::Logical,
+        memory: scroll::Memory,
+        context: Option<String>,
     ) -> Element<'static, Message> {
         let identity = logical.identity;
-        self.surface(theme, limit, target, find, Some(logical), Some((memory, context, identity)))
+        self.surface(
+            theme,
+            limit,
+            target,
+            find,
+            Some(logical),
+            Some((memory, context, identity)),
+        )
     }
 
     fn surface(
@@ -301,12 +323,18 @@ impl ToolText {
                 design::scrollbar(),
             ))
             .height(Length::Shrink);
-        if let Some((_, context, identity)) = &reader { scrolled = scrolled.id(scroll::block_id(target, context.as_deref(), *identity)); }
+        if let Some((_, context, identity)) = &reader {
+            scrolled = scrolled.id(scroll::block_id(target, context.as_deref(), *identity));
+        }
         let scrolled: Element<'static, Message> = if follows {
             scroll::tool_output(scrolled.anchor_bottom())
-        } else { scrolled.into() };
+        } else {
+            scrolled.into()
+        };
         let scrolled = match reader {
-            Some((memory, context, identity)) => scroll::block(scrolled, memory, context, identity, follows),
+            Some((memory, context, identity)) => {
+                scroll::block(scrolled, memory, context, identity, follows)
+            }
             None => scrolled,
         };
         widget::container(scrolled).max_height(height).into()

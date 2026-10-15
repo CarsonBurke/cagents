@@ -9,15 +9,17 @@ use iced::advanced::{
 };
 use iced::{Event, Point, Rectangle, Size, Vector};
 use std::any::Any;
-use std::{cell::RefCell, rc::Rc};
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
+use std::{cell::RefCell, rc::Rc};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod boundary;
 mod document;
-pub(super) use document::{Bookmark, Catalog, Builder as DocumentBuilder, identity as logical_identity};
 pub(super) use boundary::{Kind, wrap};
+pub(super) use document::{
+    Bookmark, Builder as DocumentBuilder, Catalog, identity as logical_identity,
+};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);

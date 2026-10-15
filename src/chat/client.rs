@@ -1348,12 +1348,26 @@ impl ClientHandle {
             command,
         })
     }
-    pub(crate) fn known_append(&self, previous: &Arc<super::Item>, current: &Arc<super::Item>) -> bool {
-        self.inner.append_lineage.lock().unwrap_or_else(|p| p.into_inner()).proves(previous, current)
+    pub(crate) fn known_append(
+        &self,
+        previous: &Arc<super::Item>,
+        current: &Arc<super::Item>,
+    ) -> bool {
+        self.inner
+            .append_lineage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proves(previous, current)
     }
 
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
-        if !visible { self.inner.append_lineage.lock().unwrap_or_else(|p| p.into_inner()).clear(); }
+        if !visible {
+            self.inner
+                .append_lineage
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        }
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }

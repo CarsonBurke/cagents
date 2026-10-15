@@ -2,8 +2,7 @@
 use super::*;
 use iced::advanced::text::{Paragraph, Renderer as TextRenderer};
 use iced::advanced::{
-    Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
-    Renderer as _,
+    Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
 };
 use iced::widget::text::{Span, Wrapping};
@@ -729,8 +728,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             && let Some(position) = cursor.position_in(layout.bounds())
         {
             let state = tree.state.downcast_ref::<State>();
-            if state.link(position).is_some()
-            {
+            if state.link(position).is_some() {
                 mouse::Interaction::Pointer
             } else {
                 mouse::Interaction::Text

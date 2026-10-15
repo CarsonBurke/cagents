@@ -389,7 +389,9 @@ impl Runtime {
                     ),
                     start: 0,
                     paint: self.find_paint.clone(),
-                }, self.scroll_memory.clone(), self.selected_subagent.clone(),
+                },
+                self.scroll_memory.clone(),
+                self.selected_subagent.clone(),
             ),
             Some(
                 if matches!(part, CopyPart::Input)
@@ -408,7 +410,6 @@ impl Runtime {
                     design::caption(caption.to_owned()).into()
                 },
             ),
-
             Some(copy),
         )
     }

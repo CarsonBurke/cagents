@@ -228,24 +228,46 @@ impl Builder {
             }
         }
     }
-    pub fn finish(self) -> Arc<Catalog> { self.finish_reusing(None) }
+    pub fn finish(self) -> Arc<Catalog> {
+        self.finish_reusing(None)
+    }
     pub fn finish_reusing(self, previous: Option<&Catalog>) -> Arc<Catalog> {
-        let positions = self.read.blocks.iter().enumerate().map(|(index, block)| (block.identity, index)).collect();
+        let positions = self
+            .read
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.identity, index))
+            .collect();
         let plain_bytes = self.read.blocks.iter().map(|block| block.plain.len()).sum();
-        let prefix_hashes = self.read.blocks.iter().map(|block| {
-            if let Some(previous) = previous
-                && previous.text(block.identity).is_some_and(|plain| Arc::ptr_eq(&plain, &block.plain))
-                && let Some(prefixes) = previous.prefix_hashes.get(&block.identity) {
-                return (block.identity, prefixes.clone());
-            }
-            let mut hash = blake3::Hasher::new();
-            let mut prefixes = vec![*hash.finalize().as_bytes()];
-            for chunk in block.plain.as_bytes().chunks_exact(4096) {
-                hash.update(chunk); prefixes.push(*hash.finalize().as_bytes());
-            }
-            (block.identity, Arc::from(prefixes))
-        }).collect();
-        Arc::new(Catalog { read: self.read, positions, plain_bytes, prefix_hashes })
+        let prefix_hashes = self
+            .read
+            .blocks
+            .iter()
+            .map(|block| {
+                if let Some(previous) = previous
+                    && previous
+                        .text(block.identity)
+                        .is_some_and(|plain| Arc::ptr_eq(&plain, &block.plain))
+                    && let Some(prefixes) = previous.prefix_hashes.get(&block.identity)
+                {
+                    return (block.identity, prefixes.clone());
+                }
+                let mut hash = blake3::Hasher::new();
+                let mut prefixes = vec![*hash.finalize().as_bytes()];
+                for chunk in block.plain.as_bytes().chunks_exact(4096) {
+                    hash.update(chunk);
+                    prefixes.push(*hash.finalize().as_bytes());
+                }
+                (block.identity, Arc::from(prefixes))
+            })
+            .collect();
+        Arc::new(Catalog {
+            read: self.read,
+            positions,
+            plain_bytes,
+            prefix_hashes,
+        })
     }
 }
 
@@ -255,15 +277,24 @@ mod tests {
     #[test]
     fn unchanged_logical_blocks_reuse_validation_hashes_but_rewrites_do_not() {
         let first: Arc<str> = "historical source ".repeat(100000).into();
-        let mut builder = Catalog::builder(); builder.plain("history", &[0], first.clone());
+        let mut builder = Catalog::builder();
+        builder.plain("history", &[0], first.clone());
         let original = builder.finish();
-        let mut builder = Catalog::builder(); builder.plain("history", &[0], first);
+        let mut builder = Catalog::builder();
+        builder.plain("history", &[0], first);
         builder.plain("tail", &[0], Arc::from("new streamed tail"));
         let next = builder.finish_reusing(Some(&original));
         let identity = identity("history", &[0]);
-        assert!(Arc::ptr_eq(&original.prefix_hashes[&identity], &next.prefix_hashes[&identity]));
-        let mut builder = Catalog::builder(); builder.plain("history", &[0], Arc::from("rewritten source"));
+        assert!(Arc::ptr_eq(
+            &original.prefix_hashes[&identity],
+            &next.prefix_hashes[&identity]
+        ));
+        let mut builder = Catalog::builder();
+        builder.plain("history", &[0], Arc::from("rewritten source"));
         let rewritten = builder.finish_reusing(Some(&next));
-        assert!(!Arc::ptr_eq(&next.prefix_hashes[&identity], &rewritten.prefix_hashes[&identity]));
+        assert!(!Arc::ptr_eq(
+            &next.prefix_hashes[&identity],
+            &rewritten.prefix_hashes[&identity]
+        ));
     }
 }
