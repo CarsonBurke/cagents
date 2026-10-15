@@ -8,6 +8,7 @@ mod claude_edits;
 mod claude_permissions;
 pub mod codex;
 pub mod omp;
+pub(crate) mod original_proof;
 mod terminal_output;
 
 #[derive(Debug, Clone)]
