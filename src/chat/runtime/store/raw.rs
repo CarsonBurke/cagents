@@ -576,4 +576,22 @@ mod descriptor_budget_tests {
         let window=store.window().unwrap();assert_eq!(window.items.len(),WINDOW_ITEMS);assert_eq!(window.raw_source_parts.len(),WINDOW_ITEMS*2);
         for item in &window.items{for field in [RawSourceField::ToolInput,RawSourceField::CommandCall]{assert!(window.raw_source_parts.iter().any(|part|part.item_id==item.id&&part.field==field));}}
     }
+    #[test]
+    fn actual_store_paging_omits_and_restores_exact_raw_source_without_deleting_it() {
+        let mut store=Store::new().unwrap();let id="paged-raw-call";
+        full(&mut store,id,"{}");
+        store.apply(Event::Item(Item {id:id.into(),role:Role::Assistant,at:None,started_at:None,
+            content:ItemContent::Tool {name:"Write".into(),input:"{}".into(),output:String::new(),status:ToolStatus::Succeeded}})).unwrap();
+        let original=store.window().unwrap().raw_source_parts.into_iter().find(|part|part.item_id==id).unwrap();
+        for index in 0..super::super::WINDOW_ITEMS+1 {
+            store.apply(Event::Item(Item {id:format!("later-{index}"),role:Role::Assistant,at:None,started_at:None,
+                content:ItemContent::Text {text:"later message".into(),thinking:false,phase:crate::chat::Phase::Final}})).unwrap();
+        }
+        let away=store.window().unwrap();assert!(!away.items.iter().any(|item|item.id==id));assert!(!away.raw_source_parts.iter().any(|part|part.source==original.source));
+        let still_stored=store.raw_source_page(query(id)).unwrap();assert_eq!(still_stored.text,"{}");assert_eq!(still_stored.epoch,original.epoch);
+        assert!(store.earlier().unwrap());let returned=store.window().unwrap();
+        let current=returned.raw_source_parts.iter().find(|part|part.item_id==id).unwrap();assert_eq!(current,&original);
+        full(&mut store,id,r#"{"changed":true}"#);let rewritten=store.raw_source_page(query(id)).unwrap();assert_ne!(rewritten.epoch,original.epoch);
+    }
+
 }
