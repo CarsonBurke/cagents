@@ -12930,7 +12930,9 @@ mod tests {
             runtime.selected.as_mut().unwrap().unstaged = true;
             assert_eq!(runtime.source_surface, SourceSurface::Editor);
             let renderer = headless_renderer();
-            let mut toolbar = selected_file_toolbar(card, &runtime).unwrap();
+            // Exercise the same native control producer used by the editor's
+            // More popover. The unopened popover has no root accessibility rows.
+            let mut toolbar = diff_basis_controls(card, &runtime);
             let mut tree = Tree::new(toolbar.as_widget());
             let viewport = iced::Rectangle::with_size(iced::Size::new(760.0, 160.0));
             let node = toolbar.as_widget_mut().layout(
@@ -13055,8 +13057,10 @@ mod tests {
     #[test]
     fn emitted_native_save_and_discard_cannot_target_a_replacement_dirty_document() {
         let card = CardId::new();
-        for label in ["Save unsaved changes", "Discard unsaved edits"] {
-            let original = RepositoryRuntime::dirty_fixture(card);
+        for label in ["Save unsaved changes", "Revert"] {
+            // The Diff header mounts the discard action directly as Revert;
+            // the editor header puts it inside the More popover.
+            let original = RepositoryRuntime::working_history_fixture(card);
             let emitted = click_native_repository_control(selected_file_toolbar(card, &original).unwrap(), label);
             let RepositoryAction::CapturedCommand { target, action } = emitted else { panic!("toolbar keeps its displayed source"); };
             assert!(original.resolve_captured_command(&target, *action.clone()).is_some(), "unchanged control remains usable");
@@ -13075,6 +13079,8 @@ mod tests {
         let card = CardId::new();
         let (mut original, _) = RepositoryRuntime::open_fixture(card, "source.rs", "source\n");
         original.selected.as_mut().unwrap().unstaged = true;
+        original.source_surface = SourceSurface::Diff;
+        load_fresh_diff(&mut original, card, two_change_model());
         original.set_external_editors(vec![crate::sidebar::SidebarEditor { id: "chosen".into(), name: "Chosen".into(), icon: "editor".into() }]);
         for label in ["Stage file changes", "Open in Chosen"] {
             let emitted = click_native_repository_control(selected_file_toolbar(card, &original).unwrap(), label);
