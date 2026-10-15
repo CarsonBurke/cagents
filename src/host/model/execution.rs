@@ -1258,6 +1258,14 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        let run = update_agent_run_in(&tx, id, revision, update, now_ms)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(run)
+    }
+}
+
+/// A remote actor receipt and its semantic run update share this transaction.
+pub(super) fn update_agent_run_in(tx: &Transaction<'_>, id: RunId, revision: u64, update: Update, now_ms: u64) -> Result<Run, String> {
         let record: String = tx
             .query_row(
                 "SELECT record FROM agent_runs WHERE id = ?1",
@@ -1313,9 +1321,7 @@ impl Registry {
             [],
         )
         .map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
-    }
 }
 
 fn state_key(state: State) -> &'static str {

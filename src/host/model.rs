@@ -31,10 +31,12 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod navigation;
+mod native_actor;
+pub(super) use native_actor::NativeActorEvent;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 15;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -622,6 +624,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 12 {
         mailbox::migrate_attention(db)?;
+    }
+    if version < 15 {
+        native_actor::migrate(db)?;
     }
     Ok(())
 }
