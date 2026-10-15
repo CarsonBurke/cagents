@@ -6179,20 +6179,21 @@ for line in sys.stdin:
         let session = TerminalSession { id, recovery_origin: None, predecessor: None,
             owned_codex_listener: None, launch: recipe.clone(), transcript_path: None, resume_hint: None,
             continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None } };
-        let handle = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
-        let events = handle.events();
-        shared.lock().unwrap().finish_spawn(1, session, handle.clone(), false).unwrap();
-        let weak = Arc::downgrade(&shared);
+        let (_, handle) = spawn_terminal_view_owned(
+            &shared, 1, session, TerminalSpawnOptions::default(), None, false,
+        ).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let observation = (|| -> Result<_, String> {
             loop {
-                let event = events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .map_err(|error| error.to_string())?;
-                if matches!(&event, TerminalEvent::TitleChanged(title) if title == "Native terminal title") {
-                    record_event_from(&weak, id, event, Some(&handle));
-                    let state = shared.lock().unwrap();
-                    return state.descriptor(1, id).map(|row| row.title).map_err(|error| error.to_string());
+                let title = shared.lock().unwrap().descriptor(1, id)
+                    .map_err(|error| error.to_string())?.title;
+                if title.as_deref() == Some("Native terminal title") {
+                    return Ok(title);
                 }
+                if Instant::now() >= deadline {
+                    return Err("production event observer did not publish the PTY title".into());
+                }
+                thread::sleep(Duration::from_millis(5));
             }
         })();
         handle.shutdown().unwrap();
