@@ -8561,8 +8561,16 @@ mod tests {
     fn snapshot_cache_status_or_content_change_reuses_metadata() {
         let mut outputs = (0..8).map(|_| success(b"")).collect::<Vec<_>>();
         outputs[1] = success(b"# branch.oid (initial)\0# branch.head main\0");
-        outputs.extend([success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"), success(b""), success(b"")]);
-        outputs.extend([success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"), success(b""), success(b"")]);
+        outputs.extend([
+            success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"),
+            success(b""),
+            success(b""),
+        ]);
+        outputs.extend([
+            success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"),
+            success(b""),
+            success(b""),
+        ]);
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();

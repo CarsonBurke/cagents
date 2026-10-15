@@ -13039,13 +13039,17 @@ pub(crate) mod tests {
             );
             let mut with_badge = accessible_names(&renderer, row(true));
             let without_badge = accessible_names(&renderer, row(false));
-            assert!(without_badge.iter().any(|name| name.contains("1 changes")),
-                "the row retains its full dirty status when the visual badge is hidden");
+            assert!(
+                without_badge.iter().any(|name| name.contains("1 changes")),
+                "the row retains its full dirty status when the visual badge is hidden"
+            );
             // The expanded visual badge now includes a numeric text node.
             // Removing that auxiliary node must preserve every semantic label.
             with_badge.retain(|name| name != "1");
-            assert_eq!(with_badge, without_badge,
-                "dirty status remains available to assistive technology");
+            assert_eq!(
+                with_badge, without_badge,
+                "dirty status remains available to assistive technology"
+            );
             assert!(worktree_indicator(&worktree, true, None, None, compact, false).is_some());
         }
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);

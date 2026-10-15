@@ -3417,12 +3417,16 @@ mod tests {
         drop(app.update(message));
         use cosmic::iced::futures::StreamExt;
         let immediate = cosmic::iced::runtime::task::into_stream(app.git_fallback_tick());
-        let action = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
-            match immediate {
-                Some(mut stream) => stream.next().await,
-                None => None,
-            }
-        });
+        let action = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                match immediate {
+                    Some(mut stream) => stream.next().await,
+                    None => None,
+                }
+            });
         assert!(action.is_none(), "failure cannot retry before its interval");
         fs::write(private_c.join("index"), index_c).unwrap();
         fs::write(
