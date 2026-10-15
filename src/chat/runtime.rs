@@ -1990,11 +1990,16 @@ impl Actor {
                         crate::secure_file::reject_symlink_components(&directory).map_err(|error| error.to_string())?;
                         context.verify_directory(&directory)?;
                         if self.working_directory == directory { return Ok(()); }
+                        let provider_observed = context.provider_directory_was_observed(&self.working_directory);
                         self.adapter.relocate_directory(&directory)?;
                         if let Err(error) = self.store.lock().unwrap_or_else(|p| p.into_inner()).relocate_file_directory(&directory) {
                             let _ = self.adapter.relocate_directory(&self.working_directory);
                             return Err(error);
                         }
+                        // Only carry an existing provider scope receipt. A pinned
+                        // cwd and a default adapter hook cannot certify legacy
+                        // resumed/OMP tool scope. Failure leaves scope unknown.
+                        if provider_observed { let _ = context.observe_provider_directory(&directory); }
                         self.working_directory = directory;
                         self.dirty = true;
                         Ok(())
@@ -3346,11 +3351,13 @@ mod tests {
             fn command_for_run(&mut self, _run: crate::model::RunId, command: Command) -> Result<Step, String> { self.command(command) }
             fn receive(&mut self, _frame: serde_json::Value) -> Result<Step, String> { Ok(Step::default()) }
         }
+        for observed in [false, true] {
         let fixture = tempfile::tempdir().unwrap();
         let old = fixture.path().join("old"); std::fs::create_dir(&old).unwrap();
         let original = Arc::new(std::fs::File::open(&old).unwrap());
         let context = Arc::new(super::super::protocol::ExecutionContext::new(Some(original)));
-        let spec = ProcessSpec { execution: Some(context), messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new() };
+        if observed { context.observe_provider_directory(&old).unwrap(); }
+        let spec = ProcessSpec { execution: Some(context.clone()), messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new() };
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut initial = Step { events: vec![Event::Ready(true)], ..Default::default() };
         let store = preflight(&spec, &mut initial).unwrap();
@@ -3358,6 +3365,7 @@ mod tests {
         let moved = fixture.path().join("moved"); std::fs::rename(&old, &moved).unwrap();
         std::fs::create_dir(&old).unwrap();
         handle.relocate_execution_directory(&moved).unwrap();
+        assert_eq!(context.provider_directory_observed(&moved).unwrap(), observed, "Locate carries only pre-existing provider authority");
         handle.command_for_run(crate::model::RunId::new(), Command::Prompt { text: "fixture".into(), attachments: Vec::new(), mode: super::super::PromptMode::Send }).unwrap();
         assert_eq!(*calls.lock().unwrap(), vec![moved.clone()]);
         assert!(handle.relocate_execution_directory(&old).is_err(), "reused path is another inode, not the approved process directory");
@@ -3366,6 +3374,7 @@ mod tests {
         assert!(handle.command(Command::Prompt { text: "replacement must refuse".into(), attachments: Vec::new(), mode: super::super::PromptMode::Send }).is_err());
         assert_eq!(calls.lock().unwrap().len(), 1);
         handle.close().unwrap();
+        }
     }
 
     #[test]

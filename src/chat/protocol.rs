@@ -97,6 +97,7 @@ pub(crate) struct ExecutionContext {
     owned_directory: std::sync::Mutex<Option<std::sync::Arc<std::fs::File>>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
+    provider_directory: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl ExecutionContext {
@@ -215,6 +216,25 @@ impl ExecutionContext {
             state.owner = None;
         }
         Ok(state.outcome)
+    }
+    /// Established only by typed provider preparation after the adapter hook,
+    /// independently from the immutable issued recipe and process cwd pin.
+    pub(crate) fn observe_provider_directory(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.directory_descriptor().is_none() { return Err("Provider scope requires its admitted directory descriptor".into()); }
+        self.verify_directory(path)?;
+        *self.provider_directory.lock().unwrap_or_else(|p| p.into_inner()) = Some(path.to_owned());
+        Ok(())
+    }
+    pub(crate) fn provider_directory_observed(&self, path: &std::path::Path) -> Result<bool, String> {
+        if !self.provider_directory_was_observed(path) { return Ok(false); }
+        self.verify_directory(path)?;
+        Ok(true)
+    }
+    /// The old spelling may no longer exist after Locate. This only decides
+    /// whether an already-established receipt may follow the verified actor;
+    /// it cannot create authority for a legacy resumed provider.
+    pub(crate) fn provider_directory_was_observed(&self, path: &std::path::Path) -> bool {
+        self.provider_directory.lock().unwrap_or_else(|p| p.into_inner()).as_deref() == Some(path)
     }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
         let Some(expected) = self.directory_identity()? else {

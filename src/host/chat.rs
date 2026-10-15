@@ -2,6 +2,7 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
 mod native_cleanup;
+mod execution_directory;
 mod native_recovery;
 mod owned_listener;
 #[cfg(test)]
@@ -1028,7 +1029,9 @@ fn start_with_execution(
             "Native restart launch differs from its issued conversation",
         ));
     }
-    let process_launch = &operational_launch;
+    let prepared_directory = execution_directory::prepare(&operational_launch, execution)?;
+    let execution = prepared_directory.context.clone();
+    let process_launch = &prepared_directory.launch;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
     } else {
@@ -1102,29 +1105,12 @@ fn start_with_execution(
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
         .clone();
-    // Ordinary native sessions need the same pinned authority as delegated
-    // agents. Capture before any provider starts; immutable launch provenance
-    // remains untouched when a proven operational spelling has moved.
-    if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
-        let binding = operational_binding;
-        if let Some(binding) = &binding {
-            if let Some(reason) = &binding.refusal { return Err(unavailable(reason.clone())); }
-            if binding.directory != spec.working_directory {
-                adapter.relocate_directory(&binding.directory).map_err(unavailable)?;
-                spec.working_directory = binding.directory.clone();
-            }
-        }
-        if execution.is_none() && source.is_none()
-            && !matches!(spec.transport, chat::protocol::TransportSpec::UnixWebSocket { .. }) {
-            execution = Some(Arc::new(chat::protocol::ExecutionContext::capture(&spec.working_directory).map_err(unavailable)?));
-        }
-        if let Some(context) = &execution {
-            context.verify_directory(&spec.working_directory).map_err(unavailable)?;
-            if let Some(expected) = binding.and_then(|binding| binding.approved)
-                && context.directory_identity().map_err(unavailable)? != Some(expected) {
-                return Err(unavailable("The original native conversation directory was replaced; close it and create a new session for this folder"));
-            }
-        }
+    // All provider adapters receive the pinned operational directory before
+    // initialization, including unchanged spellings and resumed threads.
+    prepared_directory.authorize(&mut spec, adapter.as_mut())?;
+    if let Some(expected) = operational_binding.and_then(|binding| binding.approved)
+        && execution.as_ref().is_none_or(|context| context.directory_identity().ok().flatten() != Some(expected)) {
+        return Err(unavailable("The original native conversation directory was replaced; close it and create a new session for this folder"));
     }
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
