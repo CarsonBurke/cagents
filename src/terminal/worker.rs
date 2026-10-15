@@ -2364,7 +2364,7 @@ impl Worker {
         // newest history row: active rows can move inside scrolling regions
         // without removing any history, so they cannot measure global pruning.
         use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
-        let marker_row = self.terminal.scrollback_rows().unwrap_or(0).saturating_sub(1);
+        let marker_row = (self.terminal.scrollback_rows().unwrap_or(0) as u64).saturating_sub(1);
         let marker = self.terminal.track_grid_ref(Point::Screen(PointCoordinate {
             x: 0, y: u32::try_from(marker_row).unwrap_or(u32::MAX),
         })).ok();
