@@ -205,7 +205,9 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
             state.lines.get_mut().clear();
             state.history = EditHistory::new(self.content.text(), self.content.cursor());
         } else if state.history.restoring.is_some() {
-            state.history.reconcile_restoration(self.content.text(), self.content.cursor());
+            state
+                .history
+                .reconcile_restoration(self.content.text(), self.content.cursor());
         }
         self.inner.set_id(state.identity.id.clone());
         tree.children[0].diff(&mut self.inner as &mut dyn Widget<Message, Theme, Renderer>);
@@ -643,15 +645,31 @@ mod tests {
                 .on_cursor(Message::Cursor)
                 .into();
             tree.diff(editor.as_widget_mut());
-            let node = editor.as_widget_mut().layout(tree, renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(400., 180.)));
+            let node = editor.as_widget_mut().layout(
+                tree,
+                renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(400., 180.)),
+            );
             let layout = Layout::new(&node);
-            editor.as_widget_mut().operate(tree, layout, renderer,
-                &mut cosmic::iced::advanced::widget::operation::focusable::focus::<()>(Id::new("test.batch-composer")));
+            editor.as_widget_mut().operate(
+                tree,
+                layout,
+                renderer,
+                &mut cosmic::iced::advanced::widget::operation::focusable::focus::<()>(Id::new(
+                    "test.batch-composer",
+                )),
+            );
             for key in keys {
-                editor.as_widget_mut().update(tree, &Event::Keyboard(key.clone()), layout,
-                    mouse::Cursor::Unavailable, renderer, &mut clipboard::Null,
-                    &mut Shell::new(&mut messages), &layout.bounds());
+                editor.as_widget_mut().update(
+                    tree,
+                    &Event::Keyboard(key.clone()),
+                    layout,
+                    mouse::Cursor::Unavailable,
+                    renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &layout.bounds(),
+                );
             }
         }
         for message in messages {
@@ -665,22 +683,46 @@ mod tests {
 
     #[test]
     fn typing_in_the_same_native_batch_as_undo_keeps_history_usable() {
-        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Physical},
+        };
         let key = |value: &str, code, modifiers, text: Option<&str>| keyboard::Event::KeyPressed {
             key: keyboard::Key::Character(value.into()),
             modified_key: keyboard::Key::Character(value.into()),
-            physical_key: Physical::Code(code), modifiers,
-            text: text.map(Into::into), repeat: false,
+            physical_key: Physical::Code(code),
+            modifiers,
+            text: text.map(Into::into),
+            repeat: false,
             location: keyboard::Location::Standard,
         };
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let mut content = text_editor::Content::new();
         let mut tree = Tree::empty();
         let undo = key("z", Code::KeyZ, keyboard::Modifiers::CTRL, None);
-        let redo = key("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None);
+        let redo = key(
+            "z",
+            Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            None,
+        );
         for (events, expected) in [
-            (vec![key("a", Code::KeyA, keyboard::Modifiers::empty(), Some("a"))], "a"),
-            (vec![undo.clone(), key("b", Code::KeyB, keyboard::Modifiers::empty(), Some("b"))], "b"),
+            (
+                vec![key(
+                    "a",
+                    Code::KeyA,
+                    keyboard::Modifiers::empty(),
+                    Some("a"),
+                )],
+                "a",
+            ),
+            (
+                vec![
+                    undo.clone(),
+                    key("b", Code::KeyB, keyboard::Modifiers::empty(), Some("b")),
+                ],
+                "b",
+            ),
             (vec![undo.clone()], ""),
             (vec![redo.clone()], "b"),
             (vec![undo, redo], "b"),

@@ -64,7 +64,8 @@ mod tests {
 
     #[test]
     fn fish_markers_preserve_both_prompts_pipeline_status_and_exact_output() {
-        let script = format!(r#"
+        let script = format!(
+            r#"
 function fish_prompt
     printf 'status=%s,pipeline=%s\n\n' $status "$pipestatus"
     set -g __cagents_probe_state yes
@@ -81,19 +82,32 @@ printf 'left-return=%s,state=%s\n' $status "$__cagents_probe_state"
 false | true
 fish_right_prompt
 printf 'right-return=%s\n' $status
-"#);
-        let result = match std::process::Command::new("fish").args(["--no-config", "-c", &script]).output() {
+"#
+        );
+        let result = match std::process::Command::new("fish")
+            .args(["--no-config", "-c", &script])
+            .output()
+        {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(error) => panic!("Run fish prompt fixture: {error}"),
         };
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         assert_eq!(result.stdout, b"\x1b]133;A\x07status=0,pipeline=1 0\n\n\x1b]133;B\x07left-return=7,state=yes\n\x1b]133;P;k=r\x07right=0,pipeline=1 0\x1b]133;B\x07right-return=9\n");
     }
 
     #[test]
     fn right_prompt_markers_keep_the_cursor_on_the_prompt_row() {
-        let mut terminal = Terminal::new(TerminalOptions { cols: 40, rows: 6, max_scrollback: 100 }).unwrap();
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 6,
+            max_scrollback: 100,
+        })
+        .unwrap();
         terminal.vt_write(b"\x1b]133;A\x07> \x1b]133;B\x07");
         let prompt_row = terminal.cursor_y().unwrap();
         terminal.vt_write(b"\x1b[30G\x1b]133;P;k=r\x07right\x1b]133;B\x07");
