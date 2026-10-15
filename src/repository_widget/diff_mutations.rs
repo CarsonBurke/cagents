@@ -195,7 +195,7 @@ impl RepositoryRuntime {
             let replaces_all = change.as_ref().is_some_and(|change|
                 change.start == (text_editor::Position { line: 0, column: 0 })
                     && change.inserted.is_empty()
-                    && content_matches(&document.content, &change.removed));
+                    && document.content.text_len() == change.removed.len());
             if !matches!(mode, Some(0o100644 | 0o100755))
                 || (!document.content.is_empty() && !replaces_all) {
                 return Err("The complete current file and its mode are required before removing it.".into());
