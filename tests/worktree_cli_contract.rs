@@ -228,6 +228,27 @@ impl Fixture {
         assert!(output.stdout.is_empty(), "JSON errors belong to stderr: {output:?}");
         serde_json::from_slice(&output.stderr).unwrap_or_else(|error| panic!("Invalid error JSON: {error}: {output:?}"))
     }
+    fn release_completed_setup(
+        client: &mut cagents::control::ControlClient,
+        expected: &cagents::model::TerminalSession,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let completed = loop {
+            let current = client.list().unwrap().into_iter()
+                .find(|terminal| terminal.session.id == expected.id)
+                .expect("the completed setup terminal remains visible until explicit close");
+            assert_eq!(current.session.launch, expected.launch);
+            if matches!(&current.session.continuity,
+                cagents::model::TerminalContinuity::Exited { .. }
+                | cagents::model::TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }) {
+                break current.session;
+            }
+            assert!(Instant::now() < deadline, "setup did not reach an ended result before explicit close");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(client.release_completed_terminal(completed, false).unwrap(),
+            cagents::terminal_ipc::TerminalCloseResult::Closed);
+    }
     fn refusal(&self, target: &str, contains: &str) {
         let output = self.output(&["worktree", "remove", target]);
         assert!(!output.status.success(), "{output:?}");
@@ -1016,10 +1037,7 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
         "retained setup holder must be explicitly cleaned up before retrying"
     );
     assert_eq!(fixture.setup_intent(&path)["run_id"], run.to_string());
-    assert_eq!(
-        client.close_terminal_checked(session.id, false).unwrap(),
-        cagents::terminal_ipc::TerminalCloseResult::Closed
-    );
+    Fixture::release_completed_setup(&mut client, &session);
     let device_service::Reply::Worktree(Reply::SetupPrepared {
         setup: None,
         run_id: skipped_run,
@@ -1413,7 +1431,7 @@ fn proved_setup_family_cleanup_allows_fresh_reviewed_commands() {
     }};
     assert!(client.device_operation(resume(Some(first_run))).is_err(),"a completed screen still owns its original setup lease until explicit cleanup");
     assert_eq!(fixture.setup_intent(&path)["run_id"],first_run.to_string());
-    assert_eq!(client.close_terminal_checked(first.id,false).unwrap(),cagents::terminal_ipc::TerminalCloseResult::Closed);
+    Fixture::release_completed_setup(&mut client, &first);
     let device_service::Reply::Worktree(Reply::SetupPrepared{setup:Some(second),run_id:second_run,warnings,..})=client.device_operation(resume(Some(first_run))).unwrap() else {panic!("wrong reviewed retry result")};
     assert!(warnings.is_empty(),"{warnings:?}");
     assert!(second.error.is_none(),"{second:?}");
@@ -1426,7 +1444,7 @@ fn proved_setup_family_cleanup_allows_fresh_reviewed_commands() {
     assert_eq!(fixture.setup_intent(&path)["run_id"],second_run.to_string());
     assert!(client.device_operation(resume(Some(first_run))).is_err(),"old approval cannot advance the current retry");
     assert_eq!(fixture.setup_intent(&path)["run_id"],second_run.to_string());
-    assert_eq!(client.close_terminal_checked(second.id,false).unwrap(),cagents::terminal_ipc::TerminalCloseResult::Closed);
+    Fixture::release_completed_setup(&mut client, &second);
 }
 
 #[test]
@@ -1576,7 +1594,7 @@ fn edited_pending_setup_cannot_use_a_current_runs_trust_for_a_different_recipe()
     let mut recipe = canonical.clone(); recipe.program = "/bin/bash".into(); altered.push(recipe);
     let mut recipe = canonical.clone(); recipe.environment.insert("ENV".into(), path.join("unreviewed-env").to_string_lossy().into_owned()); altered.push(recipe);
     let mut recipe = canonical.clone(); recipe.unset_environment.insert("PATH".into()); altered.push(recipe);
-    for (approved, recipe) in altered.into_iter().map(|recipe| (false, recipe)).chain(std::iter::once((true, canonical))) {
+    for (approved, recipe) in altered.into_iter().map(|recipe| (false, recipe)).chain(std::iter::once((true, canonical.clone()))) {
         let model = client.read_workspace_model().unwrap();
         let view = model.views.iter().find(|view| view.scope == scope).unwrap();
         let before = view.panes.iter().find(|pane| pane.id == pane_id).unwrap().clone();
@@ -1604,5 +1622,5 @@ fn edited_pending_setup_cannot_use_a_current_runs_trust_for_a_different_recipe()
         thread::sleep(Duration::from_millis(20));
     }
     assert!(!path.join("unauthorized-setup").exists());
-    assert_eq!(client.close_terminal_checked(terminal, false).unwrap(), cagents::terminal_ipc::TerminalCloseResult::Closed);
+    Fixture::release_completed_setup(&mut client, &session(canonical));
 }
