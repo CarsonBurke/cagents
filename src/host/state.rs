@@ -177,6 +177,7 @@ impl Subscriptions {
             .retain(|(sent_client, _), _| *sent_client != client_id);
         self.output.retain(|(client, _), _| *client != client_id);
         self.viewports.retain(|(client, _), _| *client != client_id);
+        self.worker_instances.retain(|(client, _), _| *client != client_id);
         for terminal_id in terminals.keys() {
             if let Some(clients) = self.by_terminal.get_mut(terminal_id) {
                 clients.remove(&client_id);
@@ -200,6 +201,7 @@ impl Subscriptions {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     fn visibility(&self, terminal_id: TerminalId) -> TerminalVisibility {
         let mut effective = TerminalVisibility::Hibernated;
         let Some(clients) = self.by_terminal.get(&terminal_id) else {
@@ -698,7 +700,7 @@ impl HostState {
             .subscriptions
             .by_client
             .get(&client_id)
-            .map(|terminals| terminals.keys().copied().collect::<Vec<_>>())
+            .map(|terminals| terminals.keys().copied().filter(|id|self.subscription_current(client_id,*id)).collect::<Vec<_>>())
             .unwrap_or_default();
         let handles = terminal_ids
             .iter()
@@ -711,7 +713,7 @@ impl HostState {
         self.subscriptions.disconnect(client_id);
         for terminal_id in terminal_ids {
             self.refresh_presentation_owner(terminal_id);
-            let visibility = self.subscriptions.visibility(terminal_id);
+            let visibility = self.current_visibility(terminal_id);
             if let Some(record) = self.terminals.get(&terminal_id) {
                 let _ = apply_visibility(&record.handle, visibility);
             }
@@ -740,11 +742,11 @@ impl HostState {
             self.attached_terminal(client_id,terminal_id)?;
             return self.descriptor(client_id, terminal_id);
         }
-        let old_visibility = self.subscriptions.visibility(terminal_id);
+        let old_visibility = self.current_visibility(terminal_id);
         self.subscriptions
             .attach(client_id, terminal_id, TerminalVisibility::Hidden);
         self.subscriptions.worker_instances.insert((client_id,terminal_id),record.handle.execution_instance());
-        let new_visibility = self.subscriptions.visibility(terminal_id);
+        let new_visibility = self.current_visibility(terminal_id);
         if old_visibility != new_visibility
             && let Err(error) = apply_visibility(&record.handle, new_visibility)
         {
@@ -773,10 +775,16 @@ impl HostState {
         else {
             return Ok(());
         };
+        // Stale cleanup may forget its own attachment, but cannot apply
+        // visibility/focus/output changes to the same-ID successor.
+        if !self.subscription_current(client_id,terminal_id) {
+            self.subscriptions.detach(client_id,terminal_id);
+            return Ok(());
+        }
         let old_worker=self.subscriptions.worker_instances.get(&(client_id,terminal_id)).copied();
-        let old_visibility = self.subscriptions.visibility(terminal_id);
+        let old_visibility = self.current_visibility(terminal_id);
         self.subscriptions.detach(client_id, terminal_id);
-        let new_visibility = self.subscriptions.visibility(terminal_id);
+        let new_visibility = self.current_visibility(terminal_id);
         if old_visibility != new_visibility
             && let Err(error) = apply_visibility(&record.handle, new_visibility)
         {
@@ -814,10 +822,10 @@ impl HostState {
                 false,
             ));
         };
-        let old_visibility = self.subscriptions.visibility(terminal_id);
+        let old_visibility = self.current_visibility(terminal_id);
         self.subscriptions
             .set_visibility(client_id, terminal_id, requested);
-        let new_visibility = self.subscriptions.visibility(terminal_id);
+        let new_visibility = self.current_visibility(terminal_id);
         if old_visibility != new_visibility
             && let Err(error) = apply_visibility(&record.handle, new_visibility)
         {
@@ -847,6 +855,7 @@ impl HostState {
     }
 
     fn rearm_output(&mut self, client_id: ClientId, terminal_id: TerminalId) {
+        if !self.subscription_current(client_id,terminal_id) {return;}
         let Some(observation) = self.subscriptions.output.get_mut(&(client_id, terminal_id)) else {
             return;
         };
@@ -872,6 +881,7 @@ impl HostState {
             .is_some_and(|clients| {
                 clients.iter().any(|(client, visibility)| {
                     *visibility != TerminalVisibility::Visible
+                        && self.subscription_current(*client,terminal_id)
                         && self
                             .subscriptions
                             .output
@@ -916,7 +926,7 @@ impl HostState {
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
         self.descriptor_as(
-            self.subscriptions.attached(client_id, terminal_id),
+            self.subscription_current(client_id, terminal_id),
             terminal_id,
         )
     }
@@ -1189,6 +1199,21 @@ impl HostState {
         self.subscriptions.worker_instances.insert((client_id,terminal_id),execution_instance);
         self.rearm_output(client_id, terminal_id);
         self.descriptor(client_id, terminal_id)
+    }
+
+    fn current_visibility(&self,id:TerminalId)->TerminalVisibility {
+        let mut effective=TerminalVisibility::Hidden;
+        let mut any=false;
+        for (client,visibility) in self.subscriptions.by_terminal.get(&id).into_iter().flat_map(|clients|clients.iter()) {
+            if !self.subscription_current(*client,id) {continue;}
+            if !any {effective=TerminalVisibility::Hibernated;any=true;}
+            match visibility {
+                TerminalVisibility::Visible=>return TerminalVisibility::Visible,
+                TerminalVisibility::Hidden=>effective=TerminalVisibility::Hidden,
+                TerminalVisibility::Hibernated=>{}
+            }
+        }
+        effective
     }
 
     fn subscription_current(&self,client:ClientId,id:TerminalId)->bool {
@@ -3886,7 +3911,7 @@ fn broadcast_redraw_from(host: &Weak<HostLock>, terminal_id: TerminalId, generat
         if visible.is_empty() {
             // Serialize visibility commands with attachment/reveal changes.
             // Otherwise this Hide could overtake a newly attached UI's Reveal.
-            if state.subscriptions.visibility(terminal_id) == TerminalVisibility::Hidden
+            if state.current_visibility(terminal_id) == TerminalVisibility::Hidden
                 && let Some(record) = state.terminals.get(&terminal_id)
             {
                 let _ = record.handle.hide();
@@ -4523,6 +4548,9 @@ mod tests {
         let successor=TerminalHandle::spawn(source.clone(),Default::default(),|_|{}).unwrap();
         let mut state=test_host();let old_delivery=state.register_client(1);state.reserve_spawn(id).unwrap();
         state.finish_spawn(1,source,original.clone(),false).unwrap();
+        state.set_visibility(1,id,TerminalVisibility::Visible).unwrap();
+        state.resize_client(1,id,crate::terminal::TerminalSize {columns:80,rows:24,cell_width_px:8,cell_height_px:16}).unwrap();
+        state.focus_client(1,id,true).unwrap();
         state.terminals.get_mut(&id).unwrap().handle=successor.clone();
         assert_ne!(original.execution_instance(),successor.execution_instance());
         assert_eq!(state.surface_handle(1,id).unwrap_err().code,ProtocolErrorCode::ProofMismatch);
@@ -4531,8 +4559,26 @@ mod tests {
         assert!(state.attach(1,id).is_err(),"an old connection cannot refresh its own stale subscription authority");
         let fresh_delivery=state.register_client(2);let descriptor=state.attach(2,id).unwrap();
         assert_eq!(descriptor.execution_instance,successor.execution_instance());
+        assert_eq!(state.current_visibility(id),TerminalVisibility::Hidden,"stale visible client must not reveal successor");
+        state.set_visibility(2,id,TerminalVisibility::Visible).unwrap();
+        state.resize_client(2,id,crate::terminal::TerminalSize {columns:120,rows:36,cell_width_px:8,cell_height_px:16}).unwrap();
+        assert_eq!(state.subscriptions.size_owners.get(&id),Some(&2),"old focused viewport must not win current size ownership");
+        // A stale client's teardown cannot return the successor to connection
+        // cleanup, or change its presentation after a new owner has attached.
+        state.register_client(3);
+        state.subscriptions.attach(3,id,TerminalVisibility::Visible);
+        state.subscriptions.worker_instances.insert((3,id),original.execution_instance());
+        state.subscriptions.viewports.entry((3,id)).or_default().focused=true;
+        state.detach(3,id).unwrap();
+        assert_eq!(state.subscriptions.size_owners.get(&id),Some(&2));
+        assert!(state.unregister_client(1).is_empty(),"stale connection cleanup must not retain successor handle");
+        assert!(!state.descriptor(1,id).unwrap().attached);
+        assert_eq!(state.subscriptions.size_owners.get(&id),Some(&2));
         assert!(state.surface_handle(2,id).unwrap().same_worker(&successor));
         assert!(!successor.is_completed(),"refusing stale input must preserve the new owner");
+        old_delivery.close_after_drain();
+        while old_delivery.pop().is_some() {}
+        // Fresh visibility also queued a redraw; retain only following events.
         let shared=Arc::new(crate::host::state::HostLock::new(state));
         record_event_from(&Arc::downgrade(&shared),id,TerminalEvent::TitleChanged("STALE_OLD_WORKER".into()),Some(&original));
         broadcast_redraw_from(&Arc::downgrade(&shared),id,999,Some(original.execution_instance()));
@@ -4540,7 +4586,11 @@ mod tests {
         record_event_from(&Arc::downgrade(&shared),id,TerminalEvent::TitleChanged("successor-only".into()),Some(&successor));
         old_delivery.close_after_drain();fresh_delivery.close_after_drain();
         assert!(old_delivery.pop().is_none(),"new worker semantic payload must never inherit old subscription authority");
-        assert!(matches!(fresh_delivery.pop().unwrap().message,ServerMessage::Event {event:WireTerminalEvent::TitleChanged {title},..} if title=="successor-only"));
+        let mut titles=Vec::new();
+        while let Some(message)=fresh_delivery.pop() {
+            if let ServerMessage::Event {event:WireTerminalEvent::TitleChanged {title},..}=message.message {titles.push(title);}
+        }
+        assert_eq!(titles,vec!["successor-only".to_owned()]);
         original.shutdown().unwrap();successor.shutdown().unwrap();
     }
 

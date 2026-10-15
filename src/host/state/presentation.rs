@@ -170,6 +170,7 @@ impl HostState {
             .flat_map(|clients| clients.iter())
             .filter(|(client, visibility)| {
                 **visibility == TerminalVisibility::Visible
+                    && self.subscription_current(**client,id)
                     && self
                         .subscriptions
                         .viewports
@@ -186,7 +187,7 @@ impl HostState {
         let owner = owner
             .or_else(|| {
                 previous.filter(|client| {
-                    self.subscriptions
+                    self.subscription_current(*client,id) && self.subscriptions
                         .by_client
                         .get(client)
                         .and_then(|terminals| terminals.get(&id))
@@ -197,7 +198,7 @@ impl HostState {
                 self.subscriptions.by_terminal.get(&id).and_then(|clients| {
                     clients
                         .iter()
-                        .find(|(_, visible)| **visible == TerminalVisibility::Visible)
+                        .find(|(client, visible)| **visible == TerminalVisibility::Visible && self.subscription_current(**client,id))
                         .map(|(client, _)| *client)
                 })
             });
