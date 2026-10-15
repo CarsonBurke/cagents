@@ -4948,7 +4948,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_running_tool_turn_stops_showing_working() {
+    fn cancelled_outcome_stops_running_tool_turn() {
         let items = [chat::Item {
             id: "cancelled-tool".into(),
             role: chat::Role::Assistant,

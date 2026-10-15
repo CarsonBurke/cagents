@@ -1070,31 +1070,27 @@ mod tests {
     }
 
     #[test]
-    fn marking_all_read_retains_channel_until_attention_filter_reentry() {
+    fn marking_all_read_retains_only_previously_qualified_channels() {
         let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         let channel = ChannelId::new();
-        Arc::make_mut(&mut app.durable)
-            .channels
-            .push(ProjectChannel {
-                title_source: Default::default(),
-                id: channel,
-                project_id: ProjectId::new(),
-                title: "Unread".into(),
-                ordinal: 0,
-                shared: false,
-                cards: vec![card],
-                focused: Some(card),
+        let already_read = super::super::tests::terminal_card_state();
+        let read_id = already_read.id;
+        let read_channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(already_read);
+        for (id, card, title) in [(channel, card, "Unread"), (read_channel, read_id, "Already read")] {
+            durable.channels.push(ProjectChannel {
+                title_source: Default::default(), id, project_id: ProjectId::new(), title: title.into(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card),
             });
-        app.sidebar_state
-            .apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
+        }
+        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
         app.sidebar_state.observe_card_update(card);
-        drop(app.mark_cards_read(vec![card]));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
         assert!(!app.sidebar_state.has_card_update(card));
-        assert!(
-            app.sidebar_state
-                .attention_retained(sidebar::SelectionRow::Channel(channel))
-        );
+        assert!(app.sidebar_state.attention_retained(sidebar::SelectionRow::Channel(channel)));
+        assert!(!app.sidebar_state.attention_retained(sidebar::SelectionRow::Channel(read_channel)), "bulk read must not promote a previously hidden read channel");
     }
 
     #[test]
