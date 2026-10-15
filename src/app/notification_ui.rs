@@ -753,7 +753,7 @@ impl Cagents {
     /// never grants launch authority: require one live owner, its proof, and a
     /// currently open exact placement. Model ambiguity is deferred, not guessed.
     fn resolved_activation_agent(&self, session: TerminalId) -> Option<ManagedActivation> {
-        use crate::agent_execution::{HostedSession, Placement};
+        use crate::agent_execution::Placement;
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return None;
         }
@@ -767,26 +767,10 @@ impl Cagents {
         if owners.next().is_some() {
             return None;
         }
-        let requested: Vec<_> = agent.session.iter().filter(|owner| owner.id() == session).cloned()
-            .chain(agent.console.iter().filter(|owner| owner.id == session).cloned().map(HostedSession::Terminal))
-            .collect();
-        // A shared UUID names both typed descriptors. Do not hide an
-        // incomplete counterpart by retaining only its proved sibling.
-        if requested.iter().any(|owner| !owner.has_complete_proof()) { return None; }
-        let requested_owner = requested.first()?.clone();
-        let display = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model)
-            .resolve_activation(agent, &requested_owner)?;
-        // A shared UUID can legitimately name both typed surfaces of this one
-        // actor. Existing canonical membership disambiguates the display. With
-        // no saved surface, an ambiguous UUID is insufficient to create one.
-        if display.pane.is_none() && requested.iter().any(|other| !requested_owner.same_process(other)) { return None; }
-        let owner = match display.pane.as_ref().map(|pane| &pane.kind) {
-            Some(CardKind::Chat(session)) => HostedSession::Chat(session.clone()),
-            Some(CardKind::Terminal(session)) => HostedSession::Terminal(session.clone()),
-            Some(_) => return None,
-            None => requested_owner,
-        };
-        if !owner.has_complete_proof() { return None; }
+        let resolved = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model)
+            .activation_display(agent, session)?;
+        let display = resolved.display;
+        let owner = resolved.session;
         let repository = match &display.scope {
             Placement::Channel(id) => {
                 let shared = self.workspace_model.channel(*id)?;
@@ -1630,6 +1614,32 @@ mod tests {
             assert_eq!(app.durable.cards, saved_cards);
             assert_eq!(app.workspace_model.agents[0], original);
         }
+    }
+
+    #[test]
+    fn attention_fresh_headless_pair_mounts_primary_once_without_replaying_provider() {
+        use crate::agent_execution::HostedSession;
+        let (mut app, mut agent) = scheduled_attention_fixture();
+        let console = agent.console.clone().unwrap();
+        let native = crate::chat::Session {
+            native_continuity: Default::default(), id: console.id,
+            proof: console.continuity.live_proof(), terminal: Some(console.clone()), owned_codex_listener: None,
+            launch: crate::chat::Launch { provider: agent.spec.provider, session_id: None, recipe: console.launch.clone() },
+        };
+        agent.session = Some(HostedSession::Chat(native.clone()));
+        let original = agent.clone();
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        let initial_count = app.durable.cards.len();
+        assert!(app.workspace_model.views.iter().all(|view| view.panes.iter().all(|pane| pane.id != id)));
+        app.workspace_model.agents.push(agent);
+        drop(app.update_notifications(Action::Activated(Target::Session(console.id))));
+        assert_eq!(app.workspace.focused(), Some(id));
+        assert_eq!(app.card_state(id).unwrap().kind, CardKind::Chat(native));
+        assert_eq!(app.durable.cards.len(), initial_count + 1);
+        assert_eq!(app.workspace_model.agents[0], original, "activation cannot rewrite or replay the actor");
+        drop(app.update_notifications(Action::Activated(Target::Session(console.id))));
+        assert_eq!(app.workspace.focused(), Some(id));
+        assert_eq!(app.durable.cards.len(), initial_count + 1, "repeated clicks reuse canonical membership");
     }
 
     #[test]
