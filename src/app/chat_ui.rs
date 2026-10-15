@@ -25,6 +25,7 @@ mod images;
 mod layout;
 mod markdown_source;
 mod monospace;
+mod outcomes;
 mod permissions;
 mod prose;
 mod retained;
@@ -1498,6 +1499,7 @@ pub(super) struct Runtime {
     snapshot: Arc<Snapshot>,
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
+    turn_outcome_markers: HashMap<String, outcomes::Marker>,
     cache: HashMap<String, CachedItem>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
@@ -2069,6 +2071,7 @@ impl Runtime {
             }),
             source_clock: None,
             finished_stamp: None,
+            turn_outcome_markers: HashMap::new(),
             connection,
             queued: None,
             followups: Vec::new(),
@@ -2145,6 +2148,7 @@ impl Runtime {
     fn forget_transcript(&mut self) {
         self.cache.clear();
         self.turns.clear();
+        self.turn_outcome_markers.clear();
         self.selected_subagent = None;
         self.subagent_scroll.clear();
         self.page_request = None;
@@ -2573,6 +2577,14 @@ impl Runtime {
         // A cancel armed for one turn must not carry over to the next.
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
+        }
+        if !Arc::ptr_eq(&snapshot.turn_outcomes, &self.snapshot.turn_outcomes)
+            || snapshot.session_id != self.snapshot.session_id
+            || snapshot.items.len() != self.snapshot.items.len()
+            || snapshot.items.first().map(|item| &item.id) != self.snapshot.items.first().map(|item| &item.id)
+            || snapshot.items.last().map(|item| &item.id) != self.snapshot.items.last().map(|item| &item.id)
+        {
+            self.turn_outcome_markers = outcomes::project(&snapshot);
         }
         self.snapshot = snapshot;
         images::sync(self);

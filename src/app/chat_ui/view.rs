@@ -3093,6 +3093,7 @@ impl Runtime {
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
             (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
+            self.turn_outcome_markers.get(&item.id).hash(&mut hasher);
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied
@@ -3187,6 +3188,23 @@ impl Runtime {
         }
     }
 
+    fn turn_outcome_marker(&self, item: &chat::Item) -> Option<Element<'static, Message>> {
+        let marker = self.turn_outcome_markers.get(&item.id)?;
+        let (icon, class) = match marker.tone {
+            outcomes::Tone::Finished => (Icon::Check, design::muted_text as fn(&cosmic::Theme) -> iced::widget::text::Style),
+            outcomes::Tone::Cancelled => (Icon::Cancel, design::muted_text as fn(&cosmic::Theme) -> iced::widget::text::Style),
+            outcomes::Tone::Failed => (Icon::Warning, design::destructive_text as fn(&cosmic::Theme) -> iced::widget::text::Style),
+        };
+        Some(widget::tooltip(
+            widget::row::with_children(vec![
+                widget::icon(icon.handle()).size(design::COMPACT_ICON_SIZE).into(),
+                design::caption(marker.label.clone()).class(cosmic::theme::Text::Custom(class)).into(),
+            ]).spacing(step::GAP_S).align_y(Alignment::Center),
+            design::caption(marker.detail.clone()),
+            widget::tooltip::Position::Top,
+        ).into())
+    }
+
     /// The rows of one exchange, with `step` drawing each of its steps and
     /// `card` each of its messages to and launches of other agents.
     fn turn_rows<'s, 'a>(
@@ -3219,6 +3237,9 @@ impl Runtime {
                     MESSAGE_ACTION_FOOTER,
                 );
             }
+            if let Some(marker) = self.turn_outcome_marker(item) {
+                rows.push(marker);
+            }
         }
         if !turn.steps.is_empty() {
             let mut strip = self.step_strip(turn, || {
@@ -3236,6 +3257,11 @@ impl Runtime {
                     .into();
             }
             rows.push(strip);
+            for placed in &turn.steps {
+                if let Some(marker) = items.get(placed.index).and_then(|item| self.turn_outcome_marker(item)) {
+                    rows.push(marker);
+                }
+            }
         }
         for prose in &turn.prose {
             let Some((item, cached)) = placed(prose.index) else {
@@ -3248,6 +3274,7 @@ impl Runtime {
                     scroll::item(&item.id, card(item, cached, coordinated)),
                     Self::prose_action_footer(item, cached, prose.slot),
                 );
+                if let Some(marker) = self.turn_outcome_marker(item) { rows.push(marker); }
                 continue;
             }
             rows.message(
@@ -3265,6 +3292,7 @@ impl Runtime {
                 ),
                 Self::prose_action_footer(item, cached, prose.slot),
             );
+            if let Some(marker) = self.turn_outcome_marker(item) { rows.push(marker); }
         }
         widget::container(widget::column::with_children(rows.children).width(Length::Fill))
             .id(iced::advanced::widget::Id::new(format!(
@@ -5054,6 +5082,59 @@ mod tests {
             );
             assert!(runtime.turns.iter().all(|turn| !turn.running));
         }
+    }
+
+    #[test]
+    fn attention_persisted_cancelled_marker_survives_queued_work_and_invalidates_only_its_exact_row() {
+        use chat::turn_outcomes::{TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome};
+        let item = |id: &str, role| chat::Item {
+            id: id.into(), role, started_at: None, at: Some(1000),
+            content: ItemContent::Text { text: id.into(), thinking: false, phase: chat::Phase::Final },
+        };
+        let items = [item("input-A", chat::Role::User), item("answer-A", chat::Role::Assistant),
+            item("input-B", chat::Role::User), item("answer-B", chat::Role::Assistant)];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.session_id = Some("proved-session".into());
+        snapshot.busy = true;
+        snapshot.turn_generation = 2;
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turns.len(), 2);
+        let before = runtime.turns.iter().map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000))).collect::<Vec<_>>();
+        snapshot.generation += 1;
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 1, complete: true, records: vec![VisibleTurnOutcome {
+            outcome: TurnOutcome { identity: TurnIdentity { session_id: "proved-session".into(), kind: TurnIdentityKind::AcceptedInput, id: "confirmed-A".into() },
+                outcome: crate::agent::ActivityOutcome::Cancelled, finished_at: 1234 }, item_ids: vec!["input-A".into()],
+        }] });
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert!(runtime.snapshot.busy);
+        assert_eq!(runtime.snapshot.turn_generation, 2);
+        assert!(runtime.snapshot.outcome.is_none(), "late historical proof cannot settle B");
+        assert_eq!(runtime.conversation_status(false), (Some(Icon::AgentWorking), "Responding"));
+        assert!(runtime.turn_outcome_markers["input-A"].label.starts_with("Cancelled"));
+        assert!(!runtime.turn_outcome_markers.contains_key("input-B"));
+        let after = runtime.turns.iter().map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000))).collect::<Vec<_>>();
+        assert_ne!(before[0], after[0], "an outcome-only projection must invalidate the retained row that draws it");
+        assert_eq!(before[1], after[1], "unrelated streaming work must retain its existing row");
+        // A subsequent delta can carry the unchanged projection by Arc. It
+        // must not erase A's marker when B completes and its footer changes.
+        snapshot.generation += 1;
+        snapshot.busy = false;
+        snapshot.finished_at = Some(9000);
+        snapshot.outcome = Some(crate::agent::ActivityOutcome::Succeeded);
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert!(runtime.turn_outcome_markers["input-A"].label.starts_with("Cancelled"));
+        assert_eq!(runtime.conversation_status(false).1, "Finished");
+        let replay: Snapshot = postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
+        let (mut reattached, new_handle) = frame_cost::live_runtime(&items);
+        new_handle.replace_snapshot_for_test(replay);
+        reattached.refresh();
+        assert_eq!(reattached.turn_outcome_markers, runtime.turn_outcome_markers,
+            "a newly attached UI projects the same supplied durable outcome without local history state");
     }
 
     #[test]
