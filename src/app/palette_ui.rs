@@ -1997,7 +1997,7 @@ impl Cagents {
         Task::none()
     }
 
-    fn palette_origin(&self) -> PaletteOrigin {
+    pub(super) fn palette_origin(&self) -> PaletteOrigin {
         self.command_origin(self.workspace.focused(), true)
     }
 
@@ -2045,7 +2045,7 @@ impl Cagents {
 
     /// Availability is shared by palette listing and execution. A stale menu
     /// or shortcut cannot turn an unavailable command into a silent no-op.
-    fn command_context(&self, card: Option<CardId>) -> workspace_widget::CommandContext {
+    pub(super) fn command_context(&self, card: Option<CardId>) -> workspace_widget::CommandContext {
         self.command_context_for_device(card, crate::device::is_remote())
     }
 
@@ -2714,10 +2714,31 @@ impl Cagents {
         }
     }
 
+    pub(super) fn chrome_command_context(&self) -> workspace_widget::CommandContext {
+        let mut context = self.command_context(self.workspace.focused());
+        // A toolbar popup addresses the selected workspace. Last keyboard
+        // focus in the sidebar is not its originating row command.
+        context.sidebar_commands = None;
+        context
+    }
+
+    pub(super) fn run_chrome_workspace_command(&mut self, command: Command) -> Task<Message> {
+        self.run_workspace_command_with_scope(command, keyboard::Modifiers::empty(), false)
+    }
+
     pub(super) fn run_workspace_command(
         &mut self,
         command: Command,
         modifiers: keyboard::Modifiers,
+    ) -> Task<Message> {
+        self.run_workspace_command_with_scope(command, modifiers, true)
+    }
+
+    fn run_workspace_command_with_scope(
+        &mut self,
+        command: Command,
+        modifiers: keyboard::Modifiers,
+        allow_sidebar: bool,
     ) -> Task<Message> {
         if self.workspace_inputs_blocked()
             && !(command == Command::ToggleInspector
@@ -2726,14 +2747,19 @@ impl Cagents {
         {
             return Task::none();
         }
-        if !self.command_available(command) {
+        let context = if allow_sidebar {
+            self.command_context(self.workspace.focused())
+        } else {
+            self.chrome_command_context()
+        };
+        if !workspace_widget::shortcut_descriptor(command).available(&context) {
             self.status = Some(TransientNotice::warning(format!(
                 "{} is unavailable in the current context",
                 workspace_widget::shortcut_descriptor(command).label
             )));
             return Task::none();
         }
-        if command.sidebar_command_bit().is_some() && self.sidebar_command_target().is_some() {
+        if allow_sidebar && command.sidebar_command_bit().is_some() && self.sidebar_command_target().is_some() {
             return self.run_registered_command(command);
         }
         match command {
