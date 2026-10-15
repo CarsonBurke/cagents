@@ -8844,6 +8844,9 @@ fn editable_document_view<'a>(
             })
             .key_binding(move |press| {
                 use iced::keyboard::{Key, key::Named};
+                // Highlighted dependency sources retain caret/copy/navigation,
+                // while Tab leaves the read-only viewer through normal focus traversal.
+                if runtime.is_read_only_source() && matches!(&press.key, Key::Named(Named::Tab)) { return None; }
                 if let Some(delta) = crate::interaction::font_zoom_chord(
                     &press.key,
                     press.physical_key,
