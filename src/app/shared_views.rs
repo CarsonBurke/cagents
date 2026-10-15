@@ -1043,7 +1043,9 @@ impl Cagents {
         for pane in self.workspace_model.views.iter().flat_map(|view| &view.panes).filter(|pane| local_cards.contains(&pane.id)) {
             if !seen.insert(pane.id) { ambiguous.insert(pane.id); }
             if let CardKind::Chat(session) = &pane.kind {
-                self.shared_views.observed_chats.insert(pane.id, session.clone());
+                if self.shared_views.observed_chats.get(&pane.id) != Some(session) {
+                    self.shared_views.observed_chats.insert(pane.id, session.clone());
+                }
             } else {
                 self.shared_views.observed_chats.remove(&pane.id);
             }
@@ -1378,10 +1380,13 @@ impl Cagents {
                 self.retain_local_pane(id);
                 if view.retired.contains(&id)
                     && !self.chat_start_pending(id)
-                    && let Some(source) = self.shared_views.observed_chats.get(&id).cloned()
-                    && matches!(self.card_state(id).map(|card| &card.kind), Some(CardKind::Chat(session)) if super::chat_ui::closed_draft_source_matches(&source, session))
+                    && let Some(source) = self.shared_views.observed_chats.get(&id)
+                    && matches!(self.card_state(id).map(|card| &card.kind), Some(CardKind::Chat(session)) if super::chat_ui::closed_draft_source_matches(source, session))
                 {
-                    self.shared_views.closed_chats.insert(id, source);
+                    if self.shared_views.closed_chats.get(&id) != Some(source) {
+                        let source = source.clone();
+                        self.shared_views.closed_chats.insert(id, source);
+                    }
                     self.sync_closed_chat_draft(id);
                 }
                 self.status = Some(TransientNotice::warning(
