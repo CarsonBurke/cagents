@@ -1251,6 +1251,32 @@ fn shortcut_matches_pressed_key(chords: &str, event: Option<&keyboard::Event>) -
     })
 }
 
+fn fixed_shortcut_matches_pressed_key(
+    fixed: &settings::FixedShortcut,
+    event: Option<&keyboard::Event>,
+) -> bool {
+    let Some(event) = event else {
+        return true;
+    };
+    if let Some(expected) = fixed.font_zoom_delta {
+        let keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        return crate::interaction::font_zoom_chord(key, *physical_key, *modifiers)
+            == Some(expected);
+    }
+    fixed
+        .chords
+        .iter()
+        .any(|chord| shortcut_matches_pressed_key(chord, Some(event)))
+}
+
 fn keyboard_groups<'a>(
     draft: &'a SettingsDraft,
     invalid: &'a HashMap<SettingsField, String>,
@@ -1289,7 +1315,7 @@ fn keyboard_groups<'a>(
             .filter(|fixed| fixed.scope == group)
         {
             let keys = fixed.chords.join(", ");
-            if !shortcut_matches_pressed_key(&keys, pressed_key) {
+            if !fixed_shortcut_matches_pressed_key(fixed, pressed_key) {
                 continue;
             }
             let row = widget::row::with_children(vec![
@@ -1762,6 +1788,47 @@ mod keyboard_table_tests {
             1,
             "a numpad digit matches neither the number-row nor symbol binding"
         );
+        let keypad_reset = press(
+            "0",
+            "0",
+            keyboard::key::Code::Numpad0,
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(
+            crate::interaction::font_zoom_chord(
+                &keyboard::Key::Character("0".into()),
+                keyboard::key::Physical::Code(keyboard::key::Code::Numpad0),
+                keyboard::Modifiers::CTRL,
+            ),
+            Some(0),
+            "the actual native handler accepts this logical keypad zero"
+        );
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&keypad_reset));
+        assert_eq!(app.settings_search, "Ctrl+0");
+        assert!(
+            !shortcut_matches_pressed_key("Ctrl+0", app.palette.pressed_key_filter()),
+            "configurable digit bindings still require the number row"
+        );
+        let fixed_matches: Vec<_> = settings::FIXED_SHORTCUTS
+            .iter()
+            .filter(|fixed| {
+                fixed_shortcut_matches_pressed_key(fixed, app.palette.pressed_key_filter())
+            })
+            .map(|fixed| fixed.label)
+            .collect();
+        assert_eq!(fixed_matches, ["Reset font size"]);
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .len(),
+            2,
+            "the pressed keypad filter renders its controls and the actual fixed reset row"
+        );
+
         drop(app.update_palette(palette_ui::Action::FilterKey));
         drop(app.palette_key_event(&press(
             "à",
