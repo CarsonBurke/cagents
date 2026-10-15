@@ -41,6 +41,15 @@ impl ReadSource {
             .with_worktree_authority(authority)
             .map_err(|e| e.to_string())
     }
+    pub fn validate_original(&self) -> Result<(), String> {
+        self.authority
+            .get()
+            .ok_or("The original source snapshot is unavailable")?
+            .as_ref()
+            .map_err(Clone::clone)?
+            .validate()
+            .map_err(|e| e.to_string())
+    }
     fn mutation_service(
         &self,
     ) -> Result<

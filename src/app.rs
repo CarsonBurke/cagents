@@ -11024,6 +11024,7 @@ impl Cagents {
                         &cancellation,
                     )?;
                 }
+                read_source.validate_original()?;
                 Ok(snapshot)
             })
             .await
