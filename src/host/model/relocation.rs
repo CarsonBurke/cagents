@@ -64,7 +64,9 @@ mod tests {
         let card = CardId::new();
         let pane = Pane { id: card, title: "File".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.5, kind: CardKind::Repository(RepositoryView { project: ProjectId::new(), repository: relocation.repository.clone(), worktree: relocation.old_root.clone(), selected_file: Some("src/main.rs".into()) }), scope: Some(relocation.old_root.clone()) };
         let scope = Scope::Worktree { repository: relocation.repository.clone(), path: relocation.old_root.clone() };
-        registry.apply(&ModelEdit::SeedView { scope, panes: vec![pane], closed: vec![] }).unwrap();
+        let browser = CardKind::Browser(crate::model::BrowserSession { id: crate::model::BrowserId::new(), current_url: "https://example.invalid/current".parse().unwrap(), history: vec!["https://example.invalid/prior".parse().unwrap(), "https://example.invalid/current".parse().unwrap()], history_index: 1, scroll_x: 13.0, scroll_y: 42.0, fidelity: crate::model::BrowserRestoreFidelity::UrlOnly });
+        let browser_pane = Pane { id: CardId::new(), title: "Saved browser".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.5, kind: browser.clone(), scope: Some(relocation.old_root.clone()) };
+        registry.apply(&ModelEdit::SeedView { scope, panes: vec![pane, browser_pane], closed: vec![] }).unwrap();
         let before = registry.model().unwrap();
         let applied = registry.apply(&ModelEdit::RelocateProject { relocation: relocation.clone() }).unwrap();
         assert!(applied.changed);
@@ -75,6 +77,7 @@ mod tests {
         assert_eq!(after.channels[0].id, channel);
         assert_eq!(after.channels[0].repository, relocation.destination);
         assert_eq!(after.views[0].panes[0].id, card);
+        assert_eq!(after.views[0].panes[1].kind, browser, "browserless host preserves every saved browser field during relocation");
         assert_eq!(after.views[0].panes[0].scope.as_ref(), Some(&relocation.new_root));
         assert!(after.views[0].revision > before.views[0].revision);
         assert_eq!(after.views[0].scope, Scope::Worktree { repository: relocation.destination.clone(), path: relocation.new_root.clone() });
