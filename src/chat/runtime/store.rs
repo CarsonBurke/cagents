@@ -86,6 +86,7 @@ pub(crate) struct Store {
     pending_child_tool: Option<child_tools::Pending>,
     child_tools_unavailable: Option<&'static str>,
     child_tools_have_revocations: bool,
+    pending_child_source: Option<(String, String, String)>,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
@@ -190,6 +191,7 @@ impl Store {
                 pending_child_tool: None,
                 child_tools_unavailable: None,
                 child_tools_have_revocations: false,
+                pending_child_source: None,
             })
         })();
         if result.is_err() {
