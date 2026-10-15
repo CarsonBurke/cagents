@@ -143,6 +143,11 @@ impl Editor {
     }
 
     pub(super) fn checkout_action(&mut self, action: Action) -> Task<Message> {
+        if matches!(&action, Action::Resolve | Action::Create)
+            && self.checkout_dialog.as_ref().is_some_and(|dialog| self.editor_recovery_blocks(dialog.target.repository())) {
+            self.notice = Some("Resolve retained file recovery before creating another worktree from this source.".into());
+            return Task::none();
+        }
         match action {
             Action::JournalLoaded(result) => match result {
                 Ok((journal, reports)) => {

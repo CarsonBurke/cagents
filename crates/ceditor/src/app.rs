@@ -179,6 +179,7 @@ mod git_mutations;
 mod git_review;
 mod lsp_navigation;
 mod notification_ui;
+mod recovery;
 
 #[derive(Clone)]
 pub struct Flags {
@@ -280,6 +281,7 @@ struct FileOperationDialog {
 pub enum Message {
     Checkout(checkout::Action),
     GitReview(git_review::Action),
+    Recovery(recovery::Action),
     Choose(bool),
     Chosen(u64, Result<Option<PathBuf>, String>),
     Opened(u64, Result<Opened, String>),
@@ -653,6 +655,7 @@ pub struct Editor {
     tabs: Vec<Tab>,
     review_requests: pull_request_review::request_ui::monitor::Monitor,
     notifications: notification_ui::State,
+    recovery: Option<recovery::State>,
     active: Option<CardId>,
     selection_epoch: u64,
     git_groups: BTreeMap<PathBuf, git_mutations::GroupQueue>,
@@ -1264,6 +1267,10 @@ impl Editor {
             return Task::none();
         };
         let root = tab.runtime.descriptor.worktree.clone();
+        if self.editor_recovery_blocks(&root) {
+            self.notice = Some("Resolve retained file recovery before changing files in this worktree.".into());
+            return Task::none();
+        }
         if !duplicate && self.rename_blocked(&root.join(&source)) {
             self.notice = Some(
                 "Save this file and wait for pending file or Git operations before renaming it."
@@ -1293,6 +1300,10 @@ impl Editor {
         let Some(dialog) = self.file_dialog.as_ref().filter(|dialog| !dialog.busy) else {
             return Task::none();
         };
+        if self.editor_recovery_blocks(&dialog.root) {
+            self.file_dialog.as_mut().unwrap().error = Some("Resolve retained file recovery before changing files in this worktree.".into());
+            return Task::none();
+        }
         let destination = match file_operation_destination(&dialog.source, &dialog.name) {
             Ok(destination) => destination,
             Err(error) => {
@@ -1951,6 +1962,10 @@ impl Editor {
             self.notice = Some("Choose a location outside Untitled notes.".into());
             return Task::none();
         }
+        if self.editor_recovery_blocks_path(&path) {
+            self.notice = Some("Resolve retained file recovery before saving in this worktree.".into());
+            return Task::none();
+        }
         if let Err(error) = create_new_file(&path, &text) {
             self.notice = Some(error);
             return Task::none();
@@ -1966,7 +1981,7 @@ impl Editor {
     }
 
     fn remove_tab(&mut self, id: CardId) {
-        if self.tab(id).is_some_and(|tab| tab.runtime.has_editor_recovery()) {
+        if self.tab(id).is_some_and(|tab| self.editor_recovery_blocks(&tab.runtime.descriptor.worktree)) {
             self.notice = Some("The editor was retained until its file recovery finishes.".into());
             return;
         }
@@ -2383,6 +2398,10 @@ impl Editor {
     }
 
     fn request_close(&mut self, id: CardId) -> Task<Message> {
+        if self.tab(id).is_some_and(|tab| self.editor_recovery_blocks(&tab.runtime.descriptor.worktree)) {
+            self.notice = Some("Resolve this worktree's retained file recovery before closing its editor.".into());
+            return Task::none();
+        }
         let untitled_note = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab))
             && self.untitled_has_content(id)
             && !self.exiting;
@@ -2413,6 +2432,7 @@ impl Editor {
     }
 
     fn continue_exit(&mut self) -> Task<Message> {
+        if self.refuse_recovery_close() { return Task::none(); }
         if let Some(tab) = self.tabs.first() {
             return self.request_close(tab.id);
         }
@@ -3103,6 +3123,10 @@ impl Editor {
         queue_turn: Option<u64>,
     ) -> Option<PathBuf> {
         let tab = self.tab(id)?;
+        if self.editor_recovery_blocks(&tab.runtime.descriptor.worktree) {
+            self.notice = Some("Resolve retained file recovery before changing this worktree's Git state.".into());
+            return None;
+        }
         if !tab.git {
             return None;
         }
@@ -3495,6 +3519,7 @@ impl Application for Editor {
             tabs: Vec::new(),
             review_requests: Default::default(),
             notifications: Default::default(),
+            recovery: None,
             active: None,
             selection_epoch: 0,
             git_groups: BTreeMap::new(),
@@ -3608,6 +3633,11 @@ impl Application for Editor {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Recovery is owned before modal, source, tab or stale-receipt checks.
+        if let Message::Repository(action) = &message {
+            self.retain_repository_recovery(action);
+            if self.refuse_recovery_disk_action(action) { return Task::none(); }
+        }
         if let Some(notice) = cagents::diagnostics::take_notice() {
             self.notice = Some(match self.notice.take() {
                 Some(previous) => format!("{previous}\n{notice}"),
@@ -3722,6 +3752,7 @@ impl Application for Editor {
                 }
                 Message::Checkout(action) => self.checkout_action(action),
                 Message::GitReview(action) => self.git_review_action(action),
+                Message::Recovery(action) => self.recovery_action(action),
                 Message::WindowResized(size) => {
                     self.window_size = size;
                     Task::none()
@@ -3881,6 +3912,7 @@ impl Application for Editor {
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
+                    if self.refuse_recovery_close() { return Task::none(); }
                     if self
                         .checkout_dialog
                         .as_ref()
@@ -3958,7 +3990,10 @@ impl Application for Editor {
                     self.exiting = false;
                     self.resume_pending_files()
                 }
-                Message::Reaped => iced::exit().map(cosmic::Action::App),
+                Message::Reaped => {
+                    if self.refuse_recovery_close() { Task::none() }
+                    else { iced::exit().map(cosmic::Action::App) }
+                },
                 Message::ResolvedDiffBasis { card, basis } => {
                     let task = self.tab_mut(card).map_or_else(Task::none, |tab| {
                         repository_task(
@@ -4127,6 +4162,7 @@ impl Application for Editor {
                     ) && self.active == Some(id)
                         && !self.modal_open();
                     let saved = matches!(action, RepositoryAction::SaveFinished { .. });
+                    let recovered = matches!(action, RepositoryAction::EditorRecoveryResolved { .. });
                     let back_to_files = matches!(action, RepositoryAction::BackToFiles { .. });
                     let Some(tab) = self.tab_mut(id) else {
                         return Task::none();
@@ -4190,6 +4226,7 @@ impl Application for Editor {
                         tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
                     }
                     tasks.push(self.drain(id));
+                    if recovered { tasks.push(self.resume_recovery_work()); }
                     if loaded || saved {
                         tasks.push(self.resume_pending_files());
                     }
@@ -5734,6 +5771,7 @@ impl Application for Editor {
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
         body.push(design::horizontal_rule().into());
+        if let Some(recovery) = self.editor_recovery_view() { body.push(recovery); }
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             let mut toolbar_controls = Vec::new();
@@ -7282,6 +7320,7 @@ mod tests {
             tabs: Vec::new(),
             review_requests: Default::default(),
             notifications: Default::default(),
+            recovery: None,
             active: None,
             selection_epoch: 0,
             git_groups: BTreeMap::new(),
