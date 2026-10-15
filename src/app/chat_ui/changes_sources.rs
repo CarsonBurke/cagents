@@ -110,6 +110,17 @@ struct Entry {
     patch_requests:HashMap<usize,u64>,
     patch_errors:HashMap<usize,String>,
 }
+/// Immutable, ordered logical file descriptors for Find/Catalog. The same
+/// patch Arc is drawn and indexed; byte offsets never refer to a raw prefix.
+#[derive(Clone)]
+pub(super) struct FindSource {
+    pub source:chat::cache::SourceKey,
+    pub epoch:chat::cache::SourceEpoch,
+    pub revision:u64,
+    pub manifests:Vec<Arc<Manifest>>,
+    pub patches:Vec<(usize,Arc<str>)>,
+    pub complete:bool,
+}
 pub(super) struct LoadedPatch {
     pub text:Arc<str>,
     pub record:chat::source_owners::ResidentPatch,
@@ -296,7 +307,8 @@ impl State {
         let Some(entry)=self.entries.get_mut(key).filter(|entry|entry.requested.get(&offset)==Some(&request)) else {return false;};
         entry.requested.remove(&offset);
         match result {
-            Ok(page) if page.source==*key && page.epoch==entry.part.epoch=>{
+            Ok(page) if page.source==*key && page.epoch==entry.part.epoch
+                && page.metadata.total_files==entry.part.metadata.total_files && page.metadata.total_bytes==entry.part.metadata.total_bytes=>{
                 if page.omitted_files>0 && entry.copy_all {entry.copy_all=false;entry.copy_error=Some("The original file list is incomplete. No partial copy was made.".into());}
                 if page.metadata.total_files==1 {entry.opened.insert(0);}
                 entry.pages.insert(offset,page);
@@ -348,6 +360,17 @@ impl State {
     }
     pub(super) fn copy_patch(&self,item:&str,index:usize)->Option<Arc<str>> {
         let key=self.aliases.get(item)?;Some(self.entries.get(key)?.current(index)?.text.clone())
+    }
+    pub(super) fn find_sources(&self)->Vec<FindSource> {
+        self.entries.iter().map(|(key,entry)|FindSource {
+            source:key.clone(),epoch:entry.part.epoch,revision:entry.revision,
+            manifests:entry.pages.values().cloned().collect(),
+            patches:entry.pages.values().flat_map(|page|page.files.iter()).filter_map(|file|
+                entry.current(file.file_index).map(|patch|(file.file_index,patch.text.clone()))).collect(),
+            complete:entry.pages.values().any(|page|page.next_offset.is_none() && page.omitted_files==0)
+                && entry.pages.values().map(|page|page.files.len()).sum::<usize>()==entry.part.metadata.total_files
+                && entry.pages.values().flat_map(|page|page.files.iter()).all(|file|entry.current(file.file_index).is_some()),
+        }).collect()
     }
     pub(super) fn find_patches(&self)->Vec<(String,usize,Arc<str>)> {
         self.entries.iter().flat_map(|(key,entry)|entry.patches.keys().filter_map(|index|
@@ -661,7 +684,10 @@ mod tests {
         assert!(state.complete_patch(&page.source,0,request,Ok(prepared)));
         let loaded=state.copy_patch(&page.source.source_id,0).unwrap();assert_eq!(loaded.as_ref(),text);
         assert!(Arc::ptr_eq(&loaded,&state.entries[&page.source].current(0).unwrap().view.text));
-        assert!(state.complete_for_find());assert_eq!(state.find_patches().len(),1);drop(loaded);
+        assert!(state.complete_for_find());assert_eq!(state.find_patches().len(),1);
+        let sources=state.find_sources();assert_eq!(sources.len(),1);assert!(sources[0].complete);assert_eq!(sources[0].epoch,page.epoch);
+        assert_eq!(sources[0].manifests[0].files[0].path,page.files[0].path);assert_eq!(sources[0].patches[0].0,0);
+        assert!(Arc::ptr_eq(&sources[0].patches[0].1,&loaded));drop(sources);drop(loaded);
         state.toggle_file(&page.source.source_id,0);state.project(raw,None,&expanded,false);
         assert!(state.copy_patch(&page.source.source_id,0).is_none());assert!(weak.upgrade().is_none());
     }
@@ -704,7 +730,9 @@ mod tests {
         let text="@@ -1 +1 @@\n-before\n+after\nEND";let page=fixture(text);let (mut state,raw,expanded)=open(&page,"part");
         let request=state.entries[&page.source].patch_requests[&0];assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
         let captured=state.capture();assert_eq!(captured.manifests.len(),1);assert_eq!(captured.patches.len(),1);
-        let weak=Arc::downgrade(&captured.patches[0].0);let mut restored=State::default();restored.project(raw.clone(),None,&expanded,false);
+        let projected=state.project(raw.clone(),None,&expanded,false);
+        assert!(projected.changes_parts.iter().any(|part|part.item_id==page.source.source_id && part.replacement && part.files.is_empty()));
+        let weak=Arc::downgrade(&captured.patches[0].0);let mut restored=State::default();restored.project(projected,None,&expanded,false);
         assert!(restored.restore(captured.clone()).is_ok());assert_eq!(restored.retained_bytes(),text.len());
         let mut forged=captured.clone();forged.patches[0].1.epoch.incarnation=uuid::Uuid::from_u128(888);
         assert!(restored.restore(forged).is_err());
