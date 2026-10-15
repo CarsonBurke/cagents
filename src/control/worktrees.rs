@@ -70,8 +70,11 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
         WorktreeCommand::Create {branch,base,linear,no_setup,spawn_agent,prompt,model,reasoning_effort,..}=>(Operation::Create {repository:repository.clone(),branch,base,linear,no_setup},spawn_agent.map(|provider|(provider,prompt,model,reasoning_effort))),
         WorktreeCommand::List {..}=>(Operation::List {repository:repository.clone()},None),
         WorktreeCommand::Remove {target,force,delete_branch,..}=> {
-            let target=if !crate::device::is_remote() {match std::fs::canonicalize(&target) {Ok(path)=>path.into_os_string().into_string().map_err(|_|AppError::new("worktree_path","The selected worktree path is not UTF-8; refusing a lossy removal target"))?,Err(_)=>target}} else {target};
-            (Operation::Remove {repository:repository.clone(),target,force,delete_branch,expected_fingerprint:None},None)
+            let resolved_path=if !crate::device::is_remote() {std::fs::canonicalize(&target).ok().map(|path| {
+                if path.to_str().is_none() {return Err(AppError::new("worktree_path","The selected worktree path is not UTF-8; refusing a lossy removal target"));}
+                Ok(path)
+            }).transpose()?} else {None};
+            (Operation::Remove {repository:repository.clone(),target,force,delete_branch,expected_fingerprint:None,resolved_path},None)
         },
     };
     let response=client.device_operation(crate::device_service::Operation::Worktree {operation}).map_err(protocol_error)?;
