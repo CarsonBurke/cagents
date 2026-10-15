@@ -678,15 +678,24 @@ mod tests {
         assert_eq!(journal.input(&input).unwrap().unwrap().state,InputState::Accepted);
     }
     #[test]
-    fn malformed_turn_proof_is_refused_and_encoded_payload_budget_remains_enforced() {
+    fn malformed_turn_proof_is_refused_before_journal_publication() {
         use crate::chat::turn_outcomes::{TurnUpdate,MAX_TURN_ID_BYTES,MAX_TURN_ITEM_IDS};
         let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),DEFAULT_BUDGET).unwrap();
         let invalid=Update::TurnOutcome {update:TurnUpdate::Bind {identity:historical_turn("old"),item_ids:vec!["duplicate".into(),"duplicate".into()]}};
         assert!(journal.append(&invalid).is_err());assert_eq!(journal.latest().unwrap(),0);
-        // Valid individual raw IDs can expand under JSON escaping. The shared
-        // 1MiB semantic entry cap still refuses them with an honest typed loss.
-        let ids=(0..MAX_TURN_ITEM_IDS).map(|index|format!("{index}{}","\0".repeat(MAX_TURN_ID_BYTES-4))).collect();
+        // Shared TurnUpdate validation caps the aggregate raw proof at 64 KiB;
+        // this refusal occurs before encoded-entry capacity/loss accounting.
+        let ids=(0..MAX_TURN_ITEM_IDS).map(|index|format!("{index}{}","a".repeat(MAX_TURN_ID_BYTES-4))).collect();
         let large=Update::TurnOutcome {update:TurnUpdate::Bind {identity:historical_turn("old"),item_ids:ids}};
+        assert!(journal.append(&large).is_err());
+        assert_eq!(journal.latest().unwrap(),0);assert!(journal.continuity_loss().unwrap().is_none());
+    }
+    #[test]
+    fn encoded_semantic_entry_cap_records_a_typed_loss() {
+        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),DEFAULT_BUDGET).unwrap();
+        let large=Update::Attention(crate::notifications::Evidence {
+            key:"k".repeat(1024*1024),kind:crate::notifications::Kind::Succeeded,
+        });
         assert!(journal.append(&large).unwrap_err().contains("overflowed"));
         assert_eq!(journal.latest().unwrap(),0);assert!(journal.continuity_loss().unwrap().is_some());
     }
