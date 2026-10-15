@@ -363,6 +363,10 @@ survive `git worktree move` and do not enter commits. `linear unlink` removes
 the link without contacting Linear. Branch names never select mutation targets.
 An explicit workspace conflicting with the saved link is rejected; relink to
 change workspace. Writes accept `--id ENG-123` instead of `--current`.
+Recovery of an interrupted creation preserves any later explicit `linear link`
+or `linear unlink` choice. If creation reports a conflicting link, review the
+saved ticket, then explicitly link the originally requested ticket before
+reconciling that creation again.
 
 `create` (also `save-issue`) creates a ticket with `--team` and `--title`, or
 updates a ticket with `--id`/`--current`. `--body-file -` reads Markdown from

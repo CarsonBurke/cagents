@@ -11357,7 +11357,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // A crash leaves the prior unresolved row and the marker intact;
             // recovery repeats this idempotent write instead of losing the link.
             if let Some(issue) = &journal.request.linear_issue
-                && let Err(error) = crate::linear::context::link_at(
+                && let Err(error) = crate::linear::context::ensure_link_at(
                     &journal.request.destination,
                     &issue.issue_id,
                     issue.workspace.as_deref(),
@@ -11941,6 +11941,75 @@ mod worktree_journal_tests {
                 .issue_id,
             "ENG-123"
         );
+    }
+
+    #[test]
+    fn interrupted_linear_creation_preserves_later_ticket_workspace_and_unlink() {
+        for change in ["ticket", "workspace", "unlink"] {
+            let mut fixture = Fixture::new();
+            let original = crate::linear::context::LinkedIssue {
+                issue_id: "ENG-123".into(),
+                workspace: Some("TEST".into()),
+            };
+            fixture.request.linear_issue = Some(original.clone());
+            interrupted_linear_checkout(&fixture);
+            let later = match change {
+                "ticket" => Some(
+                    crate::linear::context::link_at(
+                        &fixture.request.destination,
+                        "ENG-999",
+                        Some("TEST"),
+                    )
+                    .unwrap(),
+                ),
+                "workspace" => Some(
+                    crate::linear::context::link_at(
+                        &fixture.request.destination,
+                        "ENG-123",
+                        Some("OTHER"),
+                    )
+                    .unwrap(),
+                ),
+                _ => {
+                    crate::linear::context::unlink_at(&fixture.request.destination).unwrap();
+                    None
+                }
+            };
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                report.state,
+                WorktreeOperationState::ReconcileRequired,
+                "{change}: {report:?}"
+            );
+            assert!(report.detail.contains("preserved"), "{report:?}");
+            let current = crate::linear::context::resolve_at(&fixture.request.destination);
+            match later {
+                Some(later) => assert_eq!(current.unwrap(), later),
+                None => assert_eq!(current.unwrap_err().kind, "linear_issue_required"),
+            }
+            assert_eq!(
+                fixture.journal(fixture.request.operation_id).state,
+                WorktreeOperationState::ReconcileRequired
+            );
+            // A deliberate explicit resolution allows the retained operation
+            // to settle without replaying Git or overriding the user's edit.
+            crate::linear::context::link_at(
+                &fixture.request.destination,
+                &original.issue_id,
+                original.workspace.as_deref(),
+            )
+            .unwrap();
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap()
+                .remove(0);
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        }
     }
 
     #[test]

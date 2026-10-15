@@ -140,6 +140,14 @@ fn issue_reads_link_current_and_unlink_need_no_daemon() {
     );
     assert_eq!(f.calls(), calls);
     f.success(&["linear", "unlink"]);
+    let tombstone: Value =
+        serde_json::from_slice(&fs::read(f.path().join(".git/cagents-linear.json")).unwrap())
+            .unwrap();
+    assert_eq!(tombstone["version"], 2);
+    assert!(
+        tombstone["issue"].is_null(),
+        "explicit unlink must remain distinguishable from pristine absence during creator recovery"
+    );
     assert_eq!(
         f.failure(&["linear", "issue", "--current"])["kind"],
         "linear_issue_required"
