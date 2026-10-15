@@ -561,7 +561,8 @@ impl Cagents {
     }
 
     fn pane_transfer_source(&self, card: CardId) -> Option<(&View, &Path)> {
-        if self.focused_repository_is_saving()
+        if self.pane_close_owned(card)
+            || self.focused_repository_is_saving()
             || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
         {
             return None;
@@ -2701,6 +2702,69 @@ mod tests {
                 .cards
                 .contains(&pane.id)
         );
+    }
+
+    #[test]
+    fn asynchronous_terminal_close_blocks_moves_until_its_actual_cancel() {
+        use super::super::terminal_close::CloseOutcome;
+        let (mut app, source, destination, pane) =
+            channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        // Starting the real application close reserves its asynchronous owner,
+        // while the pane and runtime remain open and no dialog is visible yet.
+        drop(app.begin_card_close(pane.id));
+        assert!(app.terminal_close_pending(pane.id));
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.modal_is_open());
+        assert!(app.pane_move_destinations(pane.id).is_empty());
+        drop(app.update(Message::MovePaneToChannel {
+            card: pane.id,
+            channel: destination,
+        }));
+        drop(app.update(Message::PaneDropToChannel {
+            generation: app.workspace_view_generation,
+            card: pane.id,
+            channel: destination,
+        }));
+        assert!(
+            rx.try_recv().is_err(),
+            "close cannot be overtaken by a transfer"
+        );
+        assert!(!app.pane_transfer_pending(pane.id));
+        let intent = app.terminal_close.as_ref().unwrap();
+        let (terminal, proof, generation) =
+            (intent.terminal, intent.proof.clone(), intent.generation);
+        drop(app.terminal_close_finished(
+            pane.id,
+            terminal,
+            proof,
+            generation,
+            CloseOutcome::Active,
+        ));
+        assert!(app.modal_is_open());
+        assert!(app.pane_move_destinations(pane.id).is_empty());
+        drop(app.cancel_terminal_close());
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        drop(app.move_pane_to_channel(pane.id, destination));
+        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+            scope: Scope::Channel(from), change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
+        } if from == source && id == pane.id && to == destination));
+    }
+
+    #[test]
+    fn focus_handoff_close_keeps_its_source_until_commit() {
+        let (mut app, _, destination, pane) = channel_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.request_card_removal(pane.id));
+        assert_eq!(app.workspace.pending_close().unwrap().unmounting, pane.id);
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(app.pane_move_destinations(pane.id).is_empty());
+        drop(app.move_pane_to_channel(pane.id, destination));
+        assert!(rx.try_recv().is_err());
+        assert!(!app.pane_transfer_pending(pane.id));
     }
 
     #[test]
