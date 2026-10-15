@@ -49,3 +49,7 @@ shell effects; callers still verify configuration/trust before explicit setup.
 Copies preserve source access ACLs as well as mode bits and remove inherited
 access ACLs when the source has none. An ACL-copy error prevents publication of
 the temporary copy; the created worktree is retained for inspection.
+
+`worktree_setup_creation` reads one settled creation through the same identity
+checks without reconciling or rewriting it. It returns no row when absent and
+an error for invalid evidence; resume callers verify the current checkout too.
