@@ -576,6 +576,7 @@ impl Server {
     fn finish_inputs(&mut self) {
         let journal=self.journal.clone();
         let completed=self.actor.is_completed();
+        let changed=self.changed.clone();
         self.pending.retain(|(identity,response,effects)| {
             if !completed && effects.as_ref().is_some_and(|(_,state)|state.load(Ordering::Acquire)==0) {return true;}
             let result=match response.try_recv() {Ok(result)=>Some(InputState::Acknowledged(result)),Err(crossbeam_channel::TryRecvError::Disconnected)=>Some(InputState::Unknown("The retained actor stopped before acknowledging this input; never replay it automatically".into())),Err(crossbeam_channel::TryRecvError::Empty)=>None};
@@ -585,6 +586,7 @@ impl Server {
                     if let Err(error)=journal.refuse_unexecuted_run(*run) {let _=journal.record_loss(&error);}
                 }
                 if let Err(error)=journal.finish(identity,state) {let _=journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));}
+                changed.fetch_add(1,Ordering::Release);
                 false
             } else {true}
         });
@@ -843,6 +845,21 @@ done"#;
         assert!(!fixture._root.path().join("prompts").exists(),"restart never replays an accepted prompt");
         let mut changed=payload;changed["arguments"]=json!(["-c","exit 0"]);
         assert!(server.restart(serde_json::from_value(changed).unwrap()).is_err(),"same restart UUID cannot select a different launch");
+    }
+    #[test]
+    fn input_refusal_and_storage_failure_publish_new_resident_revisions() {
+        for storage_failure in [false,true] {
+            let mut fixture=resident_fixture();let server=&mut fixture.server;
+            let run=crate::model::RunId::new();let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:[9;32]};
+            {let mut journal=server.journal.lock().unwrap();journal.admit_with_run(&identity,Some(run)).unwrap();if storage_failure {journal.fail_input_storage();}}
+            let before=server.resident().unwrap();assert_eq!(before.retained_runs,vec![run]);
+            let (reply,response)=crossbeam_channel::bounded(1);reply.send(Err("fixture refusal".to_owned())).unwrap();
+            server.pending.push((identity,response,Some((run,Arc::new(std::sync::atomic::AtomicU8::new(if storage_failure {2}else {1}))))));
+            server.finish_inputs();
+            let response=server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"state".into(),args:json!([before.changed])}).unwrap();
+            let next:Option<Resident>=serde_json::from_value(response).unwrap();let next=next.expect("consumed completions must invalidate an earlier resident token");
+            if storage_failure {assert!(next.continuity_loss.is_some());assert_eq!(next.continuity_loss.unwrap().affected_runs,vec![run]);} else {assert!(next.retained_runs.is_empty());assert!(next.continuity_loss.is_none());}
+        }
     }
     #[test]
     fn concurrent_ready_publication_cannot_be_hidden_by_a_new_revision_on_old_metadata() {
