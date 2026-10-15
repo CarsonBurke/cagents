@@ -5,7 +5,8 @@
 //!
 //! ```sh
 //! cargo test --locked --no-default-features --features ui --profile dev-runtime \
-//!     --config 'profile.dev-runtime.opt-level=2' --lib \
+//!     --config 'profile.dev-runtime.opt-level=2' \
+//!     --config 'profile.dev-runtime.debug-assertions=false' --lib \
 //!     chat_ui::view::frame_cost -- --ignored --nocapture --test-threads=1
 //! ```
 //!
