@@ -475,12 +475,12 @@ pub(super) fn process_request(
         ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Worktree { operation } } => {
             let repository=operation.repository().map(std::path::Path::to_path_buf);
             let mutates=operation.mutates();
-            let scope=if matches!(&operation,crate::worktree_control::Operation::Remove {..}) {
+            let mut scope=if matches!(&operation,crate::worktree_control::Operation::Remove {..}) {
                 Some(host.lock().unwrap_or_else(|poison|poison.into_inner()).worktree_removal_scope()
                     .map_err(|error|ProtocolError::new(ProtocolErrorCode::InvalidRequest,error.to_string(),false))?)
             } else {None};
             let result=crate::worktree_control::service::execute(operation, |path| {
-                if let Some(scope)=&scope {scope.check(path).map_err(|error|error.to_string())?;}
+                if let Some(scope)=scope.take() {scope.check(path).map_err(|error|error.to_string())?;}
                 Ok(host.lock().unwrap_or_else(|p|p.into_inner()).worktree_live_sessions(path))
             });
             // A later setup/branch failure can follow a committed Git mutation.

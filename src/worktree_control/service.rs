@@ -24,7 +24,7 @@ fn entry(service: &Service, record: &WorktreeRecord, primary: bool, cancellation
     })
 }
 
-pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Result<Vec<crate::model::TerminalId>,String>) -> Result<Reply,String> {
+pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path) -> Result<Vec<crate::model::TerminalId>,String>) -> Result<Reply,String> {
     let cancellation = CancellationToken::new();
     let service = RepositoryService::system("git");
     let store=journal_store()?;
