@@ -93,10 +93,10 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
                 _ => Err(report.detail),
             }
         }
-        Operation::Remove {repository,target,force,delete_branch:delete,expected_fingerprint} => {
+        Operation::Remove {repository,target,force,delete_branch:delete,expected_fingerprint,resolved_path} => {
             let records=service.list_worktrees(&repository,&cancellation).map_err(|error|error.to_string())?;
             let full_branch=format!("refs/heads/{target}");
-            let candidate=if Path::new(&target).is_absolute() { PathBuf::from(&target) } else {
+            let candidate=if let Some(path)=resolved_path {path} else if Path::new(&target).is_absolute() { PathBuf::from(&target) } else {
                 records.first().map(|record|record.path.join(&target)).ok_or("Repository has no primary checkout")?
             };
             let canonical=std::fs::canonicalize(&candidate).ok();

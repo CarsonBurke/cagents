@@ -20,6 +20,7 @@ pub enum Operation {
         force: bool,
         delete_branch: bool,
         expected_fingerprint: Option<String>,
+        resolved_path: Option<PathBuf>,
     },
     Inspect { repository:PathBuf, path:PathBuf },
     StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },

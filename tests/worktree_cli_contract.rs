@@ -141,6 +141,18 @@ fn removal_refuses_modified_untracked_ignored_unpushed_and_detached_only_work() 
 }
 
 #[test]
+fn removal_refuses_a_target_naming_different_branch_and_relative_path_worktrees() {
+    let fixture=Fixture::new();
+    let branch_target=fixture.create("managed/path-choice");
+    let path_target=fixture.create("path-choice");
+    let output=fixture.output(&["worktree","remove","managed/path-choice","--force"]);
+    assert!(!output.status.success(),"{output:?}");
+    let value:Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value.to_string().contains("matches different branch and path worktrees"),"{value}");
+    assert!(branch_target.join("tracked").is_file());assert!(path_target.join("tracked").is_file());
+}
+
+#[test]
 fn untrusted_setup_refuses_before_creation_no_setup_skips_and_trusted_copy_uses_terminal() {
     let fixture=Fixture::new();let project=fixture.root.path().join("project");
     fs::create_dir(project.join(".cagents")).unwrap();
