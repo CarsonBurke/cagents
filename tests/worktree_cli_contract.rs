@@ -67,6 +67,12 @@ impl Fixture {
         let data=self.cli(&["worktree","create",branch,"--no-setup"]);
         assert_eq!(data["schema_version"],1);Path::new(data["worktree"]["path"].as_str().unwrap()).into()
     }
+    fn setup_intent(&self,path:&Path)->Value {
+        let journal=self.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("worktree-operations.sqlite3");
+        let connection=rusqlite::Connection::open_with_flags(journal,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW).unwrap();
+        let payload:String=connection.query_row("SELECT payload_json FROM pending_operations WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?1",[path.to_str().unwrap()],|row|row.get(0)).unwrap();
+        serde_json::from_str::<Value>(&payload).unwrap()["request"]["setup_intent"].clone()
+    }
     fn refusal(&self,target:&str,contains:&str) {
         let output=self.output(&["worktree","remove",target]);assert!(!output.status.success(),"{output:?}");
         let value:Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(value["ok"],false);assert!(value.to_string().contains(contains),"{value}");
@@ -142,10 +148,15 @@ fn untrusted_setup_refuses_before_creation_no_setup_skips_and_trusted_copy_uses_
     fs::write(project.join(".env"),"fixture secret\n").unwrap();
     let denied=fixture.output(&["worktree","create","untrusted"]);assert!(!denied.status.success());assert!(!project.join("managed/untrusted").exists());
     let skipped=fixture.create("skipped");assert!(!skipped.join(".env").exists());assert!(!skipped.join("setup-result").exists());
+    let skipped_intent=fixture.setup_intent(&skipped);assert_eq!(skipped_intent["skip"],true);assert_eq!(skipped_intent["copy_done"],true);assert!(skipped_intent["plan"].is_null());
     let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
     cagents::worktree_setup::trust(&project,&plan,&cagents::repository::CancellationToken::new()).unwrap();
     let created=fixture.cli(&["worktree","create","trusted"]);let path=Path::new(created["worktree"]["path"].as_str().unwrap());
     assert_eq!(fs::read_to_string(path.join(".env")).unwrap(),"fixture secret\n");
+    let intent=fixture.setup_intent(path);assert_eq!(intent["copy_done"],true);assert_eq!(intent["skip"],false);
+    assert_eq!(intent["plan"]["fingerprint"],plan.fingerprint);
+    assert_eq!(intent["run_id"],created["setup"]["run_id"]);
+    assert_eq!(intent["run_id"],created["setup"]["terminal"]["launch"]["environment"]["CAGENTS_WORKTREE_SETUP_ID"]);
     assert!(created["setup"]["terminal"]["id"].is_string(),"{created}");
     let deadline=Instant::now()+Duration::from_secs(10);
     while !path.join("setup-result").exists() {assert!(Instant::now()<deadline,"setup terminal did not run: {created}");thread::sleep(Duration::from_millis(20));}

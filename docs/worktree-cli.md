@@ -21,7 +21,10 @@ Project setup uses `.cagents/worktree.toml` and the same exact-configuration tru
 as the dialog; see [Worktree setup](worktree-setup.md). Untrusted commands are
 refused before creation. Review and trust them in the dialog, or pass `--no-setup`
 to skip both copies and commands. Setup output runs in a **Worktree setup** terminal
-card scoped to the new worktree. A preparation or terminal failure keeps the
+card scoped to the new worktree. Its exact plan, skip decision, copy progress and
+run identity are retained with the creation journal. Saved setup recipes are
+never automatically replayed after interruption; use explicit reviewed recovery
+in the application. A preparation or terminal failure keeps the
 created checkout and is reported in the result. `--spawn-agent` waits up to two
 minutes for setup to succeed; if setup fails or is still running, its error names
 the retained worktree and the agent is not started.
@@ -44,7 +47,7 @@ Failure uses the ordinary error envelope and a non-zero exit code. The `data`
 object has `schema_version: 1`:
 
 - `worktree.create`: `worktree`, `warnings` (strings), `setup` (null or
-  `{ command, terminal, error }`), and `agent` when requested and accepted.
+  `{ command, run_id, terminal, error }`), and `agent` when requested and accepted.
 - `worktree.list`: `worktrees` (array of entries).
 - `worktree.remove`: `path`, `branch_deleted` (null when retained), `warnings` (strings), and
   `branch_error` (null unless the requested safe branch deletion failed).
