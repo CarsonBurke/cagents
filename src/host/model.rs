@@ -422,8 +422,17 @@ impl Registry {
                     > 0
             }
         };
-        if changed {
+        if !moves.is_empty() {
+            if let ModelEdit::RelocateProject { relocation } = edit {
+                let open: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [repository_key(&relocation.destination)?], |row| row.get(0)).map_err(|error| error.to_string())?;
+                if !open { return Err("The located project is no longer open; no session authority changed".into()); }
+            }
             session_locations::apply(&transaction, moves)?;
+        }
+        // Same-project verification is a meaningful state change when it
+        // clears or records a session refusal, even without rekeying a project.
+        let changed = changed || !moves.is_empty();
+        if changed {
             transaction
                 .execute(
                     "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",

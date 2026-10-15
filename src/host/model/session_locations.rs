@@ -141,6 +141,7 @@ impl Registry {
         location.blocked_directory = Some(candidate.to_owned());
         location.refusal = Some(reason.chars().filter(|character| !character.is_control()).take(1024).collect());
         write(&tx, &location)?;
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", []).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
     }
 
