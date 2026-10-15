@@ -3906,6 +3906,7 @@ mod tests {
             fn command(&mut self,command:Command)->Result<Step,String> {
                 let events=match command {
                     Command::SetFastMode{..}=>vec![Event::TurnStarted,Event::Status {busy:true,detail:"Working".into()},Event::Request(super::super::Request {kind:super::super::RequestKind::Approval,id:"new-approval".into(),title:"New tool".into(),description:String::new(),fields:Vec::new(),actions:Vec::new()})],
+                    Command::Interrupt=>vec![Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Cancelled},Event::Status {busy:false,detail:"Stopped".into()}],
                     Command::Compact=>vec![Event::PastTurnFinished {key:Some("old-result".into()),outcome:crate::notifications::Kind::Cancelled}],
                     _=>return Err("Unexpected late-result fixture command".into()),
                 };
