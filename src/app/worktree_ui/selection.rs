@@ -38,6 +38,14 @@ pub(in crate::app) enum Intent {
     Delete(project_ui::Target),
 }
 
+fn context_directory(intent: &Intent) -> Option<&Path> {
+    match intent {
+        Intent::PrAgentContext {worktree,..}=>Some(worktree),
+        Intent::Channel {after,..}=>context_directory(after),
+        _=>None,
+    }
+}
+
 struct Prepared {
     path: PathBuf,
     canonical: Vec<(PathBuf, PathBuf)>,
@@ -185,12 +193,18 @@ impl Cagents {
         if self.refuse_in_deleting_worktree(&prepared.path) {
             return self.abandon_worktree_selection(intent);
         }
+        let context_scope=context_directory(&intent).and_then(|target|prepared.canonical.iter()
+            .find(|(path,_)|path==target).map(|(_,physical)|physical.clone()));
+        if context_directory(&intent).is_some() && context_scope.is_none() {
+            self.status=Some(TransientNotice::warning("Review context's worktree changed before its scope was prepared."));
+            return self.abandon_worktree_selection(intent);
+        }
         self.worktree_protections.install_prepared(prepared.guard);
         self.worktree_protection_sync.invalidate();
         self.worktree_owner_paths.install_prepared(prepared.canonical);
         let selected = self.commit_worktree_selection_scope(prepared.path, create, &intent);
         let initialization = self.initialize_prepared_scope_runtimes();
-        let after = self.finish_worktree_selection(intent);
+        let after = self.finish_worktree_selection_with_context(intent,context_scope);
         Task::batch([selected,initialization,after,self.resolve_worktree_owner_paths()])
     }
 
@@ -218,11 +232,16 @@ impl Cagents {
     }
 
     pub(super) fn finish_worktree_selection(&mut self, intent: Intent) -> Task<Message> {
+        let context_scope=context_directory(&intent).map(|path|self.worktree_owner_paths.canonical(path));
+        self.finish_worktree_selection_with_context(intent,context_scope)
+    }
+
+    fn finish_worktree_selection_with_context(&mut self, intent: Intent, context_scope: Option<PathBuf>) -> Task<Message> {
         match intent {
             Intent::Navigate => Task::none(),
-            Intent::Channel {after,..} => self.finish_worktree_selection(*after),
+            Intent::Channel {after,..} => self.finish_worktree_selection_with_context(*after,context_scope),
             Intent::EnsureDefaultPane => self.ensure_default_pane(),
-            Intent::PrAgentContext {worktree,card,prompt,provider} => self.finish_pr_agent_context(worktree,card,prompt,provider),
+            Intent::PrAgentContext {worktree,card,prompt,provider} => self.finish_pr_agent_context(worktree,card,prompt,provider,context_scope),
             Intent::Terminal(session) => self.insert_terminal_card(session,None),
             Intent::TerminalWithLifecycle {session,committed,rejected} => {
                 if self.refuse_in_deleting_worktree(&session.launch.working_directory) {
