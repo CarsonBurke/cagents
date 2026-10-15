@@ -220,9 +220,16 @@ fn reconcile_agent_run_with_archive(
             record.handle.clone()
         };
         let completed = handle.is_completed();
-        let snapshot = (!completed || archive.is_some())
+        let snapshot = (!completed || retire)
             .then(|| handle.snapshot(None).ok_or("Provider state is unavailable"))
             .transpose()?;
+        // Process exit does not settle provider-reported delegated work. Its
+        // canonical ownership evidence must survive until explicitly resolved.
+        if retire && snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.is_working() || snapshot.waiting || !snapshot.requests.is_empty()
+        }) {
+            return Err("The provider is not idle; automatic cleanup did not stop it".into());
+        }
         let idle_generation = if !completed {
             let snapshot = snapshot.as_ref().expect("live provider snapshot");
             let working = if retire { snapshot.is_working() } else { snapshot.busy };
