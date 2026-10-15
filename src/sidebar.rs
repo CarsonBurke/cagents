@@ -2298,7 +2298,7 @@ impl SourceControlModel {
     /// True while a further page can exist. An unborn `HEAD` has no walk to
     /// page through, so it is offered no pager.
     fn can_load_history(&self) -> bool {
-        !self.history_loading && !self.history_complete && !self.unborn
+        !self.history_loading && !self.history_complete && !self.unborn && self.head_oid.is_some()
     }
 
     /// Records that the first page has been asked for, so expanding, closing,

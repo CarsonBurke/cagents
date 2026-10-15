@@ -14921,14 +14921,19 @@ impl Application for Cagents {
                     }
                     SidebarAction::OpenPublish { .. } => Task::none(),
                     SidebarAction::LoadMoreHistory { key, page } => {
-                        if !self.source_control_is_bound(&key) {
+                        if !self.source_control_is_bound(&key) || crate::device::is_remote() {
                             return Task::none();
                         }
-                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                            if source.history_loading || source.next_history_page != page { return Task::none(); }
-                            source.mark_history_requested();
-                        }
-                        Self::source_control_history_task(self.history_ui.next_page_request(), key, self.sidebar_model.source_control.as_ref().and_then(|source| source.head_oid.as_deref()).and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), page, self.sidebar_model.source_control.as_ref().map(|source| source.history_query.clone()).unwrap_or_default(), self.history_ui.page_cancellation())
+                        let Some(source) = self.sidebar_model.source_control.as_mut() else { return Task::none(); };
+                        if source.history_loading || source.next_history_page != page { return Task::none(); }
+                        let Some(head) = source.head_oid.as_deref()
+                            .and_then(|oid| crate::repository::Oid::parse_object(oid).ok()) else {
+                            return Task::none();
+                        };
+                        let query = source.history_query.clone();
+                        source.mark_history_requested();
+                        Self::source_control_history_task(self.history_ui.next_page_request(), key,
+                            Some(head), page, query, self.history_ui.page_cancellation())
                     }
                     SidebarAction::ToggleControls => {
                         let target = if self.sidebar_state.controls_expanded() {

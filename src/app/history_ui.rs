@@ -231,6 +231,26 @@ mod tests {
     }
 
     #[test]
+    fn history_paging_without_head_keeps_the_page_idle() {
+        for unborn in [false, true] {
+            let (mut app, key, _, _) = fixture();
+            let mut source = SourceControlModel::loading(key.clone());
+            source.unborn = unborn;
+            app.sidebar_model.source_control = Some(source);
+            let generation = app.history_ui.page_generation;
+            drop(app.update(Message::Sidebar(SidebarAction::LoadMoreHistory {
+                key,
+                page: 0,
+            })));
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert!(!source.history_loading);
+            assert!(!source.history_requested());
+            assert_eq!(source.next_history_page, 0);
+            assert_eq!(app.history_ui.page_generation, generation);
+        }
+    }
+
+    #[test]
     fn switching_commits_cancels_the_old_read_and_rejects_its_completion() {
         let (mut app, key, first, second) = fixture();
         drop(app.open_history_commit(key.clone(), first.clone()));
