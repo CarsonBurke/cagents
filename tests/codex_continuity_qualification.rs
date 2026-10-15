@@ -40,7 +40,7 @@ use cagents::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -226,7 +226,7 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
             "content":[{"type":"output_text","text":"SCENARIO_COMPLETE"}]
         }),
         None if scenario.contains("SCENARIO orphan-reaping") => shell(
-            "orphan-tools", "i=0; while [ \"$i\" -lt 3600 ]; do sh -c 'sleep 0.05 & echo $! >> orphan-pids'; sleep 0.2; i=$((i+1)); done; echo ORPHAN_LOOP_FINISHED".into(), 1000,
+            "orphan-tools", "i=0; while [ \"$i\" -lt 3600 ] && [ ! -e stop-orphan-loop ]; do sh -c 'sleep 0.05 & echo $! >> orphan-pids'; sleep 0.2; i=$((i+1)); done; echo ORPHAN_LOOP_FINISHED".into(), 1000,
         ),
         None if scenario.contains("SCENARIO long") => shell(
             "long",
@@ -931,32 +931,75 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
             .find_map(|entry| serde_json::from_slice(&fs::read(entry.path()).ok()?).ok())
     });
     let holder = record["holder"]["pid"].as_u64().unwrap();
-    let children = format!("/proc/{holder}/task/{holder}/children");
-    let started = Instant::now();
-    let mut samples = 0u64;
-    let mut zombies = BTreeSet::new();
-    while started.elapsed() < Duration::from_secs(10 * 60) {
-        let pids = fs::read_to_string(&children).expect("native holder vanished during the qualification");
-        for pid in pids.split_whitespace() {
+    let holder_start = record["holder"]["start"].as_u64().unwrap();
+    // Every exit has a finite SIGCHLD delivery/reap window. Record raw Z
+    // observations honestly, and separately detect accumulation persisting
+    // across a 250ms grace period; a product polling timer is not involved.
+    let census = || {
+        let identity = || {
+            let stat = fs::read_to_string(format!("/proc/{holder}/stat")).expect("fixture holder vanished");
+            let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
+            fields[19].parse::<u64>().unwrap()
+        };
+        assert_eq!(identity(), holder_start, "the fixture holder incarnation changed");
+        let mut children = BTreeSet::new();
+        for task in fs::read_dir(format!("/proc/{holder}/task")).unwrap().flatten() {
+            if let Ok(pids) = fs::read_to_string(task.path().join("children")) {
+                children.extend(pids.split_whitespace().map(str::to_owned));
+            }
+        }
+        let mut zombies = BTreeSet::new();
+        for pid in children {
             if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
                 let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
                 if fields.first() == Some(&"Z") && fields.get(1).and_then(|parent| parent.parse::<u64>().ok()) == Some(holder) {
-                    zombies.insert(pid.to_owned());
+                    zombies.insert((pid, fields[19].parse::<u64>().unwrap()));
                 }
             }
+        }
+        assert_eq!(identity(), holder_start);
+        zombies
+    };
+    let started = Instant::now();
+    let mut samples = 0u64;
+    let mut observed = BTreeSet::new();
+    let mut pending = BTreeMap::new();
+    let mut persistent = BTreeSet::new();
+    while started.elapsed() < Duration::from_secs(10 * 60) {
+        let zombies = census();
+        pending.retain(|identity, _| zombies.contains(identity));
+        for identity in zombies {
+            observed.insert(identity.clone());
+            let since = pending.entry(identity.clone()).or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(250) { persistent.insert(identity); }
         }
         samples += 1;
         thread::sleep(Duration::from_millis(100));
     }
+    // End only this fixture's tool loop, keeping its actual provider/holder
+    // alive so the final zero census cannot be caused by owner destruction.
+    fs::write(fixture.root.path().join("project/stop-orphan-loop"), b"settle").unwrap();
+    until(Duration::from_secs(30), "the fixture orphan loop to settle", || {
+        let snapshot = window.read(chat.id);
+        (!snapshot.busy && snapshot.requests.is_empty()).then_some(())
+    });
+    let settle_deadline = Instant::now() + Duration::from_secs(2);
+    let final_zombies = loop {
+        let zombies = census();
+        if zombies.is_empty() || Instant::now() >= settle_deadline { break zombies; }
+        thread::sleep(Duration::from_millis(10));
+    };
     let tools = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap().lines().count();
     let report = json!({"provider":fixture.version, "seconds":started.elapsed().as_secs_f64(),
-        "holder":holder, "samples":samples, "background_children":tools, "observed_zombies":zombies});
+        "holder":holder, "holder_start":holder_start, "samples":samples, "background_children":tools,
+        "raw_zombie_observations":observed, "persistent_zombies_250ms":persistent, "final_zombies":final_zombies});
     eprintln!("{report}");
     if let Some(path) = std::env::var_os("CAGENTS_QUALIFICATION_EVIDENCE") {
         fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
     assert!(tools >= 1000, "the provider did not repeatedly background tools: {report}");
-    assert!(zombies.is_empty(), "holder children were observed unreaped: {report}");
+    assert!(persistent.is_empty(), "holder children remained unreaped across the measured grace period: {report}");
+    assert!(final_zombies.is_empty(), "the same live holder retained zombies after its tool loop settled: {report}");
     let diagnostics = fixture.cli(&["diagnostics"]);
     let reports = diagnostics["holders"].as_array().expect("CLI holder diagnostics are absent");
     assert!(reports.iter().any(|report| report["pid"] == holder && report["zombie_children"] == 0));
