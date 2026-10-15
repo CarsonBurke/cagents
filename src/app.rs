@@ -2864,6 +2864,13 @@ pub enum SettingsField {
     ShortcutSettingsAccounts,
     ShortcutSettingsNotifications,
     ShortcutSettingsAbout,
+    ShortcutEditorUndo,
+    ShortcutEditorRedo,
+    ShortcutEditorCut,
+    ShortcutEditorCopy,
+    ShortcutEditorPaste,
+    ShortcutEditorSelectAll,
+
     ShortcutMarkAllRead,
     ShortcutSearchInProject,
     ShortcutCloneRepository,
@@ -2872,7 +2879,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 77] = [
+    const SHORTCUTS: [Self; 83] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2947,6 +2954,13 @@ impl SettingsField {
         Self::ShortcutSettingsAccounts,
         Self::ShortcutSettingsNotifications,
         Self::ShortcutSettingsAbout,
+        Self::ShortcutEditorUndo,
+        Self::ShortcutEditorRedo,
+        Self::ShortcutEditorCut,
+        Self::ShortcutEditorCopy,
+        Self::ShortcutEditorPaste,
+        Self::ShortcutEditorSelectAll,
+
         Self::ShortcutMarkAllRead,
         Self::ShortcutSearchInProject,
         Self::ShortcutCloneRepository,
@@ -3028,6 +3042,13 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => "Open settings: Accounts",
             Self::ShortcutSettingsNotifications => "Open settings: Notifications",
             Self::ShortcutSettingsAbout => "Open settings: About",
+            Self::ShortcutEditorUndo => "Undo in editor",
+            Self::ShortcutEditorRedo => "Redo in editor",
+            Self::ShortcutEditorCut => "Cut in editor",
+            Self::ShortcutEditorCopy => "Copy in editor",
+            Self::ShortcutEditorPaste => "Paste in editor",
+            Self::ShortcutEditorSelectAll => "Select all in editor",
+
             Self::ShortcutMarkAllRead => "Mark all as read",
             Self::ShortcutSearchInProject => "Search in project",
             Self::ShortcutCloneRepository => "Clone repository",
@@ -3168,6 +3189,12 @@ impl SettingsField {
             | Self::ShortcutSettingsAccounts
             | Self::ShortcutSettingsNotifications
             | Self::ShortcutSettingsAbout
+            | Self::ShortcutEditorUndo
+            | Self::ShortcutEditorRedo
+            | Self::ShortcutEditorCut
+            | Self::ShortcutEditorCopy
+            | Self::ShortcutEditorPaste
+            | Self::ShortcutEditorSelectAll
             | Self::ShortcutMarkAllRead
             | Self::ShortcutSearchInProject
             | Self::ShortcutCloneRepository
@@ -3267,6 +3294,13 @@ struct ShortcutDraft {
     settings_accounts: String,
     settings_notifications: String,
     settings_about: String,
+    editor_undo: String,
+    editor_redo: String,
+    editor_cut: String,
+    editor_copy: String,
+    editor_paste: String,
+    editor_select_all: String,
+
     mark_all_read: String,
     search_in_project: String,
     clone_repository: String,
@@ -3354,6 +3388,13 @@ impl ShortcutDraft {
             settings_accounts: settings::format_chords(&shortcuts.settings_accounts),
             settings_notifications: settings::format_chords(&shortcuts.settings_notifications),
             settings_about: settings::format_chords(&shortcuts.settings_about),
+            editor_undo: settings::format_chords(&shortcuts.editor_undo),
+            editor_redo: settings::format_chords(&shortcuts.editor_redo),
+            editor_cut: settings::format_chords(&shortcuts.editor_cut),
+            editor_copy: settings::format_chords(&shortcuts.editor_copy),
+            editor_paste: settings::format_chords(&shortcuts.editor_paste),
+            editor_select_all: settings::format_chords(&shortcuts.editor_select_all),
+
             mark_all_read: settings::format_chords(&shortcuts.mark_all_read),
             search_in_project: settings::format_chords(&shortcuts.search_in_project),
             clone_repository: settings::format_chords(&shortcuts.clone_repository),
@@ -3653,6 +3694,13 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.settings_notifications = value
             }
             SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
+            SettingsField::ShortcutEditorUndo => self.keyboard_shortcuts.editor_undo = value,
+            SettingsField::ShortcutEditorRedo => self.keyboard_shortcuts.editor_redo = value,
+            SettingsField::ShortcutEditorCut => self.keyboard_shortcuts.editor_cut = value,
+            SettingsField::ShortcutEditorCopy => self.keyboard_shortcuts.editor_copy = value,
+            SettingsField::ShortcutEditorPaste => self.keyboard_shortcuts.editor_paste = value,
+            SettingsField::ShortcutEditorSelectAll => self.keyboard_shortcuts.editor_select_all = value,
+
             SettingsField::ShortcutMarkAllRead => self.keyboard_shortcuts.mark_all_read = value,
             SettingsField::ShortcutSearchInProject => self.keyboard_shortcuts.search_in_project = value,
             SettingsField::ShortcutCloneRepository => self.keyboard_shortcuts.clone_repository = value,
@@ -3888,6 +3936,31 @@ fn settings_update(
             next.keyboard_shortcuts.settings_about = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutEditorUndo => {
+            next.keyboard_shortcuts.editor_undo = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorRedo => {
+            next.keyboard_shortcuts.editor_redo = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorCut => {
+            next.keyboard_shortcuts.editor_cut = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorCopy => {
+            next.keyboard_shortcuts.editor_copy = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorPaste => {
+            next.keyboard_shortcuts.editor_paste = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorSelectAll => {
+            next.keyboard_shortcuts.editor_select_all = settings::parse_chords(value);
+            Ok(())
+        }
+
         SettingsField::ShortcutMarkAllRead => {
             next.keyboard_shortcuts.mark_all_read = settings::parse_chords(value);
             Ok(())
@@ -6621,6 +6694,7 @@ impl Cagents {
             crate::terminal::monospace_font(self.settings.editor_font_family()),
             self.settings.editor_font_size(),
         );
+        runtime.set_keyboard_shortcuts(Arc::new(self.settings.keyboard_shortcuts.clone()));
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
@@ -7363,6 +7437,7 @@ impl Cagents {
             crate::terminal::monospace_font(self.settings.editor_font_family()),
             self.settings.editor_font_size(),
         );
+        runtime.set_keyboard_shortcuts(Arc::new(self.settings.keyboard_shortcuts.clone()));
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
@@ -13421,6 +13496,14 @@ impl Cagents {
             }
         }
         if previous.keyboard_shortcuts != self.settings.keyboard_shortcuts {
+            let shortcuts = Arc::new(self.settings.keyboard_shortcuts.clone());
+            for runtime in self.cards.values_mut() {
+                match runtime {
+                    CardRuntime::Repository(runtime) => runtime.set_keyboard_shortcuts(Arc::clone(&shortcuts)),
+                    CardRuntime::PullRequests(pane) => pane.runtime.set_keyboard_shortcuts(Arc::clone(&shortcuts)),
+                    _ => {}
+                }
+            }
             self.card_chrome.clear();
         }
         if previous.worktree_sort != self.settings.worktree_sort {
@@ -16952,6 +17035,7 @@ impl Application for Cagents {
                         self.focused_pane(),
                     ) {
                         Some(command) => {
+                            if captured && workspace_widget::shortcut_descriptor(command).scope == workspace_widget::ShortcutScope::Editor { return Task::none(); }
                             let modifiers = match event {
                                 keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
                                 _ => keyboard::Modifiers::empty(),

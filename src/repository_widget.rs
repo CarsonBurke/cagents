@@ -1843,6 +1843,7 @@ pub struct RepositoryRuntime {
     directory_only: bool,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
+    keyboard_shortcuts: Arc<crate::settings::KeyboardShortcuts>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
     /// document operation.
@@ -2064,6 +2065,7 @@ impl RepositoryRuntime {
             worktree_protection: None,
             standalone: false,
             external_editors: Vec::new(),
+            keyboard_shortcuts: Arc::new(crate::settings::KeyboardShortcuts::default()),
             generation: 0,
             file_list_generation: 0,
             pdf_request: 0,
@@ -2154,6 +2156,24 @@ impl RepositoryRuntime {
 
     pub fn set_external_editors(&mut self, editors: Vec<crate::sidebar::SidebarEditor>) {
         self.external_editors = editors;
+    }
+
+    pub fn set_keyboard_shortcuts(&mut self, shortcuts: Arc<crate::settings::KeyboardShortcuts>) {
+        self.keyboard_shortcuts = shortcuts;
+    }
+
+    /// Cached native-buffer capabilities used by menus, palette and shortcuts.
+    pub fn editor_command_capabilities(&self) -> u8 {
+        if !self.editable_surface_visible() { return 0; }
+        let DocumentState::Editable(document) = &self.document else { return 0; };
+        let selected = document.content.cursor().selection.is_some_and(|anchor| anchor != document.content.cursor().position);
+        let writable = !self.search_mode && document.active_save.is_none();
+        u8::from(writable && document.history.can_undo())
+            | (u8::from(writable && document.history.can_redo()) << 1)
+            | (u8::from(writable && selected) << 2)
+            | (u8::from(selected) << 3)
+            | (u8::from(writable) << 4)
+            | (u8::from(!document.content.is_empty()) << 5)
     }
 
     /// Changes presentation without replacing the open buffer or its edit history.
@@ -7490,84 +7510,74 @@ enum EditorMenuCommand {
     Clipboard(CardId, ClipboardOp),
 }
 
+impl EditorMenuCommand {
+    fn command(self) -> crate::workspace_widget::GlobalShortcut {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        match self {
+            Self::Undo(_) => Command::EditorUndo,
+            Self::Redo(_) => Command::EditorRedo,
+            Self::Clipboard(_, ClipboardOp::Cut) => Command::EditorCut,
+            Self::Clipboard(_, ClipboardOp::Copy) => Command::EditorCopy,
+            Self::Clipboard(_, ClipboardOp::Paste) => Command::EditorPaste,
+            Self::Clipboard(_, ClipboardOp::SelectAll) => Command::EditorSelectAll,
+        }
+    }
+}
+
+/// `Some(None)` retires an original native editing chord after remapping;
+/// `None` leaves unrelated native navigation and form input unchanged.
+fn registered_editor_binding(card: CardId, runtime: &RepositoryRuntime, press: &iced::widget::text_editor::KeyPress) -> Option<Option<text_editor::Binding<RepositoryAction>>> {
+    if let Some(command) = crate::workspace_widget::editor_shortcut(&press.key, press.physical_key, press.modifiers, &runtime.keyboard_shortcuts) {
+        return Some(editor_command_action(card, command).map(text_editor::Binding::Custom));
+    }
+    use iced::keyboard::Key;
+    if text_editor::history_command(press).is_some() || (press.modifiers.command() && !press.modifiers.alt() && !press.modifiers.shift() && matches!(&press.key, Key::Character(key) if matches!(key.to_ascii_lowercase().as_str(), "x" | "c" | "v" | "a"))) { return Some(None); }
+    None
+}
+
+pub fn editor_command_action(card: CardId, command: crate::workspace_widget::GlobalShortcut) -> Option<RepositoryAction> {
+    use crate::workspace_widget::GlobalShortcut as Command;
+    Some(match command {
+        Command::EditorUndo => RepositoryAction::Undo { card },
+        Command::EditorRedo => RepositoryAction::Redo { card },
+        Command::EditorCut => RepositoryAction::Clipboard { card, op: ClipboardOp::Cut },
+        Command::EditorCopy => RepositoryAction::Clipboard { card, op: ClipboardOp::Copy },
+        Command::EditorPaste => RepositoryAction::Clipboard { card, op: ClipboardOp::Paste },
+        Command::EditorSelectAll => RepositoryAction::Clipboard { card, op: ClipboardOp::SelectAll },
+        _ => return None,
+    })
+}
+
 impl widget::menu::Action for EditorMenuCommand {
     type Message = RepositoryAction;
-
     fn message(&self) -> RepositoryAction {
-        match *self {
-            Self::Undo(card) => RepositoryAction::Undo { card },
-            Self::Redo(card) => RepositoryAction::Redo { card },
-            Self::Clipboard(card, op) => RepositoryAction::Clipboard { card, op },
-        }
+        let card = match *self { Self::Undo(card) | Self::Redo(card) | Self::Clipboard(card, _) => card };
+        editor_command_action(card, self.command()).expect("registered editor menu command")
     }
 }
 
 /// The editor's context menu: history, then the clipboard, each entry
 /// showing the chord that does the same thing.
-fn editor_context_menu(
-    card: CardId,
-    document: &EditorDocument,
-) -> Vec<widget::menu::Tree<RepositoryAction>> {
-    use widget::menu::{Item, KeyBind, key_bind::Modifier};
-    let chord = |modifiers: &[Modifier], key: &str| KeyBind {
-        modifiers: modifiers.to_vec(),
-        key: iced::keyboard::Key::Character(key.into()),
-    };
-    let ctrl = [Modifier::Ctrl];
-    let entries = [
-        (
-            "Undo",
-            EditorMenuCommand::Undo(card),
-            chord(&ctrl, "z"),
-            document.history.can_undo(),
-        ),
-        (
-            "Redo",
-            EditorMenuCommand::Redo(card),
-            chord(&[Modifier::Ctrl, Modifier::Shift], "z"),
-            document.history.can_redo(),
-        ),
-        (
-            "Cut",
-            EditorMenuCommand::Clipboard(card, ClipboardOp::Cut),
-            chord(&ctrl, "x"),
-            true,
-        ),
-        (
-            "Copy",
-            EditorMenuCommand::Clipboard(card, ClipboardOp::Copy),
-            chord(&ctrl, "c"),
-            true,
-        ),
-        (
-            "Paste",
-            EditorMenuCommand::Clipboard(card, ClipboardOp::Paste),
-            chord(&ctrl, "v"),
-            true,
-        ),
-        (
-            "Select all",
-            EditorMenuCommand::Clipboard(card, ClipboardOp::SelectAll),
-            chord(&ctrl, "a"),
-            true,
-        ),
+fn editor_context_menu(card: CardId, runtime: &RepositoryRuntime) -> Vec<widget::menu::Tree<RepositoryAction>> {
+    use widget::menu::Item;
+    let commands = [
+        EditorMenuCommand::Undo(card), EditorMenuCommand::Redo(card),
+        EditorMenuCommand::Clipboard(card, ClipboardOp::Cut), EditorMenuCommand::Clipboard(card, ClipboardOp::Copy),
+        EditorMenuCommand::Clipboard(card, ClipboardOp::Paste), EditorMenuCommand::Clipboard(card, ClipboardOp::SelectAll),
     ];
-    let key_binds = entries
-        .iter()
-        .map(|(_, command, chord, _)| (chord.clone(), *command))
-        .collect::<HashMap<_, _>>();
-    let mut items = Vec::with_capacity(entries.len() + 1);
-    for (index, (label, command, _, enabled)) in entries.into_iter().enumerate() {
-        if index == 2 {
-            items.push(Item::Divider);
-        }
-        items.push(if enabled {
+    let capabilities = runtime.editor_command_capabilities();
+    let mut hints = HashMap::new();
+    let mut items = Vec::with_capacity(7);
+    for (index, command) in commands.into_iter().enumerate() {
+        let action = command.command();
+        if let Some(chord) = crate::workspace_widget::menu_shortcut(action, &runtime.keyboard_shortcuts) { hints.insert(chord, command); }
+        if index == 2 { items.push(Item::Divider); }
+        let label = crate::workspace_widget::shortcut_descriptor(action).label;
+        items.push(if capabilities & crate::workspace_widget::editor_command_bit(action).expect("editor action") != 0 {
             Item::Button(label, None, command)
-        } else {
-            Item::ButtonDisabled(label, None, command)
-        });
+        } else { Item::ButtonDisabled(label, None, command) });
     }
-    widget::menu::items(&key_binds, items)
+    widget::menu::items(&hints, items)
 }
 
 impl widget::menu::Action for ExternalEditorCommand<'_> {
@@ -8621,12 +8631,7 @@ fn editable_document_view<'a>(
                         delta,
                     }));
                 }
-                if let Some(command) = text_editor::history_command(&press) {
-                    return Some(text_editor::Binding::Custom(match command {
-                        text_editor::HistoryCommand::Undo => RepositoryAction::Undo { card },
-                        text_editor::HistoryCommand::Redo => RepositoryAction::Redo { card },
-                    }));
-                }
+                if let Some(binding) = registered_editor_binding(card, runtime, &press) { return binding; }
                 if !matches!(
                     press.status,
                     iced::widget::text_editor::Status::Focused { .. }
@@ -8675,7 +8680,7 @@ fn editable_document_view<'a>(
             });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
-        crate::interaction::context_menu(editor, editor_context_menu(card, document))
+        crate::interaction::context_menu(editor, editor_context_menu(card, runtime))
     };
     // Keep the named editor in the same slot when save warnings appear.
     let error_slot = widget::column::with_children(error_rows).width(Length::Fill);
@@ -15955,6 +15960,53 @@ mod tests {
             "the caret follows the text the user chose, past the edit inserted above it"
         );
         assert!(runtime.is_dirty());
+    }
+
+    #[test]
+    fn registry_editor_menu_commands_share_native_actions_and_capabilities() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        use widget::menu::Action as _;
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "original");
+        let commands = [EditorMenuCommand::Undo(card), EditorMenuCommand::Redo(card), EditorMenuCommand::Clipboard(card, ClipboardOp::Cut), EditorMenuCommand::Clipboard(card, ClipboardOp::Copy), EditorMenuCommand::Clipboard(card, ClipboardOp::Paste), EditorMenuCommand::Clipboard(card, ClipboardOp::SelectAll)];
+        for command in commands {
+            assert_eq!(crate::workspace_widget::shortcut_descriptor(command.command()).id(), command.command().id());
+            assert!(editor_command_action(card, command.command()).is_some());
+        }
+        assert_eq!(runtime.editor_command_capabilities() & 15, 0);
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("changed".into()))) }));
+        let changed = buffer_text(&runtime);
+        assert_ne!(changed, "original");
+        assert_ne!(runtime.editor_command_capabilities() & 1, 0);
+        drop(runtime.update(EditorMenuCommand::Undo(card).message()));
+        assert_eq!(buffer_text(&runtime), "original");
+        assert_ne!(runtime.editor_command_capabilities() & 2, 0);
+        drop(runtime.update(editor_command_action(card, Command::EditorRedo).unwrap()));
+        assert_eq!(buffer_text(&runtime), changed);
+        drop(runtime.update(editor_command_action(card, Command::EditorSelectAll).unwrap()));
+        assert_ne!(runtime.editor_command_capabilities() & 12, 0);
+        assert_eq!(runtime.selected_text().as_deref(), Some(changed.as_str()));
+        runtime.set_search_mode(true);
+        assert_eq!(runtime.editor_command_capabilities() & (1|2|4|16), 0);
+        assert_ne!(runtime.editor_command_capabilities() & 8, 0);
+    }
+
+    #[test]
+    fn registry_editor_remapping_retires_native_chords_without_touching_other_keys() {
+        use iced::keyboard::{Key, key::{Code, Physical}};
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "original");
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.editor_undo = vec!["Ctrl+Alt+K".into()];
+        shortcuts.editor_copy.clear();
+        runtime.set_keyboard_shortcuts(Arc::new(shortcuts));
+        let press = |key: &str, code, modifiers| iced::widget::text_editor::KeyPress { key: Key::Character(key.into()), modified_key: Key::Character(key.into()), physical_key: Physical::Code(code), modifiers, text: None, status: iced::widget::text_editor::Status::Focused { is_hovered: false } };
+        assert!(matches!(registered_editor_binding(card, &runtime, &press("z", Code::KeyZ, iced::keyboard::Modifiers::CTRL)), Some(None)));
+        assert!(matches!(registered_editor_binding(card, &runtime, &press("c", Code::KeyC, iced::keyboard::Modifiers::CTRL)), Some(None)));
+        assert!(matches!(registered_editor_binding(card, &runtime, &press("k", Code::KeyK, iced::keyboard::Modifiers::CTRL|iced::keyboard::Modifiers::ALT)), Some(Some(text_editor::Binding::Custom(RepositoryAction::Undo { card: id }))) if id == card));
+        assert!(registered_editor_binding(card, &runtime, &press("a", Code::KeyA, iced::keyboard::Modifiers::empty())).is_none());
+        assert_eq!(crate::workspace_widget::shortcut_descriptor(Command::EditorCopy).category(), "Editor");
     }
 
     #[test]

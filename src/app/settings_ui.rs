@@ -1246,7 +1246,7 @@ fn keyboard_groups<'a>(
                     .expect("registered draft")
                     .1;
                 shortcut_input(
-                    field.label(),
+                    workspace_widget::shortcut_descriptor(action).label,
                     value,
                     field,
                     &draft.keyboard_shortcuts,
@@ -1345,13 +1345,14 @@ fn shortcut_input<'a>(
                     break;
                 }
                 Ok(binding) => {
-                    if let Some(reason) = settings::shortcut_chord_refusal(binding) {
+                    if let Some(reason) = settings::shortcut_chord_refusal_for(action.id(), binding) {
                         error = Some(sentence(reason));
                         break;
                     }
                     if let Some((other, _)) =
                         draft.shortcut_values().into_iter().find(|(other, value)| {
                             *other != action
+                                && settings::shortcut_binding_conflicts(action.id(), other.id(), binding)
                                 && settings::parse_chords(value).iter().any(|chord| {
                                     settings::parse_shortcut(chord)
                                         .is_ok_and(|candidate| candidate == binding)
@@ -1394,7 +1395,7 @@ fn shortcut_input<'a>(
     if let Some(reason) = chords
         .iter()
         .filter_map(|chord| settings::parse_shortcut(chord).ok())
-        .find_map(settings::text_editing_shortcut_conflict)
+        .find_map(|binding| settings::text_editing_shortcut_conflict_for(action.id(), binding))
     {
         children.push(design::caption(format!("Scoped conflict: {reason}")).into());
     }

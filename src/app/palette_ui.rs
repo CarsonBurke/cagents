@@ -567,16 +567,15 @@ impl Cagents {
             SettingsDecision::Invalid(reason) => {
                 self.palette.recording_error = Some(reason);
                 if let Ok(binding) = settings::parse_shortcut(&chord)
-                    && settings::shortcut_chord_refusal(binding).is_none()
+                    && settings::shortcut_chord_refusal_for(action.id(), binding).is_none()
                     && let Some(owner) =
                         self.settings
                             .keyboard_shortcuts
                             .actions()
                             .iter()
-                            .position(|chords| {
-                                chords.iter().any(|candidate| {
-                                    settings::parse_shortcut(candidate).ok() == Some(binding)
-                                })
+                            .enumerate()
+                            .find_map(|(owner, chords)| {
+                                (settings::shortcut_binding_conflicts(action.id(), KeyboardShortcuts::action_names()[owner], binding) && chords.iter().any(|candidate| settings::parse_shortcut(candidate).ok() == Some(binding))).then_some(owner)
                             })
                     && SettingsField::SHORTCUTS[owner] != field
                 {
@@ -995,6 +994,7 @@ impl Cagents {
                 _ if state.is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) => workspace_widget::FocusedPane::ChatPane,
                 _ => workspace_widget::FocusedPane::Other,
             },
+            editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
             pane_index,
             pane_count: self.workspace.order().count(),
             project_count: self.sidebar_model.projects.len(),
@@ -1100,6 +1100,7 @@ impl Cagents {
             return self.update(message);
         }
         match command {
+            Command::EditorUndo | Command::EditorRedo | Command::EditorCut | Command::EditorCopy | Command::EditorPaste | Command::EditorSelectAll => self.workspace.focused().and_then(|card| repository_widget::editor_command_action(card, command)).map_or_else(Task::none, |action| self.update(Message::Repository(action))),
             Command::NewBrowser => self.update(Message::NewBrowser),
             Command::MarkAllRead => self.update(Message::Sidebar(SidebarAction::MarkAllRead)),
             Command::SearchInProject => self.update(Message::SelectContextTab(ContextTab::Search)),
@@ -1215,7 +1216,13 @@ impl Cagents {
             | Command::SettingsAbout
             | Command::MarkAllRead
             | Command::SearchInProject
-            | Command::CloneRepository => self.run_registered_command(command),
+            | Command::CloneRepository
+            | Command::EditorUndo
+            | Command::EditorRedo
+            | Command::EditorCut
+            | Command::EditorCopy
+            | Command::EditorPaste
+            | Command::EditorSelectAll => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -1424,6 +1431,13 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => Some(Command::SettingsAccounts),
             Self::ShortcutSettingsNotifications => Some(Command::SettingsNotifications),
             Self::ShortcutSettingsAbout => Some(Command::SettingsAbout),
+            Self::ShortcutEditorUndo => Some(Command::EditorUndo),
+            Self::ShortcutEditorRedo => Some(Command::EditorRedo),
+            Self::ShortcutEditorCut => Some(Command::EditorCut),
+            Self::ShortcutEditorCopy => Some(Command::EditorCopy),
+            Self::ShortcutEditorPaste => Some(Command::EditorPaste),
+            Self::ShortcutEditorSelectAll => Some(Command::EditorSelectAll),
+
             Self::ShortcutMarkAllRead => Some(Command::MarkAllRead),
             Self::ShortcutSearchInProject => Some(Command::SearchInProject),
             Self::ShortcutCloneRepository => Some(Command::CloneRepository),
@@ -1536,6 +1550,13 @@ impl ShortcutDraft {
                 self.settings_notifications.as_str(),
             ),
             (Command::SettingsAbout, self.settings_about.as_str()),
+            (Command::EditorUndo, self.editor_undo.as_str()),
+            (Command::EditorRedo, self.editor_redo.as_str()),
+            (Command::EditorCut, self.editor_cut.as_str()),
+            (Command::EditorCopy, self.editor_copy.as_str()),
+            (Command::EditorPaste, self.editor_paste.as_str()),
+            (Command::EditorSelectAll, self.editor_select_all.as_str()),
+
             (Command::MarkAllRead, self.mark_all_read.as_str()),
             (Command::SearchInProject, self.search_in_project.as_str()),
             (Command::CloneRepository, self.clone_repository.as_str()),

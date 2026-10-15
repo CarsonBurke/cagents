@@ -82,6 +82,13 @@ pub enum GlobalShortcut {
     SettingsAccounts,
     SettingsNotifications,
     SettingsAbout,
+    EditorUndo,
+    EditorRedo,
+    EditorCut,
+    EditorCopy,
+    EditorPaste,
+    EditorSelectAll,
+
     MarkAllRead,
     SearchInProject,
     CloneRepository,
@@ -168,6 +175,13 @@ impl GlobalShortcut {
             Self::SettingsAccounts => "settings_accounts",
             Self::SettingsNotifications => "settings_notifications",
             Self::SettingsAbout => "settings_about",
+            Self::EditorUndo => "editor_undo",
+            Self::EditorRedo => "editor_redo",
+            Self::EditorCut => "editor_cut",
+            Self::EditorCopy => "editor_copy",
+            Self::EditorPaste => "editor_paste",
+            Self::EditorSelectAll => "editor_select_all",
+
             Self::MarkAllRead => "mark_all_read",
             Self::SearchInProject => "search_in_project",
             Self::CloneRepository => "clone_repository",
@@ -236,6 +250,8 @@ pub enum ShortcutScope {
     Review,
     /// Only in a native chat pane; other panes retain the configured keys.
     Chat,
+    /// Native editable code buffer only.
+    Editor,
 }
 
 impl ShortcutScope {
@@ -248,6 +264,7 @@ impl ShortcutScope {
             Self::OutsideTextInput => !focused.is_text_editing(),
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane),
+            Self::Editor => focused == FocusedPane::Editor,
         }
     }
 }
@@ -312,6 +329,7 @@ pub struct CommandContext {
     pub daemon_can_restart: bool,
     pub can_reopen: bool,
     pub has_unread: bool,
+    pub editor_commands: u8,
     pub can_search_project: bool,
     pub has_attention: bool,
     pub can_cycle_workspace: bool,
@@ -355,6 +373,8 @@ impl ShortcutDescriptor {
             || matches!(self.action, GlobalShortcut::ResumeConversation | GlobalShortcut::NewThread)
         {
             "Chat"
+        } else if self.scope == ShortcutScope::Editor {
+            "Editor"
         } else if self.scope == ShortcutScope::Review {
             "Review"
         } else {
@@ -369,10 +389,13 @@ impl ShortcutDescriptor {
     pub fn available(self, context: &CommandContext) -> bool {
         // OutsideTerminal controls chord reservation; explicit palette
         // invocation remains available when the terminal has its own finder.
-        if matches!(self.scope, ShortcutScope::Chat | ShortcutScope::Review)
+        if matches!(self.scope, ShortcutScope::Chat | ShortcutScope::Review | ShortcutScope::Editor)
             && !self.scope.applies_to(context.focused)
         {
             return false;
+        }
+        if let Some(bit) = editor_command_bit(self.action) {
+            return context.editor_commands & bit != 0;
         }
         let pane = context.pane_index.is_some();
         match self.action {
@@ -882,6 +905,43 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
+        action: GlobalShortcut::EditorUndo,
+        label: "Undo",
+        repeatable: true,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorRedo,
+        label: "Redo",
+        repeatable: true,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorCut,
+        label: "Cut",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorCopy,
+        label: "Copy",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorPaste,
+        label: "Paste",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorSelectAll,
+        label: "Select all",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+
+    ShortcutDescriptor {
         action: GlobalShortcut::MarkAllRead,
         label: "Mark all as read",
         repeatable: false,
@@ -947,6 +1007,13 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::SettingsAccounts => &shortcuts.settings_accounts,
         GlobalShortcut::SettingsNotifications => &shortcuts.settings_notifications,
         GlobalShortcut::SettingsAbout => &shortcuts.settings_about,
+        GlobalShortcut::EditorUndo => &shortcuts.editor_undo,
+        GlobalShortcut::EditorRedo => &shortcuts.editor_redo,
+        GlobalShortcut::EditorCut => &shortcuts.editor_cut,
+        GlobalShortcut::EditorCopy => &shortcuts.editor_copy,
+        GlobalShortcut::EditorPaste => &shortcuts.editor_paste,
+        GlobalShortcut::EditorSelectAll => &shortcuts.editor_select_all,
+
         GlobalShortcut::MarkAllRead => &shortcuts.mark_all_read,
         GlobalShortcut::SearchInProject => &shortcuts.search_in_project,
         GlobalShortcut::CloneRepository => &shortcuts.clone_repository,
@@ -1297,8 +1364,8 @@ pub fn global_shortcut(
     else {
         return None;
     };
-    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
-    if focused.is_text_editing()
+    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts, focused)?;
+    if focused.is_text_editing() && descriptor.scope != ShortcutScope::Editor
         && text_editing_conflict(descriptor.action, key, *physical_key, *modifiers)
     {
         return None;
@@ -1327,9 +1394,9 @@ pub(crate) fn is_global_shortcut_chord(
     focused: FocusedPane,
 ) -> bool {
     crate::tab_history::is_chord(key, modifiers)
-        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts).is_some_and(
+        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts, focused).is_some_and(
             |descriptor| {
-                !(focused.is_text_editing()
+                descriptor.scope != ShortcutScope::Editor && !(focused.is_text_editing() && descriptor.scope != ShortcutScope::Editor
                     && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
                     && shortcut_applies(descriptor, focused, shortcuts)
             },
@@ -1438,15 +1505,34 @@ fn global_shortcut_descriptor(
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
     shortcuts: &KeyboardShortcuts,
+    focused: FocusedPane,
 ) -> Option<&'static ShortcutDescriptor> {
     GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| {
-        shortcut_keys(descriptor.action, shortcuts)
-            .iter()
-            .any(|chord| {
-                parse_shortcut(chord)
-                    .is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
+        shortcut_applies(descriptor, focused, shortcuts)
+            && !(focused.is_text_editing() && descriptor.scope != ShortcutScope::Editor && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
+            && shortcut_keys(descriptor.action, shortcuts).iter().any(|chord| {
+                parse_shortcut(chord).is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
             })
     })
+}
+
+pub const fn editor_command_bit(command: GlobalShortcut) -> Option<u8> {
+    Some(match command {
+        GlobalShortcut::EditorUndo => 1,
+        GlobalShortcut::EditorRedo => 2,
+        GlobalShortcut::EditorCut => 4,
+        GlobalShortcut::EditorCopy => 8,
+        GlobalShortcut::EditorPaste => 16,
+        GlobalShortcut::EditorSelectAll => 32,
+        _ => return None,
+    })
+}
+
+/// Native code-buffer widgets dispatch registered editing actions once, before
+/// the application sees the same captured event.
+pub fn editor_shortcut(key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: keyboard::Modifiers, shortcuts: &KeyboardShortcuts) -> Option<GlobalShortcut> {
+    global_shortcut_descriptor(key, physical, modifiers, shortcuts, FocusedPane::Editor)
+        .filter(|descriptor| descriptor.scope == ShortcutScope::Editor).map(|descriptor| descriptor.action)
 }
 
 fn shortcut_matches(
@@ -3859,7 +3945,7 @@ mod tests {
             FocusedPane::Chat,
             FocusedPane::TextInput,
         ] {
-            assert_eq!(global_shortcut(&redo, &shortcuts, focused), None);
+            assert_eq!(global_shortcut(&redo, &shortcuts, focused), (focused == FocusedPane::Editor).then_some(GlobalShortcut::EditorRedo));
             assert!(!is_global_shortcut_chord(
                 &keyboard::Key::Character("z".into()),
                 keyboard::key::Physical::Code(Code::KeyZ),

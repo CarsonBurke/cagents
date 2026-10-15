@@ -436,3 +436,11 @@ The command registry also exposes `keyboard_shortcuts.mark_all_read` and
 `keyboard_shortcuts.search_in_project` (`Ctrl+Alt+F`). `focus_last_pane`
 uses `Alt+0`; `next_attention` and `previous_attention` follow the configured
 attention navigation bindings. All of these appear in Keyboard settings.
+
+Native code-buffer actions are separately configurable as
+`keyboard_shortcuts.editor_undo` (`Ctrl+Z`), `editor_redo` (`Ctrl+Shift+Z`,
+`Ctrl+Y`), `editor_cut` (`Ctrl+X`), `editor_copy` (`Ctrl+C`), `editor_paste`
+(`Ctrl+V`) and `editor_select_all` (`Ctrl+A`). These bindings apply only to the
+editable code buffer. Other text fields and terminal programs retain their own
+editing keys. Rebinding or clearing an editor action also replaces its original
+code-buffer chord; menu hints follow the current binding.

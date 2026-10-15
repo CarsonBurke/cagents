@@ -316,6 +316,13 @@ pub struct KeyboardShortcuts {
     pub settings_accounts: Vec<String>,
     pub settings_notifications: Vec<String>,
     pub settings_about: Vec<String>,
+    pub editor_undo: Vec<String>,
+    pub editor_redo: Vec<String>,
+    pub editor_cut: Vec<String>,
+    pub editor_copy: Vec<String>,
+    pub editor_paste: Vec<String>,
+    pub editor_select_all: Vec<String>,
+
     pub mark_all_read: Vec<String>,
     pub search_in_project: Vec<String>,
     pub clone_repository: Vec<String>,
@@ -401,6 +408,13 @@ impl Default for KeyboardShortcuts {
             settings_accounts: Vec::new(),
             settings_notifications: Vec::new(),
             settings_about: Vec::new(),
+            editor_undo: vec!["Ctrl+Z".into()],
+            editor_redo: vec!["Ctrl+Shift+Z".into(),"Ctrl+Y".into()],
+            editor_cut: vec!["Ctrl+X".into()],
+            editor_copy: vec!["Ctrl+C".into()],
+            editor_paste: vec!["Ctrl+V".into()],
+            editor_select_all: vec!["Ctrl+A".into()],
+
             mark_all_read: vec![],
             search_in_project: vec!["Ctrl+Alt+F".into()],
             clone_repository: vec![],
@@ -436,7 +450,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 77] {
+    pub fn actions(&self) -> [&Vec<String>; 83] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -512,6 +526,13 @@ impl KeyboardShortcuts {
             &self.settings_accounts,
             &self.settings_notifications,
             &self.settings_about,
+            &self.editor_undo,
+            &self.editor_redo,
+            &self.editor_cut,
+            &self.editor_copy,
+            &self.editor_paste,
+            &self.editor_select_all,
+
             &self.mark_all_read,
             &self.search_in_project,
             &self.clone_repository,
@@ -521,7 +542,7 @@ impl KeyboardShortcuts {
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 77] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 83] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -597,6 +618,12 @@ impl KeyboardShortcuts {
             &mut self.settings_accounts,
             &mut self.settings_notifications,
             &mut self.settings_about,
+            &mut self.editor_undo,
+            &mut self.editor_redo,
+            &mut self.editor_cut,
+            &mut self.editor_copy,
+            &mut self.editor_paste,
+            &mut self.editor_select_all,
             &mut self.mark_all_read,
             &mut self.search_in_project,
             &mut self.clone_repository,
@@ -635,10 +662,10 @@ impl KeyboardShortcuts {
                     Ok(binding) => binding,
                     Err(error) => return fault(error, None),
                 };
-                if let Some(message) = shortcut_chord_refusal(binding) {
+                if let Some(message) = shortcut_chord_refusal_for(SHORTCUT_ACTIONS[index], binding) {
                     return fault(message, None);
                 }
-                if let Some(&(_, owner)) = parsed.iter().find(|(other, _)| *other == binding) {
+                if let Some(&(_, owner)) = parsed.iter().find(|(other, owner)| *other == binding && shortcut_binding_conflicts(SHORTCUT_ACTIONS[index], SHORTCUT_ACTIONS[*owner], binding)) {
                     return fault("keyboard shortcuts must not conflict", Some(owner));
                 }
                 parsed.push((binding, index));
@@ -649,7 +676,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 77] = [
+const SHORTCUT_ACTIONS: [&str; 83] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -724,6 +751,13 @@ const SHORTCUT_ACTIONS: [&str; 77] = [
     "settings_accounts",
     "settings_notifications",
     "settings_about",
+    "editor_undo",
+    "editor_redo",
+    "editor_cut",
+    "editor_copy",
+    "editor_paste",
+    "editor_select_all",
+
     "mark_all_read",
     "search_in_project",
     "clone_repository",
@@ -863,6 +897,30 @@ pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'stat
                 .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
         })
         .map(|fixed| fixed.refusal)
+}
+
+/// Native code-buffer actions have a narrower scope than workspace actions.
+/// Ordinary text controls and shells keep their own editing commands.
+pub fn is_editor_command(action: &str) -> bool {
+    matches!(action, "editor_undo" | "editor_redo" | "editor_cut" | "editor_copy" | "editor_paste" | "editor_select_all")
+}
+
+pub fn text_editing_shortcut_conflict_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
+    if is_editor_command(action) { None } else { text_editing_shortcut_conflict(binding) }
+}
+
+pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBinding) -> bool {
+    // Native editing chords already suppress ordinary workspace bindings in
+    // an editable buffer; Reopen pane and Redo can therefore share CtrlShiftZ.
+    !(is_editor_command(left) != is_editor_command(right) && text_editing_shortcut_conflict(binding).is_some())
+}
+
+pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
+    if is_editor_command(action) && text_editing_shortcut_conflict(binding).is_some() {
+        None
+    } else {
+        shortcut_chord_refusal(binding)
+    }
 }
 
 /// The same refusal is used by the recorder, typed edits and file validation.
@@ -1829,7 +1887,11 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
         return;
     }
     let defaults = default_chords(action);
-    let free = free_defaults(defaults.clone(), &bound_chords(shortcuts, &[]));
+    let free: Vec<_> = defaults.iter().filter(|chord| {
+        parse_shortcut(chord).is_ok_and(|binding| !shortcuts.iter().any(|(other, chords)| {
+            shortcut_binding_conflicts(action, other, binding) && chords.as_array().is_some_and(|chords| chords.iter().filter_map(toml::Value::as_str).any(|chord| parse_shortcut(chord).ok() == Some(binding)))
+        }))
+    }).cloned().collect();
     if free != defaults {
         shortcuts.insert(action.into(), free.into());
     }
@@ -1837,7 +1899,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 72] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 78] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1907,6 +1969,13 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 72] = [
     "settings_accounts",
     "settings_notifications",
     "settings_about",
+    "editor_undo",
+    "editor_redo",
+    "editor_cut",
+    "editor_copy",
+    "editor_paste",
+    "editor_select_all",
+
     "mark_all_read",
     "search_in_project",
     "clone_repository",
@@ -3334,6 +3403,25 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registered_editor_chords_preserve_workspace_scope_and_migrate_without_stealing() {
+        let shortcuts = KeyboardShortcuts::default();
+        assert!(shortcuts.fault().is_none());
+        let binding = parse_shortcut("Ctrl+Shift+Z").unwrap();
+        assert!(!shortcut_binding_conflicts("editor_redo", "reopen_pane", binding));
+        assert!(shortcut_binding_conflicts("editor_redo", "editor_undo", binding));
+        assert!(shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+C").unwrap()).is_none());
+        assert!(shortcut_chord_refusal_for("rename_pane", parse_shortcut("Ctrl+C").unwrap()).is_some());
+        assert!(shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+S").unwrap()).is_some());
+        let mut sparse = toml::Table::new();
+        sparse.insert("reopen_pane".into(), vec!["Ctrl+Shift+Z"].into());
+        preserve_introduced_shortcuts(&mut sparse);
+        let decoded: KeyboardShortcuts = toml::Value::Table(sparse).try_into().unwrap();
+        assert_eq!(decoded.editor_redo, shortcuts.editor_redo);
+        assert_eq!(decoded.reopen_pane, shortcuts.reopen_pane);
+        assert!(decoded.fault().is_none());
+    }
+
     #[test]
     fn mutable_shortcut_order_matches_serialized_registry() {
         for (index, name) in SHORTCUT_ACTIONS.iter().enumerate() {
