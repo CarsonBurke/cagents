@@ -633,12 +633,25 @@ pub struct Report {
     pub cli_protocol: u16,
     pub path: PathBuf,
     pub products: Vec<ProductReport>,
+    pub transcript_caches: Option<crate::transcript_cache::Usage>,
 }
 impl Report {
     pub fn human(&self) -> String {
-        let mut lines = vec![format!("cagents {} (protocol {})", self.cli_version, self.cli_protocol),
+        let mut lines = vec![
+            format!(
+                "cagents {} (protocol {})",
+                self.cli_version, self.cli_protocol
+            ),
             format!("Private diagnostics: {}", self.path.display()),
-            "Recorded evidence only; sibling versions and health are last observed, not a live check.".into()];
+            "Sibling versions and health are last observed, not a live check.".into(),
+        ];
+        match &self.transcript_caches {
+            Some(usage) => lines.push(format!(
+                "Transcript caches: {} ({} bytes)",
+                usage.count, usage.bytes
+            )),
+            None => lines.push("Transcript caches: unavailable".into()),
+        }
         for product in &self.products {
             match &product.last_observed {
                 Some(last) => lines.push(format!("{}: last observed {} (protocol {}), at_unix_ms={}, lifecycle={:?}, clean_shutdown={:?}, persistence={:?}, skipped_events={}, run={}", product.product.name(), last.version, last.protocol, last.at_unix_ms, last.lifecycle, last.clean_shutdown, last.persistence, last.skipped_events, last.run)),
@@ -670,8 +683,9 @@ impl Report {
     }
 }
 
-/// This intentionally reads only recorded evidence, never runtime sockets,
-/// installation routes or databases. Absence is not proof of a clean shutdown.
+/// Read recorded health evidence and current transcript-cache file metadata,
+/// never runtime sockets, installation routes or databases. Absence is not
+/// proof of a clean shutdown.
 pub fn inspect() -> io::Result<Report> {
     inspect_at(state_path()?)
 }
@@ -697,6 +711,14 @@ fn inspect_at(path: PathBuf) -> io::Result<Report> {
         cli_protocol: crate::terminal::ipc::PROTOCOL_VERSION,
         path,
         products,
+        transcript_caches: crate::daemon::RuntimePaths::discover()
+            .ok()
+            .and_then(|paths| {
+                paths
+                    .socket
+                    .parent()
+                    .and_then(|root| crate::transcript_cache::usage(root).ok())
+            }),
     })
 }
 
