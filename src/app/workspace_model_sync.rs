@@ -483,7 +483,11 @@ impl Cagents {
                 let closing = match &edit {
                     ModelEdit::CloseProject { repository } => Some(repository.clone()),
                     ModelEdit::ReopenProject { repository, .. }
-                    | ModelEdit::VisitProject { repository, reopen: true, .. } => {
+                    | ModelEdit::VisitProject {
+                        repository,
+                        reopen: true,
+                        ..
+                    } => {
                         self.cancel_shared_project_close(repository);
                         self.project_ui.closed.remove(repository);
                         // The observer can see a reopen from another window

@@ -85,12 +85,19 @@ mod tests {
         assert_eq!(project.kind, ProjectKind::Git);
         assert_eq!(project.ordinal, before.projects[0].ordinal);
         assert_eq!(project.checkout.as_deref(), Some(Path::new("/linked")));
-        assert_eq!(project.primary_checkout.as_deref(), Some(Path::new("/primary")));
+        assert_eq!(
+            project.primary_checkout.as_deref(),
+            Some(Path::new("/primary"))
+        );
         assert!(!registry.apply(&visit).unwrap().changed);
         drop(registry);
         let mut restored = Registry::at(&path).unwrap();
         assert_eq!(restored.model().unwrap().projects, applied.model.projects);
-        restored.apply(&ModelEdit::CloseProject { repository: repository.into() }).unwrap();
+        restored
+            .apply(&ModelEdit::CloseProject {
+                repository: repository.into(),
+            })
+            .unwrap();
         assert!(!restored.apply(&visit).unwrap().changed);
         assert!(restored.model().unwrap().projects.is_empty());
         let mut reopen = visit;

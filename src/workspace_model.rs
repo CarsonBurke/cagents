@@ -706,20 +706,34 @@ mod tests {
             reopen,
         };
         model.fold(1, &visit("/primary", true));
-        model.fold(2, &ModelEdit::OpenProject {
-            repository: repository.clone(),
-            checkout: None,
-            primary_checkout: Some("/primary".into()),
-            name: "Custom project".into(),
-            kind: ProjectKind::Git,
-        });
+        model.fold(
+            2,
+            &ModelEdit::OpenProject {
+                repository: repository.clone(),
+                checkout: None,
+                primary_checkout: Some("/primary".into()),
+                name: "Custom project".into(),
+                kind: ProjectKind::Git,
+            },
+        );
         model.projects[0].ordinal = 7;
         model.fold(3, &visit("/linked", false));
         assert_eq!(model.projects[0].name, "Custom project");
-        assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/linked")));
-        assert_eq!(model.projects[0].primary_checkout.as_deref(), Some(Path::new("/primary")));
+        assert_eq!(
+            model.projects[0].checkout.as_deref(),
+            Some(Path::new("/linked"))
+        );
+        assert_eq!(
+            model.projects[0].primary_checkout.as_deref(),
+            Some(Path::new("/primary"))
+        );
         assert_eq!(model.projects[0].ordinal, 7);
-        model.fold(4, &ModelEdit::CloseProject { repository: repository.clone() });
+        model.fold(
+            4,
+            &ModelEdit::CloseProject {
+                repository: repository.clone(),
+            },
+        );
         model.fold(5, &visit("/linked", false));
         assert!(model.projects.is_empty());
         assert_eq!(model.closed_projects, vec![repository.clone()]);
