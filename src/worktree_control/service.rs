@@ -375,16 +375,15 @@ pub(crate) fn execute(
             expected_oid,
         } => {
             if force && expected_oid.is_none() {
-                return Ok(Reply::BranchDeleteRefused {
+                Ok(Reply::BranchDeleteRefused {
                     failure: BranchDeleteFailure {
                         kind: BranchDeleteFailureKind::Other,
                         detail: "Force deletion requires the branch commit shown in confirmation"
                             .into(),
                     },
-                });
-            }
-            Ok(
-                match delete_branch_checked_at(
+                })
+            } else {
+                Ok(match delete_branch_checked_at(
                     &repository,
                     &branch,
                     force,
@@ -393,8 +392,8 @@ pub(crate) fn execute(
                 ) {
                     Ok(()) => Reply::BranchDeleted { branch },
                     Err(failure) => Reply::BranchDeleteRefused { failure },
-                },
-            )
+                })
+            }
         }
         Operation::Inspect { repository, path } => {
             inspect(&service, &repository, &path, &cancellation)
