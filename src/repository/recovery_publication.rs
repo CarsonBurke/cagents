@@ -11,6 +11,21 @@ use super::*;
 use crate::recovery_authority::RecoverySlot;
 use std::os::unix::fs::FileExt;
 
+/// Create and retain the actual output inode before giving it to Git. Git
+/// receives only its stdout descriptor; it never creates or opens a pathname.
+/// The private name is fixed and initially absent within a new held directory.
+pub(super) fn create_blob_file(root: &fs_safety::Root) -> Result<Arc<fs::File>, String> {
+    use std::os::fd::FromRawFd;
+    let name = c"restored-blob";
+    // SAFETY: the Root owns its directory FD and the fixed leaf has no slash.
+    // O_EXCL|O_NOFOLLOW refuses any existing entry. The returned File owns the
+    // exact newly-created descriptor, with read/write access for later proofs.
+    let fd = unsafe { libc::openat(root.descriptor(), name.as_ptr(),
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
+    if fd == -1 { return Err(std::io::Error::last_os_error().to_string()); }
+    Ok(Arc::new(unsafe { fs::File::from_raw_fd(fd) }))
+}
+
 struct Holding {
     publication: fs_safety::DirectoryPublication,
     root: fs_safety::Root,
@@ -247,13 +262,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 Some((generated, proof))
             }
             SavedEntry::Blob { oid, mode, bytes } => {
-                let output = self.unpack_recovery_object(source, &holding.publication, oid, cancellation).map_err(|error|error.to_string())?;
-                let bytes_name = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
-                let generated = RepoPath::parse(Path::new(OsStr::from_bytes(bytes_name))).map_err(|error|error.to_string())?;
-                if generated.as_path().components().count() != 1 || !bytes_name.starts_with(b".merge_file_") {
-                    return Err("Git returned an invalid recovery temporary name; unknown entries were preserved".into());
-                }
-                let file = holding.open(generated.as_path())?;
+                let generated = PathBuf::from("restored-blob");
+                let file = create_blob_file(&holding.root)?;
+                // The creator's exact FD survives every error, including a
+                // failed/partial cat-file write. No returned Git name is trusted.
+                holding.files.push(file.clone());
+                self.stream_recovery_object(source, &holding.publication, oid, &file, *bytes, cancellation).map_err(|error|error.to_string())?;
                 let before = file.metadata().map_err(|error|error.to_string())?;
                 if !before.is_file() || before.len() != *bytes { return Err("Recovery blob has an unexpected type or size".into()); }
                 let digest = digest_file(&file, before.len(), cancellation)?;
@@ -261,9 +275,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 if actual != *oid || full_version(&before) != full_version(&file.metadata().map_err(|error|error.to_string())?) {
                     return Err("Recovery blob does not match its saved object; the unknown entry was preserved".into());
                 }
-                let named = fs_safety::metadata_beneath(&holding.root, generated.as_path()).map_err(|error|error.to_string())?;
+                let named = fs_safety::metadata_beneath(&holding.root, &generated).map_err(|error|error.to_string())?;
                 if full_version(&named) != full_version(&before) { return Err("Recovery temporary name changed; it was preserved".into()); }
-                let generated = generated.as_path().to_owned();
                 let proof = Proof::after_blob_mode_change(holding, &generated, file, before, digest, *mode, cancellation, |_| Ok(()))?;
                 Some((generated, proof))
             }

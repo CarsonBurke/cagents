@@ -6065,17 +6065,15 @@ fn recovery_refuses_late_writes_during_other_batches_and_destructive_prechecks()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
+fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
     struct SubstituteUnpacked { changed: std::sync::atomic::AtomicBool }
     impl ProcessExecutor for SubstituteUnpacked {
         fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
             let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancel)?;
-            if command.arguments.iter().any(|argument| argument == "unpack-file") && output.success {
-                use std::os::unix::ffi::OsStrExt;
-                let name = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
-                assert!(name.starts_with(b".merge_file_"));
+            if command.arguments.iter().any(|argument| argument == "cat-file") && output.success {
+                assert!(output.stdout.is_empty(), "blob bytes must stream directly into the retained FD");
                 let cwd = command.arguments.windows(2).find(|pair| pair[0] == "-C").expect("fixed recovery command has a held cwd");
-                let path = Path::new(&cwd[1]).join(OsStr::from_bytes(name));
+                let path = Path::new(&cwd[1]).join("restored-blob");
                 assert_eq!(fs::metadata(&path).unwrap().len(), 4);
                 fs::remove_file(&path).unwrap();
                 fs::write(&path, b"EVIL").unwrap();
@@ -6151,7 +6149,7 @@ fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_per
     impl ProcessExecutor for ChangeParentMode {
         fn execute(&self, command: &CommandSpec, cancellation: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
             let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
-            if output.success && command.arguments.iter().any(|argument| argument == "unpack-file")
+            if output.success && command.arguments.iter().any(|argument| argument == "cat-file")
                 && !self.changed.swap(true, Ordering::AcqRel)
             {
                 fs::set_permissions(self.root.join("a"), fs::Permissions::from_mode(0o711)).unwrap();

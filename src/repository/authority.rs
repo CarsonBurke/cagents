@@ -263,7 +263,7 @@ impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
     }
 }
 
-enum RecoveryObjectCommand<'a> { Unpack(&'a Oid), Hash(&'a Arc<fs::File>) }
+enum RecoveryObjectCommand<'a> { Stream { oid: &'a Oid, file: &'a Arc<fs::File>, max_bytes: u64 }, Hash(&'a Arc<fs::File>) }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
     /// Retain the original object-store authority for one recovery operation.
@@ -287,11 +287,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Fixed recovery-only commands. No general executor or foreign-root
     /// service is exposed: the private destination is a published held inode,
     /// and every Git metadata/worktree scope stays on the original authority.
-    pub(super) fn unpack_recovery_object(
+    pub(super) fn stream_recovery_object(
         &self, source: &WorktreeAuthority, holding: &fs_safety::DirectoryPublication,
-        oid: &Oid, cancellation: &CancellationToken,
+        oid: &Oid, file: &Arc<fs::File>, expected_bytes: u64, cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, RepositoryError> {
-        self.run_recovery_object(source, holding, RecoveryObjectCommand::Unpack(oid), cancellation)
+        let max_bytes = expected_bytes.checked_add(1).ok_or_else(|| ValidationError::Io("Recovery blob size budget overflows".into()))?;
+        self.run_recovery_object(source, holding, RecoveryObjectCommand::Stream { oid, file, max_bytes }, cancellation)
     }
 
     pub(super) fn hash_recovery_object(
@@ -350,7 +351,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .inherit_file(source.child_git.clone()).map_err(metadata_error)?
             .inherit_file(source.child_common.clone()).map_err(metadata_error)?;
         command = match operation {
-            RecoveryObjectCommand::Unpack(oid) => command.args(["unpack-file", oid.as_str()]),
+            RecoveryObjectCommand::Stream { oid, file, max_bytes } => command
+                .args(["cat-file", "blob", oid.as_str()])
+                .stdout_file(file.clone(), max_bytes).map_err(metadata_error)?,
             RecoveryObjectCommand::Hash(file) => command.args(["hash-object", "--no-filters", "--"])
                 .arg(format!("/proc/self/fd/{}", file.as_raw_fd()))
                 .inherit_file(file.clone()).map_err(metadata_error)?,
@@ -534,14 +537,12 @@ mod authority_tests {
         let authority = WorktreeAuthority::capture(&source).unwrap();
         let holding = recovery_holding(directory.path());
         let cancel = CancellationToken::new();
-        let output = service.unpack_recovery_object(&authority, &holding, &oid, &cancel).unwrap();
-        let name = output.stdout.strip_suffix(b"\n").unwrap();
-        let path = Path::new(OsStr::from_bytes(name));
-        assert_eq!(path.components().count(), 1);
-        let file = Arc::new(fs_safety::open_beneath(holding.directory(), path).unwrap());
+        let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+        let output = service.stream_recovery_object(&authority, &holding, &oid, &file, 14, &cancel).unwrap();
+        assert!(output.stdout.is_empty());
         assert_eq!(service.hash_recovery_object(&authority, &holding, &file, &cancel).unwrap(), oid);
-        assert_eq!(fs::read(holding.directory().path().join(path)).unwrap(), b"recovery proof");
-        assert!(!source.join(path).exists(), "unpack-file must not create a shared worktree temporary");
+        assert_eq!(fs::read(holding.directory().path().join("restored-blob")).unwrap(), b"recovery proof");
+        assert!(!source.join("restored-blob").exists());
     }
 
     #[test]
@@ -557,11 +558,11 @@ mod authority_tests {
         let authority = WorktreeAuthority::capture(&source).unwrap();
         for parent in [source.clone(), source.join(".git")] {
             let holding = recovery_holding(&parent);
-            let output = service.unpack_recovery_object(&authority, &holding, &oid, &CancellationToken::new()).unwrap();
-            let name = Path::new(OsStr::from_bytes(output.stdout.strip_suffix(b"\n").unwrap()));
-            assert_eq!(fs::read(holding.directory().path().join(name)).unwrap(), b"private bytes");
-            assert!(!source.join(name).exists(), "RUN_SETUP must not chdir into the shared worktree");
-            assert!(!source.join(".git").join(name).exists());
+            let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+            service.stream_recovery_object(&authority, &holding, &oid, &file, 13, &CancellationToken::new()).unwrap();
+            assert_eq!(fs::read(holding.directory().path().join("restored-blob")).unwrap(), b"private bytes");
+            assert!(!source.join("restored-blob").exists());
+            assert!(!source.join(".git/restored-blob").exists());
         }
     }
 
@@ -578,9 +579,11 @@ mod authority_tests {
         fs::rename(source.join(".git"), directory.path().join("saved-metadata")).unwrap();
         fs::create_dir(source.join(".git")).unwrap();
         let oid = Oid::parse_object("a".repeat(40)).unwrap();
-        assert!(service.unpack_recovery_object(&authority, &holding, &oid, &CancellationToken::new()).is_err());
+        let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+        assert!(service.stream_recovery_object(&authority, &holding, &oid, &file, 1, &CancellationToken::new()).is_err());
+        assert_eq!(file.metadata().unwrap().len(), 0);
         assert!(inner.0.lock().unwrap().is_empty());
-        assert_eq!(fs::read_dir(holding.directory().path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(holding.directory().path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -588,7 +591,7 @@ mod authority_tests {
         struct Delayed { source: PathBuf, parent: PathBuf, parked: PathBuf }
         impl ProcessExecutor for Delayed {
             fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
-                assert!(command.arguments.iter().any(|argument| argument == "unpack-file"));
+                assert!(command.arguments.iter().any(|argument| argument == "cat-file"));
                 fs::rename(self.source.join(".git"), self.parent.join("saved-git")).unwrap();
                 fs::create_dir(self.source.join(".git")).unwrap();
                 fs::rename(self.parent.join("holding"), &self.parked).unwrap();
@@ -608,12 +611,58 @@ mod authority_tests {
         let holding = recovery_holding(directory.path());
         let parked = directory.path().join("retained-holding");
         let service = RepositoryService::new("git", Arc::new(Delayed { source: source.clone(), parent: directory.path().to_owned(), parked: parked.clone() }));
-        let output = service.unpack_recovery_object(&authority, &holding, &oid, &CancellationToken::new()).unwrap();
-        let name = Path::new(OsStr::from_bytes(output.stdout.strip_suffix(b"\n").unwrap()));
-        assert_eq!(fs::read(parked.join(name)).unwrap(), b"original object");
-        assert!(!directory.path().join("holding").join(name).exists());
+        let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+        service.stream_recovery_object(&authority, &holding, &oid, &file, 15, &CancellationToken::new()).unwrap();
+        assert_eq!(fs::read(parked.join("restored-blob")).unwrap(), b"original object");
+        assert!(!directory.path().join("holding/restored-blob").exists());
         assert_eq!(fs::read(directory.path().join("holding/foreign")).unwrap(), b"preserve");
         assert_eq!(fs::read_dir(source.join(".git")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn recovery_object_stream_is_disk_bounded_and_cancellation_preserves_owned_partial() {
+        use std::os::unix::fs::FileExt;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        actual_git(&source, &["init", "-b", "main"]);
+        let length = 5 * 1024 * 1024;
+        fs::write(source.join("file"), vec![b'x'; length]).unwrap();
+        let output = actual_git(&source, &["hash-object", "-w", "--", "file"]);
+        let oid = Oid::parse_object(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+        let service = RepositoryService::system("git");
+        let authority = WorktreeAuthority::capture(&source).unwrap();
+        for scenario in ["complete", "budget", "cancelled"] {
+            let parent = directory.path().join(scenario);
+            fs::create_dir(&parent).unwrap();
+            let holding = recovery_holding(&parent);
+            let file = super::super::recovery_publication::create_blob_file(holding.directory()).unwrap();
+            let cancellation = CancellationToken::new();
+            if scenario == "cancelled" { cancellation.cancel(); }
+            let expected = if scenario == "budget" { 31 } else { length as u64 };
+            let result = service.stream_recovery_object(&authority, &holding, &oid, &file, expected, &cancellation);
+            match scenario {
+                "complete" => {
+                    let output = result.unwrap();
+                    assert!(output.stdout.is_empty());
+                    assert_eq!(file.metadata().unwrap().len(), length as u64);
+                    assert_eq!(service.hash_recovery_object(&authority, &holding, &file, &cancellation).unwrap(), oid);
+                    let mut tail = [0; 1];
+                    file.read_at(&mut tail, length as u64 - 1).unwrap();
+                    assert_eq!(tail, [b'x']);
+                }
+                "budget" => {
+                    assert!(result.is_err());
+                    assert!(file.metadata().unwrap().len() > 0);
+                    assert!(file.metadata().unwrap().len() <= 32);
+                }
+                _ => {
+                    assert!(result.is_err());
+                    assert_eq!(file.metadata().unwrap().len(), 0);
+                }
+            }
+            assert!(holding.directory().path().join("restored-blob").exists(), "the caller retains the actual sink on every outcome");
+        }
     }
 
     #[test]
