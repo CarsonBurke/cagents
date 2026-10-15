@@ -13684,12 +13684,24 @@ impl Cagents {
     /// running: two `git add` runs against one index corrupt each other's
     /// `index.lock`, and the panel's own controls stand down while one is in
     /// flight, so this is the guard for a press that raced the frame.
+    fn git_mutation_unavailable(&mut self, key: &ActiveWorktreeKey) -> bool {
+        let reason = self.sidebar_model.source_control.as_ref()
+            .filter(|source| &source.key == key)
+            .and_then(|source| source.mutation_unavailable_reason())
+            .map(str::to_owned);
+        if let Some(reason) = reason {
+            self.status = Some(TransientNotice::warning(reason));
+            true
+        } else { false }
+    }
+
     fn begin_mutation(
         &mut self,
         key: &ActiveWorktreeKey,
         kind: MutationKind,
         commit_revision: Option<u64>,
     ) -> Option<uuid::Uuid> {
+        if self.git_mutation_unavailable(key) { return None; }
         if !self.source_control_is_bound(key)
             || self.folder_scope(key)
             || self
@@ -13729,6 +13741,7 @@ impl Cagents {
         key: ActiveWorktreeKey,
         request: QueuedGitMutation,
     ) -> Task<Message> {
+        if self.git_mutation_unavailable(&key) { return Task::none(); }
         if !self.source_control_is_bound(&key) || self.folder_scope(&key) {
             return Task::none();
         }
@@ -30923,6 +30936,37 @@ mod tests {
                 &Message::Sidebar(action)
             ));
         }
+    }
+
+    #[test]
+    fn read_only_git_refuses_actual_mutation_dispatch_and_queue_admission() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        let branch = source.branch.clone().unwrap();
+        let target = source.upstream.clone().unwrap();
+        let selected = source.group(crate::repository::ChangeArea::Untracked).unwrap().rows()[0].selection();
+        let reason: Arc<str> = "This host provides repository reads without strong Git mutation authority.".into();
+        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason.clone()));
+        for action in [
+            SidebarAction::Stage { key: key.clone(), selection: vec![selected.clone()] },
+            SidebarAction::Commit { key: key.clone(), message: "Do not commit".into(), amend: true },
+            SidebarAction::Push { key: key.clone(), branch, target },
+            SidebarAction::GitOperation { key: key.clone(), operation: crate::repository::GitOperation::Fetch { remote: "origin".into(), prune: true } },
+        ] {
+            drop(app.update(Message::Sidebar(action)));
+            assert!(app.source_control_mutations.is_empty(), "actual host dispatch must refuse, not only hide a button");
+        }
+        assert!(app.notices.recent().any(|entry| entry.notice.message == reason.as_ref()));
+        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(None);
+        assert!(app.begin_mutation(&key, MutationKind::Stage, None).is_some());
+        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason));
+        let before = app.sidebar_model.source_control.as_ref().unwrap().groups().to_vec();
+        drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![selected])));
+        assert!(app.source_control_mutations[&key.canonical_path].pending.is_empty(), "a capability change cannot append another queued mutation");
+        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().groups(), before.as_slice(), "refused queue admission must not project a stage");
     }
 
     #[test]
