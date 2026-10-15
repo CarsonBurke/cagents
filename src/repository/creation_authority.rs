@@ -5,7 +5,7 @@
 //! Git receives it; only its verified registration can grant destination scope.
 
 use super::*;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,10 +27,49 @@ pub(super) fn anchor(root: &fs_safety::Root) -> PathBuf {
     PathBuf::from(format!("/proc/{}/fd/{}/.", std::process::id(), root.descriptor()))
 }
 
+/// Each new directory entry must reach disk before a journal can publish the
+/// path as durable authority. Existing ancestors are retained, never traversed
+/// again through their public names.
+fn durable_parent(root: &fs_safety::Root, relative: &Path)
+    -> Result<(fs_safety::Root, OsString), RepositoryError>
+{
+    let parts = relative.components().map(|component| match component {
+        std::path::Component::Normal(name) => Ok(name.to_owned()),
+        _ => Err(ValidationError::DestinationOutsideRoot.into()),
+    }).collect::<Result<Vec<_>, RepositoryError>>()?;
+    if parts.len() > 64 { return Err(invalid("The managed destination exceeds 64 directory levels")); }
+    let (leaf, parents) = parts.split_last().ok_or(ValidationError::DestinationOutsideRoot)?;
+    let mut held = root.try_clone().map_err(filesystem)?;
+    for name in parents {
+        let (child, created) = fs_safety::create_directory_beneath(&held, Path::new(name), 0o777)
+            .map_err(filesystem)?;
+        if created {
+            fs_safety::sync_directory(&child).map_err(filesystem)?;
+            fs_safety::sync_directory(&held).map_err(filesystem)?;
+        }
+        held = child;
+    }
+    Ok((held, leaf.clone()))
+}
+
 impl DirectoryWitness {
     fn held(root: &fs_safety::Root) -> Result<Self, RepositoryError> {
         let metadata = root.metadata().map_err(filesystem)?;
-        Ok(Self { path: root.path().to_owned(), device: metadata.dev(), inode: metadata.ino() })
+        let witness = Self { path: root.path().to_owned(), device: metadata.dev(), inode: metadata.ino() };
+        witness.validate_durable_name()?;
+        Ok(witness)
+    }
+
+    fn validate_durable_name(&self) -> Result<(), RepositoryError> {
+        // A descriptor alias is valid for IO only, never as restart authority.
+        // Canonical names also avoid retargetable symlink ancestors in receipts.
+        if !self.path.is_absolute()
+            || self.path.starts_with("/proc") || self.path.starts_with("/dev/fd")
+            || fs::canonicalize(&self.path).map_err(filesystem)? != self.path
+        {
+            return Err(invalid("Creation authority needs a stable canonical directory name"));
+        }
+        Ok(())
     }
 
     fn validate(&self, root: &fs_safety::Root) -> Result<(), RepositoryError> {
@@ -44,6 +83,269 @@ impl DirectoryWitness {
         }
         Ok(())
     }
+
+    fn reopen(&self) -> Result<fs_safety::Root, RepositoryError> {
+        self.validate_durable_name()?;
+        let root = fs_safety::Root::open(&self.path).map_err(filesystem)?;
+        self.validate(&root)?;
+        Ok(root)
+    }
+}
+
+/// Stable names and physical identities only. Process-local descriptor anchors
+/// must never enter the durable journal or become restart authority by name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreationEvidence {
+    operation: OperationId,
+    source: [DirectoryWitness; 3],
+    ancestor: DirectoryWitness,
+    parent: Option<DirectoryWitness>,
+    checkout: Option<DirectoryWitness>,
+    admin: Option<DirectoryWitness>,
+}
+
+pub(super) struct CreationSession {
+    source: WorktreeAuthority,
+    source_roots: [fs_safety::Root; 3],
+    plan: DestinationPlan,
+    destination: Mutex<Option<Arc<OwnedDestination>>>,
+}
+
+impl fmt::Debug for CreationSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("CreationSession").field("source", &self.source)
+            .field("destination", &self.plan.destination).finish_non_exhaustive()
+    }
+}
+
+impl CreationSession {
+    pub(super) fn capture(authority: &WorktreeAuthority, request: &CreateWorktreeRequest)
+        -> Result<(Arc<Self>, CreationEvidence), RepositoryError>
+    {
+        if authority.path() != request.repository {
+            return Err(ValidationError::InvalidWorktree(request.repository.display().to_string()).into());
+        }
+        let (root, private, common) = authority.retained_roots()?;
+        let plan = DestinationPlan::capture(&root, &request.managed_root, &request.destination)?;
+        let evidence = CreationEvidence {
+            operation: request.operation_id,
+            source: [DirectoryWitness::held(&root)?, DirectoryWitness::held(&private)?, DirectoryWitness::held(&common)?],
+            ancestor: plan.witness.clone(), parent: None, checkout: None, admin: None,
+        };
+        Ok((Arc::new(Self { source: authority.clone(), source_roots: [root, private, common],
+            plan, destination: Mutex::new(None) }), evidence))
+    }
+
+    pub(super) fn restore(evidence: &CreationEvidence, request: &CreateWorktreeRequest,
+        common: &Path) -> Result<Arc<Self>, RepositoryError>
+    {
+        if evidence.operation != request.operation_id
+            || evidence.source[0].path != request.repository
+            || evidence.source[2].path != common
+            || !destination_within_managed_root(&request.destination, &request.managed_root)
+        {
+            return Err(invalid("Creation authority does not match its durable request"));
+        }
+        let root = evidence.source[0].reopen()?;
+        let private = evidence.source[1].reopen()?;
+        let common = evidence.source[2].reopen()?;
+        let source = WorktreeAuthority::from_retained_roots(root.try_clone().map_err(filesystem)?,
+            private.try_clone().map_err(filesystem)?, common.try_clone().map_err(filesystem)?)?;
+        let ancestor = evidence.ancestor.reopen()?;
+        let plan = DestinationPlan {
+            managed_relative: request.managed_root.strip_prefix(&evidence.ancestor.path)
+                .map_err(|_| ValidationError::DestinationOutsideRoot)?.to_owned(),
+            destination_relative: request.destination.strip_prefix(&evidence.ancestor.path)
+                .map_err(|_| ValidationError::DestinationOutsideRoot)?.to_owned(),
+            destination: request.destination.clone(), ancestor, witness: evidence.ancestor.clone(),
+        };
+        let destination = match (&evidence.parent, &evidence.checkout) {
+            (Some(parent), Some(checkout)) => {
+                if checkout.path != request.destination || Some(parent.path.as_path()) != request.destination.parent() {
+                    return Err(invalid("The saved destination authority names another directory"));
+                }
+                Some(Arc::new(OwnedDestination {
+                    root: checkout.reopen()?, witness: checkout.clone(), parent: parent.reopen()?,
+                    parent_witness: parent.clone(), leaf: request.destination.file_name()
+                        .ok_or(ValidationError::DestinationOutsideRoot)?.to_owned(),
+                }))
+            }
+            (None, None) => None,
+            _ => return Err(invalid("Creation authority has incomplete destination evidence")),
+        };
+        Ok(Arc::new(Self { source, source_roots: [root, private, common], plan,
+            destination: Mutex::new(destination) }))
+    }
+
+    pub(super) fn validate(&self) -> Result<(), RepositoryError> {
+        self.source.validate()?;
+        self.plan.witness.validate(&self.plan.ancestor)?;
+        if let Some(destination) = &*self.destination.lock().unwrap_or_else(|p| p.into_inner()) {
+            destination.validate()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn source_authority(&self) -> Result<WorktreeAuthority, RepositoryError> {
+        self.validate()?;
+        Ok(self.source.clone())
+    }
+
+    pub(super) fn common_operand(&self) -> Result<PathBuf, RepositoryError> {
+        self.validate()?;
+        Ok(anchor(&self.source_roots[2]))
+    }
+
+    pub(super) fn ensure_managed_root(&self) -> Result<(), RepositoryError> {
+        self.validate()?;
+        self.plan.ensure_managed_root()
+    }
+
+    pub(super) fn publish(&self, evidence: &mut CreationEvidence) -> Result<(), RepositoryError> {
+        self.validate()?;
+        let mut destination = self.destination.lock().unwrap_or_else(|p| p.into_inner());
+        if destination.is_some() { return Err(invalid("The creation destination was already published")); }
+        let owned = Arc::new(self.plan.publish()?);
+        evidence.parent = Some(owned.parent_witness.clone());
+        evidence.checkout = Some(owned.witness.clone());
+        *destination = Some(owned);
+        self.source.validate()
+    }
+
+    pub(super) fn bind_destination_operand(&self, mut command: CommandSpec, position: usize)
+        -> Result<CommandSpec, RepositoryError>
+    {
+        self.validate()?;
+        if command.arguments.get(position).map(|value| Path::new(value.as_os_str()))
+            != Some(self.plan.destination.as_path())
+        {
+            return Err(invalid("The creation command lost its expected destination operand"));
+        }
+        let destination = self.destination.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            .ok_or_else(|| invalid("Creation has not published a destination"))?;
+        destination.validate()?;
+        // Retain the SAME duplicate whose number enters argv. Parent-PID FD
+        // paths must not escape into a child that can outlive this service.
+        let directory = Arc::new(destination.root.retained_directory().map_err(filesystem)?);
+        command.arguments[position] = format!("/proc/self/fd/{}/.", directory.as_raw_fd()).into();
+        command.inherit_file(directory).map_err(filesystem)
+    }
+
+    pub(super) fn lease_path(&self, operation: OperationId) -> Result<PathBuf, RepositoryError> {
+        self.validate()?;
+        Ok(anchor(&self.source_roots[2]).join(format!("cagents-operation-{operation}.lease")))
+    }
+
+    pub(super) fn bind_created(self: &Arc<Self>, evidence: &mut CreationEvidence,
+        request: &CreateWorktreeRequest, registered: &WorktreeRecord, expected_oid: &str)
+        -> Result<Arc<VerifiedCreatedRoot>, RepositoryError>
+    {
+        self.validate()?;
+        if evidence.operation != request.operation_id || registered.path != request.destination
+            || registered.branch.as_deref() != Some(request.branch.full_ref().as_str())
+            || registered.head_oid.as_deref() != Some(expected_oid)
+            || registered.lock.reason.as_deref() != Some(format!("cagents:{}", request.operation_id).as_str())
+            || registered.bare || registered.prunable_reason.is_some()
+        {
+            return Err(invalid("The created checkout has no matching journal-owned registration"));
+        }
+        let owned = self.destination.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            .ok_or_else(|| invalid("No retained created directory is available"))?;
+        let locator = regular_locator(&owned.root, ".git")?;
+        let locator = locator.strip_prefix(b"gitdir: ")
+            .ok_or_else(|| invalid("The created checkout has an invalid Git locator"))?;
+        let admin_path = bytes_to_path(trim_one_line_ending(locator));
+        let common = &self.source_roots[2];
+        if admin_path.parent() != Some(common.path().join("worktrees").as_path()) {
+            return Err(invalid("The created checkout points outside its original common metadata"));
+        }
+        let relative = admin_path.strip_prefix(common.path())
+            .map_err(|_| invalid("The created administrative path changed repositories"))?;
+        let admin = fs_safety::open_directory_beneath(common, relative).map_err(filesystem)?;
+        let admin_witness = DirectoryWitness::held(&admin)?;
+        if evidence.admin.as_ref().is_some_and(|saved| saved != &admin_witness) {
+            return Err(invalid("The created administrative directory was replaced"));
+        }
+        let authority = WorktreeAuthority::from_retained_roots(
+            owned.root.try_clone().map_err(filesystem)?, admin,
+            common.try_clone().map_err(filesystem)?)?;
+        let created = Arc::new(VerifiedCreatedRoot { source: self.clone(), owned,
+            authority, admin: admin_witness.clone(), operation: request.operation_id,
+            branch: request.branch.full_ref() });
+        created.validate()?;
+        evidence.admin = Some(admin_witness);
+        Ok(created)
+    }
+}
+
+fn regular_locator(root: &fs_safety::Root, leaf: &str) -> Result<Vec<u8>, RepositoryError> {
+    let file = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(anchor(root).join(leaf))
+        .map_err(filesystem)?;
+    if !file.metadata().map_err(filesystem)?.is_file() {
+        return Err(invalid("Creation metadata is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(8193).read_to_end(&mut bytes).map_err(filesystem)?;
+    if bytes.len() > 8192 || bytes.contains(&0) {
+        return Err(invalid("Creation metadata is oversized or invalid"));
+    }
+    Ok(bytes)
+}
+
+/// This type can only be constructed after pre-Git publication, the matching
+/// registered branch/OID, operation lock and both metadata backlinks agree.
+pub(super) struct VerifiedCreatedRoot {
+    source: Arc<CreationSession>,
+    owned: Arc<OwnedDestination>,
+    authority: WorktreeAuthority,
+    admin: DirectoryWitness,
+    operation: OperationId,
+    branch: String,
+}
+
+impl fmt::Debug for VerifiedCreatedRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("VerifiedCreatedRoot").field("operation", &self.operation)
+            .field("destination", &self.owned.root.path()).field("admin", &self.admin)
+            .field("registered_branch", &self.branch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedCreatedRoot {
+    pub(super) fn validate(&self) -> Result<(), RepositoryError> {
+        self.source.validate()?;
+        self.owned.validate()?;
+        self.authority.validate()?;
+        let (_, admin, common) = self.authority.retained_roots()?;
+        self.admin.validate(&admin)?;
+        let locked = regular_locator(&admin, "locked")?;
+        let backlink = regular_locator(&admin, "gitdir")?;
+        let commondir = regular_locator(&admin, "commondir")?;
+        if trim_one_line_ending(&locked) != format!("cagents:{}", self.operation).as_bytes()
+            || bytes_to_path(trim_one_line_ending(&backlink)) != self.owned.root.path().join(".git")
+            || trim_one_line_ending(&commondir) != b"../.."
+            || common.path() != self.source.source_roots[2].path()
+        {
+            return Err(invalid("The created checkout lost its journal-owned metadata"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn authority(&self) -> Result<WorktreeAuthority, RepositoryError> {
+        self.validate()?;
+        Ok(self.authority.clone())
+    }
+
+    pub(super) fn roots(&self) -> Result<(fs_safety::Root, fs_safety::Root), RepositoryError> {
+        self.validate()?;
+        let (checkout, admin, _) = self.authority.retained_roots()?;
+        Ok((admin, checkout))
+    }
+
+    pub(super) fn admin_path(&self) -> &Path { &self.admin.path }
 }
 
 /// Captured before creation effects. Missing components are created only below
@@ -99,7 +401,7 @@ impl DestinationPlan {
     pub(super) fn ensure_managed_root(&self) -> Result<(), RepositoryError> {
         self.witness.validate(&self.ancestor)?;
         let probe = self.managed_relative.join(".cagents-parent-probe");
-        fs_safety::create_parent_beneath(&self.ancestor, &probe).map_err(filesystem)?;
+        durable_parent(&self.ancestor, &probe)?;
         self.witness.validate(&self.ancestor)
     }
 
@@ -108,8 +410,7 @@ impl DestinationPlan {
     /// destination name after an executor launch delay.
     pub(super) fn publish(&self) -> Result<OwnedDestination, RepositoryError> {
         self.witness.validate(&self.ancestor)?;
-        let (parent, leaf) = fs_safety::create_parent_beneath(&self.ancestor, &self.destination_relative)
-            .map_err(filesystem)?;
+        let (parent, leaf) = durable_parent(&self.ancestor, &self.destination_relative)?;
         let parent_witness = DirectoryWitness::held(&parent)?;
         parent_witness.validate(&parent)?;
         let staging = tempfile::Builder::new().prefix(".cagents-create-")
@@ -126,9 +427,12 @@ impl DestinationPlan {
                 .map_err(filesystem)?;
             if !created { return Err(invalid("The private creation directory was already occupied")); }
             let original = held.metadata().map_err(filesystem)?;
+            fs_safety::sync_directory(&held).map_err(filesystem)?;
+            fs_safety::sync_directory(&staging_root).map_err(filesystem)?;
             parent_witness.validate(&parent)?;
             fs_safety::rename_new_between(&staging_root, OsStr::new("checkout"), &parent, &leaf)
                 .map_err(filesystem)?;
+            fs_safety::sync_directory(&staging_root).map_err(filesystem)?;
             fs_safety::sync_directory(&parent).map_err(filesystem)?;
             let public = fs_safety::Root::open(&self.destination).map_err(filesystem)?;
             let published = public.metadata().map_err(filesystem)?;
@@ -174,6 +478,18 @@ impl OwnedDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_evidence_rejects_process_descriptor_aliases() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(fixture.path()).unwrap();
+        let witness = DirectoryWitness::held(&root).unwrap();
+        assert!(witness.reopen().is_ok());
+        let alias = DirectoryWitness { path: anchor(&root), ..witness };
+        assert!(alias.reopen().is_err());
+        let alias_root = fs_safety::Root::open(&alias.path).unwrap();
+        assert!(DirectoryWitness::held(&alias_root).is_err());
+    }
 
     #[test]
     fn destination_publication_never_replaces_an_existing_entry() {
