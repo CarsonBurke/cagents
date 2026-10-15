@@ -260,7 +260,7 @@ impl Action {
                 | Self::Completion(completion::Action::Loaded { .. } | completion::Action::Candidates { .. } | completion::Action::Finished { .. } | completion::Action::Search { .. })
                 | Self::ViewedBatchSummary { .. }
                 | Self::Discussion(
-                    discussion_ui::Action::Loaded { .. } | discussion_ui::Action::Finished { .. }
+                    discussion_ui::Action::Loaded { .. } | discussion_ui::Action::Finished { .. } | discussion_ui::Action::Reanchored { .. }
                 )
         )
     }
