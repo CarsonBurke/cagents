@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand, error::ErrorKind as ClapErrorKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use uuid::Uuid;
 
 mod accounts;
 pub use accounts::AccountCommand;
@@ -1038,6 +1039,26 @@ impl ControlClient {
         }
     }
 
+    /// Metadata-only status on THIS authenticated daemon connection. The caller
+    /// owns the selected daemon/registry scope; this never chooses a new host.
+    pub fn pending_project_operations(&mut self,registry:Uuid)->Result<Vec<crate::project_recovery::ProjectOperationStatus>,ControlError> {
+        match self.request_strict(ClientRequest::ProjectOperations{registry})? {
+            ServerResponse::ProjectOperations{operations} if !registry.is_nil() && operations.len()<=64 && operations.iter().all(|status|
+                !status.operation.is_nil() && status.project.registry==registry && status.project.validate().is_ok()
+                    && !(status.running&&status.resumable) && status.reason.len()<=4096)=>Ok(operations),
+            response=>Err(unexpected_response("pending project operations",&response)),
+        }
+    }
+    pub fn resume_project_operation(&mut self,registry:Uuid,operation:Uuid)->Result<crate::project_recovery::ProjectOperationOutcome,ControlError> {
+        match self.request_with_deadline(ClientRequest::ResumeProjectOperation{registry,operation},Instant::now()+Duration::from_secs(75))? {
+            ServerResponse::ProjectOperation{outcome} if match &outcome {
+                crate::project_recovery::ProjectOperationOutcome::Committed{operation:received,model}=>!registry.is_nil()&&!operation.is_nil()&&*received==operation&&model.identity==registry,
+                crate::project_recovery::ProjectOperationOutcome::Pending{operation:received,..}=>!registry.is_nil()&&!operation.is_nil()&&*received==operation,
+            }=>Ok(outcome),
+            response=>Err(unexpected_response("resumed original project operation",&response)),
+        }
+    }
+
     pub fn close_project_guarded(
         &mut self,
         project: crate::project_recovery::ProjectInstance,
@@ -1888,6 +1909,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
         ServerResponse::ProjectOperation { .. } => "project operation",
+        ServerResponse::ProjectOperations { .. } => "pending project operations",
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",
@@ -4068,6 +4090,57 @@ mod tests {
         assert!(matches!(client.project_operation(request.clone()).unwrap(),crate::project_recovery::ProjectOperationOutcome::Pending{..}));
         assert!(matches!(client.project_operation(request).unwrap(),crate::project_recovery::ProjectOperationOutcome::Committed{..}));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn reconnect_discovers_metadata_then_resumes_only_registry_and_original_operation() {
+        use crate::project_recovery::{ProjectInstance,ProjectOperationStatus,ProjectOperationKind,ProjectOperationPhase,ProjectOperationOutcome};
+        let (client_stream,mut peer_stream)=UnixStream::pair().unwrap();
+        peer_stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();peer_stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let host_proof=proof("reconnected-ui","boot","incarnation");let registry=Uuid::new_v4();let operation=Uuid::new_v4();
+        let project=ProjectInstance{registry,repository:"/original-scope".into(),ordinal:9};
+        let status=ProjectOperationStatus{operation,project,kind:ProjectOperationKind::Remove,phase:ProjectOperationPhase::PendingCommit,running:false,resumable:true,reason:"Retained original close progress".into()};
+        // Shared binary DTO order is round-tripped through the real framing
+        // below, without asserting independently allocated global ordinals.
+        let expected=status.clone();
+        let server=thread::spawn(move|| {
+            let connected:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();
+            write_frame(&mut peer_stream,&connected_envelope(connected.request_id,host_proof.clone(),host_proof.clone())).unwrap();
+            let listed:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();
+            assert_eq!(listed.request,ClientRequest::ProjectOperations{registry});
+            write_frame(&mut peer_stream,&ServerEnvelope{version:PROTOCOL_VERSION,request_id:Some(listed.request_id),proof:host_proof.clone(),message:ServerMessage::Response{response:ServerResponse::ProjectOperations{operations:vec![status]}}}).unwrap();
+            let resume:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();
+            assert_eq!(resume.request,ClientRequest::ResumeProjectOperation{registry,operation},"no request/path/roster or inventory is reconstructed by a fresh client");
+            write_frame(&mut peer_stream,&ServerEnvelope{version:PROTOCOL_VERSION,request_id:Some(resume.request_id),proof:host_proof,message:ServerMessage::Response{response:ServerResponse::ProjectOperation{outcome:ProjectOperationOutcome::Committed{operation,model:WorkspaceModel{identity:registry,..Default::default()}}}}}).unwrap();
+        });
+        let mut client=ControlClient::from_stream(client_stream).unwrap();
+        assert_eq!(client.pending_project_operations(registry).unwrap(),vec![expected]);
+        assert!(matches!(client.resume_project_operation(registry,operation).unwrap(),ProjectOperationOutcome::Committed{operation:received,..} if received==operation));server.join().unwrap();
+    }
+    #[test]
+    fn operation_metadata_and_resume_reject_substituted_registry_operation_or_running_grant() {
+        use crate::project_recovery::{ProjectInstance,ProjectOperationStatus,ProjectOperationKind,ProjectOperationPhase,ProjectOperationOutcome};
+        for invalid in 0..4 {
+            let (client_stream,mut peer_stream)=UnixStream::pair().unwrap();
+            peer_stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();peer_stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let host_proof=proof("bad-operation-response","boot","incarnation");let registry=Uuid::new_v4();let operation=Uuid::new_v4();
+            let server=thread::spawn(move|| {
+                let connected:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();
+                write_frame(&mut peer_stream,&connected_envelope(connected.request_id,host_proof.clone(),host_proof.clone())).unwrap();
+                let request:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();
+                let response=if invalid<2 {
+                    assert_eq!(request.request,ClientRequest::ProjectOperations{registry});
+                    ServerResponse::ProjectOperations{operations:vec![ProjectOperationStatus{operation,project:ProjectInstance{registry:if invalid==0{Uuid::new_v4()}else{registry},repository:"/scope".into(),ordinal:3},kind:ProjectOperationKind::Locate,phase:ProjectOperationPhase::PendingCommit,running:invalid==1,resumable:true,reason:"Invalid response fixture".into()}]}
+                } else {
+                    assert_eq!(request.request,ClientRequest::ResumeProjectOperation{registry,operation});
+                    ServerResponse::ProjectOperation{outcome:ProjectOperationOutcome::Committed{operation:if invalid==2{Uuid::new_v4()}else{operation},model:WorkspaceModel{identity:if invalid==3{Uuid::new_v4()}else{registry},..Default::default()}}}
+                };
+                write_frame(&mut peer_stream,&ServerEnvelope{version:PROTOCOL_VERSION,request_id:Some(request.request_id),proof:host_proof,message:ServerMessage::Response{response}}).unwrap();
+            });
+            let mut client=ControlClient::from_stream(client_stream).unwrap();
+            if invalid<2 {assert!(client.pending_project_operations(registry).is_err());}else{assert!(client.resume_project_operation(registry,operation).is_err());}
+            server.join().unwrap();
+        }
     }
 
     /// `channel spawn` opens the project before creating the channel in it,

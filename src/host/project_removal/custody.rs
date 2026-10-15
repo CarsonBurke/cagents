@@ -119,6 +119,67 @@ fn public_phase(phase:Phase)->PublicPhase {
         Phase::ModelCommitted=>PublicPhase::ModelCommitted,Phase::Resolved|Phase::Aborted=>PublicPhase::UnavailableAfterRestart}
 }
 
+/// Read-only discovery survives a UI restart. Only the live operation object
+/// can attest resumability; a durable path/scope row never supplies authority.
+pub(in crate::host) fn statuses(host:&SharedHost,client:ClientId,identity:uuid::Uuid)->Result<(ServerResponse,Vec<ServerMessage>,bool),ProtocolError> {
+    use crate::project_recovery::{ProjectOperationStatus,ProjectOperationKind};
+    let gate=super::super::client::control_gate(host);
+    let _read=gate.read().unwrap_or_else(|p|p.into_inner());
+    super::super::client::ensure_control_open(host)?;
+    super::super::agent_execution::terminals::admit(host,client,&ClientRequest::ProjectOperations{registry:identity})?;
+    let registry=super::super::agent_execution::registry(host).map_err(error)?;
+    let rows=registry.lock().unwrap_or_else(|p|p.into_inner()).project_operations_for_registry(identity).map_err(error)?;
+    let operations=rows.into_iter().map(|row| {
+        let scope=row.scope.as_ref().ok_or_else(||error("A pending operation lost its original negative scope"))?;
+        let kind=if scope.relocation.is_some(){ProjectOperationKind::Locate}else{ProjectOperationKind::Remove};
+        let retained=super::reservation::retained_operation(host,row.operation);
+        let (running,resumable)=retained.as_ref().map(|(_,owner)| {
+            let original=owner.request.as_ref().is_some_and(|request|request.project==row.project)
+                && owner.request_digest==row.request_digest && owner.commit_digest==row.commit_digest && !owner.is_settled();
+            let running=original&&owner.claimed.load(Ordering::Acquire);
+            (running,original&&!running)
+        }).unwrap_or((false,false));
+        let phase=if running||resumable {public_phase(row.phase)}else{PublicPhase::UnavailableAfterRestart};
+        let reason=if running {"The original project operation is still running. Its exact owners and directory pins remain retained."}
+            else if resumable {"Retry this original operation to continue its retained progress; no new sources or paths will be selected."}
+            else {"The original prepared custody is unavailable. Its negative reservation remains; path-based replay is refused."};
+        Ok(ProjectOperationStatus{operation:row.operation,project:row.project,kind,phase,running,resumable,reason:reason.into()})
+    }).collect::<Result<Vec<_>,ProtocolError>>()?;
+    Ok((ServerResponse::ProjectOperations{operations},Vec::new(),false))
+}
+
+/// Explicit recovery resolves ONLY a server-retained original request. It does
+/// not accept a client replacement request, directory, roster or new proof.
+pub(in crate::host) fn resume(host:&SharedHost,client:ClientId,identity:uuid::Uuid,operation:uuid::Uuid)->Result<(ServerResponse,Vec<ServerMessage>,bool),ProtocolError> {
+    let original={
+        let gate=super::super::client::control_gate(host);
+        let _read=gate.read().unwrap_or_else(|p|p.into_inner());
+        super::super::client::ensure_control_open(host)?;
+        super::super::agent_execution::terminals::admit(host,client,&ClientRequest::ResumeProjectOperation{registry:identity,operation})?;
+        let registry=super::super::agent_execution::registry(host).map_err(error)?;
+        let row=registry.lock().unwrap_or_else(|p|p.into_inner()).project_operation_for_registry(identity,operation).map_err(error)?
+            .ok_or_else(||error("This original project operation is unknown; no replacement request was constructed"))?;
+        let retained=super::reservation::retained_operation(host,operation);
+        let original=retained.as_ref().and_then(|(_,owner)|owner.request.clone());
+        if let Some(request)=original {
+            if request.project!=row.project {return Err(error("The retained request no longer matches its original project identity"));}
+            Some(request)
+        } else {
+            match row.phase {
+                Phase::Resolved=> {
+                    let model=registry.lock().unwrap_or_else(|p|p.into_inner()).model().map_err(error)?;
+                    if model.identity!=identity {return Err(error("The original operation receipt belongs to another registry"));}
+                    return Ok((ServerResponse::ProjectOperation{outcome:Outcome::Committed{operation,model}},Vec::new(),false));
+                }
+                Phase::Aborted=>return Err(error("This operation ended before effects. A fresh explicit project action is required.")),
+                _=>return pending(operation,PublicPhase::UnavailableAfterRestart,"Original prepared custody is unavailable. The affected scope remains reserved; no request, repair or close was reconstructed."),
+            }
+        }
+    };
+    // Release the read guard before the existing nonblocking writer admission.
+    process(host,client,original.expect("a retained original request was required"))
+}
+
 pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)->Result<(ServerResponse,Vec<ServerMessage>,bool),ProtocolError> {
     request.validate().map_err(error)?;
     let digest=project_operations::digest(&request).map_err(error)?;

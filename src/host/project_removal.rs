@@ -494,6 +494,31 @@ mod tests {
     fn operation_reply(host:&SharedHost,request:crate::project_recovery::ProjectOperationRequest)->crate::project_recovery::ProjectOperationOutcome {
         let (ServerResponse::ProjectOperation{outcome},_,_)=super::super::client::process_request(host,1,ClientRequest::ProjectOperation{request}).unwrap() else {panic!("typed project operation reply required")};outcome
     }
+    fn pending_status(host:&SharedHost,client:ClientId,registry:uuid::Uuid)->Vec<crate::project_recovery::ProjectOperationStatus> {
+        let (ServerResponse::ProjectOperations{operations},messages,close)=super::super::client::process_request(host,client,ClientRequest::ProjectOperations{registry}).unwrap() else {panic!("status response required")};
+        assert!(messages.is_empty());assert!(!close);operations
+    }
+    fn resume_original(host:&SharedHost,client:ClientId,registry:uuid::Uuid,operation:uuid::Uuid)->crate::project_recovery::ProjectOperationOutcome {
+        let (ServerResponse::ProjectOperation{outcome},_,_)=super::super::client::process_request(host,client,ClientRequest::ResumeProjectOperation{registry,operation}).unwrap() else {panic!("original-operation response required")};outcome
+    }
+    #[test]
+    fn status_while_exact_operation_is_claimed_never_waits_for_its_prepared_work_lock() {
+        if isolated_custody("host::project_removal::tests::status_while_exact_operation_is_claimed_never_waits_for_its_prepared_work_lock") {return;}
+        let fixture=Fixture::new();fixture.host.lock().unwrap().register_client(2);
+        let request=crate::project_recovery::ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:fixture.expected.clone(),action:crate::project_recovery::ProjectOperationAction::Remove{sessions:Vec::new()}};
+        let weak=Arc::downgrade(&fixture.host);let identity=request.project.registry;let operation=request.operation;
+        let observed=Arc::new(std::sync::atomic::AtomicBool::new(false));let flag=observed.clone();
+        fixture.host.lock().unwrap().project_operation_before_commit=Some(Arc::new(move|current| {
+            assert_eq!(current,operation);
+            let host=weak.upgrade().unwrap();
+            let rows=pending_status(&host,2,identity);
+            assert_eq!(rows.len(),1);assert_eq!(rows[0].operation,operation);
+            assert!(rows[0].running);assert!(!rows[0].resumable);
+            flag.store(true,std::sync::atomic::Ordering::Release);
+        }));
+        assert!(matches!(operation_reply(&fixture.host,request),crate::project_recovery::ProjectOperationOutcome::Committed{..}));
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+    }
     #[test]
     fn repaired_git_busy_retains_exact_operation_plan_and_restart_negative_scope() {
         if isolated_custody("host::project_removal::tests::repaired_git_busy_retains_exact_operation_plan_and_restart_negative_scope") {return;}
@@ -536,7 +561,20 @@ mod tests {
         let restarted=Arc::new(HostLock::new(restarted));
         assert!(matches!(operation_reply(&restarted,request.clone()),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::UnavailableAfterRestart,..}));
         assert!(ensure_available(&restarted,Some(&common),Some(&moved),None).is_err());
-        assert!(ensure_available(&restarted,None,Some(&other),None).is_ok());drop(restarted);
+        assert!(ensure_available(&restarted,None,Some(&other),None).is_ok());
+        // New UI delivery has only registry+operation metadata. Reopening the
+        // host state cannot turn the durable negative scope into a repair plan.
+        restarted.lock().unwrap().register_client(2);
+        let lost=pending_status(&restarted,2,request.project.registry);
+        assert_eq!(lost.len(),1);assert_eq!(lost[0].operation,request.operation);
+        assert_eq!(lost[0].project,request.project);
+        assert_eq!(lost[0].phase,ProjectOperationPhase::UnavailableAfterRestart);
+        assert!(!lost[0].running);assert!(!lost[0].resumable);
+        assert!(matches!(resume_original(&restarted,2,request.project.registry,request.operation),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::UnavailableAfterRestart,..}));
+        assert_eq!(std::fs::metadata(common.join("config")).unwrap().ino(),inode);
+        assert_eq!(std::fs::read(common.join("config")).unwrap(),after);
+        assert_eq!(restarted.lock().unwrap().read_model().unwrap().project(&common).unwrap().checkout.as_ref(),Some(&old));
+        assert!(ensure_available(&restarted,Some(&common),Some(&moved),None).is_err());drop(restarted);
         std::fs::write(common.join("config.lock"),b"foreign lock after original repair").unwrap();
         fixture.host.lock().unwrap().project_operation_before_commit=None;drop(held);
         assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Committed{..}));
@@ -565,12 +603,29 @@ mod tests {
         assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&fixture.root).is_some());
         assert!(ensure_available(&fixture.host,Some(&fixture.root),Some(&fixture.root),None).is_err());
         assert!(super::super::client::process_request(&fixture.host,1,ClientRequest::Input{terminal_id:unrelated.source.id(),bytes:b"after pending close\n".to_vec()}).is_ok());
+        // Simulate a replacement UI connection with no original request in
+        // its memory. Status exposes no roster, and Resume accepts only the
+        // operation identity already owned by the daemon.
+        fixture.host.lock().unwrap().register_client(2);
+        let status=pending_status(&fixture.host,2,request.project.registry);
+        assert_eq!(status.len(),1);assert_eq!(status[0].operation,request.operation);
+        assert_eq!(status[0].project,request.project);
+        assert_eq!(status[0].kind,crate::project_recovery::ProjectOperationKind::Remove);
+        assert_eq!(status[0].phase,ProjectOperationPhase::PendingCommit);
+        assert!(status[0].resumable);assert!(!status[0].running);
+        let process=|request|super::super::client::process_request(&fixture.host,2,request);
+        assert!(process(ClientRequest::ProjectOperations{registry:uuid::Uuid::new_v4()}).is_err());
+        assert!(process(ClientRequest::ResumeProjectOperation{registry:request.project.registry,operation:uuid::Uuid::new_v4()}).is_err());
+        assert!(process(ClientRequest::ResumeProjectOperation{registry:request.project.registry,operation:uuid::Uuid::nil()}).is_err());
+        assert!(process(ClientRequest::ResumeProjectOperation{registry:uuid::Uuid::new_v4(),operation:request.operation}).is_err());
+        assert!(ensure_available(&fixture.host,Some(&fixture.root),None,None).is_err());
         fixture.host.lock().unwrap().project_operation_before_commit=None;drop(held);
-        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Committed{..}),"original roster still contains the now-absent owner; success must use retained close progress");
+        assert!(matches!(resume_original(&fixture.host,2,request.project.registry,request.operation),ProjectOperationOutcome::Committed{..}),"original roster still contains the now-absent owner; success must use retained close progress");
         assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&fixture.root).is_none());
         assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
         assert!(!fixture.handles[1].is_completed());
-        assert!(matches!(operation_reply(&fixture.host,request),ProjectOperationOutcome::Committed{..}));
+        assert!(pending_status(&fixture.host,2,request.project.registry).is_empty());
+        assert!(matches!(resume_original(&fixture.host,2,request.project.registry,request.operation),ProjectOperationOutcome::Committed{..}),"settled receipt is idempotent without retaining its heavy roster");
     }
 
     #[test]

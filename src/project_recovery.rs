@@ -82,6 +82,20 @@ pub enum ProjectOperationPhase {
     ModelCommitted,
     UnavailableAfterRestart,
 }
+/// Bounded recovery metadata for an already admitted operation. This exposes
+/// no request body, provider/worker descriptor, environment, FD, or new grant.
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Serialize,Deserialize)]
+pub enum ProjectOperationKind {Locate,Remove}
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
+pub struct ProjectOperationStatus {
+    pub operation:uuid::Uuid,
+    pub project:ProjectInstance,
+    pub kind:ProjectOperationKind,
+    pub phase:ProjectOperationPhase,
+    pub running:bool,
+    pub resumable:bool,
+    pub reason:String,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProjectOperationOutcome {
     Committed { operation: uuid::Uuid, model: crate::workspace_model::WorkspaceModel },

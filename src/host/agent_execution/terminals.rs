@@ -62,6 +62,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::ProjectCloseInventory { .. }
         | R::CloseProjectGuarded { .. }
         | R::ProjectOperation { .. }
+        | R::ProjectOperations { .. }
+        | R::ResumeProjectOperation { .. }
         | R::CompletePendingTerminal { .. }
         | R::DeviceOperation { .. }
         | R::Agent { .. }

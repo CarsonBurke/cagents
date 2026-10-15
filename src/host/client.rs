@@ -364,6 +364,12 @@ pub(super) fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
+    if let ClientRequest::ProjectOperations{registry}=&request {
+        return super::project_removal::custody::statuses(host,client_id,*registry);
+    }
+    if let ClientRequest::ResumeProjectOperation{registry,operation}=&request {
+        return super::project_removal::custody::resume(host,client_id,*registry,*operation);
+    }
     if let ClientRequest::ProjectOperation{request} = request {
         return super::project_removal::custody::process(host,client_id,request);
     }
@@ -465,7 +471,7 @@ pub(super) fn process_admitted(
             Vec::new(),
             false,
         )),
-        ClientRequest::CloseProjectGuarded { .. } | ClientRequest::ProjectOperation{..} => Err(ProtocolError::new(
+        ClientRequest::CloseProjectGuarded { .. } | ClientRequest::ProjectOperation{..} | ClientRequest::ProjectOperations{..} | ClientRequest::ResumeProjectOperation{..} => Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
             "Guarded project removal requires its scoped admission reservation",
             false,

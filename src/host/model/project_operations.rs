@@ -82,6 +82,7 @@ impl Phase {
 #[derive(Clone, Debug)]
 pub(crate) struct Obligation {
     pub operation: Uuid,
+    pub project: ProjectInstance,
     pub request_digest: String,
     pub commit_digest: String,
     pub phase: Phase,
@@ -139,22 +140,27 @@ fn valid_digest(value: &str) -> bool {
 }
 fn read(db: &Connection, operation: Uuid) -> Result<Option<Obligation>, String> {
     let row = db.query_row(
-        "SELECT request_digest,commit_digest,phase,CASE WHEN length(CAST(scope AS BLOB))<=1048576 THEN scope END,scope IS NOT NULL,committed_sequence FROM project_operation_obligations WHERE operation=?1",
+        "SELECT request_digest,commit_digest,phase,CASE WHEN length(CAST(scope AS BLOB))<=1048576 THEN scope END,scope IS NOT NULL,committed_sequence,registry,CASE WHEN length(CAST(repository AS BLOB))<=16384 THEN repository END,project_ordinal FROM project_operation_obligations WHERE operation=?1",
         [operation.to_string()],
-        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,bool>(4)?,row.get::<_,Option<u64>>(5)?)),
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,bool>(4)?,row.get::<_,Option<u64>>(5)?,row.get::<_,String>(6)?,row.get::<_,Option<String>>(7)?,row.get::<_,u32>(8)?)),
     ).optional().map_err(|error| error.to_string())?;
-    row.map(|(request_digest,commit_digest,phase,scope,has_scope,committed_sequence)| {
+    row.map(|(request_digest,commit_digest,phase,scope,has_scope,committed_sequence,registry,repository,ordinal)| {
         if !valid_digest(&request_digest) || !valid_digest(&commit_digest) || has_scope != scope.is_some() {
             return Err("Unreadable project operation custody metadata; its scope remains unavailable".into());
         }
+        let project=ProjectInstance{registry:registry.parse::<Uuid>().map_err(|error|error.to_string())?,repository:PathBuf::from(repository.ok_or("Unreadable project operation registry scope")?),ordinal};
+        project.validate()?;
         let phase=Phase::parse(&phase)?;
         let scope=scope.map(|scope|serde_json::from_str::<SavedScope>(&scope).map_err(|error|error.to_string())).transpose()?;
-        if let Some(scope)=&scope {scope.validate()?;}
+        if let Some(scope)=&scope {
+            scope.validate()?;
+            if scope.project!=project {return Err("The original project-operation scope conflicts with its durable identity".into());}
+        }
         if matches!(phase,Phase::Resolved|Phase::Aborted) != scope.is_none()
             || matches!(phase,Phase::ModelCommitted|Phase::Resolved) != committed_sequence.is_some() {
             return Err("Inconsistent project operation custody phase".into());
         }
-        Ok(Obligation{operation,request_digest,commit_digest,phase,scope,committed_sequence})
+        Ok(Obligation{operation,project,request_digest,commit_digest,phase,scope,committed_sequence})
     }).transpose()
 }
 
@@ -175,6 +181,30 @@ fn pending(db:&Connection)->Result<Vec<Obligation>,String> {
 pub(crate) fn pending_in(tx:&rusqlite::Transaction<'_>)->Result<Vec<Obligation>,String> {pending(tx)}
 
 impl Registry {
+    /// Pending/status diagnostics share one read snapshot and never migrate or
+    /// acquire execution authority. Scope bodies are bounded private metadata.
+    fn operation_snapshot<T>(&self,expected:Uuid,read:impl FnOnce(&rusqlite::Transaction<'_>)->Result<T,String>)->Result<T,String> {
+        if expected.is_nil() {return Err("The original registry identity is required".into());}
+        let tx=self.db.unchecked_transaction().map_err(|error|error.to_string())?;
+        schema::check_readonly(&tx)?;
+        let current:String=tx.query_row("SELECT identity FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
+        if current!=expected.to_string() {return Err("The original operation belongs to another workspace registry".into());}
+        let result=read(&tx)?;tx.commit().map_err(|error|error.to_string())?;Ok(result)
+    }
+    pub(crate) fn project_operations_for_registry(&self,expected:Uuid)->Result<Vec<Obligation>,String> {
+        self.operation_snapshot(expected,|tx| {
+            let rows=pending_in(tx)?;
+            if rows.iter().any(|row|row.project.registry!=expected) {return Err("The retained operation journal contains a different registry's scope".into());}
+            Ok(rows)
+        })
+    }
+    pub(crate) fn project_operation_for_registry(&self,expected:Uuid,operation:Uuid)->Result<Option<Obligation>,String> {
+        self.operation_snapshot(expected,|tx| {
+            let row=load_in(tx,operation)?;
+            if row.as_ref().is_some_and(|row|row.project.registry!=expected) {return Err("The original operation receipt belongs to another registry".into());}
+            Ok(row)
+        })
+    }
     pub(crate) fn project_operation(&self, operation: Uuid) -> Result<Option<Obligation>, String> {
         if operation.is_nil() {return Err("Project operation identity is required".into());}
         read(&self.db,operation)
@@ -274,6 +304,28 @@ mod tests {
         assert!(registry.model().unwrap().project(Path::new("/project")).is_some());
         // This row carries only negative metadata, not handles/FDs. The live
         // consumer must refuse execution/replay when original custody is absent.
+    }
+    #[test]
+    fn operation_status_reads_original_identity_including_settled_receipts_and_refuses_wrong_registry() {
+        let (mut registry,_,scope)=setup();let operation=Uuid::new_v4();
+        let request=digest(&scope.project).unwrap();let edit=ModelEdit::CloseProjectInstance{project:scope.project.clone()};
+        registry.begin_project_operation(operation,&request,&digest(&edit).unwrap(),&scope).unwrap();
+        assert_eq!(registry.project_operations_for_registry(scope.project.registry).unwrap()[0].project,scope.project);
+        assert!(registry.project_operations_for_registry(Uuid::nil()).is_err());
+        assert!(registry.project_operations_for_registry(Uuid::new_v4()).is_err());
+        assert!(registry.project_operation_for_registry(scope.project.registry,Uuid::nil()).is_err());
+        assert!(registry.project_operation_for_registry(scope.project.registry,Uuid::new_v4()).unwrap().is_none());
+        registry.advance_project_operation(operation,&request,Phase::Admitted,Phase::PendingCommit).unwrap();
+        let tx=registry.db.transaction().unwrap();model_committed(&tx,operation,&request,&edit).unwrap();tx.commit().unwrap();
+        registry.advance_project_operation(operation,&request,Phase::ModelCommitted,Phase::Resolved).unwrap();
+        assert!(registry.project_operations_for_registry(scope.project.registry).unwrap().is_empty());
+        let settled=registry.project_operation_for_registry(scope.project.registry,operation).unwrap().unwrap();
+        assert_eq!(settled.project,scope.project);assert_eq!(settled.phase,Phase::Resolved);assert!(settled.scope.is_none());
+        assert!(registry.project_operation_for_registry(Uuid::new_v4(),operation).is_err());
+        // Even a syntactically valid row cannot substitute a different scope
+        // identity into the bounded read snapshot.
+        registry.db.execute("UPDATE project_operation_obligations SET registry=?2 WHERE operation=?1",params![operation.to_string(),Uuid::new_v4().to_string()]).unwrap();
+        assert!(registry.project_operation_for_registry(scope.project.registry,operation).is_err());
     }
     #[test]
     fn original_operation_cannot_be_rekeyed_or_advanced_by_a_different_request() {

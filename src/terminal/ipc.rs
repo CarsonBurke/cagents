@@ -494,6 +494,8 @@ pub enum ClientRequest {
     ProjectOperation {
         request: crate::project_recovery::ProjectOperationRequest,
     },
+    ProjectOperations {registry:uuid::Uuid},
+    ResumeProjectOperation {registry:uuid::Uuid,operation:uuid::Uuid},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -807,6 +809,7 @@ pub enum ServerResponse {
     ProjectOperation {
         outcome: crate::project_recovery::ProjectOperationOutcome,
     },
+    ProjectOperations {operations:Vec<crate::project_recovery::ProjectOperationStatus>},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
