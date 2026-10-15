@@ -13,10 +13,38 @@ const STDERR_LIMIT:usize=64*1024;
 const DEADLINE:Duration=Duration::from_secs(30);
 
 fn run(test:&str, child_key:&str, value:&str, deadline:Duration, limits:(usize,usize))->Result<ProcessOutput,ProcessFailure> {
+    use std::os::unix::fs::{PermissionsExt,OpenOptionsExt};
+    use std::io::Write as _;
+    let directory=tempfile::Builder::new().prefix("cagents-ui-fixture-").tempdir().expect("private fixture directory");
+    std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["home","config","data","cache","runtime","tmp"] {
+        let path=directory.path().join(name);std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let spec=CommandSpec::new(std::env::current_exe().expect("current test executable"))
         .args([test,"--exact","--nocapture","--test-threads=1"])
+        .cwd(directory.path()).env("HOME",directory.path().join("home"))
+        .env("XDG_CONFIG_HOME",directory.path().join("config"))
+        .env("XDG_DATA_HOME",directory.path().join("data"))
+        .env("XDG_CACHE_HOME",directory.path().join("cache"))
+        .env("XDG_RUNTIME_DIR",directory.path().join("runtime"))
+        .env("TMPDIR",directory.path().join("tmp"))
         .env(child_key,value).timeout(deadline).output_limits(limits.0,limits.1);
-    SystemProcessExecutor.execute(&spec,&CancellationToken::new())
+    let result=SystemProcessExecutor.execute(&spec,&CancellationToken::new());
+    // Preserve bounded logs and the private test state for any failed run.
+    // No environment values are logged. Outer B0 still owns family settlement.
+    let failed=match &result {Ok(output)=>!output.success,Err(_)=>true};
+    if failed {
+        let (stdout,stderr)=match &result {Ok(output)=>(&output.stdout,&output.stderr),Err(error)=>(&error.stdout,&error.stderr)};
+        for (name,bytes) in [("stdout.log",stdout),("stderr.log",stderr)] {
+            let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                .open(directory.path().join(name)).unwrap();
+            file.write_all(bytes).unwrap();
+        }
+        let retained=directory.keep();
+        eprintln!("bounded UI fixture failure evidence retained at {}",retained.display());
+    }
+    result
 }
 fn exact_pass(output:&ProcessOutput, test:&str)->bool {
     if !output.success || output.exit_code!=Some(0) || output.signal.is_some() {return false;}
@@ -60,6 +88,17 @@ mod tests {
                 let bytes=[b'x';4096];let mut stdout=std::io::stdout().lock();
                 loop {stdout.write_all(&bytes).unwrap();stdout.flush().unwrap();}
             }
+            Some("private")=>{
+                use std::os::unix::fs::PermissionsExt;
+                let root=std::env::current_dir().unwrap();
+                assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode()&0o777,0o700);
+                for (key,name) in [("HOME","home"),("XDG_CONFIG_HOME","config"),("XDG_DATA_HOME","data"),
+                    ("XDG_CACHE_HOME","cache"),("XDG_RUNTIME_DIR","runtime"),("TMPDIR","tmp")] {
+                    let path=std::path::PathBuf::from(std::env::var_os(key).unwrap());
+                    assert_eq!(path,root.join(name));
+                    assert_eq!(std::fs::metadata(path).unwrap().permissions().mode()&0o777,0o700);
+                }
+            }
             _=>{}
         }
     }
@@ -67,7 +106,7 @@ mod tests {
     fn current_executable_hang_obeys_deadline_and_does_not_claim_family_proof() {
         let start=std::time::Instant::now();
         let error=run(FIXTURE,CHILD,"hang",Duration::from_secs(2),(4096,4096)).unwrap_err();
-        assert_eq!(error.kind,ProcessFailureKind::TimedOut);
+        assert_eq!(error.kind,ProcessFailureKind::TimedOut);assert!(error.started);
         assert!(String::from_utf8_lossy(&error.stdout).contains("bounded UI fixture entered"));
         assert!(error.stdout.len()<=4096 && error.stderr.len()<=4096);
         assert!(start.elapsed()<Duration::from_secs(10));
@@ -76,8 +115,13 @@ mod tests {
     #[test]
     fn current_executable_output_is_capped_before_collection() {
         let error=run(FIXTURE,CHILD,"cap",Duration::from_secs(5),(16384,4096)).unwrap_err();
-        assert_eq!(error.kind,ProcessFailureKind::OutputLimit);
+        assert_eq!(error.kind,ProcessFailureKind::OutputLimit);assert!(error.started);
         assert!(error.stdout.len()<=16384 && error.stderr.len()<=4096);
+    }
+    #[test]
+    fn current_executable_has_private_home_xdg_and_working_directory() {
+        let output=run(FIXTURE,CHILD,"private",Duration::from_secs(5),(4096,4096)).unwrap();
+        assert!(exact_pass(&output,FIXTURE));
     }
     #[test]
     fn an_empty_filter_success_is_not_a_named_fixture_pass() {
