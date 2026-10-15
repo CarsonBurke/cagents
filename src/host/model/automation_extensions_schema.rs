@@ -3,6 +3,24 @@
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 const OBJECTS: &[(&str,&str,&str)] = &[
+    // Exact c924/dbc/2556 negative custody leaf: the outer controller alone
+    // installs it. No original directory/owner authority is backfilled.
+    ("table","project_operation_obligations",r###"CREATE TABLE project_operation_obligations (
+ operation TEXT PRIMARY KEY CHECK(length(operation)=36),
+ registry TEXT NOT NULL CHECK(length(registry)=36),
+ repository TEXT NOT NULL CHECK(length(repository) BETWEEN 1 AND 16384),
+ project_ordinal INTEGER NOT NULL CHECK(project_ordinal BETWEEN 0 AND 4294967295),
+ request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+ commit_digest TEXT NOT NULL CHECK(length(commit_digest)=64),
+ phase TEXT NOT NULL CHECK(phase IN ('admitted','repairing','closing','pending_commit','model_committed','resolved','aborted')),
+ scope TEXT CHECK(scope IS NULL OR length(CAST(scope AS BLOB))<=1048576),
+ committed_sequence INTEGER CHECK(committed_sequence IS NULL OR committed_sequence>=0),
+ CHECK((phase IN ('resolved','aborted')) = (scope IS NULL)),
+ CHECK((phase IN ('model_committed','resolved')) = (committed_sequence IS NOT NULL))
+) STRICT;"###),
+    ("index","project_operation_obligations_pending_project",r###"CREATE INDEX project_operation_obligations_pending_project
+ ON project_operation_obligations(registry,repository,project_ordinal)
+ WHERE phase NOT IN ('resolved','aborted');"###),
     ("table","created_start_requirements",r###"CREATE TABLE created_start_requirements (
         session_id TEXT PRIMARY KEY, card_id TEXT NOT NULL,
         intent_operation TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>=0),
@@ -235,6 +253,43 @@ mod tests {
     }
 
     #[test]
+    fn registry19_project_custody_is_empty_until_admitted_and_partial_catalogs_refuse() {
+        for missing in ["index", "table"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("registry.sqlite3");
+            let registry = Registry::at(&path).unwrap();
+            assert_eq!(registry.db.query_row("SELECT count(*) FROM project_operation_obligations", [], |row| row.get::<_, u64>(0)).unwrap(), 0,
+                "migration must not invent repair, close, or retry custody");
+            let sql = if missing == "index" {
+                "DROP INDEX project_operation_obligations_pending_project"
+            } else {
+                "DROP TABLE project_operation_obligations"
+            };
+            registry.db.execute_batch(sql).unwrap();
+            let before = schema::stored_contents(&registry.db);
+            let version: u32 = registry.db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+            assert!(Registry::at(&path).is_err());
+            assert_eq!(schema::stored_contents(&registry.db), before,
+                "a matching number must not repair missing custody {missing}");
+            assert_eq!(registry.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), version);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("registry.sqlite3");
+        let registry = Registry::at(&path).unwrap();
+        discard_for_legacy_fixture(&registry.db);
+        registry.db.pragma_update(None, "user_version", 18).unwrap();
+        for &(kind, name, sql) in OBJECTS {
+            if name.starts_with("project_operation_obligations") {
+                assert!(matches!(kind, "table" | "index"));
+                registry.db.execute_batch(sql).unwrap();
+            }
+        }
+        let before = schema::stored_contents(&registry.db);
+        assert!(Registry::at(&path).is_err(), "private custody rows cannot hide under checkpoint18");
+        assert_eq!(schema::stored_contents(&registry.db), before);
+    }
+
+    #[test]
     fn registry19_second_connection_advances_are_rechecked_without_downgrade_or_replay() {
         for future in [false,true] {
             let root=tempfile::tempdir().unwrap();let path=root.path().join("registry.sqlite3");
@@ -283,7 +338,7 @@ mod tests {
         assert_eq!(registry.db.query_row("SELECT name FROM projects WHERE repository='/original-missing'",[],|row|row.get::<_,String>(0)).unwrap(),"preserve original filing");
         let policy:Option<String>=registry.db.query_row("SELECT directory FROM agent_policies WHERE agent=?1",[agent.id.to_string()],|row|row.get(0)).unwrap();
         assert!(policy.is_none(),"path metadata must not mint a physical grant");
-        for table in ["automation_snapshots","automation_report_descriptors","automation_report_sources","automation_notifications","automation_retired_manual_requests","created_start_requirements"] {
+        for table in ["automation_snapshots","automation_report_descriptors","automation_report_sources","automation_notifications","automation_retired_manual_requests","created_start_requirements","project_operation_obligations"] {
             assert_eq!(registry.db.query_row(&format!("SELECT count(*) FROM {table}"),[],|row|row.get::<_,u64>(0)).unwrap(),0);
         }
         assert_eq!(registry.db.query_row("SELECT descriptors,receipts,receipt_bytes FROM automation_report_usage WHERE key=0",[],|row|Ok((row.get::<_,u64>(0)?,row.get::<_,u64>(1)?,row.get::<_,u64>(2)?))).unwrap(),(0,0,0));
