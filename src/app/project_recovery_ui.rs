@@ -241,7 +241,9 @@ impl Cagents {
     }
 
     pub(super) fn card_location_refusal(&self, card: CardId) -> Option<&crate::workspace_model::SessionLocationRefusal> {
-        let session = match &self.card_state(card)?.kind {
+        let state = self.card_state(card)?;
+        if !state.existence.is_open() { return None; }
+        let session = match &state.kind {
             CardKind::Chat(session) => session.id,
             CardKind::Terminal(session) => session.id,
             _ => return None,
