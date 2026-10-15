@@ -204,6 +204,9 @@ impl State {
     /// Manifests, bodies, requests and copy demand are released; source reset,
     /// Ready and account revocation still clear the intent entirely.
     pub(super) fn evict(&mut self,find:bool) {
+        if self.raw.is_none() && self.projected.is_none() && self.entries.values().all(|entry|
+            entry.pages.is_empty() && entry.patches.is_empty() && entry.restored.is_empty()
+                && entry.requested.is_empty() && entry.patch_requests.is_empty() && !entry.copy_all) {return;}
         for entry in self.entries.values_mut() {
             for (offset,page) in &entry.pages {
                 for file in &page.files {
@@ -867,7 +870,7 @@ mod tests {
         assert_eq!(sources[0].manifests[0].files[0].path,page.files[0].path);assert_eq!(sources[0].patches[0].0,0);
         assert!(Arc::ptr_eq(&sources[0].patches[0].1,&loaded));drop(sources);drop(loaded);
         state.toggle_file(&page.source.source_id,0,false);state.project(raw,None,&expanded,false);
-        assert!(state.copy_patch(&page.source.source_id,0).is_none());assert!(weak.upgrade().is_none());
+        assert!(state.copy_patch(&page.source.source_id,0).is_none());flush_retired();assert!(weak.upgrade().is_none());
     }
     #[tokio::test]
     async fn same_session_source_reset_rejects_old_patch_and_unchanged_descriptor() {
@@ -887,10 +890,33 @@ mod tests {
         let weak=Arc::downgrade(&pending.0.lock().unwrap().as_ref().unwrap().text);
         let mut replacement=(*page).clone();replacement.epoch.incarnation=uuid::Uuid::from_u128(999);
         state.project(raw(&replacement,"part"),None,&expanded,false);
-        assert!(!state.complete_patch(&page.source,0,request,Ok(pending)));assert!(weak.upgrade().is_none());
+        assert!(!state.complete_patch(&page.source,0,request,Ok(pending)));flush_retired();assert!(weak.upgrade().is_none());
         let new_request=state.entries[&page.source].requested[&0];state.clear();
         assert!(!state.complete_manifest(&page.source,0,new_request,Ok(page)));
         assert!(state.entries.is_empty());assert!(state.capture().patches.is_empty());
+    }
+    fn flush_retired() {
+        struct Done(std::sync::mpsc::Sender<()>);impl Drop for Done {fn drop(&mut self) {let _=self.0.send(());}}
+        let(send,recv)=std::sync::mpsc::channel();retire_copy(Done(send));recv.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    #[tokio::test]
+    async fn live_hide_keeps_exact_open_file_and_page_intent_without_patch_owners() {
+        let text="@@ -1 +1 @@\n-before\n+after exact original\n";let page=fixture(text);
+        let(mut state,source,expanded)=open(&page,"visible part");let request=state.entries[&page.source].patch_requests[&0];
+        let pending=ready(&page,text).await;let weak=Arc::downgrade(&pending.0.lock().unwrap().as_ref().unwrap().text);
+        assert!(state.complete_patch(&page.source,0,request,Ok(pending)));
+        state.evict(false);flush_retired();flush_retired();assert!(weak.upgrade().is_none());assert_eq!(state.retained_bytes(),0);
+        assert!(state.entries[&page.source].opened.contains(&0));assert!(state.entries[&page.source].manual_pages.contains(&0));
+        assert_eq!(state.pending_paths(&page.source.source_id),vec![vec![6,0],vec![7,0,0]]);
+        state.project(source.clone(),None,&expanded,false);let request=state.entries[&page.source].requested[&0];
+        assert!(state.complete_manifest(&page.source,0,request,Ok(page.clone())));
+        assert_eq!(state.pending_paths(&page.source.source_id),vec![vec![6,0]]);
+        let request=state.entries[&page.source].patch_requests[&0];assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
+        assert_eq!(state.copy_patch(&page.source.source_id,0).unwrap().as_ref(),text);assert!(state.pending_paths(&page.source.source_id).is_empty());
+        state.evict(false);let mut replacement=(*source).clone();replacement.changes_parts[0].epoch.revision+=1;
+        state.project(Arc::new(replacement),None,&expanded,false);
+        assert!(state.entries[&page.source].opened.is_empty());assert!(state.pending_paths(&page.source.source_id).is_empty(),"rewrites cannot suspend an old selection");
+        state.clear();assert!(state.entries.is_empty(),"Reset/Ready/revoke forgets intent completely");
     }
     #[test]
     fn unselected_children_never_demand_patch_bodies_and_selection_retires_parent_owners() {
@@ -928,7 +954,7 @@ mod tests {
         let mut uncharged=captured.clone();uncharged.patches[0].0=Arc::from(text);
         assert!(restored.restore(uncharged).is_err(),"equal bytes do not prove a decoded lease");
         drop(captured);state.clear();assert!(weak.upgrade().is_some(),"actual restored owner remains charged");
-        restored.clear();assert!(weak.upgrade().is_none());
+        restored.clear();flush_retired();assert!(weak.upgrade().is_none());
     }
 
     #[tokio::test]
@@ -995,7 +1021,7 @@ mod tests {
         {let entry=state.entries.get_mut(&page.source).unwrap();entry.wanted_pages.insert(128);entry.requested.insert(128,999);}
         state.reconcile_demand(&HashSet::new(),false);
         let entry=&state.entries[&page.source];assert!(entry.patch_requests.is_empty());assert!(entry.requested.is_empty());
-        assert!(entry.wanted_pages.is_empty());assert_eq!(state.retained_bytes(),0);assert!(weak.upgrade().is_none());
+        assert!(entry.wanted_pages.is_empty());assert_eq!(state.retained_bytes(),0);flush_retired();assert!(weak.upgrade().is_none());
     }
 
     #[tokio::test]
