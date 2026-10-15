@@ -10431,8 +10431,26 @@ impl Cagents {
 
     /// Routes one language-server event onto the card whose document it names.
     fn apply_lsp_event(&mut self, event: LspEvent) {
+        if let LspEvent::RootDiscovered { doc, ticket, root } = event {
+            if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
+                && let Some(card) = self.lsp_documents.get(&doc)
+                && let Some(state) = self.lsp_contexts.get_mut(card)
+            {
+                state.context.status = Some(status);
+                state.context.live_servers = Arc::from(self.lsp.live_servers());
+            }
+            return;
+        }
+        if matches!(event, LspEvent::Resources { .. } | LspEvent::Status { .. }) {
+            let servers: Arc<[String]> = Arc::from(self.lsp.live_servers());
+            for state in self.lsp_contexts.values_mut() {
+                state.context.live_servers = servers.clone();
+            }
+        }
         let doc = match &event {
-            LspEvent::Diagnostics { doc, .. }
+            LspEvent::Resources { doc }
+            | LspEvent::RootDiscovered { doc, .. }
+            | LspEvent::Diagnostics { doc, .. }
             | LspEvent::Completion { doc, .. }
             | LspEvent::Hover { doc, .. }
             | LspEvent::Locations { doc, .. }
@@ -10451,6 +10469,8 @@ impl Cagents {
             return;
         };
         match event {
+            LspEvent::RootDiscovered { .. } => unreachable!("handled above"),
+            LspEvent::Resources { .. } => {}
             LspEvent::Diagnostics { version, items, .. } => {
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.set_editor_diagnostics(
@@ -11272,8 +11292,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -12617,7 +12640,13 @@ impl Cagents {
     /// re-announced to the replacement: leaving them would show the user files
     /// that look checked and are not.
     fn synchronize_language_servers(&mut self) -> Task<Message> {
-        if self.lsp.servers() == self.settings.language_servers.as_slice() {
+        if self.lsp.servers() == self.settings.language_servers.as_slice()
+            && self.lsp.lifecycle()
+                == (
+                    self.settings.lsp_idle_timeout_seconds.max(1),
+                    self.settings.lsp_max_sessions.clamp(1, 64),
+                )
+        {
             return Task::none();
         }
         // `shutdown` alone moves the sessions into the outgoing manager's own
@@ -12627,7 +12656,10 @@ impl Cagents {
         // `begin_shutdown` spawns the reap on the runtime the sessions run on,
         // so it survives the returned future being dropped here.
         drop(self.lsp.begin_shutdown());
-        self.lsp = LspManager::new(self.settings.language_servers.clone());
+        self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
+            self.settings.lsp_idle_timeout_seconds,
+            self.settings.lsp_max_sessions,
+        );
         self.lsp_contexts.clear();
         self.lsp_documents.clear();
         self.lsp_pending_jumps.clear();
@@ -12850,7 +12882,8 @@ impl Application for Cagents {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
             }),
-            lsp: LspManager::new(settings.language_servers.clone()),
+            lsp: LspManager::new(settings.language_servers.clone())
+                .with_lifecycle(settings.lsp_idle_timeout_seconds, settings.lsp_max_sessions),
             lsp_documents: HashMap::new(),
             lsp_contexts: HashMap::new(),
             lsp_pending_jumps: HashMap::new(),
@@ -25121,7 +25154,8 @@ mod tests {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
             }),
-            lsp: LspManager::new(settings.language_servers.clone()),
+            lsp: LspManager::new(settings.language_servers.clone())
+                .with_lifecycle(settings.lsp_idle_timeout_seconds, settings.lsp_max_sessions),
             lsp_documents: HashMap::new(),
             lsp_contexts: HashMap::new(),
             lsp_pending_jumps: HashMap::new(),

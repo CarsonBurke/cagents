@@ -2088,7 +2088,10 @@ impl Editor {
             }
             // The manager's shutdown owns its reaper even when this future is dropped.
             drop(self.lsp.begin_shutdown());
-            self.lsp = LspManager::new(self.settings.language_servers.clone());
+            self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
+                self.settings.lsp_idle_timeout_seconds,
+                self.settings.lsp_max_sessions,
+            );
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
@@ -2920,7 +2923,8 @@ impl Application for Editor {
             notice = Some(format!("Cannot safely open editor folders yet: {error}"));
             startup_paths.clear();
         }
-        let lsp = LspManager::new(settings.language_servers.clone());
+        let lsp = LspManager::new(settings.language_servers.clone())
+            .with_lifecycle(settings.lsp_idle_timeout_seconds, settings.lsp_max_sessions);
         let line_height_draft = settings.terminal_line_height.to_string();
         let sidebar_open = saved_session.sidebar_open;
         let mut app = Self {
@@ -4316,8 +4320,22 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if let Some(event) = event {
+                        if let LspEvent::RootDiscovered { doc, ticket, root } = event {
+                            if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
+                                && let Some(error) = language_server_failure(status)
+                                && let Some(tab) = self
+                                    .tabs
+                                    .iter_mut()
+                                    .find(|tab| tab.runtime.lsp_document() == Some(doc))
+                            {
+                                tab.lsp_error = Some(error);
+                            }
+                            return self.lsp_next();
+                        }
                         let doc = match &event {
-                            LspEvent::Diagnostics { doc, .. }
+                            LspEvent::RootDiscovered { doc, .. }
+                            | LspEvent::Resources { doc }
+                            | LspEvent::Diagnostics { doc, .. }
                             | LspEvent::Completion { doc, .. }
                             | LspEvent::Hover { doc, .. }
                             | LspEvent::Locations { doc, .. }

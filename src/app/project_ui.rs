@@ -1345,6 +1345,7 @@ impl Cagents {
                     return Task::batch([sweep, self.attach_next_restored_agent()]);
                 }
                 Ok(()) => {
+                    self.lsp.remove_worktree(&target.path);
                     if let Some(id) = target.worktree {
                         self.project_ui.deletions.remove(&id);
                     }

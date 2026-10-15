@@ -173,6 +173,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `show_status_bar` | boolean | `true` | Shows the bottom status bar with the usage limits left on each signed-in provider account. Hiding it also stops the usage checks that feed it, unless the Accounts pane is open |
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
+| `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
+| `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
 | `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
@@ -262,6 +264,17 @@ ansi = [
 ```
 
 ## Language servers
+
+Language servers are shared by workspace root. Rust selects the outermost Cargo
+workspace (or nearest Cargo package); JavaScript and TypeScript recognize npm
+workspaces, `pnpm-workspace.yaml`, and TypeScript project references. Discovery
+runs off the UI thread. The inspector lists live servers and their cached process
+RSS, refreshed in the background; RSS describes the server process, excluding its
+children. Closing the last document arms the idle timeout. Worktree removal
+retires its servers immediately; removals outside the app are detected within
+five seconds. When all slots have active documents, opening a new server reports
+the limit instead of evicting a server in use. Set the two scalar options before
+any TOML table headers.
 
 `language_servers` lists external Language Server Protocol (LSP) servers for
 the native editor. If the key is missing, cagents uses this built-in list. If
