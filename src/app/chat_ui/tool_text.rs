@@ -326,6 +326,20 @@ impl ToolText {
 mod tests {
     use super::*;
 
+    // Geometry fixtures explicitly finish the same preparation stage before
+    // inspecting glyphs. Timed frame/native workloads never use this helper.
+    fn laid_out(block: &ToolText, make: &impl Fn() -> Element<'static,Message>,
+        tree: &mut iced::advanced::widget::Tree, renderer: &cosmic::Renderer,
+        limits: &iced::advanced::layout::Limits) -> (Element<'static,Message>,iced::advanced::layout::Node) {
+        let mut element = make(); element.as_widget_mut().diff(tree);
+        let mut node = element.as_widget_mut().layout(tree,renderer,limits);
+        for _ in 0..3 {
+            if !block.flow_cache.complete_fixture() {break;}
+            element = make(); element.as_widget_mut().diff(tree);
+            node = element.as_widget_mut().layout(tree,renderer,limits);
+        }
+        (element,node)
+    }
     #[test]
     fn view_shares_cached_syntax_spans_and_keeps_complete_tool_text() {
         use iced::advanced::{
@@ -452,18 +466,21 @@ mod tests {
         let source = format!("{}{}", "ordinary line\n".repeat(300), "x".repeat(6000));
         let block = ToolText::update(None, &source, Language::Plain);
         for limit in [None, Some((120.0, false)), Some((120.0, true))] {
-            let mut element = scroll::viewport(block.view_logical_with_reader(
+            let memory = scroll::Memory::default();
+            let make = || scroll::viewport(block.view_logical_with_reader(
                 crate::settings::EditorSyntaxTheme::Auto, limit, target, None,
-                selectable_prose::Logical { identity: 42, start: 0 }, scroll::Memory::default(), None));
-            let mut tree = Tree::new(&element);
+                selectable_prose::Logical { identity: 42, start: 0 }, memory.clone(), None));
+            let mut tree = Tree::new(&make());
             let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 20000.0));
-            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut Move {
-                horizontal: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Horizontal)),
-                vertical: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Vertical)),
-                bottom: limit.is_some_and(|(_, bottom)| bottom),
-            });
-            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let (mut element,mut node) = laid_out(&block,&make,&mut tree,&renderer,&limits);
+            for _ in 0..3 {
+                element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut Move {
+                    horizontal: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Horizontal)),
+                    vertical: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Vertical)),
+                    bottom: limit.is_some_and(|(_, bottom)| bottom),
+                });
+                (element,node) = laid_out(&block,&make,&mut tree,&renderer,&limits);
+            }
             let mut tail = Tail::default();
             element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut tail);
             assert!(!tail.duplicate, "nested axes must have distinct IDs");
@@ -504,26 +521,26 @@ mod tests {
         };
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 2000.0));
         let mut element = make(); let mut tree = Tree::new(&element);
-        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let (mut element,mut node) = laid_out(&block,&make,&mut tree,&renderer,&limits);
         element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(Some(10000.0), None));
-        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        (element,node) = laid_out(&block,&make,&mut tree,&renderer,&limits);
         let mut read = probe(None, None);
         element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
         let (x, width) = read.observed.unwrap();
         assert!((x - 10000.0).abs() < 1.0 && width > 30000.0);
         element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(None, Some(f32::MAX)));
-        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        (element,node) = laid_out(&block,&make,&mut tree,&renderer,&limits);
         let mut read = probe(None, None);
         element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
         assert_eq!(read.observed.unwrap(), (x, width), "short visible lines must not collapse measured horizontal travel");
         drop(tree); drop(element);
         let mut element = make(); let mut tree = Tree::new(&element);
-        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let (mut element,mut node) = laid_out(&block,&make,&mut tree,&renderer,&limits);
         let mut read = probe(None, None);
         element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
         assert_eq!(read.observed.unwrap(), (x, width), "cheap geometry restores x while the wide line is still evicted");
         element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(None, Some(0.0)));
-        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        (element,node) = laid_out(&block,&make,&mut tree,&renderer,&limits);
         let mut read = probe(None, None);
         element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
         assert!((read.observed.unwrap().0 - x).abs() < 1.0, "returning to the wide line keeps the horizontal bookmark");

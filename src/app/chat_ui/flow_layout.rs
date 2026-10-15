@@ -145,6 +145,20 @@ impl Cache {
     pub(super) fn find(&self, id: u64) -> Option<Handle> {
         self.0.borrow().requests.get(&id).and_then(std::rc::Weak::upgrade)
     }
+    #[cfg(test)]
+    pub(super) fn complete_fixture(&self) -> bool {
+        let entries: Vec<_> = self.0.borrow().logical.values().filter_map(std::rc::Weak::upgrade).collect();
+        let mut changed = false;
+        for entry in entries {
+            let Some(request) = entry.borrow_mut().request() else {continue;};
+            let (spans,plain) = request.source.materialize();
+            let mut prepared = Prepared::new(&spans,request.key.size,request.key.font,request.key.width,
+                if request.key.unwrapped {iced::widget::text::Wrapping::None} else {iced::widget::text::Wrapping::WordOrGlyph});
+            prepared.plain = plain;
+            changed |= entry.borrow_mut().complete(&request,Some(Arc::new(prepared)));
+        }
+        changed
+    }
     pub(super) fn retained_bytes(&self) -> usize {
         self.0.borrow().logical.values().filter_map(std::rc::Weak::upgrade).filter_map(|entry| entry.borrow().ready.clone())
             .map(|prepared| prepared.snapshot.retained_bytes()).sum()
