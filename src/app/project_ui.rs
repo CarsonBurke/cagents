@@ -2672,14 +2672,17 @@ impl Cagents {
         })
     }
 
-    fn worktree_busy_agents(&self, target: &Target) -> usize {
+    fn worktree_activity_counts(&self, target: &Target) -> (usize, usize) {
         self.project_ui
             .dialog
             .as_ref()
             .filter(|dialog| {
                 dialog.target.worktree == target.worktree && dialog.target.path == target.path
             })
-            .map_or(0, |dialog| dialog.busy_agents.len())
+            .map_or((0, 0), |dialog| {
+                let working = dialog.busy_agents.iter().filter(|agent| agent.working_agent).count();
+                (working, dialog.busy_agents.len() - working)
+            })
     }
 
     fn delete_branch_default(&self, target: &Target, snapshot: &WorktreeSafetySnapshot) -> bool {
@@ -2913,7 +2916,11 @@ impl Cagents {
                 )));
             }
         }
-        let busy = self.worktree_busy_agents(target);
+        let (working, busy) = self.worktree_activity_counts(target);
+        if working > 0 {
+            rows.push(super::notice_body(format!("{working} {} working in this worktree.",
+                if working == 1 { "agent is" } else { "agents are" })));
+        }
         if busy > 0 {
             rows.push(super::notice_body(format!(
                 "{busy} {} in this worktree. Agent turns and commands in these sessions will be stopped.",
@@ -3785,6 +3792,7 @@ fn checked_busy_worktree_agents(
     }) || agents
         .iter()
         .any(|agent| census.binary_search(agent).is_err())
+        || census.iter().any(|agent| agent.working_agent && agents.binary_search(agent).is_err())
     {
         return Err("The daemon returned ambiguous active agent identities".into());
     }
@@ -4211,7 +4219,7 @@ mod tests {
         );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         let target = app.project_target(project, Some(linked.id)).unwrap();
-        drop(app.open_worktree_delete_dialog(target));
+        drop(app.open_worktree_delete_dialog(target.clone()));
         // No current-window card exists for this detached daemon agent.
         assert!(app.durable.cards.is_empty());
         let agent = BusyAgent {
@@ -4220,9 +4228,16 @@ mod tests {
             close_revision: Some(1),
             turn_generation: Some(3),
             session_instance: uuid::Uuid::new_v4(),
+            working_agent: true,
         };
-        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![agent.clone()];
-        app.project_ui.dialog.as_mut().unwrap().session_census = vec![agent];
+        let mut uncertain = agent.clone();
+        uncertain.session = TerminalId::new(); uncertain.instance = uuid::Uuid::new_v4();
+        uncertain.session_instance = uuid::Uuid::new_v4(); uncertain.working_agent = false;
+        uncertain.close_revision = None; uncertain.turn_generation = None;
+        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![agent.clone(), uncertain.clone()];
+        app.project_ui.dialog.as_mut().unwrap().session_census = vec![agent, uncertain];
+        assert_eq!(app.worktree_activity_counts(&target), (1, 1),
+            "unknown live shells must not inflate the positively working-agent count");
         confirm_deletion_fixture(&mut app);
         assert!(!app.project_ui.is_deleting(linked.id));
         let request = app.project_ui.dialog.as_ref().unwrap().request;
@@ -4233,7 +4248,7 @@ mod tests {
 
     #[test]
     fn replacing_an_agent_or_its_turn_invalidates_counted_consent() {
-        for change in 0..5 {
+        for change in 0..6 {
             let repository = PathBuf::from("/repo");
             let primary = SidebarWorktree::from_durable(
                 WorktreeId::new(),
@@ -4255,7 +4270,8 @@ mod tests {
                 close_revision: Some(1),
                 turn_generation: Some(3),
                 session_instance: uuid::Uuid::new_v4(),
-            };
+            working_agent: true,
+        };
             app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![original.clone()];
             app.project_ui.dialog.as_mut().unwrap().session_census = vec![original.clone()];
             confirm_deletion_fixture(&mut app);
@@ -4267,7 +4283,8 @@ mod tests {
                 1 => changed.instance = uuid::Uuid::new_v4(),
                 2 => changed.close_revision = Some(2),
                 3 => changed.turn_generation = Some(4),
-                _ => changed.session_instance = uuid::Uuid::new_v4(),
+                4 => changed.session_instance = uuid::Uuid::new_v4(),
+                _ => changed.working_agent = false,
             }
             drop(app.handle_project_action(Action::SafetyRead {
                 request,
@@ -4315,6 +4332,7 @@ mod tests {
             close_revision: Some(1),
             turn_generation: Some(0),
             session_instance: uuid::Uuid::new_v4(),
+            working_agent: false,
         };
         drop(app.handle_project_action(Action::DeleteOptionsRead {
             request,
@@ -4411,7 +4429,9 @@ mod tests {
     #[test]
     fn whole_session_consent_retains_lifetimes_instead_of_turn_revisions() {
         let actor = BusyAgent {session: TerminalId::new(), instance: uuid::Uuid::new_v4(),
-            close_revision: Some(1), turn_generation: Some(1), session_instance: uuid::Uuid::new_v4()};
+            close_revision: Some(1), turn_generation: Some(1), session_instance: uuid::Uuid::new_v4(),
+            working_agent: false,
+        };
         let original = AgentCensus {agents: vec![], census: vec![actor.clone()]};
         let expected = worktree_session_stop_consent(&original).unwrap();
         assert_eq!(expected.sessions.len(), 1, "idle sessions are included in explicit stop consent");
@@ -4441,6 +4461,7 @@ mod tests {
             close_revision: Some(1),
             turn_generation: Some(1),
             session_instance: uuid::Uuid::new_v4(),
+            working_agent: true,
         };
         assert!(
             checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions {
@@ -4449,6 +4470,9 @@ mod tests {
             })
             .is_err()
         );
+        assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions {
+            agents: vec![], census: vec![agent.clone()],
+        }).is_err(), "positively working actors cannot disappear from the warning subset");
         assert!(
             checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions {
                 agents: vec![agent.clone(), agent.clone()],
@@ -4545,6 +4569,7 @@ mod tests {
             close_revision: Some(1),
             turn_generation: Some(1),
             session_instance: uuid::Uuid::new_v4(),
+            working_agent: true,
         }];
         drop(app.handle_project_action(Action::BusyAgentsConfirmed(stale, true)));
         assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
