@@ -130,6 +130,7 @@ enum Command {
         visible: bool,
     },
     ObserveAgent(Sender<Option<String>>),
+    CheckInputDrained(Sender<Result<(), String>>),
     PrepareUpgrade(Sender<Result<UpgradeSnapshot, String>>),
     Carry {
         socket: PathBuf,
@@ -368,6 +369,8 @@ pub(crate) fn flush_archived_notices() {
 
 #[derive(Default)]
 struct InputOrder {
+    /// A carry has fenced further admission until its outcome is known.
+    handoff: bool,
     generation: u64,
     interrupt_key: Option<KeyInput>,
 }
@@ -455,8 +458,9 @@ impl PublishedState {
         }
     }
 
-    fn request_interrupt(&self, key: Option<KeyInput>) {
+    fn request_interrupt(&self, key: Option<KeyInput>) -> bool {
         let mut order = self.input_order.lock().unwrap_or_else(|p| p.into_inner());
+        if order.handoff { return false; }
         order.generation = order
             .generation
             .checked_add(1)
@@ -464,6 +468,7 @@ impl PublishedState {
         order.interrupt_key = key;
         self.interrupt_requested.store(true, Ordering::Release);
         let _ = self.capture_tx.try_send(());
+        true
     }
 
     fn request_shutdown(&self) {
@@ -1226,6 +1231,16 @@ impl TerminalHandle {
             .map_err(|error| format!("Cannot inspect the active agent: {error}"))
     }
 
+    /// Call with host control admission excluded, before committing an
+    /// upgrade. Kernel-admitted bytes survive on the original PTY; bytes still
+    /// in this parser cannot be silently discarded with its replacement.
+    pub(crate) fn check_input_drained(&self) -> Result<(), String> {
+        let (reply, result) = crossbeam_channel::bounded(1);
+        self.try_command(Command::CheckInputDrained(reply)).map_err(|error| error.to_string())?;
+        result.recv_timeout(Duration::from_secs(3))
+            .map_err(|error| format!("Cannot verify terminal input before upgrade: {error}"))?
+    }
+
     pub(crate) fn prepare_upgrade(&self) -> Result<UpgradeSnapshot, String> {
         let (sender, receiver) = crossbeam_channel::bounded(1);
         self.try_command(Command::PrepareUpgrade(sender))
@@ -1245,12 +1260,24 @@ impl TerminalHandle {
     /// reported as an unknown carry outcome; it never authorizes killing a
     /// terminal that may already belong to a successor.
     pub(crate) fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
+        {
+            let mut order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+            if order.handoff { return Err("Terminal ownership is already changing".into()); }
+            order.handoff = true;
+        }
+        let reopen = || self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner()).handoff = false;
         let (reply, result) = crossbeam_channel::bounded(1);
-        self.send_command(Command::Carry { socket, reply })
-            .map_err(|error| error.to_string())?;
-        let carried = result
-            .recv_timeout(WORKER_JOIN_TIMEOUT * 2)
-            .map_err(|_| "terminal carry outcome is unknown after its deadline".to_owned())??;
+        if let Err(error) = self.send_command(Command::Carry { socket, reply }) {
+            reopen();
+            return Err(error.to_string());
+        }
+        let carried = match result.recv_timeout(WORKER_JOIN_TIMEOUT * 2) {
+            Ok(Ok(carried)) => carried,
+            Ok(Err(error)) => { reopen(); return Err(error); }
+            // A timeout cannot prove this worker still owns the PTY. Keep
+            // admission fenced; never acknowledge input that might be lost.
+            Err(_) => return Err("terminal carry outcome is unknown after its deadline".into()),
+        };
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
         if let Some(worker) = self
             .take_worker_until(deadline)
@@ -1517,9 +1544,17 @@ impl TerminalHandle {
             }
         }
         if let Command::Interrupt(key) = command {
-            published.request_interrupt(key);
-            return Ok(());
+            return if published.request_interrupt(key) { Ok(()) } else { Err(TerminalSendError::Closed) };
         }
+        // Serialize input admission with the priority cancellation boundary.
+        // Commands submitted after Ctrl+C must survive its queue drain.
+        let order = self
+            .inner
+            .published
+            .input_order
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if order.handoff { return Err(TerminalSendError::Closed); }
         if matches!(command, Command::CloseChecked { .. }) {
             let mut priority = published
                 .priority_close
@@ -1532,14 +1567,6 @@ impl TerminalHandle {
             let _ = published.capture_tx.try_send(());
             return Ok(());
         }
-        // Serialize input admission with the priority cancellation boundary.
-        // Commands submitted after Ctrl+C must survive its queue drain.
-        let order = self
-            .inner
-            .published
-            .input_order
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let command = if matches!(
             command,
             Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)
@@ -2567,9 +2594,12 @@ impl Worker {
                 let _ = reply.send(outcome);
                 return close;
             }
+            Command::CheckInputDrained(reply) => {
+                let _ = reply.send(self.input_drained_for_handoff());
+            }
             Command::PrepareUpgrade(reply) => {
-                let result = self
-                    .inspect_close(std::time::Instant::now() + std::time::Duration::from_secs(3))
+                let result = self.input_drained_for_handoff().and_then(|()| self
+                    .inspect_close(std::time::Instant::now() + std::time::Duration::from_secs(3)))
                     .and_then(|(active, family)| {
                         self.refresh_resume_hint(true);
                         if active && self.resume_hint.as_deref()
@@ -3132,11 +3162,19 @@ impl Worker {
         }
     }
 
+    fn input_drained_for_handoff(&self) -> Result<(), String> {
+        if !self.pending_input.is_empty() || !self.commands.is_empty() || !self.retained_commands.is_empty() {
+            return Err("Terminal input or control is still pending; let it finish or cancel input before upgrading".into());
+        }
+        Ok(())
+    }
+
     /// Stops reading the terminal, takes in everything already read, and
     /// detaches its holder with the screen that output drew. A terminal that
     /// cannot be detached is read again; one whose reader would not stop is
     /// left to that reader.
     fn carry(&mut self, socket: &std::path::Path) -> Result<Carried, String> {
+        self.input_drained_for_handoff()?;
         // Observed while this worker still owns the terminal's processes.
         self.refresh_resume_hint(true);
         self.stop_reading()?;
@@ -6536,6 +6574,50 @@ mod tests {
                 .try_iter()
                 .any(|event| matches!(event, TerminalEvent::Error { .. }))
         );
+        worker.run();
+    }
+
+    #[test]
+    fn handoff_refuses_pending_input_without_discarding_it() {
+        let (mut worker, _) = capture_worker_for(shell_session("exec cat").launch);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("must-not-detach.sock");
+        worker.pending_input.extend(b"accepted but not written");
+        let expected = worker.pending_input.clone();
+        let (reply, result) = crossbeam_channel::bounded(1);
+        assert!(!worker.handle_command(Command::CheckInputDrained(reply)));
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        let (reply, result) = crossbeam_channel::bounded(1);
+        assert!(!worker.handle_command(Command::Carry { socket: socket.clone(), reply }));
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        assert_eq!(worker.pending_input, expected);
+        assert!(!worker.carried);
+        assert!(!socket.exists());
+        worker.pending_input.clear();
+        assert!(worker.input_drained_for_handoff().is_ok());
+        worker.retained_commands.push_back(Command::Input(b"retained".to_vec()));
+        assert!(worker.input_drained_for_handoff().is_err());
+        worker.retained_commands.clear();
+        worker.run();
+    }
+
+    #[test]
+    fn handoff_fence_refuses_both_ordinary_and_priority_input() {
+        let (mut worker, events) = capture_worker_for(shell_session("exec cat").launch);
+        let (commands, receiver) = command_channel(4);
+        worker.commands = receiver;
+        let handle = TerminalHandle { inner: Arc::new(HandleInner {
+            commands, events, published: worker.published.clone(), worker: Mutex::new(None),
+        }) };
+        worker.published.input_order.lock().unwrap().handoff = true;
+        assert_eq!(handle.input(b"later".to_vec()), Err(TerminalSendError::Closed));
+        assert_eq!(handle.input(vec![3]), Err(TerminalSendError::Closed));
+        assert!(worker.commands.is_empty());
+        assert!(!worker.published.interrupt_requested.load(Ordering::Acquire));
+        worker.published.input_order.lock().unwrap().handoff = false;
+        assert!(handle.input(b"allowed".to_vec()).is_ok());
+        assert!(!worker.commands.is_empty());
+        drop(handle);
         worker.run();
     }
 
