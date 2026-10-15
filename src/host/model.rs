@@ -85,10 +85,17 @@ impl Registry {
         prepare_private_file(path)
             .map_err(|error| format!("cannot prepare {}: {error}", path.display()))?;
         let db = Connection::open(path).map_err(|error| error.to_string())?;
+        // Even a rejected read-write connection can checkpoint/delete a
+        // pre-existing WAL on its final close. Keep rejection side-effect free
+        // through both outer and authoritative writer admission.
+        db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .map_err(|error| error.to_string())?;
         schema::check_readonly(&db)?;
         configure_connection(&db)?;
         migrate(&db)?;
         configure(&db)?;
+        db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             db,
             path: path.to_owned(),

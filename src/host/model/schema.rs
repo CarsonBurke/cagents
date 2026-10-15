@@ -192,6 +192,25 @@ mod tests {
     }
 
     #[test]
+    fn rejected_wal_databases_keep_primary_and_committed_wal_bytes() {
+        for checkpoint in [13, 16, 18] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("registry.sqlite3");
+            legacy(&path, 12);
+            let db = Connection::open(&path).unwrap();
+            db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+            db.pragma_update(None, "user_version", checkpoint).unwrap();
+            drop(db);
+            let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+            let before = (image(&path), image(&wal));
+            assert!(!before.1.is_empty(), "fixture must retain actual committed WAL frames");
+            assert!(Registry::at(&path).is_err());
+            assert_eq!((image(&path), image(&wal)), before, "version {checkpoint}");
+        }
+    }
+
+    #[test]
     fn ambiguous_partial_layouts_are_refused_without_repair_or_writes() {
         for checkpoint in [12, 17] {
             let directory = tempfile::tempdir().unwrap();
