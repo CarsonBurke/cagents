@@ -3591,6 +3591,32 @@ impl Application for Editor {
                     Task::batch(tasks)
                 }
                 Message::Sidebar(action) => {
+                    // Sidebar menus share command identities with the ADE,
+                    // while this host owns its file mutations and preferences.
+                    let action = match action {
+                        SidebarAction::RunCommand { command, action } => {
+                            let valid = cagents::sidebar::commands::command_id(&action) == Some(command)
+                                && self.current().is_some_and(|tab| {
+                                    let SidebarAction::FileCommand { key, path, .. } = action.as_ref() else {
+                                        return false;
+                                    };
+                                    tab.navigation.active_worktree() == Some(key)
+                                        && tab.sidebar.source_control.as_ref().is_some_and(|source| {
+                                            source.key == *key
+                                                && !source.reloading
+                                                && !source.busy()
+                                                && cagents::sidebar::commands::file_rows(source)
+                                                    .any(|row| row.path == *path)
+                                        })
+                                });
+                            if !valid {
+                                self.notice = Some("The original file menu target is no longer available.".into());
+                                return Task::none();
+                            }
+                            *action
+                        }
+                        action => action,
+                    };
                     if matches!(action, SidebarAction::OpenSettings) {
                         return self.update(Message::Settings);
                     }
@@ -7128,6 +7154,50 @@ mod tests {
             file_operation_destination(source, " renamed λ.txt ").unwrap(),
             Path::new("src/ renamed λ.txt "),
         );
+    }
+
+    #[test]
+    fn registered_file_menus_keep_editor_host_mutations_and_reject_stale_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.txt"), "saved").unwrap();
+        let mut app = editor();
+        let id = add(&mut app, root.to_str().unwrap(), None);
+        drop(app.update(Message::Repository(RepositoryAction::FilesLoaded {
+            identity: AsyncIdentity {
+                card: id,
+                worktree: root.to_path_buf(),
+                path: ".".into(),
+                generation: 1,
+            },
+            result: repository_widget::load_directory_files(root),
+        })));
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        let path = cagents::repository::RepoPath::parse("a.txt").unwrap();
+        for command in [FileCommand::Rename, FileCommand::CopyFile] {
+            let action = SidebarAction::FileCommand { key: key.clone(), path: path.clone(), command };
+            drop(app.update(Message::Sidebar(sidebar::commands::registered(action))));
+            let dialog = app.file_dialog.as_ref().expect("the host file operation opens");
+            assert_eq!(dialog.source, Path::new("a.txt"));
+            assert_eq!(dialog.duplicate, command == FileCommand::CopyFile);
+            drop(app.update(Message::CancelFileOperation));
+        }
+        let action = SidebarAction::FileCommand { key: key.clone(), path: path.clone(), command: FileCommand::Rename };
+        drop(app.update(Message::Sidebar(SidebarAction::RunCommand {
+            command: workspace_widget::GlobalShortcut::DuplicateFile,
+            action: Box::new(action.clone()),
+        })));
+        assert!(app.file_dialog.is_none(), "a mismatched identity cannot invoke a mutation");
+        let mut stale_key = key;
+        stale_key.canonical_path = root.join("replaced-worktree");
+        drop(app.update(Message::Sidebar(sidebar::commands::registered(SidebarAction::FileCommand {
+            key: stale_key, path, command: FileCommand::Rename,
+        }))));
+        assert!(app.file_dialog.is_none(), "the original worktree binding is required");
+        app.tab_mut(id).unwrap().sidebar.source_control.as_mut().unwrap().files.clear();
+        drop(app.update(Message::Sidebar(sidebar::commands::registered(action))));
+        assert!(app.file_dialog.is_none(), "a removed row cannot invoke its old menu");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "saved");
     }
 
     #[test]
