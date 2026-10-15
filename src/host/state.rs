@@ -451,7 +451,10 @@ impl HostState {
         // A native actor and its paired CLI terminal describe one conversation;
         // the actor has the current activity when both descriptors are present.
         for (id, record) in &self.chats {
-            let state = record.handle.activity();
+            let state = record
+                .handle
+                .activity_if_ready()
+                .unwrap_or(ActivityState::Unknown);
             // An exited/connecting observer has no authoritative activity. A
             // still-live paired CLI can continue waiting after that observer ends.
             if state == ActivityState::Unknown && agents.contains_key(id) {

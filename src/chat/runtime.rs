@@ -968,6 +968,12 @@ impl Handle {
             .activity()
     }
 
+    /// A connecting observer cannot supersede a paired terminal's activity.
+    pub(crate) fn activity_if_ready(&self) -> Option<crate::agent::ActivityState> {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.ready.then(|| state.activity())
+    }
+
     /// Update preflights need activity without loading the transcript window.
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -3202,10 +3208,20 @@ mod tests {
             UpdateReadiness::Unready,
             "initialization is not idle"
         );
+        assert_eq!(
+            handle.activity_if_ready(),
+            None,
+            "a connecting observer must not replace its paired terminal's waiting state"
+        );
         handle.command(Command::Compact).unwrap();
         assert_eq!(
             handle.check_update_readiness().unwrap(),
             UpdateReadiness::Idle
+        );
+        assert_eq!(
+            handle.activity_if_ready(),
+            Some(crate::agent::ActivityState::Idle),
+            "a ready observer supplies the conversation's current activity"
         );
         assert!(
             !handle.0.stop.load(Ordering::Acquire),
