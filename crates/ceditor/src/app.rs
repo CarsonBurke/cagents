@@ -1887,10 +1887,16 @@ impl Editor {
                 if self.active == Some(id) { self.active = Some(owner); }
                 if let Some((line, column)) = location {
                     let foreground = self.active == Some(owner);
-                    if let Some(tab) = self.tab_mut(owner)
-                        && let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf) {
-                        let task = repository_task(tab.runtime.update(RepositoryAction::OpenLocation { card: owner, path, line, column }));
-                        if foreground { tasks.push(task); }
+                    if let Some(tab) = self.tab_mut(owner) {
+                        if let Some(pending) = tab.pending_file.as_mut().filter(|pending| pending.canonical.as_ref() == Some(&canonical)) {
+                            // A reservation can still belong to an earlier
+                            // buffer while its file list finishes loading.
+                            pending.location = Some((line, column));
+                        } else if tab.owned_file.as_ref() == Some(&canonical)
+                            && let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf) {
+                            let task = repository_task(tab.runtime.update(RepositoryAction::OpenLocation { card: owner, path, line, column }));
+                            if foreground { tasks.push(task); }
+                        }
                     }
                 }
                 continue;
@@ -6405,6 +6411,45 @@ mod tests {
         assert_eq!(app.active, Some(file));
         assert_eq!(app.tab(file).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 41, character: 2 }));
         assert!(app.tab(folder).unwrap().pending_file.is_none());
+    }
+
+    #[test]
+    fn quick_open_locations_follow_pending_canonical_reservations_without_touching_old_buffers() {
+        for old_buffer in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            std::fs::write(root.join("foo.rs"), "a😀bcdef\n".repeat(30_001)).unwrap();
+            std::fs::write(root.join("bar.rs"), "previous buffer\n").unwrap();
+            let mut app = configured(&directory);
+            let task = app.add(Opened { root: root.into(), file: old_buffer.then(|| "bar.rs".into()), snapshot: None }, true);
+            run_tasks(&mut app, task);
+            let owner = app.active.unwrap();
+            app.tab_mut(owner).unwrap().files_loaded = false;
+            let reserve = app.request_file(owner, "foo.rs".into());
+            run_tasks(&mut app, reserve);
+            assert_eq!(app.tab(owner).unwrap().pending_file.as_ref().unwrap().canonical.as_deref(), Some(root.join("foo.rs").as_path()));
+            let request = app.tab(owner).unwrap().pending_file.as_ref().unwrap().request;
+            let before = app.tab(owner).unwrap().runtime.cursor_position();
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            run_tasks(&mut app, task);
+            let folder = app.active.unwrap();
+            assert_ne!(folder, owner);
+            drop(app.update(Message::QuickOpen));
+            let search = app.update(Message::QuickOpenQueryChanged("foo.rs:30000:5".into()));
+            run_tasks(&mut app, search);
+            let open = app.update(Message::QuickOpenActivate);
+            run_tasks(&mut app, open);
+            assert_eq!(app.active, Some(owner));
+            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), before, "the previous buffer must not receive the new file's location");
+            let pending = app.tab(owner).unwrap().pending_file.as_ref().unwrap();
+            assert_eq!(pending.request, request);
+            assert_eq!(pending.location, Some((29_999, 4)));
+            app.tab_mut(owner).unwrap().files_loaded = true;
+            let open = app.resume_pending_files();
+            run_tasks(&mut app, open);
+            assert_eq!(app.tab(owner).unwrap().runtime.selected_path(), Some(Path::new("foo.rs")));
+            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29_999, character: 4 }));
+        }
     }
 
     #[test]
