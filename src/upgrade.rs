@@ -1236,10 +1236,12 @@ pub(crate) mod handoff {
             // temporary file never becomes recovery or replay authority.
             let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
-            let result = file.write_all(&bytes).and_then(|()| file.sync_all());
+            let result = file.write_all(&bytes).and_then(|()| file.sync_all())
+                .map_err(|error| error.to_string());
             let removed = fs_safety::unlink_within(&self.root, &temporary)
-                .and_then(|()| fs_safety::sync_directory(&self.root));
-            result.and(removed).map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())
+                .and_then(|()| fs_safety::sync_directory(&self.root).map_err(|error| error.to_string()));
+            result.and(removed)
         }
 
         #[cfg(any(feature = "host", test))]
