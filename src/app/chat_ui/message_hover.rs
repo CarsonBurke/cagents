@@ -21,7 +21,10 @@
 //!
 //! Based on iced_widget::helpers::hover (MIT, iced contributors). The pinned
 //! implementation omits a11y_nodes, so use this local forwarding correction.
-use core::{Widget, overlay, widget::operation};
+use core::{
+    Widget,
+    widget::operation::{self, Operation},
+};
 use cosmic::iced::{Element, Length, advanced as core, window};
 
 pub(super) fn hover<'a, Message, Theme, Renderer>(

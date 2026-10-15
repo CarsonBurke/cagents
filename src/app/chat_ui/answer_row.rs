@@ -23,7 +23,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Answers<'_> {
             .collect()
     }
     fn diff(&mut self, tree: &mut Tree) {
-        tree.diff_children(&self.children);
+        tree.diff_children(&mut self.children);
     }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Shrink, Length::Shrink)
