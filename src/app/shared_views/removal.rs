@@ -38,7 +38,7 @@ impl RemovalSource {
         self.observed_chat=None;
         Some(self)
     }
-    pub(super) fn current(&self, model: &crate::workspace_model::WorkspaceModel) -> bool {
+    pub(in crate::app) fn current(&self, model: &crate::workspace_model::WorkspaceModel) -> bool {
         removal_current(model, &self.scope, &self.change())
     }
 }
