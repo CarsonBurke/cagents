@@ -77,3 +77,43 @@ impl WindowRecoveryRoots {
         Ok(ResolvedWindowRoots { edited_and_project_roots: unique, common_directory_candidates: common })
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn window_census_uses_published_source_and_refuses_retired_pending_intake() {
+        const TEST: &str = "app::recovery_placement::tests::window_census_uses_published_source_and_refuses_retired_pending_intake";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path().join("repository");
+        super::super::git_binding::tests::init(&root, "original\n");
+        let (mut app, key) = super::super::git_binding::tests::app_for(&root);
+        let loaded = super::super::load_repository(&root, Some(key.project_id), CancellationToken::new()).unwrap();
+        app.repository_generations.insert(key.project_id, 1);
+        drop(app.update(Message::RepositoryLoaded {
+            project_id: key.project_id, generation: 1, open_cards: false, result: Ok(Box::new(loaded)),
+        }));
+        let source = app.retained_project_creation_source(key.project_id).unwrap();
+        let (original, common) = source.recovery_roots().unwrap();
+        let resolved = app.recovery_window_roots().unwrap().resolve(&CancellationToken::new()).unwrap();
+        assert!(resolved.edited_and_project_roots.iter().any(|root| Arc::ptr_eq(root, &original)));
+        assert!(resolved.common_directory_candidates.iter().any(|root| Arc::ptr_eq(root, &common)));
+        let delayed = app.recovery_window_roots().unwrap();
+        app.retire_project_creation_source(key.project_id);
+        assert!(delayed.resolve(&CancellationToken::new()).is_err(), "queued intake cannot replace a retired actor");
+        // Already resolved roots are still inputs, not an effect capability.
+        // A separately accepted daemon/protection context may keep these exact
+        // objects for cleanup after the originating project is closed.
+        assert!(resolved.edited_and_project_roots[0].metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn cancelled_census_does_not_resolve_any_project_or_open_a_replacement() {
+        let token = CancellationToken::new(); token.cancel();
+        let input = WindowRecoveryRoots { projects: Vec::new(), edited: Vec::new() };
+        let error = match input.resolve(&token) { Ok(_) => panic!("cancelled intake succeeded"), Err(error) => error };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+}
