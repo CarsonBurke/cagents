@@ -54,6 +54,20 @@ const RECENT_OPERATIONS: usize = 2048;
 pub(super) fn migrate_history(db: &Connection) -> Result<(), String> {
     let transaction = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
+    // The caller's version read precedes this writer admission. Another
+    // opener may have completed this migration or installed a newer schema
+    // while we waited; never write or downgrade from that stale decision.
+    let current: u32 = transaction
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if current > SCHEMA_VERSION {
+        return Err(format!(
+            "workspace registry schema {current} is newer than supported schema {SCHEMA_VERSION}"
+        ));
+    }
+    if current >= 13 {
+        return transaction.commit().map_err(|error| error.to_string());
+    }
     transaction.execute_batch("CREATE TABLE IF NOT EXISTS retired_view_panes(
         scope TEXT NOT NULL REFERENCES shared_view_scopes(scope) ON DELETE CASCADE,
         id TEXT NOT NULL, PRIMARY KEY(scope, id)
@@ -670,6 +684,39 @@ mod tests {
             registry.apply(&edit).unwrap();
         }
         assert_eq!(read(&registry.db, &Scope::Channel(a)).unwrap().panes, vec![pane]);
+    }
+
+    #[test]
+    fn history_migration_refuses_a_newer_schema_committed_after_outer_admission() {
+        let (registry, directory, _, _) = setup();
+        let path = directory.path().join("model.sqlite3");
+        registry.db.execute_batch(
+            "DROP TABLE retired_view_panes; DROP INDEX agents_open_by_recency; PRAGMA user_version=12;",
+        ).unwrap();
+        // This is the exact decision migrate() makes before obtaining this
+        // helper's Immediate writer. A separate real connection then wins.
+        let observed: u32 = registry.db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(observed, 12);
+        let mut successor = Connection::open(&path).unwrap();
+        let transaction = successor.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        transaction.execute_batch("CREATE TABLE successor_marker(value TEXT); INSERT INTO successor_marker VALUES('preserve');").unwrap();
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        transaction.commit().unwrap();
+        let before: Vec<(String, String, String)> = successor.prepare(
+            "SELECT type, name, coalesce(sql, '') FROM sqlite_schema ORDER BY type, name",
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        let error = migrate_history(&registry.db).unwrap_err();
+        assert!(error.contains("newer than supported"), "{error}");
+        let actual: u32 = successor.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(actual, SCHEMA_VERSION + 1, "a stale opener cannot lower the schema version");
+        let after: Vec<(String, String, String)> = successor.prepare(
+            "SELECT type, name, coalesce(sql, '') FROM sqlite_schema ORDER BY type, name",
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(after, before, "future-schema refusal must precede this migration's DDL");
+        let marker: String = successor.query_row("SELECT value FROM successor_marker", [], |row| row.get(0)).unwrap();
+        assert_eq!(marker, "preserve");
     }
 
     #[test]
