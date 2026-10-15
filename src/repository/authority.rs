@@ -162,6 +162,45 @@ pub struct WorktreeExecutor<E> {
     authority: WorktreeAuthority,
 }
 
+/// A journal-owned destination handoff retains the same original executor.
+/// No unwrapping API is exposed to callers, and this cannot authorize an
+/// arbitrary second root.
+pub(super) struct JournalExecutor {
+    original: Arc<dyn ProcessExecutor>,
+    created: Arc<super::creation_authority::VerifiedCreatedRoot>,
+}
+
+pub(super) struct JournalSourceExecutor {
+    original: Arc<dyn ProcessExecutor>,
+    source: Arc<super::creation_authority::CreationSession>,
+}
+
+impl ProcessExecutor for JournalSourceExecutor {
+    fn execute(&self, command: &CommandSpec, cancellation: &CancellationToken)
+        -> Result<ProcessOutput, ProcessFailure>
+    {
+        self.source.validate().map_err(|error| ProcessFailure {
+            kind: ProcessFailureKind::Io, program: command.program.clone(),
+            exit_code: None, signal: None, stdout: Vec::new(), stderr: Vec::new(),
+            message: error.to_string(), started: false,
+        })?;
+        self.original.execute(command, cancellation)
+    }
+}
+
+impl ProcessExecutor for JournalExecutor {
+    fn execute(&self, command: &CommandSpec, cancellation: &CancellationToken)
+        -> Result<ProcessOutput, ProcessFailure>
+    {
+        self.created.validate().map_err(|error| ProcessFailure {
+            kind: ProcessFailureKind::Io, program: command.program.clone(),
+            exit_code: None, signal: None, stdout: Vec::new(), stderr: Vec::new(),
+            message: error.to_string(), started: false,
+        })?;
+        self.original.execute(command, cancellation)
+    }
+}
+
 impl<E> Clone for WorktreeExecutor<E> {
     fn clone(&self) -> Self { Self { inner: self.inner.clone(), authority: self.authority.clone() } }
 }
@@ -225,6 +264,40 @@ impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    pub(super) fn journal_source_service(
+        &self,
+        source: Arc<super::creation_authority::CreationSession>,
+    ) -> Result<RepositoryService<WorktreeExecutor<JournalSourceExecutor>>, RepositoryError> {
+        let authority = source.source_authority()?;
+        Ok(RepositoryService {
+            git: self.git.clone(),
+            executor: Arc::new(WorktreeExecutor {
+                inner: Arc::new(JournalSourceExecutor {
+                    original: self.creation_executor.clone(), source }),
+                authority: authority.clone(),
+            }),
+            authority: Some(authority),
+            creation_executor: self.creation_executor.clone(),
+        })
+    }
+
+    pub(super) fn created_worktree_service(
+        &self,
+        created: Arc<super::creation_authority::VerifiedCreatedRoot>,
+    ) -> Result<RepositoryService<WorktreeExecutor<JournalExecutor>>, RepositoryError> {
+        let authority = created.authority()?;
+        Ok(RepositoryService {
+            git: self.git.clone(),
+            executor: Arc::new(WorktreeExecutor {
+                inner: Arc::new(JournalExecutor {
+                    original: self.creation_executor.clone(), created }),
+                authority: authority.clone(),
+            }),
+            authority: Some(authority),
+            creation_executor: self.creation_executor.clone(),
+        })
+    }
+
     /// Bind subsequent operations to the retained directory. This does not
     /// authorize other paths, bypass filesystem permissions, or exclude Git
     /// processes outside this application from changing the original worktree.
@@ -234,6 +307,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             git: self.git.clone(),
             executor: Arc::new(WorktreeExecutor { inner: self.executor.clone(), authority: authority.clone() }),
             authority: Some(authority),
+            creation_executor: self.creation_executor.clone(),
         })
     }
 

@@ -20,6 +20,7 @@ use std::{
 
 mod authority;
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
+mod creation_authority;
 mod browse_reveal;
 mod ignore_path;
 pub use browse_reveal::include as include_revealed_path;
@@ -3832,6 +3833,10 @@ pub struct RepositoryService<E = SystemProcessExecutor> {
     git: PathBuf,
     executor: Arc<E>,
     authority: Option<WorktreeAuthority>,
+    // Only a verified creation-journal handoff can use this original executor
+    // to construct a separately scoped destination service. It is never exposed
+    // through the public authority API or used for ordinary foreign commands.
+    creation_executor: Arc<dyn ProcessExecutor>,
 }
 
 impl RepositoryService<SystemProcessExecutor> {
@@ -3841,9 +3846,12 @@ impl RepositoryService<SystemProcessExecutor> {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
-    pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self {
+    pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self
+    where E: 'static
+    {
         Self {
             git: git.into(),
+            creation_executor: executor.clone(),
             executor,
             authority: None,
         }
@@ -12931,6 +12939,12 @@ struct WorktreeJournal {
     /// journals written before it was recorded.
     #[serde(default)]
     admin_dir: Option<PathBuf>,
+    #[serde(default)]
+    creation_authority: Option<creation_authority::CreationEvidence>,
+    #[serde(skip)]
+    live_creation: Option<Arc<creation_authority::CreationSession>>,
+    #[serde(skip)]
+    live_created: Option<Arc<creation_authority::VerifiedCreatedRoot>>,
     outcome: Option<WorktreeCreationOutcome>,
     warnings: Vec<ProcessFailure>,
     detail: String,
@@ -13136,6 +13150,36 @@ fn git_locks_present(common: &Path) -> io::Result<bool> {
 }
 
 impl WorktreeJournal {
+    fn restore_creation_authority(&mut self) -> Result<(), RepositoryError> {
+        if let Some(evidence) = &self.creation_authority {
+            if self.live_creation.as_ref().is_none_or(|scope|
+                evidence.has_published_destination() && !scope.has_destination()) {
+                self.live_creation = Some(creation_authority::CreationSession::restore(
+                    evidence, &self.request, &self.common_dir)?);
+            }
+            self.live_creation.as_ref().expect("authority restored").validate()?;
+        }
+        Ok(())
+    }
+
+    fn lease_io_path(&self) -> Result<PathBuf, RepositoryError> {
+        match &self.live_creation {
+            Some(scope) => scope.lease_path(self.request.operation_id),
+            None if self.creation_authority.is_some() => Err(ValidationError::Io(
+                "Creation authority must be restored before lease access".into()).into()),
+            None => Ok(self.lease_path.clone()),
+        }
+    }
+
+    fn common_io_path(&self) -> Result<PathBuf, RepositoryError> {
+        match &self.live_creation {
+            Some(scope) => scope.common_operand(),
+            None if self.creation_authority.is_some() => Err(ValidationError::Io(
+                "Creation authority must be restored before common-directory access".into()).into()),
+            None => Ok(self.common_dir.clone()),
+        }
+    }
+
     /// Whether this creation made `removed`; see
     /// [`release_deleted_worktree_creations`].
     fn created(&self, removed: &RemovedWorktree) -> bool {
@@ -13260,6 +13304,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         progress: &async_channel::Sender<WorktreeProgressEvent>,
     ) -> WorktreeOperationReport {
+        if let Some(authority) = &self.authority {
+            let captured = creation_authority::CreationSession::capture(authority, request);
+            match captured.and_then(|(scope, evidence)| {
+                self.journal_source_service(scope.clone()).map(|service| (service, scope, evidence))
+            }) {
+                Ok((service, scope, evidence)) => return service.create_worktree_journaled_inner(
+                    store, request, generation, cancellation, progress, Some((scope, evidence))),
+                Err(error) => {
+                    for stage in [WorktreeProgressStage::Validating, WorktreeProgressStage::Finished] {
+                        let _ = progress.try_send(WorktreeProgressEvent {
+                            operation_id: request.operation_id, generation, stage,
+                        });
+                    }
+                    return WorktreeOperationReport {
+                        operation_id: request.operation_id, generation, request: Some(request.clone()),
+                        state: WorktreeOperationState::MalformedPayload, outcome: None,
+                        detail: format!("The captured creation authority is unavailable; no creation was started: {error}"),
+                        created_at_unix_ms: operation_timestamp(),
+                    };
+                }
+            }
+        }
+        self.create_worktree_journaled_inner(store, request, generation, cancellation, progress, None)
+    }
+
+    #[cfg(feature = "ui")]
+    fn create_worktree_journaled_inner(
+        &self, store: &StateStore, request: &CreateWorktreeRequest, generation: u64,
+        cancellation: &CancellationToken, progress: &async_channel::Sender<WorktreeProgressEvent>,
+        captured: Option<(Arc<creation_authority::CreationSession>, creation_authority::CreationEvidence)>,
+    ) -> WorktreeOperationReport {
         let created_at = operation_timestamp();
         let emit = |stage| {
             let _ = progress.try_send(WorktreeProgressEvent {
@@ -13299,6 +13374,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return failure_report(WorktreeOperationState::MalformedPayload, error.to_string());
             }
         };
+        if let Some((scope, evidence)) = captured {
+            journal.creation_authority = Some(evidence);
+            journal.live_creation = Some(scope);
+        }
         let mut payload = match serde_json::to_value(&journal) {
             Ok(payload) => payload,
             Err(error) => {
@@ -13326,7 +13405,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return failure_report(state, error.to_string());
         }
         // From this commit onward every effect is recoverable through this row.
-        let lease = match worktree_lease(&journal.lease_path, true) {
+        let lease_path = match journal.lease_io_path() {
+            Ok(path) => path,
+            Err(error) => {
+                journal.state = WorktreeOperationState::OutcomeUnknown;
+                journal.detail = format!("Creation authority changed before lease acquisition: {error}");
+                return finish_worktree_journal(store, &journal, &payload, created_at, &emit);
+            }
+        };
+        let lease = match worktree_lease(&lease_path, true) {
             Ok(lease) => lease,
             Err(error) => {
                 journal.state = WorktreeOperationState::OutcomeUnknown;
@@ -13498,7 +13585,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
-            if git_locks_present(&journal.common_dir)
+            if git_locks_present(&journal.common_io_path()?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?
             {
                 return Err(ValidationError::Io(
@@ -13506,8 +13593,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
-            fs::create_dir_all(&journal.request.managed_root)
-                .map_err(|e| ValidationError::Io(e.to_string()))?;
+            if let Some(scope) = &journal.live_creation {
+                scope.ensure_managed_root()?;
+            } else {
+                fs::create_dir_all(&journal.request.managed_root)
+                    .map_err(|e| ValidationError::Io(e.to_string()))?;
+            }
             let plan = self.plan_worktree_creation(&journal.request)?;
             self.run_checked(&plan.validate_branch, cancellation)?;
             let branch = self.run(&plan.check_branch_absent, cancellation)?;
@@ -13540,9 +13631,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 }
                 self.create_worktree_command(&journal.request, &oid)?
             };
+            if let Some(scope) = journal.live_creation.clone() {
+                let published = scope.publish(journal.creation_authority.as_mut()
+                    .ok_or_else(|| ValidationError::Io("Missing durable creation authority".into()))?);
+                // Even if final name validation refused after publication,
+                // retain every known directory identity before returning.
+                journal.persist(store, &payload).map(|next| payload = next).map_err(|error| {
+                    journal_write_failed = true;
+                    ValidationError::Io(format!("journal write failed: {error}"))
+                })?;
+                published?;
+                let position = command.arguments.len().checked_sub(2)
+                    .ok_or(ValidationError::DestinationOutsideRoot)?;
+                command = scope.bind_destination_operand(command, position)?;
+            }
             command.inherited_lease = Some(lease.as_raw_fd());
             emit(WorktreeProgressStage::RunningGit);
             self.run_checked(&command, cancellation)?;
+            if let Some(scope) = journal.live_creation.clone() {
+                let registered = self.list_worktrees(&journal.request.repository, cancellation)?
+                    .into_iter().find(|record| record.path == journal.request.destination)
+                    .ok_or_else(|| ValidationError::Io("Git did not register the owned destination".into()))?;
+                journal.live_created = Some(scope.bind_created(
+                    journal.creation_authority.as_mut().ok_or_else(|| ValidationError::Io("Missing creation authority".into()))?,
+                    &journal.request, &registered, &oid)?);
+            }
             if journal
                 .existing_branch_oid
                 .as_ref()
@@ -13640,6 +13753,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 cancellation,
             )?
             .map(|oid| oid.to_string());
+        if self.authority.is_some() && existing_branch_oid.is_some()
+            && !(matches!(&request.base, BaseRevision::LocalBranch(branch) if branch == &request.branch)
+                && !request.track)
+        {
+            return Err(ValidationError::InvalidBranch(
+                "Captured worktree creation cannot yet advance an existing branch; choose an unused branch or reconcile the existing branch explicitly. No fetch or creation was started".into()
+            ).into());
+        }
         Ok(WorktreeJournal {
             version: 1,
             request,
@@ -13653,6 +13774,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             base_oid: None,
             existing_branch_oid,
             admin_dir: None,
+            creation_authority: None,
+            live_creation: None,
+            live_created: None,
             outcome: None,
             warnings: Vec::new(),
             detail: "Prepared durable worktree request".into(),
@@ -13660,8 +13784,34 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 
     fn settle_worktree_journal(&self, journal: &mut WorktreeJournal, lease_grace: Duration) {
+        if journal.creation_authority.is_some() {
+            let scoped = journal.restore_creation_authority().and_then(|()| {
+                self.journal_source_service(journal.live_creation.clone().expect("authority restored"))
+            });
+            match scoped {
+                Ok(service) => service.settle_worktree_journal_inner(journal, lease_grace),
+                Err(error) => {
+                    journal.outcome = None;
+                    journal.state = WorktreeOperationState::OutcomeUnknown;
+                    journal.detail = format!("The original creation authority is unavailable; no replacement was authorized: {error}");
+                }
+            }
+        } else {
+            self.settle_worktree_journal_inner(journal, lease_grace);
+        }
+    }
+
+    fn settle_worktree_journal_inner(&self, journal: &mut WorktreeJournal, lease_grace: Duration) {
         journal.outcome = None;
-        let evidence = worktree_lease_with_grace(&journal.lease_path, false, lease_grace);
+        let lease_path = match journal.lease_io_path() {
+            Ok(path) => path,
+            Err(error) => {
+                journal.state = WorktreeOperationState::OutcomeUnknown;
+                journal.detail = format!("Creation lease authority is unavailable: {error}");
+                return;
+            }
+        };
+        let evidence = worktree_lease_with_grace(&lease_path, false, lease_grace);
         let _lease = match evidence {
             Ok(lease) => {
                 if journal.lease_identity.is_some()
@@ -13685,7 +13835,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return;
             }
         };
-        match git_locks_present(&journal.common_dir) {
+        let common_io = match journal.common_io_path() {
+            Ok(path) => path,
+            Err(error) => {
+                journal.state = WorktreeOperationState::OutcomeUnknown;
+                journal.detail = format!("Creation metadata authority is unavailable: {error}");
+                return;
+            }
+        };
+        match git_locks_present(&common_io) {
             Ok(false) => {}
             result => {
                 journal.state = WorktreeOperationState::OutcomeUnknown;
@@ -13797,7 +13955,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// The created worktree's administrative directory, when the destination
     /// is evidently the worktree this journal created.
-    fn created_admin_dir(&self, journal: &WorktreeJournal) -> Option<PathBuf> {
+    fn created_admin_dir(&self, journal: &mut WorktreeJournal) -> Option<PathBuf> {
+        if journal.creation_authority.is_some() {
+            return self.created_journal_roots(journal).map(|(path, _, _)| path);
+        }
         let token = CancellationToken::new();
         let destination = &journal.request.destination;
         if fs::canonicalize(destination).ok().as_ref() != Some(destination) {
@@ -13841,11 +14002,42 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         clean.then_some(git_dir)
     }
 
+    /// Supplies the original roots to generation/setup/Linear settlement too;
+    /// no caller should rediscover new authority from the destination path.
+    fn created_journal_roots(&self, journal: &mut WorktreeJournal)
+        -> Option<(PathBuf, fs_safety::Root, fs_safety::Root)>
+    {
+        journal.restore_creation_authority().ok()?;
+        let scope = journal.live_creation.clone()?;
+        let registered = self.list_worktrees(&journal.request.repository, &CancellationToken::new()).ok()?
+            .into_iter().find(|record| record.path == journal.request.destination)?;
+        let created = scope.bind_created(journal.creation_authority.as_mut()?, &journal.request,
+            &registered, journal.base_oid.as_deref()?) .ok()?;
+        let (admin, checkout) = created.roots().ok()?;
+        if !journal.checkout_completed {
+            if !fs_safety::metadata_beneath(&admin, Path::new("index")).ok()?.is_file() {
+                return None;
+            }
+            let service = self.created_worktree_service(created.clone()).ok()?;
+            let output = service.run_checked(&service.git_read(&journal.request.destination,
+                ["status", "--porcelain=v2", "-z", "--untracked-files=all"]),
+                &CancellationToken::new()).ok()?;
+            if !output.stdout.is_empty() || output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                return None;
+            }
+        }
+        created.validate().ok()?;
+        let path = created.admin_path().to_owned();
+        journal.live_created = Some(created);
+        Some((path, admin, checkout))
+    }
+
     /// Only the original live request may clean up its own Git lock. Startup
     /// reconciliation deliberately never calls this mutating helper.
     fn unlock_created_worktree(&self, journal: &mut WorktreeJournal) {
         let cleanup = (|| -> Result<(), RepositoryError> {
-            let lease = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE)
+            let lease_path = journal.lease_io_path()?;
+            let lease = worktree_lease_with_grace(&lease_path, false, CLEANUP_GRACE)
                 .map_err(|error| ValidationError::Io(error.to_string()))?;
             if lease_file_identity(&lease).ok() != journal.lease_identity {
                 return Err(ValidationError::Io(
@@ -13877,6 +14069,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     journal.request.destination.as_os_str().to_owned(),
                 ],
             );
+            if let Some(scope) = &journal.live_creation {
+                let position = unlock.arguments.len().checked_sub(1)
+                    .ok_or(ValidationError::DestinationOutsideRoot)?;
+                unlock = scope.bind_destination_operand(unlock, position)?;
+            }
             unlock.inherited_lease = Some(lease.as_raw_fd());
             self.run_checked(&unlock, &CancellationToken::new())?;
             if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome {
@@ -14221,6 +14418,258 @@ mod worktree_journal_tests {
                 cancellation,
                 &sender,
             )
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_creation_settles_the_owned_child_and_persists_stable_authority() {
+        for existing in [false, true] {
+            let mut fixture = Fixture::new();
+            if existing {
+                fixture.git(&["branch", "feature", "main"]);
+                fixture.request.base = BaseRevision::LocalBranch(fixture.request.branch.clone());
+            }
+            let authority = WorktreeAuthority::capture(&fixture.request.repository).unwrap();
+            let scoped = fixture.service.with_worktree_authority(authority).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(),
+                b"committed content\n");
+            let journal = fixture.journal(fixture.request.operation_id);
+            assert!(serde_json::to_value(journal.creation_authority.as_ref().unwrap()).unwrap()["admin"].is_object());
+            let serialized = serde_json::to_string(&journal).unwrap();
+            assert!(!serialized.contains("/proc/"), "descriptor IO paths must not survive a restart");
+            assert!(!serialized.contains("/dev/fd/"));
+            assert_eq!(journal.common_dir, fixture.request.repository.join(".git"));
+            assert_eq!(journal.lease_path.parent(), Some(journal.common_dir.as_path()));
+            assert!(journal.live_creation.is_none(), "deserialization never invents a live scope");
+            let recovered = RepositoryService::system("git")
+                .rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, WorktreeOperationState::Created);
+            assert_eq!(fixture.git(&["rev-parse", "feature"]), fixture.git(&["rev-parse", "main"]));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_publication_failure_preserves_known_identity_for_restart() {
+        let fixture = Fixture::new();
+        let scoped = fixture.service.with_worktree_authority(
+            WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+        let (sender, _) = async_channel::bounded(8);
+        creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true));
+        let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+            7, &CancellationToken::new(), &sender);
+        creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(false));
+        assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{report:?}");
+        assert!(fixture.request.destination.is_dir());
+        assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none());
+        let mut journal = fixture.journal(fixture.request.operation_id);
+        let payload = serde_json::to_value(&journal).unwrap();
+        assert!(payload["creation_authority"]["checkout"].is_object());
+        assert!(payload["creation_authority"]["parent"].is_object());
+        assert!(journal.live_creation.is_none());
+        // Reconstruct only the originally published inode, never infer its
+        // ownership merely from the now-existing destination pathname.
+        journal.restore_creation_authority().unwrap();
+        let scope = journal.live_creation.as_ref().unwrap();
+        assert!(scope.has_destination());
+        let command = scope.bind_destination_operand(CommandSpec::new("git")
+            .arg(&fixture.request.destination), 0).unwrap();
+        let held = fs::metadata(Path::new(&command.arguments[0])).unwrap();
+        let named = fs::metadata(&fixture.request.destination).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+        let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+        assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown);
+        let mut replacement_journal = fixture.journal(fixture.request.operation_id);
+        fs::rename(&fixture.request.destination, fixture.directory.path().join("original-child")).unwrap();
+        fs::create_dir(&fixture.request.destination).unwrap();
+        fs::write(fixture.request.destination.join("keep"), b"foreign\n").unwrap();
+        assert!(replacement_journal.restore_creation_authority().is_err());
+        assert_eq!(fs::read(fixture.request.destination.join("keep")).unwrap(), b"foreign\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_existing_branch_advance_refuses_before_journal_or_directory_effects() {
+        let fixture = Fixture::new();
+        fixture.git(&["branch", "feature", "main"]);
+        let authority = WorktreeAuthority::capture(&fixture.request.repository).unwrap();
+        let scoped = fixture.service.with_worktree_authority(authority).unwrap();
+        let before = fixture.git(&["rev-parse", "feature"]);
+        let (sender, _) = async_channel::bounded(8);
+        let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+            7, &CancellationToken::new(), &sender);
+        assert_eq!(report.state, WorktreeOperationState::MalformedPayload, "{report:?}");
+        assert!(report.detail.contains("cannot yet advance an existing branch"));
+        assert!(!fixture.request.managed_root.exists());
+        assert!(fixture.store.journaled_worktree_operations().unwrap().is_empty());
+        assert_eq!(fixture.git(&["rev-parse", "feature"]), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReplaceAtCreation {
+        target: PathBuf,
+        parked: PathBuf,
+        destination: PathBuf,
+        seen: AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcessExecutor for ReplaceAtCreation {
+        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
+            -> Result<ProcessOutput, ProcessFailure>
+        {
+            if command.arguments.windows(2).any(|pair| pair[0] == "worktree" && pair[1] == "add")
+                && !self.seen.swap(true, Ordering::SeqCst)
+            {
+                // This is the innermost executor: all authority wrappers have
+                // already validated and issued the actual delayed command.
+                fs::rename(&self.target, &self.parked).unwrap();
+                fs::create_dir_all(&self.destination).unwrap();
+                fs::write(self.destination.join("foreign"), b"replacement work\n").unwrap();
+            }
+            SystemProcessExecutor.execute(command, token)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_creation_launch_delay_never_writes_replacement_directories() {
+        for replacement in ["source", "parent", "destination"] {
+            let fixture = Fixture::new();
+            let target = match replacement {
+                "source" => fixture.request.repository.clone(),
+                "parent" => fixture.request.managed_root.clone(),
+                _ => fixture.request.destination.clone(),
+            };
+            let parked = fixture.directory.path().join(format!("parked-{replacement}"));
+            let replacement_destination = if replacement == "source" { target.clone() }
+                else { fixture.request.destination.clone() };
+            let executor = Arc::new(ReplaceAtCreation { target, parked: parked.clone(),
+                destination: replacement_destination.clone(), seen: AtomicBool::new(false) });
+            let service = RepositoryService::new("git", executor.clone());
+            let scoped = service.with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert!(executor.seen.load(Ordering::SeqCst), "the test must reach the delayed Git effect");
+            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{replacement}: {report:?}");
+            assert_eq!(fs::read(replacement_destination.join("foreign")).unwrap(), b"replacement work\n");
+            assert!(!replacement_destination.join("tracked.txt").exists());
+            assert!(!replacement_destination.join(".git").exists());
+            let original = match replacement {
+                "parent" => parked.join("feature"),
+                "destination" => parked,
+                _ => fixture.request.destination.clone(),
+            };
+            assert_eq!(fs::read(original.join("tracked.txt")).unwrap(), b"committed content\n",
+                "the command must address only its retained destination");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AlterCreatedMetadata {
+        destination: PathBuf,
+        foreign: PathBuf,
+        alteration: &'static str,
+        seen: AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcessExecutor for AlterCreatedMetadata {
+        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
+            -> Result<ProcessOutput, ProcessFailure>
+        {
+            let output = SystemProcessExecutor.execute(command, token)?;
+            if output.success && command.arguments.windows(2)
+                .any(|pair| pair[0] == "worktree" && pair[1] == "add")
+                && !self.seen.swap(true, Ordering::SeqCst)
+            {
+                let locator = fs::read(self.destination.join(".git")).unwrap();
+                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                match self.alteration {
+                    "locator" => {
+                        fs::write(self.destination.join(".git"),
+                            format!("gitdir: {}\n", self.foreign.display())).unwrap();
+                    }
+                    "admin" => {
+                        fs::rename(&admin, admin.with_extension("original")).unwrap();
+                        fs::create_dir(&admin).unwrap();
+                        fs::write(admin.join("foreign"), b"foreign admin\n").unwrap();
+                    }
+                    "backlink" => fs::write(admin.join("gitdir"),
+                        format!("{}\n", self.foreign.join(".git").display())).unwrap(),
+                    "commondir" => fs::write(admin.join("commondir"),
+                        format!("{}\n", self.foreign.display())).unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_creation_never_grants_child_authority_after_metadata_substitution() {
+        for alteration in ["locator", "admin", "backlink", "commondir"] {
+            let fixture = Fixture::new();
+            let foreign = fixture.directory.path().join("foreign-metadata");
+            fs::create_dir(&foreign).unwrap();
+            fs::write(foreign.join("keep"), b"unrelated metadata\n").unwrap();
+            let executor = Arc::new(AlterCreatedMetadata { destination: fixture.request.destination.clone(),
+                foreign: foreign.clone(), alteration, seen: AtomicBool::new(false) });
+            let scoped = RepositoryService::new("git", executor.clone())
+                .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert!(executor.seen.load(Ordering::SeqCst));
+            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{alteration}: {report:?}");
+            assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"unrelated metadata\n");
+            assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1,
+                "no destination command may rediscover or modify substituted metadata");
+            if alteration == "admin" {
+                let locator = fs::read(fixture.request.destination.join(".git")).unwrap();
+                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                assert_eq!(fs::read(admin.join("foreign")).unwrap(), b"foreign admin\n");
+                assert_eq!(fs::read_dir(admin).unwrap().count(), 1);
+            }
+            let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown, "{alteration}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_cancellation_distinguishes_published_empty_child_from_completed_checkout() {
+        for after_exit in [false, true] {
+            let fixture = Fixture::new();
+            let token = CancellationToken::new();
+            let scoped = RepositoryService::new("git", Arc::new(CancelAtGit { after_exit }))
+                .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &token, &sender);
+            assert!(token.is_cancelled());
+            let expected = if after_exit { WorktreeOperationState::Created }
+                else { WorktreeOperationState::OutcomeUnknown };
+            assert_eq!(report.state, expected, "{after_exit}: {report:?}");
+            assert!(fixture.journal(fixture.request.operation_id).creation_authority
+                .as_ref().unwrap().has_published_destination());
+            let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, expected);
+            if after_exit {
+                assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(), b"committed content\n");
+            } else {
+                assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none(),
+                    "a published directory is a known partial effect, never a rollback claim");
+            }
         }
     }
 
