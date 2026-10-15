@@ -228,6 +228,12 @@ pub enum GlobalShortcut {
     EditorSignatureHelp,
     SettingsOpenFile,
     SettingsRevealFile,
+    GitHistoryCopySha,
+    GitHistoryCopyMessage,
+    GitHistoryNewWorktree,
+    GitHistoryCreateBranch,
+    GitHistoryRevert,
+    GitHistoryCherryPick,
 
     CommandPalette,
     NewThread,
@@ -331,6 +337,12 @@ impl GlobalShortcut {
             Self::IgnoreChangePath => Some(1 << 29),
             Self::GitAcceptOurs => Some(1 << 30),
             Self::GitAcceptTheirs => Some(1 << 31),
+            Self::GitHistoryCopySha => Some(1 << 32),
+            Self::GitHistoryCopyMessage => Some(1 << 33),
+            Self::GitHistoryNewWorktree => Some(1 << 34),
+            Self::GitHistoryCreateBranch => Some(1 << 35),
+            Self::GitHistoryRevert => Some(1 << 36),
+            Self::GitHistoryCherryPick => Some(1 << 37),
             _ => None,
         }
     }
@@ -377,6 +389,10 @@ impl GlobalShortcut {
                     | Self::DiffStageHunk
                     | Self::DiffUnstageHunk
                     | Self::DiffRevertHunk
+                    | Self::GitHistoryNewWorktree
+                    | Self::GitHistoryCreateBranch
+                    | Self::GitHistoryRevert
+                    | Self::GitHistoryCherryPick
             )
     }
 
@@ -557,6 +573,12 @@ impl GlobalShortcut {
             Self::EditorSignatureHelp => "editor_signature_help",
             Self::SettingsOpenFile => "settings_open_file",
             Self::SettingsRevealFile => "settings_reveal_file",
+            Self::GitHistoryCopySha => "git_history_copy_sha",
+            Self::GitHistoryCopyMessage => "git_history_copy_message",
+            Self::GitHistoryNewWorktree => "git_history_new_worktree",
+            Self::GitHistoryCreateBranch => "git_history_create_branch",
+            Self::GitHistoryRevert => "git_history_revert",
+            Self::GitHistoryCherryPick => "git_history_cherry_pick",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -2211,6 +2233,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::EditorSignatureHelp, label: "Show signature help", repeatable: false, scope: ShortcutScope::Editor },
     ShortcutDescriptor { action: GlobalShortcut::SettingsOpenFile, label: "Open settings.toml", repeatable: false, scope: ShortcutScope::Workspace },
     ShortcutDescriptor { action: GlobalShortcut::SettingsRevealFile, label: "Reveal settings.toml", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitHistoryCopySha, label: "Copy commit SHA", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::GitHistoryCopyMessage, label: "Copy commit message", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::GitHistoryNewWorktree, label: "New worktree from commit…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::GitHistoryCreateBranch, label: "Create branch from commit…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::GitHistoryRevert, label: "Revert commit", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::GitHistoryCherryPick, label: "Cherry-pick commit into this worktree", repeatable: false, scope: ShortcutScope::Sidebar },
 
 ];
 
@@ -2405,6 +2433,12 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::EditorSignatureHelp => &shortcuts.editor_signature_help,
         GlobalShortcut::SettingsOpenFile => &shortcuts.settings_open_file,
         GlobalShortcut::SettingsRevealFile => &shortcuts.settings_reveal_file,
+        GlobalShortcut::GitHistoryCopySha => &shortcuts.git_history_copy_sha,
+        GlobalShortcut::GitHistoryCopyMessage => &shortcuts.git_history_copy_message,
+        GlobalShortcut::GitHistoryNewWorktree => &shortcuts.git_history_new_worktree,
+        GlobalShortcut::GitHistoryCreateBranch => &shortcuts.git_history_create_branch,
+        GlobalShortcut::GitHistoryRevert => &shortcuts.git_history_revert,
+        GlobalShortcut::GitHistoryCherryPick => &shortcuts.git_history_cherry_pick,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,

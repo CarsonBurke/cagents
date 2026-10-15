@@ -455,6 +455,12 @@ pub struct KeyboardShortcuts {
     pub editor_signature_help: Vec<String>,
     pub settings_open_file: Vec<String>,
     pub settings_reveal_file: Vec<String>,
+    pub git_history_copy_sha: Vec<String>,
+    pub git_history_copy_message: Vec<String>,
+    pub git_history_new_worktree: Vec<String>,
+    pub git_history_create_branch: Vec<String>,
+    pub git_history_revert: Vec<String>,
+    pub git_history_cherry_pick: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -678,6 +684,12 @@ impl Default for KeyboardShortcuts {
             editor_signature_help: vec!["Ctrl+Shift+Space".into()],
             settings_open_file: Vec::new(),
             settings_reveal_file: Vec::new(),
+            git_history_copy_sha: Vec::new(),
+            git_history_copy_message: Vec::new(),
+            git_history_new_worktree: Vec::new(),
+            git_history_create_branch: Vec::new(),
+            git_history_revert: Vec::new(),
+            git_history_cherry_pick: Vec::new(),
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -710,7 +722,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 209] {
+    pub fn actions(&self) -> [&Vec<String>; 215] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -921,12 +933,18 @@ impl KeyboardShortcuts {
             &self.editor_signature_help,
             &self.settings_open_file,
             &self.settings_reveal_file,
+            &self.git_history_copy_sha,
+            &self.git_history_copy_message,
+            &self.git_history_new_worktree,
+            &self.git_history_create_branch,
+            &self.git_history_revert,
+            &self.git_history_cherry_pick,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 209] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 215] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -1137,6 +1155,12 @@ impl KeyboardShortcuts {
             &mut self.editor_signature_help,
             &mut self.settings_open_file,
             &mut self.settings_reveal_file,
+            &mut self.git_history_copy_sha,
+            &mut self.git_history_copy_message,
+            &mut self.git_history_new_worktree,
+            &mut self.git_history_create_branch,
+            &mut self.git_history_revert,
+            &mut self.git_history_cherry_pick,
         ]
     }
 
@@ -1198,7 +1222,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 209] = [
+const SHORTCUT_ACTIONS: [&str; 215] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1408,6 +1432,12 @@ const SHORTCUT_ACTIONS: [&str; 209] = [
     "editor_signature_help",
     "settings_open_file",
     "settings_reveal_file",
+    "git_history_copy_sha",
+    "git_history_copy_message",
+    "git_history_new_worktree",
+    "git_history_create_branch",
+    "git_history_revert",
+    "git_history_cherry_pick",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -2797,7 +2827,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 204] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 210] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -3002,6 +3032,12 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 204] = [
     "editor_signature_help",
     "settings_open_file",
     "settings_reveal_file",
+    "git_history_copy_sha",
+    "git_history_copy_message",
+    "git_history_new_worktree",
+    "git_history_create_branch",
+    "git_history_revert",
+    "git_history_cherry_pick",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {

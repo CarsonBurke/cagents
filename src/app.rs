@@ -3129,6 +3129,12 @@ pub enum SettingsField {
     ShortcutEditorSignatureHelp,
     ShortcutSettingsOpenFile,
     ShortcutSettingsRevealFile,
+    ShortcutGitHistoryCopySha,
+    ShortcutGitHistoryCopyMessage,
+    ShortcutGitHistoryNewWorktree,
+    ShortcutGitHistoryCreateBranch,
+    ShortcutGitHistoryRevert,
+    ShortcutGitHistoryCherryPick,
     ShortcutTerminalReview,
 }
 
@@ -3221,7 +3227,7 @@ impl SettingsField {
     }
 
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 209] = [
+    const SHORTCUTS: [Self; 215] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3431,6 +3437,12 @@ impl SettingsField {
         Self::ShortcutEditorSignatureHelp,
         Self::ShortcutSettingsOpenFile,
         Self::ShortcutSettingsRevealFile,
+        Self::ShortcutGitHistoryCopySha,
+        Self::ShortcutGitHistoryCopyMessage,
+        Self::ShortcutGitHistoryNewWorktree,
+        Self::ShortcutGitHistoryCreateBranch,
+        Self::ShortcutGitHistoryRevert,
+        Self::ShortcutGitHistoryCherryPick,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3658,6 +3670,12 @@ impl SettingsField {
             Self::ShortcutEditorSignatureHelp => "Show signature help",
             Self::ShortcutSettingsOpenFile => "Open settings.toml",
             Self::ShortcutSettingsRevealFile => "Reveal settings.toml",
+            Self::ShortcutGitHistoryCopySha => "Copy commit SHA",
+            Self::ShortcutGitHistoryCopyMessage => "Copy commit message",
+            Self::ShortcutGitHistoryNewWorktree => "New worktree from commit…",
+            Self::ShortcutGitHistoryCreateBranch => "Create branch from commit…",
+            Self::ShortcutGitHistoryRevert => "Revert commit",
+            Self::ShortcutGitHistoryCherryPick => "Cherry-pick commit into this worktree",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3938,6 +3956,12 @@ impl SettingsField {
             | Self::ShortcutEditorSignatureHelp
             | Self::ShortcutSettingsOpenFile
             | Self::ShortcutSettingsRevealFile
+            | Self::ShortcutGitHistoryCopySha
+            | Self::ShortcutGitHistoryCopyMessage
+            | Self::ShortcutGitHistoryNewWorktree
+            | Self::ShortcutGitHistoryCreateBranch
+            | Self::ShortcutGitHistoryRevert
+            | Self::ShortcutGitHistoryCherryPick
             | Self::ShortcutTerminalReview
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
@@ -4174,6 +4198,12 @@ struct ShortcutDraft {
     editor_signature_help: String,
     settings_open_file: String,
     settings_reveal_file: String,
+    git_history_copy_sha: String,
+    git_history_copy_message: String,
+    git_history_new_worktree: String,
+    git_history_create_branch: String,
+    git_history_revert: String,
+    git_history_cherry_pick: String,
 
     terminal_review: String,
     command_palette: String,
@@ -4399,6 +4429,12 @@ impl ShortcutDraft {
             editor_signature_help: settings::format_chords(&shortcuts.editor_signature_help),
             settings_open_file: settings::format_chords(&shortcuts.settings_open_file),
             settings_reveal_file: settings::format_chords(&shortcuts.settings_reveal_file),
+            git_history_copy_sha: settings::format_chords(&shortcuts.git_history_copy_sha),
+            git_history_copy_message: settings::format_chords(&shortcuts.git_history_copy_message),
+            git_history_new_worktree: settings::format_chords(&shortcuts.git_history_new_worktree),
+            git_history_create_branch: settings::format_chords(&shortcuts.git_history_create_branch),
+            git_history_revert: settings::format_chords(&shortcuts.git_history_revert),
+            git_history_cherry_pick: settings::format_chords(&shortcuts.git_history_cherry_pick),
 
             terminal_review: settings::format_chords(&shortcuts.terminal_review),
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4972,6 +5008,12 @@ impl SettingsDraft {
             SettingsField::ShortcutEditorSignatureHelp => self.keyboard_shortcuts.editor_signature_help = value,
             SettingsField::ShortcutSettingsOpenFile => self.keyboard_shortcuts.settings_open_file = value,
             SettingsField::ShortcutSettingsRevealFile => self.keyboard_shortcuts.settings_reveal_file = value,
+            SettingsField::ShortcutGitHistoryCopySha => self.keyboard_shortcuts.git_history_copy_sha = value,
+            SettingsField::ShortcutGitHistoryCopyMessage => self.keyboard_shortcuts.git_history_copy_message = value,
+            SettingsField::ShortcutGitHistoryNewWorktree => self.keyboard_shortcuts.git_history_new_worktree = value,
+            SettingsField::ShortcutGitHistoryCreateBranch => self.keyboard_shortcuts.git_history_create_branch = value,
+            SettingsField::ShortcutGitHistoryRevert => self.keyboard_shortcuts.git_history_revert = value,
+            SettingsField::ShortcutGitHistoryCherryPick => self.keyboard_shortcuts.git_history_cherry_pick = value,
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5988,6 +6030,12 @@ fn settings_update(
         SettingsField::ShortcutEditorSignatureHelp => { next.keyboard_shortcuts.editor_signature_help = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutSettingsOpenFile => { next.keyboard_shortcuts.settings_open_file = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutSettingsRevealFile => { next.keyboard_shortcuts.settings_reveal_file = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitHistoryCopySha => { next.keyboard_shortcuts.git_history_copy_sha = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitHistoryCopyMessage => { next.keyboard_shortcuts.git_history_copy_message = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitHistoryNewWorktree => { next.keyboard_shortcuts.git_history_new_worktree = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitHistoryCreateBranch => { next.keyboard_shortcuts.git_history_create_branch = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitHistoryRevert => { next.keyboard_shortcuts.git_history_revert = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitHistoryCherryPick => { next.keyboard_shortcuts.git_history_cherry_pick = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -18704,6 +18752,11 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                if let SidebarAction::HistoryCommand { key, oid, command, mainline, message } = &action {
+                    if !self.sidebar_model.source_control.as_ref().is_some_and(|source| source.key == *key && source.history_command_available(oid, *mainline, message, *command)) {
+                        return Task::none();
+                    }
+                }
                 self.sidebar_state.apply(&action);
                 // Opening a row, by pointer or keyboard, is navigation: it
                 // ends any explicit selection and anchors a later range, but
@@ -22611,6 +22664,10 @@ impl Application for Cagents {
             sidebar::change_panel_focus_id(),
             workspace_widget::FocusedPane::SidebarChanges.into(),
         ));
+        if self.sidebar_state.changes_tab() == sidebar::ChangesTab::History
+            && let Some(source) = &self.sidebar_model.source_control {
+            focus_regions.extend(source.history.iter().map(|row| (sidebar::history_row_focus_id(row), workspace_widget::FocusedPane::SidebarChanges.into())));
+        }
         let projection = self.workspace.projection(self.workspace.viewport_width());
         for mounted in &projection.mounted {
             let card = mounted.id;

@@ -2074,6 +2074,7 @@ impl CommitRow {
             metadata.push_str(" · merge");
         }
         let chrome = CommitRowChrome {
+            focus_id: widget::Id::new(format!("sidebar.history.commit.{}", commit.oid)),
             accessible_name: format!(
                 "Commit {} {}, {metadata}",
                 commit.oid.short(),
@@ -2095,6 +2096,7 @@ impl CommitRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitRowChrome {
+    focus_id: widget::Id,
     subject: Box<str>,
     metadata: Box<str>,
     accessible_name: Box<str>,
@@ -8038,6 +8040,30 @@ fn change_context_controls<'a>(
     )
 }
 
+pub fn history_row_focus_id(row: &CommitRow) -> widget::Id { row.chrome.focus_id.clone() }
+
+pub fn history_row_from_focus_id<'a>(source: &'a SourceControlModel, id: &widget::Id) -> Option<&'a CommitRow> {
+    source.history.iter().find(|row| row.chrome.focus_id == *id)
+}
+
+impl SourceControlModel {
+    /// A history action retains the exact immutable commit shown by its row.
+    /// Draft forms and Git writes use the same host-capability policy as the
+    /// existing dispatcher; copying remains available during an operation.
+    fn history_command_policy_available(&self, command: HistoryCommand) -> bool {
+        !self.is_reloading() && matches!(self.data_state, SidebarDataState::Ready)
+            && (matches!(command, HistoryCommand::CopySha | HistoryCommand::CopyMessage)
+                || (self.mutations_available() && !self.busy()))
+    }
+
+    pub fn history_command_available(&self, oid: &Oid, mainline: Option<u32>, message: &str, command: HistoryCommand) -> bool {
+        self.history_command_policy_available(command)
+            && self.history.iter().chain(self.commit_changes.iter().map(|changes| &changes.commit))
+                .any(|row| row.oid == *oid && row.mainline == mainline && row.message.as_ref() == message)
+    }
+
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryCommand { CopySha, CopyMessage, NewWorktree, CreateBranch, Revert, CherryPick }
 
@@ -8047,21 +8073,30 @@ struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRo
 impl widget::menu::Action for HistoryContextCommand<'_> {
     type Message = SidebarAction;
     fn message(&self) -> SidebarAction {
-        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) }
+        commands::registered(SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) })
     }
 }
 
-fn history_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a CommitRow, blocked: bool) -> Element<'a, SidebarAction> {
+fn history_context_controls<'a>(content: Element<'a, SidebarAction>, source: &'a SourceControlModel, row: &'a CommitRow, blocked: bool, shortcuts: &crate::settings::KeyboardShortcuts, binding_key: Arc<[Option<widget::menu::KeyBind>; 6]>) -> Element<'a, SidebarAction> {
     if blocked { return content; }
-    let entries = [
-        ("Copy SHA", HistoryCommand::CopySha),
-        ("Copy message", HistoryCommand::CopyMessage),
-        ("New worktree from this commit…", HistoryCommand::NewWorktree),
-        ("Create branch here…", HistoryCommand::CreateBranch),
-        (if row.mainline.is_some() { "Revert commit (first parent)" } else { "Revert commit" }, HistoryCommand::Revert),
-        (if row.mainline.is_some() { "Cherry-pick into this worktree (first parent)" } else { "Cherry-pick into this worktree" }, HistoryCommand::CherryPick),
-    ].into_iter().map(|(label, command)| widget::menu::Item::Button(label.to_owned(), None, HistoryContextCommand { key, row, command })).collect();
-    crate::interaction::context_menu(content, widget::menu::items(&std::collections::HashMap::new(), entries))
+    let entries = [HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick]
+        .into_iter().map(|command| {
+            let id = commands::history_command_id(command);
+            let label = if row.mainline.is_some() && matches!(command, HistoryCommand::Revert | HistoryCommand::CherryPick) {
+                format!("{} (first parent)", commands::label(id))
+            } else { commands::label(id).to_owned() };
+            let action = HistoryContextCommand { key: &source.key, row, command };
+            // Rows come directly from this source; only activation needs a commit lookup.
+            if source.history_command_policy_available(command) {
+                widget::menu::Item::Button(label, None, action)
+            } else { widget::menu::Item::ButtonDisabled(label, None, action) }
+        }).collect::<Vec<_>>();
+    let bindings = menu_bindings(entries.iter().filter_map(|item| match item {
+        widget::menu::Item::Button(_, _, action) => Some(*action), _ => None,
+    }), shortcuts, &[]);
+    crate::interaction::context_menu_keyed(content,
+        (row.chrome.focus_id.clone(), row.mainline, Arc::clone(&row.message), source.mutations_available(), source.busy(), source.history_command_policy_available(HistoryCommand::CopySha), binding_key),
+        widget::menu::items(&bindings, entries))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9119,7 +9154,7 @@ fn source_control_panel<'a>(
                 .into()
         }
         ChangesTab::Branch => branch_changes_section(state, source, modal_open),
-        ChangesTab::History => history_section(state, source, modal_open),
+        ChangesTab::History => history_section_with_shortcuts(state, source, modal_open, shortcuts),
     };
     // Committing is the panel's terminal action, so it sits at the panel's
     // bottom edge rather than after however many change rows the scroll
@@ -11423,11 +11458,17 @@ fn commit_changes_section<'a>(
     column.into()
 }
 
-fn history_section<'a>(
-    state: &'a SidebarState,
-    source: &'a SourceControlModel,
-    modal_open: bool,
-) -> Element<'a, SidebarAction> {
+#[cfg(test)]
+fn history_section<'a>(state: &'a SidebarState, source: &'a SourceControlModel, modal_open: bool) -> Element<'a, SidebarAction> {
+    static DEFAULT: LazyLock<crate::settings::KeyboardShortcuts> = LazyLock::new(Default::default);
+    history_section_with_shortcuts(state, source, modal_open, &DEFAULT)
+}
+
+fn history_section_with_shortcuts<'a>(state: &'a SidebarState, source: &'a SourceControlModel, modal_open: bool, shortcuts: &crate::settings::KeyboardShortcuts) -> Element<'a, SidebarAction> {
+    // Six parsed native chords form a bounded shared snapshot for all row
+    // popup keys. No row clones the full shortcut table or a path vector.
+    let binding_key = Arc::new([HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick]
+        .map(|command| crate::workspace_widget::menu_shortcut(commands::history_command_id(command), shortcuts)));
     let key = &source.key;
     if let Some(changes) = &source.commit_changes {
         return commit_changes_section(state, source, changes, modal_open);
@@ -11503,6 +11544,7 @@ fn history_section<'a>(
             )
             .padding([space::XS, space::XS])
             .class(sidebar_button_style(false))
+            .id(history_row_focus_id(row))
             .on_press_maybe(gated(
                 SidebarAction::OpenCommit {
                     key: key.clone(),
@@ -11511,7 +11553,7 @@ fn history_section<'a>(
                 modal_open,
             ))
             .width(Length::Fill),
-        ), key, row, modal_open));
+        ), source, row, modal_open, shortcuts, Arc::clone(&binding_key)));
     }
     column = column.push(rows);
     column = column.push(slot((!source.history_complete && !source.unborn).then(
@@ -14322,6 +14364,22 @@ pub(crate) mod tests {
             },
             &settings,
         );
+        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
+        let commit = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![], author: identity.clone(), committer: identity, subject: "Commit".into(), body: String::new() });
+        for (command, chord) in [
+            (HistoryCommand::CopySha, "Ctrl+Alt+F1"),
+            (HistoryCommand::CopyMessage, "Ctrl+Alt+F2"),
+            (HistoryCommand::NewWorktree, "Ctrl+Alt+F3"),
+            (HistoryCommand::CreateBranch, "Ctrl+Alt+F5"),
+            (HistoryCommand::Revert, "Ctrl+Alt+F6"),
+            (HistoryCommand::CherryPick, "Ctrl+Alt+F7"),
+        ] {
+            let id = commands::history_command_id(command);
+            let index = crate::workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().position(|descriptor| descriptor.action == id).unwrap();
+            *settings.actions_mut()[index] = vec![chord.into()];
+            assert_eq!(commands::history_command(id), Some(command));
+            assert_hint(HistoryContextCommand { key: &key, row: &commit, command }, &settings);
+        }
         let model = panel_model();
         let source = model.source_control.as_ref().unwrap();
         let row = source
@@ -21295,7 +21353,9 @@ pub(crate) mod tests {
         let action = widget::menu::Action::message(&HistoryContextCommand { key: &key, row: &row, command: HistoryCommand::Revert });
         let message = Arc::clone(&row.message);
         drop(row);
-        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = action else { panic!("expected a history command"); };
+        let SidebarAction::RunCommand { command, action } = action else { panic!("registered history command"); };
+        assert_eq!(command, crate::workspace_widget::GlobalShortcut::GitHistoryRevert);
+        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = *action else { panic!("expected a history command"); };
         assert_eq!(oid, oid_of(3));
         assert_eq!(mainline, Some(1));
         assert_eq!(captured.as_ref(), "Merge subject\n\nBody line\n");

@@ -3904,6 +3904,10 @@ impl Application for Editor {
                             let valid = cagents::sidebar::commands::command_id(&action)
                                 == Some(command)
                                 && self.current().is_some_and(|tab| {
+                                    if matches!(action.as_ref(), SidebarAction::HistoryCommand { .. }) {
+                                        return cagents::sidebar::commands::CommandTarget::from_action(&action)
+                                            .and_then(|target| target.resolve_in(&tab.sidebar, &tab.navigation, command)).as_ref() == Some(action.as_ref());
+                                    }
                                     let SidebarAction::FileCommand { key, path, .. } =
                                         action.as_ref()
                                     else {
@@ -3922,7 +3926,7 @@ impl Application for Editor {
                                 });
                             if !valid {
                                 self.notice = Some(
-                                    "The original file menu target is no longer available.".into(),
+                                    "The original sidebar menu target is no longer available.".into(),
                                 );
                                 return Task::none();
                             }

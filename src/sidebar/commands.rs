@@ -4,6 +4,12 @@ use crate::workspace_widget::GlobalShortcut as Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandTarget {
+    History {
+        key: ActiveWorktreeKey,
+        oid: Oid,
+        mainline: Option<u32>,
+        message: Arc<str>,
+    },
     /// Focus belonged to a sidebar control that no longer resolves.
     Unavailable,
     Rows(Vec<SelectionRow>),
@@ -57,10 +63,34 @@ pub const fn whole_group_command_id(area: ChangeArea, command: ChangeGroupComman
     })
 }
 
+pub const fn history_command_id(command: HistoryCommand) -> Command {
+    match command {
+        HistoryCommand::CopySha => Command::GitHistoryCopySha,
+        HistoryCommand::CopyMessage => Command::GitHistoryCopyMessage,
+        HistoryCommand::NewWorktree => Command::GitHistoryNewWorktree,
+        HistoryCommand::CreateBranch => Command::GitHistoryCreateBranch,
+        HistoryCommand::Revert => Command::GitHistoryRevert,
+        HistoryCommand::CherryPick => Command::GitHistoryCherryPick,
+    }
+}
+
+pub const fn history_command(command: Command) -> Option<HistoryCommand> {
+    Some(match command {
+        Command::GitHistoryCopySha => HistoryCommand::CopySha,
+        Command::GitHistoryCopyMessage => HistoryCommand::CopyMessage,
+        Command::GitHistoryNewWorktree => HistoryCommand::NewWorktree,
+        Command::GitHistoryCreateBranch => HistoryCommand::CreateBranch,
+        Command::GitHistoryRevert => HistoryCommand::Revert,
+        Command::GitHistoryCherryPick => HistoryCommand::CherryPick,
+        _ => return None,
+    })
+}
+
 /// Menu parameters remain in their ordinary self-contained sidebar action.
 /// Only the template identity is shared with palette/shortcut registration.
 pub fn command_id(action: &SidebarAction) -> Option<Command> {
     Some(match action {
+        SidebarAction::HistoryCommand { command, .. } => history_command_id(*command),
         SidebarAction::ProjectCommand {
             worktree_id,
             command,
@@ -172,6 +202,9 @@ pub fn file_rows(source: &SourceControlModel) -> impl Iterator<Item = &FileRow> 
 impl CommandTarget {
     pub fn from_action(action: &SidebarAction) -> Option<Self> {
         Some(match action {
+            SidebarAction::HistoryCommand { key, oid, mainline, message, .. } => Self::History {
+                key: key.clone(), oid: oid.clone(), mainline: *mainline, message: Arc::clone(message),
+            },
             SidebarAction::ProjectCommand {
                 project_id,
                 worktree_id,
@@ -226,6 +259,13 @@ impl CommandTarget {
 
     pub fn resolve(&self, model: &SidebarModel, command: Command) -> Option<SidebarAction> {
         match self {
+            Self::History { key, oid, mainline, message } => {
+                let source = model.source_control.as_ref()?;
+                let command = history_command(command)?;
+                (source.key == *key && model.contains_worktree(key)
+                    && source.history_command_available(oid, *mainline, message, command))
+                    .then(|| SidebarAction::HistoryCommand { key: key.clone(), oid: oid.clone(), command, mainline: *mainline, message: Arc::clone(message) })
+            }
             Self::Unavailable | Self::Changes { .. } => None,
             Self::File { key, path } => {
                 let source = model.source_control.as_ref()?;
@@ -365,6 +405,10 @@ impl CommandTarget {
         state: &SidebarState,
         command: Command,
     ) -> Option<SidebarAction> {
+        if let Self::History { key, .. } = self {
+            return (state.active_worktree() == Some(key) && state.changes_tab() == ChangesTab::History)
+                .then(|| self.resolve(model, command)).flatten();
+        }
         let Self::Changes {
             key,
             row,
@@ -466,6 +510,52 @@ impl CommandTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_templates_keep_the_shown_commit_and_current_worktree_policy() {
+        let mut model = super::super::tests::panel_model();
+        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
+        let row = CommitRow::new(&CommitSummary { oid: Oid::parse("1234567890123456789012345678901234567890").unwrap(), parents: vec![], author: identity.clone(), committer: identity, subject: "Shown subject".into(), body: "Shown body".into() });
+        let source = model.source_control.as_mut().unwrap();
+        source.history = vec![row];
+        let row = &source.history[0];
+        let target = CommandTarget::History { key: source.key.clone(), oid: row.oid.clone(), mainline: row.mainline, message: Arc::clone(&row.message) };
+        let mut state = super::super::tests::panel_state(&model);
+        state.changes_tab = ChangesTab::History;
+        let commands = [HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick];
+        for command in commands {
+            let action = target.resolve_in(&model, &state, history_command_id(command)).unwrap();
+            assert_eq!(command_id(&action), Some(history_command_id(command)));
+            assert_eq!(CommandTarget::from_action(&action), Some(target.clone()));
+        }
+        model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from("Read-only host")));
+        for command in commands {
+            assert_eq!(target.resolve_in(&model, &state, history_command_id(command)).is_some(), matches!(command, HistoryCommand::CopySha | HistoryCommand::CopyMessage));
+        }
+        let source = model.source_control.as_mut().unwrap();
+        source.set_mutation_unavailable_reason(None);
+        source.mutation = Some(MutationKind::Stage);
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryCopyMessage).is_some());
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryRevert).is_none());
+        model.source_control.as_mut().unwrap().mutation = None;
+        state.changes_tab = ChangesTab::Changes;
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryCopySha).is_none());
+        state.changes_tab = ChangesTab::History;
+        model.source_control.as_mut().unwrap().history[0].message = Arc::from("Replacement message at the same OID");
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryCopyMessage).is_none());
+        if let CommandTarget::History { message, .. } = &target {
+            model.source_control.as_mut().unwrap().history[0].message = Arc::clone(message);
+        }
+        model.source_control.as_mut().unwrap().history[0].mainline = Some(1);
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryRevert).is_none());
+        model.source_control.as_mut().unwrap().history[0].mainline = None;
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryRevert).is_some());
+        model.source_control.as_mut().unwrap().reloading = true;
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryCopySha).is_none());
+        model.source_control.as_mut().unwrap().reloading = false;
+        model.source_control.as_mut().unwrap().key.worktree_id = WorktreeId::new();
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryCopySha).is_none());
+    }
 
     #[test]
     fn captured_worktree_never_resolves_to_a_replacement_row() {

@@ -1628,6 +1628,11 @@ impl Cagents {
                 let Some(source) = self.sidebar_model.source_control.as_ref() else {
                     return Some(sidebar::commands::CommandTarget::Unavailable);
                 };
+                if self.sidebar_state.changes_tab() == sidebar::ChangesTab::History {
+                    return Some(sidebar::history_row_from_focus_id(source, &widget).map_or(
+                        sidebar::commands::CommandTarget::Unavailable,
+                        |row| sidebar::commands::CommandTarget::History { key: source.key.clone(), oid: row.oid.clone(), mainline: row.mainline, message: Arc::clone(&row.message) }));
+                }
                 let Some(row) = sidebar::change_row_from_focus_id(source, &source.key, &widget)
                 else {
                     return Some(sidebar::commands::CommandTarget::Unavailable);
@@ -1755,8 +1760,13 @@ impl Cagents {
         command: Command,
         action: SidebarAction,
     ) -> Task<Message> {
-        let valid = sidebar::commands::CommandTarget::from_action(&action)
-            .is_some_and(|target| target.accepts(&self.sidebar_model, command, &action));
+        let valid = !self.modal_is_open()
+            && !(self.focused_repository_is_saving() && command.blocked_during_save())
+            && sidebar::commands::CommandTarget::from_action(&action).is_some_and(|target| {
+                if matches!(target, sidebar::commands::CommandTarget::History { .. }) {
+                    target.resolve_in(&self.sidebar_model, &self.sidebar_state, command).as_ref() == Some(&action)
+                } else { target.accepts(&self.sidebar_model, command, &action) }
+            });
         if !valid || (crate::device::is_remote() && !device_ui::supports_sidebar_action(&action)) {
             self.status = Some(TransientNotice::warning(
                 "The original sidebar target is no longer available",
@@ -2642,6 +2652,12 @@ impl Cagents {
             | Command::EditorSignatureHelp
             | Command::SettingsOpenFile
             | Command::SettingsRevealFile
+            | Command::GitHistoryCopySha
+            | Command::GitHistoryCopyMessage
+            | Command::GitHistoryNewWorktree
+            | Command::GitHistoryCreateBranch
+            | Command::GitHistoryRevert
+            | Command::GitHistoryCherryPick
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -2997,6 +3013,12 @@ impl SettingsField {
             Self::ShortcutEditorSignatureHelp => Some(Command::EditorSignatureHelp),
             Self::ShortcutSettingsOpenFile => Some(Command::SettingsOpenFile),
             Self::ShortcutSettingsRevealFile => Some(Command::SettingsRevealFile),
+            Self::ShortcutGitHistoryCopySha => Some(Command::GitHistoryCopySha),
+            Self::ShortcutGitHistoryCopyMessage => Some(Command::GitHistoryCopyMessage),
+            Self::ShortcutGitHistoryNewWorktree => Some(Command::GitHistoryNewWorktree),
+            Self::ShortcutGitHistoryCreateBranch => Some(Command::GitHistoryCreateBranch),
+            Self::ShortcutGitHistoryRevert => Some(Command::GitHistoryRevert),
+            Self::ShortcutGitHistoryCherryPick => Some(Command::GitHistoryCherryPick),
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -3382,6 +3404,12 @@ impl ShortcutDraft {
             (Command::EditorSignatureHelp, self.editor_signature_help.as_str()),
             (Command::SettingsOpenFile, self.settings_open_file.as_str()),
             (Command::SettingsRevealFile, self.settings_reveal_file.as_str()),
+            (Command::GitHistoryCopySha, self.git_history_copy_sha.as_str()),
+            (Command::GitHistoryCopyMessage, self.git_history_copy_message.as_str()),
+            (Command::GitHistoryNewWorktree, self.git_history_new_worktree.as_str()),
+            (Command::GitHistoryCreateBranch, self.git_history_create_branch.as_str()),
+            (Command::GitHistoryRevert, self.git_history_revert.as_str()),
+            (Command::GitHistoryCherryPick, self.git_history_cherry_pick.as_str()),
         ]
     }
 }
