@@ -43,6 +43,7 @@ use crate::{
 type ActionTask = iced::Task<Action>;
 
 pub mod cache;
+pub mod completion;
 pub mod checkout;
 pub mod discussion;
 pub mod discussion_ui;
@@ -158,6 +159,7 @@ pub enum Action {
         action: Box<Action>,
     },
     Discussion(discussion_ui::Action),
+    Completion(completion::Action),
     SetSource(Option<ReviewSource>),
     Cached {
         generation: u64,
@@ -237,6 +239,8 @@ impl Action {
                 | Self::Cached { .. }
                 | Self::CacheSaved { .. }
                 | Self::ViewedApplied { .. }
+                | Self::Discussion(discussion_ui::Action::SuggestionLines { .. } | discussion_ui::Action::SuggestionPreview { .. } | discussion_ui::Action::SuggestionApplied { .. })
+                | Self::Completion(completion::Action::Loaded { .. } | completion::Action::Candidates { .. } | completion::Action::Finished { .. } | completion::Action::Search { .. })
                 | Self::Discussion(
                     discussion_ui::Action::Loaded { .. } | discussion_ui::Action::Finished { .. }
                 )
@@ -385,6 +389,7 @@ impl ReviewSource {
 pub struct State {
     unavailable_reason: Option<String>,
     discussion: discussion_ui::DiscussionState,
+    completion: completion::Controls,
     parked_discussions: Vec<(ReviewTarget, discussion_ui::DiscussionState)>,
     api: Arc<dyn GitHubReviewApi>,
     cache: Option<Arc<dyn cache::Store>>,
@@ -590,6 +595,7 @@ impl State {
         Self {
             unavailable_reason: None,
             discussion: discussion_ui::DiscussionState::default(),
+            completion: completion::Controls::default(),
             parked_discussions: Vec::new(),
             api,
             cache: None,
@@ -808,6 +814,7 @@ impl State {
                 self.update(*action)
             }
             Action::Discussion(action) => self.update_discussion(action),
+            Action::Completion(action) => self.update_completion(action),
             Action::SetSource(source) => self.set_source(source),
             Action::BrowserFocused => {
                 if self.target.is_none()
@@ -1332,6 +1339,7 @@ impl State {
     }
 
     fn reset_target(&mut self) {
+        self.completion.reset();
         self.cache_loading = false;
         self.cache_dirty = false;
         self.cached_viewer = None;
@@ -1879,6 +1887,7 @@ impl State {
                     ))
                     .width(Length::Fill)
                     .into(),
+                crate::ui_controls::button::quiet("PR actions").on_press_maybe((!modal_open && self.context.is_some()).then(||self.fenced(Action::Completion(completion::Action::Toggle)))).into(),
                 self.review_control(modal_open),
             ])
             .spacing(space::M)
@@ -1889,6 +1898,7 @@ impl State {
             })
             .into(),
         );
+        if self.completion.open { rows.push(self.completion_view(modal_open)); }
         widget::column::with_children(rows)
             .spacing(space::XS)
             .padding(Padding::from([space::M, space::M]))

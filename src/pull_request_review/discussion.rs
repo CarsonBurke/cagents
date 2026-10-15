@@ -335,7 +335,7 @@ fn execute_current(
             outcome(api.reply_to_thread(repository, &request, cancellation)).map(drop)
         }
         Mutation::Edit { comment, body } => {
-            let candidate = own_pending_comment(&conversation, comment)?;
+            let candidate = own_editable_comment(&conversation, comment)?;
             if !candidate.viewer_can_update {
                 return Err(Outcome::Refused(
                     "GitHub no longer permits editing that comment.".into(),
@@ -373,6 +373,12 @@ fn execute_current(
             unreachable!()
         }
     }
+}
+
+fn own_editable_comment<'a>(conversation: &'a PullRequestConversation, id: &str) -> Result<&'a crate::github::PullRequestComment, Outcome> {
+    conversation.threads.iter().flat_map(|thread| &thread.comments)
+        .find(|comment| comment.id.as_deref() == Some(id) && comment.viewer_did_author && comment.viewer_can_update)
+        .ok_or_else(|| Outcome::Refused("Only your own editable comments can be changed here. Refresh before trying again.".into()))
 }
 
 fn own_pending_comment<'a>(
