@@ -5,7 +5,7 @@ use super::Action;
 #[cfg(feature = "winit")]
 use crate::Application;
 
-use iced::{Rectangle, window};
+use iced::window;
 #[cfg(all(wayland_platform, feature = "winit"))]
 use iced_runtime::platform_specific::wayland::CornerRadius;
 #[cfg(wayland_platform)]

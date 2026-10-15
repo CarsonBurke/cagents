@@ -4,7 +4,7 @@
 //! A container which displays an overlay when a popup widget is attached.
 
 use iced::widget;
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::widget::{Operation, Tree};
 use iced_core::{
     Clipboard, Element, Layout, Length, Point, Rectangle, Shell, Size, Vector, Widget, layout,
@@ -498,12 +498,6 @@ where
             Default::default(),
         )
     }
-}
-
-/// The local state of a [`Popover`].
-#[derive(Debug, Default)]
-struct State {
-    is_open: bool,
 }
 
 /// The first child in [`Popover::children`] is always the wrapped content.

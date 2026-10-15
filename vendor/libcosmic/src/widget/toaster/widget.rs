@@ -4,7 +4,7 @@
 use iced::{Limits, Size};
 use iced_core::layout::Node;
 
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::renderer::{self};
 use iced_core::widget::Operation;
 use iced_core::widget::tree::Tree;
@@ -152,8 +152,6 @@ where
                 translation,
             )
         } else {
-            let bounds = layout.bounds();
-
             Some(overlay::Element::new(Box::new(ToasterOverlay::new(
                 &mut state.children[1],
                 &mut self.toasts,

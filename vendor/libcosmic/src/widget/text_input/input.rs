@@ -21,12 +21,12 @@ use apply::Apply;
 use iced::Limits;
 use iced::clipboard::dnd::{DndAction, DndEvent, OfferEvent, SourceEvent};
 use iced::clipboard::mime::AsMimeTypes;
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::input_method::{self, InputMethod, Preedit};
 use iced_core::mouse::{self, click};
 use iced_core::overlay::Group;
 use iced_core::renderer::{self, Renderer as CoreRenderer};
-use iced_core::text::{self, Affinity, Paragraph, Renderer, Text};
+use iced_core::text::{self, Paragraph, Renderer, Text};
 use iced_core::time::{Duration, Instant};
 use iced_core::widget::Id;
 use iced_core::widget::operation::{self, Operation};
@@ -844,7 +844,7 @@ where
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
-        renderer: &crate::Renderer,
+        _renderer: &crate::Renderer,
         operation: &mut dyn Operation,
     ) {
         operation.container(Some(&self.id), layout.bounds());
@@ -964,7 +964,7 @@ where
                 // Enable custom buttons defined on the trailing icon position to be handled.
                 if !self.is_editable_variant {
                     if let Some(trailing_layout) = trailing_icon_layout {
-                        let res = trailing_icon.as_widget_mut().update(
+                        trailing_icon.as_widget_mut().update(
                             tree,
                             event,
                             trailing_layout,
@@ -2375,23 +2375,12 @@ pub fn update<'a, Message: Clone + 'static>(
         #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Offer(
             rectangle,
-            OfferEvent::Enter {
-                x,
-                y,
-                mime_types,
-                surface,
-            },
+            OfferEvent::Enter { x, mime_types, .. },
         )) if *rectangle == Some(dnd_id) => {
             cold();
-            let is_clicked = text_layout.bounds().contains(Point {
-                x: *x as f32,
-                y: *y as f32,
-            });
-
             let mut accepted = false;
             for m in mime_types {
                 if SUPPORTED_TEXT_MIME_TYPES.contains(&m.as_str()) {
-                    let clone = m.clone();
                     accepted = true;
                 }
             }
@@ -2451,7 +2440,7 @@ pub fn update<'a, Message: Clone + 'static>(
         Event::Dnd(DndEvent::Offer(rectangle, OfferEvent::Drop)) if *rectangle == Some(dnd_id) => {
             cold();
             if let DndOfferState::HandlingOffer(mime_types, _action) = state.dnd_offer.clone() {
-                let Some(mime_type) = SUPPORTED_TEXT_MIME_TYPES
+                let Some(_mime_type) = SUPPORTED_TEXT_MIME_TYPES
                     .iter()
                     .find(|&&m| mime_types.iter().any(|t| t == m))
                 else {
@@ -2468,7 +2457,7 @@ pub fn update<'a, Message: Clone + 'static>(
         Event::Dnd(DndEvent::Offer(id, OfferEvent::LeaveDestination)) if Some(dnd_id) != *id => {}
         #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Offer(
-            rectangle,
+            _rectangle,
             OfferEvent::Leave | OfferEvent::LeaveDestination,
         )) => {
             cold();
@@ -2769,7 +2758,7 @@ pub fn draw<'a, Message>(
     let handling_dnd_offer = !matches!(state.dnd_offer, DndOfferState::None);
     #[cfg(not(wayland_platform))]
     let handling_dnd_offer = false;
-    let (cursors, offset, is_selecting) = if let Some(focus) =
+    let (cursors, offset, _is_selecting) = if let Some(focus) =
         state.is_focused.filter(|f| f.focused).or_else(|| {
             let now = Instant::now();
             handling_dnd_offer.then_some(Focus {
@@ -2952,11 +2941,11 @@ pub fn draw<'a, Message>(
     // draw the end icon in the text input
     if let (Some(icon), Some(tree)) = (trailing_icon, trailing_icon_tree) {
         let mut children = text_layout.children();
-        let mut icon_layout = children.next().unwrap();
+        children.next().unwrap();
         if has_start_icon {
-            icon_layout = children.next().unwrap();
+            children.next().unwrap();
         }
-        icon_layout = children.next().unwrap();
+        let icon_layout = children.next().unwrap();
 
         icon.as_widget().draw(
             tree,

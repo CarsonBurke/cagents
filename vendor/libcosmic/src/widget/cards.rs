@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use crate::anim;
 use crate::theme::THEME;
-use crate::widget::card::style::Style;
 use crate::widget::icon::{self, Handle};
 use crate::widget::{button, column, row, text};
 use float_cmp::approx_eq;

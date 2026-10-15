@@ -92,8 +92,6 @@ pub struct Core {
 
     pub(super) portal_accent: Option<Srgba>,
 
-    pub(super) portal_is_high_contrast: Option<bool>,
-
     pub(super) title: HashMap<Id, String>,
 
     pub window: Window,
@@ -183,7 +181,6 @@ impl Default for Core {
             settings_daemon: None,
             portal_is_dark: None,
             portal_accent: None,
-            portal_is_high_contrast: None,
             main_window: None,
             exit_on_main_window_closed: true,
             menu_bars: HashMap::new(),
@@ -314,11 +311,6 @@ impl Core {
     #[inline]
     pub fn nav_bar_toggle_condensed(&mut self) {
         self.nav_bar_set_toggled_condensed(!self.nav_bar.toggled_condensed);
-    }
-
-    #[inline]
-    pub(crate) const fn nav_bar_context(&self) -> nav_bar::Id {
-        self.nav_bar.context_id
     }
 
     #[inline]

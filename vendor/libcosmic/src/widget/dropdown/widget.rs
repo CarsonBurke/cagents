@@ -8,7 +8,7 @@ use crate::widget::icon::{self, Handle};
 use crate::{Element, surface};
 use derive_setters::Setters;
 use iced::window;
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::text::{self, Paragraph, Text};
 use iced_core::widget::tree::{self, Tree};
 use iced_core::{
@@ -17,7 +17,6 @@ use iced_core::{
 };
 use iced_widget::pick_list::{self, Catalog};
 use std::borrow::Cow;
-use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -328,10 +327,10 @@ where
 
     fn operate(
         &mut self,
-        tree: &mut Tree,
+        _tree: &mut Tree,
         _layout: Layout<'_>,
         _renderer: &crate::Renderer,
-        operation: &mut dyn iced_core::widget::Operation,
+        _operation: &mut dyn iced_core::widget::Operation,
     ) {
         // TODO: double check operation handling
         // let state = tree.state.downcast_mut::<State>();
@@ -343,7 +342,7 @@ where
         tree: &'b mut Tree,
         layout: Layout<'b>,
         renderer: &crate::Renderer,
-        viewport: &Rectangle,
+        _viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, crate::Theme, crate::Renderer>> {
         #[cfg(wayland_platform)]
@@ -452,7 +451,7 @@ impl super::operation::Dropdown for State {
 /// Computes the layout of a [`Dropdown`].
 #[allow(clippy::too_many_arguments)]
 pub fn layout(
-    renderer: &crate::Renderer,
+    _renderer: &crate::Renderer,
     limits: &layout::Limits,
     width: Length,
     gap: f32,
@@ -546,7 +545,7 @@ pub fn update<
     cursor: mouse::Cursor,
     shell: &mut Shell<'_, Message>,
     #[cfg(wayland_platform)]
-    positioner: iced_runtime::platform_specific::wayland::popup::SctkPositioner,
+    _positioner: iced_runtime::platform_specific::wayland::popup::SctkPositioner,
     on_selected: Arc<dyn Fn(usize) -> Message + Send + Sync + 'static>,
     selected: Option<usize>,
     selections: &[S],
@@ -558,7 +557,7 @@ pub fn update<
     gap: f32,
     padding: Padding,
     text_size: Option<f32>,
-    font: Option<crate::font::Font>,
+    _font: Option<crate::font::Font>,
     selected_option: Option<usize>,
 ) {
     let state = state();

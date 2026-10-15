@@ -1,7 +1,7 @@
 //! Create choices using radio buttons.
 use crate::{Theme, theme};
 use iced::border;
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::widget::tree::Tree;
 use iced_core::{
     Border, Clipboard, Element, Layout, Length, Pixels, Rectangle, Shell, Size, Vector, Widget,

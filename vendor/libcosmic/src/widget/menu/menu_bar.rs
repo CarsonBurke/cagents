@@ -13,10 +13,8 @@ use crate::Renderer;
 use crate::app::cosmic::{WINDOWING_SYSTEM, WindowingSystem};
 use crate::style::menu_bar::StyleSheet;
 use crate::widget::RcWrapper;
-use crate::widget::dropdown::menu::{self, State};
 use crate::widget::menu::menu_inner::init_root_menu;
 
-use iced::event::Status;
 use iced::{Point, Shadow, Vector, window};
 use iced_core::Border;
 use iced_widget::core::layout::{Limits, Node};
@@ -45,7 +43,6 @@ pub(crate) struct MenuBarStateInner {
     pub(crate) tree: Tree,
     pub(crate) popup_id: HashMap<window::Id, window::Id>,
     pub(crate) pressed: bool,
-    pub(crate) bar_pressed: bool,
     pub(crate) view_cursor: Cursor,
     pub(crate) open: bool,
     pub(crate) active_root: Vec<usize>,
@@ -82,7 +79,6 @@ impl Default for MenuBarStateInner {
             vertical_direction: Direction::Positive,
             menu_states: Vec::new(),
             popup_id: HashMap::new(),
-            bar_pressed: false,
         }
     }
 }
@@ -156,15 +152,6 @@ where
             tree
         });
         tree.children.extend(extended);
-    }
-}
-
-pub fn get_mut_or_default<T: Default>(vec: &mut Vec<T>, index: usize) -> &mut T {
-    if index < vec.len() {
-        &mut vec[index]
-    } else {
-        vec.resize_with(index + 1, T::default);
-        &mut vec[index]
     }
 }
 
@@ -741,7 +728,7 @@ where
         tree: &'b mut Tree,
         layout: Layout<'b>,
         _renderer: &Renderer,
-        viewport: &Rectangle,
+        _viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, crate::Theme, Renderer>> {
         #[cfg(wayland_platform)]

@@ -1,18 +1,18 @@
 //! Show toggle controls using togglers.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{Element, anim};
 use iced_core::renderer::{self, Renderer};
 use iced_core::widget::{self, Tree, tree};
 use iced_core::{
     Border, Clipboard, Event, Layout, Length, Pixels, Rectangle, Shell, Size, Widget, alignment,
-    event, layout, mouse, text, touch, window,
+    layout, mouse, text, touch, window,
 };
 use iced_widget::Id;
 use iced_widget::toggler::Status;
 
-pub use iced_widget::toggler::{Catalog, Style};
+use iced_widget::toggler::Catalog;
 
 pub fn toggler<'a, Message>(is_checked: bool) -> Toggler<'a, Message> {
     Toggler::new(is_checked)
@@ -260,7 +260,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
                     shell.capture_event();
                 }
             }
-            Event::Window(window::Event::RedrawRequested(now)) => {
+            Event::Window(window::Event::RedrawRequested(_now)) => {
                 state.anim.anim_done(self.duration);
                 if state.anim.last_change.is_some() {
                     shell.request_redraw();
@@ -381,7 +381,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
             },
             style.background,
         );
-        let mut t = state.anim.t(self.duration, self.is_toggled);
+        let t = state.anim.t(self.duration, self.is_toggled);
 
         let toggler_foreground_bounds = Rectangle {
             x: bounds.x

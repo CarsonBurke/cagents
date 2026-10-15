@@ -6,7 +6,7 @@ use iced_core::window;
 use crate::Element;
 use crate::widget::{Id, Widget, container};
 use iced::clipboard::dnd::{DndAction, DndEvent, SourceEvent};
-use iced::{Event, Length, Point, Rectangle, Vector, event, mouse, overlay};
+use iced::{Event, Length, Point, Rectangle, Vector, mouse, overlay};
 use iced_core::widget::{Tree, tree};
 use iced_core::{self, Clipboard, Shell, layout, renderer};
 

@@ -9,7 +9,7 @@ use crate::widget::menu::{
     self, CloseCondition, ItemHeight, ItemWidth, MenuBarState, PathHighlight, menu_roots_children,
     menu_roots_diff,
 };
-use crate::widget::{Icon, context_menu, icon};
+use crate::widget::{Icon, icon};
 use crate::{Element, Renderer};
 use derive_setters::Setters;
 use iced::clipboard::dnd::{
@@ -1643,7 +1643,7 @@ where
 
                         #[cfg(wayland_platform)]
                         if is_pressed(event)
-                            && let Some(on_context) = self.on_context.as_ref()
+                            && let Some(_on_context) = self.on_context.as_ref()
                         {
                             let (was_open, id) = state.menu_state.inner.with_data_mut(|data| {
                                 let was_open = data.open;
@@ -2667,7 +2667,7 @@ where
     }
 }
 
-struct TabDragSource<Message> {
+pub(super) struct TabDragSource<Message> {
     mime: String,
     threshold: f32,
     _marker: PhantomData<Message>,
@@ -2718,7 +2718,6 @@ struct TabDragCandidate {
 #[derive(Debug, Clone, Copy)]
 struct Focus {
     updated_at: Instant,
-    now: Instant,
 }
 
 /// State that is maintained by each individual widget.
@@ -2788,7 +2787,6 @@ impl LocalState {
 
         self.focused = Some(Focus {
             updated_at: now,
-            now,
         });
     }
 }

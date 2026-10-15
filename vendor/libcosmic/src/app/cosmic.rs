@@ -114,13 +114,15 @@ where
     T::Message: Send + 'static,
 {
     pub fn init(
-        (mut core, flags): (Core, T::Flags),
+        (core, flags): (Core, T::Flags),
     ) -> (Self, iced::Task<crate::Action<T::Message>>) {
         #[cfg(all(feature = "dbus-config", target_os = "linux"))]
-        {
+        let core = {
             use iced_futures::futures::executor::block_on;
+            let mut core = core;
             core.settings_daemon = block_on(cosmic_config::dbus::settings_daemon_proxy()).ok();
-        }
+            core
+        };
         let id = core.main_window_id().unwrap_or(window::Id::RESERVED);
 
         let (model, command) = T::init(core, flags);
@@ -159,7 +161,7 @@ where
         #[cfg(feature = "surface-message")]
         match _surface_message {
             #[cfg(wayland_platform)]
-            crate::surface::Action::AppSubsurface(settings, live_settings, view) => {
+            crate::surface::Action::AppSubsurface(settings, _live_settings, view) => {
                 let Some(settings) = std::sync::Arc::try_unwrap(settings)
                     .ok()
                     .and_then(|s| s.downcast::<Box<dyn Fn(&mut T) -> iced_runtime::platform_specific::wayland::subsurface::SctkSubsurfaceSettings + Send + Sync>>().ok()) else {
@@ -186,7 +188,7 @@ where
                 self.get_subsurface(settings, view.map(|v| *v))
             }
             #[cfg(wayland_platform)]
-            crate::surface::Action::Subsurface(settings, live_settings, view) => {
+            crate::surface::Action::Subsurface(settings, _live_settings, view) => {
                 let Some(settings) = std::sync::Arc::try_unwrap(settings)
                     .ok()
                     .and_then(|s| s.downcast::<Box<dyn Fn() -> iced_runtime::platform_specific::wayland::subsurface::SctkSubsurfaceSettings + Send + Sync>>().ok()) else {
@@ -502,6 +504,7 @@ where
                 }
                 Task::none()
             }
+            #[cfg(not(wayland_platform))]
             _ => iced::Task::none(),
         }
 
@@ -569,7 +572,7 @@ where
         f64::from(self.app.core().scale_factor())
     }
 
-    pub fn style(&self, theme: &Theme) -> theme::Style {
+    pub fn style(&self, _theme: &Theme) -> theme::Style {
         if let Some(style) = self.app.style() {
             style
         } else {
@@ -797,15 +800,15 @@ impl<T: Application> Cosmic<T> {
     #[allow(clippy::too_many_lines)]
     fn cosmic_update(&mut self, message: Action) -> iced::Task<crate::Action<T::Message>> {
         match message {
-            Action::WindowMaximized(id, maximized) => {
+            Action::WindowMaximized(_id, _maximized) => {
                 #[cfg(not(wayland_platform))]
                 if self
                     .app
                     .core()
                     .main_window_id()
-                    .is_some_and(|main_id| main_id == id)
+                    .is_some_and(|main_id| main_id == _id)
                 {
-                    self.app.core_mut().window.sharp_corners = maximized;
+                    self.app.core_mut().window.sharp_corners = _maximized;
                 }
             }
 
@@ -1435,7 +1438,7 @@ impl<T: Application> Cosmic<T> {
                 {
                     use iced_winit::platform_specific::commands::corner_radius::corner_radius;
 
-                    let mut theme = THEME.lock().unwrap();
+                    let theme = THEME.lock().unwrap();
 
                     // TODO do we need per window sharp corners?
                     let rounded = (!self.app.core().window.sharp_corners
@@ -1505,6 +1508,7 @@ impl<T: Application> Cosmic<T> {
                         iced_runtime::window::run_with_handle(id, init_windowing_system),
                     ]);
                 }
+                #[cfg(not(wayland_platform))]
                 return iced_runtime::window::run_with_handle(id, init_windowing_system);
             }
             #[cfg(wayland_platform)]

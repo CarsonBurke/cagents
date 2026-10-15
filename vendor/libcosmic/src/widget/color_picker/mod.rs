@@ -16,7 +16,7 @@ use crate::widget::segmented_button::Entity;
 use crate::widget::{container, slider};
 use derive_setters::Setters;
 use iced::Task;
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::gradient::{ColorStop, Linear};
 use iced_core::renderer::Quad;
 use iced_core::widget::{Tree, tree};

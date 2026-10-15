@@ -10,7 +10,7 @@ use iced::Alignment;
 use iced_runtime::core::widget::Id;
 use iced_runtime::{Action, Task, keyboard, task};
 
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::renderer::{self, Quad, Renderer};
 use iced_core::widget::Operation;
 use iced_core::widget::tree::{self, Tree};
@@ -681,7 +681,6 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
             height,
         } = layout.bounds();
         let bounds = Rect::new(x as f64, y as f64, (x + width) as f64, (y + height) as f64);
-        let is_hovered = state.state.downcast_ref::<State>().is_hovered;
 
         let mut node = Node::new(Role::Button);
         node.add_action(Action::Focus);
@@ -760,12 +759,6 @@ impl State {
     #[inline]
     pub fn is_focused(self) -> bool {
         self.is_focused
-    }
-
-    /// Returns whether the [`Button`] is currently hovered or not.
-    #[inline]
-    pub fn is_hovered(self) -> bool {
-        self.is_hovered
     }
 
     /// Focuses the [`Button`].
@@ -903,7 +896,7 @@ pub fn draw<Renderer: iced_core::Renderer, Theme>(
     viewport_bounds: Rectangle,
     styling: &super::style::Style,
     draw_contents: impl FnOnce(&mut Renderer, &Style),
-    is_image: bool,
+    _is_image: bool,
 ) where
     Theme: super::style::Catalog,
 {
