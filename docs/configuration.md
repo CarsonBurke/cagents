@@ -501,3 +501,7 @@ separate; the Keyboard table shows **Scoped** for bindings whose pane context
 cannot take a terminal's keys.
 
 PDF viewer commands `pdf_first_page`, `pdf_previous_page`, `pdf_next_page`, `pdf_last_page`, `pdf_zoom_out`, `pdf_zoom_in`, `pdf_fit` and `pdf_toggle_colors` are unbound by default. They appear in Keyboard settings; palette availability reflects the mounted PDF preview. Page and zoom limits use the same availability as the viewer toolbar.
+
+Diff presentation commands (`diff_unified`, `diff_split`, `diff_ignore_whitespace`, `diff_working`, `diff_staged`, `diff_branch`, `diff_history`, `diff_revert`, `diff_retry`) and explicit selected-row mutation commands (`diff_stage_selection`, `diff_unstage_selection`, `diff_revert_selection`) are unbound by default. Selection commands require actual changed rows and retain the displayed source, selected rows and layout revision through palette activation. Existing confirmation and mutation handling still apply.
+
+`stage_or_unstage_file` defaults to Ctrl+Shift+S, preferring Stage when the file has unstaged changes and otherwise Unstage. `stage_file` and `unstage_file` are separate unbound actions. These operate on the current file, including a clean native editor; the selected-row commands remain separate. Clearing or rebinding the toggle retires Ctrl+Shift+S. Toolbar hints use current configured bindings and only advertise the toggle for the direction it would perform.

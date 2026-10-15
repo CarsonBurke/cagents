@@ -9146,30 +9146,16 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             .into(),
         );
     }
-    // Stage and unstage follow the file the buffer is. On a symbolic link
-    // that is the target's row, or nothing when that row has no changes.
-    let subject = runtime.subject_file();
-    let staged = subject.as_ref().is_some_and(|file| file.staged);
-    let unstaged = subject.as_ref().is_some_and(|file| file.unstaged);
-    let staging: &[(bool, bool, Icon, &str)] = if runtime.reviews_pull_request() {
-        &[]
-    } else {
-        &[
-            (true, unstaged, Icon::Plus, "Stage file changes"),
-            (false, staged, Icon::Minus, "Unstage file changes"),
-        ]
-    };
-    for &(stage, has_changes, icon, label) in staging {
-        document_actions.push(
-            icon_button(icon, label)
-                .on_press_maybe(
-                    (has_changes
-                        && !runtime.mutation_refresh_pending
-                        && !runtime.blocks_navigation())
-                    .then(|| RepositoryAction::StageSelected { card, stage }),
-                )
-                .into(),
-        );
+    // Stage and unstage follow the file the buffer is; shared runtime guards
+    // retain followed-target, saving and mutation behavior in every surface.
+    if !runtime.reviews_pull_request() {
+        for (stage, icon, label, command) in [
+            (true, Icon::Plus, "Stage file changes", DiffPresentationCommand::StageFile),
+            (false, Icon::Minus, "Unstage file changes", DiffPresentationCommand::UnstageFile),
+        ] {
+            document_actions.push(icon_button(icon, registered_command_hint(runtime, stage_file_hint_command(card, runtime, stage), label))
+                .on_press_maybe(runtime.diff_presentation_action(card, command)).into());
+        }
     }
     if !document_actions.is_empty() && runtime.source_surface != SourceSurface::Diff {
         controls.push(toolbar_group(document_actions));
@@ -10156,9 +10142,49 @@ fn editable_document_view<'a>(
         .into()
 }
 
+fn registered_diff_control<'a>(
+    runtime: &RepositoryRuntime,
+    label: &'static str,
+    tooltip: impl Into<std::borrow::Cow<'a, str>>,
+    selected: bool,
+    action: Option<RepositoryAction>,
+) -> Element<'a, RepositoryAction> {
+    use crate::workspace_widget::GlobalShortcut as Command;
+    let command = action.as_ref().and_then(|action| Some(match action {
+        RepositoryAction::ApplyDiffMode { split, .. } => if *split { Command::DiffSplit } else { Command::DiffUnified },
+        RepositoryAction::ToggleDiffWhitespace { .. } => Command::DiffIgnoreWhitespace,
+        RepositoryAction::ApplyDiffBasis { basis: DiffBasis::IndexToWorktree, .. } => Command::DiffWorking,
+        RepositoryAction::ApplyDiffBasis { basis: DiffBasis::HeadToIndex, .. } => Command::DiffStaged,
+        RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::Branch, .. } => Command::DiffBranch,
+        RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::LastCommit, .. } => Command::DiffHistory,
+        RepositoryAction::StageSelected { card, stage } => stage_file_hint_command(*card, runtime, *stage),
+        RepositoryAction::DiscardEdits { .. } | RepositoryAction::RevertFile { .. } => Command::DiffRevert,
+        RepositoryAction::PreviousChange { .. } => Command::ReviewPreviousChange,
+        RepositoryAction::NextChange { .. } => Command::ReviewNextChange,
+        RepositoryAction::RetryDiff { .. } => Command::DiffRetry,
+        _ => return None,
+    }));
+    let tooltip = tooltip.into();
+    let tooltip = command.map_or_else(|| tooltip.to_string(), |command| registered_command_hint(runtime, command, &tooltip));
+    labelled_diff_control(label, tooltip, selected, action)
+}
+
+fn registered_command_hint(runtime: &RepositoryRuntime, command: crate::workspace_widget::GlobalShortcut, label: &str) -> String {
+    if crate::workspace_widget::shortcut_keys(command, &runtime.keyboard_shortcuts).is_empty() { label.to_owned() }
+    else { crate::workspace_widget::shortcut_tooltip_named(command, &runtime.keyboard_shortcuts, label) }
+}
+
+fn stage_file_hint_command(card: CardId, runtime: &RepositoryRuntime, stage: bool) -> crate::workspace_widget::GlobalShortcut {
+    use crate::workspace_widget::GlobalShortcut as Command;
+    let explicit = if stage { Command::StageFile } else { Command::UnstageFile };
+    if crate::workspace_widget::shortcut_keys(explicit, &runtime.keyboard_shortcuts).is_empty()
+        && matches!(runtime.diff_presentation_action(card, DiffPresentationCommand::StageOrUnstageFile), Some(RepositoryAction::StageSelected { stage: actual, .. }) if actual == stage)
+    { Command::StageOrUnstageFile } else { explicit }
+}
+
 fn labelled_diff_control<'a>(
     label: &'static str,
-    tooltip: &'static str,
+    tooltip: impl Into<std::borrow::Cow<'a, str>>,
     selected: bool,
     action: Option<RepositoryAction>,
 ) -> Element<'a, RepositoryAction> {
@@ -10189,7 +10215,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         ("History", "Compare last commit with its parent", BasisChoice::Committed(CommittedChoice::LastCommit), DiffPresentationCommand::History),
     ] {
         let action = runtime.diff_presentation_action(card, command);
-        controls.push(labelled_diff_control(
+        controls.push(registered_diff_control(runtime,
             label,
             tip,
             action.is_some() && selected == Some(choice),
@@ -10208,16 +10234,16 @@ fn diff_action_toolbar(
     let mut actions = Vec::new();
     if !runtime.reviews_pull_request() {
         for (command, label, tooltip) in [
-            (DiffPresentationCommand::StageFile, "Stage", "Stage file changes · Ctrl+Shift+S"),
-            (DiffPresentationCommand::UnstageFile, "Unstage", "Unstage file changes · Ctrl+Shift+S when no unstaged changes"),
+            (DiffPresentationCommand::StageFile, "Stage", "Stage file changes"),
+            (DiffPresentationCommand::UnstageFile, "Unstage", "Unstage file changes"),
         ] {
-            actions.push(labelled_diff_control(label, tooltip, false,
+            actions.push(registered_diff_control(runtime, label, tooltip, false,
                 runtime.diff_presentation_action(card, command)));
         }
-        actions.push(labelled_diff_control(
+        actions.push(registered_diff_control(runtime,
             "Revert",
             if runtime.can_discard_edits() {
-                "Discard unsaved edits · Ctrl+Z restores them"
+                "Discard unsaved edits"
             } else {
                 "Revert working tree file changes…"
             },
@@ -10225,7 +10251,7 @@ fn diff_action_toolbar(
             runtime.diff_presentation_action(card, DiffPresentationCommand::Revert),
         ));
     }
-    actions.push(labelled_diff_control(
+    actions.push(registered_diff_control(runtime,
         "Ignore whitespace",
         "Ignore horizontal whitespace in every diff",
         runtime.diff_ignore_whitespace,
@@ -10271,7 +10297,7 @@ fn diff_action_toolbar(
             .into()
     } else {
         crate::ui_controls::popover(
-            labelled_diff_control(
+            registered_diff_control(runtime,
                 "Diff actions ⋮",
                 "Diff actions",
                 runtime.toolbar_overflow_open,
@@ -10318,13 +10344,13 @@ fn diff_review_controls(
             "Refreshing diff",
         ),
         crate::ui_controls::segmented_controls(vec![
-            labelled_diff_control(
+            registered_diff_control(runtime,
                 "Unified",
                 "Unified diff",
                 runtime.diff_mode == DiffMode::Inline,
                 runtime.diff_presentation_action(card, DiffPresentationCommand::Unified),
             ),
-            labelled_diff_control(
+            registered_diff_control(runtime,
                 "Split",
                 "Side-by-side diff",
                 runtime.diff_mode == DiffMode::Split,
@@ -10333,9 +10359,9 @@ fn diff_review_controls(
         ]),
         // Navigation commands are a plain cluster, distinct from mode choices.
         toolbar_group(vec![
-            labelled_diff_control(
+            registered_diff_control(runtime,
                 "Previous",
-                "Previous hunk · Alt+K / Shift+F7",
+                "Previous hunk",
                 false,
                 (runtime.can_step_change(false))
                     .then_some(RepositoryAction::PreviousChange { card }),
@@ -10357,9 +10383,9 @@ fn diff_review_controls(
                 .width(Length::Fixed(crate::design::STEPPER_LABEL_WIDTH)),
                 basis_label(&runtime.diff_basis),
             ),
-            labelled_diff_control(
+            registered_diff_control(runtime,
                 "Next",
-                "Next hunk · Alt+J / F7",
+                "Next hunk",
                 false,
                 (runtime.can_step_change(true)).then_some(RepositoryAction::NextChange { card }),
             ),
@@ -10367,7 +10393,7 @@ fn diff_review_controls(
     ];
     if let Some(action) = runtime.diff_presentation_action(card, DiffPresentationCommand::Retry) {
         controls.push(toolbar_group(vec![
-            icon_button(Icon::Refresh, "Retry diff")
+            icon_button(Icon::Refresh, registered_command_hint(runtime, crate::workspace_widget::GlobalShortcut::DiffRetry, "Retry diff"))
                 .on_press(action)
                 .into(),
         ]));

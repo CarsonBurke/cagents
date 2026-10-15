@@ -32,6 +32,7 @@ pub enum Action {
     OpenPanes,
     ClosePane(CardId),
     MovePane(CardId),
+    RunDiffSelection(Command, Box<RepositoryAction>),
     RunGitStash(
         sidebar::git_commands::GitTarget,
         Command,
@@ -84,7 +85,7 @@ fn entry_category(message: &Message) -> char {
 
 fn entry_key(message: &Message) -> String {
     match message {
-        Message::RunCommand(command) => format!("command:{}", command.id()),
+        Message::RunCommand(command) | Message::Palette(Action::RunDiffSelection(command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::RunGitStash(_, command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::MovePaneToChannel(_, _)) => {
             format!("command:{}", Command::MovePaneToChannel.id())
@@ -110,6 +111,10 @@ fn entry_key(message: &Message) -> String {
 fn same_palette_entry(left: &Message, right: &Message) -> bool {
     match (left, right) {
         (Message::RunCommand(left), Message::RunCommand(right)) => left == right,
+        (Message::Palette(Action::RunDiffSelection(lc, la)), Message::Palette(Action::RunDiffSelection(rc, ra))) => lc == rc && match (la.as_ref(), ra.as_ref()) {
+            (RepositoryAction::ApplyDiffHunk { card: left, kind: lk, request: lr }, RepositoryAction::ApplyDiffHunk { card: right, kind: rk, request: rr }) => left == right && lk == rk && lr == rr,
+            _ => false,
+        },
         (
             Message::Palette(Action::RunGitStash(lt, lc, le)),
             Message::Palette(Action::RunGitStash(rt, rc, re)),
@@ -439,6 +444,20 @@ impl Cagents {
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
+            }
+            Action::RunDiffSelection(command, action) => {
+                let current = match action.as_ref() {
+                    RepositoryAction::ApplyDiffHunk { card, kind, request } if workspace_widget::diff_selection_command_kind(command) == Some(*kind) && self.diff_mutation_source(*card).is_some() => matches!(self.cards.get(card), Some(CardRuntime::Repository(runtime)) if runtime.capture_diff_mutation(*card, *kind, Some(request)).is_some()),
+                    _ => false,
+                };
+                if !current || self.workspace_inputs_blocked() {
+                    self.status = Some(TransientNotice::warning("The selected diff changed; select its rows again"));
+                    return Task::none();
+                }
+                // Keep the captured source, row coordinates and layout revision.
+                // The existing patch pipeline rejects stale requests and owns
+                // confirmation, queueing and any in-buffer undo transaction.
+                self.update(Message::Repository(*action))
             }
             Action::RunGitStash(target, command, entry) => {
                 if self.focused_repository_is_saving() || self.workspace_inputs_blocked() {
@@ -817,7 +836,7 @@ impl Cagents {
             } else {
                 match message {
                     Message::FocusAttention(_) => "Needs attention",
-                    Message::RunCommand(_) => "Commands",
+                    Message::RunCommand(_) | Message::Palette(Action::RunDiffSelection(_, _)) => "Commands",
                     Message::Palette(Action::FocusPane(_)) => "Panes",
                     _ => "Workspaces",
                 }
@@ -1004,15 +1023,21 @@ impl Cagents {
                     .iter()
                     .filter(|descriptor| descriptor.action != Command::CommandPalette)
                     .filter(|descriptor| descriptor.available(&context))
-                    .map(|descriptor| {
-                        (
+                    .filter_map(|descriptor| {
+                        let message = if let Some(kind) = workspace_widget::diff_selection_command_kind(descriptor.action) {
+                            let action = self.workspace.focused().and_then(|card| match self.cards.get(&card) {
+                                Some(CardRuntime::Repository(runtime)) => runtime.diff_selection_mutation_action(card, kind), _ => None,
+                            })?;
+                            Message::Palette(Action::RunDiffSelection(descriptor.action, Box::new(action)))
+                        } else { Message::RunCommand(descriptor.action) };
+                        Some((
                             descriptor.label.to_owned(),
                             workspace_widget::shortcut_chords(
                                 descriptor.action,
                                 &self.settings.keyboard_shortcuts,
                             ),
-                            Message::RunCommand(descriptor.action),
-                        )
+                            message,
+                        ))
                     })
                     .collect()
             } else {
@@ -1129,7 +1154,7 @@ impl Cagents {
                         } else {
                             match message {
                                 Message::FocusAttention(_) => 1,
-                                Message::RunCommand(_) => 2,
+                                Message::RunCommand(_) | Message::Palette(Action::RunDiffSelection(_, _)) => 2,
                                 Message::Palette(Action::FocusPane(_)) => 3,
                                 _ => 4,
                             }
@@ -1630,6 +1655,8 @@ impl Cagents {
                 _ => None,
             }.map_or(0, |runtime| workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| workspace_widget::diff_command_bit(descriptor.action).filter(|_| runtime.diff_command_available(descriptor.id()))).fold(0, |flags, bit| flags | bit))),
             pdf_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.pdf_command_capabilities(id), _ => 0 }),
+            diff_presentation_commands: card.map_or(0, |card| self.diff_presentation_command_capabilities(card)),
+            diff_selection_commands: card.map_or(0, |card| self.diff_selection_command_capabilities(card)),
             editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
             editor_surface_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_surface_command_capabilities(id), Some(CardRuntime::PullRequests(pane)) => pane.runtime.editor_surface_command_capabilities(id), _ => 0 }),
             editor_language_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) if self.lsp_document(id) == runtime.lsp_document() && self.lsp_document(id).and_then(|doc| self.lsp.document_version(doc)).is_some() => runtime.editor_language_command_capabilities(), _ => 0 }),
@@ -1729,7 +1756,51 @@ impl Cagents {
         })
     }
 
+    fn diff_mutation_source(&self, card: CardId) -> Option<&sidebar::SourceControlModel> {
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return None; };
+        self.sidebar_model.source_control.as_ref().filter(|source| {
+            source.key.canonical_path == runtime.descriptor.worktree
+                && self.sidebar_state.active_worktree() == Some(&source.key)
+                && self.sidebar_model.contains_worktree(&source.key)
+                && matches!(source.data_state, sidebar::SidebarDataState::Ready)
+                && !source.reloading && !source.busy()
+        })
+    }
+
+    fn diff_selection_command_capabilities(&self, card: CardId) -> u8 {
+        if self.diff_mutation_source(card).is_none() { return 0; }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return 0; };
+        workspace_widget::DIFF_SELECTION_COMMANDS.into_iter().filter_map(|command| {
+            let kind = workspace_widget::diff_selection_command_kind(command)?;
+            runtime.can_apply_diff_selection(kind).then(|| workspace_widget::diff_selection_command_bit(command)).flatten()
+        }).fold(0, |mask, bit| mask | bit)
+    }
+
+    fn diff_presentation_command_capabilities(&self, card: CardId) -> u16 {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.as_ref(), Some(CardRuntime::PullRequests(pane)) => &pane.runtime, _ => return 0,
+        };
+        workspace_widget::DIFF_PRESENTATION_COMMANDS.into_iter().filter_map(|command| {
+            let action = runtime.diff_presentation_action(card, workspace_widget::diff_presentation_command(command)?)?;
+            if matches!(action, RepositoryAction::StageSelected { .. } | RepositoryAction::RevertFile { .. }) && self.diff_mutation_source(card).is_none() { return None; }
+            workspace_widget::diff_presentation_command_bit(command)
+        }).fold(0, |mask, bit| mask | bit)
+    }
+
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if let Some(kind) = workspace_widget::diff_presentation_command(command) {
+            let action = self.workspace.focused().and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime.diff_presentation_action(card, kind), Some(CardRuntime::PullRequests(pane)) => pane.runtime.diff_presentation_action(card, kind), _ => None,
+            });
+            return action.map_or_else(Task::none, |action| self.update(Message::Repository(action)));
+        }
+        if let Some(kind) = workspace_widget::diff_selection_command_kind(command) {
+            let action = self.workspace.focused().and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime.diff_selection_mutation_action(card, kind), _ => None,
+            });
+            return action.map_or_else(Task::none, |action| self.update(Message::Repository(action)));
+        }
+
         if workspace_widget::editor_surface_command_bit(command).is_some() {
             return self
                 .workspace
@@ -2088,7 +2159,23 @@ impl Cagents {
             | Command::PdfZoomOut
             | Command::PdfZoomIn
             | Command::PdfFit
-            | Command::PdfToggleColors => self.run_registered_command(command),
+            | Command::PdfToggleColors
+            | Command::DiffUnified
+            | Command::DiffSplit
+            | Command::DiffIgnoreWhitespace
+            | Command::DiffWorking
+            | Command::DiffStaged
+            | Command::DiffBranch
+            | Command::DiffHistory
+            | Command::StageFile
+            | Command::UnstageFile
+            | Command::StageOrUnstageFile
+            | Command::DiffRevert
+            | Command::DiffRetry
+            | Command::DiffStageSelection
+            | Command::DiffUnstageSelection
+            | Command::DiffRevertSelection
+            => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -2378,6 +2465,21 @@ impl SettingsField {
             Self::ShortcutPdfZoomIn => Some(Command::PdfZoomIn),
             Self::ShortcutPdfFit => Some(Command::PdfFit),
             Self::ShortcutPdfToggleColors => Some(Command::PdfToggleColors),
+            Self::ShortcutDiffUnified => Some(Command::DiffUnified),
+            Self::ShortcutDiffSplit => Some(Command::DiffSplit),
+            Self::ShortcutDiffIgnoreWhitespace => Some(Command::DiffIgnoreWhitespace),
+            Self::ShortcutDiffWorking => Some(Command::DiffWorking),
+            Self::ShortcutDiffStaged => Some(Command::DiffStaged),
+            Self::ShortcutDiffBranch => Some(Command::DiffBranch),
+            Self::ShortcutDiffHistory => Some(Command::DiffHistory),
+            Self::ShortcutStageFile => Some(Command::StageFile),
+            Self::ShortcutUnstageFile => Some(Command::UnstageFile),
+            Self::ShortcutStageOrUnstageFile => Some(Command::StageOrUnstageFile),
+            Self::ShortcutDiffRevert => Some(Command::DiffRevert),
+            Self::ShortcutDiffRetry => Some(Command::DiffRetry),
+            Self::ShortcutDiffStageSelection => Some(Command::DiffStageSelection),
+            Self::ShortcutDiffUnstageSelection => Some(Command::DiffUnstageSelection),
+            Self::ShortcutDiffRevertSelection => Some(Command::DiffRevertSelection),
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -2613,6 +2715,21 @@ impl ShortcutDraft {
             (Command::PdfZoomIn, self.pdf_zoom_in.as_str()),
             (Command::PdfFit, self.pdf_fit.as_str()),
             (Command::PdfToggleColors, self.pdf_toggle_colors.as_str()),
+            (Command::DiffUnified, self.diff_unified.as_str()),
+            (Command::DiffSplit, self.diff_split.as_str()),
+            (Command::DiffIgnoreWhitespace, self.diff_ignore_whitespace.as_str()),
+            (Command::DiffWorking, self.diff_working.as_str()),
+            (Command::DiffStaged, self.diff_staged.as_str()),
+            (Command::DiffBranch, self.diff_branch.as_str()),
+            (Command::DiffHistory, self.diff_history.as_str()),
+            (Command::StageFile, self.stage_file.as_str()),
+            (Command::UnstageFile, self.unstage_file.as_str()),
+            (Command::StageOrUnstageFile, self.stage_or_unstage_file.as_str()),
+            (Command::DiffRevert, self.diff_revert.as_str()),
+            (Command::DiffRetry, self.diff_retry.as_str()),
+            (Command::DiffStageSelection, self.diff_stage_selection.as_str()),
+            (Command::DiffUnstageSelection, self.diff_unstage_selection.as_str()),
+            (Command::DiffRevertSelection, self.diff_revert_selection.as_str()),
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
             (Command::ClonePane, self.clone_pane.as_str()),

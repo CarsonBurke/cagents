@@ -176,6 +176,21 @@ pub enum GlobalShortcut {
     PdfZoomIn,
     PdfFit,
     PdfToggleColors,
+    DiffUnified,
+    DiffSplit,
+    DiffIgnoreWhitespace,
+    DiffWorking,
+    DiffStaged,
+    DiffBranch,
+    DiffHistory,
+    StageFile,
+    UnstageFile,
+    StageOrUnstageFile,
+    DiffRevert,
+    DiffRetry,
+    DiffStageSelection,
+    DiffUnstageSelection,
+    DiffRevertSelection,
 
     CommandPalette,
     NewThread,
@@ -314,6 +329,8 @@ impl GlobalShortcut {
                     | Self::DiffOpenInEditor
                     | Self::OpenFile
                     | Self::DeleteChannel
+                | Self::StageFile | Self::UnstageFile | Self::StageOrUnstageFile
+                | Self::DiffStageSelection | Self::DiffUnstageSelection | Self::DiffRevertSelection | Self::DiffRevert
             )
     }
 
@@ -441,6 +458,21 @@ impl GlobalShortcut {
             Self::PdfZoomIn => "pdf_zoom_in",
             Self::PdfFit => "pdf_fit",
             Self::PdfToggleColors => "pdf_toggle_colors",
+            Self::DiffUnified => "diff_unified",
+            Self::DiffSplit => "diff_split",
+            Self::DiffIgnoreWhitespace => "diff_ignore_whitespace",
+            Self::DiffWorking => "diff_working",
+            Self::DiffStaged => "diff_staged",
+            Self::DiffBranch => "diff_branch",
+            Self::DiffHistory => "diff_history",
+            Self::StageFile => "stage_file",
+            Self::UnstageFile => "unstage_file",
+            Self::StageOrUnstageFile => "stage_or_unstage_file",
+            Self::DiffRevert => "diff_revert",
+            Self::DiffRetry => "diff_retry",
+            Self::DiffStageSelection => "diff_stage_selection",
+            Self::DiffUnstageSelection => "diff_unstage_selection",
+            Self::DiffRevertSelection => "diff_revert_selection",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -633,6 +665,8 @@ pub struct CommandContext {
     pub can_reopen: bool,
     pub has_unread: bool,
     pub editor_commands: u8,
+    pub diff_presentation_commands: u16,
+    pub diff_selection_commands: u8,
     pub pdf_commands: u8,
     pub editor_surface_commands: u8,
     pub editor_language_commands: u8,
@@ -654,6 +688,7 @@ impl ShortcutDescriptor {
     }
 
     pub fn category(self) -> &'static str {
+        if matches!(self.action, GlobalShortcut::StageFile | GlobalShortcut::UnstageFile | GlobalShortcut::StageOrUnstageFile) { return "Git"; }
         if self.id().starts_with("git_") {
             return "Git";
         }
@@ -744,6 +779,8 @@ impl ShortcutDescriptor {
         if let Some(bit) = diff_command_bit(self.action) {
             return context.diff_commands & bit != 0;
         }
+        if let Some(bit) = diff_presentation_command_bit(self.action) { return context.diff_presentation_commands & bit != 0; }
+        if let Some(bit) = diff_selection_command_bit(self.action) { return context.diff_selection_commands & bit != 0; }
         if let Some(bit) = editor_language_command_bit(self.action) {
             return context.editor_language_commands & bit != 0;
         }
@@ -1762,6 +1799,21 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Repository,
     },
+    ShortcutDescriptor { action: GlobalShortcut::DiffUnified, label: "Unified diff", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffSplit, label: "Side-by-side diff", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffIgnoreWhitespace, label: "Toggle ignored diff whitespace", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffWorking, label: "Compare index with working tree", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffStaged, label: "Compare HEAD with index", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffBranch, label: "Compare branch with base", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffHistory, label: "Compare last commit with parent", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::StageFile, label: "Stage file", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::UnstageFile, label: "Unstage file", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::StageOrUnstageFile, label: "Stage or unstage file", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::DiffRevert, label: "Revert file changes", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffRetry, label: "Retry diff", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffStageSelection, label: "Stage selected diff rows", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffUnstageSelection, label: "Unstage selected diff rows", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffRevertSelection, label: "Revert selected diff rows", repeatable: false, scope: ShortcutScope::Review },
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
@@ -1903,6 +1955,21 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::PdfZoomIn => &shortcuts.pdf_zoom_in,
         GlobalShortcut::PdfFit => &shortcuts.pdf_fit,
         GlobalShortcut::PdfToggleColors => &shortcuts.pdf_toggle_colors,
+        GlobalShortcut::DiffUnified => &shortcuts.diff_unified,
+        GlobalShortcut::DiffSplit => &shortcuts.diff_split,
+        GlobalShortcut::DiffIgnoreWhitespace => &shortcuts.diff_ignore_whitespace,
+        GlobalShortcut::DiffWorking => &shortcuts.diff_working,
+        GlobalShortcut::DiffStaged => &shortcuts.diff_staged,
+        GlobalShortcut::DiffBranch => &shortcuts.diff_branch,
+        GlobalShortcut::DiffHistory => &shortcuts.diff_history,
+        GlobalShortcut::StageFile => &shortcuts.stage_file,
+        GlobalShortcut::UnstageFile => &shortcuts.unstage_file,
+        GlobalShortcut::StageOrUnstageFile => &shortcuts.stage_or_unstage_file,
+        GlobalShortcut::DiffRevert => &shortcuts.diff_revert,
+        GlobalShortcut::DiffRetry => &shortcuts.diff_retry,
+        GlobalShortcut::DiffStageSelection => &shortcuts.diff_stage_selection,
+        GlobalShortcut::DiffUnstageSelection => &shortcuts.diff_unstage_selection,
+        GlobalShortcut::DiffRevertSelection => &shortcuts.diff_revert_selection,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -2451,6 +2518,75 @@ pub fn shortcut_descriptor_by_id(id: &str) -> Option<&'static ShortcutDescriptor
     GLOBAL_SHORTCUT_DESCRIPTORS
         .iter()
         .find(|descriptor| descriptor.id() == id)
+}
+
+pub const DIFF_PRESENTATION_COMMANDS: [GlobalShortcut; 12] = [GlobalShortcut::DiffUnified, GlobalShortcut::DiffSplit, GlobalShortcut::DiffIgnoreWhitespace, GlobalShortcut::DiffWorking, GlobalShortcut::DiffStaged, GlobalShortcut::DiffBranch, GlobalShortcut::DiffHistory, GlobalShortcut::StageFile, GlobalShortcut::UnstageFile, GlobalShortcut::StageOrUnstageFile, GlobalShortcut::DiffRevert, GlobalShortcut::DiffRetry];
+pub const fn diff_presentation_command(command: GlobalShortcut) -> Option<crate::repository_widget::DiffPresentationCommand> {
+    match command {
+        GlobalShortcut::DiffUnified => Some(crate::repository_widget::DiffPresentationCommand::Unified),
+        GlobalShortcut::DiffSplit => Some(crate::repository_widget::DiffPresentationCommand::Split),
+        GlobalShortcut::DiffIgnoreWhitespace => Some(crate::repository_widget::DiffPresentationCommand::IgnoreWhitespace),
+        GlobalShortcut::DiffWorking => Some(crate::repository_widget::DiffPresentationCommand::Working),
+        GlobalShortcut::DiffStaged => Some(crate::repository_widget::DiffPresentationCommand::Staged),
+        GlobalShortcut::DiffBranch => Some(crate::repository_widget::DiffPresentationCommand::Branch),
+        GlobalShortcut::DiffHistory => Some(crate::repository_widget::DiffPresentationCommand::History),
+        GlobalShortcut::StageFile => Some(crate::repository_widget::DiffPresentationCommand::StageFile),
+        GlobalShortcut::UnstageFile => Some(crate::repository_widget::DiffPresentationCommand::UnstageFile),
+        GlobalShortcut::StageOrUnstageFile => Some(crate::repository_widget::DiffPresentationCommand::StageOrUnstageFile),
+        GlobalShortcut::DiffRevert => Some(crate::repository_widget::DiffPresentationCommand::Revert),
+        GlobalShortcut::DiffRetry => Some(crate::repository_widget::DiffPresentationCommand::Retry),
+        _ => None,
+    }
+}
+pub const fn diff_presentation_registry_command(command: crate::repository_widget::DiffPresentationCommand) -> GlobalShortcut {
+    match command {
+        crate::repository_widget::DiffPresentationCommand::Unified => GlobalShortcut::DiffUnified,
+        crate::repository_widget::DiffPresentationCommand::Split => GlobalShortcut::DiffSplit,
+        crate::repository_widget::DiffPresentationCommand::IgnoreWhitespace => GlobalShortcut::DiffIgnoreWhitespace,
+        crate::repository_widget::DiffPresentationCommand::Working => GlobalShortcut::DiffWorking,
+        crate::repository_widget::DiffPresentationCommand::Staged => GlobalShortcut::DiffStaged,
+        crate::repository_widget::DiffPresentationCommand::Branch => GlobalShortcut::DiffBranch,
+        crate::repository_widget::DiffPresentationCommand::History => GlobalShortcut::DiffHistory,
+        crate::repository_widget::DiffPresentationCommand::StageFile => GlobalShortcut::StageFile,
+        crate::repository_widget::DiffPresentationCommand::UnstageFile => GlobalShortcut::UnstageFile,
+        crate::repository_widget::DiffPresentationCommand::StageOrUnstageFile => GlobalShortcut::StageOrUnstageFile,
+        crate::repository_widget::DiffPresentationCommand::Revert => GlobalShortcut::DiffRevert,
+        crate::repository_widget::DiffPresentationCommand::Retry => GlobalShortcut::DiffRetry,
+    }
+}
+pub const fn diff_presentation_command_bit(command: GlobalShortcut) -> Option<u16> {
+    match command {
+        GlobalShortcut::DiffUnified => Some(1 << 0),
+        GlobalShortcut::DiffSplit => Some(1 << 1),
+        GlobalShortcut::DiffIgnoreWhitespace => Some(1 << 2),
+        GlobalShortcut::DiffWorking => Some(1 << 3),
+        GlobalShortcut::DiffStaged => Some(1 << 4),
+        GlobalShortcut::DiffBranch => Some(1 << 5),
+        GlobalShortcut::DiffHistory => Some(1 << 6),
+        GlobalShortcut::StageFile => Some(1 << 7),
+        GlobalShortcut::UnstageFile => Some(1 << 8),
+        GlobalShortcut::StageOrUnstageFile => Some(1 << 9),
+        GlobalShortcut::DiffRevert => Some(1 << 10),
+        GlobalShortcut::DiffRetry => Some(1 << 11),
+        _ => None,
+    }
+}
+pub const DIFF_SELECTION_COMMANDS: [GlobalShortcut; 3] = [GlobalShortcut::DiffStageSelection, GlobalShortcut::DiffUnstageSelection, GlobalShortcut::DiffRevertSelection];
+pub const fn diff_selection_command_kind(command: GlobalShortcut) -> Option<crate::git_patch::Kind> {
+    match command {
+        GlobalShortcut::DiffStageSelection => Some(crate::git_patch::Kind::Stage),
+        GlobalShortcut::DiffUnstageSelection => Some(crate::git_patch::Kind::Unstage),
+        GlobalShortcut::DiffRevertSelection => Some(crate::git_patch::Kind::Revert),
+        _ => None,
+    }
+}
+pub const fn diff_selection_command_bit(command: GlobalShortcut) -> Option<u8> {
+    match command {
+        GlobalShortcut::DiffStageSelection => Some(1 << 0),
+        GlobalShortcut::DiffUnstageSelection => Some(1 << 1),
+        GlobalShortcut::DiffRevertSelection => Some(1 << 2),
+        _ => None,
+    }
 }
 
 pub const fn editor_language_command_bit(command: GlobalShortcut) -> Option<u8> {

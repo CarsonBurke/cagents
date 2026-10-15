@@ -403,6 +403,21 @@ pub struct KeyboardShortcuts {
     pub pdf_zoom_in: Vec<String>,
     pub pdf_fit: Vec<String>,
     pub pdf_toggle_colors: Vec<String>,
+    pub diff_unified: Vec<String>,
+    pub diff_split: Vec<String>,
+    pub diff_ignore_whitespace: Vec<String>,
+    pub diff_working: Vec<String>,
+    pub diff_staged: Vec<String>,
+    pub diff_branch: Vec<String>,
+    pub diff_history: Vec<String>,
+    pub stage_file: Vec<String>,
+    pub unstage_file: Vec<String>,
+    pub stage_or_unstage_file: Vec<String>,
+    pub diff_revert: Vec<String>,
+    pub diff_retry: Vec<String>,
+    pub diff_stage_selection: Vec<String>,
+    pub diff_unstage_selection: Vec<String>,
+    pub diff_revert_selection: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -572,6 +587,21 @@ impl Default for KeyboardShortcuts {
             pdf_zoom_in: Vec::new(),
             pdf_fit: Vec::new(),
             pdf_toggle_colors: Vec::new(),
+            diff_unified: Vec::new(),
+            diff_split: Vec::new(),
+            diff_ignore_whitespace: Vec::new(),
+            diff_working: Vec::new(),
+            diff_staged: Vec::new(),
+            diff_branch: Vec::new(),
+            diff_history: Vec::new(),
+            stage_file: Vec::new(),
+            unstage_file: Vec::new(),
+            stage_or_unstage_file: vec!["Ctrl+Shift+S".into()],
+            diff_revert: Vec::new(),
+            diff_retry: Vec::new(),
+            diff_stage_selection: Vec::new(),
+            diff_unstage_selection: Vec::new(),
+            diff_revert_selection: Vec::new(),
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -604,7 +634,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 156] {
+    pub fn actions(&self) -> [&Vec<String>; 171] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -762,12 +792,27 @@ impl KeyboardShortcuts {
             &self.pdf_zoom_in,
             &self.pdf_fit,
             &self.pdf_toggle_colors,
+            &self.diff_unified,
+            &self.diff_split,
+            &self.diff_ignore_whitespace,
+            &self.diff_working,
+            &self.diff_staged,
+            &self.diff_branch,
+            &self.diff_history,
+            &self.stage_file,
+            &self.unstage_file,
+            &self.stage_or_unstage_file,
+            &self.diff_revert,
+            &self.diff_retry,
+            &self.diff_stage_selection,
+            &self.diff_unstage_selection,
+            &self.diff_revert_selection,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 156] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 171] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -925,6 +970,21 @@ impl KeyboardShortcuts {
             &mut self.pdf_zoom_in,
             &mut self.pdf_fit,
             &mut self.pdf_toggle_colors,
+            &mut self.diff_unified,
+            &mut self.diff_split,
+            &mut self.diff_ignore_whitespace,
+            &mut self.diff_working,
+            &mut self.diff_staged,
+            &mut self.diff_branch,
+            &mut self.diff_history,
+            &mut self.stage_file,
+            &mut self.unstage_file,
+            &mut self.stage_or_unstage_file,
+            &mut self.diff_revert,
+            &mut self.diff_retry,
+            &mut self.diff_stage_selection,
+            &mut self.diff_unstage_selection,
+            &mut self.diff_revert_selection,
         ]
     }
 
@@ -986,7 +1046,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 156] = [
+const SHORTCUT_ACTIONS: [&str; 171] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1143,6 +1203,21 @@ const SHORTCUT_ACTIONS: [&str; 156] = [
     "pdf_zoom_in",
     "pdf_fit",
     "pdf_toggle_colors",
+    "diff_unified",
+    "diff_split",
+    "diff_ignore_whitespace",
+    "diff_working",
+    "diff_staged",
+    "diff_branch",
+    "diff_history",
+    "stage_file",
+    "unstage_file",
+    "stage_or_unstage_file",
+    "diff_revert",
+    "diff_retry",
+    "diff_stage_selection",
+    "diff_unstage_selection",
+    "diff_revert_selection",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1186,12 +1261,6 @@ pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
         chords: &["Ctrl+0"],
         scope: "Editor",
         refusal: "This chord is reserved for Reset font size",
-    },
-    FixedShortcut {
-        label: "Stage / unstage selected lines",
-        chords: &["Ctrl+Shift+S"],
-        scope: "Editor",
-        refusal: "This chord is reserved for Stage / unstage selected lines",
     },
     FixedShortcut {
         label: "Copy terminal selection",
@@ -1312,6 +1381,7 @@ pub fn text_editing_shortcut_conflict_for(
 /// History bindings must therefore collide with it even though ordinary native
 /// editor commands are disjoint from immutable review surfaces.
 pub fn is_review_command(action: &str) -> bool {
+    if matches!(action, "diff_unified" | "diff_split" | "diff_ignore_whitespace" | "diff_working" | "diff_staged" | "diff_branch" | "diff_history" | "diff_revert" | "diff_retry" | "diff_stage_selection" | "diff_unstage_selection" | "diff_revert_selection") { return true; }
     matches!(
         action,
         "review_toggle_viewed"
@@ -2402,7 +2472,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 151] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 166] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2554,6 +2624,21 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 151] = [
     "pdf_zoom_in",
     "pdf_fit",
     "pdf_toggle_colors",
+    "diff_unified",
+    "diff_split",
+    "diff_ignore_whitespace",
+    "diff_working",
+    "diff_staged",
+    "diff_branch",
+    "diff_history",
+    "stage_file",
+    "unstage_file",
+    "stage_or_unstage_file",
+    "diff_revert",
+    "diff_retry",
+    "diff_stage_selection",
+    "diff_unstage_selection",
+    "diff_revert_selection",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -5474,7 +5559,6 @@ new_thread = "Alt+Shift+G"
             ("Ctrl+Tab", "Cycle recent panes"),
             ("Ctrl+=", "Increase font size"),
             ("Ctrl+Shift+C", "Copy terminal selection"),
-            ("Ctrl+Shift+S", "Stage / unstage selected lines"),
         ] {
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.new_terminal = vec![chord.into()];

@@ -2952,11 +2952,26 @@ pub enum SettingsField {
     ShortcutPdfZoomIn,
     ShortcutPdfFit,
     ShortcutPdfToggleColors,
+    ShortcutDiffUnified,
+    ShortcutDiffSplit,
+    ShortcutDiffIgnoreWhitespace,
+    ShortcutDiffWorking,
+    ShortcutDiffStaged,
+    ShortcutDiffBranch,
+    ShortcutDiffHistory,
+    ShortcutStageFile,
+    ShortcutUnstageFile,
+    ShortcutStageOrUnstageFile,
+    ShortcutDiffRevert,
+    ShortcutDiffRetry,
+    ShortcutDiffStageSelection,
+    ShortcutDiffUnstageSelection,
+    ShortcutDiffRevertSelection,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 156] = [
+    const SHORTCUTS: [Self; 171] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3113,6 +3128,21 @@ impl SettingsField {
         Self::ShortcutPdfZoomIn,
         Self::ShortcutPdfFit,
         Self::ShortcutPdfToggleColors,
+        Self::ShortcutDiffUnified,
+        Self::ShortcutDiffSplit,
+        Self::ShortcutDiffIgnoreWhitespace,
+        Self::ShortcutDiffWorking,
+        Self::ShortcutDiffStaged,
+        Self::ShortcutDiffBranch,
+        Self::ShortcutDiffHistory,
+        Self::ShortcutStageFile,
+        Self::ShortcutUnstageFile,
+        Self::ShortcutStageOrUnstageFile,
+        Self::ShortcutDiffRevert,
+        Self::ShortcutDiffRetry,
+        Self::ShortcutDiffStageSelection,
+        Self::ShortcutDiffUnstageSelection,
+        Self::ShortcutDiffRevertSelection,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3278,6 +3308,21 @@ impl SettingsField {
             Self::ShortcutPdfZoomIn => "Zoom PDF in",
             Self::ShortcutPdfFit => "Fit PDF page to pane",
             Self::ShortcutPdfToggleColors => "Toggle PDF adapted colors",
+            Self::ShortcutDiffUnified => "Unified diff",
+            Self::ShortcutDiffSplit => "Side-by-side diff",
+            Self::ShortcutDiffIgnoreWhitespace => "Toggle ignored diff whitespace",
+            Self::ShortcutDiffWorking => "Compare index with working tree",
+            Self::ShortcutDiffStaged => "Compare HEAD with index",
+            Self::ShortcutDiffBranch => "Compare branch with base",
+            Self::ShortcutDiffHistory => "Compare last commit with parent",
+            Self::ShortcutStageFile => "Stage file",
+            Self::ShortcutUnstageFile => "Unstage file",
+            Self::ShortcutStageOrUnstageFile => "Stage or unstage file",
+            Self::ShortcutDiffRevert => "Revert file changes",
+            Self::ShortcutDiffRetry => "Retry diff",
+            Self::ShortcutDiffStageSelection => "Stage selected diff rows",
+            Self::ShortcutDiffUnstageSelection => "Unstage selected diff rows",
+            Self::ShortcutDiffRevertSelection => "Revert selected diff rows",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3497,6 +3542,21 @@ impl SettingsField {
             | Self::ShortcutPdfZoomIn
             | Self::ShortcutPdfFit
             | Self::ShortcutPdfToggleColors
+            | Self::ShortcutDiffUnified
+            | Self::ShortcutDiffSplit
+            | Self::ShortcutDiffIgnoreWhitespace
+            | Self::ShortcutDiffWorking
+            | Self::ShortcutDiffStaged
+            | Self::ShortcutDiffBranch
+            | Self::ShortcutDiffHistory
+            | Self::ShortcutStageFile
+            | Self::ShortcutUnstageFile
+            | Self::ShortcutStageOrUnstageFile
+            | Self::ShortcutDiffRevert
+            | Self::ShortcutDiffRetry
+            | Self::ShortcutDiffStageSelection
+            | Self::ShortcutDiffUnstageSelection
+            | Self::ShortcutDiffRevertSelection
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3680,6 +3740,21 @@ struct ShortcutDraft {
     pdf_zoom_in: String,
     pdf_fit: String,
     pdf_toggle_colors: String,
+    diff_unified: String,
+    diff_split: String,
+    diff_ignore_whitespace: String,
+    diff_working: String,
+    diff_staged: String,
+    diff_branch: String,
+    diff_history: String,
+    stage_file: String,
+    unstage_file: String,
+    stage_or_unstage_file: String,
+    diff_revert: String,
+    diff_retry: String,
+    diff_stage_selection: String,
+    diff_unstage_selection: String,
+    diff_revert_selection: String,
 
     command_palette: String,
     new_native_thread: String,
@@ -3852,6 +3927,21 @@ impl ShortcutDraft {
             pdf_zoom_in: settings::format_chords(&shortcuts.pdf_zoom_in),
             pdf_fit: settings::format_chords(&shortcuts.pdf_fit),
             pdf_toggle_colors: settings::format_chords(&shortcuts.pdf_toggle_colors),
+            diff_unified: settings::format_chords(&shortcuts.diff_unified),
+            diff_split: settings::format_chords(&shortcuts.diff_split),
+            diff_ignore_whitespace: settings::format_chords(&shortcuts.diff_ignore_whitespace),
+            diff_working: settings::format_chords(&shortcuts.diff_working),
+            diff_staged: settings::format_chords(&shortcuts.diff_staged),
+            diff_branch: settings::format_chords(&shortcuts.diff_branch),
+            diff_history: settings::format_chords(&shortcuts.diff_history),
+            stage_file: settings::format_chords(&shortcuts.stage_file),
+            unstage_file: settings::format_chords(&shortcuts.unstage_file),
+            stage_or_unstage_file: settings::format_chords(&shortcuts.stage_or_unstage_file),
+            diff_revert: settings::format_chords(&shortcuts.diff_revert),
+            diff_retry: settings::format_chords(&shortcuts.diff_retry),
+            diff_stage_selection: settings::format_chords(&shortcuts.diff_stage_selection),
+            diff_unstage_selection: settings::format_chords(&shortcuts.diff_unstage_selection),
+            diff_revert_selection: settings::format_chords(&shortcuts.diff_revert_selection),
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -4305,6 +4395,21 @@ impl SettingsDraft {
             SettingsField::ShortcutPdfToggleColors => {
                 self.keyboard_shortcuts.pdf_toggle_colors = value
             }
+            SettingsField::ShortcutDiffUnified => self.keyboard_shortcuts.diff_unified = value,
+            SettingsField::ShortcutDiffSplit => self.keyboard_shortcuts.diff_split = value,
+            SettingsField::ShortcutDiffIgnoreWhitespace => self.keyboard_shortcuts.diff_ignore_whitespace = value,
+            SettingsField::ShortcutDiffWorking => self.keyboard_shortcuts.diff_working = value,
+            SettingsField::ShortcutDiffStaged => self.keyboard_shortcuts.diff_staged = value,
+            SettingsField::ShortcutDiffBranch => self.keyboard_shortcuts.diff_branch = value,
+            SettingsField::ShortcutDiffHistory => self.keyboard_shortcuts.diff_history = value,
+            SettingsField::ShortcutStageFile => self.keyboard_shortcuts.stage_file = value,
+            SettingsField::ShortcutUnstageFile => self.keyboard_shortcuts.unstage_file = value,
+            SettingsField::ShortcutStageOrUnstageFile => self.keyboard_shortcuts.stage_or_unstage_file = value,
+            SettingsField::ShortcutDiffRevert => self.keyboard_shortcuts.diff_revert = value,
+            SettingsField::ShortcutDiffRetry => self.keyboard_shortcuts.diff_retry = value,
+            SettingsField::ShortcutDiffStageSelection => self.keyboard_shortcuts.diff_stage_selection = value,
+            SettingsField::ShortcutDiffUnstageSelection => self.keyboard_shortcuts.diff_unstage_selection = value,
+            SettingsField::ShortcutDiffRevertSelection => self.keyboard_shortcuts.diff_revert_selection = value,
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -4869,6 +4974,21 @@ fn settings_update(
             next.keyboard_shortcuts.pdf_toggle_colors = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutDiffUnified => { next.keyboard_shortcuts.diff_unified = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffSplit => { next.keyboard_shortcuts.diff_split = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffIgnoreWhitespace => { next.keyboard_shortcuts.diff_ignore_whitespace = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffWorking => { next.keyboard_shortcuts.diff_working = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffStaged => { next.keyboard_shortcuts.diff_staged = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffBranch => { next.keyboard_shortcuts.diff_branch = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffHistory => { next.keyboard_shortcuts.diff_history = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutStageFile => { next.keyboard_shortcuts.stage_file = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutUnstageFile => { next.keyboard_shortcuts.unstage_file = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutStageOrUnstageFile => { next.keyboard_shortcuts.stage_or_unstage_file = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffRevert => { next.keyboard_shortcuts.diff_revert = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffRetry => { next.keyboard_shortcuts.diff_retry = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffStageSelection => { next.keyboard_shortcuts.diff_stage_selection = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffUnstageSelection => { next.keyboard_shortcuts.diff_unstage_selection = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffRevertSelection => { next.keyboard_shortcuts.diff_revert_selection = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -18458,42 +18578,6 @@ impl Application for Cagents {
                             }
                         }
                         return Task::none();
-                    }
-                    if !captured
-                        && !self.workspace_inputs_blocked()
-                        && !matches!(
-                            self.focused_pane(),
-                            workspace_widget::FocusedPane::TextInput
-                                | workspace_widget::FocusedPane::OutsideWorkspace
-                                | workspace_widget::FocusedPane::SidebarRows
-                                | workspace_widget::FocusedPane::SidebarFiles
-                                | workspace_widget::FocusedPane::SidebarChanges
-                        )
-                        && workspace_widget::global_shortcut(
-                            &event,
-                            &self.settings.keyboard_shortcuts,
-                            self.focused_pane(),
-                        )
-                        .is_none()
-                        && let keyboard::Event::KeyPressed {
-                            key: keyboard::Key::Character(key),
-                            modifiers,
-                            ..
-                        } = &event
-                        && modifiers.control()
-                        && modifiers.shift()
-                        && !modifiers.alt()
-                        && !modifiers.logo()
-                        && key.eq_ignore_ascii_case("s")
-                        && let Some(card) = self.workspace.focused()
-                        && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
-                    {
-                        let stage = runtime.selected_staging_selection(true).is_some();
-                        if stage || runtime.selected_staging_selection(false).is_some() {
-                            return cosmic::task::message(Message::Repository(
-                                RepositoryAction::StageSelected { card, stage },
-                            ));
-                        }
                     }
                     if let Some(task) = self.project_search_key_event(&event) {
                         return task;

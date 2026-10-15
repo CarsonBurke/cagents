@@ -1071,7 +1071,7 @@ mod tests {
         assert!(matches!(runtime.diff_presentation_action(card, Revert), Some(RepositoryAction::DiscardEdits { .. })));
         assert!(!runtime.diff_presentation_available(StageFile));
         let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
-        document.active_save = Some(SaveTicket { id: 1, identity, revision: document.revision, snapshot: "saved snapshot".into() });
+        document.active_save = Some(SaveTicket { id: 1, identity, revision: document.revision, history_revision: document.history.revision(), snapshot_source: document.content.text_snapshot(), snapshot: document.content.text() });
         for command in [Unified, Split, Working, Staged, Branch, History, StageFile, UnstageFile, StageOrUnstageFile, Revert] {
             assert!(runtime.diff_presentation_action(card, command).is_none());
         }
