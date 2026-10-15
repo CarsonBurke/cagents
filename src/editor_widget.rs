@@ -62,7 +62,9 @@ pub use snapshot::TextSnapshot;
 thread_local! { static TEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
-pub(crate) fn take_text_call_count() -> usize { TEXT_CALLS.with(|count| count.replace(0)) }
+pub(crate) fn take_text_call_count() -> usize {
+    TEXT_CALLS.with(|count| count.replace(0))
+}
 
 /// A diagnostic mapped once to the renderer's byte-addressed line positions.
 #[derive(Debug, Clone)]
@@ -1014,7 +1016,11 @@ where
         let count = editor.line_count();
         let snapshot = TextSnapshot::from_lines((0..count).map(|index| {
             let ending = editor.line(index).expect("native line exists").ending;
-            (editor.buffer().lines[index].text(), ending, terminator(ending, index + 1 == count))
+            (
+                editor.buffer().lines[index].text(),
+                ending,
+                terminator(ending, index + 1 == count),
+            )
         }));
         Self(RefCell::new(Internal {
             editor,
@@ -1037,10 +1043,16 @@ where
         let editing = matches!(action, Action::Edit(_));
         let window = (editing && self.0.borrow().snapshot_edit_depth == 0)
             .then(|| self.snapshot_edit_window());
-        if editing { self.0.get_mut().snapshot_edit_depth += 1; }
+        if editing {
+            self.0.get_mut().snapshot_edit_depth += 1;
+        }
         self.perform_native(action);
-        if editing { self.0.get_mut().snapshot_edit_depth -= 1; }
-        if let Some(window) = window { self.refresh_snapshot(window); }
+        if editing {
+            self.0.get_mut().snapshot_edit_depth -= 1;
+        }
+        if let Some(window) = window {
+            self.refresh_snapshot(window);
+        }
     }
 
     fn perform_native(&mut self, mut action: Action) {
@@ -1078,29 +1090,47 @@ where
         internal.editor.perform(action);
     }
 
-    fn snapshot_edit_window(&self) -> (usize,usize,usize) {
+    fn snapshot_edit_window(&self) -> (usize, usize, usize) {
         let cursor = self.cursor();
         let anchor = cursor.selection.unwrap_or(cursor.position);
         let count = self.line_count();
-        (cursor.position.line.min(anchor.line).saturating_sub(1),
-            (cursor.position.line.max(anchor.line)+1).min(count.saturating_sub(1)), count)
+        (
+            cursor.position.line.min(anchor.line).saturating_sub(1),
+            (cursor.position.line.max(anchor.line) + 1).min(count.saturating_sub(1)),
+            count,
+        )
     }
 
-    fn refresh_snapshot(&mut self, (first,last,before_count): (usize,usize,usize)) {
+    fn refresh_snapshot(&mut self, (first, last, before_count): (usize, usize, usize)) {
         let internal = self.0.get_mut();
-        if internal.snapshot_edit_depth != 0 { return; }
+        if internal.snapshot_edit_depth != 0 {
+            return;
+        }
         let after_count = internal.editor.line_count();
-        let after_last = (last+after_count).saturating_sub(before_count).max(first).min(after_count.saturating_sub(1));
+        let after_last = (last + after_count)
+            .saturating_sub(before_count)
+            .max(first)
+            .min(after_count.saturating_sub(1));
         let editor = &internal.editor;
-        internal.snapshot.replace_lines(first, last+1, (first..=after_last).map(|index| {
-            let ending = editor.line(index).expect("native line exists").ending;
-            (editor.buffer().lines[index].text(), ending, terminator(ending,index+1 == after_count))
-        }));
+        internal.snapshot.replace_lines(
+            first,
+            last + 1,
+            (first..=after_last).map(|index| {
+                let ending = editor.line(index).expect("native line exists").ending;
+                (
+                    editor.buffer().lines[index].text(),
+                    ending,
+                    terminator(ending, index + 1 == after_count),
+                )
+            }),
+        );
     }
 
     /// Clone an immutable, Send snapshot in constant time. Its complete text
     /// is materialized once on whichever worker actually needs it.
-    pub fn text_snapshot(&self) -> TextSnapshot { self.0.borrow().snapshot.clone() }
+    pub fn text_snapshot(&self) -> TextSnapshot {
+        self.0.borrow().snapshot.clone()
+    }
 
     /// Native multiline insertion and removal shift row vectors repeatedly.
     /// Bound those operations; large splices rebuild from native fragments in
@@ -1338,7 +1368,9 @@ where
     ///
     /// This is a length, not a fingerprint: equal lengths do not imply equal
     /// text, so it can only rule a change *in*, never out.
-    pub fn text_len(&self) -> usize { self.0.borrow().snapshot.len() }
+    pub fn text_len(&self) -> usize {
+        self.0.borrow().snapshot.len()
+    }
 
     /// Returns an iterator of the text of the lines in the [`Content`].
     pub fn lines(&self) -> impl Iterator<Item = Line<'_>> {
@@ -1350,7 +1382,8 @@ where
 
     /// Returns the text of the [`Content`].
     pub fn text(&self) -> String {
-        #[cfg(test)] TEXT_CALLS.with(|count| count.set(count.get()+1));
+        #[cfg(test)]
+        TEXT_CALLS.with(|count| count.set(count.get() + 1));
         let internal = self.0.borrow();
         let count = internal.editor.line_count();
         let mut contents = String::new();
@@ -4961,19 +4994,27 @@ mod tests {
                 if let Some(edit) = content.perform_edit(edit) {
                     history.record(edit.change, kind, edit.before, content.cursor(), now);
                 }
-                assert_eq!(content.text_snapshot().text().as_ref(), content.text(), "snapshot round {round} step {step}");
+                assert_eq!(
+                    content.text_snapshot().text().as_ref(),
+                    content.text(),
+                    "snapshot round {round} step {step}"
+                );
                 assert_eq!(content.text_len(), content.text().len());
             }
             let last = content.text();
             let last_lines = native_lines(&content);
-            while history.undo(&mut content) == Replay::Applied { assert_eq!(content.text_snapshot().text().as_ref(), content.text()); }
+            while history.undo(&mut content) == Replay::Applied {
+                assert_eq!(content.text_snapshot().text().as_ref(), content.text());
+            }
             assert_eq!(content.text(), original, "round {round}");
             assert_eq!(
                 native_lines(&content),
                 original_lines,
                 "native undo, round {round}"
             );
-            while history.redo(&mut content) == Replay::Applied { assert_eq!(content.text_snapshot().text().as_ref(), content.text()); }
+            while history.redo(&mut content) == Replay::Applied {
+                assert_eq!(content.text_snapshot().text().as_ref(), content.text());
+            }
             assert_eq!(content.text(), last, "round {round}");
             assert_eq!(
                 native_lines(&content),
