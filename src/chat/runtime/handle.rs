@@ -43,6 +43,11 @@ impl Handle {
     pub(crate) fn is_remote_record(record:&crate::daemon::holder_registry::Record)->bool {RemoteActor::is_record(record)}
     pub(crate) fn wake_retained_outcomes(&self) {if let Owner::Remote(remote)=&self.0 {remote.wake_outcomes();}}
     pub(crate) fn uncommitted_outcomes(&self)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>{remote.refresh_state()?;remote.call("outbox_unacked",serde_json::Value::Null)},_=>Err("This actor has no retained outcome outbox".into())}}
+    /// Current provider incarnation; the immutable retained helper Record.root
+    /// intentionally continues identifying the original incarnation.
+    /// Remote callers needing a destructive fence must refresh outside HostLock
+    /// while holding their lifecycle gate before reading this cached metadata.
+    pub(crate) fn provider_process(&self)->Option<crate::daemon::holder_registry::Process> {match &self.0 {Owner::Local(local)=>local.provider_process(),Owner::Remote(remote)=>remote.state().provider_process.clone()}}
     pub(crate) fn actor_identity(&self)->Option<ActorIdentity> {match &self.0 {Owner::Remote(remote)=>Some(remote.identity()),_=>None}}
     pub(crate) fn retained_outcomes(&self,after:u64)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("outbox",serde_json::json!([after])),_=>Err("This actor has no remote outbox".into())}}
     pub(crate) fn commit_retained_outcomes(&self,through:u64)->Result<(),String> {match &self.0 {Owner::Remote(remote)=>remote.call("ack_outbox",serde_json::json!([through])),_=>Err("This actor has no remote outbox".into())}}
