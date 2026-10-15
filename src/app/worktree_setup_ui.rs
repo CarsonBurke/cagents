@@ -460,6 +460,13 @@ fn verify_local_setup_resume(store: &crate::persistence::StateStore, creation: O
     let report = service.worktree_setup_creation(store, creation).map_err(|error| error.to_string())?.ok_or("The setup creation is no longer recorded")?;
     let request = report.request.ok_or("The setup creation request is unavailable")?;
     if request.destination != path || request.setup_intent.as_ref() != Some(expected) { return Err("The saved setup intent changed. Reopen its review.".into()); }
+    let identity = service.worktree_setup_creation_identity(store, creation).map_err(|error| error.to_string())?
+        .ok_or("The setup creation identity is no longer recorded")?;
+    let common = service.common_dir(&request.repository, token).map_err(|error| error.to_string())?;
+    let admin = service.git_dir(path, token).map_err(|error| error.to_string())?;
+    if !setup_creation_identity_matches(&identity, &common, &admin) {
+        return Err("This checkout no longer matches the recorded Git administrative identity. Create or configure setup for the current checkout explicitly.".into());
+    }
     let records = service.list_worktrees(&request.repository, token).map_err(|error| error.to_string())?;
     if !records.iter().any(|record| record.path == path && !record.bare && record.branch.as_deref() == Some(request.branch.full_ref().as_str())) {
         return Err("This checkout no longer matches the recorded creation".into());
@@ -471,6 +478,10 @@ fn verify_local_setup_resume(store: &crate::persistence::StateStore, creation: O
         return Err("The previous setup is still hosted. Reconnect to that terminal instead of running its commands again.".into());
     }
     Ok(())
+}
+
+fn setup_creation_identity_matches(identity: &crate::repository::WorktreeSetupCreationIdentity, common: &Path, admin: &Path) -> bool {
+    identity.common_dir == common && identity.admin_dir.as_deref() == Some(admin)
 }
 
 fn setup_run_is_live(session: &TerminalSession, path: &Path, run: Option<OperationId>) -> bool {
@@ -671,6 +682,16 @@ mod tests {
         app.recover_worktree_setup(current, path.clone(), SetupIntent { run_id: Some(current), ..Default::default() });
         assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Succeeded);
         assert_eq!(app.setup_ui.terminals[&path].1, expected);
+    }
+
+    #[test]
+    fn replaced_or_legacy_checkout_identity_does_not_authorize_resume() {
+        let identity = crate::repository::WorktreeSetupCreationIdentity { common_dir: "/repo/.git".into(), admin_dir: Some("/repo/.git/worktrees/original".into()) };
+        assert!(setup_creation_identity_matches(&identity, Path::new("/repo/.git"), Path::new("/repo/.git/worktrees/original")));
+        assert!(!setup_creation_identity_matches(&identity, Path::new("/repo/.git"), Path::new("/repo/.git/worktrees/replacement")));
+        assert!(!setup_creation_identity_matches(&identity, Path::new("/other/.git"), Path::new("/repo/.git/worktrees/original")));
+        let legacy = crate::repository::WorktreeSetupCreationIdentity { admin_dir: None, ..identity };
+        assert!(!setup_creation_identity_matches(&legacy, Path::new("/repo/.git"), Path::new("/repo/.git/worktrees/original")));
     }
 
     #[test]

@@ -29,6 +29,14 @@ pub struct WorktreeSetupIntent {
     pub copy_done: bool,
 }
 
+/// Administrative identity recorded when a creation settled. Paths alone do
+/// not authorize resuming setup in a replacement checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSetupCreationIdentity {
+    pub common_dir: PathBuf,
+    pub admin_dir: Option<PathBuf>,
+}
+
 fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal, StoreError> {
     let creation_id = operation.id;
     let invalid = || StoreError::InvalidState(format!(
@@ -73,6 +81,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         let journal = settled_setup_journal(&operation)?;
         Ok(Some(journal.report(operation.created_at_unix_ms)))
+    }
+
+    /// Read recorded identity without Git, reconciliation or mutation. A
+    /// legacy missing admin directory remains explicit for callers to refuse.
+    pub fn worktree_setup_creation_identity(
+        &self,
+        store: &StateStore,
+        creation_id: OperationId,
+    ) -> Result<Option<WorktreeSetupCreationIdentity>, StoreError> {
+        let Some(operation) = store.journaled_worktree_operation(creation_id)? else { return Ok(None); };
+        let journal = settled_setup_journal(&operation)?;
+        Ok(Some(WorktreeSetupCreationIdentity { common_dir: journal.common_dir, admin_dir: journal.admin_dir }))
     }
 
     /// Update metadata on a settled creation without reconciling or executing
@@ -211,6 +231,24 @@ mod tests {
         assert_eq!(read.state, WorktreeOperationState::Created);
         assert_eq!(read.created_at_unix_ms, 42);
         assert_eq!(reopened.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload, before);
+        assert!(!request.destination.exists());
+    }
+
+    #[test]
+    fn settled_identity_read_preserves_admin_and_legacy_missing_evidence_without_effects() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let store = StateStore::open(root.path().join("state.sqlite"), crate::model::BootId::new("setup-identity")).unwrap();
+        let service = RepositoryService::system("must-not-execute-git");
+        let request = request(root.path());
+        let journal = journal(request.clone());
+        seed(&store, &journal, PendingOperationStatus::Applied);
+        let before = store.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload;
+        assert_eq!(service.worktree_setup_creation_identity(&store, request.operation_id).unwrap(), Some(WorktreeSetupCreationIdentity { common_dir: journal.common_dir.clone(), admin_dir: journal.admin_dir.clone() }));
+        assert_eq!(store.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload, before);
+        let mut legacy = journal.clone(); legacy.admin_dir = None;
+        store.update_operation(request.operation_id, &before, &serde_json::to_value(&legacy).unwrap(), PendingOperationStatus::Applied).unwrap();
+        assert!(service.worktree_setup_creation_identity(&store, request.operation_id).unwrap().unwrap().admin_dir.is_none());
+        assert!(service.worktree_setup_creation_identity(&store, OperationId::new()).unwrap().is_none());
         assert!(!request.destination.exists());
     }
 

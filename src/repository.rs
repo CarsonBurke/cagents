@@ -6,7 +6,7 @@
 //! straightforward to test with a fake executor.
 
 mod worktree_setup_intent;
-pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
+pub use worktree_setup_intent::{WorktreeSetupCreationIdentity, WorktreeSetupIntent, WorktreeSetupPlan};
 
 use std::{
     borrow::Cow,
@@ -11981,6 +11981,25 @@ mod worktree_journal_tests {
         let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
         assert_eq!(recovered.state, WorktreeOperationState::Created, "{recovered:?}");
         assert_eq!(crate::linear::context::resolve_at(&fixture.request.destination).unwrap().issue_id, "ENG-123");
+    }
+
+    #[test]
+    fn setup_creation_identity_distinguishes_a_replacement_at_the_same_branch_and_path() {
+        let fixture = Fixture::new();
+        let token = CancellationToken::new();
+        let report = fixture.run(&token);
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        let identity = fixture.service.worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id).unwrap().unwrap();
+        assert_eq!(identity.admin_dir.as_ref(), Some(&fixture.service.git_dir(&fixture.request.destination, &token).unwrap()));
+        fixture.git(&["worktree", "remove", fixture.request.destination.to_str().unwrap()]);
+        let replacement = fixture.request.managed_root.join("replacement");
+        fixture.git(&["worktree", "add", replacement.to_str().unwrap(), fixture.request.branch.as_str()]);
+        fixture.git(&["worktree", "move", replacement.to_str().unwrap(), fixture.request.destination.to_str().unwrap()]);
+        let record = fixture.service.list_worktrees(&fixture.request.repository, &token).unwrap().into_iter().find(|record| record.path == fixture.request.destination).unwrap();
+        assert_eq!(record.branch.as_deref(), Some(fixture.request.branch.full_ref().as_str()));
+        assert_eq!(identity.common_dir, fixture.service.common_dir(&fixture.request.repository, &token).unwrap());
+        assert_ne!(identity.admin_dir.as_ref(), Some(&fixture.service.git_dir(&fixture.request.destination, &token).unwrap()), "same branch and path do not prove creation identity");
+        assert_eq!(fixture.service.worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id).unwrap(), Some(identity), "a read must retain the original receipt rather than reconcile it to the replacement");
     }
 
     #[test]
