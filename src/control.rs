@@ -3018,6 +3018,7 @@ enum ResolvedProject {
         repository: PathBuf,
         kind: crate::model::ProjectKind,
         checkout: Option<PathBuf>,
+        primary_checkout: Option<PathBuf>,
     },
     List,
     Close {
@@ -3043,6 +3044,7 @@ impl ProjectCommand {
                     repository: location.key,
                     kind: location.kind,
                     checkout: location.checkout,
+                    primary_checkout: location.primary_checkout,
                 }
             }
             Self::List => ResolvedProject::List,
@@ -3059,7 +3061,7 @@ fn project_output(
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ResolvedProject::Open { repository, kind, checkout } => {
+        ResolvedProject::Open { repository, kind, checkout, primary_checkout } => {
             // The same upsert a window publishes when it opens a repository,
             // carrying the name derived from the same key, so a project opened
             // from a shell and one opened in a window are one row that no
@@ -3070,6 +3072,7 @@ fn project_output(
                     repository: repository.clone(),
                     name: repository_display_name(checkout.as_deref().unwrap_or(&repository)),
                     checkout,
+                    primary_checkout,
                 })
                 .map_err(protocol_error)?;
             let project = model.project(&repository).cloned().ok_or_else(|| {
@@ -3180,7 +3183,7 @@ fn close_project(
 /// One project per line: verified checkout, name. Repository metadata remains
 /// the canonical identity in JSON; unknown legacy checkout paths are explicit.
 fn project_line(project: &ModelProject) -> String {
-    let path = project.checkout.as_deref().or_else(|| (project.kind==crate::model::ProjectKind::Folder).then_some(project.repository.as_path()));
+    let path = project.checkout.as_deref().or(project.primary_checkout.as_deref()).or_else(|| (project.kind==crate::model::ProjectKind::Folder).then_some(project.repository.as_path()));
     format!("{}\t{}", path.map(|path|path.display().to_string()).unwrap_or_else(||"(checkout unavailable)".into()), project.name)
 }
 
@@ -3221,6 +3224,7 @@ enum ResolvedChannel {
         title: String,
         kind: crate::model::ProjectKind,
         checkout: Option<PathBuf>,
+        primary_checkout: Option<PathBuf>,
     },
     List {
         repository: Option<PathBuf>,
@@ -3247,6 +3251,7 @@ impl ChannelCommand {
                     repository: location.key,
                     kind: location.kind,
                     checkout: location.checkout,
+                    primary_checkout: location.primary_checkout,
                     title,
                 }
             }
@@ -3273,6 +3278,7 @@ fn channel_output(
             title,
             kind,
             checkout,
+            primary_checkout,
         } => {
             // The project comes first: a channel in a repository no project owns
             // is reachable from no window's sidebar. `OpenProject` is an upsert,
@@ -3283,6 +3289,7 @@ fn channel_output(
                     repository: repository.clone(),
                     name: repository_display_name(checkout.as_deref().unwrap_or(&repository)),
                     checkout,
+                    primary_checkout,
                 })
                 .map_err(protocol_error)?;
             // The id is minted here, exactly as `terminal spawn` mints its
@@ -3412,13 +3419,14 @@ fn resolve_project_location(
                 key: from,
                 kind: project.kind,
                 checkout: project.checkout.clone(),
+                primary_checkout: project.primary_checkout.clone(),
             });
         }
         return match crate::device_service::request(crate::device_service::Operation::Discover {
             path: from,
         }) {
-            Ok(crate::device_service::Reply::Project { key, kind, checkout, .. }) => {
-                Ok(crate::project_location::ProjectLocation { key, kind, checkout })
+            Ok(crate::device_service::Reply::Project { key, kind, checkout, primary_checkout, .. }) => {
+                Ok(crate::project_location::ProjectLocation { key, kind, checkout, primary_checkout })
             }
             Ok(_) => Err(AppError::new(
                 "repository",
@@ -3988,6 +3996,7 @@ mod tests {
                         kind: Default::default(),
                         repository: server_repository.clone(),
                         checkout: server_repository.parent().map(Path::to_path_buf),
+                        primary_checkout: server_repository.parent().map(Path::to_path_buf),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
                         name: expected_name.clone(),
@@ -4130,7 +4139,7 @@ mod tests {
         git(&checkout,&["init","--quiet","--separate-git-dir",metadata.to_str().unwrap()]);
         let checkout=checkout.canonicalize().unwrap();
         let metadata=metadata.canonicalize().unwrap();
-        let project=ModelProject{repository:metadata.clone(),checkout:Some(checkout.clone()),kind:crate::model::ProjectKind::Git,name:"checkout".into(),ordinal:1};
+        let project=ModelProject{repository:metadata.clone(),checkout:Some(checkout.clone()),primary_checkout:Some(checkout.clone()),kind:crate::model::ProjectKind::Git,name:"checkout".into(),ordinal:1};
         let (client_stream,mut server_stream)=UnixStream::pair().unwrap();
         let peer_proof=proof("session","boot","incarnation");
         let served=project.clone();
@@ -4138,7 +4147,7 @@ mod tests {
             let _:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(&mut server_stream,&connected_envelope(1,peer_proof.clone(),peer_proof.clone())).unwrap();
             let opened:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-            assert_eq!(opened.request,ClientRequest::EditWorkspaceModel{edit:ModelEdit::ReopenProject{repository:served.repository.clone(),checkout:served.checkout.clone(),kind:served.kind,name:served.name.clone()}});
+            assert_eq!(opened.request,ClientRequest::EditWorkspaceModel{edit:ModelEdit::ReopenProject{repository:served.repository.clone(),checkout:served.checkout.clone(),primary_checkout:served.primary_checkout.clone(),kind:served.kind,name:served.name.clone()}});
             let mut model=WorkspaceModel::default();model.projects.push(served);
             write_frame(&mut server_stream,&model_envelope(opened.request_id,peer_proof.clone(),model.clone())).unwrap();
             let listed:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
@@ -4205,6 +4214,7 @@ mod tests {
             kind: crate::model::ProjectKind::Folder,
             repository: root.clone(),
             checkout: Some(root.clone()),
+            primary_checkout: None,
             name: "Folder".into(),
             ordinal: 0,
         });
@@ -4305,6 +4315,7 @@ mod tests {
                         kind: Default::default(),
                         repository: served.clone(),
                         checkout: served.parent().map(Path::to_path_buf),
+                        primary_checkout: served.parent().map(Path::to_path_buf),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
                         name: served_name.clone(),
@@ -4319,6 +4330,7 @@ mod tests {
                 projects: vec![ModelProject {
                     kind: Default::default(),
                     checkout: served.parent().map(Path::to_path_buf),
+                    primary_checkout: served.parent().map(Path::to_path_buf),
                     repository: served,
                     name: served_name,
                     ordinal: 2,
@@ -4363,6 +4375,7 @@ mod tests {
             kind: Default::default(),
             repository: PathBuf::from("/window/.git"),
             checkout: Some(PathBuf::from("/window")),
+            primary_checkout: Some(PathBuf::from("/window")),
             name: "window".into(),
             ordinal: 1,
         };
@@ -4370,6 +4383,7 @@ mod tests {
             kind: Default::default(),
             repository: PathBuf::from("/shell/.git"),
             checkout: Some(PathBuf::from("/shell")),
+            primary_checkout: Some(PathBuf::from("/shell")),
             name: "shell".into(),
             ordinal: 2,
         };
@@ -4562,6 +4576,7 @@ mod tests {
                 kind: Default::default(),
                 repository: repository.to_path_buf(),
                 checkout: repository.parent().map(Path::to_path_buf),
+                primary_checkout: repository.parent().map(Path::to_path_buf),
                 name: repository_display_name(repository),
                 ordinal: 1,
             }],
