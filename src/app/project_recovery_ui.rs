@@ -198,6 +198,9 @@ impl Cagents {
             .map(|card| card.id)
             .collect()
     }
+    pub(super) fn project_has_editor_recovery(&self, project: ProjectId) -> bool {
+        self.project_cards(project).into_iter().any(|card| self.card_has_editor_recovery(card))
+    }
     pub(super) fn missing_project_cards(&self) -> HashSet<CardId> {
         self.sidebar_model
             .projects

@@ -30,6 +30,9 @@ pub struct State {
     close_started: HashMap<ProjectId, Instant>,
     close_in_flight: HashSet<ProjectId>,
     close_failed: HashSet<ProjectId>,
+    // A completed teardown must not be repeated merely because file recovery
+    // arrived while it ran. Only its original local close generation may finish.
+    recovery_closures: HashMap<ProjectId, (u64, ProjectSessionClosure)>,
     close_cancellations: HashMap<ProjectId, CancellationToken>,
     pub(super) close_generation: HashMap<ProjectId, u64>,
     next_close_generation: u64,
@@ -432,7 +435,7 @@ impl Cagents {
             return Some("Project removal is already in progress.".into());
         }
         self.project_has_unsaved_editors(project)
-            .then(|| "Save or close this project's unsaved editor buffers first.".into())
+            .then(|| "Save unsaved buffers and resolve this project's file recovery first.".into())
     }
 
     pub(super) fn selected_worktree_deletion_blocker(
@@ -535,6 +538,7 @@ impl Cagents {
             cancellation.cancel();
         }
         self.project_ui.closing.remove(&project);
+        self.project_ui.recovery_closures.remove(&project);
         self.project_ui.close_started.remove(&project);
         self.project_ui.close_in_flight.remove(&project);
         self.project_ui.close_failed.remove(&project);
@@ -560,6 +564,11 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         Task::batch(ready.into_iter().map(|project| {
+            if let Some((generation, closure)) = self.project_ui.recovery_closures.remove(&project) {
+                if self.project_ui.close_generation.get(&project) == Some(&generation) {
+                    return self.finish_closed_project(project, closure);
+                }
+            }
             let Some(row) = self.sidebar_model.project(project) else {
                 return Task::none();
             };
@@ -610,6 +619,7 @@ impl Cagents {
     }
 
     fn project_has_unsaved_editors(&self, project: ProjectId) -> bool {
+        if self.project_has_editor_recovery(project) { return true; }
         let scope = self.project_session_scope(project);
         self.cards.iter().any(|(id, runtime)| {
             matches!(runtime, CardRuntime::Repository(editor)
@@ -738,9 +748,20 @@ impl Cagents {
         id: ProjectId,
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
+        if self.project_ui.closing.contains_key(&id) && self.project_has_editor_recovery(id) {
+            self.project_ui.close_in_flight.remove(&id);
+            if let Some(generation) = self.project_ui.close_generation.get(&id).copied() {
+                self.project_ui.recovery_closures.insert(id, (generation, closure));
+            }
+            self.status = Some(TransientNotice::warning(
+                "Project sessions have closed. Editors were kept until file recovery finishes.",
+            ));
+            return Task::none();
+        }
         let Some(repository) = self.project_ui.closing.remove(&id) else {
             return Task::none();
         };
+        self.project_ui.recovery_closures.remove(&id);
         self.project_ui.close_started.remove(&id);
         self.project_ui.close_in_flight.remove(&id);
         self.project_ui.close_failed.remove(&id);
@@ -1462,12 +1483,17 @@ impl Cagents {
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
                     // a second close request: dropping a runtime only detaches.
+                    let retained_recovery = self.durable.cards.iter().any(|card| {
+                        card.existence.is_open() && card_belongs_to(card, &target.path)
+                            && self.card_has_editor_recovery(card.id)
+                    });
                     let ids = self
                         .durable
                         .cards
                         .iter()
                         .filter(|card| {
                             card.existence.is_open() && card_belongs_to(card, &target.path)
+                                && !self.card_has_editor_recovery(card.id)
                         })
                         .map(|card| card.id)
                         .collect::<Vec<_>>();
@@ -1543,9 +1569,11 @@ impl Cagents {
                         }
                     };
                     self.persist();
-                    self.status = Some(TransientNotice::success(
-                        "Worktree deleted; branch retained.",
-                    ));
+                    self.status = Some(if retained_recovery {
+                        TransientNotice::warning("The worktree was removed. Editors with pending file recovery were kept.")
+                    } else {
+                        TransientNotice::success("Worktree deleted; branch retained.")
+                    });
                     let refresh =
                         self.repository_load_task(target.repository, Some(target.project), false);
                     return Task::batch([
@@ -1749,6 +1777,15 @@ impl Cagents {
         }
         if worktree.locked {
             return Some("This worktree is locked. Unlock it explicitly in Git first.".into());
+        }
+        if self.cards.iter().any(|(card, runtime)| {
+            self.card_has_editor_recovery(*card) && match runtime {
+                CardRuntime::Repository(runtime) => runtime.descriptor.worktree.starts_with(&target.path),
+                CardRuntime::PullRequests(pane) => pane.runtime.descriptor.worktree.starts_with(&target.path),
+                _ => false,
+            }
+        }) {
+            return Some("Resolve this worktree's file recovery before deleting it.".into());
         }
         if self.cards.values().any(|runtime| {
             matches!(runtime, CardRuntime::Repository(runtime)
@@ -2838,6 +2875,95 @@ mod tests {
             Vec::new(),
         ));
         (app, directory, project)
+    }
+
+    // The Runtime API comes from the editor recovery lifetime prerequisite;
+    // these exercise project/worktree completion rather than generic Close.
+    fn retain_project_editor_recovery(app: &mut Cagents, project: ProjectId, repository: &Path, worktree: &Path) -> (CardId, crate::editor::RecoveryAuthority) {
+        drop(app.add_terminal(worktree.to_path_buf()));
+        let card=app.durable.cards.last().unwrap().id;
+        let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"source.rs","clean");
+        runtime.descriptor.project=project;
+        runtime.descriptor.repository=repository.to_path_buf();
+        runtime.descriptor.worktree=worktree.to_path_buf();
+        app.card_state_mut(card).unwrap().kind=CardKind::Repository(runtime.descriptor.clone());
+        let authority=crate::editor::RecoverySlot::reserve().unwrap().retain("original held recovery files".into(),||Ok(()));
+        runtime.retain_editor_recovery(authority.clone(),"recovery needed".into());
+        assert!(!runtime.is_saving());assert!(!runtime.is_dirty());
+        app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));
+        (card,authority)
+    }
+
+    #[test]
+    fn project_and_worktree_admission_preserve_recovery_without_active_save() {
+        let repository=PathBuf::from("/recovery-project");
+        let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
+        let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+        let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
+        let (card,authority)=retain_project_editor_recovery(&mut app,project,&repository,&linked.path);
+        assert!(app.selected_project_removal_blocker(project).is_some());
+        assert!(app.selected_worktree_deletion_blocker(project,linked.id).unwrap().contains("recovery"));
+        assert!(!app.project_has_editor_recovery(ProjectId::new()));
+        assert!(app.card_state(card).unwrap().existence.is_open());assert!(!authority.is_resolved());
+    }
+
+    #[tokio::test]
+    async fn actual_project_completion_waits_with_original_generation_and_recovery_runtime() {
+        let repository=PathBuf::from("/recovery-project");
+        let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
+        let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+        let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
+        // This recovery arrives after the already-admitted session teardown.
+        app.project_ui.closing.insert(project,repository.clone());
+        app.project_ui.close_generation.insert(project,7);
+        app.project_ui.close_in_flight.insert(project);
+        let (card,authority)=retain_project_editor_recovery(&mut app,project,&repository,&linked.path);
+        drop(app.handle_project_action(Action::ProjectSessionsClosed(project,7,Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])))));
+        assert!(app.sidebar_model.project(project).is_some());assert!(app.cards.contains_key(&card));
+        assert!(app.card_state(card).unwrap().existence.is_open());assert!(!authority.is_resolved());
+        assert_eq!(app.project_ui.recovery_closures[&project].0,7);
+        assert!(!app.project_ui.close_in_flight.contains(&project));
+        drop(app.complete_closed_projects());
+        assert!(app.project_ui.recovery_closures.contains_key(&project));
+        // Resolve through the actual Runtime receipt path. Finishing now uses
+        // the original completed closure, without another daemon teardown.
+        use cosmic::iced::futures::StreamExt;
+        let Some(CardRuntime::Repository(runtime))=app.cards.get_mut(&card) else {panic!()};
+        let task=runtime.update(RepositoryAction::ResolveEditorRecovery{card,authority:authority.clone()});
+        let mut stream=iced::runtime::task::into_stream(task).unwrap();
+        let iced::runtime::Action::Output(action)=stream.next().await.unwrap() else {panic!()};
+        drop(runtime.update(action));
+        assert!(authority.is_resolved());assert!(!runtime.has_editor_recovery());
+        drop(app.complete_closed_projects());
+        assert!(!app.project_ui.recovery_closures.contains_key(&project));
+        assert!(app.sidebar_model.project(project).is_none());assert!(!app.cards.contains_key(&card));
+    }
+
+    #[test]
+    fn cancellation_retires_only_the_original_recovery_closure() {
+        let mut app=super::super::tests::context_inspector_test_app(false);
+        let project=ProjectId::new();let repository=PathBuf::from("/recovery-project");
+        app.project_ui.closing.insert(project,repository.clone());
+        app.project_ui.close_generation.insert(project,7);
+        app.project_ui.recovery_closures.insert(project,(7,ProjectSessionClosure::for_roots(vec![repository.clone()])));
+        app.cancel_shared_project_close(&repository);
+        assert!(!app.project_ui.recovery_closures.contains_key(&project));
+        assert!(!app.project_ui.close_generation.contains_key(&project));
+    }
+
+    #[test]
+    fn actual_worktree_completion_keeps_late_recovery_and_its_durable_card() {
+        let repository=PathBuf::from("/recovery-project");
+        let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
+        let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+        let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
+        let target=app.project_target(project,Some(linked.id)).unwrap();
+        let (card,authority)=retain_project_editor_recovery(&mut app,project,&repository,&linked.path);
+        drop(app.handle_project_action(Action::Deleted{target,result:Ok(())}));
+        assert!(row(&app,linked.id).is_none());
+        assert!(app.card_state(card).unwrap().existence.is_open());assert!(app.cards.contains_key(&card));
+        assert!(app.card_has_editor_recovery(card));assert!(!authority.is_resolved());
+        assert!(app.status.as_ref().is_some_and(|notice|notice.message.contains("recovery")));
     }
 
     fn row(app: &Cagents, id: WorktreeId) -> Option<&SidebarWorktree> {
