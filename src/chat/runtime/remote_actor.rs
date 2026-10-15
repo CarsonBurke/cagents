@@ -4370,7 +4370,7 @@ done"#;
         let started = Instant::now();
         let error = actor.capture_continuation_options(started + Duration::from_millis(100)).unwrap_err();
         let elapsed = started.elapsed();
-        release.send(()).unwrap();
+        let _ = release.send(());
         peer.join().unwrap();
         assert!(error.contains("deadline"));
         assert!(elapsed < Duration::from_secs(1));
