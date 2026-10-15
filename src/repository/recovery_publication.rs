@@ -533,7 +533,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let previous = Path::new("previous");
         let mut acquired = None;
         let mut moved = false;
-        let before_publication = (|| {
+        let before_publication: Result<(), String> = (|| {
             if current.is_some() {
                 fs_safety::rename_new_between(
                     &holding.parent,
