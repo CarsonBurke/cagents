@@ -23,6 +23,8 @@ pub struct Patch {
     /// Exact replacement for a dirty live buffer's single undo transaction.
     pub(crate) working_text: Option<Arc<String>>,
     pub(crate) buffer_change: Option<Arc<crate::editor_history::TextChange>>,
+    pub(crate) working_present: Option<bool>,
+    pub(crate) working_mode: Option<u32>,
 }
 
 /// A selected change is rebuilt from exact immutable source strings. The
@@ -76,6 +78,7 @@ pub(crate) fn selected_patch(
     } else {
         mode_aware_patch(old_path, new_path, before, after, modes)?
     };
+    let working_present = model.present[0] || !desired.is_empty();
     (!patch.is_empty()).then_some(Patch {
         patch: patch.into(),
         cached: kind != Kind::Revert,
@@ -83,6 +86,8 @@ pub(crate) fn selected_patch(
         expected_head,
         working_text: (kind == Kind::Revert).then(|| Arc::new(desired)),
         buffer_change: None,
+        working_present: (kind == Kind::Revert).then_some(working_present),
+        working_mode: model.modes[1],
     })
 }
 

@@ -40,11 +40,11 @@ impl Capture {
                 return None;
             }
             let replacement = patch.working_text.take()?;
-            patch.buffer_change = Some(Arc::new(buffer_change(
-                &snapshot,
-                &before,
-                replacement.as_str(),
-            )?));
+            patch.buffer_change =
+                buffer_change(&snapshot, &before, replacement.as_str()).map(Arc::new);
+            if patch.buffer_change.is_none() && before.as_ref() != replacement.as_str() {
+                return None;
+            }
         }
         patch.working_text = None;
         Some((self.identity, self.buffer_revision, patch))
@@ -225,7 +225,7 @@ impl RepositoryRuntime {
         let file = self.subject_file()?;
         let old_path = file
             .previous_path(&self.diff_basis)
-            .unwrap_or_else(|| path.clone());
+            .unwrap_or_else(|| file.path.clone());
         let (buffer_revision, buffer_snapshot) = if kind == git_patch::Kind::Revert {
             match &self.document {
                 DocumentState::Editable(document) => (
@@ -244,7 +244,7 @@ impl RepositoryRuntime {
             mode: self.diff_mode,
             rows,
             old_path: RepoPath::parse(old_path).ok()?,
-            new_path: RepoPath::parse(path).ok()?,
+            new_path: RepoPath::parse(file.path).ok()?,
             buffer_revision,
             buffer_snapshot,
         })
@@ -259,6 +259,17 @@ impl RepositoryRuntime {
         revision: u64,
         change: Arc<TextChange>,
     ) -> Result<(), String> {
+        self.apply_diff_buffer_revert_with_presence(identity, revision, Some(change), true, None)
+    }
+
+    pub(crate) fn apply_diff_buffer_revert_with_presence(
+        &mut self,
+        identity: &AsyncIdentity,
+        revision: u64,
+        change: Option<Arc<TextChange>>,
+        present: bool,
+        mode: Option<u32>,
+    ) -> Result<(), String> {
         if !self.accepts_selected(identity) || self.is_saving() {
             return Err("The file changed while Revert was prepared. Try again.".into());
         }
@@ -268,29 +279,62 @@ impl RepositoryRuntime {
         if document.revision != revision {
             return Err("The buffer changed while Revert was prepared. Try again.".into());
         }
+        if !present {
+            let replaces_all = change.as_ref().is_some_and(|change| {
+                change.start == (text_editor::Position { line: 0, column: 0 })
+                    && change.inserted.is_empty()
+                    && document.content.text_len() == change.removed.len()
+            });
+            if !matches!(mode, Some(0o100644 | 0o100755))
+                || (!document.content.is_empty() && !replaces_all)
+            {
+                return Err(
+                    "The complete current file and its mode are required before removing it."
+                        .into(),
+                );
+            }
+        }
+        let presence_id = if !present {
+            let id = document
+                .next_presence_id
+                .checked_add(1)
+                .ok_or("The file's Undo identity is exhausted. Reload before reverting.")?;
+            document.next_presence_id = id;
+            id
+        } else {
+            document.presence_id
+        };
         let cursor = document.content.cursor();
         let scroll = document.content.scroll_position();
         let mut buffer = ProtocolTracked {
             content: &mut document.content,
             edits: Vec::new(),
         };
-        if !buffer.replace(
-            change.start,
-            &change.removed,
-            &change.inserted,
-            &change.inserted_breaks,
-        ) {
+        if let Some(change) = &change
+            && !buffer.replace(
+                change.start,
+                &change.removed,
+                &change.inserted,
+                &change.inserted_breaks,
+            )
+        {
             return Err("The selected change no longer matches the buffer. Try again.".into());
         }
         let edits = buffer.edits;
         document.content.set_cursor(cursor);
         document.content.restore_scroll_position(scroll);
-        document.history.record_group(
-            vec![Arc::unwrap_or_clone(change)],
+        document.history.record_group_with_presence_identities(
+            change.into_iter().map(Arc::unwrap_or_clone).collect(),
             cursor,
             document.content.cursor(),
             Instant::now(),
+            Some(((document.present, presence_id), (present, presence_id))),
         );
+        document.present = present;
+        document.presence_id = presence_id;
+        if !present {
+            document.deletion_mode = mode;
+        }
         document.text_changed();
         self.push_lsp_edits(edits);
         Ok(())
@@ -490,6 +534,493 @@ pub(super) fn gutter<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn finish_presence_save(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
+        use cosmic::iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).expect("save task");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(action) = action {
+                drop(runtime.update(action));
+            }
+        }
+    }
+
+    fn added_file_runtime(
+        card: CardId,
+        root: &Path,
+        text: &str,
+    ) -> (RepositoryRuntime, AsyncIdentity) {
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "new.sh", text);
+        runtime.descriptor.worktree = root.to_owned();
+        runtime.source_surface = SourceSurface::Diff;
+        let mut model = crate::diff_view::build_diff("", text);
+        model.present = [false, true];
+        model.modes = [None, Some(0o100755)];
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Text {
+                model: Arc::new(model),
+                old_label: "Index".into(),
+                new_label: "Working tree".into(),
+            }),
+        );
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        runtime.working_diff.applied_rich = true;
+        runtime.working_diff.desired_rich = true;
+        let identity = runtime.current_identity(card, "new.sh".into());
+        (runtime, identity)
+    }
+
+    fn revert_complete_added_buffer(runtime: &mut RepositoryRuntime, card: CardId, mode: u32) {
+        runtime.source_surface = SourceSurface::Diff;
+        let text = runtime.editor_text().unwrap();
+        let mut model = crate::diff_view::build_diff("", &text);
+        model.present = [false, true];
+        model.modes = [None, Some(mode)];
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Text {
+                model: Arc::new(model),
+                old_label: "Index".into(),
+                new_label: "Working tree".into(),
+            }),
+        );
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        runtime.working_diff.applied_rich = true;
+        runtime.working_diff.desired_rich = true;
+        let model = runtime.current_diff_model_snapshot().unwrap();
+        let request = runtime
+            .diff_mutation_request(card, 0..model.row_count(runtime.diff_mode))
+            .unwrap();
+        let (identity, revision, mut patch) = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request))
+            .unwrap()
+            .build()
+            .unwrap();
+        runtime
+            .apply_diff_buffer_revert_with_presence(
+                &identity,
+                revision.unwrap(),
+                patch.buffer_change.take(),
+                patch.working_present.unwrap(),
+                patch.working_mode,
+            )
+            .unwrap();
+    }
+
+    fn initialize_presence_fixture(root: &Path) {
+        let initialized = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "init",
+                "--template=",
+                "-b",
+                "main",
+            ])
+            .arg(&root)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .output()
+            .unwrap();
+        assert!(
+            initialized.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+    }
+
+    async fn finish_lineage_save(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
+        use cosmic::iced::futures::StreamExt;
+        let mut pending = std::collections::VecDeque::from([task]);
+        let mut completions = 0;
+        while let Some(task) = pending.pop_front() {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                continue;
+            };
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action) = action {
+                    completions += 1;
+                    assert!(completions < 100, "fixture refresh must settle");
+                    // Settle the real file-list/Git refresh produced by the
+                    // save. Autosave timing belongs to its separate contract.
+                    pending.push_back(runtime.update_inner(action));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_change_multiple_presence_undos_restore_their_own_access_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        for (save_between_undos, late_completion) in [(true, false), (false, false), (false, true)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            initialize_presence_fixture(&root);
+            std::fs::write(root.join("new.sh"), "synthetic alpha\n").unwrap();
+            std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let card = CardId::new();
+            let (mut runtime, _) = added_file_runtime(card, &root, "synthetic alpha\n");
+            revert_complete_added_buffer(&mut runtime, card, 0o100644);
+            let task = runtime.request_save_inner(card, false, false);
+            finish_lineage_save(&mut runtime, task).await;
+            assert!(!root.join("new.sh").exists());
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!()
+            };
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new("synthetic beta\n".into()),
+            )));
+            let task = runtime.request_save_inner(card, false, false);
+            finish_lineage_save(&mut runtime, task).await;
+            std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            revert_complete_added_buffer(&mut runtime, card, 0o100644);
+            let task = runtime.request_save_inner(card, false, false);
+            if late_completion {
+                // The captured deletion belongs to B even after Undo has
+                // moved the current history back to A's absence identity.
+                drop(runtime.update(RepositoryAction::Undo { card }));
+                drop(runtime.update(RepositoryAction::Undo { card }));
+                finish_lineage_save(&mut runtime, task).await;
+                let DocumentState::Editable(document) = &runtime.document else {
+                    unreachable!()
+                };
+                assert_eq!(document.restorations.len(), 2);
+                assert_ne!(document.presence_id, document.saved_presence_id);
+                assert!(runtime.is_dirty());
+            } else {
+                finish_lineage_save(&mut runtime, task).await;
+                drop(runtime.update(RepositoryAction::Undo { card }));
+                let task = runtime.request_save_inner(card, false, false);
+                finish_lineage_save(&mut runtime, task).await;
+                assert_eq!(
+                    std::fs::read_to_string(root.join("new.sh")).unwrap(),
+                    "synthetic beta\n"
+                );
+                assert_eq!(
+                    std::fs::metadata(root.join("new.sh"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o644
+                );
+                drop(runtime.update(RepositoryAction::Undo { card }));
+            }
+            assert!(!runtime.desired_file_present());
+            if save_between_undos {
+                let task = runtime.request_save_inner(card, false, false);
+                finish_lineage_save(&mut runtime, task).await;
+                assert!(!root.join("new.sh").exists());
+            }
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().unwrap(), "synthetic alpha\n");
+            let task = runtime.request_save_inner(card, false, false);
+            finish_lineage_save(&mut runtime, task).await;
+            assert_eq!(
+                std::fs::read_to_string(root.join("new.sh")).unwrap(),
+                "synthetic alpha\n"
+            );
+            assert_eq!(
+                std::fs::metadata(root.join("new.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "older synthetic contents must not acquire the later broader permissions"
+            );
+            assert!(!runtime.is_dirty());
+        }
+        eprintln!("PRESENCE_LINEAGE_VERIFIED");
+    }
+
+    #[tokio::test]
+    async fn partial_change_presence_capacity_refuses_before_disk_effects_and_preserves_undo() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        initialize_presence_fixture(&root);
+        std::fs::write(root.join("new.sh"), "synthetic initial\n").unwrap();
+        std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let card = CardId::new();
+        let (mut runtime, _) = added_file_runtime(card, &root, "synthetic initial\n");
+        let mut latest = String::new();
+        for index in 1..=64 {
+            revert_complete_added_buffer(&mut runtime, card, 0o100644);
+            let task = runtime.request_save_inner(card, false, false);
+            finish_lineage_save(&mut runtime, task).await;
+            assert!(!root.join("new.sh").exists());
+            latest = format!("synthetic cycle {index}\n");
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!()
+            };
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new(latest.clone()),
+            )));
+            let task = runtime.request_save_inner(card, false, false);
+            finish_lineage_save(&mut runtime, task).await;
+            assert_eq!(
+                std::fs::read_to_string(root.join("new.sh")).unwrap(),
+                latest
+            );
+        }
+        revert_complete_added_buffer(&mut runtime, card, 0o100644);
+        let refused = runtime.request_save_inner(card, false, false);
+        assert!(iced::runtime::task::into_stream(refused).is_none());
+        assert!(
+            runtime
+                .save_error()
+                .unwrap()
+                .contains("retained deletion snapshots")
+        );
+        assert_eq!(
+            runtime.source_surface,
+            SourceSurface::Editor,
+            "the recovery message must be visible"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.sh")).unwrap(),
+            latest
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("new.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), latest);
+        assert!(!runtime.is_dirty());
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
+        assert_eq!(document.restorations.len(), 64);
+        document.history.clear();
+        document.prune_restorations();
+        assert_eq!(
+            document.restorations.len(),
+            1,
+            "only the current/saved lineage remains after history is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_change_full_added_file_revert_saves_absence_and_single_undo_restores_bytes_and_mode()
+     {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let text = "#!/bin/sh\r\necho native\r\nno final newline";
+        std::fs::write(root.join("new.sh"), text).unwrap();
+        std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o751))
+            .unwrap();
+        let card = CardId::new();
+        let (mut runtime, identity) = added_file_runtime(card, &root, text);
+        let model = runtime.current_diff_model_snapshot().unwrap();
+        let request = runtime
+            .diff_mutation_request(card, 0..model.row_count(runtime.diff_mode))
+            .unwrap();
+        let (_, revision, mut patch) = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(patch.working_present, Some(false));
+        runtime
+            .apply_diff_buffer_revert_with_presence(
+                &identity,
+                revision.unwrap(),
+                patch.buffer_change.take(),
+                false,
+                patch.working_mode,
+            )
+            .unwrap();
+        assert!(!runtime.desired_file_present());
+        assert!(runtime.is_dirty());
+        let task = runtime.request_save_inner(card, false, false);
+        finish_presence_save(&mut runtime, task).await;
+        assert!(!root.join("new.sh").exists());
+        assert!(!runtime.saved_file_present());
+        assert!(!runtime.is_dirty());
+        assert!(
+            runtime.auto_save_revision().is_none(),
+            "old timers cannot recreate the absent empty buffer"
+        );
+        drop(runtime.refresh_selected_status(card));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("absence keeps native Undo mounted");
+        };
+        assert!(document.history.can_undo());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), text);
+        assert!(runtime.desired_file_present());
+        assert!(runtime.is_dirty());
+        let task = runtime.request_save_inner(card, false, false);
+        finish_presence_save(&mut runtime, task).await;
+        assert_eq!(std::fs::read(root.join("new.sh")).unwrap(), text.as_bytes());
+        assert_eq!(
+            std::fs::metadata(root.join("new.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o751
+        );
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        assert!(
+            !document.history.can_undo(),
+            "the entire presence/content revert is one step"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_change_late_absent_save_keeps_newer_typing_dirty_and_recreates_it_safely() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("new.sh"), "original\n").unwrap();
+        std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let card = CardId::new();
+        let (mut runtime, identity) = added_file_runtime(card, &root, "original\n");
+        let model = runtime.current_diff_model_snapshot().unwrap();
+        let request = runtime
+            .diff_mutation_request(card, 0..model.row_count(runtime.diff_mode))
+            .unwrap();
+        let (_, revision, mut patch) = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request))
+            .unwrap()
+            .build()
+            .unwrap();
+        runtime
+            .apply_diff_buffer_revert_with_presence(
+                &identity,
+                revision.unwrap(),
+                patch.buffer_change.take(),
+                false,
+                patch.working_mode,
+            )
+            .unwrap();
+        let deletion = runtime.request_save_inner(card, false, false);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+            Arc::new("newer typing\n".into()),
+        )));
+        assert!(document.present);
+        finish_presence_save(&mut runtime, deletion).await;
+        assert!(!root.join("new.sh").exists());
+        assert!(runtime.is_dirty());
+        assert!(runtime.desired_file_present());
+        assert!(!runtime.saved_file_present());
+        assert_eq!(runtime.editor_text().unwrap(), "newer typing\n");
+        let recreation = runtime.request_save_inner(card, false, false);
+        finish_presence_save(&mut runtime, recreation).await;
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.sh")).unwrap(),
+            "newer typing\n"
+        );
+        assert!(!runtime.is_dirty());
+    }
+
+    #[test]
+    fn partial_change_patch_targets_the_followed_file_while_identity_stays_on_the_selected_link() {
+        let card = CardId::new();
+        let (mut runtime, identity) = added_file_runtime(card, Path::new("/repo"), "new\n");
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        document.source = "target.sh".into();
+        let FileListState::Ready(files) = &mut runtime.files else {
+            unreachable!();
+        };
+        files.push(RepositoryFile {
+            path: "target.sh".into(),
+            unstaged: true,
+            ..RepositoryFile::default()
+        });
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        let request = runtime.diff_mutation_request(card, 0..1).unwrap();
+        let capture = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request))
+            .unwrap();
+        assert_eq!(capture.identity, identity);
+        assert_eq!(capture.new_path.as_path(), Path::new("target.sh"));
+        assert_eq!(capture.old_path.as_path(), Path::new("target.sh"));
+        let (_, _, patch) = capture.build().unwrap();
+        let text = std::str::from_utf8(&patch.patch).unwrap();
+        assert!(text.contains("b/target.sh"));
+        assert!(!text.contains("new.sh"));
+    }
+
+    #[test]
+    fn partial_change_selected_lines_of_added_file_keep_presence_and_one_undo() {
+        let card = CardId::new();
+        let (mut runtime, identity) =
+            added_file_runtime(card, Path::new("/repo"), "one\ntwo\nthree\n");
+        let request = runtime.diff_mutation_request(card, 0..1).unwrap();
+        let (_, revision, mut patch) = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(patch.working_present, Some(true));
+        runtime
+            .apply_diff_buffer_revert_with_presence(
+                &identity,
+                revision.unwrap(),
+                patch.buffer_change.take(),
+                true,
+                patch.working_mode,
+            )
+            .unwrap();
+        assert!(runtime.desired_file_present());
+        assert_eq!(runtime.editor_text().unwrap(), "two\nthree\n");
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), "one\ntwo\nthree\n");
+        assert!(runtime.desired_file_present());
+    }
+
+    #[test]
+    fn partial_change_presence_only_edit_is_dirty_even_when_saved_and_current_text_are_empty() {
+        let card = CardId::new();
+        let (mut runtime, identity) = added_file_runtime(card, Path::new("/repo"), "");
+        runtime
+            .apply_diff_buffer_revert_with_presence(&identity, 0, None, false, Some(0o100755))
+            .unwrap();
+        assert!(runtime.is_dirty());
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        assert!(document.step_history(false).is_some());
+        assert!(document.present);
+        assert!(!document.dirty);
+        assert!(!document.history.can_undo());
+    }
 
     pub(super) fn selected_mutation_fixture(card: CardId) -> RepositoryRuntime {
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.txt", "changed\nkeep\n");

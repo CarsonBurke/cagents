@@ -1487,6 +1487,39 @@ pub fn load_repository_diff_with_options_and_font(
     }
 }
 
+/// Whitespace comparison keys retain one token for every source line, even
+/// when an unterminated final line becomes empty. Pool normalized bytes rather
+/// than allocate a String per line; ranges preserve empty tokens explicitly.
+struct NormalizedDiffLines {
+    text: String,
+    lines: Vec<Range<usize>>,
+}
+
+impl NormalizedDiffLines {
+    fn new(source: &str, cancellation: &CancellationToken) -> Result<Self, Cancelled> {
+        let mut result = Self {
+            text: String::with_capacity(source.len()),
+            lines: Vec::new(),
+        };
+        for line in source.split_inclusive('\n') {
+            check_cancelled(cancellation)?;
+            let start = result.text.len();
+            result
+                .text
+                .extend(line.chars().filter(|ch| *ch == '\n' || !ch.is_whitespace()));
+            result.lines.push(start..result.text.len());
+        }
+        Ok(result)
+    }
+
+    fn input<'a>(&'a self, after: &'a Self) -> InternedInput<&'a str> {
+        let mut input = InternedInput::default();
+        input.update_before(self.lines.iter().map(|range| &self.text[range.clone()]));
+        input.update_after(after.lines.iter().map(|range| &after.text[range.clone()]));
+        input
+    }
+}
+
 /// The editor gutter needs only new-side changed line numbers. This path
 /// creates neither display rows nor syntax/width work, including for large files.
 pub fn build_line_changes(
@@ -1499,19 +1532,18 @@ pub fn build_line_changes(
     if before == after {
         return Some(Vec::new());
     }
-    let normalized;
-    let (old, new) = if ignore_whitespace {
-        let normalize = |text: &str| {
-            text.chars()
-                .filter(|ch| *ch == '\n' || !ch.is_whitespace())
-                .collect::<String>()
-        };
-        normalized = (normalize(before), normalize(after));
-        (normalized.0.as_str(), normalized.1.as_str())
+    let normalized = if ignore_whitespace {
+        Some((
+            NormalizedDiffLines::new(before, cancellation).ok()?,
+            NormalizedDiffLines::new(after, cancellation).ok()?,
+        ))
     } else {
-        (before, after)
+        None
     };
-    let input = InternedInput::new(old, new);
+    let input = match &normalized {
+        Some((before, after)) => before.input(after),
+        None => InternedInput::new(before, after),
+    };
     check_cancelled(cancellation).ok()?;
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     check_cancelled(cancellation).ok()?;
@@ -1614,20 +1646,18 @@ fn build_diff_rows_from_sources(
         check_cancelled(cancellation)?;
         return Ok(model);
     }
-    let normalized;
-    let (old_tokens, new_tokens) = if ignore_whitespace {
-        // Retain line separators and final-newline identity. Do not join lines.
-        let normalize = |text: &str| {
-            text.chars()
-                .filter(|ch| *ch == '\n' || !ch.is_whitespace())
-                .collect::<String>()
-        };
-        normalized = (normalize(before), normalize(after));
-        (normalized.0.as_str(), normalized.1.as_str())
+    let normalized = if ignore_whitespace {
+        Some((
+            NormalizedDiffLines::new(before, cancellation)?,
+            NormalizedDiffLines::new(after, cancellation)?,
+        ))
     } else {
-        (before.as_ref(), after)
+        None
     };
-    let input = InternedInput::new(old_tokens, new_tokens);
+    let input = match &normalized {
+        Some((before, after)) => before.input(after),
+        None => InternedInput::new(before.as_ref(), after),
+    };
     check_cancelled(cancellation)?;
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     check_cancelled(cancellation)?;
@@ -2331,6 +2361,78 @@ mod tests {
             new_line.additions, 1,
             "normalization preserves line separators"
         );
+    }
+
+    #[test]
+    fn whitespace_normalization_retains_unterminated_empty_line_tokens_and_coordinates() {
+        let cancel = CancellationToken::new();
+        for (before, after, expected_changes) in [
+            ("a\n    ", "a\n  x", vec![1]),
+            ("a\n  x", "a\n    ", vec![1]),
+            ("    ", "x", vec![0]),
+            ("x", "    ", vec![0]),
+            ("", "    ", vec![0]),
+            ("    ", "", Vec::new()),
+            ("a\r\n\t  ", "a\r\n  雪", vec![1]),
+            ("a\n    ", "a\n\t", Vec::new()),
+            ("a\n    ", "a\n", Vec::new()),
+            ("a\n", "a\n    ", vec![1]),
+        ] {
+            let baseline = Arc::<str>::from(before);
+            let model = build_diff_rows_with_options(&baseline, after, true, &cancel).unwrap();
+            assert_eq!(
+                model.line_counts,
+                [
+                    before.split_inclusive('\n').count(),
+                    after.split_inclusive('\n').count()
+                ]
+            );
+            assert_eq!(
+                build_line_changes(before, after, true, &cancel).unwrap(),
+                expected_changes,
+                "{before:?} → {after:?}"
+            );
+            for (side, source) in [before, after].into_iter().enumerate() {
+                let line_count = source.split_inclusive('\n').count();
+                let coordinates = model
+                    .inline_rows
+                    .iter()
+                    .filter_map(|row| {
+                        if side == 0 {
+                            row.old_line
+                        } else {
+                            row.new_line
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    coordinates,
+                    (1..=line_count as u32).collect::<Vec<_>>(),
+                    "{before:?} → {after:?}, side{side}"
+                );
+            }
+            for mode in [DiffMode::Inline, DiffMode::Split] {
+                let range = 0..model.row_count(mode);
+                if !model.is_empty() {
+                    assert_eq!(
+                        crate::diff_patch::selected_content(
+                            &model,
+                            after,
+                            mode,
+                            range.clone(),
+                            false
+                        )
+                        .as_deref(),
+                        Some(after)
+                    );
+                    assert_eq!(
+                        crate::diff_patch::selected_content(&model, after, mode, range, true)
+                            .as_deref(),
+                        Some(before)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4100,7 +4202,7 @@ mod snapshot_performance_receipt {
     fn fifty_thousand_line_edit_and_capture() {
         use crate::repository_widget::text_editor::{Content, Cursor, Edit, Position};
         let source = (0..50_000).map(|line| format!("fn function_{line:05}() {{ let value = {line}; println!(\"value {{value}}\"); }}\n")).collect::<String>();
-        let mut content: Content = Content::with_text(&source);
+        let mut content: Content<cosmic::Renderer> = Content::with_text(&source);
         content.set_cursor(Cursor {
             position: Position {
                 line: 25_000,

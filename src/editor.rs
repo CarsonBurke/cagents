@@ -10,6 +10,10 @@ use thiserror::Error;
 
 use crate::fs_safety::{self, ResolveError, Root};
 
+mod presence;
+pub use presence::FileRestoration;
+pub(crate) use presence::{PresenceSave, save_document_file};
+
 /// Rasterizing a page happens in a child process, so the reader's document
 /// lives behind the same module boundary either way: `load_file` opens one on
 /// its first page, and the view asks for the pages after that.
@@ -190,6 +194,10 @@ pub enum FileIoError {
 pub enum SaveOutcome {
     Saved {
         content_hash: blake3::Hash,
+        durability: SaveDurability,
+    },
+    Absent {
+        restoration: std::sync::Arc<FileRestoration>,
         durability: SaveDurability,
     },
     Conflict {
