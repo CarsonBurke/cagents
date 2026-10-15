@@ -129,6 +129,9 @@ pub enum GlobalShortcut {
     StageSelectedChanges,
     UnstageSelectedChanges,
     DiscardSelectedChanges,
+    OpenFile,
+    RevealInFiles,
+    IgnoreChangePath,
 
 
     CommandPalette,
@@ -204,6 +207,9 @@ impl GlobalShortcut {
             Self::StageSelectedChanges => Some(1 << 24),
             Self::UnstageSelectedChanges => Some(1 << 25),
             Self::DiscardSelectedChanges => Some(1 << 26),
+            Self::OpenFile => Some(1 << 27),
+            Self::RevealInFiles => Some(1 << 28),
+            Self::IgnoreChangePath => Some(1 << 29),
             _ => None,
         }
     }
@@ -219,7 +225,7 @@ impl GlobalShortcut {
                 | Self::OpenSettings | Self::ToggleInspector | Self::FocusLastPane
                 | Self::FocusAdjacent(_) | Self::CycleWorkspace(_)
                 | Self::NextAttention | Self::PreviousAttention
-                | Self::MovePaneToChannel | Self::DiffOpenInEditor
+                | Self::MovePaneToChannel | Self::DiffOpenInEditor | Self::OpenFile
                 | Self::DeleteChannel)
     }
 
@@ -307,6 +313,9 @@ impl GlobalShortcut {
             Self::StageSelectedChanges => "stage_selected_changes",
             Self::UnstageSelectedChanges => "unstage_selected_changes",
             Self::DiscardSelectedChanges => "discard_selected_changes",
+            Self::OpenFile => "open_file",
+            Self::RevealInFiles => "reveal_in_files",
+            Self::IgnoreChangePath => "ignore_change_path",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -1201,6 +1210,9 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::StageSelectedChanges, label: "Stage selected changes", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::UnstageSelectedChanges, label: "Unstage selected changes", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::DiscardSelectedChanges, label: "Discard selected changes…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::OpenFile, label: "Open file", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::RevealInFiles, label: "Reveal in Files", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::IgnoreChangePath, label: "Add to .gitignore", repeatable: false, scope: ShortcutScope::Sidebar },
 
 ];
 
@@ -1302,6 +1314,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::StageSelectedChanges => &shortcuts.stage_selected_changes,
         GlobalShortcut::UnstageSelectedChanges => &shortcuts.unstage_selected_changes,
         GlobalShortcut::DiscardSelectedChanges => &shortcuts.discard_selected_changes,
+        GlobalShortcut::OpenFile => &shortcuts.open_file,
+        GlobalShortcut::RevealInFiles => &shortcuts.reveal_in_files,
+        GlobalShortcut::IgnoreChangePath => &shortcuts.ignore_change_path,
 
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,

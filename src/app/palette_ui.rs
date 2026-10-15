@@ -1215,7 +1215,7 @@ impl Cagents {
             return match target.resolve_in(&self.sidebar_model, &self.sidebar_state, command) {
                 // Check and invoke in the same update: no queued message may
                 // reinterpret a selection after its captured revision passed.
-                Some(action @ SidebarAction::InvokeChangeRows { .. }) => {
+                Some(action) if matches!(&target, sidebar::commands::CommandTarget::Changes { .. }) => {
                     if crate::device::is_remote() && !device_ui::supports_sidebar_action(&action) { return Task::none(); }
                     self.update(Message::Sidebar(action))
                 }
@@ -1414,6 +1414,9 @@ impl Cagents {
             | Command::StageSelectedChanges
             | Command::UnstageSelectedChanges
             | Command::DiscardSelectedChanges
+            | Command::OpenFile
+            | Command::RevealInFiles
+            | Command::IgnoreChangePath
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -1664,6 +1667,9 @@ impl SettingsField {
             Self::ShortcutStageSelectedChanges => Some(Command::StageSelectedChanges),
             Self::ShortcutUnstageSelectedChanges => Some(Command::UnstageSelectedChanges),
             Self::ShortcutDiscardSelectedChanges => Some(Command::DiscardSelectedChanges),
+            Self::ShortcutOpenFile => Some(Command::OpenFile),
+            Self::ShortcutRevealInFiles => Some(Command::RevealInFiles),
+            Self::ShortcutIgnoreChangePath => Some(Command::IgnoreChangePath),
 
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
@@ -1818,6 +1824,9 @@ impl ShortcutDraft {
             (Command::StageSelectedChanges, self.stage_selected_changes.as_str()),
             (Command::UnstageSelectedChanges, self.unstage_selected_changes.as_str()),
             (Command::DiscardSelectedChanges, self.discard_selected_changes.as_str()),
+            (Command::OpenFile, self.open_file.as_str()),
+            (Command::RevealInFiles, self.reveal_in_files.as_str()),
+            (Command::IgnoreChangePath, self.ignore_change_path.as_str()),
 
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),

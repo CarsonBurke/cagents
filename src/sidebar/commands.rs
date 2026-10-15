@@ -47,6 +47,9 @@ pub fn command_id(action: &SidebarAction) -> Option<Command> {
             FileCommand::RevealInFileManager => Command::RevealInFileManager,
         },
         SidebarAction::OpenFileInEditor { .. } => Command::OpenInExternalEditor,
+        SidebarAction::OpenFile { .. } => Command::OpenFile,
+        SidebarAction::RevealChangeInFiles { .. } => Command::RevealInFiles,
+        SidebarAction::IgnoreChangePath { .. } => Command::IgnoreChangePath,
         _ => return None,
     })
 }
@@ -99,7 +102,7 @@ impl CommandTarget {
             SidebarAction::RenameChannel(id) | SidebarAction::MarkChannelRead(id) | SidebarAction::DeleteChannel { channel_id: id } => Self::Rows(vec![SelectionRow::Channel(*id)]),
             SidebarAction::MarkWorktreeRead(project, worktree) => Self::Rows(vec![SelectionRow::Worktree(*project, *worktree)]),
             SidebarAction::DeleteRows(rows) => Self::Rows(rows.clone()),
-            SidebarAction::FileCommand { key, path, .. } | SidebarAction::OpenFileInEditor { key, path, .. } => Self::File { key: key.clone(), path: path.clone() },
+            SidebarAction::FileCommand { key, path, .. } | SidebarAction::OpenFileInEditor { key, path, .. } | SidebarAction::OpenFile { key, path } => Self::File { key: key.clone(), path: path.clone() },
             _ => return None,
         })
     }
@@ -123,6 +126,7 @@ impl CommandTarget {
                 if source.key != *key || !model.contains_worktree(key) || source.reloading || source.busy() { return None; }
                 let row = file_rows(source).find(|row| row.path == *path)?;
                 let file = match command {
+                    Command::OpenFile if !row.directory && row.status != Some(FileStatus::Deleted) => return Some(SidebarAction::OpenFile { key: key.clone(), path: path.clone() }),
                     Command::CopyPath => FileCommand::CopyPath,
                     Command::CopyRelativePath => FileCommand::CopyRelativePath,
                     Command::RevealInFileManager => FileCommand::RevealInFileManager,
@@ -187,8 +191,18 @@ impl CommandTarget {
     pub fn resolve_in(&self, model: &SidebarModel, state: &SidebarState, command: Command) -> Option<SidebarAction> {
         let Self::Changes { key, row, selection_revision } = self else { return self.resolve(model, command); };
         let source = model.source_control.as_ref()?;
-        if &source.key != key || !model.contains_worktree(key) || source.reloading || source.busy()
+        if &source.key != key || !model.contains_worktree(key) || source.reloading
+            || state.active_worktree() != Some(key) || !matches!(source.data_state, SidebarDataState::Ready)
             || state.change_selection_revision() != *selection_revision { return None; }
+        let current = source.group(row.area)?.visible_path(&row.path)?;
+        match command {
+            Command::CopyRelativePath => return Some(SidebarAction::FileCommand { key: key.clone(), path: row.path.clone(), command: FileCommand::CopyRelativePath }),
+            Command::OpenFile if current.entry.kind != ChangeKind::Deleted => return Some(SidebarAction::OpenFile { key: key.clone(), path: row.path.clone() }),
+            Command::RevealInFiles if current.entry.kind != ChangeKind::Deleted => return Some(SidebarAction::RevealChangeInFiles { key: key.clone(), path: row.path.clone() }),
+            Command::IgnoreChangePath if row.area == ChangeArea::Untracked && !source.busy() => return Some(SidebarAction::IgnoreChangePath { key: key.clone(), path: row.path.clone() }),
+            _ => {}
+        }
+        if source.busy() { return None; }
         let operation = match command {
             Command::StageSelectedChanges => ChangeGroupCommand::Stage,
             Command::UnstageSelectedChanges => ChangeGroupCommand::Unstage,
@@ -305,5 +319,37 @@ mod change_target_tests {
         assert!(current.resolve_in(&model, &state, Command::StageSelectedChanges).is_none());
         model.source_control = None;
         assert!(current.resolve_in(&model, &state, Command::StageSelectedChanges).is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod change_navigation_target_tests {
+    use super::*;
+    #[test]
+    fn every_change_navigation_template_uses_current_row_and_captured_revision() {
+        let model = super::super::tests::panel_model();
+        let mut state = super::super::tests::panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        let row = source.group(ChangeArea::Untracked).unwrap().rows()[0].entry.clone();
+        let target = CommandTarget::Changes { key: source.key.clone(),
+            row: ChangeSelectionRow { area: row.area, path: row.path.clone() },
+            selection_revision: state.change_selection_revision() };
+        for command in [Command::OpenFile,Command::RevealInFiles,Command::CopyRelativePath,Command::IgnoreChangePath] {
+            let resolved=target.resolve_in(&model,&state,command).expect("live row operation");
+            assert_eq!(command_id(&resolved),Some(command));
+            assert!(matches!(resolved,
+                SidebarAction::OpenFile { key,path } | SidebarAction::RevealChangeInFiles { key,path }
+                | SidebarAction::IgnoreChangePath { key,path } | SidebarAction::FileCommand { key,path,.. }
+                if key==source.key && path==row.path));
+        }
+        let order=change_selection_order(source,&state);
+        state.select_change_rows(order[0].clone(),SelectionIntent::Toggle,&order);
+        for command in [Command::OpenFile,Command::RevealInFiles,Command::CopyRelativePath,Command::IgnoreChangePath] {
+            assert!(target.resolve_in(&model,&state,command).is_none(),"stale intent must not follow another selection");
+        }
+        let tracked=source.groups().iter().filter(|group| group.area!=ChangeArea::Untracked).flat_map(|group| group.rows()).next().unwrap();
+        let target=CommandTarget::Changes { key:source.key.clone(),row:ChangeSelectionRow { area:tracked.entry.area,path:tracked.entry.path.clone() },selection_revision:state.change_selection_revision() };
+        assert!(target.resolve_in(&model,&state,Command::IgnoreChangePath).is_none());
     }
 }

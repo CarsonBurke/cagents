@@ -2927,12 +2927,15 @@ pub enum SettingsField {
     ShortcutStageSelectedChanges,
     ShortcutUnstageSelectedChanges,
     ShortcutDiscardSelectedChanges,
+    ShortcutOpenFile,
+    ShortcutRevealInFiles,
+    ShortcutIgnoreChangePath,
 
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 116] = [
+    const SHORTCUTS: [Self; 119] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3054,6 +3057,9 @@ impl SettingsField {
         Self::ShortcutStageSelectedChanges,
         Self::ShortcutUnstageSelectedChanges,
         Self::ShortcutDiscardSelectedChanges,
+        Self::ShortcutOpenFile,
+        Self::ShortcutRevealInFiles,
+        Self::ShortcutIgnoreChangePath,
 
     ];
 
@@ -3180,6 +3186,9 @@ impl SettingsField {
             Self::ShortcutStageSelectedChanges => "Stage selected changes",
             Self::ShortcutUnstageSelectedChanges => "Unstage selected changes",
             Self::ShortcutDiscardSelectedChanges => "Discard selected changes…",
+            Self::ShortcutOpenFile => "Open file",
+            Self::ShortcutRevealInFiles => "Reveal in Files",
+            Self::ShortcutIgnoreChangePath => "Add to .gitignore",
 
 
             Self::ShortcutCommandPalette => "Command palette",
@@ -3360,6 +3369,9 @@ impl SettingsField {
             | Self::ShortcutStageSelectedChanges
             | Self::ShortcutUnstageSelectedChanges
             | Self::ShortcutDiscardSelectedChanges
+            | Self::ShortcutOpenFile
+            | Self::ShortcutRevealInFiles
+            | Self::ShortcutIgnoreChangePath
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3503,6 +3515,9 @@ struct ShortcutDraft {
     stage_selected_changes: String,
     unstage_selected_changes: String,
     discard_selected_changes: String,
+    open_file: String,
+    reveal_in_files: String,
+    ignore_change_path: String,
 
 
     command_palette: String,
@@ -3634,6 +3649,9 @@ impl ShortcutDraft {
             stage_selected_changes: settings::format_chords(&shortcuts.stage_selected_changes),
             unstage_selected_changes: settings::format_chords(&shortcuts.unstage_selected_changes),
             discard_selected_changes: settings::format_chords(&shortcuts.discard_selected_changes),
+            open_file: settings::format_chords(&shortcuts.open_file),
+            reveal_in_files: settings::format_chords(&shortcuts.reveal_in_files),
+            ignore_change_path: settings::format_chords(&shortcuts.ignore_change_path),
 
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -3980,6 +3998,9 @@ impl SettingsDraft {
             SettingsField::ShortcutStageSelectedChanges => self.keyboard_shortcuts.stage_selected_changes = value,
             SettingsField::ShortcutUnstageSelectedChanges => self.keyboard_shortcuts.unstage_selected_changes = value,
             SettingsField::ShortcutDiscardSelectedChanges => self.keyboard_shortcuts.discard_selected_changes = value,
+            SettingsField::ShortcutOpenFile => self.keyboard_shortcuts.open_file = value,
+            SettingsField::ShortcutRevealInFiles => self.keyboard_shortcuts.reveal_in_files = value,
+            SettingsField::ShortcutIgnoreChangePath => self.keyboard_shortcuts.ignore_change_path = value,
 
 
             SettingsField::ShortcutCommandPalette => {
@@ -4319,6 +4340,9 @@ fn settings_update(
         SettingsField::ShortcutStageSelectedChanges => { next.keyboard_shortcuts.stage_selected_changes = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutUnstageSelectedChanges => { next.keyboard_shortcuts.unstage_selected_changes = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutDiscardSelectedChanges => { next.keyboard_shortcuts.discard_selected_changes = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutOpenFile => { next.keyboard_shortcuts.open_file = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutRevealInFiles => { next.keyboard_shortcuts.reveal_in_files = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutIgnoreChangePath => { next.keyboard_shortcuts.ignore_change_path = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
