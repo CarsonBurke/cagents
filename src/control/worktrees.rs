@@ -87,10 +87,11 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
             if let Some(terminal)=setup.as_ref().and_then(|setup|setup.terminal.as_ref()) {
                 human.push_str(&format!("\nWorktree setup terminal {}",terminal.id));
             }
+            if let Some(error)=setup.as_ref().and_then(|setup|setup.error.as_ref()) {
+                let agent=if spawn.is_some() {"; its agent was not started"} else {""};
+                return Err(AppError {kind:"worktree_setup",message:format!("Worktree was created at {}, but setup failed{agent}: {error}",worktree.path.display()),details:Some(data)});
+            }
             if let Some((provider,prompt,model,reasoning_effort))=spawn {
-                if let Some(error)=setup.as_ref().and_then(|setup|setup.error.as_ref()) {
-                    return Err(AppError {kind:"worktree_setup",message:format!("Worktree was created at {}, but setup failed and its agent was not started: {error}",worktree.path.display()),details:Some(data)});
-                }
                 if let Some(terminal)=setup.as_ref().and_then(|setup|setup.terminal.as_ref()) {
                     wait_for_setup(&mut client,terminal.id).map_err(|error|AppError { kind:"worktree_setup",message:format!("Worktree was created at {}, but its agent was not started: {error}",worktree.path.display()),details:Some(data.clone()) })?;
                 }

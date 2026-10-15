@@ -178,6 +178,23 @@ fn untrusted_setup_refuses_before_creation_no_setup_skips_and_trusted_copy_uses_
 }
 
 #[test]
+fn setup_preparation_failure_returns_nonzero_and_reports_the_retained_checkout() {
+    // A privileged process bypasses this deliberate Unix access denial.
+    if unsafe {libc::geteuid()}==0 {return;}
+    let fixture=Fixture::new();let project=fixture.root.path().join("project");
+    fs::create_dir(project.join(".cagents")).unwrap();
+    fs::write(project.join(".cagents/worktree.toml"),"copy = [\".env\"]\n").unwrap();
+    fs::write(project.join(".env"),"do not expose").unwrap();
+    fs::set_permissions(project.join(".env"),fs::Permissions::from_mode(0o000)).unwrap();
+    let output=fixture.output(&["worktree","create","failed-setup"]);
+    assert!(!output.status.success(),"known preparation failure must not report success: {output:?}");
+    let value:Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(value["ok"],false);
+    assert!(value.to_string().contains("Worktree was created"),"{value}");
+    let path=project.join("managed/failed-setup");assert!(path.join("tracked").is_file());
+    assert!(!path.join(".env").exists());
+}
+
+#[test]
 fn project_ids_resolve_from_window_storage_without_migrating_it() {
     let fixture=Fixture::new();
     let id=cagents::model::ProjectId::new();
