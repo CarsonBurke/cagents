@@ -653,7 +653,8 @@ mod tests {
                 ellipsize: text::Ellipsize::End(text::EllipsizeHeightLimit::Lines(1)),
             }
         }
-        let label = "Refactor this very long workspace label without wrapping or clipping the match";
+        let label =
+            "Refactor this very long workspace label without wrapping or clipping the match";
         let spans: Vec<text::Span<'_, (), Font>> = vec![
             text::Span::new("Refactor").color(iced::Color::from_rgb(0.9, 0.2, 0.2)),
             text::Span::new(&label[8..]),
@@ -661,13 +662,20 @@ mod tests {
         for width in [64.0, 180.0] {
             let plain = Paragraph::with_text(config(label, width));
             let mut highlighted = Paragraph::with_spans(config(spans.as_slice(), width));
-            assert!(highlighted.min_bounds().width <= width + 0.5, "rich labels must apply the ellipsis strategy, not only clip their source: {:?}", highlighted.min_bounds());
+            assert!(
+                highlighted.min_bounds().width <= width + 0.5,
+                "rich labels must apply the ellipsis strategy, not only clip their source: {:?}",
+                highlighted.min_bounds()
+            );
             assert!(highlighted.min_bounds().height <= 18.5);
             assert!((highlighted.min_bounds().width - plain.min_bounds().width).abs() <= 0.5);
             highlighted.resize(Size::new(32.0, 18.0));
             assert!(highlighted.min_bounds().width <= 32.5);
             highlighted.resize(Size::new(1200.0, 18.0));
-            assert!(highlighted.min_bounds().width > width, "resizing restores previously ellipsized text");
+            assert!(
+                highlighted.min_bounds().width > width,
+                "resizing restores previously ellipsized text"
+            );
             assert!(highlighted.min_bounds().height <= 18.5);
         }
     }
