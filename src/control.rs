@@ -439,6 +439,13 @@ pub enum ControlError {
     ShutdownRejected(ShutdownOutcome),
 }
 
+/// Edges from the shared workspace observer, in their original stream order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceUpdate {
+    Edited { sequence: u64, edit: ModelEdit },
+    WorktreesChanged { repository: PathBuf },
+}
+
 /// A bounded, synchronous client for the current cagents daemon protocol.
 pub struct ControlClient {
     stream: UnixStream,
@@ -452,7 +459,7 @@ pub struct ControlClient {
     observed: VecDeque<TerminalDescriptor>,
     /// Shared-model edges that arrived while a correlated response was pending,
     /// buffered for the same reason `observed` buffers an inventory edge.
-    observed_model: VecDeque<(u64, ModelEdit)>,
+    observed_model: VecDeque<WorkspaceUpdate>,
     observed_notifications: VecDeque<crate::notifications::Update>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
@@ -748,7 +755,13 @@ impl ControlClient {
             let envelope = self.read_envelope()?;
             self.validate_pinned_envelope(&envelope)?;
             match envelope.message {
-                ServerMessage::NotificationsChanged => {
+                ServerMessage::WorktreesChanged { repository } => {
+                if !self.observed_model.iter().any(|update| matches!(update,
+                    WorkspaceUpdate::WorktreesChanged { repository: existing } if *existing == repository)) {
+                    self.observed_model.push_back(WorkspaceUpdate::WorktreesChanged { repository });
+                }
+            }
+            ServerMessage::NotificationsChanged => {
                     return Ok(crate::notifications::Update::Changed);
                 }
                 ServerMessage::NotificationActivated { target } => {
@@ -788,30 +801,34 @@ impl ControlClient {
     /// polling: a timeout expiring mid-frame would desynchronize the stream, and
     /// a subscribed connection issues no further requests.
     pub fn next_workspace_model_edit(&mut self) -> Result<(u64, ModelEdit), ControlError> {
+        loop {
+            if let WorkspaceUpdate::Edited { sequence, edit } = self.next_workspace_update()? {
+                return Ok((sequence, edit));
+            }
+        }
+    }
+
+    /// Model and worktree inventory edges share this original subscribed stream.
+    /// Correlated requests buffer both, so an inventory edge cannot desync a reply.
+    pub fn next_workspace_update(&mut self) -> Result<WorkspaceUpdate, ControlError> {
         if let Some(edge) = self.observed_model.pop_front() {
             return Ok(edge);
         }
-        self.stream
-            .set_read_timeout(None)
-            .map_err(ControlError::Configure)?;
+        self.stream.set_read_timeout(None).map_err(ControlError::Configure)?;
         loop {
             let envelope = self.read_envelope()?;
             self.validate_pinned_envelope(&envelope)?;
             match envelope.message {
                 ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                    return Ok((sequence, edit));
+                    return Ok(WorkspaceUpdate::Edited { sequence, edit });
                 }
-                // The daemon is about to close this connection. Reporting it as
-                // a closed connection is what makes a watcher reconnect and
-                // resynchronize against the successor's registry.
+                ServerMessage::WorktreesChanged { repository } => {
+                    return Ok(WorkspaceUpdate::WorktreesChanged { repository });
+                }
                 ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
-                ServerMessage::Error(error) => {
-                    return Err(ControlError::Remote {
-                        code: error.code,
-                        message: error.message,
-                        retryable: error.retryable,
-                    });
-                }
+                ServerMessage::Error(error) => return Err(ControlError::Remote {
+                    code: error.code, message: error.message, retryable: error.retryable,
+                }),
                 _ => {}
             }
         }
@@ -1545,7 +1562,7 @@ impl ControlClient {
         match message {
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
             ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                self.observed_model.push_back((sequence, edit));
+                self.observed_model.push_back(WorkspaceUpdate::Edited { sequence, edit });
             }
             ServerMessage::NotificationsChanged => {
                 if !self
@@ -1762,6 +1779,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatActivity { .. }
         | ServerMessage::TerminalCreated { .. }
         | ServerMessage::WorkspaceModelEdited { .. }
+        | ServerMessage::WorktreesChanged { .. }
         | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::NotificationsChanged
         | ServerMessage::NotificationActivated { .. }
@@ -1784,6 +1802,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::TerminalObserved { .. } => "terminal_observed",
         ServerMessage::TerminalCreated { .. } => "terminal_created",
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
+        ServerMessage::WorktreesChanged { .. } => "worktrees_changed",
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
@@ -3951,6 +3970,36 @@ mod tests {
             boot_id: BootId::new(boot),
             host_incarnation: HostIncarnation::new(incarnation),
         }
+    }
+
+    #[test]
+    fn worktree_inventory_edges_survive_correlated_replies_in_stream_order() {
+        let (client_stream, mut peer) = UnixStream::pair().unwrap();
+        let proof = proof("worktrees", "boot", "incarnation");
+        let repository = PathBuf::from("/private/checkout");
+        let expected = repository.clone();
+        let edit = ModelEdit::CloseProject { repository: repository.clone() };
+        let expected_edit = edit.clone();
+        let server = thread::spawn(move || {
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(&mut peer, &connected_envelope(hello.request_id, proof.clone(), proof.clone())).unwrap();
+            let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            for message in [
+                ServerMessage::WorktreesChanged { repository },
+                ServerMessage::WorkspaceModelEdited { sequence: 7, edit },
+            ] {
+                write_frame(&mut peer, &ServerEnvelope { version: PROTOCOL_VERSION,
+                    request_id: None, proof: proof.clone(), message }).unwrap();
+            }
+            write_frame(&mut peer, &ServerEnvelope { version: PROTOCOL_VERSION,
+                request_id: Some(list.request_id), proof,
+                message: ServerMessage::Response { response: ServerResponse::Listed { terminals: vec![] } } }).unwrap();
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert!(client.list().unwrap().is_empty());
+        assert_eq!(client.next_workspace_update().unwrap(), WorkspaceUpdate::WorktreesChanged { repository: expected });
+        assert_eq!(client.next_workspace_update().unwrap(), WorkspaceUpdate::Edited { sequence: 7, edit: expected_edit });
+        server.join().unwrap();
     }
 
     fn connected_envelope(
