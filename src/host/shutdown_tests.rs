@@ -7,13 +7,24 @@ use std::{
     fs::File,
     os::fd::{AsRawFd, FromRawFd},
     path::Path,
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
 
 const TEST: &str = "host::shutdown_tests::shutdown_batch_continues_after_an_unfinished_worker";
 const ROOT: &str = "CAGENTS_SHUTDOWN_BATCH_ROOT";
+
+struct TestChild(Child);
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
 
 fn session(id: u128, root: &Path) -> TerminalSession {
     let recipe = LaunchRecipe {
@@ -74,7 +85,9 @@ fn shutdown_batch_continues_after_an_unfinished_worker() {
             fs::create_dir(root.join(name)).unwrap();
             fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let output = Command::new(std::env::current_exe().unwrap())
+        let stdout = root.join("test.stdout");
+        let stderr = root.join("test.stderr");
+        let mut child = TestChild(Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
             .env_clear()
             .env(ROOT, &root)
@@ -84,15 +97,29 @@ fn shutdown_batch_continues_after_an_unfinished_worker() {
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_CACHE_HOME", root.join("cache"))
             .env("PATH", "/usr/bin:/bin")
-            .output()
-            .unwrap();
+            .stdout(Stdio::from(File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(File::create(&stderr).unwrap()))
+            .spawn()
+            .unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.0.kill().unwrap();
+                child.0.wait().unwrap();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = fs::read_to_string(stdout).unwrap();
+        let stderr = fs::read_to_string(stderr).unwrap();
         assert!(
-            output.status.success(),
-            "isolated shutdown batch failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            status.is_some_and(|status| status.success()),
+            "isolated shutdown batch failed or exceeded 30s:\n{stdout}\n{stderr}"
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(stdout.contains("1 passed"));
         return;
     };
     let root = std::path::PathBuf::from(root).canonicalize().unwrap();
