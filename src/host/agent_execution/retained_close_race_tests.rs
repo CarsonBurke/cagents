@@ -52,6 +52,10 @@ impl RetainedCloseRaceFixture {
     fn start() -> Self { Self::start_with_schedule(false) }
     fn scheduled() -> Self { Self::start_with_schedule(true) }
     fn start_with_schedule(scheduled: bool) -> Self {
+        Self::start_with_schedule_observed(scheduled, |_, _, _| {})
+    }
+    fn start_with_schedule_observed(scheduled: bool,
+        before_assert: impl FnOnce(&SharedHost, &Accepted, &Run)) -> Self {
         let (host, request, path) = fixture();
         let mut cleanup = RetainedCloseRaceCleanup {
             host: host.clone(),
@@ -90,6 +94,7 @@ while IFS= read -r frame; do"#, 1);
             submit(&host, &Authority::default(), request).unwrap()
         };
         let run = settled(&host, accepted.run.id);
+        before_assert(&host, &accepted, &run);
         assert_eq!(run.state, State::Succeeded, "{run:?}");
         let agent = registry(&host).unwrap().lock().unwrap().agent(accepted.agent.id).unwrap();
         let id = agent.session.as_ref().unwrap().id();
@@ -133,6 +138,44 @@ impl Drop for RetainedCloseRaceFixture {
         // The exact private host owns its handles; no PID/name discovery occurs.
         self.cleanup.finish_or_report();
     }
+}
+
+#[test]
+fn combined_close_retained_lifecycle_constructor_panic_retires_exact_helper() {
+    const NAME: &str = "combined_close_retained_lifecycle_constructor_panic_retires_exact_helper";
+    if owning_close_isolated(NAME).is_some() { return; }
+    const PANIC: &str = "intentional failure before retained fixture construction";
+    let captured = Mutex::new(None);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        RetainedCloseRaceFixture::start_with_schedule_observed(false, |host, accepted, run| {
+            assert_eq!(run.state, State::Succeeded, "{run:?}");
+            let agent = registry(host).unwrap().lock().unwrap().agent(accepted.agent.id).unwrap();
+            let id = agent.session.as_ref().unwrap().id();
+            let (handle, proof) = {
+                let state = host.lock().unwrap();
+                (state.chats[&id].handle.clone(), state.proof().clone())
+            };
+            let identity = handle.actor_identity().expect("actual retained helper");
+            assert!(identity.record.holder.is_current());
+            *captured.lock().unwrap() = Some((host.clone(), handle, identity, proof, run.clone()));
+            panic!("{PANIC}");
+        })
+    }));
+    let payload = match result { Err(payload) => payload, Ok(_) => panic!("constructor did not panic") };
+    assert_eq!(payload.downcast_ref::<String>().map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied()), Some(PANIC));
+    let (host, handle, identity, proof, run) = captured.into_inner().unwrap()
+        .expect("failure must occur after capturing the real helper");
+    // Match an actual saved semantic/helper retirement proof, not PID absence
+    // or dropping the final proxy. The outer harness still owns family settlement.
+    assert!(chat::runtime::Handle::retained_retirement_proved(&identity.record, &proof).unwrap());
+    assert!(!identity.record.holder.is_current());
+    assert!(!identity.record.root.is_current());
+    assert_eq!(handle.actor_identity(), Some(identity));
+    let store = registry(&host).unwrap();
+    let store = store.lock().unwrap();
+    assert!(store.agent(run.agent).unwrap().closed);
+    assert_eq!(store.agent_run(run.id).unwrap(), run);
 }
 
 #[test]
