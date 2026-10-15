@@ -375,18 +375,19 @@ impl Cagents {
         {
             previous.cancel();
         }
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // Published project IDs and cached paths select presentation policy.
+        // Candidate/root resolution belongs to the blocking loader below.
         let kind = kind
             .or_else(|| {
                 self.sidebar_model
                     .projects
                     .iter()
-                    .find(|project| project.id == project_id || project.repository == canonical)
+                    .find(|project| project.id == project_id || project.repository == path)
                     .map(|project| project.kind)
             })
             .or_else(|| {
                 self.workspace_model
-                    .project(&canonical)
+                    .project(&path)
                     .map(|project| project.kind)
             });
         cosmic::task::future(async move {
