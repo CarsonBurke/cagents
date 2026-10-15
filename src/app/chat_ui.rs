@@ -16113,9 +16113,13 @@ mod tests {
         let session = chat_runtime(&app, card).session.clone();
         assert!(!session.is_unstarted());
         assert!(session.proof.is_some());
-        let target=chat_runtime(&app,card).target;
-        app.chat_runtime_mut(target).unwrap().replace_draft(text_editor::Content::with_text("Retain this unsent follow-up"));
-        let draft=chat_runtime(&app,card).unsent_text();
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text(
+                "Retain this unsent follow-up",
+            ));
+        let draft = chat_runtime(&app, card).unsent_text();
         app.chat_forget(card);
         app.cards.insert(card, CardRuntime::Loading);
         let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
@@ -16125,13 +16129,29 @@ mod tests {
             target,
             Err(chat::StartFailure::fresh("fixture: daemon gone")),
         );
-        assert!(matches!(app.cards.get(&card),Some(CardRuntime::Failed(_))));
-        assert_eq!(app.card_state(card).unwrap().kind,CardKind::Chat(session.clone()));
-        assert_eq!(saved(&app),CardKind::Chat(session.clone()),"ordinary persistence must retain the issued proof and recipe");
-        assert_eq!(app.chat_ui.drafts.get(&card),Some(&draft));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(session.clone())
+        );
+        assert_eq!(
+            saved(&app),
+            CardKind::Chat(session.clone()),
+            "ordinary persistence must retain the issued proof and recipe"
+        );
+        assert_eq!(app.chat_ui.drafts.get(&card), Some(&draft));
         assert!(!app.chat_start_pending(card));
-        assert!(app.chat_ui.retiring.iter().all(|target|target.card!=card),"failed automatic recovery must not retire the issued owner");
-        assert!(app.chat_offers_fresh_conversation(card),"a different conversation requires explicit user choice");
+        assert!(
+            app.chat_ui
+                .retiring
+                .iter()
+                .all(|target| target.card != card),
+            "failed automatic recovery must not retire the issued owner"
+        );
+        assert!(
+            app.chat_offers_fresh_conversation(card),
+            "a different conversation requires explicit user choice"
+        );
 
         // One converted from a CLI terminal may hold a conversation there,
         // so it asks, as before.
