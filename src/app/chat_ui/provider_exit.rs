@@ -491,7 +491,7 @@ mod tests {
             .begin(Key::from_snapshot(&runtime.snapshot).unwrap(), true)
             .unwrap();
         runtime.provider_exit_expanded = true;
-        runtime.set_visible(false);
+        runtime.set_visible(false).unwrap();
         assert!(!request.cancelled.load(Ordering::Acquire));
         let text = Arc::new("saved".to_owned());
         let weak = Arc::downgrade(&text);
@@ -532,7 +532,7 @@ mod tests {
     }
     #[test]
     fn provider_output_visual_pages_are_bounded_and_lossless_at_utf8_boundaries() {
-        let text = "€x".repeat(PAGE_BYTES);
+        let text = "€".repeat(PAGE_BYTES);
         let mut restored = String::new();
         let pages = text.len().div_ceil(PAGE_BYTES);
         for index in 0..pages {

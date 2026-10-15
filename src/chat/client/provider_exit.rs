@@ -6,6 +6,8 @@ const MAX_PAGE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct Output {
+    /// At most 24 MiB: each of the retained 8 MiB raw bytes can require
+    /// one three-byte Unicode replacement character. Cleanup never expands it.
     pub text: Arc<String>,
     pub omitted: u64,
 }
@@ -147,6 +149,15 @@ impl ClientHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_output_invalid_utf8_has_a_bounded_readable_expansion() {
+        let bytes = vec![0xff; 4096];
+        let text = readable(bytes.clone());
+        assert_eq!(text.len(), 3 * bytes.len());
+        assert_eq!(text.chars().count(), bytes.len());
+        assert!(text.chars().all(|character| character == '\u{fffd}'));
+    }
 
     #[test]
     fn provider_output_pages_preserve_split_utf8_and_terminal_sequences() {
