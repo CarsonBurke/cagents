@@ -4045,6 +4045,8 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                agent_locations: Vec::new(),
+                session_location_refusals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4299,6 +4301,8 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                agent_locations: Vec::new(),
+                session_location_refusals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4362,6 +4366,8 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                agent_locations: Vec::new(),
+                session_location_refusals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4486,6 +4492,8 @@ mod tests {
                         closed_projects: Vec::new(),
                         views: Vec::new(),
                         agents: Vec::new(),
+                        agent_locations: Vec::new(),
+                        session_location_refusals: Vec::new(),
                     },
                 ),
             )
@@ -4547,6 +4555,8 @@ mod tests {
             closed_projects: Vec::new(),
             views: Vec::new(),
             agents: Vec::new(),
+            agent_locations: Vec::new(),
+            session_location_refusals: Vec::new(),
         }
     }
 

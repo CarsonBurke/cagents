@@ -218,6 +218,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                         .into(),
                 );
             }
+            state.issued_chat_ids.insert(source.id);
             state.chats.remove(&source.id);
         }
         state.native_closing.remove(&source.id);

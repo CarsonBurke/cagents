@@ -353,6 +353,7 @@ fn create_inner(
             start,
             alias,
             cwd: launch.recipe.working_directory.clone(),
+            relocated_directory: false,
             expected_home,
             next_id: 0,
             pending: BTreeMap::new(),
@@ -493,6 +494,7 @@ struct Codex {
     start: Value,
     alias: Option<PathBuf>,
     cwd: PathBuf,
+    relocated_directory: bool,
     expected_home: PathBuf,
     next_id: u64,
     pending: BTreeMap<String, Pending>,
@@ -1493,6 +1495,12 @@ impl Adapter for Codex {
             })
     }
 
+    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
+        self.cwd = directory.to_path_buf();
+        self.relocated_directory = true;
+        self.start["cwd"] = serde_json::Value::String(directory.to_string_lossy().into_owned());
+        Ok(())
+    }
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -1558,6 +1566,7 @@ impl Adapter for Codex {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
+                        if self.relocated_directory { params["cwd"] = json!(self.cwd); }
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, model: self.selected.clone(), tier: self.service_tier.clone() })?;
                         self.suggestion_turn = None;
@@ -4281,6 +4290,7 @@ mod tests {
             start: json!({}),
             alias: None,
             cwd: PathBuf::from("/tmp"),
+            relocated_directory: false,
             expected_home: std::fs::canonicalize("/tmp").unwrap(),
             next_id: 0,
             pending: BTreeMap::new(),
@@ -5181,6 +5191,29 @@ for line in sys.stdin:
         assert_eq!(turn["params"]["model"], "model");
         assert_eq!(turn["params"]["effort"], "future-effort");
         successor.close().unwrap();
+    }
+
+    #[test]
+    fn approved_operational_relocation_updates_next_turn_cwd_without_mutating_thread_identity() {
+        let mut adapter = adapter();
+        let original_thread = adapter.thread.clone();
+        adapter
+            .relocate_directory(Path::new("/verified/moved"))
+            .unwrap();
+        let prompt = adapter
+            .command(Command::Prompt {
+                text: "fixture".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let start = prompt
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(start["params"]["cwd"], "/verified/moved");
+        assert_eq!(adapter.thread, original_thread);
     }
 
     #[test]

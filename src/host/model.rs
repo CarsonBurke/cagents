@@ -24,6 +24,10 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod agent_locations;
+mod session_locations;
+pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
+pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -31,10 +35,11 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod navigation;
+mod relocation;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 14;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -194,6 +199,8 @@ impl Registry {
             navigation_orders,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
+            agent_locations: agent_locations::all(&self.db)?,
+            session_location_refusals: session_locations::refusals(&self.db)?,
             identity,
             sequence: sequence as u64,
             projects,
@@ -208,10 +215,51 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
+        self.apply_with_session_moves(edit, &[])
+    }
+
+    pub(crate) fn apply_with_session_moves(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[SessionMove],
+    ) -> Result<Applied, String> {
+        // Direct registry users own no HostState lock. The live host route uses
+        // apply_with_location_moves with evidence prepared outside every lock.
+        let agent_moves = if let ModelEdit::RelocateProject { relocation } = edit {
+            self.agent_relocation_inputs(relocation)?
+                .into_iter()
+                .map(|input| input.verify())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.apply_with_location_moves(edit, moves, &agent_moves)
+    }
+
+    pub(crate) fn apply_with_location_moves(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[SessionMove],
+        agent_moves: &[AgentMove],
+    ) -> Result<Applied, String> {
+        if !moves.is_empty() && !matches!(edit, ModelEdit::RelocateProject { .. }) {
+            return Err(
+                "Session directory proofs may only accompany their project relocation".into(),
+            );
+        }
+        if let ModelEdit::RelocateProject { relocation } = edit
+            && moves
+                .iter()
+                .any(|movement| movement.repository != relocation.destination)
+        {
+            return Err("Session proofs do not belong to the requested destination project".into());
+        }
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        session_locations::pin_owned_agents(&transaction, moves)?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
+            ModelEdit::RelocateProject { relocation } => relocation::apply(&transaction, relocation, agent_moves)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
@@ -387,6 +435,27 @@ impl Registry {
                     > 0
             }
         };
+        if !moves.is_empty() {
+            if let ModelEdit::RelocateProject { relocation } = edit {
+                let open: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)",
+                        [repository_key(&relocation.destination)?],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !open {
+                    return Err(
+                        "The located project is no longer open; no session authority changed"
+                            .into(),
+                    );
+                }
+            }
+            session_locations::apply(&transaction, moves)?;
+        }
+        // Same-project verification is a meaningful state change when it
+        // clears or records a session refusal, even without rekeying a project.
+        let changed = changed || !moves.is_empty();
         if changed {
             transaction
                 .execute(
@@ -622,6 +691,12 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 12 {
         mailbox::migrate_attention(db)?;
+    }
+    if version < 13 {
+        agent_locations::migrate(db)?;
+    }
+    if version < 14 {
+        session_locations::migrate(db)?;
     }
     Ok(())
 }

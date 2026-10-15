@@ -1779,7 +1779,7 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
 }
 
 fn mark_lease_capable_process() -> io::Result<()> {
-    fs::write("/proc/self/comm", format!("{LEASE_CAPABLE_PROCESS_NAME}\n"))
+    fs::write("/proc/self/comm", LEASE_CAPABLE_PROCESS_NAME)
 }
 fn peer_ui_predates_lease(peer_directory: &Path) -> bool {
     peer_directory.join("cagents-ui").exists() && !peer_directory.join(LEASE_MARKER_FILE).is_file()
@@ -1899,6 +1899,36 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    // Isolate the main thread name from parallel lease/peer tests.
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn lease_capable_process_name_has_only_the_kernel_newline() {
+        const CHILD: &str = "CAGENTS_TEST_PROCESS_COMM";
+        if env::var_os(CHILD).is_some() {
+            mark_lease_capable_process().unwrap();
+            assert_eq!(
+                fs::read_to_string("/proc/self/comm").unwrap(),
+                format!("{LEASE_CAPABLE_PROCESS_NAME}\n")
+            );
+            let stat = fs::read_to_string("/proc/self/stat").unwrap();
+            assert_eq!(stat.lines().count(), 1);
+            assert_eq!(
+                stat.split_once('(').unwrap().1.split_once(')').unwrap().0,
+                LEASE_CAPABLE_PROCESS_NAME
+            );
+            return;
+        }
+        let status = process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "instance::tests::lease_capable_process_name_has_only_the_kernel_newline",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn verified_window_requires_its_exact_kernel_flock_not_an_open_descriptor() {
@@ -2318,6 +2348,8 @@ mod tests {
         fields[17] = "1";
         let stat = |fields: &[&str]| format!("4294967294 (cagents-ui) {}", fields.join(" "));
         fs::write(legacy.join("stat"), stat(&fields)).unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        fs::write(legacy.join("comm"), "cagents-ui").unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).unwrap());
         for state in ["Z", "X"] {
             fields[0] = state;

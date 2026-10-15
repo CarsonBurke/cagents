@@ -443,6 +443,16 @@ pub(super) fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
+    if let ClientRequest::EditWorkspaceModel {
+        edit: crate::workspace_model::ModelEdit::RelocateProject { relocation },
+    } = &request
+    {
+        let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
+        ensure_control_open(host)?;
+        super::agent_execution::terminals::admit(host, client_id, &request)?;
+        let model = super::session_locations::relocate(host, client_id, relocation.clone())?;
+        return Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
