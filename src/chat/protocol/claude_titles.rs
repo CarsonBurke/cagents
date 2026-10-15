@@ -3,7 +3,7 @@
 //! Read only after a confirmed resume or top-level result, on the host worker.
 //! Metadata format: https://platform.claude.com/cookbook/claude-agent-sdk-05-building-a-session-browser
 //! This is presentation metadata, never execution or filesystem ownership proof.
-use crate::{agent::Provider, chat::Launch};
+use crate::chat::Launch;
 use serde_json::Value;
 use std::{
     fs::File,
@@ -22,9 +22,31 @@ pub(super) struct ClaudeTitles {
 
 impl ClaudeTitles {
     pub(super) fn new(launch: &Launch) -> Option<Self> {
+        let recipe = &launch.recipe;
+        if !recipe.working_directory.is_absolute() {
+            return None;
+        }
+        let value = |key: &str| {
+            (!recipe.unset_environment.contains(key))
+                .then(|| recipe.environment.get(key))
+                .flatten()
+                .filter(|value| !value.is_empty())
+        };
+        let config = match value("CLAUDE_CONFIG_DIR") {
+            Some(config) => recipe.working_directory.join(config),
+            None => {
+                let home = Path::new(value("HOME")?);
+                // History::open's HOME fallback is not launch-cwd-relative.
+                // Refuse ambiguous metadata instead of naming another account.
+                if !home.is_absolute() {
+                    return None;
+                }
+                home.join(".claude")
+            }
+        };
         Some(Self {
-            config: Provider::Claude.session_root(&launch.recipe)?,
-            cwd: launch.recipe.working_directory.clone(),
+            config,
+            cwd: recipe.working_directory.clone(),
             previous: None,
         })
     }
@@ -189,6 +211,54 @@ mod tests {
             named_title(&mut file, &id, cwd).as_deref(),
             Some("Encryption and throughput")
         );
+    }
+
+
+    #[test]
+    fn configured_titles_use_exact_supported_roots_and_refuse_ambiguous_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let home = cwd.join("home");
+        let config = cwd.join("config");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let project: String = cwd.to_str().unwrap().chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        for (root, title) in [(home.join(".claude"), "Home title"), (config.clone(), "Configured title")] {
+            let project = root.join("projects").join(&project);
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join(format!("{id}.jsonl")), format!("{}\n{}\n",
+                json!({"type":"user","sessionId":id,"cwd":cwd,"message":{}}),
+                json!({"type":"custom-title","sessionId":id,"customTitle":title}))).unwrap();
+        }
+        let mut launch = Launch {
+            provider: crate::agent::Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(), arguments: vec![], working_directory: cwd,
+                environment: [("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into())].into(),
+                unset_environment: Default::default(),
+            },
+        };
+        // An explicit config requires no HOME and resolves relative paths in
+        // the launch directory, just like the existing exact history reader.
+        assert_eq!(ClaudeTitles::new(&launch).unwrap().update(id).as_deref(), Some("Configured title"));
+        launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(), "config".into());
+        launch.recipe.environment.insert("HOME".into(), "home".into());
+        assert_eq!(ClaudeTitles::new(&launch).unwrap().update(id).as_deref(), Some("Configured title"));
+        launch.recipe.environment.remove("CLAUDE_CONFIG_DIR");
+        assert!(ClaudeTitles::new(&launch).is_none(), "relative fallback HOME has no coherent history/title origin");
+        launch.recipe.environment.insert("HOME".into(), home.to_str().unwrap().into());
+        assert_eq!(ClaudeTitles::new(&launch).unwrap().update(id).as_deref(), Some("Home title"));
+        launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into());
+        launch.recipe.unset_environment.insert("CLAUDE_CONFIG_DIR".into());
+        assert_eq!(ClaudeTitles::new(&launch).unwrap().update(id).as_deref(), Some("Home title"));
+        launch.recipe.unset_environment.insert("HOME".into());
+        assert!(ClaudeTitles::new(&launch).is_none());
+        launch.recipe.unset_environment.remove("CLAUDE_CONFIG_DIR");
+        assert_eq!(ClaudeTitles::new(&launch).unwrap().update(id).as_deref(), Some("Configured title"));
+        launch.recipe.working_directory = "relative-work".into();
+        assert!(ClaudeTitles::new(&launch).is_none());
     }
 
     #[test]
