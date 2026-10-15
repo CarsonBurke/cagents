@@ -455,7 +455,7 @@ pub use recovery_placement::{RecoveryDirectoryStamp, RecoveryPlacement, Recovery
 #[path = "fs_safety/recovery_cache.rs"]
 mod recovery_cache;
 pub use recovery_cache::RecoveryParentCandidates;
-pub(crate) use recovery_cache::{RecoveryDirectory, RecoveryDirectoryError, prepare_recovery_directory, prepare_recovery_directory_with_owner};
+pub(crate) use recovery_cache::{RecoveryDirectory, RecoveryDirectoryError, prepare_recovery_directory, prepare_recovery_directory_with_owner, verify_recovery_directory_private};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
 
