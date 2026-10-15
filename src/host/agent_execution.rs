@@ -42,6 +42,17 @@ pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {
         .ok_or_else(|| "The agent execution registry is unavailable".into())
 }
 
+/// Unmanaged diagnostic sessions may exist without a model. Once a model is
+/// installed, a failed execution-store connection never grants permission to
+/// skip its retirement preflight or claim a managed provider was retired.
+pub(super) fn retirement_registry(host: &SharedHost) -> Result<Option<SharedRegistry>, String> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.model.is_some() && state.execution_registry.is_none() {
+        return Err("The managed execution registry is unavailable; recover its store before closing the original provider".into());
+    }
+    Ok(state.execution_registry.clone())
+}
+
 pub(super) fn origin(host: &SharedHost, authority: &Authority) -> Result<Origin, String> {
     caller(host, authority).map(|(origin, _)| origin)
 }
@@ -765,8 +776,8 @@ pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
 }
 
 pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
-    // Normal interactive sessions still work without the optional registry.
-    let Ok(registry) = registry(host) else {
+    // Only a genuinely unmanaged/no-model session has optional retirement.
+    let Some(registry) = retirement_registry(host)? else {
         return Ok(());
     };
     let changed = registry
@@ -779,10 +790,10 @@ pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), 
     Ok(())
 }
 
-/// Reads only the managed presentation. No registry means ordinary interactive
-/// conversations still close without the optional managed-agent subsystem.
+/// Read only the managed presentation. A missing installed store is a retryable
+/// refusal; only sessions without any model have an optional subsystem.
 pub(super) fn preflight_retirement(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
-    let Ok(registry) = registry(host) else { return Ok(()); };
+    let Some(registry) = retirement_registry(host)? else { return Ok(()); };
     let result = registry.lock().unwrap_or_else(|p| p.into_inner())
         .preflight_agent_retirement(&HostedSession::Chat(session.clone()));
     result
