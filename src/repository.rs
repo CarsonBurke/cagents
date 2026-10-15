@@ -3876,31 +3876,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         self.git_literal_read(worktree, arguments)
     }
 
+    fn history_start(
+        &self,
+        request: &HistoryRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Oid>, RepositoryError> {
+        match &request.revision {
+            HistoryRevision::Head => self.resolve_head(&request.worktree, cancellation),
+            HistoryRevision::Object { oid } => Ok(Some(oid.clone())),
+            HistoryRevision::Reference { name } => self.resolve_optional_revision(&request.worktree, name.as_str(), cancellation),
+        }
+    }
+
     /// One page of history, newest first.
     pub fn history(
         &self,
         request: &HistoryRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<CommitSummary>, RepositoryError> {
-        let start = match &request.revision {
-            // Resolved before walking so that every page of one paging session
-            // is taken from the same starting commit, and so that an unborn
-            // branch is an empty history rather than a `git log` failure.
-            HistoryRevision::Head => match self.resolve_head(&request.worktree, cancellation)? {
-                Some(oid) => oid,
-                None => return Ok(Vec::new()),
-            },
-            HistoryRevision::Object { oid } => oid.clone(),
-            HistoryRevision::Reference { name } => {
-                match self.resolve_optional_revision(
-                    &request.worktree,
-                    name.as_str(),
-                    cancellation,
-                )? {
-                    Some(oid) => oid,
-                    None => return Ok(Vec::new()),
-                }
-            }
+        let Some(start) = self.history_start(request, cancellation)? else {
+            return Ok(Vec::new());
         };
         let command = self.history_command(
             &request.worktree,
@@ -3923,7 +3918,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<Vec<CommitSummary>, RepositoryError> {
         let query = query.trim().to_lowercase();
         if query.is_empty() { return self.history(request, cancellation); }
+        let Some(start) = self.history_start(request, cancellation)? else { return Ok(Vec::new()); };
         let mut walk = request.clone();
+        walk.revision = HistoryRevision::Object { oid: start };
         walk.page = 0;
         let mut skip = u64::from(request.page) * u64::from(HISTORY_PAGE_SIZE);
         let mut matches = Vec::new();
@@ -8421,6 +8418,21 @@ mod tests {
         assert!(history_matches(commit, "ada"));
         assert!(history_matches(commit, &commit.oid.as_str()[..8]));
         assert!(!history_matches(commit, "--all --author=*"));
+    }
+
+    #[test]
+    fn history_filter_resolves_head_once_for_a_consistent_search_walk() {
+        let record = format!("{}\0\0Ada\0ada@example.invalid\01700000000 +0000\0Ada\0ada@example.invalid\01700000000 +0000\0ordinary\0\0", oid(1)).into_bytes();
+        let first = record.repeat(HISTORY_PAGE_SIZE as usize);
+        let service = fake_service(vec![success(format!("{}\n", oid(3)).as_bytes()), success(&first), success(b"")]);
+        let found = service.filtered_history(&HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Head, page: 0, path: None }, "unmatched", &CancellationToken::new()).unwrap();
+        assert!(found.is_empty());
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 3);
+        assert!(commands[0].arguments.contains(&OsString::from("rev-parse")));
+        for command in &commands[1..] {
+            assert!(command.arguments.contains(&OsString::from(oid(3).as_str())));
+        }
     }
 
     #[test]

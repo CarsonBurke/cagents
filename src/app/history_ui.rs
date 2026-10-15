@@ -7,13 +7,24 @@ use crate::sidebar::CommitChanges;
 pub(super) struct State {
     generation: u64,
     page_generation: u64,
+    page_cancellation: Option<CancellationToken>,
     cancellation: Option<CancellationToken>,
 }
 
 impl State {
     pub(super) fn next_page_request(&mut self) -> u64 {
-        self.page_generation = self.page_generation.wrapping_add(1);
+        self.cancel_pages();
+        self.page_cancellation = Some(CancellationToken::default());
         self.page_generation
+    }
+
+    pub(super) fn cancel_pages(&mut self) {
+        self.page_generation = self.page_generation.wrapping_add(1);
+        if let Some(cancellation) = self.page_cancellation.take() { cancellation.cancel(); }
+    }
+
+    pub(super) fn page_cancellation(&self) -> CancellationToken {
+        self.page_cancellation.clone().unwrap_or_default()
     }
 
     pub(super) fn accepts_page(&self, generation: u64) -> bool {
@@ -31,6 +42,7 @@ impl State {
 impl Drop for State {
     fn drop(&mut self) {
         self.cancel();
+        self.cancel_pages();
     }
 }
 
@@ -255,6 +267,25 @@ mod tests {
                 .result,
             Some(Ok(_))
         ));
+    }
+
+    #[test]
+    fn superseded_history_searches_and_rebindings_cancel_the_old_worker() {
+        let mut state = State::default();
+        let old = state.next_page_request();
+        let cancelled = state.page_cancellation();
+        let current = state.next_page_request();
+        assert!(cancelled.is_cancelled());
+        assert!(!state.accepts_page(old));
+        assert!(state.accepts_page(current));
+        let active = state.page_cancellation();
+        state.cancel_pages();
+        assert!(active.is_cancelled());
+        assert!(!state.accepts_page(current));
+        state.next_page_request();
+        let final_token = state.page_cancellation();
+        drop(state);
+        assert!(final_token.is_cancelled());
     }
 
     #[test]

@@ -10134,6 +10134,8 @@ impl Cagents {
                 .as_deref()
                 .and_then(|oid| crate::repository::Oid::parse_object(oid).ok()),
             0,
+            source.history_query.clone(),
+            self.history_ui.page_cancellation(),
         )
     }
 
@@ -10998,6 +11000,8 @@ impl Cagents {
         key: ActiveWorktreeKey,
         head: Option<crate::repository::Oid>,
         page: u32,
+        query: String,
+        cancellation: CancellationToken,
     ) -> Task<Message> {
         if crate::device::is_remote() {
             return Task::none();
@@ -11014,7 +11018,7 @@ impl Cagents {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 RepositoryService::system("git")
-                    .history(&request, &CancellationToken::default())
+                    .filtered_history(&request, &query, &cancellation)
                     .map_err(|error| error.to_string())
             })
             .await
@@ -14095,7 +14099,12 @@ impl Application for Cagents {
                     | SidebarAction::CommitEditorCursor { key, .. }
                     | SidebarAction::CommitSubjectEditorAction { key, .. }
                     | SidebarAction::CommitEditorAction { key, .. }
-                    | SidebarAction::AmendChanged { key, .. } if !self.source_control_is_bound(key))
+                    | SidebarAction::AmendChanged { key, .. }
+                    | SidebarAction::SearchHistory { key, .. }
+                    | SidebarAction::HistoryQueryChanged { key, .. }
+                    | SidebarAction::HistoryCommand { key, .. }
+                    | SidebarAction::HistoryBranchChanged { key, .. }
+                    | SidebarAction::CreateHistoryBranch { key, .. } if !self.source_control_is_bound(key))
                 {
                     return Task::none();
                 }
@@ -14414,18 +14423,49 @@ impl Application for Cagents {
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
+                    | SidebarAction::HistoryQueryChanged { .. }
+                    | SidebarAction::HistoryBranchChanged { .. }
+                    | SidebarAction::CancelHistoryBranch
+                    | SidebarAction::AmendChanged { .. }
                     | SidebarAction::CommitMessageChanged { .. }
                     | SidebarAction::CommitSubjectEditorCursor { .. }
                     | SidebarAction::CommitEditorCursor { .. }
                     | SidebarAction::CommitSubjectEditorAction { .. }
                     | SidebarAction::CommitEditorAction { .. }
-                    | SidebarAction::AmendChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
                     | SidebarAction::PublishBranchChanged { .. }
                     | SidebarAction::CancelPublish
                     // `apply` already cleared the pending discard, and the
                     // dialog it was driving is gone with it.
                     | SidebarAction::CancelDiscard => Task::none(),
+                    SidebarAction::SearchHistory { key, query } => {
+                        if !self.source_control_is_bound(&key) { return Task::none(); }
+                        let Some(source) = self.sidebar_model.source_control.as_mut() else { return Task::none(); };
+                        source.search_history(query.clone());
+                        Self::source_control_history_task(self.history_ui.next_page_request(), key,
+                            source.head_oid.as_deref().and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), 0, query, self.history_ui.page_cancellation())
+                    }
+                    SidebarAction::HistoryCommand { key, oid, command } => {
+                        if !self.source_control_is_bound(&key) { return Task::none(); }
+                        let mainline = self.sidebar_model.source_control.as_ref()
+                            .and_then(|source| source.history.iter().find(|row| row.oid == oid))
+                            .and_then(|row| row.mainline);
+                        match command {
+                            sidebar::HistoryCommand::CopySha => iced::clipboard::write(oid.as_str().to_owned()).map(cosmic::Action::App),
+                            sidebar::HistoryCommand::CopyMessage => {
+                                let message = self.sidebar_model.source_control.as_ref().and_then(|source| source.history.iter().find(|row| row.oid == oid)).map(|row| row.message.clone());
+                                message.map_or_else(Task::none, |message| iced::clipboard::write(message).map(cosmic::Action::App))
+                            }
+                            sidebar::HistoryCommand::NewWorktree => {
+                                let Some(project) = self.sidebar_model.project(key.project_id) else { return Task::none(); };
+                                self.open_worktree_dialog(key.project_id, project.repository.clone(), WorktreeDraft { base: oid.as_str().to_owned(), ..WorktreeDraft::default() }, None)
+                            }
+                            sidebar::HistoryCommand::CreateBranch => Task::none(),
+                            sidebar::HistoryCommand::Revert => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::RevertCommit { oid, mainline } })),
+                            sidebar::HistoryCommand::CherryPick => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::CherryPick { oid, mainline } })),
+                        }
+                    }
+                    SidebarAction::CreateHistoryBranch { key, oid, name } => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::CreateBranch { oid, name } })),
                     SidebarAction::RequestDiscard { .. } => {
                         if self.sidebar_state.pending_discard().is_some() {
                             iced::widget::operation::focus(sidebar::discard_confirm_id())
@@ -14542,7 +14582,7 @@ impl Application for Cagents {
                             if source.history_loading || source.next_history_page != page { return Task::none(); }
                             source.mark_history_requested();
                         }
-                        Self::source_control_history_task(self.history_ui.next_page_request(), key, self.sidebar_model.source_control.as_ref().and_then(|source| source.head_oid.as_deref()).and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), page)
+                        Self::source_control_history_task(self.history_ui.next_page_request(), key, self.sidebar_model.source_control.as_ref().and_then(|source| source.head_oid.as_deref()).and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), page, self.sidebar_model.source_control.as_ref().map(|source| source.history_query.clone()).unwrap_or_default(), self.history_ui.page_cancellation())
                     }
                     SidebarAction::ToggleControls => {
                         let target = if self.sidebar_state.controls_expanded() {

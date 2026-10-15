@@ -1729,6 +1729,8 @@ struct ChangeGroupChrome {
 pub struct CommitRow {
     pub oid: Oid,
     pub parent: Option<Oid>,
+    pub message: String,
+    pub mainline: Option<u32>,
     chrome: CommitRowChrome,
 }
 
@@ -1757,6 +1759,8 @@ impl CommitRow {
         Self {
             oid: commit.oid.clone(),
             parent: commit.parents.first().cloned(),
+            message: compose_commit_message(&commit.subject, &commit.body),
+            mainline: merge.then_some(1),
             chrome,
         }
     }
@@ -1916,6 +1920,7 @@ pub struct SourceControlModel {
     change_count_label: Option<Box<str>>,
     pub branch_changes: BranchChanges,
     pub history: Vec<CommitRow>,
+    pub history_query: String,
     pub commit_changes: Option<CommitChanges>,
     /// False until a page has landed. Without it an empty `history` is
     /// indistinguishable from a branch that has no commits.
@@ -2059,6 +2064,7 @@ impl SourceControlModel {
             change_count_label: None,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
+            history_query: String::new(),
             commit_changes: None,
             history_loaded: false,
             history_requested: false,
@@ -2179,6 +2185,7 @@ impl SourceControlModel {
             change_count_label,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
+            history_query: String::new(),
             commit_changes: None,
             history_loaded: false,
             history_requested: false,
@@ -2192,6 +2199,16 @@ impl SourceControlModel {
             chrome,
             file_search: FileSearch::Inactive,
         }
+    }
+
+    pub fn search_history(&mut self, query: String) {
+        self.history_query = query;
+        self.history.clear();
+        self.commit_changes = None;
+        self.history_loaded = false;
+        self.history_complete = false;
+        self.next_history_page = 0;
+        self.mark_history_requested();
     }
 
     /// Appends one loaded history page. A short page is the last one.
@@ -2310,6 +2327,7 @@ impl SourceControlModel {
         next.mutation = self.mutation;
         next.error = self.error.clone();
         next.commit_changes = self.commit_changes.clone();
+        next.history_query.clone_from(&self.history_query);
         // The loading placeholder between two snapshots has not read `HEAD`
         // yet, and that gap must not look like a `HEAD` that moved.
         if next.head_oid.is_none() && !next.unborn {
@@ -2740,6 +2758,8 @@ pub struct SidebarState {
     /// Compact mode only: whether the source-control popover is showing.
     panel_open: bool,
     files_query: String,
+    history_query: String,
+    history_branch: Option<(Oid, String)>,
     files_filter_open: bool,
     change_list_mode: FileListMode,
     /// Which view of the Git panel is showing. Local to the surface, like
@@ -3129,6 +3149,8 @@ impl SidebarState {
         self.active_worktree = next;
         // Every panel-local draft belongs to the worktree it was typed for.
         self.files_query.clear();
+        self.history_query.clear();
+        self.history_branch = None;
         self.files_filter_open = false;
         self.expanded_directories.clear();
         self.collapsed_change_directories.clear();
@@ -3301,6 +3323,13 @@ impl SidebarState {
                     );
                 }
             }
+            SidebarAction::HistoryQueryChanged { query, .. } => self.history_query.clone_from(query),
+            SidebarAction::HistoryBranchChanged { name, .. } => {
+                if let Some((_, draft)) = self.history_branch.as_mut() { draft.clone_from(name); }
+            }
+            SidebarAction::CancelHistoryBranch => self.history_branch = None,
+            SidebarAction::CreateHistoryBranch { .. } => {},
+            SidebarAction::HistoryCommand { oid, command: HistoryCommand::CreateBranch, .. } => self.history_branch = Some((oid.clone(), String::new())),
             SidebarAction::AmendChanged { amend, .. } => {
                 if self.commit_draft.amend != *amend {
                     self.revise_commit_draft();
@@ -3370,6 +3399,8 @@ impl SidebarState {
             | SidebarAction::CloseCommit { .. }
             | SidebarAction::ShowMoreCommitFiles { .. }
             | SidebarAction::LoadMoreHistory { .. }
+            | SidebarAction::SearchHistory { .. }
+            | SidebarAction::HistoryCommand { .. }
             | SidebarAction::Resize { .. }
             | SidebarAction::ResizeFinished
             | SidebarAction::SelectRows { .. }
@@ -3662,6 +3693,12 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         action: cosmic::iced::widget::text_editor::Action,
     },
+    HistoryQueryChanged { key: ActiveWorktreeKey, query: String },
+    SearchHistory { key: ActiveWorktreeKey, query: String },
+    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand },
+    HistoryBranchChanged { key: ActiveWorktreeKey, name: String },
+    CancelHistoryBranch,
+    CreateHistoryBranch { key: ActiveWorktreeKey, oid: Oid, name: ValidatedBranchName },
     AmendChanged {
         key: ActiveWorktreeKey,
         amend: bool,
@@ -6266,6 +6303,32 @@ fn context_controls<'a>(
             .collect();
         items(&std::collections::HashMap::new(), entries)
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryCommand { CopySha, CopyMessage, NewWorktree, CreateBranch, Revert, CherryPick }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand }
+
+impl widget::menu::Action for HistoryContextCommand<'_> {
+    type Message = SidebarAction;
+    fn message(&self) -> SidebarAction {
+        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command }
+    }
+}
+
+fn history_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a CommitRow, blocked: bool) -> Element<'a, SidebarAction> {
+    if blocked { return content; }
+    let entries = [
+        ("Copy SHA", HistoryCommand::CopySha),
+        ("Copy message", HistoryCommand::CopyMessage),
+        ("New worktree from this commit…", HistoryCommand::NewWorktree),
+        ("Create branch here…", HistoryCommand::CreateBranch),
+        (if row.mainline.is_some() { "Revert commit (first parent)" } else { "Revert commit" }, HistoryCommand::Revert),
+        (if row.mainline.is_some() { "Cherry-pick into this worktree (first parent)" } else { "Cherry-pick into this worktree" }, HistoryCommand::CherryPick),
+    ].into_iter().map(|(label, command)| widget::menu::Item::Button(label.to_owned(), None, HistoryContextCommand { key, row, command })).collect();
+    crate::interaction::context_menu(content, widget::menu::items(&std::collections::HashMap::new(), entries))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8881,10 +8944,29 @@ fn history_section<'a>(
                     .into()
             }),
     ));
+    let search_key = key.clone();
+    let submit_key = key.clone();
+    let mut search = crate::ui_controls::field::search("Message, author or SHA — Enter to search", &state.history_query);
+    if !modal_open {
+        search = search.on_input(move |query| SidebarAction::HistoryQueryChanged { key: search_key.clone(), query })
+            .on_submit(move |query| SidebarAction::SearchHistory { key: submit_key.clone(), query });
+    }
+    column = column.push(search);
+    if let Some((oid, name)) = &state.history_branch {
+        let branch_key = key.clone();
+        let create = ValidatedBranchName::parse(name.clone()).ok().map(|name| SidebarAction::CreateHistoryBranch { key: key.clone(), oid: oid.clone(), name });
+        let mut input = crate::ui_controls::field::text("New branch name", name);
+        if !modal_open { input = input.on_input(move |name| SidebarAction::HistoryBranchChanged { key: branch_key.clone(), name }); }
+        column = column.push(input);
+        column = column.push(widget::row::with_children(vec![
+            crate::ui_controls::button::secondary("Cancel").on_press_maybe((!modal_open).then_some(SidebarAction::CancelHistoryBranch)).into(),
+            crate::ui_controls::button::primary("Create branch").on_press_maybe(create.filter(|_| !modal_open)).into(),
+        ]).spacing(space::XS));
+    }
     let mut rows = widget::column::with_capacity(source.history.len());
     for row in &source.history {
         let chrome = &row.chrome;
-        rows = rows.push(crate::interaction::keyboard_list_row(
+        rows = rows.push(history_context_controls(crate::interaction::keyboard_list_row(
             button::custom(
                 widget::row::with_children(vec![
                     widget::container(Icon::Commit.handle().icon().size(ROW_ICON_SIZE))
@@ -8922,7 +9004,7 @@ fn history_section<'a>(
                 modal_open,
             ))
             .width(Length::Fill),
-        ));
+        ), key, row, modal_open));
     }
     column = column.push(rows);
     column = column.push(slot((!source.history_complete && !source.unborn).then(
@@ -8969,7 +9051,11 @@ fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
         return Some("This branch’s commits have not been loaded yet.");
     }
     if source.history.is_empty() {
-        return Some("HEAD names a commit, but the page of history that loaded held none.");
+        return Some(if source.history_query.is_empty() {
+            "HEAD names a commit, but the page of history that loaded held none."
+        } else {
+            "No commits match this message, author or SHA."
+        });
     }
     None
 }
