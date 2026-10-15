@@ -231,32 +231,40 @@ pub fn find_all(
 pub fn names(seeds: &[chat::Session]) -> Vec<Arc<HashMap<String, String>>> {
     let mut roots = HashMap::<PathBuf, Arc<HashMap<String, String>>>::new();
     let empty = Arc::new(HashMap::new());
-    seeds.iter().map(|seed| {
-        if seed.launch.provider != Provider::Codex {
-            return empty.clone();
-        }
-        let Some(root) = Provider::Codex.session_root(&seed.launch.recipe) else {
-            return empty.clone();
-        };
-        let path = root.join("session_index.jsonl");
-        roots.entry(path.clone()).or_insert_with(|| {
-            let mut names = HashMap::new();
-            if let Ok(file) = std::fs::File::open(&path) {
-                for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                        continue;
-                    };
-                    if let (Some(id), Some(name)) = (
-                        value["id"].as_str(),
-                        value["thread_name"].as_str().and_then(crate::workspace_model::channel_title),
-                    ) {
-                        names.insert(id.to_owned(), name);
-                    }
-                }
+    seeds
+        .iter()
+        .map(|seed| {
+            if seed.launch.provider != Provider::Codex {
+                return empty.clone();
             }
-            Arc::new(names)
-        }).clone()
-    }).collect()
+            let Some(root) = Provider::Codex.session_root(&seed.launch.recipe) else {
+                return empty.clone();
+            };
+            let path = root.join("session_index.jsonl");
+            roots
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    let mut names = HashMap::new();
+                    if let Ok(file) = std::fs::File::open(&path) {
+                        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+                            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                                continue;
+                            };
+                            if let (Some(id), Some(name)) = (
+                                value["id"].as_str(),
+                                value["thread_name"]
+                                    .as_str()
+                                    .and_then(crate::workspace_model::channel_title),
+                            ) {
+                                names.insert(id.to_owned(), name);
+                            }
+                        }
+                    }
+                    Arc::new(names)
+                })
+                .clone()
+        })
+        .collect()
 }
 
 /// Reads a transcript's identity and title, or `None` for a file that is not
@@ -356,7 +364,11 @@ struct Titles {
 
 impl Titles {
     fn note(&mut self, value: &Value) {
-        let label = |key: &str| value[key].as_str().and_then(crate::workspace_model::channel_title);
+        let label = |key: &str| {
+            value[key]
+                .as_str()
+                .and_then(crate::workspace_model::channel_title)
+        };
         match value["type"].as_str() {
             Some("custom-title") => self.named = label("customTitle").or(self.named.take()),
             Some("ai-title") => self.generated = label("aiTitle").or(self.generated.take()),
@@ -787,10 +799,24 @@ mod tests {
             .concat(),
         )
         .unwrap();
-        assert_eq!(names(&[seed.clone()])[0].get(id).map(String::as_str), Some("Renamed"));
-        for title in ["A".repeat(70), "🔐".repeat(90), "\u{202e}Bundle\nreview\u{2066}".into()] {
-            std::fs::write(root.join("session_index.jsonl"), format!("{}\n", json!({"id":id,"thread_name":title}))).unwrap();
-            assert_eq!(names(&[seed.clone()])[0].get(id).cloned(), crate::workspace_model::channel_title(&title));
+        assert_eq!(
+            names(&[seed.clone()])[0].get(id).map(String::as_str),
+            Some("Renamed")
+        );
+        for title in [
+            "A".repeat(70),
+            "🔐".repeat(90),
+            "\u{202e}Bundle\nreview\u{2066}".into(),
+        ] {
+            std::fs::write(
+                root.join("session_index.jsonl"),
+                format!("{}\n", json!({"id":id,"thread_name":title})),
+            )
+            .unwrap();
+            assert_eq!(
+                names(&[seed.clone()])[0].get(id).cloned(),
+                crate::workspace_model::channel_title(&title)
+            );
         }
     }
 
@@ -799,24 +825,58 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut seeds = Vec::new();
         let id = "01a0743a-ccb3-7990-b840-3a0779cca5dd";
-        for (slot, provider) in [Provider::Codex, Provider::Codex, Provider::Claude].into_iter().enumerate() {
+        for (slot, provider) in [Provider::Codex, Provider::Codex, Provider::Claude]
+            .into_iter()
+            .enumerate()
+        {
             let home = directory.path().join(slot.to_string());
             std::fs::create_dir_all(&home).unwrap();
-            let account = crate::account::Account {provider, home: crate::account::AccountHome::Linked {key: uuid::Uuid::new_v4(), path: home}};
-            let seed = chat::fresh_session(provider, TerminalId::new(), directory.path().into(), &account).unwrap();
+            let account = crate::account::Account {
+                provider,
+                home: crate::account::AccountHome::Linked {
+                    key: uuid::Uuid::new_v4(),
+                    path: home,
+                },
+            };
+            let seed = chat::fresh_session(
+                provider,
+                TerminalId::new(),
+                directory.path().into(),
+                &account,
+            )
+            .unwrap();
             if provider == Provider::Codex {
                 let root = provider.session_root(&seed.launch.recipe).unwrap();
                 std::fs::create_dir_all(&root).unwrap();
-                std::fs::write(root.join("session_index.jsonl"), format!("{}\n", json!({"id":id,"thread_name":format!("Account {slot} title")}))).unwrap();
+                std::fs::write(
+                    root.join("session_index.jsonl"),
+                    format!(
+                        "{}\n",
+                        json!({"id":id,"thread_name":format!("Account {slot} title")})
+                    ),
+                )
+                .unwrap();
             }
             seeds.push(seed);
         }
         seeds.push(seeds[0].clone());
         let names = names(&seeds);
-        assert_eq!(names[0].get(id).map(String::as_str), Some("Account 0 title"));
-        assert_eq!(names[1].get(id).map(String::as_str), Some("Account 1 title"));
-        assert!(names[2].is_empty(), "Claude cannot borrow a same-ID Codex name");
-        assert!(Arc::ptr_eq(&names[0], &names[3]), "one account root is read only once");
+        assert_eq!(
+            names[0].get(id).map(String::as_str),
+            Some("Account 0 title")
+        );
+        assert_eq!(
+            names[1].get(id).map(String::as_str),
+            Some("Account 1 title")
+        );
+        assert!(
+            names[2].is_empty(),
+            "Claude cannot borrow a same-ID Codex name"
+        );
+        assert!(
+            Arc::ptr_eq(&names[0], &names[3]),
+            "one account root is read only once"
+        );
     }
 
     #[test]
@@ -825,7 +885,11 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         let id = "12345678-1234-4234-8234-123456789abc";
         let prompt = json!({"type":"user","sessionId":id,"cwd":"/project","message":{"content":"Review encryption performance"}});
-        for title in ["A".repeat(70), "🧑‍💻".repeat(40), "\u{202e}Bundle\nreview\u{2066}".into()] {
+        for title in [
+            "A".repeat(70),
+            "🧑‍💻".repeat(40),
+            "\u{202e}Bundle\nreview\u{2066}".into(),
+        ] {
             let custom = json!({"type":"custom-title","sessionId":id,"customTitle":title});
             std::fs::write(&path, format!("{prompt}\n{custom}\n")).unwrap();
             let found = header(Provider::Claude, &path).unwrap();

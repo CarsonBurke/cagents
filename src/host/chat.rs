@@ -974,8 +974,16 @@ fn start_with_execution(
         (!saved_history_only && source.is_none()).then(|| {
             crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
         }),
-        if saved_history_only { &BTreeMap::new() } else { &execution_environment.0 },
-        if saved_history_only { None } else { source_execution.as_ref() },
+        if saved_history_only {
+            &BTreeMap::new()
+        } else {
+            &execution_environment.0
+        },
+        if saved_history_only {
+            None
+        } else {
+            source_execution.as_ref()
+        },
     )?;
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;
@@ -2733,9 +2741,16 @@ fn prepare_native_process_launch(
     let mut spec = chat::protocol::ProcessSpec::from(&launch.recipe);
     if let Some(daemon) = daemon {
         if selected.iter().any(|(name, value)| {
-            !crate::model::agent_recovery::fresh_environment_key(launch.provider, name, value, false)
+            !crate::model::agent_recovery::fresh_environment_key(
+                launch.provider,
+                name,
+                value,
+                false,
+            )
         }) {
-            return Err(error("Native execution environment contains an unrelated or private variable"));
+            return Err(error(
+                "Native execution environment contains an unrelated or private variable",
+            ));
         }
         spec.environment = sourceless_environment(daemon, selected.clone(), spec.environment);
     }
@@ -2751,7 +2766,10 @@ fn prepare_native_process_launch(
     process_launch.recipe.unset_environment =
         crate::account::launch_credential_overrides(&process_launch.recipe);
     let removed = &process_launch.recipe.unset_environment;
-    process_launch.recipe.environment.retain(|name, _| !removed.contains(name));
+    process_launch
+        .recipe
+        .environment
+        .retain(|name, _| !removed.contains(name));
     Ok(process_launch)
 }
 
@@ -2771,7 +2789,8 @@ fn upgrade_environment(
         (!hosted_source && !launch.needs_read_only_history()).then_some(daemon),
         &BTreeMap::new(),
         None,
-    ).map_err(|error| error.message)?;
+    )
+    .map_err(|error| error.message)?;
     let (mut spec, _) = chat::protocol::create(&process_launch)?;
     spec.remove_unset_environment();
     Ok(spec.environment)
@@ -3083,95 +3102,209 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
             let mut launch = chat::Launch {
-                provider, session_id: None,
+                provider,
+                session_id: None,
                 recipe: LaunchRecipe {
-                    program: "private-fixture".into(), arguments: vec![], working_directory: root.path().into(),
-                    environment: [("HOME".into(), root.path().to_str().unwrap().into()), ("PATH".into(), "/recipe/bin".into())].into(),
+                    program: "private-fixture".into(),
+                    arguments: vec![],
+                    working_directory: root.path().into(),
+                    environment: [
+                        ("HOME".into(), root.path().to_str().unwrap().into()),
+                        ("PATH".into(), "/recipe/bin".into()),
+                    ]
+                    .into(),
                     unset_environment: ["HTTPS_PROXY".into()].into(),
                 },
             };
             let issued = launch.clone();
-            let daemon = [("PATH".into(), "/daemon/bin".into()), ("HTTPS_PROXY".into(), "daemon-proxy".into())].into();
+            let daemon = [
+                ("PATH".into(), "/daemon/bin".into()),
+                ("HTTPS_PROXY".into(), "daemon-proxy".into()),
+            ]
+            .into();
             let selected = [("PATH".into(), "/selected/bin".into())].into();
-            let prepared = prepare_native_process_launch(&launch, Some(daemon), &selected, None).unwrap();
+            let prepared =
+                prepare_native_process_launch(&launch, Some(daemon), &selected, None).unwrap();
             assert_eq!(prepared.recipe.environment["PATH"], "/recipe/bin");
             assert!(!prepared.recipe.environment.contains_key("HTTPS_PROXY"));
             assert_eq!(launch, issued);
-            let source = [("HOME".into(), root.path().to_str().unwrap().into()), ("PATH".into(), "/source/bin".into())].into();
-            let prepared = prepare_native_process_launch(&launch, None, &BTreeMap::new(), Some(&source)).unwrap();
+            let source = [
+                ("HOME".into(), root.path().to_str().unwrap().into()),
+                ("PATH".into(), "/source/bin".into()),
+            ]
+            .into();
+            let prepared =
+                prepare_native_process_launch(&launch, None, &BTreeMap::new(), Some(&source))
+                    .unwrap();
             assert_eq!(prepared.recipe.environment, source);
             let spec = chat::protocol::ProcessSpec::from(&prepared.recipe);
             assert_eq!(spec.environment, prepared.recipe.environment);
             assert_eq!(spec.unset_environment, prepared.recipe.unset_environment);
             assert_eq!(launch, issued);
             launch.recipe.environment.remove("PATH");
-            assert!(prepare_native_process_launch(&launch, Some(BTreeMap::new()),
-                &[("UNRELATED_PRIVATE_FIXTURE_KEY".into(), "do-not-admit".into())].into(), None).is_err());
+            assert!(
+                prepare_native_process_launch(
+                    &launch,
+                    Some(BTreeMap::new()),
+                    &[(
+                        "UNRELATED_PRIVATE_FIXTURE_KEY".into(),
+                        "do-not-admit".into()
+                    )]
+                    .into(),
+                    None
+                )
+                .is_err()
+            );
         }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn native_constructor_history_uses_effective_source_selected_and_unset_home_without_reading_issued_home() {
-        use std::{io::Read, os::fd::{AsRawFd, FromRawFd}};
+    fn native_constructor_history_uses_effective_source_selected_and_unset_home_without_reading_issued_home()
+     {
+        use std::{
+            io::Read,
+            os::fd::{AsRawFd, FromRawFd},
+        };
         const CONVERSATION: &str = "12345678-1234-4234-8234-123456789abc";
         for mode in ["source", "selected", "unset"] {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().join("project");
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.canonicalize().unwrap();
-            let project: String = cwd.to_str().unwrap().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+            let project: String = cwd
+                .to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
             let issued_home = root.path().join("issued-home");
             let actual_home = root.path().join("actual-home");
             let issued_config = issued_home.join(".claude");
             let actual_config = actual_home.join(".claude");
             let mut issued_file = None;
-            for (config, body) in [(&issued_config, "issued-A-body"), (&actual_config, "effective-B-body")] {
-                let path = config.join("projects").join(&project).join(format!("{CONVERSATION}.jsonl"));
+            for (config, body) in [
+                (&issued_config, "issued-A-body"),
+                (&actual_config, "effective-B-body"),
+            ] {
+                let path = config
+                    .join("projects")
+                    .join(&project)
+                    .join(format!("{CONVERSATION}.jsonl"));
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(&path, format!("{}\n{}\n",
                     json!({"type":"user","uuid":"private-prompt","parentUuid":null,"sessionId":CONVERSATION,"cwd":cwd,"message":{"role":"user","content":body}}),
                     json!({"type":"custom-title","sessionId":CONVERSATION,"customTitle":format!("{body} title")}))).unwrap();
-                if config == &issued_config { issued_file = Some(path); }
+                if config == &issued_config {
+                    issued_file = Some(path);
+                }
             }
             let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
             assert!(fd >= 0);
             let mut watcher = unsafe { std::fs::File::from_raw_fd(fd) };
-            let path = std::ffi::CString::new(issued_file.unwrap().as_os_str().as_encoded_bytes()).unwrap();
-            assert!(unsafe { libc::inotify_add_watch(watcher.as_raw_fd(), path.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS) } >= 0);
-            let mut launch = chat::Launch { provider: Provider::Claude, session_id: Some(CONVERSATION.into()), recipe: LaunchRecipe {
-                program: "private-claude-not-executed".into(), arguments: vec!["--resume".into(), CONVERSATION.into()], working_directory: cwd,
-                environment: [("HOME".into(), issued_home.to_str().unwrap().into()), ("CLAUDE_CONFIG_DIR".into(), issued_config.to_str().unwrap().into())].into(), unset_environment: Default::default(),
-            }};
-            let source = [("HOME".into(), actual_home.to_str().unwrap().into()), ("CLAUDE_CONFIG_DIR".into(), actual_config.to_str().unwrap().into())].into();
+            let path = std::ffi::CString::new(issued_file.unwrap().as_os_str().as_encoded_bytes())
+                .unwrap();
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(
+                        watcher.as_raw_fd(),
+                        path.as_ptr(),
+                        libc::IN_OPEN | libc::IN_ACCESS,
+                    )
+                } >= 0
+            );
+            let mut launch = chat::Launch {
+                provider: Provider::Claude,
+                session_id: Some(CONVERSATION.into()),
+                recipe: LaunchRecipe {
+                    program: "private-claude-not-executed".into(),
+                    arguments: vec!["--resume".into(), CONVERSATION.into()],
+                    working_directory: cwd,
+                    environment: [
+                        ("HOME".into(), issued_home.to_str().unwrap().into()),
+                        (
+                            "CLAUDE_CONFIG_DIR".into(),
+                            issued_config.to_str().unwrap().into(),
+                        ),
+                    ]
+                    .into(),
+                    unset_environment: Default::default(),
+                },
+            };
+            let source = [
+                ("HOME".into(), actual_home.to_str().unwrap().into()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    actual_config.to_str().unwrap().into(),
+                ),
+            ]
+            .into();
             let selected = if mode == "selected" {
                 launch.recipe.environment.remove("CLAUDE_CONFIG_DIR");
-                [("CLAUDE_CONFIG_DIR".into(), actual_config.to_str().unwrap().into())].into()
-            } else { BTreeMap::new() };
+                [(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    actual_config.to_str().unwrap().into(),
+                )]
+                .into()
+            } else {
+                BTreeMap::new()
+            };
             if mode == "unset" {
-                launch.recipe.environment.insert("HOME".into(), actual_home.to_str().unwrap().into());
-                launch.recipe.unset_environment.insert("CLAUDE_CONFIG_DIR".into());
+                launch
+                    .recipe
+                    .environment
+                    .insert("HOME".into(), actual_home.to_str().unwrap().into());
+                launch
+                    .recipe
+                    .unset_environment
+                    .insert("CLAUDE_CONFIG_DIR".into());
             }
             let issued = launch.clone();
-            let prepared = prepare_native_process_launch(&launch, (mode != "source").then(BTreeMap::new), &selected, (mode == "source").then_some(&source)).unwrap();
-            assert_eq!(Provider::Claude.session_root(&prepared.recipe), Some(actual_config.clone()));
+            let prepared = prepare_native_process_launch(
+                &launch,
+                (mode != "source").then(BTreeMap::new),
+                &selected,
+                (mode == "source").then_some(&source),
+            )
+            .unwrap();
+            assert_eq!(
+                Provider::Claude.session_root(&prepared.recipe),
+                Some(actual_config.clone())
+            );
             let (spec, mut adapter) = chat::protocol::create(&prepared).unwrap();
             assert_eq!(spec.environment, prepared.recipe.environment);
             assert_eq!(spec.unset_environment, prepared.recipe.unset_environment);
             let initial = adapter.initialize().unwrap();
-            let items: Vec<_> = initial.events.iter().filter_map(|event| if let chat::Event::History {items, ..} = event {Some(items)} else {None}).flatten().collect();
+            let items: Vec<_> = initial
+                .events
+                .iter()
+                .filter_map(|event| {
+                    if let chat::Event::History { items, .. } = event {
+                        Some(items)
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+                .collect();
             assert!(items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text {text, ..} if text == "effective-B-body")));
             assert!(!items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text {text, ..} if text == "issued-A-body")));
             // The real adapter's confirmed result samples its title reader.
             // The same prepared origin must supply both history and metadata.
-            let result = adapter.receive(json!({"type":"result","session_id":CONVERSATION})).unwrap();
+            let result = adapter
+                .receive(json!({"type":"result","session_id":CONVERSATION}))
+                .unwrap();
             assert!(result.events.iter().any(|event| matches!(event,
                 chat::Event::Session {id, title:Some(title)}
                     if id == CONVERSATION && title == "effective-B-body title")));
             assert!(!result.events.iter().any(|event| matches!(event,
                 chat::Event::Session {title:Some(title), ..} if title == "issued-A-body title")));
             let mut bytes = [0_u8; 256];
-            assert_eq!(watcher.read(&mut bytes).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "issued transcript must never be opened/indexed");
+            assert_eq!(
+                watcher.read(&mut bytes).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "issued transcript must never be opened/indexed"
+            );
             assert_eq!(launch, issued);
         }
     }
@@ -3179,40 +3312,84 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn upgrade_history_validation_keeps_recorded_home_after_live_working_directory_disappears() {
-        use std::{io::Read, os::fd::{AsRawFd, FromRawFd}};
+        use std::{
+            io::Read,
+            os::fd::{AsRawFd, FromRawFd},
+        };
         const ID: &str = "12345678-1234-4234-8234-123456789abc";
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().join("now-missing-project");
-        let project: String = cwd.to_str().unwrap().chars().map(|c| if c.is_ascii_alphanumeric() {c} else {'-'}).collect();
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
         let home_a = root.path().join("recorded-home");
         let home_b = root.path().join("daemon-home");
         let mut watches = Vec::new();
         for (home, body) in [(&home_a, "recorded-A"), (&home_b, "unrelated-B")] {
-            let file = home.join(".claude/projects").join(&project).join(format!("{ID}.jsonl"));
+            let file = home
+                .join(".claude/projects")
+                .join(&project)
+                .join(format!("{ID}.jsonl"));
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, json!({"type":"user","uuid":"private-prompt","parentUuid":null,"sessionId":ID,"message":{"role":"user","content":body}}).to_string()+"\n").unwrap();
-            let fd = unsafe {libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)};
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
             assert!(fd >= 0);
-            let watcher = unsafe {std::fs::File::from_raw_fd(fd)};
+            let watcher = unsafe { std::fs::File::from_raw_fd(fd) };
             let path = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
-            assert!(unsafe {libc::inotify_add_watch(watcher.as_raw_fd(), path.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS)} >= 0);
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(
+                        watcher.as_raw_fd(),
+                        path.as_ptr(),
+                        libc::IN_OPEN | libc::IN_ACCESS,
+                    )
+                } >= 0
+            );
             watches.push(watcher);
         }
-        let launch = chat::Launch {provider: Provider::Claude, session_id: Some(ID.into()), recipe: LaunchRecipe {
-            program: "private-provider-not-executed".into(), arguments: vec!["--resume".into(), ID.into()], working_directory: cwd,
-            environment: [("HOME".into(), home_a.to_str().unwrap().into())].into(), unset_environment: Default::default(),
-        }};
+        let launch = chat::Launch {
+            provider: Provider::Claude,
+            session_id: Some(ID.into()),
+            recipe: LaunchRecipe {
+                program: "private-provider-not-executed".into(),
+                arguments: vec!["--resume".into(), ID.into()],
+                working_directory: cwd,
+                environment: [("HOME".into(), home_a.to_str().unwrap().into())].into(),
+                unset_environment: Default::default(),
+            },
+        };
         std::fs::create_dir(&launch.recipe.working_directory).unwrap();
         assert!(!launch.needs_read_only_history());
         std::fs::remove_dir(&launch.recipe.working_directory).unwrap();
         assert!(launch.needs_read_only_history());
         let issued = launch.clone();
-        let restored = upgrade_environment(&launch, false, [("HOME".into(), home_b.to_str().unwrap().into()),
-            ("CLAUDE_CONFIG_DIR".into(), home_b.join(".claude").to_str().unwrap().into())].into()).unwrap();
+        let restored = upgrade_environment(
+            &launch,
+            false,
+            [
+                ("HOME".into(), home_b.to_str().unwrap().into()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    home_b.join(".claude").to_str().unwrap().into(),
+                ),
+            ]
+            .into(),
+        )
+        .unwrap();
         assert_eq!(restored, launch.recipe.environment);
         let mut bytes = [0_u8; 256];
-        assert!(watches[0].read(&mut bytes).unwrap() > 0, "actual upgrade factory must read recorded A");
-        assert_eq!(watches[1].read(&mut bytes).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "upgrade validation must not read daemon B");
+        assert!(
+            watches[0].read(&mut bytes).unwrap() > 0,
+            "actual upgrade factory must read recorded A"
+        );
+        assert_eq!(
+            watches[1].read(&mut bytes).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "upgrade validation must not read daemon B"
+        );
         assert_eq!(launch, issued);
     }
 

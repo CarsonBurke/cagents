@@ -711,7 +711,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {
         assert_eq!(
