@@ -4266,7 +4266,11 @@ mod tests {
         .resolved()
         .unwrap();
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let opened = project_output(&mut client, resolved).unwrap();
+        let mut activated = Vec::new();
+        let opened = project_output_with_activation(&mut client, resolved, |repository| {
+            activated.push(repository.to_path_buf());
+        }).unwrap();
+        assert_eq!(activated, vec![metadata.clone()]);
         let listed = project_output(&mut client, ResolvedProject::List).unwrap();
         server.join().unwrap();
         assert_eq!(opened.human, format!("{}\tcheckout", checkout.display()));
@@ -4420,6 +4424,10 @@ mod tests {
 
     #[test]
     fn project_open_visits_without_overwriting_the_registry_name() {
+        check_project_open_visit(false);
+    }
+
+    fn check_project_open_visit(real_private_activation: bool) {
         let Some(checkout) = git_checkout() else {
             return;
         };
@@ -4488,11 +4496,20 @@ mod tests {
         .resolved()
         .unwrap();
         let mut activated = Vec::new();
-        let output = project_output_with_activation(&mut client, resolved, |repository| {
-            activated.push(repository.to_path_buf());
-        }).unwrap();
+        let output = if real_private_activation {
+            let runtime = PathBuf::from(std::env::var_os("CAGENTS_TEST_PROJECT_ACTIVATION_CHILD").unwrap());
+            assert_eq!(std::env::var_os("XDG_RUNTIME_DIR"), Some(runtime.clone().into_os_string()));
+            std::fs::write(runtime.join("expected.json"), serde_json::to_vec(&expected).unwrap()).unwrap();
+            project_output(&mut client, resolved).unwrap()
+        } else {
+            project_output_with_activation(&mut client, resolved, |repository| {
+                activated.push(repository.to_path_buf());
+            }).unwrap()
+        };
         server.join().unwrap();
-        assert_eq!(activated, vec![expected.clone()], "the fixture records selection without notifying any real window");
+        if !real_private_activation {
+            assert_eq!(activated, vec![expected.clone()], "the fixture records selection without notifying any real window");
+        }
         assert_eq!(output.command, "project.open");
         assert_eq!(output.data["project"]["ordinal"], json!(2));
         assert_eq!(output.data["project"]["name"], "Custom project label");
@@ -4505,6 +4522,63 @@ mod tests {
             ),
             "one tab-separated line: checkout path, name"
         );
+    }
+
+    #[test]
+    fn project_open_real_activation_is_confined_to_an_explicit_private_runtime() {
+        const CHILD: &str = "CAGENTS_TEST_PROJECT_ACTIVATION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            check_project_open_visit(true);
+            return;
+        }
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+        let runtime = tempfile::tempdir().unwrap();
+        // Bind both product identities only INSIDE this owned fixture; neither
+        // inherited runtime nor an existing application socket is consulted.
+        let listeners = ["cagents-development-ui.activate", "cagents-ui.activate"].map(|name| {
+            let listener = UnixListener::bind(runtime.path().join(name)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() { let _ = self.0.kill(); }
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "control::tests::project_open_real_activation_is_confined_to_an_explicit_private_runtime", "--nocapture"])
+            .env(CHILD, runtime.path()).env("XDG_RUNTIME_DIR", runtime.path())
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut observed = None;
+        while Instant::now() < deadline {
+            for listener in &listeners {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                        let mut line = String::new();
+                        std::io::BufReader::new(&mut stream).take(4096).read_line(&mut line).unwrap();
+                        let encoded = line.strip_prefix("project ").expect("actual project activation frame").trim_end();
+                        observed = Some(serde_json::from_str::<PathBuf>(encoded).unwrap());
+                        writeln!(stream, "ok").unwrap();
+                    },
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {},
+                    Err(error) => panic!("private activation listener: {error}"),
+                }
+            }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success());
+                let expected: PathBuf = serde_json::from_slice(&std::fs::read(runtime.path().join("expected.json")).unwrap()).unwrap();
+                assert_eq!(observed, Some(expected));
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("private activation child did not settle within its deadline");
     }
 
     /// A listing is of the registry, which records no source: a project a
