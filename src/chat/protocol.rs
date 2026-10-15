@@ -96,6 +96,7 @@ pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
+    provider_directory: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl ExecutionContext {
@@ -171,6 +172,20 @@ impl ExecutionContext {
         }
         Ok(state.outcome)
     }
+    /// Minted only after typed preparation has pinned the private launch and
+    /// updated the adapter before initialize. A process cwd alone is no proof
+    /// of a resumed provider thread's operational directory.
+    pub(crate) fn observe_provider_directory(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.directory.is_none() { return Err("Provider scope requires its admitted directory descriptor".into()); }
+        self.verify_directory(path)?;
+        *self.provider_directory.lock().unwrap_or_else(|p|p.into_inner()) = Some(path.to_owned());
+        Ok(())
+    }
+    pub(crate) fn provider_directory_observed(&self, path: &std::path::Path) -> Result<bool, String> {
+        if self.provider_directory.lock().unwrap_or_else(|p|p.into_inner()).as_deref() != Some(path) { return Ok(false); }
+        self.verify_directory(path)?;
+        Ok(true)
+    }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
         let Some(expected) = self.directory_identity()? else {
             return Ok(());
@@ -207,6 +222,9 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Update cached operational paths before initialization, after the caller
+    /// pinned and verified the private execution directory.
+    fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> { Ok(()) }
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(

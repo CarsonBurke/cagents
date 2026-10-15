@@ -2,6 +2,7 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
 mod native_cleanup;
+mod execution_directory;
 mod native_recovery;
 mod owned_listener;
 #[cfg(test)]
@@ -964,7 +965,9 @@ fn start_with_execution(
             "Native restart launch differs from its issued conversation",
         ));
     }
-    let process_launch = restart_launch.unwrap_or(&session.launch);
+    let prepared_directory = execution_directory::prepare(restart_launch.unwrap_or(&session.launch), execution)?;
+    let execution = prepared_directory.context.clone();
+    let process_launch = &prepared_directory.launch;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
     } else {
@@ -1038,6 +1041,9 @@ fn start_with_execution(
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
         .clone();
+    // Always apply the typed operational directory, including an unchanged
+    // canonical spelling: a resumed provider thread may retain another cwd.
+    prepared_directory.authorize(&mut spec, adapter.as_mut())?;
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {
