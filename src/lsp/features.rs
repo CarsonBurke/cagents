@@ -256,6 +256,9 @@ pub(super) fn convert_workspace_edit(store:&SnapshotStore,edit:lsp_types::Worksp
                     let needs_confirmation=annotation.needs_confirmation.unwrap_or(false);
                     out.requires_confirmation|=needs_confirmation;
                     if used_annotations.insert(edit.annotation_id.clone()) {
+                        if edit.annotation_id.len()>1024 || annotation.label.len()>1024 || annotation.description.as_ref().is_some_and(|description|description.len()>4096) {
+                            return Err(LspError::Unsupported("workspace-edit annotation metadata exceeds its bounded label/description budget".into()));
+                        }
                         if used_annotations.len()>256 {return Err(LspError::Unsupported("workspace edit contains more than 256 annotation groups".into()));}
                         out.annotations.push(LspChangeAnnotation{id:edit.annotation_id,label:annotation.label.clone(),description:annotation.description.clone(),needs_confirmation});
                     }
@@ -412,6 +415,8 @@ mod tests {
         let value=json!({"changeAnnotations":{"confirm":{"label":"Rename export","needsConfirmation":true}},"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[{"annotationId":"confirm","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"newText":"x"}]}]});
         let converted=convert_workspace_edit(&store,serde_json::from_value(value.clone()).unwrap(),None).unwrap();
         assert!(converted.requires_confirmation);assert_eq!(converted.annotations[0].label,"Rename export");assert!(converted.annotations[0].needs_confirmation);assert_eq!(converted.documents[0].edits[0].range,LspRange::new(LspPosition::new(0,1),LspPosition::new(0,2)));
+        let mut oversized=value.clone();oversized["changeAnnotations"]["confirm"]["label"]=json!("x".repeat(1025));assert!(matches!(convert_workspace_edit(&store,serde_json::from_value(oversized).unwrap(),None),Err(LspError::Unsupported(_))));
+        let mut oversized=value.clone();oversized["changeAnnotations"]["confirm"]["description"]=json!("x".repeat(4097));assert!(matches!(convert_workspace_edit(&store,serde_json::from_value(oversized).unwrap(),None),Err(LspError::Unsupported(_))));
         let mut missing=value.clone();missing["changeAnnotations"]=json!({});assert!(matches!(convert_workspace_edit(&store,serde_json::from_value(missing).unwrap(),None),Err(LspError::Unsupported(_))));
         let mut split=value;split["documentChanges"][0]["edits"][0]["range"]["start"]["character"]=json!(2);assert!(matches!(convert_workspace_edit(&store,serde_json::from_value(split).unwrap(),None),Err(LspError::SplitSurrogate{..})));
         let duplicate: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[]},{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[]}]})).unwrap();assert!(matches!(convert_workspace_edit(&store,duplicate,None),Err(LspError::Unsupported(_))));
