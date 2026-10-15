@@ -877,12 +877,20 @@ pub fn build_document_diff_sources(
     ignore_whitespace: bool,
     cancellation: &CancellationToken,
 ) -> Option<DiffModel> {
+    build_document_diff_sources_with_font(before,after,path,theme,ignore_whitespace,cosmic::iced::Font::MONOSPACE,cancellation)
+}
+
+/// Retain exact sources and measure with the same family rendered by the editor.
+/// Syntax colors are family-independent and keep sharing the baseline cache.
+pub fn build_document_diff_sources_with_font(before:Arc<str>,after:Arc<str>,path:&Path,
+    theme:crate::settings::EditorSyntaxTheme,ignore_whitespace:bool,font:cosmic::iced::Font,
+    cancellation:&CancellationToken)->Option<DiffModel> {
     check_cancelled(cancellation).ok()?;
     let mut model =
         build_diff_rows_from_sources(&before, &after, ignore_whitespace, cancellation).ok()?;
     model.syntax =
         highlight_comparison_model(&before, &after, path, theme, cancellation, &model).ok()?;
-    measure_diff(&mut model, cancellation).ok()?;
+    measure_diff_with_font(&mut model,font,cancellation).ok()?;
     check_cancelled(cancellation).ok()?;
     Some(model)
 }
@@ -897,6 +905,10 @@ struct ShapeKey<'a> {
 
 impl<'a> ShapeKey<'a> {
     fn new(text: &'a str, syntax: &[SyntaxSpan]) -> Self {
+        Self::with_font(text,syntax,cosmic::iced::Font::MONOSPACE)
+    }
+
+    fn with_font(text:&'a str,syntax:&[SyntaxSpan],font:cosmic::iced::Font)->Self {
         let mut fonts: Vec<(Range<usize>, cosmic::iced::Font)> = Vec::new();
         let mut append = |range: Range<usize>, font| {
             if range.is_empty() {
@@ -916,16 +928,14 @@ impl<'a> ShapeKey<'a> {
             let start = (span.start as usize).min(text.len());
             let end = (span.end as usize).min(text.len());
             if cursor < start {
-                append(cursor..start, cosmic::iced::Font::MONOSPACE);
+                append(cursor..start,font);
             }
-            append(
-                start..end,
-                span.font().unwrap_or(cosmic::iced::Font::MONOSPACE),
-            );
+            let styled = span.font().map(|mut styled| { styled.family = font.family; styled }).unwrap_or(font);
+            append(start..end,styled);
             cursor = end;
         }
         if cursor < text.len() {
-            append(cursor..text.len(), cosmic::iced::Font::MONOSPACE);
+            append(cursor..text.len(),font);
         }
         Self { text, fonts }
     }
@@ -1083,6 +1093,15 @@ fn arithmetic_width(
 }
 
 fn measure_diff(model: &mut DiffModel, cancellation: &CancellationToken) -> Result<(), Cancelled> {
+    measure_diff_with_font(model,cosmic::iced::Font::MONOSPACE,cancellation)
+}
+
+/// Re-measure retained rows on a CPU worker without repeating source/highlight work.
+pub fn measure_diff_for_font(model:&mut DiffModel,font:cosmic::iced::Font,cancellation:&CancellationToken)->Option<()> {
+    measure_diff_with_font(model,font,cancellation).ok()
+}
+
+fn measure_diff_with_font(model:&mut DiffModel,font:cosmic::iced::Font,cancellation:&CancellationToken)->Result<(),Cancelled> {
     use cosmic::iced::advanced::graphics::text;
     let palettes = if model
         .syntax
@@ -1108,7 +1127,7 @@ fn measure_diff(model: &mut DiffModel, cancellation: &CancellationToken) -> Resu
             ] {
                 if let Some(source) = source {
                     for (palette, width) in widths.iter_mut().enumerate().take(palettes) {
-                        let key = ShapeKey::new(source, model.syntax.line(old, line, palette == 1));
+                        let key = ShapeKey::with_font(source, model.syntax.line(old, line, palette == 1),font);
                         if let Some(cached) = measured.get(&key) {
                             *width = width.max(*cached);
                         } else if let Some(arithmetic) = arithmetic_width(&key, &cells) {
@@ -1271,6 +1290,11 @@ impl RenderedDiff {
         ignore_whitespace: bool,
         cancellation: &CancellationToken,
     ) -> Self {
+        Self::from_content_with_options_and_font(content,path,theme,ignore_whitespace,cosmic::iced::Font::MONOSPACE,cancellation)
+    }
+
+    pub fn from_content_with_options_and_font(content:DiffContent,path:&Path,theme:crate::settings::EditorSyntaxTheme,
+        ignore_whitespace:bool,font:cosmic::iced::Font,cancellation:&CancellationToken)->Self {
         if cancellation.is_cancelled() {
             return Self::Error("repository operation cancelled".into());
         }
@@ -1293,12 +1317,13 @@ impl RenderedDiff {
                     !matches!(old, crate::repository::DiffSide::Absent),
                     !matches!(new, crate::repository::DiffSide::Absent),
                 ];
-                let mut model = match build_document_diff_with_options(
-                    old.text().unwrap_or_default(),
-                    new.text().unwrap_or_default(),
+                let mut model = match build_document_diff_sources_with_font(
+                    Arc::from(old.text().unwrap_or_default()),
+                    Arc::from(new.text().unwrap_or_default()),
                     path,
                     theme,
                     ignore_whitespace,
+                    font,
                     cancellation,
                 ) {
                     Some(model) => model,
@@ -1355,6 +1380,12 @@ pub fn load_repository_diff_with_options(
     ignore_whitespace: bool,
     cancellation: &CancellationToken,
 ) -> RenderedDiff {
+    load_repository_diff_with_options_and_font(worktree,relative_path,basis,previous_path,theme,ignore_whitespace,cosmic::iced::Font::MONOSPACE,cancellation)
+}
+
+pub fn load_repository_diff_with_options_and_font(worktree:&Path,relative_path:&Path,basis:&DiffBasis,
+    previous_path:Option<&Path>,theme:crate::settings::EditorSyntaxTheme,ignore_whitespace:bool,
+    font:cosmic::iced::Font,cancellation:&CancellationToken)->RenderedDiff {
     // `RepoPath` *is* the path validation: it rejects an absolute path, `.`,
     // `..`, an empty component and an interior NUL, which is what makes the
     // pathspec safe to hand to Git.
@@ -1373,11 +1404,12 @@ pub fn load_repository_diff_with_options(
         old_path,
     };
     match RepositoryService::system("git").diff(&request, cancellation) {
-        Ok(content) => RenderedDiff::from_content_with_options(
+        Ok(content) => RenderedDiff::from_content_with_options_and_font(
             content,
             relative_path,
             theme,
             ignore_whitespace,
+            font,
             cancellation,
         ),
         Err(error) => RenderedDiff::Error(error.to_string()),
@@ -3992,5 +4024,49 @@ mod separated_change_contract {
             model.syntax.new.as_ref(),
             &highlight_side(&after, Path::new("separated.rs"), theme, &cancellation).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod selected_font_contracts {
+    use super::*;
+    use cosmic::iced::{Font,font};
+
+    #[test]
+    fn selected_family_preserves_syntax_weight_and_style() {
+        let selected = Font { family:font::Family::SansSerif,..Font::MONOSPACE };
+        let bold_italic = Font { weight:font::Weight::Bold,style:font::Style::Italic,..Font::MONOSPACE };
+        let key = ShapeKey::with_font("bold tail",&[SyntaxSpan::new(0..4,None,Some(bold_italic))],selected);
+        assert!(key.fonts.iter().all(|(_,font)| font.family == selected.family));
+        assert_eq!(key.fonts[0].1.weight,font::Weight::Bold);
+        assert_eq!(key.fonts[0].1.style,font::Style::Italic);
+        assert_eq!(key.fonts[1].1,selected);
+    }
+
+    #[test]
+    fn selected_family_extents_match_the_actual_rich_text_and_share_baseline_syntax() {
+        let before:Arc<str> = Arc::from("fn font_family_contract() { let iii = \"WWWW café\"; }\n");
+        let after:Arc<str> = Arc::from("fn font_family_contract() { let iii = \"WWWW changed café\"; }\n");
+        let cancel = CancellationToken::new();
+        let mono = build_document_diff_sources_with_font(before.clone(),after.clone(),Path::new("font-family.rs"),crate::settings::EditorSyntaxTheme::Auto,false,Font::MONOSPACE,&cancel).unwrap();
+        let selected = Font { family:font::Family::SansSerif,..Font::MONOSPACE };
+        let model = build_document_diff_sources_with_font(before,after,Path::new("font-family.rs"),crate::settings::EditorSyntaxTheme::Auto,false,selected,&cancel).unwrap();
+        assert!(Arc::ptr_eq(&mono.syntax.old,&model.syntax.old));
+        for (palette,extent) in model.max_line_width.into_iter().enumerate() {
+            let mut expected = 0.0_f32;
+            for row in &model.split_rows {
+                for (old,line,text) in [(true,row.old_line,row.old_text.as_deref()),(false,row.new_line,row.new_text.as_deref())] {
+                    if let Some(text) = text {
+                        let mut spans = line_spans(text,&[],model.syntax.line(old,line,palette == 1),cosmic::iced::Color::TRANSPARENT);
+                        for span in &mut spans {
+                            if let Some(font) = &mut span.font { font.family = selected.family; }
+                            else { span.font = Some(selected); }
+                        }
+                        expected = expected.max(shaped_spans_width(&spans));
+                    }
+                }
+            }
+            assert!((extent as f32-expected.ceil()).abs() <= 1.0,"selected-family extent {extent}, native {expected}");
+        }
     }
 }
