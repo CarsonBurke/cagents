@@ -22,6 +22,9 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(any(feature = "ui", feature = "host"))]
+#[path = "chat/protocol/terminal_output.rs"]
+pub(crate) mod terminal_output;
 
 /// Whether a provider-level failure requires the reader to renew the login.
 /// Only explicit authentication failures qualify: a bare HTTP 401 can describe
