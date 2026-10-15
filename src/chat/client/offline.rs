@@ -456,6 +456,10 @@ fn executor() -> &'static crossbeam_channel::Sender<Weak<State>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn source_epoch(incarnation: u128, revision: u64) -> crate::chat::cache::SourceEpoch {
+        crate::chat::cache::SourceEpoch { incarnation: uuid::Uuid::from_u128(incarnation), revision }
+    }
+
 
     fn handle() -> ClientHandle {
         let mut snapshot = Snapshot { generation: 12, ready: true, session_id: Some("private-offline".into()), ..Snapshot::default() };
@@ -578,14 +582,14 @@ mod tests {
         let expected = text.len();
         view.items[0] = Arc::new(item);
         let source = crate::chat::cache::SourceKey { agent_id: None, source_id: view.items[0].id.clone() };
-        assert_eq!(crate::chat::source_owners::admit(&view.items[0], &source, 7, None),
+        assert_eq!(crate::chat::source_owners::admit(&view.items[0], &source, source_epoch(1, 7), None),
             crate::chat::source_owners::Admission::Ready);
         let original_metadata = crate::chat::cache::SourceMetadata::from_item(&view.items[0]).unwrap();
         // A replacement can be known while the last rendered prefix still has
         // its original frozen epoch and source timestamps.
         view.source_parts.push(crate::chat::cache::SourcePart {
             item_id: "new-raw-part".into(), source, start: 0, end: 8,
-            source_len: expected + 99, replacement: false, epoch: 99,
+            source_len: expected + 99, replacement: false, epoch: source_epoch(2, 7),
             metadata: crate::chat::cache::SourceMetadata { at: Some(999), ..original_metadata.clone() },
         });
         handle.remember_visible_view(Arc::new(view), None);
@@ -597,7 +601,7 @@ mod tests {
         assert_eq!(text.len(), expected, "raw inline eviction must not replace the displayed view");
         assert_eq!(snapshot.source_parts.len(), 1);
         let part = &snapshot.source_parts[0];
-        assert_eq!((part.start, part.end, part.source_len, part.epoch), (0, expected, expected, 7));
+        assert_eq!((part.start, part.end, part.source_len, part.epoch), (0, expected, expected, source_epoch(1, 7)));
         assert_eq!(part.metadata, original_metadata);
         assert_eq!(part.item_id, snapshot.items[0].id);
         assert!(!part.replacement);

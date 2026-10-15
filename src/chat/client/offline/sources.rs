@@ -96,6 +96,10 @@ impl Manifest {
 mod tests {
     use super::*;
     use crate::chat::{ItemContent, Phase, Role};
+    fn source_epoch(incarnation: u128, revision: u64) -> crate::chat::cache::SourceEpoch {
+        crate::chat::cache::SourceEpoch { incarnation: uuid::Uuid::from_u128(incarnation), revision }
+    }
+
 
     fn fixture() -> (Snapshot, ResidentSource) {
         let item = Arc::new(Item {
@@ -105,7 +109,7 @@ mod tests {
         });
         let record = ResidentSource {
             source: SourceKey { agent_id: None, source_id: item.id.clone() },
-            bytes: "frozen viewed source".len(), epoch: 7,
+            bytes: "frozen viewed source".len(), epoch: source_epoch(1, 7),
             metadata: SourceMetadata::from_item(&item).unwrap(),
         };
         let snapshot = Snapshot { items: vec![item], ..Snapshot::default() };
@@ -118,12 +122,12 @@ mod tests {
         let untouched = SourcePart {
             item_id: "unloaded-window".into(),
             source: SourceKey { agent_id: None, source_id: "another-source".into() },
-            start: 100, end: 120, source_len: 4096, replacement: true, epoch: 88,
+            start: 100, end: 120, source_len: 4096, replacement: true, epoch: source_epoch(1, 88),
             metadata: record.metadata.clone(),
         };
         snapshot.source_parts = vec![SourcePart {
             item_id: "newer-replacement-window".into(), source: record.source.clone(),
-            start: 10, end: 12, source_len: 9999, replacement: true, epoch: 99,
+            start: 10, end: 12, source_len: 9999, replacement: true, epoch: source_epoch(2, 7),
             metadata: SourceMetadata { at: Some(999), ..record.metadata.clone() },
         }, untouched.clone()];
         let manifest = Manifest { sources: vec![record.clone()], body_bytes: snapshot.transcript_bytes() };
@@ -131,7 +135,7 @@ mod tests {
         assert_eq!(snapshot.source_parts.len(), 2);
         assert_eq!(snapshot.source_parts[0], untouched, "unloaded sources stay honest partial windows");
         let restored = &snapshot.source_parts[1];
-        assert_eq!((restored.start, restored.end, restored.source_len, restored.epoch), (0, record.bytes, record.bytes, 7));
+        assert_eq!((restored.start, restored.end, restored.source_len, restored.epoch), (0, record.bytes, record.bytes, source_epoch(1, 7)));
         assert_eq!(restored.metadata, record.metadata);
         assert_eq!(restored.item_id, record.source.source_id);
         assert!(!restored.replacement);
