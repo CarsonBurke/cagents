@@ -1236,7 +1236,7 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
         use crate::terminal_ipc::{ShutdownOperation, ShutdownOutcome};
         let mut state = host.lock().unwrap();
         assert!(
-            state.spawning.is_empty()
+            !state.has_pending_terminal_spawn_for_test()
                 && state.chat_spawning.is_empty()
                 && state.chats.is_empty()
                 && state.terminals.is_empty(),

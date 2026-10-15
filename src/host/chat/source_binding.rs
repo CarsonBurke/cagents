@@ -590,6 +590,7 @@ impl BackendFixture {
 mod tests {
     use super::*;
     use crate::chat::protocol::{Adapter, ProcessSpec, Step};
+    use std::sync::Mutex;
     struct Idle;
     impl Adapter for Idle {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -1030,9 +1031,7 @@ mod tests {
         terminal.execution_instance = uuid::Uuid::new_v4();
         let receipt = {
             let mut state = fixture.host.lock().unwrap();
-            state
-                .published_terminal_workers
-                .observe(terminal.session.id, terminal.execution_instance);
+            state.observe_terminal_worker_for_test(terminal.session.id, terminal.execution_instance);
             let receipt = TerminalHandoffReceipt {
                 operation: uuid::Uuid::new_v4(),
                 source: source.clone(),
@@ -1080,7 +1079,7 @@ mod tests {
             drop(state.chats.remove(&native_source.id));
             assert!(state.chats.get(&native_source.id).is_none());
             assert_eq!(
-                state.published_terminal_workers.latest(native_source.id),
+                state.latest_terminal_worker_for_test(native_source.id),
                 Some(terminal.execution_instance)
             );
             assert!(
@@ -1101,9 +1100,7 @@ mod tests {
         pending.terminal.session.id = pending_id;
         {
             let mut state = fixture.host.lock().unwrap();
-            state
-                .published_terminal_workers
-                .observe(pending_id, pending.terminal.execution_instance);
+            state.observe_terminal_worker_for_test(pending_id, pending.terminal.execution_instance);
             pending.terminal_native_epoch = state.native_sources.retain_resource_epoch(pending_id);
             state.remember_terminal_handoff(pending.clone());
             state.validate_terminal_handoff_receipt(&pending).unwrap();
@@ -1160,9 +1157,7 @@ mod tests {
                 None,
             );
             terminal.execution_instance = uuid::Uuid::new_v4();
-            state
-                .published_terminal_workers
-                .observe(terminal.session.id, terminal.execution_instance);
+            state.observe_terminal_worker_for_test(terminal.session.id, terminal.execution_instance);
             let receipt = TerminalHandoffReceipt {
                 operation: uuid::Uuid::new_v4(),
                 source: binding.source.clone(),
