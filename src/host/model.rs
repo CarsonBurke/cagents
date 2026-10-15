@@ -24,12 +24,14 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod agent_locations;
 mod automation_archive_clock;
 mod automation_membership;
-mod agent_locations;
 mod session_locations;
 pub(crate) use agent_locations::{AcceptedDirectory, AgentMove, Location as AgentLocation};
-pub(crate) use session_locations::{Location as SessionLocation, SessionDirectoryProof, SessionMove};
+pub(crate) use session_locations::{
+    Location as SessionLocation, SessionDirectoryProof, SessionMove,
+};
 mod automation_extensions_schema;
 mod automation_proposals;
 mod automation_reports;
@@ -39,10 +41,10 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod native_actor;
-mod schema;
 mod navigation;
 mod project_checkout;
 mod project_instances;
+mod schema;
 pub(super) use native_actor::NativeActorEvent;
 mod relocation;
 mod terminal_owners;
@@ -102,11 +104,15 @@ impl Registry {
         Self::at_with_migration(path, migrate)
     }
 
-    fn at_with_migration(path: &Path, migration: impl FnOnce(&Connection, Connection) -> Result<(), String>) -> Result<Self, String> {
+    fn at_with_migration(
+        path: &Path,
+        migration: impl FnOnce(&Connection, Connection) -> Result<(), String>,
+    ) -> Result<Self, String> {
         Self::at_with_admission_hook(path, migration, || Ok(()))
     }
 
-    fn at_with_admission_hook(path: &Path,
+    fn at_with_admission_hook(
+        path: &Path,
         migration: impl FnOnce(&Connection, Connection) -> Result<(), String>,
         after_inspection: impl FnOnce() -> Result<(), String>,
     ) -> Result<Self, String> {
@@ -119,28 +125,38 @@ impl Registry {
         // An initial read-write read could recover a hot rollback journal
         // before discovering an unsupported schema. Read-only admission may
         // refuse recovery; it must never repair a database on this path.
-        let inspection = Connection::open_with_flags(path,
+        let inspection = Connection::open_with_flags(
+            path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ).map_err(|error| error.to_string())?;
+        )
+        .map_err(|error| error.to_string())?;
         // Pin the admitted physical SQLite image with a genuine read
         // transaction. In rollback-journal mode its SHARED lock prevents a
         // second writer from committing or creating a hot journal between
         // this inspection and our read-write writer reservation.
-        inspection.execute_batch("BEGIN DEFERRED").map_err(|error| error.to_string())?;
+        inspection
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(|error| error.to_string())?;
         schema::check_readonly(&inspection)?;
         after_inspection()?;
         let db = Connection::open(path).map_err(|error| error.to_string())?;
         // Even a rejected read-write connection can checkpoint/delete a
         // pre-existing WAL on its final close. Keep rejection side-effect free
         // through both outer and authoritative writer admission.
-        db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
-            .map_err(|error| error.to_string())?;
+        db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .map_err(|error| error.to_string())?;
         schema::check_readonly(&db)?;
         configure_connection(&db)?;
         migration(&db, inspection)?;
         configure(&db)?;
-        db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)
-            .map_err(|error| error.to_string())?;
+        db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            false,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             db,
             path: path.to_owned(),
@@ -331,7 +347,8 @@ impl Registry {
         {
             return Err("Session proofs do not belong to the requested destination project".into());
         }
-        let transaction = self.db
+        let transaction = self
+            .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         schema::require_current_write(&transaction)?;
@@ -646,7 +663,8 @@ fn prepare_private_file(path: &Path) -> io::Result<()> {
 /// execution acceptance durable before launching a child or submitting its
 /// prompt, including a power failure after the external side effect begins.
 fn configure_connection(db: &Connection) -> Result<(), String> {
-    db.busy_timeout(BUSY_TIMEOUT).map_err(|error| error.to_string())?;
+    db.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|error| error.to_string())?;
     db.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")
         .map_err(|error| error.to_string())
 }
@@ -784,19 +802,25 @@ mod tests {
 
     #[test]
     fn schema_thirteen_checkout_only_registry_refuses_without_repair_or_user_data_changes() {
-        let directory=tempfile::tempdir().unwrap();
-        let path=directory.path().join("registry.sqlite3");
-        let mut registry=Registry::at(&path).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let mut registry = Registry::at(&path).unwrap();
         registry.apply(&open("/metadata/project.git")).unwrap();
         // Build the actual checkout-only private fork from the published12
         // layout, rather than relabel a current authority-rich registry.
         schema::discard_selected_for_legacy_fixture(&registry.db);
         registry.db.execute_batch("ALTER TABLE projects ADD COLUMN checkout TEXT; ALTER TABLE projects ADD COLUMN primary_checkout TEXT; UPDATE projects SET checkout='/checkout/project',primary_checkout='/checkout/primary'; PRAGMA user_version=13;").unwrap();
         drop(registry);
-        let wal=PathBuf::from(format!("{}-wal",path.display()));
-        let before=(std::fs::read(&path).unwrap(),std::fs::read(&wal).ok());
-        assert!(Registry::at(&path).is_err(),"private13 is ambiguous and must not be silently promoted");
-        assert_eq!((std::fs::read(&path).unwrap(),std::fs::read(&wal).ok()),before);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let before = (std::fs::read(&path).unwrap(), std::fs::read(&wal).ok());
+        assert!(
+            Registry::at(&path).is_err(),
+            "private13 is ambiguous and must not be silently promoted"
+        );
+        assert_eq!(
+            (std::fs::read(&path).unwrap(), std::fs::read(&wal).ok()),
+            before
+        );
     }
 
     #[test]

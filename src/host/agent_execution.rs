@@ -26,8 +26,8 @@ pub(super) use restart::{PairPlan, prepare_restart_pair, restore_restart_pair};
 pub(super) mod terminals;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
-    reconcile_agent_run, reconcile_agent_run_under_control, try_interactive,
-    reconcile_archived_automation_run_under_control,
+    reconcile_agent_run, reconcile_agent_run_under_control,
+    reconcile_archived_automation_run_under_control, try_interactive,
 };
 
 // Client IDs allocated to external sockets begin at one. This subscriber owns
@@ -208,9 +208,13 @@ pub(super) fn submit(
                 .ok_or_else(|| "The selected agent directory could not be pinned".to_owned())
         })
         .transpose()?;
-    let directory_observation=pinned_directory.as_ref().zip(selected.as_ref()).map(|(directory,spec)| {
-        super::model::AcceptedDirectory::observe(&spec.target.directory,directory.clone())
-    }).transpose()?;
+    let directory_observation = pinned_directory
+        .as_ref()
+        .zip(selected.as_ref())
+        .map(|(directory, spec)| {
+            super::model::AcceptedDirectory::observe(&spec.target.directory, directory.clone())
+        })
+        .transpose()?;
     let accepted = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1353,12 +1357,18 @@ fn create_console_from_recipe(
 ) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
     // Initial console creation shares the lifecycle fence used by public
     // terminal close. Restart publication already owns that same claim.
-    let transition = restart.is_none().then(|| super::chat::presentation_close::transition_gate(host, session.id));
+    let transition = restart
+        .is_none()
+        .then(|| super::chat::presentation_close::transition_gate(host, session.id));
     let _transition = match transition.as_ref().map(|gate| gate.try_lock()) {
         Some(Ok(guard)) => Some(guard),
         Some(Err(std::sync::TryLockError::Poisoned(poison))) => Some(poison.into_inner()),
-        Some(Err(std::sync::TryLockError::WouldBlock)) => return Err(
-            "The provider has a lifecycle transition in progress; no console was started".into()),
+        Some(Err(std::sync::TryLockError::WouldBlock)) => {
+            return Err(
+                "The provider has a lifecycle transition in progress; no console was started"
+                    .into(),
+            );
+        }
         None => None,
     };
     let admitted_identity = {
@@ -1366,16 +1376,25 @@ fn create_console_from_recipe(
         let record = state
             .chats
             .get_mut(&session.id)
-            .filter(|record| record.handle.same_actor(handle)
-                && record.session.id == session.id
-                && record.session.proof == session.proof
-                && record.session.launch.provider == session.launch.provider
-                && record.session.launch.recipe == session.launch.recipe
-                && record.session.terminal == session.terminal)
+            .filter(|record| {
+                record.handle.same_actor(handle)
+                    && record.session.id == session.id
+                    && record.session.proof == session.proof
+                    && record.session.launch.provider == session.launch.provider
+                    && record.session.launch.recipe == session.launch.recipe
+                    && record.session.terminal == session.terminal
+            })
             .ok_or("The exact provider source changed before opening its console")?;
         let identity = handle.try_close_identity()?;
-        if session.launch.session_id.as_ref().is_some_and(|thread| identity.confirmed_session_id.as_ref() != Some(thread)) {
-            return Err("The confirmed provider conversation changed before opening its console".into());
+        if session
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|thread| identity.confirmed_session_id.as_ref() != Some(thread))
+        {
+            return Err(
+                "The confirmed provider conversation changed before opening its console".into(),
+            );
         }
         record.console_recipe = Some(recipe.clone());
         identity

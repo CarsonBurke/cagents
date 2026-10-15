@@ -1808,13 +1808,28 @@ impl Registry {
         confirmed_manual: bool,
         now_ms: u64,
     ) -> Result<Claimed, String> {
-        self.claim_automation_with_directory(id,expected_execution_revision,expected_next,trigger,next,confirmed_manual,now_ms,None)
+        self.claim_automation_with_directory(
+            id,
+            expected_execution_revision,
+            expected_next,
+            trigger,
+            next,
+            confirmed_manual,
+            now_ms,
+            None,
+        )
     }
     pub(crate) fn claim_automation_with_directory(
-        &mut self,id:Uuid,expected_execution_revision:u64,expected_next:Option<&Occurrence>,
-        trigger:crate::automations::Trigger,next:Option<Occurrence>,confirmed_manual:bool,now_ms:u64,
-        directory:Option<super::AcceptedDirectory>,
-    )->Result<Claimed,String> {
+        &mut self,
+        id: Uuid,
+        expected_execution_revision: u64,
+        expected_next: Option<&Occurrence>,
+        trigger: crate::automations::Trigger,
+        next: Option<Occurrence>,
+        confirmed_manual: bool,
+        now_ms: u64,
+        directory: Option<super::AcceptedDirectory>,
+    ) -> Result<Claimed, String> {
         use crate::automations::{SkipReason, Trigger};
         let tx = self
             .db
@@ -1933,7 +1948,15 @@ impl Registry {
         }
         let accepted = if firing.state == FiringState::Prechecking && definition.precheck.is_none()
         {
-            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, directory.as_ref(), now_ms)?
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                directory.as_ref(),
+                now_ms,
+            )?
         } else {
             None
         };
@@ -1977,12 +2000,15 @@ impl Registry {
         outcome: super::super::automations::precheck::Outcome,
         now_ms: u64,
     ) -> Result<Option<crate::agent_execution::Accepted>, String> {
-        self.finish_automation_precheck_with_directory(firing_id,outcome,now_ms,None)
+        self.finish_automation_precheck_with_directory(firing_id, outcome, now_ms, None)
     }
     pub(crate) fn finish_automation_precheck_with_directory(
-        &mut self,firing_id:Uuid,outcome:super::super::automations::precheck::Outcome,now_ms:u64,
-        directory:Option<super::AcceptedDirectory>,
-    )->Result<Option<crate::agent_execution::Accepted>,String> {
+        &mut self,
+        firing_id: Uuid,
+        outcome: super::super::automations::precheck::Outcome,
+        now_ms: u64,
+        directory: Option<super::AcceptedDirectory>,
+    ) -> Result<Option<crate::agent_execution::Accepted>, String> {
         use crate::{automations::SkipReason, host::automations::precheck::Outcome};
         let tx = self
             .db
@@ -2038,7 +2064,15 @@ impl Registry {
         } else {
             let definition = read_definition(&tx, firing.automation, firing.revision)?;
             let key = occurrence_key(firing.revision, &firing.trigger);
-            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, directory.as_ref(), now_ms)?
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                directory.as_ref(),
+                now_ms,
+            )?
         };
         if !firing.state.is_active() {
             firing.finished_ms = Some(now_ms);
@@ -2062,7 +2096,7 @@ fn accept_firing(
     firing: &mut Firing,
     definition: &Definition,
     key: &str,
-    directory:Option<&super::AcceptedDirectory>,
+    directory: Option<&super::AcceptedDirectory>,
     now_ms: u64,
 ) -> Result<Option<crate::agent_execution::Accepted>, String> {
     use crate::{
@@ -2678,47 +2712,136 @@ mod tests {
     #[test]
     fn manual_and_precheck_acceptance_consume_original_worker_directory_observation() {
         use std::sync::Arc;
-        for precheck in [false,true] {
-            let (mut registry,_directory,mut definition)=fixture();
-            definition.session_mode=crate::automations::SessionMode::Fresh;
-            if precheck {definition.precheck=Some(crate::automations::Precheck{command:"true".into(),timeout_seconds:1});}
-            let path=definition.agent.target.directory.clone();
-            let context=crate::chat::protocol::ExecutionContext::capture(&path).unwrap();
-            let directory=context.directory_descriptor().unwrap();let metadata=directory.metadata().unwrap();
-            let approved=crate::agent_execution::DirectoryIdentity::from_metadata(&metadata);
-            let target=crate::automations::DirectoryIdentity{device:approved.device,inode:approved.inode};
-            let automation=registry.create_automation(definition,100,target).unwrap();
-            let observed=super::super::agent_locations::AcceptedDirectory::observe(&path,Arc::clone(&directory)).unwrap();
-            let claim=registry.claim_automation_with_directory(automation.id,1,None,crate::automations::Trigger::Manual{request:Uuid::new_v4()},None,true,200,if precheck{None}else{Some(observed)}).unwrap();
-            let accepted=if precheck {
+        for precheck in [false, true] {
+            let (mut registry, _directory, mut definition) = fixture();
+            definition.session_mode = crate::automations::SessionMode::Fresh;
+            if precheck {
+                definition.precheck = Some(crate::automations::Precheck {
+                    command: "true".into(),
+                    timeout_seconds: 1,
+                });
+            }
+            let path = definition.agent.target.directory.clone();
+            let context = crate::chat::protocol::ExecutionContext::capture(&path).unwrap();
+            let directory = context.directory_descriptor().unwrap();
+            let metadata = directory.metadata().unwrap();
+            let approved = crate::agent_execution::DirectoryIdentity::from_metadata(&metadata);
+            let target = crate::automations::DirectoryIdentity {
+                device: approved.device,
+                inode: approved.inode,
+            };
+            let automation = registry.create_automation(definition, 100, target).unwrap();
+            let observed = super::super::agent_locations::AcceptedDirectory::observe(
+                &path,
+                Arc::clone(&directory),
+            )
+            .unwrap();
+            let claim = registry
+                .claim_automation_with_directory(
+                    automation.id,
+                    1,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                    if precheck { None } else { Some(observed) },
+                )
+                .unwrap();
+            let accepted = if precheck {
                 assert!(claim.accepted.is_none());
-                let observed=super::super::agent_locations::AcceptedDirectory::observe(&path,directory).unwrap();
-                registry.finish_automation_precheck_with_directory(claim.firing.id,super::super::super::automations::precheck::Outcome::Passed,300,Some(observed)).unwrap().unwrap()
-            }else{claim.accepted.unwrap()};
-            assert_eq!(registry.agent_directory(accepted.agent.id).unwrap(),Some(approved));
-            assert_eq!(registry.agent_location(accepted.agent.id).unwrap().directory,path);
-            assert_eq!(registry.automation_firing(claim.firing.id).unwrap().run,Some(accepted.run.id));
+                let observed =
+                    super::super::agent_locations::AcceptedDirectory::observe(&path, directory)
+                        .unwrap();
+                registry
+                    .finish_automation_precheck_with_directory(
+                        claim.firing.id,
+                        super::super::super::automations::precheck::Outcome::Passed,
+                        300,
+                        Some(observed),
+                    )
+                    .unwrap()
+                    .unwrap()
+            } else {
+                claim.accepted.unwrap()
+            };
+            assert_eq!(
+                registry.agent_directory(accepted.agent.id).unwrap(),
+                Some(approved)
+            );
+            assert_eq!(
+                registry
+                    .agent_location(accepted.agent.id)
+                    .unwrap()
+                    .directory,
+                path
+            );
+            assert_eq!(
+                registry.automation_firing(claim.firing.id).unwrap().run,
+                Some(accepted.run.id)
+            );
         }
     }
 
     #[test]
     fn captured_current_replacement_cannot_approve_an_original_scheduled_target() {
-        let (mut registry,directory,mut definition)=fixture();
-        let path=directory.path().join("scheduled-target");std::fs::create_dir(&path).unwrap();definition.agent.target.directory=path.clone();
-        let original=crate::chat::protocol::ExecutionContext::capture(&path).unwrap();
-        let identity=original.directory_identity().unwrap().unwrap();
-        let automation=registry.create_automation(definition,100,crate::automations::DirectoryIdentity{device:identity.device,inode:identity.inode}).unwrap();
+        let (mut registry, directory, mut definition) = fixture();
+        let path = directory.path().join("scheduled-target");
+        std::fs::create_dir(&path).unwrap();
+        definition.agent.target.directory = path.clone();
+        let original = crate::chat::protocol::ExecutionContext::capture(&path).unwrap();
+        let identity = original.directory_identity().unwrap().unwrap();
+        let automation = registry
+            .create_automation(
+                definition,
+                100,
+                crate::automations::DirectoryIdentity {
+                    device: identity.device,
+                    inode: identity.inode,
+                },
+            )
+            .unwrap();
         // Same configured path, different actual inode. Retain the original
         // descriptor throughout so an inode-reuse guess cannot qualify it.
-        std::fs::rename(&path,directory.path().join("original-retained-target")).unwrap();std::fs::create_dir(&path).unwrap();
-        let replacement=crate::chat::protocol::ExecutionContext::capture(&path).unwrap();
-        let observation=super::super::agent_locations::AcceptedDirectory::observe(&path,replacement.directory_descriptor().unwrap()).unwrap();
-        let claim=registry.claim_automation_with_directory(automation.id,1,None,crate::automations::Trigger::Manual{request:Uuid::new_v4()},None,true,200,Some(observation)).unwrap();
-        assert!(claim.accepted.is_none());assert_eq!(claim.firing.state,crate::automations::FiringState::Failed);
-        assert!(claim.firing.diagnostic.unwrap().contains("original automation target changed"));
+        std::fs::rename(&path, directory.path().join("original-retained-target")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let replacement = crate::chat::protocol::ExecutionContext::capture(&path).unwrap();
+        let observation = super::super::agent_locations::AcceptedDirectory::observe(
+            &path,
+            replacement.directory_descriptor().unwrap(),
+        )
+        .unwrap();
+        let claim = registry
+            .claim_automation_with_directory(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+                Some(observation),
+            )
+            .unwrap();
+        assert!(claim.accepted.is_none());
+        assert_eq!(claim.firing.state, crate::automations::FiringState::Failed);
+        assert!(
+            claim
+                .firing
+                .diagnostic
+                .unwrap()
+                .contains("original automation target changed")
+        );
         assert!(registry.agents(None).unwrap().is_empty());
-        assert_eq!(registry.automation_firing(claim.firing.id).unwrap().run,None);
-        assert_eq!(original.directory_identity().unwrap(),Some(identity));
+        assert_eq!(
+            registry.automation_firing(claim.firing.id).unwrap().run,
+            None
+        );
+        assert_eq!(original.directory_identity().unwrap(), Some(identity));
     }
 
     #[test]
@@ -5100,14 +5223,26 @@ mod tests {
             "DROP INDEX global_pending_automation_proposals",
         ] {
             let (mut registry, directory, pane, scope, agent) = archived_membership_fixture();
-            let snapshot = registry.archived_automation_conversation(agent.id).unwrap().snapshot;
-            let firing: String = registry.db.query_row(
-                "SELECT firing FROM automation_snapshots WHERE agent=?1",
-                [agent.id.to_string()], |row| row.get(0),
-            ).unwrap();
+            let snapshot = registry
+                .archived_automation_conversation(agent.id)
+                .unwrap()
+                .snapshot;
+            let firing: String = registry
+                .db
+                .query_row(
+                    "SELECT firing FROM automation_snapshots WHERE agent=?1",
+                    [agent.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
             let firing = firing.parse::<Uuid>().unwrap();
             let model = registry.model().unwrap();
-            let revision = model.views.iter().find(|view| view.scope == scope).unwrap().revision;
+            let revision = model
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .revision;
             let remove = ModelEdit::ChangeView {
                 scope,
                 expected_revision: revision,
@@ -5122,23 +5257,60 @@ mod tests {
             // writes. A different connection now changes its admission basis.
             let other = Connection::open(directory.path().join("model.sqlite3")).unwrap();
             other.execute_batch(alteration).unwrap();
-            let changes: u64 = registry.db.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+            let changes: u64 = registry
+                .db
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
             let refuses = [
-                registry.archive_automation_conversation(firing, &agent, snapshot).is_err(),
-                registry.acknowledge_automation_notifications(&Default::default()).is_err(),
-                registry.prune_automation_history(HISTORY_TTL_MS + 1000).is_err(),
+                registry
+                    .archive_automation_conversation(firing, &agent, snapshot)
+                    .is_err(),
+                registry
+                    .acknowledge_automation_notifications(&Default::default())
+                    .is_err(),
+                registry
+                    .prune_automation_history(HISTORY_TTL_MS + 1000)
+                    .is_err(),
                 registry.apply(&remove).is_err(),
-                registry.apply(&ModelEdit::CloseProject {
-                    repository: agent.spec.target.repository.clone(),
-                }).is_err(),
+                registry
+                    .apply(&ModelEdit::CloseProject {
+                        repository: agent.spec.target.repository.clone(),
+                    })
+                    .is_err(),
             ];
             assert!(refuses.into_iter().all(|refused| refused), "{alteration}");
-            assert_eq!(registry.db.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0)).unwrap(), changes,
-                "admission must precede even a rolled-back mutation: {alteration}");
+            assert_eq!(
+                registry
+                    .db
+                    .query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0))
+                    .unwrap(),
+                changes,
+                "admission must precede even a rolled-back mutation: {alteration}"
+            );
             assert_eq!(registry.agent(agent.id).unwrap(), agent);
             assert!(registry.archived_automation_conversation(agent.id).is_ok());
-            assert_eq!(registry.db.query_row("SELECT count(*) FROM automation_report_sources", [], |row| row.get::<_, u64>(0)).unwrap(), 0);
-            assert_eq!(registry.db.query_row("SELECT count(*) FROM shared_view_panes WHERE id=?1", [crate::model::CardId::from_uuid(agent.id.as_uuid()).to_string()], |row| row.get::<_, u64>(0)).unwrap(), 1);
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM automation_report_sources",
+                        [],
+                        |row| row.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM shared_view_panes WHERE id=?1",
+                        [crate::model::CardId::from_uuid(agent.id.as_uuid()).to_string()],
+                        |row| row.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
         }
     }
 

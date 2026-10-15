@@ -188,9 +188,13 @@ impl Handle {
         if automation.execution_revision != revision {
             return Err("The automation changed before this run was confirmed".into());
         }
-        let directory=service::validate_target(&host, &automation.definition, &automation.target_identity)?;
+        let directory =
+            service::validate_target(&host, &automation.definition, &automation.target_identity)?;
         agent_execution::selected_account(&automation.definition.agent)?;
-        let observation=super::super::model::AcceptedDirectory::observe(&automation.definition.agent.target.directory,directory)?;
+        let observation = super::super::model::AcceptedDirectory::observe(
+            &automation.definition.agent.target.directory,
+            directory,
+        )?;
         let claim = self
             .0
             .registry
@@ -524,10 +528,27 @@ impl Handle {
                 };
                 // A failed observation grants nothing; the existing launch
                 // validation still records its actual failure after claim.
-                let needs_directory=automation.active_firing.is_none()&&automation.definition.precheck.is_none()
-                    &&(automation.definition.session_mode==crate::automations::SessionMode::Fresh||automation.reuse_agent.is_none());
-                let observation=if needs_directory {service::validate_target(host,&automation.definition,&automation.target_identity)
-                    .and_then(|directory|super::super::model::AcceptedDirectory::observe(&automation.definition.agent.target.directory,directory)).ok()}else{None};
+                let needs_directory = automation.active_firing.is_none()
+                    && automation.definition.precheck.is_none()
+                    && (automation.definition.session_mode
+                        == crate::automations::SessionMode::Fresh
+                        || automation.reuse_agent.is_none());
+                let observation = if needs_directory {
+                    service::validate_target(
+                        host,
+                        &automation.definition,
+                        &automation.target_identity,
+                    )
+                    .and_then(|directory| {
+                        super::super::model::AcceptedDirectory::observe(
+                            &automation.definition.agent.target.directory,
+                            directory,
+                        )
+                    })
+                    .ok()
+                } else {
+                    None
+                };
                 let claim = self
                     .0
                     .registry
