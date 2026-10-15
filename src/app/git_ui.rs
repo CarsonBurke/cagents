@@ -1,8 +1,8 @@
 //! Local Git invalidation has its own queue and generations. GitHub reads never
 //! replace local rows, and filesystem events never schedule a GitHub process.
 use super::*;
-use std::collections::BTreeMap;
 use crate::{git_watch, model::WorktreeId, repository::HeadState};
+use std::collections::BTreeMap;
 
 fn local_workers() -> usize {
     std::thread::available_parallelism().map_or(2, |count| count.get().clamp(2, 8))
@@ -134,9 +134,20 @@ pub enum Action {
     },
 }
 
-fn panel_invalidation(project: ProjectId, change: &git_watch::Change, key: &ActiveWorktreeKey) -> Option<u8> {
-    (key.project_id == project && (change.topology || change.shared_snapshot || change.worktrees.contains(&key.worktree_id)))
-        .then_some(if change.metadata || change.membership { 3 } else { 1 })
+fn panel_invalidation(
+    project: ProjectId,
+    change: &git_watch::Change,
+    key: &ActiveWorktreeKey,
+) -> Option<u8> {
+    (key.project_id == project
+        && (change.topology
+            || change.shared_snapshot
+            || change.worktrees.contains(&key.worktree_id)))
+    .then_some(if change.metadata || change.membership {
+        3
+    } else {
+        1
+    })
 }
 
 impl Cagents {
@@ -151,8 +162,14 @@ impl Cagents {
         let project = loaded.project.id;
         let state = &mut self.refresh_ui.git;
         let old = state.entries.remove(&project);
-        let records = loaded.worktrees.iter().map(|(record, _)| record.clone()).collect::<Vec<_>>();
-        let reusable_plan = old.as_ref().and_then(|entry| entry.plan.clone())
+        let records = loaded
+            .worktrees
+            .iter()
+            .map(|(record, _)| record.clone())
+            .collect::<Vec<_>>();
+        let reusable_plan = old
+            .as_ref()
+            .and_then(|entry| entry.plan.clone())
             .filter(|plan| plan.matches(&repository.common_dir, &records));
         if let Some(old) = old {
             if let Some(cancel) = &old.cancellation {
@@ -211,13 +228,19 @@ impl Cagents {
     }
 
     pub(super) fn git_subscription(&self) -> Subscription<Message> {
-        let events = self.refresh_ui.git.monitor.as_ref()
-            .map_or_else(Subscription::none, |monitor| {
-                Subscription::run_with(Source(monitor.receiver.clone()), stream)
-                    .map(|()| Message::GitUi(Action::Changed))
-            });
-        Subscription::batch([events, iced::time::every(FALLBACK_INTERVAL)
-            .map(|_| Message::GitUi(Action::Fallback))])
+        let events =
+            self.refresh_ui
+                .git
+                .monitor
+                .as_ref()
+                .map_or_else(Subscription::none, |monitor| {
+                    Subscription::run_with(Source(monitor.receiver.clone()), stream)
+                        .map(|()| Message::GitUi(Action::Changed))
+                });
+        Subscription::batch([
+            events,
+            iced::time::every(FALLBACK_INTERVAL).map(|_| Message::GitUi(Action::Fallback)),
+        ])
     }
 
     pub(super) fn git_fallback_tick(&mut self) -> Task<Message> {
@@ -276,7 +299,18 @@ impl Cagents {
         let mut tasks = vec![self.start_git_reads()];
         if self.refresh_ui.source_last_refresh.elapsed() >= FALLBACK_INTERVAL
             && self.refresh_ui.source_cancel.is_none()
-            && let Some(key) = self.sidebar_model.source_control.as_ref().filter(|source| !source.busy() && !self.source_control_mutations.contains_key(&source.key.canonical_path)).map(|source| source.key.clone()) {
+            && let Some(key) = self
+                .sidebar_model
+                .source_control
+                .as_ref()
+                .filter(|source| {
+                    !source.busy()
+                        && !self
+                            .source_control_mutations
+                            .contains_key(&source.key.canonical_path)
+                })
+                .map(|source| source.key.clone())
+        {
             tasks.push(self.reload_source_control(&key));
         }
         Task::batch(tasks)
@@ -355,15 +389,30 @@ impl Cagents {
                     .unwrap_or_default();
                 let mut reload = None;
                 for (project, change) in changes {
-                    if change.metadata && self.sidebar_model.source_control.as_ref().is_some_and(|source| source.key.project_id == project) {
+                    if change.metadata
+                        && self
+                            .sidebar_model
+                            .source_control
+                            .as_ref()
+                            .is_some_and(|source| source.key.project_id == project)
+                    {
                         // Shared refs can change a future branch picker without
                         // requiring status reads in unrelated checkouts.
-                        self.refresh_ui.source_invalidated.fetch_or(3, std::sync::atomic::Ordering::AcqRel);
+                        self.refresh_ui
+                            .source_invalidated
+                            .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
                     }
                     if let Some(source) = self.sidebar_model.source_control.as_ref()
-                        && let Some(invalidation) = panel_invalidation(project, &change, &source.key) {
-                        self.refresh_ui.source_invalidated.fetch_or(invalidation, std::sync::atomic::Ordering::AcqRel);
-                        if !self.source_control_mutations.contains_key(&source.key.canonical_path) {
+                        && let Some(invalidation) =
+                            panel_invalidation(project, &change, &source.key)
+                    {
+                        self.refresh_ui
+                            .source_invalidated
+                            .fetch_or(invalidation, std::sync::atomic::Ordering::AcqRel);
+                        if !self
+                            .source_control_mutations
+                            .contains_key(&source.key.canonical_path)
+                        {
                             reload = Some(source.key.clone());
                         }
                     }
@@ -476,12 +525,48 @@ impl Cagents {
         let active = self.sidebar_state.active_worktree().cloned();
         let state = &mut self.refresh_ui.git;
         if let Some(active) = &active {
-            state.activity.retain(|id| *id != active.project_id && state.entries.contains_key(id));
+            state
+                .activity
+                .retain(|id| *id != active.project_id && state.entries.contains_key(id));
             state.activity.insert(0, active.project_id);
         }
-        let priority = state.activity.iter().copied()
-            .chain(self.sidebar_model.projects.iter().map(|project| project.id)).collect();
-        if let Some(monitor) = &state.monitor { monitor.prioritize(priority, active.map(|key| key.worktree_id)); }
+        let mut targets = self.sidebar_state.git_watch_targets();
+        if let Some(active) = active {
+            targets.insert(0, (active.project_id, Some(active.worktree_id)));
+        }
+        let mut priority = Vec::new();
+        let mut selected = Vec::new();
+        for (project_id, worktree_id) in targets {
+            if !priority.contains(&project_id) {
+                priority.push(project_id);
+            }
+            let worktree_id = worktree_id.or_else(|| {
+                let plan = state.entries.get(&project_id)?.plan.as_ref()?;
+                plan.worktrees
+                    .iter()
+                    .find(|worktree| worktree.git_dir == plan.common_dir)
+                    .or_else(|| plan.worktrees.first())
+                    .map(|worktree| worktree.id)
+            });
+            if let Some(id) = worktree_id {
+                if !selected.contains(&id) {
+                    selected.push(id);
+                }
+            }
+        }
+        for project_id in state
+            .activity
+            .iter()
+            .copied()
+            .chain(self.sidebar_model.projects.iter().map(|project| project.id))
+        {
+            if !priority.contains(&project_id) {
+                priority.push(project_id);
+            }
+        }
+        if let Some(monitor) = &state.monitor {
+            monitor.prioritize(priority, selected);
+        }
     }
 
     fn start_git_reads(&mut self) -> Task<Message> {
@@ -598,15 +683,17 @@ fn read_local_with_plan(
             }
             HeadState::Unknown => {}
         }
-        let head_changed = status.as_ref().is_none_or(|previous| previous.head != current.head);
+        let head_changed = status
+            .as_ref()
+            .is_none_or(|previous| previous.head != current.head);
         if head_changed || change.metadata {
-        snapshot.heads.remove(&record.id);
-        if let Some(branch) = current.branch()
-            && let Some(head) =
-                crate::github::worktree_head_repository(&record.path, branch, &cancellation)
-        {
-            snapshot.heads.insert(record.id, head);
-        }
+            snapshot.heads.remove(&record.id);
+            if let Some(branch) = current.branch()
+                && let Some(head) =
+                    crate::github::worktree_head_repository(&record.path, branch, &cancellation)
+            {
+                snapshot.heads.insert(record.id, head);
+            }
         }
         *status = Some(current);
     }
@@ -619,14 +706,18 @@ fn read_local_with_plan(
             .iter()
             .any(|(record, _)| record.id == *id)
     });
-    let upstreams = snapshot.worktrees.iter().filter_map(|(record, status)| {
-        let upstream = match &status.as_ref()?.tracking {
-            crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
-            crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
-            crate::repository::TrackingState::NoUpstream => None,
-        }?;
-        Some((record.id, upstream.clone()))
-    }).collect::<BTreeMap<_, _>>();
+    let upstreams = snapshot
+        .worktrees
+        .iter()
+        .filter_map(|(record, status)| {
+            let upstream = match &status.as_ref()?.tracking {
+                crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
+                crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
+                crate::repository::TrackingState::NoUpstream => None,
+            }?;
+            Some((record.id, upstream.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
             git_watch::Project::read_changed(
@@ -835,8 +926,15 @@ mod tests {
 
     #[test]
     fn bound_panel_invalidation_ignores_unrelated_worktrees_and_projects() {
-        let key = ActiveWorktreeKey { project_id: ProjectId::new(), worktree_id: WorktreeId::new(), canonical_path: "/repo".into() };
-        let mut change = git_watch::Change { worktrees: [key.worktree_id].into(), ..Default::default() };
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: WorktreeId::new(),
+            canonical_path: "/repo".into(),
+        };
+        let mut change = git_watch::Change {
+            worktrees: [key.worktree_id].into(),
+            ..Default::default()
+        };
         assert_eq!(panel_invalidation(key.project_id, &change, &key), Some(1));
         assert_eq!(panel_invalidation(ProjectId::new(), &change, &key), None);
         change.worktrees = [WorktreeId::new()].into();
@@ -853,12 +951,41 @@ mod tests {
         let snapshot = fixture(&root);
         let id = snapshot.worktrees[0].0.id;
         let project = ProjectId::new();
-        let (_, plan) = read_local(project, snapshot.clone(), git_watch::Change { membership: true, ..Default::default() }, CancellationToken::default()).unwrap();
+        let (_, plan) = read_local(
+            project,
+            snapshot.clone(),
+            git_watch::Change {
+                membership: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
         let plan = plan.unwrap();
-        assert!(plan.matches(&snapshot.repository.common_dir, &snapshot.worktrees.iter().map(|(record, _)| record.clone()).collect::<Vec<_>>()));
+        assert!(
+            plan.matches(
+                &snapshot.repository.common_dir,
+                &snapshot
+                    .worktrees
+                    .iter()
+                    .map(|(record, _)| record.clone())
+                    .collect::<Vec<_>>()
+            )
+        );
         fs::write(root.join("new.txt"), "new\n").unwrap();
         git(&root, &["add", "new.txt"]);
-        let (_, next) = read_local_with_plan(project, snapshot, git_watch::Change { worktrees: [id].into(), metadata: true, ..Default::default() }, CancellationToken::default(), Some(&plan)).unwrap();
+        let (_, next) = read_local_with_plan(
+            project,
+            snapshot,
+            git_watch::Change {
+                worktrees: [id].into(),
+                metadata: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&plan),
+        )
+        .unwrap();
         assert!(next.is_none());
     }
 
@@ -868,16 +995,53 @@ mod tests {
         let root = directory.path().join("repo");
         let linked = directory.path().join("linked");
         let snapshot = fixture(&root);
-        git(&root, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
         let project = ProjectId::new();
-        let (snapshot, _) = read_local(project, snapshot, git_watch::Change { topology: true, ..Default::default() }, CancellationToken::default()).unwrap();
-        let gitdir = RepositoryService::system("git").git_dir(&linked, &CancellationToken::default()).unwrap();
+        let (snapshot, _) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let gitdir = RepositoryService::system("git")
+            .git_dir(&linked, &CancellationToken::default())
+            .unwrap();
         fs::write(gitdir.join("HEAD"), "invalid HEAD\n").unwrap();
         fs::write(root.join("tracked.txt"), "changed\n").unwrap();
-        let changed = snapshot.worktrees.iter().map(|(record, _)| record.id).collect();
-        let (next, _) = read_local(project, snapshot, git_watch::Change { worktrees: changed, ..Default::default() }, CancellationToken::default()).unwrap();
+        let changed = snapshot
+            .worktrees
+            .iter()
+            .map(|(record, _)| record.id)
+            .collect();
+        let (next, _) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                worktrees: changed,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
         assert_eq!(next.worktrees.len(), 2);
-        assert!(next.worktrees.iter().find(|(record, _)| record.path == root).unwrap().1.as_ref().unwrap().dirty.is_dirty());
+        assert!(
+            next.worktrees
+                .iter()
+                .find(|(record, _)| record.path == root)
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .dirty
+                .is_dirty()
+        );
     }
 
     #[test]
@@ -1178,7 +1342,10 @@ mod tests {
                 .count(),
             local_workers().min(4)
         );
-        assert_eq!(app.refresh_ui.git.queue.len(), 4_usize.saturating_sub(local_workers()));
+        assert_eq!(
+            app.refresh_ui.git.queue.len(),
+            4_usize.saturating_sub(local_workers())
+        );
         assert!(
             app.refresh_ui.projects.is_empty(),
             "fallback never schedules gh"

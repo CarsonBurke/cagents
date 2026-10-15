@@ -661,31 +661,171 @@ pub struct SnapshotCache {
     fsmonitor: Option<OsString>,
     fsmonitor_checked: bool,
     options: Option<SnapshotOptions>,
-    metadata: Option<(WorkingFiles, Vec<RemoteRecord>, Vec<LocalRefRecord>, Vec<RemoteRefRecord>, Vec<RemoteHead>)>,
+    metadata: Option<(
+        WorkingFiles,
+        Vec<RemoteRecord>,
+        Vec<LocalRefRecord>,
+        Vec<RemoteRefRecord>,
+        Vec<RemoteHead>,
+    )>,
     lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
     observed: BTreeMap<RepoPath, Option<FileIdentity>>,
     browse_root: Option<FileIdentity>,
+    admin: BTreeMap<PathBuf, Option<FileIdentity>>,
 }
 
 type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
 
 fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
-    (metadata.dev(), metadata.ino(), metadata.len(), metadata.mtime(),
-     metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec())
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+/// Filesystem-only metadata observations keep the missed-event fallback
+/// authoritative without extra Git commands on an unchanged snapshot.
+fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+    let read_path = |path: &Path| -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= 4096).then_some(bytes)
+    };
+    let marker = worktree.join(".git");
+    let git_dir = if marker.is_dir() {
+        marker.clone()
+    } else {
+        let Some(bytes) = read_path(&marker) else {
+            return BTreeMap::new();
+        };
+        let Some(relative) = bytes.strip_prefix(b"gitdir: ") else {
+            return BTreeMap::new();
+        };
+        worktree.join(bytes_to_path(trim_one_line_ending(relative)))
+    };
+    let git_dir = fs::canonicalize(&git_dir).unwrap_or(git_dir);
+    let common = read_path(&git_dir.join("commondir"))
+        .map(|bytes| git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap_or_else(|| git_dir.clone());
+    let mut paths = BTreeMap::new();
+    for root in [&git_dir, &common] {
+        // Lock creation/removal changes directory times without changing Git
+        // state. For the admin roots only their directory identity matters.
+        let identity = fs::metadata(root).ok().map(|metadata| {
+            let (device, inode, ..) = file_identity(&metadata);
+            (device, inode, 0, 0, 0, 0, 0)
+        });
+        paths.insert(root.clone(), identity);
+    }
+    for name in [
+        "HEAD",
+        "index",
+        "commondir",
+        "config.worktree",
+        "FETCH_HEAD",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        let path = git_dir.join(name);
+        paths.insert(
+            path.clone(),
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+    }
+    for name in [
+        "config",
+        "packed-refs",
+        "info/exclude",
+        "refs/stash",
+        "logs/refs/stash",
+    ] {
+        let path = common.join(name);
+        paths.insert(
+            path.clone(),
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+    }
+    let mut pending = vec![common.join("refs"), git_dir.join("refs")];
+    while let Some(path) = pending.pop() {
+        if paths.contains_key(&path) {
+            continue;
+        }
+        paths.insert(
+            path.clone(),
+            fs::metadata(&path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+        if let Ok(entries) = fs::read_dir(&path) {
+            for entry in entries.flatten() {
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                {
+                    continue;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                } else {
+                    let path = entry.path();
+                    paths.insert(
+                        path.clone(),
+                        fs::symlink_metadata(path)
+                            .ok()
+                            .map(|metadata| file_identity(&metadata)),
+                    );
+                }
+            }
+        }
+    }
+    paths
 }
 
 impl SnapshotCache {
     /// Ignored-folder expansion is independent of porcelain status. Observe
     /// its directory membership too, so the slow fallback repairs missed events.
     pub fn observe_browse(&mut self, worktree: &Path, files: &WorkingFiles) {
-        let Ok(root) = fs_safety::Root::open(worktree) else { return; };
-        self.browse_root = fs::symlink_metadata(worktree).ok().map(|metadata| file_identity(&metadata));
-        for path in files.paths.iter().chain(&files.ignored).chain(&files.ignored_directories) {
+        let Ok(root) = fs_safety::Root::open(worktree) else {
+            return;
+        };
+        self.browse_root = fs::symlink_metadata(worktree)
+            .ok()
+            .map(|metadata| file_identity(&metadata));
+        for path in files
+            .paths
+            .iter()
+            .chain(&files.ignored)
+            .chain(&files.ignored_directories)
+        {
             for ancestor in path.as_path().ancestors() {
-                let Ok(path) = RepoPath::parse(ancestor) else { continue; };
-                if self.observed.contains_key(&path) { continue; }
-                let metadata = fs_safety::metadata_beneath(&root, path.as_path()).ok().map(|metadata| file_identity(&metadata));
+                let Ok(path) = RepoPath::parse(ancestor) else {
+                    continue;
+                };
+                if self.observed.contains_key(&path) {
+                    continue;
+                }
+                let metadata = fs_safety::metadata_beneath(&root, path.as_path())
+                    .ok()
+                    .map(|metadata| file_identity(&metadata));
                 self.observed.insert(path, metadata);
             }
         }
@@ -2808,8 +2948,12 @@ fn measure_untracked_cached(
     cancellation: &CancellationToken,
     cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>,
 ) {
-    let current = entries.iter().filter(|entry| entry.area == ChangeArea::Untracked)
-        .map(|entry| &entry.path).collect::<std::collections::BTreeSet<_>>();
+    let current = entries
+        .iter()
+        .filter(|entry| entry.area == ChangeArea::Untracked && !entry.submodule)
+        .take(MAX_UNTRACKED_STATUS_FILES)
+        .map(|entry| &entry.path)
+        .collect::<std::collections::BTreeSet<_>>();
     cache.retain(|path, _| current.contains(path));
     let mut untracked = entries
         .iter_mut()
@@ -2828,14 +2972,22 @@ fn measure_untracked_cached(
         if cancellation.is_cancelled() || remaining == 0 {
             break;
         }
-        let identity = fs_safety::metadata_beneath(&root, entry.path.as_path()).ok()
-            .filter(|metadata| metadata.is_file()).map(|metadata| file_identity(&metadata));
-        let cached = identity.and_then(|identity| cache.get(&entry.path)
-            .filter(|(previous, _)| *previous == identity).map(|(_, lines)| *lines));
-        if let Some(lines) = cached.or_else(||
-            untracked_line_count(&root, &entry.path, cancellation, &mut remaining, &mut bytes))
-        {
-            if let Some(identity) = identity { cache.insert(entry.path.clone(), (identity, lines)); }
+        let identity = fs_safety::metadata_beneath(&root, entry.path.as_path())
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| file_identity(&metadata));
+        let cached = identity.and_then(|identity| {
+            cache
+                .get(&entry.path)
+                .filter(|(previous, _)| *previous == identity)
+                .map(|(_, lines)| *lines)
+        });
+        if let Some(lines) = cached.or_else(|| {
+            untracked_line_count(&root, &entry.path, cancellation, &mut remaining, &mut bytes)
+        }) {
+            if let Some(identity) = identity {
+                cache.insert(entry.path.clone(), (identity, lines));
+            }
             entry.added_lines = Some(lines);
             entry.removed_lines = Some(0);
         }
@@ -3568,7 +3720,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Watch membership includes untracked directories, so later edits and
     /// creations within them produce native events too.
-    pub fn watch_files(&self, worktree: &Path, cancellation: &CancellationToken) -> Result<WorkingFiles, RepositoryError> {
+    pub fn watch_files(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
         let output = self.run_checked(&self.working_files_command(worktree), cancellation)?;
         invalid_output(parse_working_files(&output.stdout), output)
     }
@@ -3809,8 +3965,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         options: SnapshotOptions,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, RepositoryError> {
-        self.snapshot_cached(worktree, options, cancellation, &mut SnapshotCache::default())
-            .map(|snapshot| snapshot.expect("a fresh cache always returns a snapshot"))
+        self.snapshot_cached(
+            worktree,
+            options,
+            cancellation,
+            &mut SnapshotCache::default(),
+        )
+        .map(|snapshot| snapshot.expect("a fresh cache always returns a snapshot"))
     }
 
     /// Only status runs for an unchanged refresh; callers invalidate content on
@@ -3822,12 +3983,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         cache: &mut SnapshotCache,
     ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
+        let admin = snapshot_admin_fingerprint(worktree);
+        if !cache.admin.is_empty() && cache.admin != admin {
+            cache.invalidate(true);
+        }
         if cache.options != Some(options) {
             cache.invalidate(true);
             cache.options = Some(options);
         }
         if !cache.fsmonitor_checked {
-            let mut command = self.git_read(worktree, ["config", "--show-scope", "--get", "core.fsmonitor"]);
+            let mut command = self.git_read(
+                worktree,
+                ["config", "--show-scope", "--get", "core.fsmonitor"],
+            );
             // `git config` never refreshes an index or invokes fsmonitor. Read
             // its scope without the safety override that normal commands use.
             remove_fsmonitor_override(&mut command);
@@ -3836,32 +4004,60 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 trusted_fsmonitor(&output.stdout, worktree)
             } else if output.exit_code == Some(1) {
                 None
-            } else { return Err(git_failure(&command, output).into()); };
+            } else {
+                return Err(git_failure(&command, output).into());
+            };
             cache.fsmonitor_checked = true;
         }
-        let output = self.run_checked(&snapshot_fsmonitor(self.status_command_with_untracked(worktree, options.untracked_changes), cache.fsmonitor.as_deref()), cancellation)?;
+        let output = self.run_checked(
+            &snapshot_fsmonitor(
+                self.status_command_with_untracked(worktree, options.untracked_changes),
+                cache.fsmonitor.as_deref(),
+            ),
+            cancellation,
+        )?;
         use sha2::Digest;
         let digest: [u8; 32] = sha2::Sha256::digest(&output.stdout).into();
         if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some() {
             let root = fs_safety::Root::open(worktree).ok();
             let unchanged = cache.observed.iter().all(|(path, previous)| {
-                let current = root.as_ref().and_then(|root| fs_safety::metadata_beneath(root, path.as_path()).ok())
+                let current = root
+                    .as_ref()
+                    .and_then(|root| fs_safety::metadata_beneath(root, path.as_path()).ok())
                     .map(|metadata| file_identity(&metadata));
                 current == *previous
             });
-            let root_unchanged = !options.untracked_files || fs::symlink_metadata(worktree).ok().map(|metadata| file_identity(&metadata)) == cache.browse_root;
-            if unchanged && root_unchanged { return Ok(None); }
+            let root_unchanged = !options.untracked_files
+                || fs::symlink_metadata(worktree)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+                    == cache.browse_root;
+            if unchanged && root_unchanged {
+                return Ok(None);
+            }
         }
         let mut status = invalid_output(parse_status(&output.stdout), output)?;
         status.untracked_omitted = !options.untracked_changes;
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
-            let output = self.run_checked(&snapshot_fsmonitor(self.numstat_command(worktree, staged), cache.fsmonitor.as_deref()), cancellation)?;
+            let output = self.run_checked(
+                &snapshot_fsmonitor(
+                    self.numstat_command(worktree, staged),
+                    cache.fsmonitor.as_deref(),
+                ),
+                cancellation,
+            )?;
             let records = invalid_output(parse_numstat(&output.stdout), output)?;
             merge_numstat(&mut status.entries, area, &records);
         }
-        measure_untracked_cached(worktree, &mut status.entries, cancellation, &mut cache.lines);
+        measure_untracked_cached(
+            worktree,
+            &mut status.entries,
+            cancellation,
+            &mut cache.lines,
+        );
         if options.untracked_files
-            && let Some((files, ..)) = cache.metadata.as_mut() {
+            && let Some((files, ..)) = cache.metadata.as_mut()
+        {
             let output = self.run_checked(&self.working_files_command(worktree), cancellation)?;
             *files = invalid_output(parse_working_files(&output.stdout), output)?;
         }
@@ -3878,14 +4074,29 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let refs = invalid_output(parse_refs(&output.stdout), output)?;
             cache.metadata = Some((files, remotes, refs.local, refs.remote, refs.remote_heads));
         }
-        let (files, remotes, local_refs, remote_refs, remote_heads) = cache.metadata.as_ref().unwrap();
+        let (files, remotes, local_refs, remote_refs, remote_heads) =
+            cache.metadata.as_ref().unwrap();
         let root = fs_safety::Root::open(worktree).ok();
-        cache.observed = status.entries.iter().map(|entry| {
-            let identity = root.as_ref().and_then(|root| fs_safety::metadata_beneath(root, entry.path.as_path()).ok())
-                .map(|metadata| file_identity(&metadata));
-            (entry.path.clone(), identity)
-        }).collect();
-        cache.browse_root = options.untracked_files.then(|| fs::symlink_metadata(worktree).ok().map(|metadata| file_identity(&metadata))).flatten();
+        cache.observed = status
+            .entries
+            .iter()
+            .map(|entry| {
+                let identity = root
+                    .as_ref()
+                    .and_then(|root| fs_safety::metadata_beneath(root, entry.path.as_path()).ok())
+                    .map(|metadata| file_identity(&metadata));
+                (entry.path.clone(), identity)
+            })
+            .collect();
+        cache.browse_root = options
+            .untracked_files
+            .then(|| {
+                fs::symlink_metadata(worktree)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+            })
+            .flatten();
+        cache.admin = admin;
         cache.digest = Some(digest);
         cache.dirty = false;
         Ok(Some(RepositorySnapshot {
@@ -6181,24 +6392,38 @@ fn trusted_fsmonitor(output: &[u8], worktree: &Path) -> Option<OsString> {
         _ if matches!(scope, "global" | "system" | "command") => {
             // Git interprets hook values as commands. Relative commands and
             // shell syntax can select code supplied by the current checkout.
-            if !Path::new(value).is_absolute() || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte)) {
+            if !Path::new(value).is_absolute()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+            {
                 return None;
             }
             let executable = fs::canonicalize(value).ok()?;
             let worktree = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-            if executable.starts_with(&worktree) || executable.ancestors().skip(1).any(|parent| parent.join(".git").exists()) {
+            if executable.starts_with(&worktree)
+                || executable
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| parent.join(".git").exists())
+            {
                 return None;
             }
             use std::os::unix::fs::PermissionsExt;
             let metadata = fs::metadata(&executable).ok()?;
-            (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then(|| executable.into_os_string())
-        },
+            (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .then(|| executable.into_os_string())
+        }
         _ => None,
     }
 }
 
 fn remove_fsmonitor_override(command: &mut CommandSpec) {
-    if let Some(index) = command.arguments.iter().position(|argument| argument == OsStr::new("core.fsmonitor=false")) {
+    if let Some(index) = command
+        .arguments
+        .iter()
+        .position(|argument| argument == OsStr::new("core.fsmonitor=false"))
+    {
         command.arguments.remove(index);
         command.arguments.remove(index - 1);
     }
@@ -6206,7 +6431,11 @@ fn remove_fsmonitor_override(command: &mut CommandSpec) {
 
 fn snapshot_fsmonitor(mut command: CommandSpec, configured: Option<&OsStr>) -> CommandSpec {
     if let Some(configured) = configured
-        && let Some(argument) = command.arguments.iter_mut().find(|argument| **argument == OsStr::new("core.fsmonitor=false")) {
+        && let Some(argument) = command
+            .arguments
+            .iter_mut()
+            .find(|argument| **argument == OsStr::new("core.fsmonitor=false"))
+    {
         let mut value = OsString::from("core.fsmonitor=");
         value.push(configured);
         *argument = value;
@@ -6804,18 +7033,36 @@ mod tests {
         let trusted = directory.path().join("monitor");
         fs::write(&trusted, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&trusted, fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(trusted_fsmonitor(b"local\ttrue\n", &worktree), Some("true".into()));
+        assert_eq!(
+            trusted_fsmonitor(b"local\ttrue\n", &worktree),
+            Some("true".into())
+        );
         for scope in ["global", "system", "command"] {
             let config = format!("{scope}\t{}\n", trusted.display());
-            assert_eq!(trusted_fsmonitor(config.as_bytes(), &worktree), Some(trusted.clone().into_os_string()));
+            assert_eq!(
+                trusted_fsmonitor(config.as_bytes(), &worktree),
+                Some(trusted.clone().into_os_string())
+            );
         }
-        for config in ["local\t./malicious-hook\n", "worktree\t./malicious-hook\n", "global\t./hooks/monitor\n", "global\t/bin/true;./hook\n", "local\tfalse\n"] {
+        for config in [
+            "local\t./malicious-hook\n",
+            "worktree\t./malicious-hook\n",
+            "global\t./hooks/monitor\n",
+            "global\t/bin/true;./hook\n",
+            "local\tfalse\n",
+        ] {
             assert_eq!(trusted_fsmonitor(config.as_bytes(), &worktree), None);
         }
         fs::create_dir(worktree.join(".git")).unwrap();
         let untrusted = worktree.join("monitor");
         fs::copy(&trusted, &untrusted).unwrap();
-        assert_eq!(trusted_fsmonitor(format!("global\t{}\n", untrusted.display()).as_bytes(), &worktree), None);
+        assert_eq!(
+            trusted_fsmonitor(
+                format!("global\t{}\n", untrusted.display()).as_bytes(),
+                &worktree
+            ),
+            None
+        );
     }
 
     #[test]
@@ -6826,12 +7073,24 @@ mod tests {
         let mut cache = SnapshotCache::default();
         let cancel = CancellationToken::default();
         let root = Path::new("/snapshot-cache-test");
-        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(executor.commands.lock().unwrap().len(), 7);
-        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(executor.commands.lock().unwrap().len(), 8);
         cache.invalidate(true);
-        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(executor.commands.lock().unwrap().len(), 15);
     }
 
@@ -6845,11 +7104,43 @@ mod tests {
         let mut cache = SnapshotCache::default();
         let cancel = CancellationToken::default();
         let root = Path::new("/snapshot-cache-test");
-        git.snapshot_cached(root, SnapshotOptions { untracked_changes: true, untracked_files: false }, &cancel, &mut cache).unwrap();
-        let changed = git.snapshot_cached(root, SnapshotOptions { untracked_changes: true, untracked_files: false }, &cancel, &mut cache).unwrap().unwrap();
+        git.snapshot_cached(
+            root,
+            SnapshotOptions {
+                untracked_changes: true,
+                untracked_files: false,
+            },
+            &cancel,
+            &mut cache,
+        )
+        .unwrap();
+        let changed = git
+            .snapshot_cached(
+                root,
+                SnapshotOptions {
+                    untracked_changes: true,
+                    untracked_files: false,
+                },
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(changed.status.entries.len(), 1);
         cache.invalidate(false);
-        assert!(git.snapshot_cached(root, SnapshotOptions { untracked_changes: true, untracked_files: false }, &cancel, &mut cache).unwrap().is_some());
+        assert!(
+            git.snapshot_cached(
+                root,
+                SnapshotOptions {
+                    untracked_changes: true,
+                    untracked_files: false
+                },
+                &cancel,
+                &mut cache
+            )
+            .unwrap()
+            .is_some()
+        );
         assert_eq!(executor.commands.lock().unwrap().len(), 13);
     }
 
@@ -6859,23 +7150,47 @@ mod tests {
         let file = directory.path().join("new.txt");
         fs::write(&file, "abc\n").unwrap();
         let executor = Arc::new(FakeExecutor::with_outputs(vec![
-            exit(1, b""), success(b"? new.txt\0"), success(b""), success(b""),
-            success(b"? new.txt\0"), exit(1, b""), success(b""),
-            success(b"? new.txt\0"), success(b""), success(b""), success(b"? new.txt\0"),
+            exit(1, b""),
+            success(b"? new.txt\0"),
+            success(b""),
+            success(b""),
+            success(b"? new.txt\0"),
+            exit(1, b""),
+            success(b""),
+            success(b"? new.txt\0"),
+            success(b""),
+            success(b""),
+            success(b"? new.txt\0"),
         ]));
         let git = RepositoryService::new("git", executor.clone());
-        let options = SnapshotOptions { untracked_changes: true, untracked_files: false };
+        let options = SnapshotOptions {
+            untracked_changes: true,
+            untracked_files: false,
+        };
         let cancel = CancellationToken::default();
         let mut cache = SnapshotCache::default();
-        let first = git.snapshot_cached(directory.path(), options, &cancel, &mut cache).unwrap().unwrap();
+        let first = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
         assert_eq!(first.status.entries[0].added_lines, Some(1));
         // Same size and same porcelain; only descriptor metadata detects this
         // when the native event was lost.
         fs::write(&file, "a\nb\n").unwrap();
-        fs::File::open(&file).unwrap().set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
-        let second = git.snapshot_cached(directory.path(), options, &cancel, &mut cache).unwrap().unwrap();
+        fs::File::open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let second = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
         assert_eq!(second.status.entries[0].added_lines, Some(2));
-        assert!(git.snapshot_cached(directory.path(), options, &cancel, &mut cache).unwrap().is_none());
+        assert!(
+            git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(executor.commands.lock().unwrap().len(), 11);
     }
 
@@ -6883,20 +7198,75 @@ mod tests {
     fn snapshot_cache_browse_creation_refreshes_files_without_untracked_status() {
         let directory = tempfile::tempdir().unwrap();
         let executor = Arc::new(FakeExecutor::with_outputs(vec![
-            exit(1, b""), success(b""), success(b""), success(b""), success(b""), exit(1, b""), success(b""),
-            success(b""), success(b""), success(b""), success(b"? new.txt\0"), success(b""),
+            exit(1, b""),
+            success(b""),
+            success(b""),
+            success(b""),
+            success(b""),
+            exit(1, b""),
+            success(b""),
+            success(b""),
+            success(b""),
+            success(b""),
+            success(b"? new.txt\0"),
+            success(b""),
         ]));
         let git = RepositoryService::new("git", executor.clone());
-        let options = SnapshotOptions { untracked_changes: false, untracked_files: true };
+        let options = SnapshotOptions {
+            untracked_changes: false,
+            untracked_files: true,
+        };
         let cancel = CancellationToken::default();
         let mut cache = SnapshotCache::default();
-        git.snapshot_cached(directory.path(), options, &cancel, &mut cache).unwrap();
+        git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap();
         fs::write(directory.path().join("new.txt"), "new\n").unwrap();
-        fs::File::open(directory.path()).unwrap().set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
-        let next = git.snapshot_cached(directory.path(), options, &cancel, &mut cache).unwrap().unwrap();
+        fs::File::open(directory.path())
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let next = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
         assert_eq!(next.files.paths, vec![path("new.txt")]);
-        assert!(git.snapshot_cached(directory.path(), options, &cancel, &mut cache).unwrap().is_none());
+        assert!(
+            git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(executor.commands.lock().unwrap().len(), 12);
+    }
+
+    #[test]
+    fn snapshot_admin_fingerprint_tracks_refs_config_and_index_without_lock_noise() {
+        let directory = tempfile::tempdir().unwrap();
+        let gitdir = directory.path().join(".git");
+        fs::create_dir_all(gitdir.join("refs/heads/feature")).unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let first = snapshot_admin_fingerprint(directory.path());
+        fs::write(gitdir.join("index.lock"), "temporary").unwrap();
+        fs::remove_file(gitdir.join("index.lock")).unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::write(
+            gitdir.join("config"),
+            "[remote \"origin\"]\nurl = example\n",
+        )
+        .unwrap();
+        let configured = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(first, configured);
+        fs::write(gitdir.join("index"), "new-index").unwrap();
+        let indexed = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(configured, indexed);
+        fs::write(gitdir.join("refs/heads/feature/new"), "oid\n").unwrap();
+        fs::File::open(gitdir.join("refs/heads/feature"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let created = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(indexed, created);
+        fs::write(gitdir.join("refs/heads/feature/new"), "updated-oid\n").unwrap();
+        assert_ne!(created, snapshot_admin_fingerprint(directory.path()));
     }
 
     #[test]
@@ -6907,7 +7277,12 @@ mod tests {
         let mut cache = BTreeMap::new();
         let measure = |cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>| {
             let mut entries = parse_status(b"? new.txt\0").unwrap().entries;
-            measure_untracked_cached(directory.path(), &mut entries, &CancellationToken::default(), cache);
+            measure_untracked_cached(
+                directory.path(),
+                &mut entries,
+                &CancellationToken::default(),
+                cache,
+            );
             entries[0].added_lines.unwrap()
         };
         assert_eq!(measure(&mut cache), 1);

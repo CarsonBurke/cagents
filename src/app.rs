@@ -10056,18 +10056,34 @@ impl Cagents {
     fn release_source_control(&mut self) -> Task<Message> {
         let previous = self.sidebar_model.source_control.take();
         let cache = self.refresh_ui.source_cache.take();
-        if previous.is_none() && cache.is_none() { return Task::none(); }
+        if previous.is_none() && cache.is_none() {
+            return Task::none();
+        }
         // Old cancelled readers retain the old binding's invalidation flag.
         self.refresh_ui.source_invalidated = Arc::new(std::sync::atomic::AtomicU8::new(0));
-        let large = previous.as_ref().is_some_and(|source| source.files.len() > 8192
-            || source.groups().iter().map(|group| group.rows().len()).sum::<usize>() > 8192);
+        let large = previous.as_ref().is_some_and(|source| {
+            source.files.len() > 8192
+                || source
+                    .groups()
+                    .iter()
+                    .map(|group| group.rows().len())
+                    .sum::<usize>()
+                    > 8192
+        });
         cosmic::task::future(async move {
             let _ = tokio::task::spawn_blocking(move || {
                 // Wait for a cancelled old reader to drop its temporary model.
-                if let Some((_, cache)) = &cache { drop(cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())); }
+                if let Some((_, cache)) = &cache {
+                    drop(
+                        cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
+                }
                 drop(previous);
                 drop(cache);
-            }).await;
+            })
+            .await;
             #[cfg(all(target_os = "linux", target_env = "gnu"))]
             if large {
                 // Give the native view a frame to release its old widget tree.
@@ -10075,8 +10091,11 @@ impl Cagents {
                 let _ = tokio::task::spawn_blocking(|| {
                     // SAFETY: glibc's allocator trimming is thread-safe and
                     // takes no application pointers. It never runs on the UI.
-                    unsafe { libc::malloc_trim(0); }
-                }).await;
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                })
+                .await;
             }
             #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
             let _ = large;
@@ -10105,6 +10124,7 @@ impl Cagents {
             }
             return self.release_source_control();
         }
+        self.prioritize_git_watches();
         if !changed {
             return self.load_pending_history();
         }
@@ -10112,7 +10132,6 @@ impl Cagents {
         self.cancel_branch_changes();
         self.history_ui.cancel();
         self.history_ui.next_page_request();
-        self.prioritize_git_watches();
         let release = self.release_source_control();
         let Some(key) = self.sidebar_state.active_worktree().cloned() else {
             return release;
@@ -10930,8 +10949,20 @@ impl Cagents {
             return Task::none();
         }
         self.refresh_ui.source_last_refresh = Instant::now();
+        if self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .is_none_or(|source| source.data_state != sidebar::SidebarDataState::Ready)
+        {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
+        }
         if self.refresh_ui.source_cancel.is_some() {
-            self.refresh_ui.source_invalidated.fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.cancel_source_read();
         let request = self.refresh_ui.source_generation;
@@ -10976,7 +11007,8 @@ impl Cagents {
             });
         }
         let worktree = key.canonical_path.clone();
-        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
+        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked)
+            || self.context_tab == ContextTab::Files;
         let options = crate::repository::SnapshotOptions {
             untracked_changes,
             untracked_files: self.context_tab == ContextTab::Files,
@@ -10994,13 +11026,28 @@ impl Cagents {
             .expanded_directory_paths()
             .cloned()
             .collect::<Vec<_>>();
-        if self.refresh_ui.source_cache.as_ref().is_none_or(|(path, _)| path != &worktree) {
-            self.refresh_ui.source_cache = Some((worktree.clone(), Arc::new(std::sync::Mutex::new(crate::repository::SnapshotCache::default()))));
+        if self
+            .refresh_ui
+            .source_cache
+            .as_ref()
+            .is_none_or(|(path, _)| path != &worktree)
+        {
+            self.refresh_ui.source_cache = Some((
+                worktree.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    crate::repository::SnapshotCache::default(),
+                )),
+            ));
         }
-        if browse_files && (self.refresh_ui.source_expanded != expanded || self.refresh_ui.source_ignored_errors != previous_errors) {
+        if browse_files
+            && (self.refresh_ui.source_expanded != expanded
+                || self.refresh_ui.source_ignored_errors != previous_errors)
+        {
             self.refresh_ui.source_expanded = expanded.clone();
             self.refresh_ui.source_ignored_errors = previous_errors.clone();
-            self.refresh_ui.source_invalidated.fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
         }
         let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
         let invalidated = self.refresh_ui.source_invalidated.clone();
@@ -11008,17 +11055,30 @@ impl Cagents {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut cache = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let invalidation = invalidated.swap(0, std::sync::atomic::Ordering::AcqRel);
-                if invalidation != 0 { cache.invalidate(invalidation & 2 != 0); }
+                if invalidation != 0 {
+                    cache.invalidate(invalidation & 2 != 0);
+                }
                 let Some(mut snapshot) = service
                     .snapshot_cached(&worktree, options, &cancellation, &mut cache)
-                    .map_err(|error| error.to_string())? else { return Ok(None); };
-                if cancellation.is_cancelled() { cache.invalidate(false); return Err("source-control read cancelled".to_owned()); }
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
-                        .map_err(|error| { cache.invalidate(false); error.to_string() })?;
+                        .map_err(|error| {
+                            cache.invalidate(false);
+                            error.to_string()
+                        })?;
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
                     repository_widget::expand_ignored_directories(
@@ -11027,11 +11087,15 @@ impl Cagents {
                         &expanded,
                         &previous_errors,
                         &cancellation,
-                    ).inspect_err(|_| cache.invalidate(false))?;
+                    )
+                    .inspect_err(|_| cache.invalidate(false))?;
                     cache.observe_browse(&worktree, &snapshot.files);
                 }
                 let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
-                if cancellation.is_cancelled() { cache.invalidate(false); return Err("source-control read cancelled".to_owned()); }
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
                 Ok(Some(Box::new((snapshot, model))))
             })
             .await
@@ -16360,7 +16424,9 @@ impl Application for Cagents {
                 }
                 self.refresh_ui.source_cancel = None;
                 if matches!(result, Ok(None)) {
-                    if let Some(source) = self.sidebar_model.source_control.as_mut() { source.set_reloading(false); }
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_reloading(false);
+                    }
                     return Task::none();
                 }
                 if let Ok(Some(prepared)) = &result
@@ -16379,7 +16445,10 @@ impl Application for Cagents {
                     worktree.apply_status(&prepared.0.status);
                 }
                 let (snapshot, mut next) = match result {
-                    Ok(Some(prepared)) => { let (snapshot, model) = *prepared; (Some(snapshot), model) },
+                    Ok(Some(prepared)) => {
+                        let (snapshot, model) = *prepared;
+                        (Some(snapshot), model)
+                    }
                     Ok(None) => unreachable!(),
                     Err(error) => (None, SourceControlModel::failed(key, error)),
                 };
