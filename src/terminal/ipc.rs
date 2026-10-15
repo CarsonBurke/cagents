@@ -781,6 +781,10 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
+    ChatOriginal {
+        chat_id: TerminalId,
+        result: Result<crate::chat::annotations::OriginalPage, crate::chat::annotations::OriginalError>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
