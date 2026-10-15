@@ -127,9 +127,28 @@ pub(crate) struct ResidentSource {pub source:SourceKey,pub bytes:usize,pub epoch
 /// A patch's original file index/path/kind/length is frozen with its body epoch.
 /// Live tool status and timestamps remain in the captured snapshot separately.
 #[derive(Clone,Debug,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
-pub(crate) struct ResidentPatch {pub source:SourceKey,pub epoch:SourceEpoch,pub file:super::cache::changes::File}
+pub(crate) struct ResidentPatch {
+    pub source:SourceKey,pub epoch:SourceEpoch,pub file:super::cache::changes::File,
+    /// Frozen at actual byte admission. Parent bodies cannot be relabelled
+    /// when the same source/epoch is reissued under a newer cache authority.
+    #[serde(default)]
+    pub parent_authority:Option<super::cache::changes::ParentAuthority>,
+}
+impl ResidentPatch {
+    pub(crate) fn authority_matches(&self,current:Option<super::cache::changes::ParentAuthority>)->bool {
+        match self.source.agent_id {
+            Some(_)=>self.parent_authority.is_none(),
+            None=>self.parent_authority.is_some_and(|proof|proof.generation>0
+                && proof.incarnation==self.epoch.incarnation && Some(proof)==current),
+        }
+    }
+    fn valid(&self,text:&str)->bool {
+        !self.source.source_id.is_empty() && text.len()==self.file.source_len && text.len()<=SOURCE_BYTES
+            && self.authority_matches(self.parent_authority)
+    }
+}
 pub(crate) fn admit_patch(text:&Arc<str>,record:&ResidentPatch,replaced:Option<&Arc<str>>)->Admission {
-    if record.source.source_id.is_empty() || text.len()!=record.file.source_len {return Admission::Capacity;}
+    if !record.valid(text) {return Admission::Capacity;}
     let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());
     if state.patch_provenance.get(&Owner::Patch(text).id()).is_some_and(|previous|previous!=record) {return Admission::Capacity;}
     let result=state.admit_owner(Owner::Patch(text),text.len(),replaced.map(Owner::Patch));
@@ -227,7 +246,7 @@ impl Reservation {
             if unique.insert(id,(owner,bytes)).is_none() {total=total.checked_add(bytes).ok_or(ReserveError::InvalidPayload)?;}
         }
         for (text,record) in patches {
-            let bytes=text.len();if bytes>SOURCE_BYTES || bytes!=record.file.source_len || record.source.source_id.is_empty() {return Err(ReserveError::InvalidPayload);}
+            let bytes=text.len();if !record.valid(text) {return Err(ReserveError::InvalidPayload);}
             let owner=Owner::Patch(text);let id=owner.id();
             if root_files.insert((&record.source,record.file.file_index),id).is_some_and(|previous|previous!=id) {return Err(ReserveError::InvalidPayload);}
             if let Some(previous)=patch_proofs.insert(id,record) {if previous!=record {return Err(ReserveError::InvalidPayload);}}
@@ -335,9 +354,29 @@ mod tests {
         assert!(matches!(reserve_in(pool,33*MIB,33*MIB),Err(ReserveError::InvalidPayload)));
     }
     fn patch_record(text:&Arc<str>,file_index:usize)->ResidentPatch {
-        ResidentPatch {source:SourceKey {agent_id:Some("child".into()),source_id:"opaque:change:root".into()},epoch:source_epoch(7),
+        ResidentPatch {source:SourceKey {agent_id:Some("child".into()),source_id:"opaque:change:root".into()},epoch:source_epoch(7),parent_authority:None,
             file:super::super::cache::changes::File {file_index,path:format!("src/file-{file_index}.rs"),kind:super::super::ChangeKind::Updated,
                 source_len:text.len(),additions:Some(1),deletions:Some(1)}}
+    }
+    #[test]
+    fn parent_patch_authority_is_frozen_with_actual_allocation_and_cannot_be_relabelled() {
+        use super::super::cache::changes::ParentAuthority;
+        let pool=Arc::new(Mutex::new(Owners::default()));let text:Arc<str>=Arc::from("exact patch");
+        let mut record=patch_record(&text,0);record.source.agent_id=None;
+        assert!(!record.valid(&text),"legacy parent None cannot authorize bytes");
+        let token=ParentAuthority {incarnation:record.epoch.incarnation,generation:1};record.parent_authority=Some(token);
+        assert!(record.valid(&text));assert!(record.authority_matches(Some(token)));
+        reserve_in(pool.clone(),text.len(),text.len()).unwrap().adopt_mixed(&[],&[(text.clone(),record.clone())]).unwrap();
+        let mut relabelled=record.clone();relabelled.parent_authority.as_mut().unwrap().generation+=1;
+        assert!(!record.authority_matches(relabelled.parent_authority));
+        assert_eq!(reserve_in(pool.clone(),text.len(),text.len()).unwrap().adopt_mixed(&[],&[(text.clone(),relabelled)]),Err(ReserveError::InvalidPayload));
+        assert_eq!(pool.lock().unwrap().patch_provenance[&Owner::Patch(&text).id()],record);
+        let mut wrong=record.clone();wrong.parent_authority.as_mut().unwrap().incarnation=uuid::Uuid::new_v4();assert!(!wrong.valid(&text));
+        wrong=record.clone();wrong.parent_authority.as_mut().unwrap().generation=0;assert!(!wrong.valid(&text));
+        let child=patch_record(&text,1);assert!(child.valid(&text));assert!(child.authority_matches(None));assert!(child.authority_matches(Some(token)));
+        let mut forged_child=child;forged_child.parent_authority=Some(token);assert!(!forged_child.valid(&text));
+        let weak=Arc::downgrade(&text);drop(text);assert!(weak.upgrade().is_none());
+        let mut owners=pool.lock().unwrap();owners.prune();assert_eq!(owners.bytes(),0);
     }
     #[test]
     fn mixed_restore_adopts_prose_and_patch_allocations_in_one_pool() {
