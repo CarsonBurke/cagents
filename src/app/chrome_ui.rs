@@ -920,6 +920,7 @@ enum PaneMenuCommand {
     Switch,
     Fork(chat_ui::Target),
     ReviewChanges(chat_ui::Target),
+    EndConversation,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2358,6 +2359,10 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::Close),
                 ),
             ];
+            if self.card_state(id).is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) {
+                entries.push(widget::menu::Item::Button("Close conversation…".into(), None,
+                    PaneMenu(id, PaneMenuCommand::EndConversation)));
+            }
             if self.chat_switch_available(id) && self.chat_switch_ready(id) {
                 entries.push(widget::menu::Item::Button(
                     self.chat_switch_label(id).into(),

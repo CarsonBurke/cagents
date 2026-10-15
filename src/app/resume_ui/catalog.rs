@@ -47,11 +47,13 @@ pub struct Found {
     /// gave the conversation, rather than its first message.
     pub named: bool,
     pub updated_at_unix_ms: i64,
+    pub model: Option<String>,
 }
 
 /// What a transcript says of itself.
 #[derive(Debug, Clone)]
 struct Header {
+    model: Option<String>,
     id: String,
     directory: PathBuf,
     title: Option<String>,
@@ -190,6 +192,7 @@ impl Cache {
                 .title
                 .unwrap_or_else(|| format!("{} conversation", provider.label())),
             updated_at_unix_ms: candidate.modified_ms,
+            model: header.model,
         })
     }
 }
@@ -268,6 +271,7 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
     let len = file.metadata().ok()?.len();
     let mut identity = None;
     let mut prompt = None;
+    let mut model = None;
     let mut titles = Titles::default();
     let mut reader = std::io::BufReader::new((&mut file).take(HEAD_BYTES));
     let mut line = Vec::new();
@@ -284,12 +288,14 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
         let wants_identity = identity.is_none() && text.contains(identity_hint(provider));
         let wants_prompt = prompt.is_none() && text.contains(prompt_hint(provider));
         let wants_title = holds_title(text);
-        if !(wants_identity || wants_prompt || wants_title) {
+        let wants_model = text.contains("model");
+        if !(wants_identity || wants_prompt || wants_title || wants_model) {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
+        if let Some(found) = recorded_model(&value) { model = Some(found); }
         if wants_identity && let Some(declared) = declaration(provider, &value) {
             // The first record to declare a conversation decides what the
             // file holds; a subagent's is not resumed on its own.
@@ -305,21 +311,20 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
         // own picker does: it appends a conversation's name again there for
         // that reader, OMP keeps its title on the first line, and Codex keeps
         // names apart. Reading the whole head would double a cold index.
-        if identity.is_some() && prompt.is_some() {
+        if identity.is_some() && prompt.is_some() && model.is_some() {
             break;
         }
     }
     let (id, directory) = identity?;
-    let answer = |titles: Titles| Header {
+    let answer = |titles: Titles, model: Option<String>| Header {
+        model,
         id,
         directory,
         named: titles.named.is_some() || titles.summary.is_some(),
         title: titles.named.or(titles.summary).or(prompt),
     };
-    // Codex keeps a conversation's name apart from it, in [`names`].
-    if provider == Provider::Codex {
-        return Some(answer(titles));
-    }
+    // Read the bounded tail for the latest recorded model as well as titles;
+    // this matters when the model changed since the first turn.
     // A title set by renaming the conversation is appended to its end.
     if len > TAIL_BYTES {
         file.seek(SeekFrom::End(-(TAIL_BYTES as i64))).ok()?;
@@ -334,12 +339,20 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
         // The first line of a tail is the end of a record cut in two.
         lines.next();
     }
-    for line in lines.filter(|line| holds_title(line)) {
+    for line in lines.filter(|line| holds_title(line) || line.contains("model")) {
         if let Ok(value) = serde_json::from_str::<Value>(line) {
             titles.note(&value);
+            if let Some(found) = recorded_model(&value) { model = Some(found); }
         }
     }
-    Some(answer(titles))
+    Some(answer(titles, model))
+}
+
+fn recorded_model(value: &Value) -> Option<String> {
+    ["/message/model", "/payload/model", "/model", "/modelId"]
+        .into_iter().find_map(|path| value.pointer(path).and_then(Value::as_str))
+        .map(str::trim).filter(|model| !model.is_empty() && *model != "<synthetic>")
+        .map(str::to_owned)
 }
 
 /// The titles a transcript records, the latest of each kind.
@@ -502,6 +515,8 @@ pub fn session(seed: &chat::Session, found: &Found) -> Option<chat::Session> {
     session.terminal = None;
     session.launch.recipe.working_directory = found.directory.clone();
     session.launch.session_id = Some(found.id.clone());
+    super::super::chat_ui::closing::clear_model(&mut session.launch.recipe);
+    if let Some(model) = &found.model { super::super::chat_ui::closing::set_model(&mut session.launch.recipe, model); }
     if provider == Provider::Omp {
         let args = &mut session.launch.recipe.arguments;
         let mut index = 0;
@@ -541,6 +556,16 @@ mod tests {
                 Some((found, session))
             })
             .collect()
+    }
+
+    #[test]
+    fn transcript_model_metadata_supports_provider_record_shapes() {
+        for value in [
+            serde_json::json!({"type":"assistant","message":{"model":"claude-recorded"}}),
+            serde_json::json!({"type":"turn_context","payload":{"model":"codex-recorded"}}),
+            serde_json::json!({"type":"model_change","modelId":"omp-recorded"}),
+        ] { assert!(recorded_model(&value).unwrap().ends_with("recorded")); }
+        assert_eq!(recorded_model(&serde_json::json!({"message":{"model":"<synthetic>"}})), None);
     }
 
     #[test]
