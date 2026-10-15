@@ -836,9 +836,18 @@ mod tests {
             worktree_identity: (metadata.dev(), metadata.ino()),
             live_recovery: LiveDiscardRecovery::default(),
             directories: BTreeMap::new(),
-            entries: vec![],
+            entries: vec![DiscardRecoveryEntry {
+                path: RepoPath::parse("restored").unwrap(),
+                before: SavedEntry::Symlink { target: PathBuf::from("original-target") },
+                after: SavedEntry::Absent,
+                after_version: None,
+                trash: None,
+            }],
             expires_unix_ms: u64::MAX,
         };
+        // Exercise actual missing-context admission, not the earlier no-Undo
+        // fast path for a receipt with no remaining entries.
+        assert!(recovery.can_undo());
         let error = RepositoryService::system("git")
             .undo_discard(&recovery, &CancellationToken::new())
             .unwrap_err();
