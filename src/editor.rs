@@ -565,14 +565,12 @@ fn link_target_beneath(root: &Root, link: &Path, target: &Path) -> Option<Option
     Some(Some(resolved.into_iter().collect()))
 }
 
-/// Reads and classifies the regular file at `relative_path`, whose name was
-/// just found to describe something other than a link.
 /// The same source classification is used when restoring a saved absence.
 pub(crate) fn is_markdown_path(path: &Path) -> bool {
     path
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case("README"))
-        || relative_path
+        || path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| {
@@ -580,6 +578,8 @@ pub(crate) fn is_markdown_path(path: &Path) -> bool {
             })
 }
 
+/// Reads and classifies the regular file at `relative_path`, whose name was
+/// just found to describe something other than a link.
 fn load_regular_file(
     root: &Root,
     worktree: &Path,
