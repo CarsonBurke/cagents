@@ -44,10 +44,10 @@ pub(in crate::app) struct Resolved {
     pub physical_root: PathBuf,
 }
 
-/// Stable provider-history identity; independent of the close UI module.
+/// Conservative recorded-account partition shared with saved draft metadata.
+/// An unknown selector never falls back to a provider-only conversation key.
 pub(in crate::app) fn conversation_key(session: &chat::Session) -> Option<String> {
-    let id = session.launch.session_id.as_deref()?.trim();
-    (!id.is_empty()).then(|| format!("{}:{id}", session.launch.provider.label()))
+    chat::conversation_metadata_key(session)
 }
 
 // Identical to select_channel's lexical scope choice; this performs no IO.
