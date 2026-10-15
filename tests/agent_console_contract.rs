@@ -147,6 +147,27 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn stop_with_an_unresolved_runtime_path_does_not_claim_a_running_daemon_is_absent() {
+    let mut fixture = Fixture::new();
+    for runtime in [None, Some("relative-runtime")] {
+        let mut command = Fixture::command(
+            fixture.root.path(),
+            Path::new(env!("CARGO_BIN_EXE_cagents")),
+        );
+        command.env_remove("XDG_RUNTIME_DIR");
+        if let Some(runtime) = runtime {
+            command.env("XDG_RUNTIME_DIR", runtime);
+        }
+        let output = command.args(["--json", "daemon", "stop"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "socket_path", "{error}");
+        assert!(fixture.daemon.try_wait().unwrap().is_none());
+        assert_eq!(fixture.cli(&["daemon", "status"])["running"], true);
+    }
+}
+
+#[test]
 fn terminal_console_answers_requests_and_submits_durable_followups() {
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
