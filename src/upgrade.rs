@@ -865,6 +865,9 @@ pub(crate) mod handoff {
         Ok(())
     }
 
+    /// Compare an authenticated issued alias with a pane's supplied identity.
+    /// A missing presentation thread can be learned; a supplied thread must
+    /// have already been confirmed by this exact authority.
     #[cfg(feature = "host")]
     pub(crate) fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
         source.proof.is_some()
@@ -872,20 +875,9 @@ pub(crate) mod handoff {
             && saved.id == source.id
             && saved.launch.provider == source.launch.provider
             && saved.launch.recipe == source.launch.recipe
+            && source.launch.session_id.as_ref().is_none_or(|id| saved.launch.session_id.as_ref() == Some(id))
             && saved.owned_codex_listener == source.owned_codex_listener
-            && saved.terminal.as_ref().map(|terminal| {
-                (
-                    &terminal.id,
-                    &terminal.launch,
-                    terminal.continuity.live_proof(),
-                )
-            }) == source.terminal.as_ref().map(|terminal| {
-                (
-                    &terminal.id,
-                    &terminal.launch,
-                    terminal.continuity.live_proof(),
-                )
-            })
+            && saved.terminal == source.terminal
     }
 
     /// Publish the descriptor windows were issued, with only its confirmed

@@ -238,7 +238,7 @@ mod tests {
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
-                session_id: Some("confirmed-thread".into()),
+                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
             },
             proof: Some(HostSessionProof {
                 host_session_id: HostSessionId::new("source"),
@@ -293,6 +293,19 @@ mod tests {
     }
 
     #[test]
+    fn supplied_thread_must_match_the_authenticated_live_actor() {
+        let live = session();
+        let mut supplied = live.clone();
+        supplied.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        assert!(qualify(
+            &supplied,
+            std::slice::from_ref(&live),
+            live.proof.as_ref().unwrap(),
+            |_| panic!("same-proof requests cannot invent a thread identity"),
+        ).is_err());
+    }
+
+    #[test]
     fn old_proof_requires_authenticated_resolution_and_exact_current_inventory() {
         let saved = session();
         let mut current = saved.clone();
@@ -329,7 +342,7 @@ mod tests {
             .launch
             .recipe
             .arguments
-            .extend(["--resume".into(), "confirmed-thread".into()]);
+            .extend(["--resume".into(), "11111111-1111-4111-8111-111111111111".into()]);
         assert!(
             qualify(
                 &saved,
@@ -408,7 +421,7 @@ fn qualify_with_mode(
     };
     let live = inventory
         .iter()
-        .find(|live| handoff::issued_chat_matches(source, live))
+        .find(|live| handoff::issued_chat_matches(live, source))
         .ok_or("Saved conversation has no exact current source owner")?;
     if require_resumable {
         handoff::validate_chat_source(source, &live.launch)
