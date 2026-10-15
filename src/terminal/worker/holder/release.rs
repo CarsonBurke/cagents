@@ -12,6 +12,13 @@ enum Task {
 }
 static SERVICE: OnceLock<Result<crossbeam_channel::Sender<Task>, String>> = OnceLock::new();
 
+// The pending host record polls only after activity. A disconnected result
+// after unwinding must wake it just as a normal result or freed queue slot does.
+struct CompletionWake;
+impl Drop for CompletionWake {
+    fn drop(&mut self) { crate::daemon::wake(); }
+}
+
 fn service() -> Result<&'static crossbeam_channel::Sender<Task>, String> {
     SERVICE.get_or_init(|| {
         let (sender, receiver) = crossbeam_channel::bounded::<Task>(64);
@@ -19,6 +26,7 @@ fn service() -> Result<&'static crossbeam_channel::Sender<Task>, String> {
             let receiver = receiver.clone();
             std::thread::Builder::new().name(format!("terminal-holder-close-{index}")).spawn(move || {
                 while let Ok(task) = receiver.recv() {
+                    let _wake = CompletionWake;
                     match task {
                         Task::Final(mut holder) => {
                             if let Err(error) = holder.close_until(Instant::now()+Duration::from_secs(5)) {
@@ -37,7 +45,6 @@ fn service() -> Result<&'static crossbeam_channel::Sender<Task>, String> {
                             let _ = reply.send(result);
                         }
                     }
-                    crate::daemon::wake();
                 }
             }).map_err(|error| error.to_string())?;
         }
