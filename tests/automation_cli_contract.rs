@@ -792,11 +792,16 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
     let role = std::env::var(ROLE).unwrap_or_default();
     if role.is_empty() {
         // Keep process-wide subreaper state out of the ordinary test runner.
-        let status = Command::new(std::env::current_exe().unwrap()).args(["--exact",TEST,"--nocapture"]).env(ROLE,"controller").status().unwrap();
-        assert!(status.success(),"isolated archive fixture/controller failed: {status}");
+        for mode in ["controller","controller-failure"] {
+            let status = Command::new(std::env::current_exe().unwrap()).args(["--exact",TEST,"--nocapture"]).env(ROLE,mode).status().unwrap();
+            assert!(status.success(),"isolated archive fixture/{mode} failed: {status}");
+        }
         return;
     }
-    if role == "controller" {
+    if matches!(role.as_str(),"controller"|"controller-failure") {
+        let expected_failure=role=="controller-failure";
+        let controller_root=tempfile::tempdir().unwrap();
+        let failure_receipt=controller_root.path().join("confirmed-failure.json");
         struct Family { settled:bool,cleanup_deadline:Option<Instant> }
         impl Family {
             fn identity(pid:i32) -> std::io::Result<(u32,String)> {
@@ -879,7 +884,10 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
         // dedicated controller, even after it leaves the worker's session.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER,1,0,0,0) },0);
         let mut family=Family{settled:false,cleanup_deadline:None};
-        let mut worker=Command::new(std::env::current_exe().unwrap()).args(["--exact",TEST,"--nocapture"]).env(ROLE,"worker").spawn().unwrap();
+        let mut command=Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact",TEST,"--nocapture"]).env(ROLE,"worker").env_remove("CAGENTS_ARCHIVE_FAILURE_RECEIPT");
+        if expected_failure { command.env("CAGENTS_ARCHIVE_FAILURE_RECEIPT",&failure_receipt); }
+        let mut worker=command.spawn().unwrap();
         let deadline=Instant::now()+Duration::from_secs(90);
         let outcome=loop {
             if let Some(status)=worker.try_wait().unwrap() { break Some(status); }
@@ -888,7 +896,15 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
         };
         eprintln!("archive fixture worker outcome: {outcome:?}");
         family.finish().unwrap();
-        assert!(outcome.is_some_and(|status|status.success()),"archive fixture worker failed/timed out: {outcome:?}");
+        if expected_failure {
+            let receipt:Value=serde_json::from_slice(&fs::read(&failure_receipt).expect("expected failure must reach actual native confirmation")).unwrap();
+            assert_eq!(receipt["point"],"after-native-confirmation");
+            assert_eq!(receipt["provider_version"],"0.162.0");
+            assert!(uuid::Uuid::parse_str(receipt["thread"].as_str().unwrap()).is_ok());
+            assert!(outcome.is_some_and(|status|!status.success()),"intentional post-confirmation failure was not observed: {outcome:?}");
+        } else {
+            assert!(outcome.is_some_and(|status|status.success()),"archive fixture worker failed/timed out: {outcome:?}");
+        }
         return;
     }
     assert_eq!(role,"worker","unknown isolated fixture role");
@@ -953,6 +969,40 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
     let prompted: Value = serde_json::from_slice(&fs::read(root.join("codex-turn-requested.json")).unwrap()).unwrap();
     assert_eq!(confirmed["thread"],process["thread"]);
     assert_eq!(prompted["thread"],process["thread"]);
+    // Read the actual live attachment a window receives after the delayed
+    // Session frame; do not manufacture its learned native marker for the test.
+    fn exchange_fixture(stream:&mut std::os::unix::net::UnixStream,id:u64,proof:Option<cagents::model::HostSessionProof>,request:cagents::terminal_ipc::ClientRequest)->cagents::terminal_ipc::ServerResponse {
+        use cagents::terminal_ipc::{ClientEnvelope,ServerEnvelope,ServerMessage,PROTOCOL_VERSION,read_frame,write_frame};
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        write_frame(stream,&ClientEnvelope{version:PROTOCOL_VERSION,request_id:id,proof,request}).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(5);
+        loop {
+            let remaining=deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(),"fixture live attachment response timed out");
+            stream.set_read_timeout(Some(remaining)).unwrap();
+            let response:ServerEnvelope=read_frame(stream).unwrap().expect("fixture daemon disconnected");
+            if response.request_id!=Some(id) { continue; }
+            match response.message {
+                ServerMessage::Response{response}=>return response,
+                ServerMessage::Error(error)=>panic!("fixture live attachment refused: {error:?}"),
+                _=>{},
+            }
+        }
+    }
+    use cagents::terminal_ipc::{ClientRequest,ServerResponse};
+    let mut window=std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let ServerResponse::Connected{proof,..}=exchange_fixture(&mut window,0,None,ClientRequest::Connect{expected_host:None,resume:Vec::new()}) else { panic!("fixture window connect") };
+    let ServerResponse::ChatAttached{session:promoted,snapshot:live,..}=exchange_fixture(&mut window,1,Some(proof),ClientRequest::ChatAttach{session:initial.clone()}) else { panic!("fixture actual promoted attachment") };
+    assert_eq!(live.native_continuity,NativeContinuity::Durable{provider_version:"0.162.0".into()});
+    assert_eq!(promoted.native_continuity,live.native_continuity);
+    assert_eq!(promoted.launch.session_id.as_deref(),Some(thread));
+    drop(window);
+    if let Some(path)=std::env::var_os("CAGENTS_ARCHIVE_FAILURE_RECEIPT") {
+        use std::os::unix::fs::OpenOptionsExt;
+        let receipt=fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path).unwrap();
+        serde_json::to_writer(receipt,&json!({"point":"after-native-confirmation","provider_version":"0.162.0","thread":thread,"agent":owner.id.to_string()})).unwrap();
+        panic!("intentional delayed archive fixture failure after actual native confirmation");
+    }
     fs::write(root.join("release-codex-result"),thread).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let archived = loop {
@@ -972,9 +1022,8 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
     assert!(inspect_completed_automation_pane(&pane_database,&registry,card,&workspace.cards[0].kind).unwrap().is_some(),"cold pre-confirmation descriptor without saved archive map must qualify privately");
     // Persist the identity a window learns from that same real private
     // snapshot. Neither alias may force a new executable attachment on reopen.
-    let mut promoted = initial.clone();
-    promoted.launch.session_id = archived.snapshot.session_id.clone();
-    promoted.native_continuity = archived.snapshot.native_continuity.clone();
+    assert_eq!(promoted.launch.session_id,archived.snapshot.session_id);
+    assert_eq!(promoted.native_continuity,archived.snapshot.native_continuity);
     workspace.cards[0].kind = CardKind::Chat(promoted.clone());
     workspace.automation_archives.insert(card,owner.id);
     store.save_workspace(&workspace,SnapshotBase{workspace:first.generation,cards:&first.card_generations}).unwrap();
