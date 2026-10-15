@@ -1483,8 +1483,8 @@ pub(super) struct Runtime {
     find_focused: bool,
     find_matches: Arc<Vec<find::Match>>,
     find_blocks: Arc<HashMap<u64,Arc<[std::ops::Range<usize>]>>>,
-    find_turns: Arc<HashSet<String>>,
-    find_items: Arc<HashSet<String>>,
+    find_turns: Arc<HashSet<Arc<str>>>,
+    find_items: Arc<HashSet<Arc<str>>>,
     find_scope_revision: u64,
     find_generation: Arc<AtomicU64>,
     find_waiting: Option<u64>,
@@ -3596,7 +3596,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
         let Some(found) = runtime.find_matches.get(runtime.find_index).cloned() else { return Task::none(); };
         runtime.find_disclosure.turn(&found.turn,&mut runtime.opened);
-        if let Some(item) = runtime.snapshot.items.iter().chain(runtime.snapshot.subagents.iter().flat_map(|agent| agent.items.iter())).find(|item| item.id == found.item) {
+        if let Some(item) = runtime.snapshot.items.iter().chain(runtime.snapshot.subagents.iter().flat_map(|agent| agent.items.iter())).find(|item| item.id.as_str() == found.item.as_ref()) {
             if runtime.find_disclosure.item(&item.id,&mut runtime.expanded) {
                 let previous = runtime.cache.remove(&item.id);
                 let mut cached = CachedItem::updated(&item.content,runtime.syntax_theme,previous,true,false,
@@ -3615,7 +3615,7 @@ impl Cagents {
         let generation = runtime.find_generation.load(Ordering::Relaxed);
         let navigation = runtime.find_navigation;
         runtime.find_locating = Some((generation,navigation,0));
-        scroll::locate_logical(target,found.item,found.identity,found.range.start)
+        scroll::locate_logical(target,found.item.to_string(),found.identity,found.range.start)
             .map(move |location| Message::ChatUi(Action::FindLocated(target,generation,navigation,0,location)))
             .map(cosmic::Action::App)
     }
@@ -7401,7 +7401,7 @@ impl Cagents {
                     let (generation,navigation,attempt) = runtime.find_locating?;
                     let found = runtime.find_matches.get(runtime.find_index)?;
                     let target = runtime.target;
-                    Some(scroll::locate_logical(target,found.item.clone(),found.identity,found.range.start)
+                    Some(scroll::locate_logical(target,found.item.to_string(),found.identity,found.range.start)
                         .map(move |location| Message::ChatUi(Action::FindLocated(target,generation,navigation,attempt,location)))
                         .map(cosmic::Action::App))
                 }).collect::<Vec<_>>();
@@ -11148,7 +11148,7 @@ mod tests {
         complete_find_for_test(&mut app, target);
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.find_matches.len(), 3);
-        assert!(runtime.find_matches.iter().all(|found| found.turn == "prompt"));
+        assert!(runtime.find_matches.iter().all(|found| found.turn.as_ref() == "prompt"));
         drop(app.handle_chat_ui(Action::FindNext(target, true)));
         drop(app.handle_chat_ui(Action::FindNext(target, true)));
         let runtime = chat_runtime(&app, card);

@@ -1380,7 +1380,7 @@ impl Runtime {
                 let mut key = std::hash::DefaultHasher::new();
                 ("selected-child-item", &item.id).hash(&mut key);
                 let mut revision = std::hash::DefaultHasher::new();
-                (cached.revision, self.expanded.contains(&item.id), self.find.as_ref().filter(|_|self.find_items.contains(&item.id)), self.find_paint.as_ref().and_then(|paint| paint.current.as_ref()).filter(|found|found.item==item.id).map(|found| (found.identity,found.range.start)), dark).hash(&mut revision);
+                (cached.revision, self.expanded.contains(&item.id), self.find.as_ref().filter(|_|self.find_items.contains(item.id.as_str())), self.find_paint.as_ref().and_then(|paint| paint.current.as_ref()).filter(|found|found.item.as_ref()==item.id.as_str()).map(|found| (found.identity,found.range.start)), dark).hash(&mut revision);
                 let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
                     (body.len() as f32 / (content_width / 8.0).max(20.0)).ceil().max(1.0) * 22.0 + footer
                 });
@@ -3174,7 +3174,7 @@ impl Runtime {
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
         self.find.as_ref().filter(|_| self.find_turn_matches(&turn.key)).hash(&mut hasher);
-        self.find_paint.as_ref().and_then(|paint| paint.current.as_ref()).filter(|found| found.turn == turn.key).map(|found| (found.identity,found.range.start)).hash(&mut hasher);
+        self.find_paint.as_ref().and_then(|paint| paint.current.as_ref()).filter(|found| found.turn.as_ref() == turn.key.as_str()).map(|found| (found.identity,found.range.start)).hash(&mut hasher);
         // Only reasoning uses the transcript's busy state to decide whether
         // its disclosure has finished. Other rows derive activity from their
         // own items and the group's status and duration.

@@ -21,8 +21,8 @@ pub(in crate::app::chat_ui) struct Document {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::app::chat_ui) struct Match {
-    pub turn: String,
-    pub item: String,
+    pub turn: Arc<str>,
+    pub item: Arc<str>,
     pub identity: u64,
     pub range: Range<usize>,
 }
@@ -63,8 +63,10 @@ impl Index {
                 }
                 self.items.insert(document.item.clone(), Cached { revision: document.revision, ranges: ranges.into() });
             }
+            let turn:Arc<str>=Arc::from(document.turn.as_str());
+            let item:Arc<str>=Arc::from(document.item.as_str());
             for (identity, range) in self.items[&document.item].ranges.iter() {
-                result.push(Match { turn: document.turn.clone(), item: document.item.clone(),
+                result.push(Match { turn: turn.clone(), item: item.clone(),
                     identity: *identity, range: range.clone() });
             }
         }
@@ -86,7 +88,7 @@ mod tests {
         let documents = [document("a", "first", 1, &[(11, "é cat cat"), (12, "CAT")]),
             document("b", "second", 1, &[(21, "cat")])];
         let matches = index.search(&documents, "cat", 4, &generation).unwrap();
-        assert_eq!(matches.iter().map(|found| (found.item.as_str(), found.identity, found.range.clone())).collect::<Vec<_>>(),
+        assert_eq!(matches.iter().map(|found| (found.item.as_ref(), found.identity, found.range.clone())).collect::<Vec<_>>(),
             vec![("a",11,3..6),("a",11,7..10),("a",12,0..3),("b",21,0..3)]);
     }
     #[test]
@@ -147,10 +149,10 @@ pub(in crate::app::chat_ui) struct Results {
     pub matches: Arc<Vec<Match>>,
     pub blocks: Arc<HashMap<u64, Arc<[Range<usize>]>>>,
     pub revisions: HashMap<String,u64>,
-    pub turns: Arc<HashSet<String>>,
-    pub items: Arc<HashSet<String>>,
+    pub turns: Arc<HashSet<Arc<str>>>,
+    pub items: Arc<HashSet<Arc<str>>>,
     pub scope: u64,
-    positions: HashMap<(String,u64,usize,usize),usize>,
+    positions: HashMap<(Arc<str>,u64,usize,usize),usize>,
 }
 impl Results {
     pub fn new(matches: Vec<Match>) -> Self {
@@ -163,7 +165,7 @@ impl Results {
     }
     pub fn with_revisions(matches:Vec<Match>,inputs:&[Input],scope:u64) -> Self {
         let mut result=Self::new(matches);
-        let matched:HashSet<_>=result.matches.iter().map(|found|found.item.as_str()).collect();
+        let matched:HashSet<_>=result.matches.iter().map(|found|found.item.as_ref()).collect();
         result.revisions=inputs.iter().filter(|input|matched.contains(input.item.id.as_str()))
             .map(|input|(input.item.id.clone(),input.revision)).collect();
         result.scope=scope;
