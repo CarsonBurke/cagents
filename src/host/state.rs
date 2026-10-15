@@ -3432,21 +3432,27 @@ pub(super) fn verify_worktree_setup_generation(recipe:&crate::model::LaunchRecip
 /// Hold the creator's SQLite writer reservation through actual child startup.
 /// Every metadata CAS uses that same SQLite writer, so a superseding resume or
 /// skip cannot authorize an older pending pane after this check.
-fn worktree_setup_run_guard(recipe:&crate::model::LaunchRecipe)->Result<crate::persistence::WorktreeOperationGuard,ProtocolError> {
+fn worktree_setup_run_guard(recipe:&crate::model::LaunchRecipe)->Result<(crate::persistence::WorktreeOperationGuard,fs::File),ProtocolError> {
     let invalid=|detail:String|ProtocolError::new(ProtocolErrorCode::InvalidRequest,detail,false);
     let creation=recipe.environment.get("CAGENTS_WORKTREE_SETUP_CREATION_ID").ok_or_else(||invalid("Setup has no creation identity".into()))?.parse::<crate::model::OperationId>().map_err(|error|invalid(error.to_string()))?;
     let run=recipe.environment.get("CAGENTS_WORKTREE_SETUP_ID").ok_or_else(||invalid("Setup has no run identity".into()))?.parse::<crate::model::OperationId>().map_err(|error|invalid(error.to_string()))?;
-    let mut paths=crate::instance::window_database_paths().map_err(|error|invalid(error.to_string()))?;
-    let directories=crate::instance::project_dirs().ok_or_else(||invalid("Data directory is unavailable".into()))?;
-    paths.push(directories.data_dir().join("worktree-operations.sqlite3"));
-    paths.sort();paths.dedup();
-    let mut owners=Vec::new();
-    for path in paths {
-        if !path.try_exists().map_err(|error|invalid(error.to_string()))? {continue;}
-        if crate::persistence::read_worktree_operation_at(&path,creation).map_err(|error|invalid(error.to_string()))?.is_some() {owners.push(path);}
-    }
-    if owners.len()!=1 {return Err(invalid("No unique current setup creation journal is available; review this worktree again".into()));}
+    let owners=||->Result<Vec<std::path::PathBuf>,ProtocolError> {
+        let mut paths=crate::instance::window_database_paths().map_err(|error|invalid(error.to_string()))?;
+        let directories=crate::instance::project_dirs().ok_or_else(||invalid("Data directory is unavailable".into()))?;
+        paths.push(directories.data_dir().join("worktree-operations.sqlite3"));paths.sort();paths.dedup();
+        let mut owners=Vec::new();
+        for path in paths {
+            if !path.try_exists().map_err(|error|invalid(error.to_string()))? {continue;}
+            if crate::persistence::read_worktree_operation_at(&path,creation).map_err(|error|invalid(error.to_string()))?.is_some() {owners.push(path);}
+        }
+        if owners.len()!=1 {return Err(invalid("No unique current setup creation journal is available; review this worktree again".into()));}
+        Ok(owners)
+    };
+    let initial=owners()?;
+    let row=crate::persistence::read_worktree_operation_at(&initial[0],creation).map_err(|error|invalid(error.to_string()))?.ok_or_else(||invalid("Setup creation disappeared".into()))?;
     let service=crate::repository::RepositoryService::system("git");
+    let execution_lease=service.worktree_setup_execution_lease(&row).map_err(|error|invalid(error.to_string()))?;
+    let owners=owners()?;
     let cancel=crate::repository::CancellationToken::new();
     let common=service.common_dir(&recipe.working_directory,&cancel).map_err(|error|invalid(error.to_string()))?;
     let admin=service.git_dir(&recipe.working_directory,&cancel).map_err(|error|invalid(error.to_string()))?;
@@ -3466,7 +3472,7 @@ fn worktree_setup_run_guard(recipe:&crate::model::LaunchRecipe)->Result<crate::p
     if !crate::repository::worktree_setup_marker_matches(&admin,creation).map_err(|error|invalid(error.to_string()))? {
         return Err(invalid("The checkout generation changed before setup execution".into()));
     }
-    Ok(guard)
+    Ok((guard,execution_lease))
 }
 
 /// Starts a terminal's worker, spawning its process or, given `adoption`,
@@ -3639,8 +3645,11 @@ fn start_terminal_view_owned(
             }
         }
     } else {None};
+    let (setup_run_guard,setup_execution_lease)=setup_run_guard.map_or((None,None),|(database,lease)|(Some(database),Some(lease)));
+    let setup_execution_lease=setup_execution_lease.map(Arc::new);
     let weak = Arc::downgrade(shared);
     let config = TerminalConfig {
+        setup_execution_lease:setup_execution_lease.clone(),
         agent_authority,
         columns: options.columns,
         rows: options.rows,
@@ -3752,6 +3761,8 @@ fn start_terminal_view_owned(
     let event_thread = thread::Builder::new()
         .name(format!("cagentsd-events-{terminal_id}"))
         .spawn(move || {
+            // Keep cross-store Resume/Skip CAS fenced until this setup exits.
+            let _setup_execution_lease=setup_execution_lease;
             while let Ok(event) = event_rx.recv() {
                 let completed = matches!(event, TerminalEvent::Completed { .. });
                 record_event_from(&event_host, terminal_id, event, Some(&completion_handle));

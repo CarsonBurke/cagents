@@ -120,7 +120,7 @@ pub(super) fn resume(service:&Service,store:&crate::persistence::StateStore,repo
         }
     }
     let updated=WorktreeSetupIntent {primary:Some(primary.to_owned()),plan:plan.clone(),skip,run_id:Some(OperationId::new()),copy_done:skip||plan.is_none()};
-    let retained=service.update_worktree_setup_intent(store,report.operation_id,Some(previous),updated).map_err(|error|error.to_string())?;
+    let retained=service.update_worktree_setup_intent_guarded(store,report.operation_id,Some(previous),updated).map_err(|error|error.to_string())?;
     let request=retained.request.ok_or("The resumed setup receipt has no request")?;
     let mut warnings=Vec::new();
     let setup=plan.as_ref().and_then(|plan|prepare(service,store,&request,primary,&request.destination,plan,&mut warnings,cancel));
@@ -148,7 +148,7 @@ pub(super) fn prepare(service:&Service,store:&crate::persistence::StateStore,req
             for skipped in prepared.skipped_paths {warnings.push(format!("Skipped copying {}: {}",skipped.path.display(),skipped.reason));}
             let mut copied=match request.setup_intent.clone() {Some(intent)=>intent,None=>return Some(Setup {command:String::new(),run_id,error:Some("Setup has no retained intent; no command was started".into()),terminal:None})};
             copied.copy_done=true;
-            match service.update_worktree_setup_intent(store,request.operation_id,request.setup_intent.as_ref(),copied) {
+            match service.update_worktree_setup_intent_guarded(store,request.operation_id,request.setup_intent.as_ref(),copied) {
                 Ok(_)=>prepared.command.map(|command|Setup {command,run_id,terminal:None,error:None}),
                 Err(error)=> {
                     let error=format!("Setup copied files, but its progress could not be retained; no command was started: {error}");

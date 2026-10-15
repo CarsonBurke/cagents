@@ -219,6 +219,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         journal.persist(store, &operation.payload)?;
         Ok(journal.report(operation.created_at_unix_ms))
     }
+
+    /// Serialize production setup transitions across copied window journals
+    /// and the host's actual setup execution, before taking a SQLite writer.
+    pub fn update_worktree_setup_intent_guarded(
+        &self,store:&StateStore,creation_id:OperationId,
+        expected:Option<&WorktreeSetupIntent>,updated:WorktreeSetupIntent,
+    )->Result<WorktreeOperationReport,StoreError> {
+        let operation=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation receipt is missing".into()))?;
+        let _lease=self.worktree_setup_execution_lease(&operation)?;
+        self.update_worktree_setup_intent(store,creation_id,expected,updated)
+    }
+
+    pub(crate) fn worktree_setup_execution_lease(&self,operation:&PendingOperation)->Result<fs::File,StoreError> {
+        use std::os::unix::fs::MetadataExt;
+        let journal=settled_setup_journal(operation)?;
+        let expected=journal.lease_identity.ok_or_else(||StoreError::InvalidState("Setup creation has no original lease identity".into()))?;
+        // Do not wait on a starting/live setup after a caller's activity census.
+        // A retry must obtain fresh activity and intent evidence.
+        let lease=worktree_lease(&journal.lease_path,false).map_err(|error|StoreError::InvalidState(format!("Setup creation is starting, running or unavailable; review again: {error}")))?;
+        let named=fs::symlink_metadata(&journal.lease_path)?;
+        if lease_file_identity(&lease)?!=expected||!named.file_type().is_file()||(named.dev(),named.ino())!=expected {
+            return Err(StoreError::InvalidState("Setup creation lease was replaced".into()));
+        }
+        Ok(lease)
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +368,27 @@ mod tests {
         record_creation_identity(&original, creation).unwrap();
         assert!(worktree_setup_marker_matches(&moved, creation).unwrap());
         assert!(!worktree_setup_marker_matches(&admin, creation).unwrap(), "an asynchronous callback cannot initialize the replacement generation");
+    }
+
+    #[test]
+    fn guarded_setup_transitions_share_the_original_lease_across_copied_stores() {
+        let root=tempfile::tempdir().unwrap();let mut request=request(root.path());
+        let original=intent(&request);request.setup_intent=Some(original.clone());let mut journal=journal(request);
+        fs::create_dir_all(&journal.common_dir).unwrap();
+        let lease=worktree_lease(&journal.lease_path,true).unwrap();journal.lease_identity=Some(lease_file_identity(&lease).unwrap());drop(lease);
+        let first=StateStore::open(root.path().join("first.sqlite3"),crate::model::BootId::new("lease-test")).unwrap();
+        let copied=StateStore::open(root.path().join("copied.sqlite3"),crate::model::BootId::new("lease-test")).unwrap();
+        seed(&first,&journal,PendingOperationStatus::Applied);seed(&copied,&journal,PendingOperationStatus::Applied);
+        let service=RepositoryService::system("git");let id=journal.request.operation_id;
+        let row=first.journaled_worktree_operation(id).unwrap().unwrap();let running=service.worktree_setup_execution_lease(&row).unwrap();
+        let mut updated=original.clone();updated.skip=true;updated.run_id=Some(OperationId::new());
+        assert!(service.update_worktree_setup_intent_guarded(&copied,id,Some(&original),updated.clone()).is_err(),"a copied store must not bypass a starting or live execution");
+        assert_eq!(service.worktree_setup_creation(&copied,id).unwrap().unwrap().request.unwrap().setup_intent,Some(original.clone()));
+        drop(running);
+        service.update_worktree_setup_intent_guarded(&copied,id,Some(&original),updated).unwrap();
+        let old=fs::File::open(&journal.lease_path).unwrap();fs::rename(&journal.lease_path,journal.lease_path.with_extension("retained")).unwrap();
+        drop(worktree_lease(&journal.lease_path,true).unwrap());
+        assert!(service.worktree_setup_execution_lease(&row).is_err(),"replacement lease inode must not inherit execution authority");drop(old);
     }
 
     #[test]
