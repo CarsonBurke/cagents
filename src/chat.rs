@@ -954,8 +954,19 @@ pub struct Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderExitDiagnostic {
     pub summary: String,
-    /// Last 64 KiB of readable stderr. The complete stream is in the debug log.
+    /// Last 64 KiB of readable stderr, independent of retained-log availability.
     pub output: String,
+    #[serde(default)]
+    pub log: Option<ProviderExitLog>,
+}
+
+/// Opaque retained diagnostic identity. Full output is loaded only on demand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitLog {
+    pub id: String,
+    pub bytes: u64,
+    /// Raw bytes beyond the per-session disk cap or lost after a write failure.
+    pub omitted: u64,
 }
 
 /// When a provider takes a message it is holding.
@@ -2081,6 +2092,7 @@ mod tests {
                 provider_exit: Some(super::ProviderExitDiagnostic {
                     summary: "Provider exited with status 3. Restart session to continue.".into(),
                     output: "First diagnostic\nAuthentication failed\n".into(),
+                    log: Some(super::ProviderExitLog { id: "retained-log".into(), bytes: 4096, omitted: 128 }),
                 }),
                 ..Default::default()
             };
