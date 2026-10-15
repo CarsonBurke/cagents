@@ -3,6 +3,7 @@
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
 mod turn_outcomes;
+mod history_origins;
 use super::{Adapter, ProcessSpec, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
@@ -1171,7 +1172,7 @@ impl Claude {
         if record["parent_tool_use_id"].is_null()
             && let Some(account)=&record.account_origin
             && let Some(session)=record["sessionId"].as_str() {
-            let origins=turn_outcomes::history_origins(account,session,&step.events[start..]);
+            let origins=history_origins::events(account,session,&step.events[start..]);
             step.events.extend(origins);
         }
         Ok(())
