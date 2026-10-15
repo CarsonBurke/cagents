@@ -447,15 +447,17 @@ pub fn prepare(
                 }
                 output.write_all(&buffer[..read]).map_err(error)?;
             }
+            // Keep the temporary copy private while removing inherited ACL
+            // identities and restoring the source group. Raising its mode
+            // first could expose bytes to a destination's unrelated group or
+            // named ACL user before the source's permissions replace them.
+            fs_safety::copy_group(&input, &output).map_err(error)?;
+            fs_safety::copy_access_acl(&input, &output).map_err(error)?;
             output
                 .set_permissions(fs::Permissions::from_mode(
                     metadata.permissions().mode() & 0o777,
                 ))
                 .map_err(error)?;
-            // Numeric group mode bits can describe the ACL mask rather than
-            // actual group access. Preserve the source ACL and remove any
-            // default ACL inherited by a new copy when the source has none.
-            fs_safety::copy_access_acl(&input, &output).map_err(error)?;
             output.sync_all().map_err(error)?;
             check_cancel(cancel)?;
             index_lock.check().map_err(error)?;
@@ -719,6 +721,35 @@ mod tests {
         assert_eq!(fs::read(fixture.destination.join(".env.restricted")).unwrap(), b"restricted");
         assert_eq!(fs::read(fixture.destination.join(".env.plain")).unwrap(), b"plain");
         println!("SETUP_ACL_COPY_VERIFIED");
+    }
+
+    #[test]
+    fn copy_preserves_source_group_in_setgid_destination() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = Fixture::new();
+        fs::write(fixture.primary.join(".env"), "private source group").unwrap();
+        fs::set_permissions(fixture.primary.join(".env"), fs::Permissions::from_mode(0o640)).unwrap();
+        let source_group = fs::metadata(fixture.primary.join(".env")).unwrap().gid();
+        // SAFETY: null/zero queries the supplementary group count.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0 as libc::gid_t; count as usize];
+        // SAFETY: groups is writable for count gid_t values.
+        assert!(unsafe { libc::getgroups(count, groups.as_mut_ptr()) } >= 0);
+        let Some(destination_group) = groups.into_iter().find(|group| *group != source_group) else {
+            eprintln!("SETUP_GROUP_FIXTURE_NO_ALTERNATE_GROUP");
+            return;
+        };
+        std::os::unix::fs::chown(&fixture.destination, None, Some(destination_group)).unwrap();
+        fs::set_permissions(&fixture.destination, fs::Permissions::from_mode(0o2770)).unwrap();
+        let plan = fixture.config("copy = ['.env']");
+        fixture.prepare(&plan).unwrap();
+        let copied = fs::metadata(fixture.destination.join(".env")).unwrap();
+        assert_eq!(copied.gid(), source_group);
+        assert_eq!(copied.permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::metadata(&fixture.destination).unwrap().gid(), destination_group);
+        assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"private source group");
+        println!("SETUP_GROUP_COPY_VERIFIED");
     }
 
     #[test]
