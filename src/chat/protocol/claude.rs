@@ -490,11 +490,30 @@ impl Claude {
             self.retired.pop_front();
         }
     }
-    fn tool(&mut self, item: Item) {
+    fn tool(&mut self, mut item: Item) -> Item {
+        // Whole assistant frames may arrive after the permission decision.
+        // They supply the call's input, never authority to start a denied or
+        // still-pending tool. Keep those states through replay/coalescing.
+        if item.content.status() == Some(ToolStatus::Running) {
+            if self
+                .pending
+                .values()
+                .any(|frame| frame["request"]["tool_use_id"].as_str() == Some(item.id.as_str()))
+            {
+                item.content.set_status(ToolStatus::AwaitingApproval);
+            } else if self
+                .tools
+                .get(&item.id)
+                .and_then(|old| old.content.status())
+                == Some(ToolStatus::Denied)
+            {
+                item.content.set_status(ToolStatus::Denied);
+            }
+        }
         if !self.tools.contains_key(&item.id) {
             self.tool_order.push_back(item.id.clone());
         }
-        self.tools.insert(item.id.clone(), item);
+        self.tools.insert(item.id.clone(), item.clone());
         while self.tool_order.len() > MAX_TOOLS {
             if let Some(id) = self.tool_order.pop_front() {
                 self.tools.remove(&id);
@@ -503,6 +522,7 @@ impl Claude {
                 self.tool_inputs.remove(&id);
             }
         }
+        item
     }
     fn task_rows_for_agent(&mut self, tool: &str) -> Vec<String> {
         self.agent_task_calls
@@ -673,7 +693,8 @@ impl Claude {
         let raw = self
             .pending
             .get(&id)
-            .ok_or("Claude request is stale, cancelled, or already answered")?;
+            .ok_or("Claude request is stale, cancelled, or already answered")?
+            .clone();
         let request = &raw["request"];
         if string(request, "subtype") == "elicitation" {
             return self.answer_elicitation(id, action, answers);
@@ -686,11 +707,18 @@ impl Claude {
         }
         let response = match action.as_str() {
             "deny" => {
-                json!({"behavior":"deny", "message": if string(request, "tool_name") == "AskUserQuestion" {
-                    "The user skipped these questions"
-                } else {
-                    "The user denied this request"
-                }})
+                let redirect = answers
+                    .iter()
+                    .find(|answer| answer.field == Answer::DENIAL_INSTRUCTIONS)
+                    .and_then(|answer| answer.values.first())
+                    .filter(|message| !message.trim().is_empty());
+                json!({"behavior":"deny", "message": redirect.map(String::as_str).unwrap_or_else(|| {
+                    if string(request, "tool_name") == "AskUserQuestion" {
+                        "The user skipped these questions"
+                    } else {
+                        "The user denied this request"
+                    }
+                })})
             }
             "allow" | "allow_session" => {
                 let mut input = request["input"].clone();
@@ -740,6 +768,19 @@ impl Claude {
             ],
             events: vec![],
         };
+        self.retire(id, &mut step);
+        let tool_id = request["tool_use_id"].as_str().map(str::to_owned);
+        if let Some(tool_id) = tool_id {
+            if let Some(mut item) = self.tools.get(&tool_id).cloned() {
+                item.content.set_status(if action == "deny" {
+                    ToolStatus::Denied
+                } else {
+                    ToolStatus::Running
+                });
+                let item = self.tool(item);
+                step.events.push(Event::Item(item));
+            }
+        }
         if action == "deny"
             && string(request, "tool_name") != "AskUserQuestion"
             && let Some(tool_use_id) = request["tool_use_id"].as_str()
@@ -756,7 +797,6 @@ impl Claude {
                 &mut step,
             )?;
         }
-        self.retire(id, &mut step);
         Ok(step)
     }
     fn permission(&mut self, raw: Value) -> Result<Step, String> {
@@ -868,9 +908,22 @@ impl Claude {
             fields,
             actions,
         };
+        let mut events = vec![Event::Request(event)];
+        if !question && let Some(tool_id) = request["tool_use_id"].as_str() {
+            let mut item = self.tools.get(tool_id).cloned().unwrap_or_else(|| Item {
+                id: tool_id.to_owned(),
+                role: Role::Assistant,
+                content: tool_content(name, &request["input"], &self.cwd),
+                started_at: None,
+                at: None,
+            });
+            item.content.set_status(ToolStatus::AwaitingApproval);
+            let item = self.tool(item);
+            events.push(Event::Item(item));
+        }
         self.pending.insert(id, raw);
         Ok(Step {
-            events: vec![Event::Request(event)],
+            events,
             ..Step::default()
         })
     }
@@ -1202,7 +1255,7 @@ impl Claude {
                                 self.edit_tools
                                     .insert(tool_id.clone(), string(block, "name").into());
                             }
-                            self.tool(item.clone());
+                            let item = self.tool(item);
                             step.events.push(Event::Item(item));
                         } else if history {
                             // Keep the original call position as an overlap
@@ -1251,6 +1304,7 @@ impl Claude {
                                 started_at: None,
                                 at: None,
                             });
+                        let denied = item.content.status() == Some(ToolStatus::Denied);
                         apply_result(
                             &mut item.content,
                             content_text(&block["content"]),
@@ -1265,6 +1319,9 @@ impl Claude {
                                 &Value::Null
                             },
                         );
+                        if denied {
+                            item.content.set_status(ToolStatus::Denied);
+                        }
                         if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
                         {
                             // A nested agent's progress never reaches this
@@ -1313,7 +1370,7 @@ impl Claude {
                                 }));
                             }
                         }
-                        self.tool(item.clone());
+                        let item = self.tool(item);
                         step.events.push(Event::Item(item));
                     }
                     "image" => step.events.push(Event::Item(Item {
@@ -3705,11 +3762,14 @@ impl Claude {
                         if matches!(content, ItemContent::Changes { .. }) {
                             self.edit_tools.insert(item.id.clone(), name.clone());
                         }
-                        if !matches!(content, ItemContent::Tool { .. }) {
+                        let classified = !matches!(content, ItemContent::Tool { .. });
+                        if classified {
                             item.content = content;
-                            step.events.push(Event::Item(item.clone()));
                         }
-                        self.tool(item);
+                        let item = self.tool(item);
+                        if classified {
+                            step.events.push(Event::Item(item));
+                        }
                     }
                 }
             }
@@ -3960,7 +4020,7 @@ impl Claude {
                         background: None,
                     });
                 }
-                self.tool(item.clone());
+                let item = self.tool(item);
                 if represented {
                     if self.visible_task_rows.remove(&item.id) {
                         step.events.push(Event::ItemsRemoved {
@@ -5502,6 +5562,64 @@ mod tests {
     fn approval(id: &str, tool: &str, input: Value) -> Value {
         json!({"type":"control_request", "request_id":id, "request":{"subtype":"can_use_tool", "tool_name":tool, "tool_use_id":"tool-1", "input":input}})
     }
+    #[test]
+    fn deny_instructions_reach_the_provider_and_denials_stay_neutral() {
+        let mut adapter = Claude::default();
+        let pending = adapter
+            .receive(approval(
+                "approval",
+                "Bash",
+                json!({"command":"git push --force"}),
+            ))
+            .unwrap();
+        assert!(pending.events.iter().any(|event| matches!(event,
+            Event::Item(item) if item.content.status() == Some(ToolStatus::AwaitingApproval))));
+        let denied = adapter
+            .answer(
+                "approval".into(),
+                "deny".into(),
+                vec![Answer::denial_instructions(
+                    "use git push --force-with-lease instead".into(),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            denied.writes[0]["response"]["response"],
+            json!({
+                "behavior":"deny", "message":"use git push --force-with-lease instead"
+            })
+        );
+        assert!(denied.events.iter().any(|event| matches!(event,
+            Event::Item(item) if item.content.status() == Some(ToolStatus::Denied))));
+        let late = adapter.receive(json!({"type":"assistant","uuid":"late-call","message":{"content":[{
+            "type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"git push --force"}
+        }]}})).unwrap();
+        assert!(late.events.iter().all(|event| !matches!(event,
+            Event::Item(item) if item.id == "tool-1" && item.content.status() == Some(ToolStatus::Running))));
+        assert_eq!(
+            adapter.tools["tool-1"].content.status(),
+            Some(ToolStatus::Denied)
+        );
+
+        let result = adapter
+            .receive(json!({"type":"user","uuid":"result","message":{"content":[{
+                "type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":"User denied"
+            }]}}))
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(event,
+            Event::Item(item) if item.id == "tool-1" && item.content.status() == Some(ToolStatus::Denied))));
+        adapter
+            .receive(approval("again", "Bash", json!({"command":"git push"})))
+            .unwrap();
+        let default = adapter
+            .answer("again".into(), "deny".into(), vec![])
+            .unwrap();
+        assert_eq!(
+            default.writes[0]["response"]["response"]["message"],
+            "The user denied this request"
+        );
+    }
+
     /// A permission request shows what would be done as a block the surface
     /// sets as literal text: the command, the patch, or the input a line to
     /// an argument, after a blank line and never as part of the sentence.

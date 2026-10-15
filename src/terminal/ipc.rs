@@ -143,7 +143,9 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Version 78 adds AwaitingApproval to tool states delivered to existing native
+/// chat subscribers. Older postcard peers must be rejected before receiving it.
+pub const PROTOCOL_VERSION: u16 = 78;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2105,6 +2107,36 @@ mod tests {
         assert!(restored.fast_mode.is_none());
         assert!(!restored.capabilities.fast_mode);
         assert!(restored.usage.cost_estimate.is_none());
+    }
+
+    #[test]
+    fn chat_approval_state_round_trips_at_the_matched_protocol_boundary() {
+        assert!(
+            PROTOCOL_VERSION > 77,
+            "existing subscribers cannot decode AwaitingApproval at version 77"
+        );
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(crate::chat::Snapshot {
+                items: vec![std::sync::Arc::new(crate::chat::Item {
+                    id: "approval".into(),
+                    role: crate::chat::Role::Assistant,
+                    started_at: Some(1),
+                    at: Some(2),
+                    content: crate::chat::ItemContent::Tool {
+                        name: "Bash".into(),
+                        input: "{}".into(),
+                        output: String::new(),
+                        status: crate::chat::ToolStatus::AwaitingApproval,
+                    },
+                })],
+                ..Default::default()
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

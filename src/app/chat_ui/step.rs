@@ -62,6 +62,7 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
             ),
             Some(design::Tone::Themed(design::accent_color)),
         ),
+        ToolStatus::AwaitingApproval => glyph(Icon::AgentWaiting, None),
         ToolStatus::Succeeded => glyph(Icon::Check, None),
         ToolStatus::Failed => glyph(
             Icon::Error,
@@ -76,6 +77,22 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
             Some(design::Tone::Themed(design::muted_color)),
         ),
     }
+}
+
+fn summary_spans(summary: &str) -> Vec<iced::widget::text::Span<'static, String>> {
+    let mut spans = Vec::new();
+    for (index, part) in summary.split(" · ").enumerate() {
+        if index > 0 {
+            spans.push(iced::widget::text::Span::new(" · "));
+        }
+        let span = iced::widget::text::Span::new(part.to_owned());
+        spans.push(if index > 0 && part.ends_with(" failed") {
+            span.color(design::destructive_color(&cosmic::theme::active()))
+        } else {
+            span
+        });
+    }
+    spans
 }
 
 /// The glyph that stands for what a step was doing, so a reader scanning the
@@ -199,14 +216,82 @@ fn change_verb(kind: &ChangeKind) -> &'static str {
     }
 }
 
-fn change_view(change: &FileChange) -> Element<'_, Message> {
+/// Keep outside paths absolute and never shorten lexical siblings of the cwd.
+fn display_path<'a>(path: &'a str, cwd: &std::path::Path) -> &'a str {
+    std::path::Path::new(path)
+        .strip_prefix(cwd)
+        .ok()
+        .filter(|relative| {
+            !relative.as_os_str().is_empty()
+                && !relative
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+        })
+        .and_then(std::path::Path::to_str)
+        .unwrap_or(path)
+}
+
+struct PathLabel {
+    display: String,
+    absolute: String,
+}
+
+fn path_label(path: &str, cwd: &std::path::Path) -> PathLabel {
+    let path = std::path::Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let absolute = absolute.to_string_lossy().into_owned();
+    let display = display_path(&absolute, cwd).to_owned();
+    PathLabel { display, absolute }
+}
+
+fn content_path(content: &ItemContent) -> Option<&str> {
+    match content {
+        ItemContent::Command {
+            action: chat::CommandAction::Read,
+            ..
+        } => Some(turn::step_label(content)),
+        ItemContent::Changes { changes, .. } if changes.len() == 1 => Some(&changes[0].path),
+        _ => None,
+    }
+}
+
+fn diff_stat(changes: &[FileChange]) -> (usize, usize) {
+    let (mut added, mut removed) = (0, 0);
+    for change in changes {
+        let mut hunk = false;
+        for line in change.diff.lines() {
+            if line.starts_with("diff --git ") {
+                hunk = false;
+            }
+            if line.starts_with("@@") {
+                hunk = true;
+            }
+            if line.starts_with('+') && (hunk || !line.starts_with("+++ ")) {
+                added += 1;
+            }
+            if line.starts_with('-') && (hunk || !line.starts_with("--- ")) {
+                removed += 1;
+            }
+        }
+    }
+    (added, removed)
+}
+
+fn change_view<'a>(change: &'a FileChange, cwd: &std::path::Path) -> Element<'a, Message> {
+    let path = path_label(&change.path, cwd);
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
             design::caption(change_verb(&change.kind)).into(),
-            design::body(change.path.as_str())
-                .font(iced::Font::MONOSPACE)
-                .width(Length::Fill)
-                .into(),
+            crate::interaction::tooltip(
+                design::body(path.display)
+                    .font(iced::Font::MONOSPACE)
+                    .width(Length::Fill),
+                path.absolute,
+            ),
         ])
         .spacing(GAP_S)
         .align_y(Alignment::Center)
@@ -332,6 +417,26 @@ impl Runtime {
         steps: impl FnOnce() -> Vec<Element<'a, Message>>,
     ) -> Element<'a, Message> {
         let target = self.target;
+        let summary = turn
+            .steps
+            .first()
+            .filter(|_| turn.steps.len() == 1)
+            .and_then(|placed| self.snapshot.items.get(placed.index))
+            .filter(|item| {
+                self.cache
+                    .get(&item.id)
+                    .and_then(|cached| cached.coordination.as_deref())
+                    .is_none()
+            })
+            .and_then(|item| content_path(&item.content))
+            .map(|path| {
+                turn.summary.replacen(
+                    path,
+                    &path_label(path, &self.session.launch.recipe.working_directory).display,
+                    1,
+                )
+            })
+            .unwrap_or_else(|| turn.summary.clone());
         let key = turn.key.as_str();
         // Explicit reader choices override the configured default.
         let open = self
@@ -353,13 +458,24 @@ impl Runtime {
                 line.push(indicator);
                 tone
             }
-            None => None,
+            None => {
+                line.push(
+                    widget::icon(Icon::Utilities.handle())
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into(),
+                );
+                None
+            }
         };
-        line.push(
-            design::heading(turn.summary.clone())
+        line.push(if turn.steps.len() > 1 && summary.contains(" failed") {
+            iced::widget::rich_text(summary_spans(&summary))
+                .font(design::heading_font())
+                .size(design::TEXT_BODY)
                 .width(Length::Fill)
-                .into(),
-        );
+                .into()
+        } else {
+            design::heading(summary.clone()).width(Length::Fill).into()
+        });
         // The one-second chat tick advances running timers even while a tool
         // is quiet. The label shares its cadence with the retained-turn cache.
         let elapsed = self
@@ -372,8 +488,8 @@ impl Runtime {
         // name as well: a reader on a screen reader is the one who cannot see
         // the caption beside it.
         let name = match &elapsed {
-            Some(elapsed) => format!("{} · {elapsed}", turn.summary),
-            None => turn.summary.clone(),
+            Some(elapsed) => format!("{summary} · {elapsed}"),
+            None => summary.clone(),
         };
         let header = widget::button::custom(
             widget::row::with_children(line)
@@ -464,7 +580,7 @@ impl Runtime {
         // A step that worked with another agent says what it did in the
         // conversation's own names rather than reprinting its command.
         let coordinated = cached.coordination.as_deref();
-        let (verb, label) = match coordinated {
+        let (verb, mut label) = match coordinated {
             Some(coordinated) => coordinated.line(&|id| self.agent_name(id)),
             None => (
                 turn::step_verb(&item.content).to_owned(),
@@ -490,9 +606,8 @@ impl Runtime {
         // The target is a path, a pattern, or a command, so it is set in the
         // same face the reader would see it in a terminal or an editor. That
         // is also what separates it at a glance from the verb beside it.
-        // A long command wraps onto the next line rather than running under
-        // the outcome beside it: a pane is often narrow, and a row whose end
-        // is hidden is a row the reader cannot check.
+        // Keep primary commands and paths on one ellipsized line. Their
+        // complete source stays available through expansion and copying.
         // What the step is comes first and stays: the tool's name and
         // input, or the command. What it last printed follows on a muted
         // line of its own, so a running build can be followed without the
@@ -519,6 +634,44 @@ impl Runtime {
         } else {
             preview.push(cached.preview.view());
         }
+        let cwd = &self.session.launch.recipe.working_directory;
+        let path = coordinated
+            .is_none()
+            .then(|| content_path(&item.content))
+            .flatten()
+            .map(|path| path_label(path, cwd));
+        if let Some(path) = &path {
+            label = path.display.clone();
+            preview = vec![crate::interaction::tooltip(
+                design::body(path.display.clone())
+                    .font(iced::Font::MONOSPACE)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::advanced::text::Ellipsize::End(
+                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .width(Length::Fill),
+                path.absolute.clone(),
+            )];
+        }
+        match &item.content {
+            ItemContent::Command {
+                label: description,
+                command,
+                action: chat::CommandAction::Run,
+                ..
+            } if coordinated.is_none() && !description.is_empty() && description != command => {
+                preview.push(
+                    design::caption(turn::first_line(description).to_owned())
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::advanced::text::Ellipsize::End(
+                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+            _ => {}
+        }
         preview.extend(cached.preview.tail_view());
         line.push(
             widget::column::with_children(preview)
@@ -526,6 +679,14 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         );
+        if let ItemContent::Changes { changes, .. } = &item.content {
+            let (added, removed) = diff_stat(changes);
+            line.push(design::caption(format!("+{added} −{removed}")).into());
+        }
+        if let Some(status) = item.content.status() {
+            let (indicator, _) = status_indicator(status);
+            line.push(indicator);
+        }
         if let Some(detail) = &cached.detail {
             line.push(design::caption(detail.clone()).into());
         }
@@ -540,16 +701,41 @@ impl Runtime {
                 .align_y(Alignment::Start),
         )
         .name(name)
-        .class(crate::ui_controls::control_style(open, None))
+        .class(crate::ui_controls::control_style(
+            open,
+            match item.content.status() {
+                Some(ToolStatus::Failed) => Some(design::Tone::Themed(design::destructive_color)),
+                Some(ToolStatus::Denied | ToolStatus::Stopped) => {
+                    Some(design::Tone::Themed(design::muted_color))
+                }
+                _ => None,
+            },
+        ))
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
         .on_press(action(Action::Toggle(target, item.id.clone())));
+        let mut controls = vec![self.message_copy(item)];
+        if let Some(path) = &path {
+            controls.insert(
+                0,
+                small_icon(
+                    Icon::Copy,
+                    "Copy full path",
+                    Action::CopyLiteral(path.absolute.clone()),
+                ),
+            );
+        }
         hover::view(
-            widget::row::with_children(vec![header.into(), widget::Space::new().width(24).into()])
-                .align_y(Alignment::Center)
-                .spacing(GAP_XS)
-                .width(Length::Fill),
-            widget::container(self.message_copy(item))
+            widget::row::with_children(vec![
+                header.into(),
+                widget::Space::new()
+                    .width(if path.is_some() { 48 } else { 24 })
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(GAP_XS)
+            .width(Length::Fill),
+            widget::container(widget::row::with_children(controls).spacing(GAP_XS))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .align_x(Alignment::End)
@@ -604,21 +790,22 @@ impl Runtime {
                 ));
             }
             ItemContent::Command {
-                working_directory,
+                command,
                 output,
+                action: command_action,
                 ..
             } => {
-                rows.push(self.tool_code_surface(
-                    item,
-                    cached,
-                    CopyPart::Input,
-                    if working_directory.is_empty() {
-                        "Command"
-                    } else {
-                        working_directory
-                    },
-                    Some(Self::OUTPUT_HEIGHT),
-                ));
+                if *command_action != chat::CommandAction::Read
+                    || command != turn::step_label(&item.content)
+                {
+                    rows.push(self.tool_code_surface(
+                        item,
+                        cached,
+                        CopyPart::Input,
+                        "Command",
+                        Some(Self::OUTPUT_HEIGHT),
+                    ));
+                }
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());
                 } else {
@@ -636,7 +823,14 @@ impl Runtime {
                     rows.push(design::caption("No file changes were reported.").into());
                 }
                 for (index, change) in changes.iter().enumerate() {
-                    rows.push(change_view(change));
+                    if changes.len() > 1 {
+                        rows.push(change_view(
+                            change,
+                            &self.session.launch.recipe.working_directory,
+                        ));
+                    } else if let ChangeKind::Renamed { from } = &change.kind {
+                        rows.push(design::caption(format!("from {from}")).into());
+                    }
                     if !change.diff.is_empty() {
                         rows.push(self.tool_code_surface(
                             item,
@@ -735,5 +929,139 @@ impl Runtime {
             .spacing(space::XS)
             .width(Length::Fill)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn command_row_renders_command_before_description() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let item = chat::Item {
+            id: "bash".into(),
+            role: chat::Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Command {
+                label: "Run tests for module 295".into(),
+                command: "cargo test --lib module_295".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: Some(120),
+                output: String::new(),
+            },
+        };
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(Provider::Claude),
+            false,
+        )
+        .unwrap();
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                items: vec![Arc::new(item.clone())],
+                ..Snapshot::default()
+            },
+        ));
+        let runtime = Runtime::new(
+            Target {
+                card: CardId::new(),
+                generation: 1,
+            },
+            session,
+            Connection::Live(handle),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
+        let mut tree = Tree::new(&element);
+        let renderer = crate::app::tests::headless_renderer();
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(956.0, 500.0)),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let nodes = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .collect::<Vec<_>>();
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.node().label() == Some("Ran cargo test --lib module_295"))
+        );
+        assert!(nodes.iter().any(
+            |node| node.node().label() == Some("Run tests for module 295")
+                || node.node().value() == Some("Run tests for module 295")
+        ));
+    }
+
+    #[test]
+    fn mixed_summary_colors_only_the_failed_count() {
+        let spans = summary_spans("Ran 5 commands · 4 ok · 1 failed");
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "Ran 5 commands · 4 ok · 1 failed"
+        );
+        assert!(
+            spans[..spans.len() - 1]
+                .iter()
+                .all(|span| span.color.is_none())
+        );
+        assert!(spans.last().unwrap().color.is_some());
+    }
+
+    #[test]
+    fn relative_provider_paths_have_absolute_tooltips_and_copy_values() {
+        let path = path_label("src/main.rs", std::path::Path::new("/repo/worktree"));
+        assert_eq!(path.display, "src/main.rs");
+        assert_eq!(path.absolute, "/repo/worktree/src/main.rs");
+        let outside = path_label("/outside/main.rs", std::path::Path::new("/repo/worktree"));
+        assert_eq!(outside.display, "/outside/main.rs");
+        assert_eq!(outside.absolute, "/outside/main.rs");
+    }
+
+    #[test]
+    fn paths_are_relative_only_under_the_session_directory() {
+        let cwd = std::path::Path::new("/repo/worktree");
+        assert_eq!(
+            display_path("/repo/worktree/src/main.rs", cwd),
+            "src/main.rs"
+        );
+        assert_eq!(
+            display_path("/repo/worktree-other/main.rs", cwd),
+            "/repo/worktree-other/main.rs"
+        );
+        assert_eq!(
+            display_path("/elsewhere/main.rs", cwd),
+            "/elsewhere/main.rs"
+        );
+        assert_eq!(display_path("src/main.rs", cwd), "src/main.rs");
+    }
+
+    #[test]
+    fn diff_statistics_exclude_headers_and_count_prefixes_in_hunks() {
+        let changes = vec![FileChange {
+            path: "src/main.rs".into(), kind: ChangeKind::Updated,
+            diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,3 @@\n-old\n+new\n+++ prefix in source\n context\n".into(),
+        }];
+        assert_eq!(diff_stat(&changes), (2, 1));
     }
 }
