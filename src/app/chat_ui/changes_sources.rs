@@ -99,6 +99,7 @@ struct Entry {
     revision:u64,
     render_revision:u64,
     copy_all:bool,
+    copy_intent:Option<clipboard_intent::Intent>,
     copy_error:Option<String>,
     part:chat::cache::changes::Part,
     pages:std::collections::BTreeMap<usize,Arc<Manifest>>,
@@ -138,7 +139,7 @@ static NEXT:AtomicU64=AtomicU64::new(1);
 fn attempt()->u64 {NEXT.fetch_add(1,Ordering::Relaxed)}
 impl Entry {
     fn new(part:chat::cache::changes::Part)->Self {
-        Self {revision:attempt(),render_revision:0,copy_all:false,copy_error:None,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
+        Self {revision:attempt(),render_revision:0,copy_all:false,copy_intent:None,copy_error:None,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
             wanted_pages:Default::default(),manual_pages:Default::default(),opened:Default::default(),patches:Default::default(),restored:Default::default(),
             patch_requests:Default::default(),patch_errors:Default::default()}
     }
@@ -152,6 +153,9 @@ impl Entry {
     }
     fn demand(&mut self,expanded:bool,find:bool) {
         let old=(self.requested.len(),self.patch_requests.len(),self.patches.len());
+        if self.copy_all && self.copy_intent.as_ref().is_none_or(|intent|!intent.current()) {
+            self.copy_all=false;self.copy_intent=None;self.revision=attempt();
+        }
         let all=find || self.copy_all;
         if !all {
             self.wanted_pages=self.manual_pages.clone();
@@ -363,18 +367,23 @@ impl State {
         }
         entry.revision=attempt();self.revision=self.revision.wrapping_add(1);true
     }
-    pub(super) fn request_copy_all(&mut self,item:&str)->bool {
+    pub(super) fn request_copy_all(&mut self,item:&str,intent:clipboard_intent::Intent)->bool {
+        if !intent.current() {return false;}
         let Some(key)=self.aliases.get(item) else {return false;};let Some(entry)=self.entries.get_mut(key) else {return false;};
         if entry.part.metadata.unavailable.is_some() || entry.pages.values().any(|page|page.omitted_files>0) {return false;}
-        entry.copy_error=None;entry.copy_all=true;entry.demand(true,false);entry.revision=attempt();true
+        entry.copy_error=None;entry.copy_intent=Some(intent);entry.copy_all=true;entry.demand(true,false);entry.revision=attempt();true
     }
-    pub(super) fn take_copy_all(&mut self)->Option<(String,Vec<Arc<str>>)> {
+    pub(super) fn take_copy_all(&mut self)->Option<(String,Vec<Arc<str>>,clipboard_intent::Intent)> {
         for (key,entry) in &mut self.entries {
             if !entry.copy_all || !entry.pages.values().any(|page|page.next_offset.is_none() && page.omitted_files==0)
                 || entry.pages.values().map(|page|page.files.len()).sum::<usize>()!=entry.part.metadata.total_files {continue;}
             let patches:Option<Vec<_>>=entry.pages.values().flat_map(|page|page.files.iter())
                 .map(|file|entry.current(file.file_index).map(|patch|patch.text.clone())).collect();
-            if let Some(patches)=patches {entry.copy_all=false;return Some((key.source_id.clone(),patches));}
+            if let Some(patches)=patches {
+                entry.copy_all=false;let intent=entry.copy_intent.take()?;
+                if !intent.current() {continue;}
+                return Some((key.source_id.clone(),patches,intent));
+            }
         }
         None
     }
@@ -483,45 +492,71 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message
 
 
 #[derive(Clone)]
-pub(super) struct CopyReady(Arc<Mutex<Option<CopyOutput>>>);
-struct CopyOutput {
-    text:String,
-    _capacity:chat::source_owners::ReaderCapacity,
-    _permit:tokio::sync::OwnedSemaphorePermit,
+pub(super) struct CopyReady(Arc<CopySlot>);
+struct CopySlot {value:Mutex<Option<Result<CopyOutput,String>>>,intent:clipboard_intent::Intent}
+impl Drop for CopySlot {fn drop(&mut self) {if let Some(value)=self.value.get_mut().unwrap_or_else(|error|error.into_inner()).take() {retire_copy(value);}}}
+struct CopyOutput {text:String,_capacity:chat::source_owners::ReaderCapacity,_permit:tokio::sync::OwnedSemaphorePermit}
+struct CopyInput(Mutex<Option<Vec<Arc<str>>>>);
+impl CopyInput {fn take(&self)->Option<Vec<Arc<str>>> {self.0.lock().unwrap_or_else(|error|error.into_inner()).take()}}
+impl clipboard_intent::Pending for CopyInput {fn withdraw(&self) {if let Some(texts)=self.take() {retire_copy(texts);}}}
+impl Drop for CopyInput {fn drop(&mut self) {if let Some(texts)=self.0.get_mut().unwrap_or_else(|error|error.into_inner()).take() {retire_copy(texts);}}}
+fn retire_copy(value:impl Send+'static) {
+    type Retired=Box<dyn std::any::Any+Send>;
+    static SENDER:std::sync::OnceLock<std::sync::mpsc::Sender<Retired>>=std::sync::OnceLock::new();
+    let sender=SENDER.get_or_init(||{let(send,receive)=std::sync::mpsc::channel::<Retired>();std::thread::Builder::new().name("cagents-patch-copy-retire".into()).spawn(move||{for value in receive {drop(value);}}).expect("start patch copy retirement");send});
+    if let Err(value)=sender.send(Box::new(value)) {drop(value);}
 }
-/// Clipboard conversion/concatenation is also whole-source work. Run it on a
-/// bounded reader worker, keeping input Arcs and output capacity attributed.
-pub(super) fn copy_task(runtime:&mut Runtime,one:Option<(String,usize)>)->Task<Message> {
-    let (item,texts)=if let Some((item,index))=one {
-        let Some(text)=runtime.logical_changes.copy_patch(&item,index) else {return Task::none();};(item,vec![text])
+/// Clipboard conversion is whole-source work. Queued input withdrawal and
+/// output retirement preserve actual payload leases until final destruction.
+pub(super) fn copy_task(runtime:&mut Runtime,one:Option<(String,usize,clipboard_intent::Intent)>)->Task<Message> {
+    let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());
+    runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);
+    let (item,texts,intent)=if let Some((item,index,intent))=one {
+        if !intent.current() {return Task::none();}
+        let Some(text)=runtime.logical_changes.copy_patch(&item,index) else {return Task::none();};(item,vec![text],intent)
     } else {
         let Some(value)=runtime.logical_changes.take_copy_all() else {return Task::none();};value
     };
     let Some(epoch)=runtime.logical_changes.epoch(&item) else {return Task::none();};
     let target=runtime.target;let context=runtime.logical_changes.context;
+    let input=Arc::new(CopyInput(Mutex::new(Some(texts))));intent.register(&input);
     cosmic::task::future(async move {
-        let result=tokio::time::timeout(Duration::from_secs(40),async move {
+        let current=intent.clone();
+        let value=tokio::time::timeout(Duration::from_secs(40),async move {
             let permit=chat::source_owners::readers().clone().acquire_owned().await.map_err(|_|"Copy stopped.".to_owned())?;
             tokio::task::spawn_blocking(move || {
+                let texts=input.take().ok_or_else(||"A newer copy replaced this request.".to_owned())?;
+                if !current.current() {return Err("A newer copy replaced this request.".to_owned());}
                 let bytes=texts.iter().try_fold(0usize,|total,text|total.checked_add(text.len()).and_then(|total|total.checked_add(1)))
                     .ok_or_else(||"The complete patches are too large to copy.".to_owned())?;
                 if bytes>chat::source_owners::SOURCE_BYTES+texts.len() {return Err("The complete patches exceed the 32 MiB copy limit.".to_owned());}
                 let capacity=chat::source_owners::ReaderCapacity::default();let mut text=String::with_capacity(bytes);capacity.set(text.capacity());
                 for (index,part) in texts.iter().enumerate() {if index>0 && !text.ends_with('\n') {text.push('\n');}text.push_str(part);}
-                Ok(CopyReady(Arc::new(Mutex::new(Some(CopyOutput {text,_capacity:capacity,_permit:permit})))))
+                Ok(CopyOutput {text,_capacity:capacity,_permit:permit})
             }).await.map_err(|_|"Copy stopped.".to_owned())?
         }).await.unwrap_or_else(|_|Err("The complete patches could not be copied in time.".to_owned()));
+        let result=Ok(CopyReady(Arc::new(CopySlot {value:Mutex::new(Some(value)),intent})));
         Message::ChatUi(Action::CompleteChangeCopy(target,item,epoch,context,result))
     })
 }
 pub(super) fn complete_copy(runtime:&mut Runtime,item:&str,epoch:chat::cache::SourceEpoch,context:u64,result:Result<CopyReady,String>)->Task<Message> {
     if runtime.logical_changes.context!=context || runtime.logical_changes.epoch(item)!=Some(epoch) || !runtime.visible.load(Ordering::Relaxed) {return Task::none();}
-    match result {
-        Ok(ready)=>if let Some(output)=ready.0.lock().unwrap_or_else(|error|error.into_inner()).take() {
+    // A superseded completion still releases copy-only demand immediately;
+    // manually expanded and active Find sources remain independently wanted.
+    let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());
+    runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);
+    let value=match result {
+        Ok(ready)=>{
+            if !ready.0.intent.current() {return Task::none();}
+            let Some(value)=ready.0.value.lock().unwrap_or_else(|error|error.into_inner()).take() else {return Task::none();};value
+        }
+        Err(error)=>Err(error),
+    };
+    match value {
+        Ok(output)=>{
             runtime.copied=Some((item.into(),Instant::now()));
             let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());
-            runtime.logical_changes.reconcile_demand(&runtime.expanded,find);
-            changes_find::sync(runtime);
+            runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);
             return iced::clipboard::write(output.text).map(cosmic::Action::App);
         },
         Err(error)=>if let Some(key)=runtime.logical_changes.aliases.get(item)
@@ -688,6 +723,41 @@ mod tests {
         let result=read_manifest(query,move |_| {let omitted=omitted.clone();async move {Ok(omitted)}}).await.unwrap();
         assert_eq!(result.omitted_files,1);assert!(result.metadata.unavailable.is_some());
     }
+    #[test]
+    fn newer_copy_cancels_loading_all_file_copy_but_preserves_search_demand() {
+        for find in [false,true] {
+            let page=fixture("original patch");let(mut state,_,_)=open(&page,"visible-part");
+            let intents=clipboard_intent::Intents::default();
+            assert!(state.request_copy_all(&page.source.source_id,intents.next()));
+            intents.next();state.reconcile_demand(&HashSet::new(),find);
+            assert!(!state.entries[&page.source].copy_all);
+            assert_eq!(state.entries[&page.source].patch_requests.contains_key(&0),find);
+            assert!(state.take_copy_all().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_patch_copy_result_cannot_replace_a_newer_literal_copy() {
+        use iced::futures::StreamExt as _;
+        let text="@@ -1 +1 @@\n-before\n+after\n";let page=fixture(text);
+        let(mut state,raw,expanded)=open(&page,"late-part");let request=state.entries[&page.source].patch_requests[&0];
+        assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
+        let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
+        let handle=Arc::new(ClientHandle::fixture(session.clone(),(*raw).clone()));
+        let mut runtime=Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle),true,crate::settings::EditorSyntaxTheme::default());
+        runtime.logical_changes=state;runtime.expanded=expanded;let target=runtime.target;
+        let mut app=crate::app::tests::context_inspector_test_app(false);app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        let task=app.handle_chat_ui(Action::CopyChangePatch(target,page.source.source_id.clone(),0));
+        let mut stream=iced::runtime::task::into_stream(task).unwrap();
+        let completed=loop {
+            if let Some(iced::runtime::Action::Output(cosmic::Action::App(message@Message::ChatUi(Action::CompleteChangeCopy(..)))))=stream.next().await {break message;}
+        };
+        drop(app.handle_chat_ui(Action::CopyLiteral("newer literal code".into())));
+        drop(app.handle_chat_ui(match completed {Message::ChatUi(action)=>action,_=>unreachable!()}));
+        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        assert!(app.chat_runtime_mut(target).unwrap().logical_changes.entries[&page.source].copy_error.is_none());
+    }
+
     #[test]
     fn reader_future_and_pending_output_are_send_without_ui_cache_owners() {
         fn assert_send<T:Send>() {}assert_send::<PendingPatch>();

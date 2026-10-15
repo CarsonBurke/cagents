@@ -24,6 +24,7 @@ mod fold;
 mod hover;
 mod hydration;
 mod changes_sources;
+mod clipboard_intent;
 mod changes_find;
 mod reader_source;
 mod images;
@@ -496,6 +497,7 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, and the
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
+    copy_intents: clipboard_intent::Intents,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -523,6 +525,7 @@ impl Default for State {
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             drafts: HashMap::new(),
+            copy_intents: clipboard_intent::Intents::default(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -7711,13 +7714,14 @@ impl Cagents {
                 }
             }
             Action::Copy(target, id, part) => {
+                let intent=self.chat_ui.copy_intents.next();
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
                 if runtime.logical_changes.epoch(&id).is_some() {
                     return match part {
-                        CopyPart::Text=>{runtime.logical_changes.request_copy_all(&id);changes_sources::copy_task(runtime,None)},
-                        CopyPart::Change(index)=>changes_sources::copy_task(runtime,Some((id,index))),
+                        CopyPart::Text=>{runtime.logical_changes.request_copy_all(&id,intent);changes_sources::copy_task(runtime,None)},
+                        CopyPart::Change(index)=>changes_sources::copy_task(runtime,Some((id,index,intent))),
                         _=>Task::none(),
                     };
                 }
@@ -7844,11 +7848,13 @@ impl Cagents {
                 if let Some(runtime)=self.chat_runtime_mut(target) {let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());runtime.logical_changes.retry(&item,index,find);runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);}
             }
             Action::CopyChangePatch(target,item,index)=>{
-                if let Some(runtime)=self.chat_runtime_mut(target) {return changes_sources::copy_task(runtime,Some((item,index)));}
+                let intent=self.chat_ui.copy_intents.next();
+                if let Some(runtime)=self.chat_runtime_mut(target) {return changes_sources::copy_task(runtime,Some((item,index,intent)));}
             }
             Action::CopyAllChangePatches(target,item)=>{
+                let intent=self.chat_ui.copy_intents.next();
                 if let Some(runtime)=self.chat_runtime_mut(target) {
-                    runtime.logical_changes.request_copy_all(&item);return changes_sources::copy_task(runtime,None);
+                    runtime.logical_changes.request_copy_all(&item,intent);return changes_sources::copy_task(runtime,None);
                 }
             }
             Action::CompleteChangeCopy(target,item,epoch,context,result)=>{
@@ -7910,6 +7916,7 @@ impl Cagents {
                 }
             }
             Action::CopyLiteral(text) => {
+                self.chat_ui.copy_intents.next();
                 self.status = Some(TransientNotice::success("Copied code block"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }
