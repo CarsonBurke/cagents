@@ -63,6 +63,9 @@ impl WorktreeAuthority {
         Ok(authority)
     }
 
+    pub(super) fn stable_private_metadata_path(&self) -> &Path { self.git_dir.path() }
+    pub(super) fn stable_common_metadata_path(&self) -> &Path { self.common_dir.path() }
+
     pub(super) fn private_metadata_path(&self) -> PathBuf { descriptor_path(&self.git_dir) }
     pub(super) fn common_metadata_path(&self) -> PathBuf { descriptor_path(&self.common_dir) }
 
@@ -191,10 +194,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if let Some(authority) = &self.authority {
             authority.validate()?;
             if let Ok(relative) = path.strip_prefix(authority.path()) {
+                if let Ok(metadata_relative) = relative.strip_prefix(".git")
+                    && !metadata_relative.as_os_str().is_empty()
+                { return Ok(authority.private_metadata_path().join(metadata_relative)); }
                 return Ok(authority.anchored_path().join(relative));
             }
         }
         Ok(path.to_path_buf())
+    }
+
+    pub(super) fn git_dir_for_io(&self, worktree: &Path, cancellation: &CancellationToken) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != worktree { return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.private_metadata_path());
+        }
+        self.git_dir(worktree, cancellation)
+    }
+
+    pub(super) fn common_dir_for_io(&self, worktree: &Path, cancellation: &CancellationToken) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != worktree { return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.common_metadata_path());
+        }
+        self.common_dir(worktree, cancellation)
     }
 
     pub(super) fn captured_worktree_root(&self, path: &Path) -> Result<fs_safety::Root, RepositoryError> {
