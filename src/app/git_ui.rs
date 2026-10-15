@@ -658,10 +658,14 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = ()> + Sen
 }
 
 impl Cagents {
+    pub(super) fn github_project_polling_ready(&self, project: ProjectId) -> bool {
+        self.review_repositories.get(&project).is_none_or(|repository| {
+            crate::github::polling::ready(&repository.host, false)
+        })
+    }
+
     pub(super) fn github_read_task(&mut self, project: ProjectId) -> Task<Message> {
-        if self.review_repositories.get(&project).is_some_and(|repository| {
-            !crate::github::polling::ready(&repository.host, false)
-        }) {
+        if !self.github_project_polling_ready(project) {
             return Task::none();
         }
         let Some(entry) = self.refresh_ui.git.entries.get_mut(&project) else {
