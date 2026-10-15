@@ -49,28 +49,64 @@ impl Locations {
     }
 }
 
-pub(crate) struct SavedUndo { pub source: PathBuf, pub disk_hash: blake3::Hash, pub history: History, pub cursor: Cursor }
+/// A history and the immutable metadata identities its presence edges name.
+/// Cloned Arcs retain the existing restoration permits; the cache cannot
+/// reconstruct or silently substitute a missing template.
+#[derive(Default)]
+pub(crate) struct SavedPresence {
+    pub present: bool,
+    pub id: u64,
+    pub next_id: u64,
+    pub deletion_mode: Option<u32>,
+    pub restorations: std::collections::BTreeMap<u64, std::sync::Arc<crate::editor::FileRestoration>>,
+    pub captured_ids: std::collections::BTreeSet<u64>,
+}
+pub(crate) struct SavedUndo { pub source: PathBuf, pub disk_hash: blake3::Hash, pub history: History, pub cursor: Cursor, pub root: Option<crate::editor::FileRootIdentity>, pub presence: SavedPresence }
+impl SavedUndo {
+    fn retained_bytes(&self) -> usize {
+        let mut seen = std::collections::BTreeSet::new();
+        self.presence.restorations.values().filter(|template| seen.insert(std::sync::Arc::as_ptr(template))).fold(
+            self.history.retained_bytes().saturating_add(std::mem::size_of::<Self>()).saturating_add(self.source.as_os_str().len()).saturating_add(self.presence.restorations.len().saturating_mul(96)).saturating_add(self.presence.captured_ids.len().saturating_mul(32)),
+            |bytes, template| bytes.saturating_add(template.retained_bytes()),
+        )
+    }
+}
 #[derive(Default)]
 pub(crate) struct UndoLru { entries: VecDeque<(PathBuf, SavedUndo)>, bytes: usize }
 impl UndoLru {
     pub fn insert(&mut self, path: PathBuf, mut undo: SavedUndo) {
         if let Some(index) = self.entries.iter().position(|(candidate, _)| *candidate == path) {
-            if let Some((_, previous)) = self.entries.remove(index) { self.bytes -= previous.history.retained_bytes(); }
+            if let Some((_, previous)) = self.entries.remove(index) { self.bytes -= previous.retained_bytes(); }
         }
         undo.history.seal();
-        let bytes = undo.history.retained_bytes();
+        let bytes = undo.retained_bytes();
         if bytes > 32 * 1024 * 1024 { return; }
         self.bytes += bytes;
         self.entries.push_back((path, undo));
         while self.entries.len() > 8 || self.bytes > 32 * 1024 * 1024 {
-            if let Some((_, oldest)) = self.entries.pop_front() { self.bytes -= oldest.history.retained_bytes(); }
+            if let Some((_, oldest)) = self.entries.pop_front() { self.bytes -= oldest.retained_bytes(); }
         }
     }
-    pub fn take(&mut self, path: &std::path::Path, source: &std::path::Path, hash: blake3::Hash) -> Option<SavedUndo> {
+    pub fn expected_absence(&self, path: &std::path::Path) -> Option<(PathBuf, crate::editor::FileRootIdentity)> {
+        self.entries.iter().find(|(candidate, _)| candidate == path)
+            .filter(|(_, undo)| !undo.presence.present).and_then(|(_, undo)| Some((undo.source.clone(), undo.root.clone()?)))
+    }
+    pub fn validate_root(&mut self, path: &std::path::Path, root: Option<&crate::editor::FileRootIdentity>) {
+        if self.entries.iter().any(|(candidate, undo)| candidate == path && undo.root.as_ref() != root) {
+            self.remove(path);
+        }
+    }
+    pub fn remove(&mut self, path: &std::path::Path) {
+        if let Some(index) = self.entries.iter().position(|(candidate, _)| candidate == path)
+            && let Some((_, previous)) = self.entries.remove(index) {
+            self.bytes -= previous.retained_bytes();
+        }
+    }
+    pub fn take(&mut self, path: &std::path::Path, source: &std::path::Path, hash: blake3::Hash, present: bool) -> Option<SavedUndo> {
         let index = self.entries.iter().position(|(candidate, _)| candidate == path)?;
         let (_, undo) = self.entries.remove(index)?;
-        self.bytes -= undo.history.retained_bytes();
-        (undo.source == source && undo.disk_hash == hash).then_some(undo)
+        self.bytes -= undo.retained_bytes();
+        (undo.source == source && undo.disk_hash == hash && undo.presence.present == present).then_some(undo)
     }
 }
 
@@ -102,11 +138,31 @@ mod tests {
         assert!(history.navigate(location("c", 4), true).is_none());
     }
     #[test]
+    fn eviction_releases_immutable_metadata_and_accounts_aliased_templates_once() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("source"), "saved").unwrap();
+        let root = std::sync::Arc::new(crate::editor::worktree_root(directory.path()).unwrap());
+        let template = crate::editor::capture_restoration_at(&root, std::path::Path::new("source"), blake3::hash(b"saved")).unwrap();
+        let weak = std::sync::Arc::downgrade(&template);
+        let mut presence = SavedPresence { present: true, ..Default::default() };
+        presence.restorations.insert(1, template.clone());
+        presence.restorations.insert(2, template.clone());
+        let saved = SavedUndo { source: "source".into(), disk_hash: blake3::hash(b"saved"), history: History::default(), cursor: location("", 0).cursor, root: Some(crate::editor::FileRootIdentity::of(root).unwrap()), presence };
+        assert_eq!(saved.retained_bytes(), std::mem::size_of::<SavedUndo>() + "source".len() + 2 * 96 + template.retained_bytes());
+        drop(template);
+        let mut cache = UndoLru::default(); cache.insert("retained".into(), saved);
+        assert!(weak.upgrade().is_some());
+        for index in 0..8 { cache.insert(format!("{index}").into(), SavedUndo { source: "source".into(), disk_hash: blake3::hash(b"saved"), history: History::default(), cursor: location("", 0).cursor, root: None, presence: SavedPresence { present: true, ..Default::default() } }); }
+        assert!(weak.upgrade().is_none(), "eviction must release the retained descriptor permit");
+        assert_eq!(cache.entries.len(), 8);
+    }
+
+    #[test]
     fn undo_lru_requires_matching_source_and_disk_hash_and_is_bounded() {
         let mut cache = UndoLru::default(); let hash = blake3::hash(b"same");
-        for index in 0..10 { cache.insert(format!("{index}").into(), SavedUndo { source: "source".into(), disk_hash: hash, history: History::default(), cursor: location("", 0).cursor }); }
-        assert!(cache.take(std::path::Path::new("0"), std::path::Path::new("source"), hash).is_none());
-        assert!(cache.take(std::path::Path::new("9"), std::path::Path::new("source"), blake3::hash(b"changed")).is_none());
-        assert!(cache.take(std::path::Path::new("8"), std::path::Path::new("source"), hash).is_some());
+        for index in 0..10 { cache.insert(format!("{index}").into(), SavedUndo { source: "source".into(), disk_hash: hash, history: History::default(), cursor: location("", 0).cursor, root: None, presence: SavedPresence { present: true, ..Default::default() } }); }
+        assert!(cache.take(std::path::Path::new("0"), std::path::Path::new("source"), hash, true).is_none());
+        assert!(cache.take(std::path::Path::new("9"), std::path::Path::new("source"), blake3::hash(b"changed"), true).is_none());
+        assert!(cache.take(std::path::Path::new("8"), std::path::Path::new("source"), hash, true).is_some());
     }
 }

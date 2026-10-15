@@ -226,6 +226,11 @@ pub struct LoadedFile {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileContent {
+    /// An unchanged absent baseline of a retained editor history. Only the
+    /// saved-history loader produces this after proving the selected path
+    /// still resolves to the same missing source; empty files stay Editable.
+    SavedAbsence,
+
     Editable {
         text: String,
         content_hash: blake3::Hash,
@@ -391,6 +396,45 @@ pub fn load_file(
 ) -> Result<LoadedFile, FileIoError> {
     let root = worktree_root(worktree)?;
     load_file_at(&root, relative_path, tone)
+}
+
+/// Filesystem identity of the root used by an asynchronous document read.
+#[derive(Debug, Clone)]
+pub struct FileRootIdentity { path: PathBuf, device: u64, inode: u64, _root: std::sync::Arc<Root> }
+impl PartialEq for FileRootIdentity {
+    fn eq(&self, other: &Self) -> bool { self.path == other.path && self.device == other.device && self.inode == other.inode }
+}
+impl Eq for FileRootIdentity {}
+impl FileRootIdentity {
+    pub(crate) fn of(root: std::sync::Arc<Root>) -> Result<Self, FileIoError> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = root.metadata().map_err(io_error)?;
+        Ok(Self { path: root.path().to_path_buf(), device: metadata.dev(), inode: metadata.ino(), _root: root })
+    }
+}
+
+/// Reopens a saved history without confusing a missing source with an empty
+/// present file. Follow the same bounded in-worktree link policy as normal
+/// loading and require the exact previously saved source before admitting it.
+pub(crate) fn load_file_with_saved_absence(root: &Root, path: &Path, tone: PdfTone, absent: Option<&Path>) -> Result<LoadedFile, FileIoError> {
+    if let Some(expected) = absent {
+        validate_repo_path(path)?;
+        let mut source = path.to_path_buf();
+        for _ in 0..=MAX_FOLLOWED_LINKS {
+            match fs_safety::metadata_beneath(&root, &source) {
+                Err(error) if error.is_not_found() && source == expected => {
+                    return Ok(LoadedFile { source, content: FileContent::SavedAbsence });
+                }
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = fs_safety::read_link_beneath(&root, &source).map_err(resolve_error)?;
+                    let Some(Some(next)) = link_target_beneath(&root, &source, &target) else { break; };
+                    source = next;
+                }
+                _ => break,
+            }
+        }
+    }
+    load_file_at(&root, path, tone)
 }
 
 pub(crate) fn load_file_at(root: &Root, relative_path: &Path, tone: PdfTone) -> Result<LoadedFile, FileIoError> {
@@ -1328,6 +1372,21 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn saved_absence_loader_distinguishes_empty_recreated_files_and_retargeted_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = worktree_root(directory.path()).unwrap();
+        std::os::unix::fs::symlink("missing.rs", directory.path().join("alias.rs")).unwrap();
+        assert!(matches!(load_file_with_saved_absence(&root, Path::new("alias.rs"), PdfTone::Original, Some(Path::new("missing.rs"))).unwrap().content, FileContent::SavedAbsence));
+        std::fs::write(directory.path().join("missing.rs"), "").unwrap();
+        assert!(matches!(load_file_with_saved_absence(&root, Path::new("alias.rs"), PdfTone::Original, Some(Path::new("missing.rs"))).unwrap().content, FileContent::Editable { .. }));
+        std::fs::remove_file(directory.path().join("missing.rs")).unwrap();
+        std::fs::remove_file(directory.path().join("alias.rs")).unwrap();
+        std::os::unix::fs::symlink("other.rs", directory.path().join("alias.rs")).unwrap();
+        assert!(!matches!(load_file_with_saved_absence(&root, Path::new("alias.rs"), PdfTone::Original, Some(Path::new("missing.rs"))).unwrap().content, FileContent::SavedAbsence));
+        assert!(!matches!(load_file_with_saved_absence(&root, Path::new("new.rs"), PdfTone::Original, None), Ok(LoadedFile { content: FileContent::SavedAbsence, .. })));
+    }
 
     #[test]
     fn external_sources_are_bounded_regular_utf8_without_binary_or_directory_reads() {

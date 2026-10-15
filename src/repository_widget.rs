@@ -711,7 +711,7 @@ pub enum RepositoryAction {
         request: u64,
         result: Result<crate::editor::BinaryPreview, FileIoError>,
     },
-    ConfiguredFileLoaded { identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, indentation: crate::editor_indent::Overrides },
+    ConfiguredFileLoaded { identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, indentation: crate::editor_indent::Overrides, root: Option<crate::editor::FileRootIdentity> },
     OpenWorkingFileLocation {
         identity: AsyncIdentity,
         line: usize,
@@ -1049,6 +1049,7 @@ struct EditorDocument {
     presence_id: u64,
     saved_presence_id: u64,
     next_presence_id: u64,
+    undo_root: Option<crate::editor::FileRootIdentity>,
     restorations: std::collections::BTreeMap<u64, Arc<FileRestoration>>,
     captured_presence_ids: std::collections::BTreeSet<u64>,
     markdown: bool,
@@ -1154,6 +1155,7 @@ impl EditorDocument {
             presence_id: 0,
             saved_presence_id: 0,
             next_presence_id: 0,
+            undo_root: None,
             restorations: std::collections::BTreeMap::new(),
             captured_presence_ids: std::collections::BTreeSet::new(),
             markdown,
@@ -1254,6 +1256,21 @@ impl EditorDocument {
                 Applied::Unchanged
             }
         }
+    }
+
+    fn restore_undo(&mut self, retained: crate::editor_navigation::SavedUndo) {
+        self.history = retained.history;
+        self.saved_history_revision = self.history.revision();
+        self.content.set_cursor(retained.cursor);
+        self.present = retained.presence.present;
+        self.saved_present = retained.presence.present;
+        self.presence_id = retained.presence.id;
+        self.saved_presence_id = retained.presence.id;
+        self.next_presence_id = retained.presence.next_id;
+        self.deletion_mode = retained.presence.deletion_mode;
+        self.restorations = retained.presence.restorations;
+        self.captured_presence_ids = retained.presence.captured_ids;
+        self.prune_restorations();
     }
 
     fn prune_restorations(&mut self) {
@@ -6497,10 +6514,12 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
-            RepositoryAction::ConfiguredFileLoaded { identity, result, indentation } => {
+            RepositoryAction::ConfiguredFileLoaded { identity, result, indentation, root } => {
                 let current = self.accepts_selected(&identity);
+                if current { self.undo_lru.validate_root(&identity.path, root.as_ref()); }
                 let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
                 if current && let DocumentState::Editable(document) = &mut self.document {
+                    document.undo_root = root;
                     document.indentation = indentation;
                     document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, indentation));
                 }
@@ -6826,6 +6845,9 @@ impl RepositoryRuntime {
                 let restored_focus = self
                     .restores_editor_navigation(&identity)
                     .then(|| identity.clone());
+                if !matches!(&result, Ok(LoadedFile { content: FileContent::Editable { .. } | FileContent::SavedAbsence, .. })) {
+                    self.undo_lru.remove(&identity.path);
+                }
                 self.document = match result {
                     Ok(LoadedFile {
                         source,
@@ -6836,14 +6858,23 @@ impl RepositoryRuntime {
                                 markdown,
                             },
                     }) => {
-                        let retained = self.undo_lru.take(&identity.path, &source, content_hash);
+                        let retained = self.undo_lru.take(&identity.path, &source, content_hash, true);
                         let mut document = EditorDocument::new(identity.path, source, text, content_hash, markdown);
                         if let Some(retained) = retained {
-                            document.history = retained.history;
-                            document.saved_history_revision = document.history.revision();
-                            document.content.set_cursor(retained.cursor);
+                            document.restore_undo(retained);
                         }
                         DocumentState::Editable(document)
+                    },
+                    Ok(LoadedFile { source, content: FileContent::SavedAbsence }) => {
+                        match self.undo_lru.take(&identity.path, &source, blake3::hash(b""), false) {
+                            Some(retained) => {
+                                let markdown = source.extension().is_some_and(|ext| matches!(ext.to_str(), Some("md" | "markdown")));
+                                let mut document = EditorDocument::new(identity.path, source, String::new(), blake3::hash(b""), markdown);
+                                document.restore_undo(retained);
+                                DocumentState::Editable(document)
+                            }
+                            None => DocumentState::Failed { path: identity.path, message: "The retained missing-file history is no longer available.".into() },
+                        }
                     },
                     Ok(LoadedFile {
                         source,
@@ -8646,7 +8677,8 @@ impl RepositoryRuntime {
         self.markdown_mode = MarkdownMode::Edit;
         self.document_tone = pdf_tone(&cosmic::theme::active());
         let identity = self.next_identity(card, path);
-        file_task(identity, self.document_tone)
+        let absent = self.undo_lru.expected_absence(&identity.path);
+        file_task(identity, self.document_tone, absent)
     }
 
     fn diff_mode_index(&self) -> usize {
@@ -8887,10 +8919,16 @@ impl RepositoryRuntime {
         }
         if let DocumentState::Editable(document) = &mut self.document
             && !document.dirty && document.active_save.is_none() && document.durability_warning.is_none()
-            && document.saved_present && document.history.retained_presence_ids().next().is_none() {
+            && document.workspace_edit.is_none() && !document.conflict && !document.external_check_pending && document.error.is_none() && !document.external_deleted
+            && (document.undo_root.is_some() || (document.saved_present && document.history.retained_presence_ids().next().is_none())) {
             self.undo_lru.insert(document.path.clone(), crate::editor_navigation::SavedUndo {
                 source: document.source.clone(), disk_hash: document.disk_hash,
-                history: std::mem::take(&mut document.history), cursor: document.content.cursor(),
+                history: std::mem::take(&mut document.history), cursor: document.content.cursor(), root: document.undo_root.clone(),
+                presence: crate::editor_navigation::SavedPresence {
+                    present: document.saved_present, id: document.saved_presence_id,
+                    next_id: document.next_presence_id, deletion_mode: document.deletion_mode,
+                    restorations: document.restorations.clone(), captured_ids: document.captured_presence_ids.clone(),
+                },
             });
         }
         self.capture_native_viewport();
@@ -9275,19 +9313,28 @@ fn page_edge(theme: &cosmic::Theme) -> cosmic::widget::container::Style {
 }
 
 /// Reads the file, rendering a document's first page with `tone`.
-fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone) -> Task<RepositoryAction> {
+fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone, absent: Option<(PathBuf, crate::editor::FileRootIdentity)>) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
         let loaded = tokio::task::spawn_blocking(move || {
             let indentation = crate::editor_indent::read(&worktree, &path);
-            (load_file(&worktree, &path, tone), indentation)
+            let opened = crate::editor::worktree_root(&worktree).and_then(|root| {
+                let root = Arc::new(root);
+                let identity = crate::editor::FileRootIdentity::of(root.clone())?;
+                let absent = absent.as_ref().filter(|(_, expected)| *expected == identity).map(|(source, _)| source.as_path());
+                Ok((crate::editor::load_file_with_saved_absence(&root, &path, tone, absent), identity))
+            });
+            match opened {
+                Ok((result, root)) => (result, indentation, Some(root)),
+                Err(error) => (Err(error), indentation, None),
+            }
         })
             .await
             .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
             ;
-        let (result, indentation) = loaded.unwrap_or_else(|error| (Err(error), crate::editor_indent::Overrides::default()));
-        RepositoryAction::ConfiguredFileLoaded { identity, result, indentation }
+        let (result, indentation, root) = loaded.unwrap_or_else(|error| (Err(error), crate::editor_indent::Overrides::default(), None));
+        RepositoryAction::ConfiguredFileLoaded { identity, result, indentation, root }
     })
 }
 
@@ -13825,9 +13872,66 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), "external third\n");
         assert_eq!(std::fs::metadata(root.join(path)).unwrap().mode() & 0o777, 0o640);
         assert!(!runtime.is_dirty());
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.undo_root = Some(crate::editor::FileRootIdentity::of(Arc::new(crate::editor::worktree_root(root).unwrap())).unwrap());
+        }
         runtime.retain_viewports();
-        assert!(runtime.undo_lru.take(path, path, blake3::hash(b"external third\n")).is_none(), "text-only LRU must not detach live metadata lineage from its Undo");
-        assert!(runtime.can_step_editor_history(false));
+        let retained = runtime.undo_lru.take(path, path, blake3::hash(b"external third\n"), true).expect("metadata lineage stays with history");
+        assert!(Arc::ptr_eq(retained.presence.restorations.get(&2).unwrap(), &restoration));
+        assert_eq!(retained.presence.restorations.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn per_file_undo_retains_absence_metadata_and_refuses_recreation_and_root_replacement() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap(); let root = directory.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "original\n").unwrap();
+        std::fs::write(root.join("b.rs"), "other\n").unwrap();
+        std::fs::set_permissions(root.join("a.rs"), std::fs::Permissions::from_mode(0o640)).unwrap();
+        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "original\n");
+        runtime.descriptor.worktree = root.clone(); runtime.standalone = true; runtime.set_auto_save(false);
+        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &mut runtime.document else { panic!("loaded A"); };
+        let before = document.content.cursor();
+        let change = document.content.replacement_to_text("").unwrap();
+        assert!(ProtocolTracked { content: &mut document.content, edits: Vec::new() }.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks));
+        document.next_presence_id = 1; document.presence_id = 1; document.present = false; document.deletion_mode = Some(0o100644);
+        document.history.record_group_with_presence_identities(vec![change], before, document.content.cursor(), Instant::now(), Some(((true, 1), (false, 1))));
+        document.text_changed();
+        let task = runtime.request_save_inner(card, false, false); finish_navigation_task(&mut runtime, task).await;
+        assert!(!root.join("a.rs").exists()); assert!(!runtime.is_dirty());
+        let template = match &runtime.document { DocumentState::Editable(document) => document.restorations.get(&1).unwrap().clone(), _ => panic!() };
+        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        assert!(!runtime.saved_file_present()); assert!(!runtime.desired_file_present());
+        assert!(matches!(&runtime.document, DocumentState::Editable(document) if Arc::ptr_eq(document.restorations.get(&1).unwrap(), &template)));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("original\n"));
+        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(std::fs::read(root.join("a.rs")).unwrap(), b"original\n");
+        assert_eq!(std::fs::metadata(root.join("a.rs")).unwrap().mode() & 0o777, 0o640);
+        assert!(!runtime.is_dirty());
+        // Present metadata-bearing histories survive the same round trip.
+        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        let task = runtime.request_save_inner(card, false, false); finish_navigation_task(&mut runtime, task).await;
+        assert!(!root.join("a.rs").exists());
+        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        // A recreated empty file has the same empty hash but different presence.
+        std::fs::write(root.join("a.rs"), "").unwrap();
+        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        assert!(runtime.saved_file_present()); assert!(!runtime.can_step_editor_history(false));
+        // Cache an ordinary edit, then replace the root with identical bytes.
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        std::fs::rename(&root, directory.path().join("retired")).unwrap();
+        std::fs::create_dir(&root).unwrap(); std::fs::write(root.join("a.rs"), "x").unwrap();
+        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some("x"));
+        assert!(!runtime.can_step_editor_history(false), "same bytes in a different checkout cannot adopt old metadata/history");
     }
 
     #[tokio::test]
@@ -20567,7 +20671,7 @@ mod tests {
         assert!(!runtime.observes_open_sources());
         assert!(runtime.disk_poll.is_none());
         let identity = runtime.current_identity(card, "file.rs".into());
-        drop(runtime.update(RepositoryAction::ConfiguredFileLoaded { identity, result: Err(FileIoError::Io("old read".into())), indentation: crate::editor_indent::Overrides::default() }));
+        drop(runtime.update(RepositoryAction::ConfiguredFileLoaded { identity, result: Err(FileIoError::Io("old read".into())), indentation: crate::editor_indent::Overrides::default(), root: None }));
         assert_eq!(runtime.editor_text().as_deref(), Some("A"));
         assert!(runtime.workspace_edit_pending());
         runtime.cancel_workspace_edit(1);
