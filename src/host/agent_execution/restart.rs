@@ -189,7 +189,8 @@ pub(in crate::host) fn restore_restart_pair(host: &SharedHost, client: super::su
                     .ok_or("The paired console restart did not return its exact receipt".into());
             }
             Kind::Codex(recipe) => {
-                super::super::chat::codex_terminal_view(host,client,session.id,&handle,session.clone(),recipe.clone())
+                let (directory, execution) = plan.execution_directory()?;
+                super::super::chat::codex_terminal_view_at_directory(host,client,session.id,&handle,session.clone(),recipe.clone(),&directory,execution)
                     .map_err(|error|error.message)?;
             }
             Kind::None => {}
