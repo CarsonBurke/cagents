@@ -6,11 +6,12 @@ use crate::chat::protocol::CanonicalItemKey;
 pub(super) const SCHEMA: &str = "CREATE TABLE child_tools(agent TEXT NOT NULL,id TEXT NOT NULL,metadata BLOB NOT NULL,len0 INTEGER NOT NULL,len1 INTEGER NOT NULL,spans BLOB NOT NULL,cost INTEGER NOT NULL,PRIMARY KEY(agent,id));
 CREATE TABLE child_tool_chunks(agent TEXT NOT NULL,id TEXT NOT NULL,field INTEGER NOT NULL,position INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(agent,id,field,position),FOREIGN KEY(agent,id) REFERENCES child_tools(agent,id) ON DELETE CASCADE);
 CREATE TABLE child_tool_revoked(agent TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(agent,id));
-CREATE TABLE child_tool_budget(singleton INTEGER PRIMARY KEY CHECK(singleton=1),bytes INTEGER NOT NULL,items INTEGER NOT NULL);
-INSERT INTO child_tool_budget VALUES(1,0,0);";
+CREATE TABLE child_tool_budget(singleton INTEGER PRIMARY KEY CHECK(singleton=1),bytes INTEGER NOT NULL,items INTEGER NOT NULL,chunks INTEGER NOT NULL);
+INSERT INTO child_tool_budget VALUES(1,0,0,0);";
 const ITEM_BYTES: usize = 64 * 1024 * 1024;
 const STORE_BYTES: usize = 256 * 1024 * 1024;
 const STORE_ITEMS: usize = 8192;
+const STORE_CHUNKS: usize = 65536;
 const PENDING_BYTES: usize = 64 * 1024;
 const KEY_BYTES: usize = 4096;
 const SOURCE_ERROR: &str = "Exact delegated tool source could not be updated; its recorded source was preserved and no replacement tool was invented";
@@ -36,8 +37,9 @@ impl Store {
         let tx = self.db.transaction().map_err(|e| e.to_string())?;
         let cost: Option<usize> = tx.query_row("SELECT cost FROM child_tools WHERE agent=?1 AND id=?2",params![agent,id],|row|row.get(0)).optional().map_err(|e| e.to_string())?;
         if let Some(cost) = cost {
+            let chunks:usize=tx.query_row("SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2",params![agent,id],|row|row.get(0)).map_err(|e|e.to_string())?;
             tx.execute("DELETE FROM child_tools WHERE agent=?1 AND id=?2",params![agent,id]).map_err(|e| e.to_string())?;
-            tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1,items=items-1 WHERE singleton=1",[cost]).map_err(|e| e.to_string())?;
+            tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1,items=items-1,chunks=chunks-?2 WHERE singleton=1",params![cost,chunks]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
     }
@@ -50,11 +52,12 @@ impl Store {
         let tx=self.db.transaction().map_err(|e|e.to_string())?;
         let cost:Option<usize>=tx.query_row("SELECT cost FROM child_tools WHERE agent=?1 AND id=?2",params![agent,id],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
         if let Some(cost)=cost {
+            let chunks:usize=tx.query_row("SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2",params![agent,id],|row|row.get(0)).map_err(|e|e.to_string())?;
             tx.execute("DELETE FROM child_tools WHERE agent=?1 AND id=?2",params![agent,id]).map_err(|e|e.to_string())?;
             tx.execute("INSERT OR IGNORE INTO child_tool_revoked VALUES(?1,?2)",params![agent,id]).map_err(|e|e.to_string())?;
             // Keep only the bounded key until Reset. Late adapter updates may
             // not re-create a body the provider explicitly removed.
-            tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1+?2 WHERE singleton=1",params![cost,agent.len()+id.len()+64]).map_err(|e|e.to_string())?;
+            tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1+?2,chunks=chunks-?3 WHERE singleton=1",params![cost,agent.len()+id.len()+64,chunks]).map_err(|e|e.to_string())?;
         }
         tx.commit().map_err(|e|e.to_string())
     }
@@ -66,7 +69,7 @@ impl Store {
             Event::Reset { .. } => {
                 self.pending_child_tool = None;
                 self.child_tools_unavailable = None;
-                self.db.execute_batch("DELETE FROM child_tools; DELETE FROM child_tool_revoked; UPDATE child_tool_budget SET bytes=0,items=0 WHERE singleton=1;").map_err(|e| e.to_string())?;
+                self.db.execute_batch("DELETE FROM child_tools; DELETE FROM child_tool_revoked; UPDATE child_tool_budget SET bytes=0,items=0,chunks=0 WHERE singleton=1;").map_err(|e| e.to_string())?;
                 return Ok(None);
             }
             Event::SubagentItemsRemoved { id, ids } => {
@@ -94,7 +97,8 @@ impl Store {
             else {self.pending_child_tool=Some(Pending {agent:agent.clone(),id:id.clone(),input,offset,delta:delta.clone()});}
             return Ok(None);
         }
-        if let Some(warning)=self.flush_child_tool()? {return Ok(Some(warning));}
+        let replaces_pending=match event {Event::SubagentItem{id,item}=>self.pending_child_tool.as_ref().is_some_and(|pending|pending.agent==*id && pending.id==item.id),Event::SubagentTextDelta{id,item_id,..}=>self.pending_child_tool.as_ref().is_some_and(|pending|pending.agent==*id && pending.id==*item_id),_=>false};
+        if replaces_pending && let Some(warning)=self.flush_child_tool()? {return Ok(Some(warning));}
         if let Event::SubagentItem { id, item } = event {
             return self.put_child_tool(id,item);
         }
@@ -140,15 +144,18 @@ impl Store {
         if metadata.len()>METADATA_LIMIT || spans.len()>METADATA_LIMIT {return Ok(self.child_source_refused(BUDGET_ERROR));}
         let preserve_input=matches!(&original.content,ItemContent::Tool{input,..} if input.is_empty()) && previous.as_ref().is_some_and(|(_,_,bytes)|postcard::from_bytes::<Item>(bytes).is_ok_and(|old|matches!(old.content,ItemContent::Tool{..})));
         if preserve_input {lengths[0]=previous.as_ref().unwrap().1;}
-        let cost=identity.saturating_add(metadata.len()).saturating_add(spans.len()).saturating_add(lengths[0]).saturating_add(lengths[1]);
-        let (total,count):(usize,usize)=self.db.query_row("SELECT bytes,items FROM child_tool_budget WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|e|e.to_string())?;
-        if lengths[0].saturating_add(lengths[1])>ITEM_BYTES || total.saturating_sub(previous.as_ref().map_or(0,|row|row.0)).saturating_add(cost)>STORE_BYTES || previous.is_none() && count>=STORE_ITEMS {return Ok(self.child_source_refused(BUDGET_ERROR));}
+        let old_chunks:usize=self.db.query_row("SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2",params![agent,id],|row|row.get(0)).map_err(|e|e.to_string())?;
+        let input_chunks=if preserve_input {self.db.query_row("SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2 AND field=0",params![agent,id],|row|row.get::<_,usize>(0)).map_err(|e|e.to_string())?} else {fragment_chunks(&bodies[0])};
+        let chunks=input_chunks.saturating_add(fragment_chunks(&bodies[1]));
+        let cost=identity.saturating_add(metadata.len()).saturating_add(spans.len()).saturating_add(lengths[0]).saturating_add(lengths[1]).saturating_add(chunks.saturating_mul(chunk_cost(agent,id)));
+        let (total,count,total_chunks):(usize,usize,usize)=self.db.query_row("SELECT bytes,items,chunks FROM child_tool_budget WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|e|e.to_string())?;
+        if lengths[0].saturating_add(lengths[1])>ITEM_BYTES || total.saturating_sub(previous.as_ref().map_or(0,|row|row.0)).saturating_add(cost)>STORE_BYTES || previous.is_none() && count>=STORE_ITEMS || total_chunks.saturating_sub(old_chunks).saturating_add(chunks)>STORE_CHUNKS {return Ok(self.child_source_refused(BUDGET_ERROR));}
         let tx=self.db.transaction().map_err(|e|e.to_string())?;
         tx.execute("INSERT INTO child_tools VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(agent,id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,spans=excluded.spans,cost=excluded.cost",params![agent,id,metadata,lengths[0],lengths[1],spans,cost]).map_err(|e|e.to_string())?;
         tx.execute("DELETE FROM child_tool_chunks WHERE agent=?1 AND id=?2 AND (?3=0 OR field=1)",params![agent,id,preserve_input]).map_err(|e|e.to_string())?;
         if !preserve_input {insert_fragments(&tx,agent,id,0,0,&bodies[0])?;}
         insert_fragments(&tx,agent,id,1,0,&bodies[1])?;
-        tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1+?2,items=items+?3 WHERE singleton=1",params![previous.as_ref().map_or(0,|row|row.0),cost,usize::from(previous.is_none())]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1+?2,items=items+?3,chunks=chunks-?4+?5 WHERE singleton=1",params![previous.as_ref().map_or(0,|row|row.0),cost,usize::from(previous.is_none()),old_chunks,chunks]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(None)
     }
@@ -169,19 +176,22 @@ impl Store {
         let field=match item.content {ItemContent::Tool{..}=>if input {0}else{1},ItemContent::Command{..} if !input=>0,_=>return Ok(self.child_source_refused(SOURCE_ERROR))};
         let length=if field==0 {len0}else{len1};
         if offset!=length {return Ok(self.child_source_refused(SOURCE_ERROR));}
-        let total:usize=self.db.query_row("SELECT bytes FROM child_tool_budget WHERE singleton=1",[],|row|row.get(0)).map_err(|e|e.to_string())?;
-        if len0.saturating_add(len1).saturating_add(delta.len())>ITEM_BYTES || total.saturating_add(delta.len())>STORE_BYTES {return Ok(self.child_source_refused(BUDGET_ERROR));}
+        let (total,total_chunks):(usize,usize)=self.db.query_row("SELECT bytes,chunks FROM child_tool_budget WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|e|e.to_string())?;
+        let chunks=delta.len().div_ceil(PART_BYTES);
+        let cost=delta.len().saturating_add(chunks.saturating_mul(chunk_cost(agent,id)));
+        if len0.saturating_add(len1).saturating_add(delta.len())>ITEM_BYTES || total.saturating_add(cost)>STORE_BYTES || total_chunks.saturating_add(chunks)>STORE_CHUNKS {return Ok(self.child_source_refused(BUDGET_ERROR));}
         let tx=self.db.transaction().map_err(|e|e.to_string())?;
         insert_fragments(&tx,agent,id,field,offset,&[delta])?;
-        let update=if field==0 {"UPDATE child_tools SET len0=len0+?3,cost=cost+?3 WHERE agent=?1 AND id=?2"}else{"UPDATE child_tools SET len1=len1+?3,cost=cost+?3 WHERE agent=?1 AND id=?2"};
-        tx.execute(update,params![agent,id,delta.len()]).map_err(|e|e.to_string())?;
-        tx.execute("UPDATE child_tool_budget SET bytes=bytes+?1 WHERE singleton=1",[delta.len()]).map_err(|e|e.to_string())?;
+        let update=if field==0 {"UPDATE child_tools SET len0=len0+?3,cost=cost+?4 WHERE agent=?1 AND id=?2"}else{"UPDATE child_tools SET len1=len1+?3,cost=cost+?4 WHERE agent=?1 AND id=?2"};
+        tx.execute(update,params![agent,id,delta.len(),cost]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE child_tool_budget SET bytes=bytes+?1,chunks=chunks+?2 WHERE singleton=1",params![cost,chunks]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e|e.to_string())?;Ok(None)
     }
 
     pub(super) fn child_adapter_item(&mut self,key:&CanonicalItemKey)->Result<Option<Item>,String> {
         if let Some(reason)=self.child_tools_unavailable {return Err(reason.into());}
-        if let Some(warning)=self.flush_child_tool()? {return Err(warning);}
+        if self.pending_child_tool.as_ref().is_some_and(|pending|Some(&pending.agent)==key.agent_id.as_ref() && pending.id==key.item_id)
+            && let Some(warning)=self.flush_child_tool()? {return Err(warning);}
         if let Some(reason)=self.child_tools_unavailable {return Err(reason.into());}
         let agent=key.agent_id.as_ref().ok_or("A delegated tool requires its exact child identity")?;
         if agent.len()>KEY_BYTES || key.item_id.len()>KEY_BYTES {return Err("Delegated tool identity exceeds its canonical limit".into());}
@@ -224,21 +234,15 @@ impl Store {
     }
 }
 
+fn chunk_cost(agent:&str,id:&str)->usize {agent.len().saturating_add(id.len()).saturating_add(64)}
+fn fragment_chunks(fragments:&[&str])->usize {fragments.iter().map(|fragment|fragment.len().div_ceil(PART_BYTES)).sum()}
+
 fn insert_fragments(tx:&rusqlite::Transaction<'_>,agent:&str,id:&str,field:i64,mut offset:usize,fragments:&[&str])->Result<(),String> {
-    // Refill the final partial chunk. Interleaved one-byte deltas must not
-    // turn a bounded body into millions of SQLite rows and duplicated keys.
-    let previous:Option<(usize,Option<Vec<u8>>)>=tx.query_row("SELECT position,CASE WHEN length(data)<=?4 THEN data ELSE NULL END FROM child_tool_chunks WHERE agent=?1 AND id=?2 AND field=?3 ORDER BY position DESC LIMIT 1",params![agent,id,field,PART_BYTES],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|e|e.to_string())?;
-    let (mut position,mut buffer)=match previous {
-        Some((position,bytes))=>{let bytes=bytes.ok_or("Delegated tool has an oversized canonical chunk")?;if position.checked_add(bytes.len())!=Some(offset) || bytes.is_empty() {return Err("Delegated tool append is not contiguous with its stored source".into());}if bytes.len()<PART_BYTES {(position,bytes)}else{(offset,Vec::new())}},
-        None if offset==0=>(0,Vec::new()),
-        None=>return Err("Delegated tool append is missing its original source".into()),
-    };
-    let mut statement=tx.prepare_cached("INSERT INTO child_tool_chunks VALUES(?1,?2,?3,?4,?5) ON CONFLICT(agent,id,field,position) DO UPDATE SET data=excluded.data").map_err(|e|e.to_string())?;
-    for fragment in fragments {let mut remaining=fragment.as_bytes();while !remaining.is_empty() {
-        let keep=(PART_BYTES-buffer.len()).min(remaining.len());buffer.extend_from_slice(&remaining[..keep]);remaining=&remaining[keep..];offset=offset.checked_add(keep).ok_or("Delegated tool chunk offset overflow")?;
-        if buffer.len()==PART_BYTES {statement.execute(params![agent,id,field,position,buffer]).map_err(|e|e.to_string())?;position=offset;buffer.clear();}
-    }}
-    if !buffer.is_empty() {statement.execute(params![agent,id,field,position,buffer]).map_err(|e|e.to_string())?;}
+    // Append only new bytes. Rewriting the final partial chunk on each child
+    // switch amplifies tiny deltas into repeated 128 KiB writes. Row/key cost
+    // and total chunk count are separately charged to the namespace budget.
+    let mut statement=tx.prepare_cached("INSERT INTO child_tool_chunks VALUES(?1,?2,?3,?4,?5)").map_err(|e|e.to_string())?;
+    for fragment in fragments {for bytes in fragment.as_bytes().chunks(PART_BYTES) {statement.execute(params![agent,id,field,offset,bytes]).map_err(|e|e.to_string())?;offset=offset.checked_add(bytes.len()).ok_or("Delegated tool chunk offset overflow")?;}}
     Ok(())
 }
 
@@ -297,20 +301,55 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_token_deltas_keep_one_small_pending_batch_and_coalesced_disk_chunks() {
+    fn unrelated_status_keeps_one_small_pending_batch_until_a_matching_read_or_switch() {
         let mut store=Store::new().unwrap();put(&mut store,"child",tool("tool","",""));
         for offset in 0..4096 {
             store.apply(Event::SubagentInputDelta{id:"child".into(),item_id:"tool".into(),offset,delta:"x".into()}).unwrap();
             assert!(store.pending_child_tool.as_ref().is_none_or(|pending|pending.delta.len()<=PENDING_BYTES));
-            // Force a flush between tiny deltas: disk rows must still coalesce.
+            // Unrelated status must not force a transaction for each token.
             store.apply(Event::Status{busy:true,detail:"working".into()}).unwrap();
         }
-        assert_eq!(store.db.query_row("SELECT count(*) FROM child_tool_chunks",[],|r|r.get::<_,usize>(0)).unwrap(),1);
+        assert_eq!(store.db.query_row("SELECT count(*) FROM child_tool_chunks",[],|r|r.get::<_,usize>(0)).unwrap(),0);
         for offset in 0..1024 {store.apply(Event::SubagentOutputDelta{id:"child".into(),item_id:"tool".into(),offset,delta:"y".into()}).unwrap();}
         let item=read(&mut store,"child","tool").unwrap();
         assert!(matches!(item.content,ItemContent::Tool{input,output,..} if input=="x".repeat(4096) && output=="y".repeat(1024)));
         assert!(store.pending_child_tool.is_none());
         assert_eq!(store.db.query_row("SELECT count(*) FROM child_tool_chunks",[],|r|r.get::<_,usize>(0)).unwrap(),2);
+    }
+
+    fn cache_writes(store:&Store,reset:bool)->usize {
+        let (mut current,mut high)=(0,0);
+        // Read SQLite's actual dirty-cache page-write counter, rather than
+        // inferring write volume from the number of rows left afterward.
+        let result=unsafe {rusqlite::ffi::sqlite3_db_status(store.db.handle(),rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,&mut current,&mut high,i32::from(reset))};
+        assert_eq!(result,rusqlite::ffi::SQLITE_OK);
+        usize::try_from(current).unwrap()
+    }
+
+    #[test]
+    fn switching_children_with_fifty_byte_deltas_never_rewrites_old_tool_body_pages() {
+        const STEPS:usize=128;
+        fn workload(previous_output:usize)->usize {
+            let mut store=Store::new().unwrap();
+            store.db.execute_batch("PRAGMA cache_size=-64").unwrap();
+            for child in ["one","two"] {put(&mut store,child,tool("tool","",&"x".repeat(previous_output)));}
+            cache_writes(&store,true);
+            for step in 0..STEPS {
+                store.apply(Event::SubagentOutputDelta{id:if step%2==0 {"one"}else{"two"}.into(),item_id:"tool".into(),offset:previous_output+(step/2)*50,delta:"y".repeat(50)}).unwrap();
+                store.apply(Event::Status{busy:true,detail:"interleaved status".into()}).unwrap();
+            }
+            assert!(store.flush_child_tool().unwrap().is_none());
+            let writes=cache_writes(&store,false);
+            assert!(writes>0,"the counter must observe actual canonical commits");
+            assert!(writes<=STEPS*16+64,"bounded dirty page writes, observed {writes}");
+            for child in ["one","two"] {
+                assert!(matches!(read(&mut store,child,"tool").unwrap().content,ItemContent::Tool{output,..} if output.len()==previous_output+STEPS/2*50 && output.ends_with(&"y".repeat(STEPS/2*50))));
+            }
+            writes
+        }
+        let short=workload(0);
+        let almost_full=workload(PART_BYTES-8192);
+        assert!(almost_full<=short+STEPS*4,"append I/O must not scale with already recorded body: short={short}, long={almost_full}");
     }
 
     #[test]
@@ -354,10 +393,13 @@ mod tests {
 
     #[test]
     fn source_budget_or_bad_append_fails_explicitly_without_serving_stale_records() {
-        for count_limit in [false,true] {
+        for limit in 0..3 {
             let mut store=Store::new().unwrap();put(&mut store,"child",tool("old","preserved",""));
-            if count_limit {store.db.execute("UPDATE child_tool_budget SET items=?1",[STORE_ITEMS]).unwrap();}
-            else {store.db.execute("UPDATE child_tool_budget SET bytes=?1",[STORE_BYTES]).unwrap();}
+            match limit {
+                0=>{store.db.execute("UPDATE child_tool_budget SET bytes=?1",[STORE_BYTES]).unwrap();},
+                1=>{store.db.execute("UPDATE child_tool_budget SET items=?1",[STORE_ITEMS]).unwrap();},
+                _=>{store.db.execute("UPDATE child_tool_budget SET chunks=?1",[STORE_CHUNKS]).unwrap();},
+            }
             let warnings=store.apply(Event::SubagentItem{id:"child".into(),item:tool("new","over budget","")}).unwrap();
             assert!(warnings.iter().any(|event|matches!(event,Event::Error{fatal:false,..})));
             assert!(store.child_adapter_item(&CanonicalItemKey::new(Some("child"),"old")).is_err());
