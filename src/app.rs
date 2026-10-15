@@ -7074,7 +7074,11 @@ impl Cagents {
         // A successful attachment completes hydration even when the provider
         // has not enriched the already-saved descriptor yet.
         self.lifecycle.remove(card);
-        if let Some(state) = self.card_state_mut(card) {
+        if self
+            .card_state(card)
+            .is_some_and(|state| state.residency != Residency::Hot)
+            && let Some(state) = self.card_state_mut(card)
+        {
             state.residency = Residency::Hot;
         }
         if unchanged {
