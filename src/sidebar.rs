@@ -7284,14 +7284,22 @@ fn files_section<'a>(
             query,
         });
     }
-    let folded = fold(state.files_query().trim());
+    if !modal_open
+        && let Some((path, _, _)) = crate::editor_navigation::parse_location(state.files_query().trim()) {
+        let candidate = PathBuf::from(path);
+        let relative = if candidate.is_absolute() { candidate.strip_prefix(&key.canonical_path).ok().map(Path::to_path_buf) } else { Some(candidate) };
+        if let Some(path) = relative.and_then(|path| RepoPath::parse(path).ok()) {
+            filter = filter.on_submit(SidebarAction::OpenFile { key: key.clone(), path });
+        }
+    }
+    let folded = fold(&crate::editor_navigation::file_query(state.files_query().trim()));
     // File browsing is always a tree: the flat list exists only for
     // diff/change review. A text filter still flattens to matching files.
     let flat = !folded.is_empty();
     let (visible, hidden, notice): (Vec<&FileRow>, usize, Option<&str>) = match &source.file_search
     {
         FileSearch::Pending { query }
-            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() =>
         {
             let (visible, hidden) = file_row_page(
                 &source.files,
@@ -7308,12 +7316,12 @@ fn files_section<'a>(
             query,
             files,
             hidden,
-        } if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() => {
+        } if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() => {
             let notice = files.is_empty().then_some("No files match this filter.");
             (files.iter().collect(), *hidden, notice)
         }
         FileSearch::Failed { query, message }
-            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() =>
         {
             (Vec::new(), 0, Some(message.as_str()))
         }

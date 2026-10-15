@@ -2750,6 +2750,7 @@ pub enum SettingsField {
     EditorAutoSave,
     EditorWrapLines,
     EditorTabWidth,
+    EditorAutoClose,
     DiffHideUnchanged,
     ChatEnterSends,
     ChatExpandToolGroups,
@@ -2880,6 +2881,7 @@ impl SettingsField {
             Self::EditorAutoSave => "Auto-save",
             Self::EditorWrapLines => "Word wrap",
             Self::EditorTabWidth => "Tab width",
+            Self::EditorAutoClose => "Auto-close brackets and quotes",
             Self::DiffHideUnchanged => "Hide unchanged diff lines",
             Self::EditorFontFamily => "Editor font family",
             Self::EditorFontSize => "Editor font size",
@@ -2976,6 +2978,7 @@ impl SettingsField {
             Self::EditorAutoSave
             | Self::EditorWrapLines
             | Self::EditorTabWidth
+            | Self::EditorAutoClose
             | Self::EditorSyntaxTheme
             | Self::EditorFontFamily
             | Self::EditorFontSize
@@ -3159,6 +3162,7 @@ struct SettingsDraft {
     editor_auto_save: bool,
     editor_wrap_lines: bool,
     editor_tab_width: String,
+    editor_auto_close: bool,
     diff_hide_unchanged: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
@@ -3220,6 +3224,7 @@ impl SettingsDraft {
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
             editor_tab_width: settings.editor_tab_width.to_string(),
+            editor_auto_close: settings.editor_auto_close,
             diff_hide_unchanged: settings.diff_hide_unchanged,
             confirm_terminal_close: settings.confirm_terminal_close,
             confirm_multiline_paste: settings.confirm_multiline_paste,
@@ -3280,6 +3285,7 @@ impl SettingsDraft {
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
             SettingsField::EditorTabWidth => self.editor_tab_width = value,
+            SettingsField::EditorAutoClose => self.editor_auto_close = value == "true",
             SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
@@ -3581,6 +3587,7 @@ fn settings_update(
         SettingsField::EditorSyntaxTheme => settings::EditorSyntaxTheme::from_key(value)
             .map(|theme| next.editor_syntax_theme = theme)
             .ok_or_else(|| "Choose one of the listed syntax themes.".to_owned()),
+        SettingsField::EditorAutoClose => value.parse::<bool>().map(|enabled| next.editor_auto_close = enabled).map_err(|_| "Choose whether brackets and quotes auto-close".to_owned()),
         SettingsField::EditorTabWidth => value.parse::<u16>().ok().filter(|width| (1..=16).contains(width)).map(|width| next.editor_tab_width = width).ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
         SettingsField::EditorWrapLines => value
             .parse::<bool>()
@@ -4402,6 +4409,7 @@ struct PendingPanelOpen {
     /// Worktree-relative, exactly as the card's own file list names paths.
     path: PathBuf,
     ignored: bool,
+    location: Option<(usize, usize)>,
 }
 
 struct DirtyRepositoryClose {
@@ -6056,6 +6064,7 @@ impl Cagents {
         );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_editor_tab_width(self.settings.editor_tab_width);
+        runtime.set_editor_auto_close(self.settings.editor_auto_close);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         PullRequestPane {
@@ -6781,6 +6790,7 @@ impl Cagents {
         );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_editor_tab_width(self.settings.editor_tab_width);
+        runtime.set_editor_auto_close(self.settings.editor_auto_close);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
@@ -10196,6 +10206,7 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
+        let location = crate::editor_navigation::parse_location(self.sidebar_state.files_query()).map(|(_, line, column)| (line, column));
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
@@ -10203,6 +10214,7 @@ impl Cagents {
                     card,
                     path,
                     ignored,
+                    location,
                 });
                 let focus = self
                     .workspace
@@ -10230,6 +10242,7 @@ impl Cagents {
                         card,
                         path,
                         ignored,
+                    location,
                     });
                 }
                 task
@@ -10689,6 +10702,7 @@ impl Cagents {
             )));
             return Task::none();
         }
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.remember_jump_origin(); }
         self.lsp_pending_jumps.insert(
             card,
             PendingLspJump {
@@ -10859,6 +10873,9 @@ impl Cagents {
             .pending_panel_open
             .take()
             .expect("the pending open was just matched");
+        if let Some((line, column)) = open.location {
+            return cosmic::task::message(Message::Repository(RepositoryAction::OpenLocation { card, path: open.path, line: line - 1, column: column - 1 }));
+        }
         let action = if open.ignored {
             let Ok(path) = RepoPath::parse(&open.path) else {
                 return Task::none();
@@ -10922,7 +10939,7 @@ impl Cagents {
                 .map(|path| path.as_path().to_path_buf())
                 .collect::<Vec<_>>();
             let query = self.sidebar_state.files_query().to_owned();
-            let search = query.clone();
+            let search = crate::editor_navigation::file_query(&query).into_owned();
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     if !search.is_empty() {
@@ -12561,18 +12578,20 @@ impl Cagents {
             self.settings.editor_wrap_lines,
             self.settings.editor_syntax_theme,
         );
-        if previous.editor_tab_width != self.settings.editor_tab_width || previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
+        if previous.editor_auto_close != self.settings.editor_auto_close || previous.editor_tab_width != self.settings.editor_tab_width || previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
         {
             for runtime in self.cards.values_mut() {
                 match runtime {
                     CardRuntime::Repository(runtime) => {
                         runtime.set_wrap_lines(wrap_lines);
                         runtime.set_editor_tab_width(self.settings.editor_tab_width);
+                        runtime.set_editor_auto_close(self.settings.editor_auto_close);
                         runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::PullRequests(pane) => {
                         pane.runtime.set_wrap_lines(wrap_lines);
                         pane.runtime.set_editor_tab_width(self.settings.editor_tab_width);
+                        pane.runtime.set_editor_auto_close(self.settings.editor_auto_close);
                         pane.runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
@@ -15951,6 +15970,12 @@ impl Application for Cagents {
                 // The dialog is an overlay, so it has already seen the
                 // keystroke by the time this runs, and what it does with one
                 // is its own affair.
+                if !captured && is_escape_press(&event)
+                    && let Some(card) = self.workspace.focused()
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                    && runtime.go_to_line_is_open() {
+                    return repository_task(runtime.update(RepositoryAction::CloseGoToLine { card }));
+                }
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
@@ -21236,6 +21261,7 @@ mod tests {
                 card,
                 path: PathBuf::from("tracked.rs"),
                 ignored,
+                location: None,
             };
             app.pending_panel_open = Some(pending.clone());
             let completion = |generation| {

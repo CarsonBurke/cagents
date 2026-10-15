@@ -643,6 +643,8 @@ const fn default_focus_follows_mouse() -> bool {
     false
 }
 
+const fn default_editor_auto_close() -> bool { true }
+
 const fn default_editor_tab_width() -> u16 { 4 }
 
 const fn default_editor_auto_save() -> bool {
@@ -858,6 +860,8 @@ pub struct AppSettings {
     pub editor_wrap_lines: bool,
     #[serde(default = "default_editor_tab_width")]
     pub editor_tab_width: u16,
+    #[serde(default = "default_editor_auto_close")]
+    pub editor_auto_close: bool,
     #[serde(default = "default_diff_hide_unchanged")]
     pub diff_hide_unchanged: bool,
     #[serde(default)]
@@ -968,6 +972,7 @@ impl Default for AppSettings {
             browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
             editor_tab_width: default_editor_tab_width(),
+            editor_auto_close: default_editor_auto_close(),
             diff_hide_unchanged: default_diff_hide_unchanged(),
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
