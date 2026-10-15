@@ -347,8 +347,18 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: true,
         scope: ShortcutScope::Workspace,
     },
-    ShortcutDescriptor { action: GlobalShortcut::NextAttention, label: "Next pane needing attention", repeatable: true, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::PreviousAttention, label: "Previous pane needing attention", repeatable: true, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor {
+        action: GlobalShortcut::NextAttention,
+        label: "Next pane needing attention",
+        repeatable: true,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PreviousAttention,
+        label: "Previous pane needing attention",
+        repeatable: true,
+        scope: ShortcutScope::Workspace,
+    },
     ShortcutDescriptor {
         action: GlobalShortcut::ReviewToggleViewed,
         label: "Mark reviewed file viewed",

@@ -14,6 +14,7 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    SessionActivationExpired { session: TerminalId, generation: u64 },
     InboxResolved {
         lineage: crate::agent_execution::Lineage,
         operation: uuid::Uuid,
@@ -45,6 +46,10 @@ pub(super) struct State {
     pub testing: bool,
     inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
     session_activation: Option<TerminalId>,
+    activation_generation: u64,
+    activation_attempt: Option<(Weak<WorkspaceState>, bool)>,
+    #[cfg(test)]
+    activation_attempts: usize,
 }
 
 impl Default for State {
@@ -61,6 +66,10 @@ impl Default for State {
             testing: false,
             inbox_activation: None,
             session_activation: None,
+            activation_generation: 0,
+            activation_attempt: None,
+            #[cfg(test)]
+            activation_attempts: 0,
         }
     }
 }
@@ -253,10 +262,17 @@ impl Cagents {
     /// Explicit reads acknowledge the durable journal as well as local badges.
     pub(super) fn acknowledge_card_notices(&mut self, card: CardId) {
         let session = self.card_state(card).and_then(card_session);
-        let ids: Vec<_> = self.notification_ui.snapshot.notices.iter()
+        let ids: Vec<_> = self
+            .notification_ui
+            .snapshot
+            .notices
+            .iter()
             .filter(|notice| session.is_some() && notice.event.source_session() == session)
-            .map(|notice| notice.id).collect();
-        for id in ids { self.notification_ui.acknowledge(id); }
+            .map(|notice| notice.id)
+            .collect();
+        for id in ids {
+            self.notification_ui.acknowledge(id);
+        }
     }
 
     pub(super) fn sync_notification_presence(&mut self) {
@@ -337,6 +353,8 @@ impl Cagents {
         }
         if matches!(&action, Action::Activated(_)) {
             self.notification_ui.session_activation = None;
+            self.notification_ui.activation_attempt = None;
+            self.notification_ui.activation_generation = self.notification_ui.activation_generation.wrapping_add(1);
         }
         match action {
             Action::Snapshot(snapshot) => {
@@ -433,11 +451,29 @@ impl Cagents {
                 self.update_notifications(Action::Activated(Target::Session(session.id)))
             }
             Action::Activated(Target::Session(session)) => {
-                // The notification watch may beat hosted inventory/model adoption.
-                // Keep only the newest target; adoption attaches its existing actor.
+                // Inventory/model adoption may arrive after the activation watch.
                 self.notification_ui.session_activation = Some(session);
+                let generation = self.notification_ui.activation_generation;
                 let focus = self.retry_notification_activation();
-                Task::batch([focus, self.activate_main_window(None)])
+                let expiry = if self.notification_ui.session_activation.is_some() {
+                    cosmic::task::future(async move {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        Message::NotificationUi(Action::SessionActivationExpired { session, generation })
+                    })
+                } else { Task::none() };
+                Task::batch([focus, expiry, self.activate_main_window(None)])
+            }
+            Action::SessionActivationExpired { session, generation } => {
+                if self.notification_ui.session_activation == Some(session)
+                    && self.notification_ui.activation_generation == generation
+                {
+                    self.notification_ui.session_activation = None;
+                    self.notification_ui.activation_attempt = None;
+                    self.status = Some(TransientNotice::warning(
+                        "This agent's pane is not available. Its attention record remains available.",
+                    ));
+                }
+                Task::none()
             }
             Action::Activated(Target::AgentRun(run)) => {
                 if self.modal_is_open() || !self.automation_ui.can_open_run() {
@@ -485,16 +521,25 @@ impl Cagents {
     /// a replacement provider. Explicitly closed cards remain closed.
     pub(super) fn retry_notification_activation(&mut self) -> Task<Message> {
         let Some(session) = self.notification_ui.session_activation else { return Task::none(); };
-        let card = self.durable.cards.iter().find(|card| card_session(card) == Some(session));
-        if card.is_some_and(|card| !card.existence.is_open()) {
-            self.notification_ui.session_activation = None;
+        let blocked = self.workspace_inputs_blocked() || self.focused_repository_is_saving() || self.update_prepared;
+        if self.notification_ui.activation_attempt.as_ref().is_some_and(|(workspace, was_blocked)|
+            workspace.as_ptr() == Arc::as_ptr(&self.durable) && *was_blocked == blocked
+        ) { return Task::none(); }
+        self.notification_ui.activation_attempt = Some((Arc::downgrade(&self.durable), blocked));
+        if blocked { return Task::none(); }
+        #[cfg(test)] { self.notification_ui.activation_attempts += 1; }
+        let card = self.durable.cards.iter().find(|card| card.existence.is_open() && card_session(card) == Some(session));
+        let Some(id) = card.map(|card| card.id) else {
+            if self.durable.cards.iter().any(|card| card_session(card) == Some(session)) {
+                self.notification_ui.session_activation = None;
+                self.notification_ui.activation_attempt = None;
+            }
             return Task::none();
-        }
-        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() { return Task::none(); }
-        let Some(id) = card.map(|card| card.id) else { return Task::none(); };
+        };
         let focus = self.focus_attention_card(id);
         if self.workspace.focused() == Some(id) {
             self.notification_ui.session_activation = None;
+            self.notification_ui.activation_attempt = None;
         }
         focus
     }
@@ -791,21 +836,51 @@ mod tests {
         let card = app.workspace.focused().unwrap();
         let session = card_session(&app.durable.cards[0]).unwrap();
         let channel = crate::model::ChannelId::new();
-        Arc::make_mut(&mut app.durable).channels.push(crate::model::ProjectChannel {
-            title_source: Default::default(), id: channel, project_id: ProjectId::new(), title: "Read fixture".into(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card),
-        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: ProjectId::new(),
+                title: "Read fixture".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
         let id = uuid::Uuid::new_v4();
-        let snapshot = Snapshot { notices: vec![crate::notifications::Notice {
-            id, event: crate::notifications::Event {
-                target: Target::Session(session), source_session: Some(session), provider: Some(Provider::Claude), directory: Some("/tmp".into()), destination: None,
-                evidence: crate::notifications::Evidence { key: "channel-complete".into(), kind: crate::notifications::Kind::Succeeded },
-            }, delivered: true, acknowledged: false, window: None,
-        }], diagnostic: None };
+        let snapshot = Snapshot {
+            notices: vec![crate::notifications::Notice {
+                id,
+                event: crate::notifications::Event {
+                    target: Target::Session(session),
+                    source_session: Some(session),
+                    provider: Some(Provider::Claude),
+                    directory: Some("/tmp".into()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "channel-complete".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+                delivered: true,
+                acknowledged: false,
+                window: None,
+            }],
+            diagnostic: None,
+        };
         drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
         assert!(app.sidebar_state.has_card_update(card));
         drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
         assert!(!app.sidebar_state.has_card_update(card));
-        assert!(app.notification_ui.pending.lock().unwrap().acknowledged.contains(&id));
+        assert!(
+            app.notification_ui
+                .pending
+                .lock()
+                .unwrap()
+                .acknowledged
+                .contains(&id)
+        );
         drop(app.update_notifications(Action::Snapshot(snapshot)));
         assert!(!app.sidebar_state.has_card_update(card));
     }
@@ -902,6 +977,25 @@ mod tests {
     }
 
     #[test]
+    fn missing_attention_target_does_not_scan_on_unrelated_wakes_and_expiry_is_fenced() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let first = TerminalId::new();
+        drop(app.update_notifications(Action::Activated(Target::Session(first))));
+        let first_generation = app.notification_ui.activation_generation;
+        assert_eq!(app.notification_ui.activation_attempts, 1);
+        for _ in 0..100 { drop(app.retry_notification_activation()); }
+        assert_eq!(app.notification_ui.activation_attempts, 1);
+        let latest = TerminalId::new();
+        drop(app.update_notifications(Action::Activated(Target::Session(latest))));
+        drop(app.update_notifications(Action::SessionActivationExpired { session: first, generation: first_generation }));
+        assert_eq!(app.notification_ui.session_activation, Some(latest));
+        let generation = app.notification_ui.activation_generation;
+        drop(app.update_notifications(Action::SessionActivationExpired { session: latest, generation }));
+        assert!(app.notification_ui.session_activation.is_none());
+    }
+
+    #[test]
     fn attention_activation_waits_for_dialog_and_latest_target_wins() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
@@ -931,14 +1025,27 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         let channel = ChannelId::new();
-        Arc::make_mut(&mut app.durable).channels.push(ProjectChannel {
-            title_source: Default::default(), id: channel, project_id: ProjectId::new(), title: "Unread".into(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card),
-        });
-        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: ProjectId::new(),
+                title: "Unread".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        app.sidebar_state
+            .apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
         app.sidebar_state.observe_card_update(card);
         drop(app.mark_cards_read(vec![card]));
         assert!(!app.sidebar_state.has_card_update(card));
-        assert!(app.sidebar_state.attention_retained(sidebar::SelectionRow::Channel(channel)));
+        assert!(
+            app.sidebar_state
+                .attention_retained(sidebar::SelectionRow::Channel(channel))
+        );
     }
 
     #[test]

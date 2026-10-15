@@ -505,14 +505,21 @@ mod tests {
         register_worktrees(&mut app, &["/repo", "/repo/worktree"]);
         drop(app.select_worktree("/repo".into(), false));
         let session = hosted("/repo/worktree/src");
-        drop(app.update(Message::NotificationUi(crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(session.id)))));
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(
+                session.id,
+            )),
+        )));
         assert!(cards_for(&app, session.id).is_empty());
         drop(app.observe_hosted_terminals(vec![session.clone()]));
         drop(app.retry_notification_activation());
         let adopted = cards_for(&app, session.id);
         assert_eq!(adopted.len(), 1);
         assert_eq!(app.workspace.focused(), Some(adopted[0].id));
-        assert!(matches!(terminal_start_mode(&session), Ok(TerminalStartMode::Attach(_))));
+        assert!(matches!(
+            terminal_start_mode(&session),
+            Ok(TerminalStartMode::Attach(_))
+        ));
     }
 
     #[test]
