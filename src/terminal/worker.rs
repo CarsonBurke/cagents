@@ -1234,9 +1234,11 @@ impl TerminalHandle {
     /// Inspection and the close decision are one serialized PTY-owner command.
     pub(crate) fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
         use super::ipc::TerminalCloseResult;
-        if self.is_completed() {
-            self.release_completed_holder();
-            return TerminalCloseResult::Closed;
+        if self.is_completed() || self.inner.published.retained_holder.try_lock().is_ok_and(|holder| holder.is_some()) {
+            return match self.release_completed_holder() {
+                Ok(()) => TerminalCloseResult::Closed,
+                Err(reason) => TerminalCloseResult::Unknown(reason),
+            };
         }
         let (reply, result) = crossbeam_channel::bounded(1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1301,6 +1303,9 @@ impl TerminalHandle {
                 }
                 Err(error) => return TerminalCloseResult::Unknown(error.to_string()),
             }
+            if let Err(reason) = self.release_completed_holder() {
+                return TerminalCloseResult::Unknown(reason);
+            }
         }
         outcome
     }
@@ -1320,12 +1325,7 @@ impl TerminalHandle {
         {
             return Err(TerminalSendError::Closed);
         }
-        if self.is_completed() {
-            self.release_completed_holder();
-            Ok(())
-        } else {
-            Err(TerminalSendError::Closed)
-        }
+        self.release_completed_holder().map_err(|_| TerminalSendError::Closed)
     }
 
     /// The caller first fences the exact source against this retained worker.
@@ -1356,22 +1356,19 @@ impl TerminalHandle {
         }
     }
 
-    fn release_completed_holder(&self) {
-        *self
-            .inner
-            .published
-            .archive
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Released;
-        self.inner.published.archive_ready.notify_all();
-        let holder = self
-            .inner
-            .published
-            .retained_holder
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+    fn release_completed_holder(&self) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut retained = self.inner.published.retained_holder.try_lock()
+            .map_err(|_| "Another close retains this terminal holder; retry after its deadline".to_owned())?;
+        if let Some(holder) = retained.as_mut() {holder.close_until(deadline)?;}
+        else if !self.is_completed() {return Err("Terminal worker has not retained a cleanup owner".into());}
+        let holder = retained.take();
+        drop(retained);
         drop(holder);
+        *self.inner.published.archive.lock().unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Released;
+        self.inner.published.completed.store(true, Ordering::Release);
+        self.inner.published.archive_ready.notify_all();
+        Ok(())
     }
 
     pub(crate) fn preserve_completed_for_restart(&self) {
@@ -2256,32 +2253,20 @@ impl Worker {
                 let _ = self.published.archived_command(command);
             }
         }
-        let ownership_released = completion.is_some() || self.carried;
-        if !ownership_released && self.holder.registered() {
-            // A missing exit report cannot authorize a fresh replacement or
-            // erase the holder's recovery record. Retain that exact owner for
-            // a successor without claiming a successful completed handoff.
-            if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
-                .and_then(|screen| self.holder.cache_screen(&screen))
-            {
-                self.error("retain unconfirmed terminal screen", error);
-            }
-            self.holder.leave_for_successor();
+        let ownership_released = self.carried || (completion.is_some() && self.holder.proves_family_on_exit());
+        if self.carried {
             drop(self.holder);
-        } else if !shutting_down && completion.is_some() && self.holder.registered() {
-            self.holder.prove_cleanup();
-            if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
-                .and_then(|screen| self.holder.cache_screen(&screen))
-            {
-                self.error("retain completed terminal screen", error);
-            }
-            *self
-                .published
-                .retained_holder
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(self.holder);
         } else {
-            drop(self.holder);
+            if completion.is_some() && self.holder.registered() {
+                if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
+                    .and_then(|screen| self.holder.cache_screen(&screen)) {
+                    self.error("retain completed terminal screen", error);
+                }
+            }
+            // Root exit, parser teardown, and checked-family kill do not
+            // release the holder's authority. The caller requests independent
+            // ECHILD plus durable cleanup and retains this exact slot on error.
+            *self.published.retained_holder.lock().unwrap_or_else(|p| p.into_inner()) = Some(self.holder);
         }
         drop(self.writer);
         drop(self.master);
