@@ -71,6 +71,8 @@ impl Handle {
     pub(crate) fn file_query(&self,command:&Command)->Result<Option<chat::FileChangeReply>,String> {match &self.0 {Owner::Local(local)=>local.file_query(command),Owner::Remote(remote)=>remote.call("file_query",serde_json::json!([command]))}}
     pub(crate) fn provider_exit_output(&self,log_id:&str,offset:u64)->Result<(Vec<u8>,Option<u64>,u64),String> {match &self.0 {Owner::Local(local)=>local.provider_exit_output(log_id,offset),Owner::Remote(remote)=>remote.call("exit_output",serde_json::json!([log_id,offset]))}}
     pub(crate) fn usage(&self)->chat::Usage {match &self.0 {Owner::Local(local)=>local.usage(),Owner::Remote(remote)=>remote.state().usage.clone()}}
+    pub(crate) fn continuity_loss(&self)->Option<super::remote_actor::ContinuityLoss> {match &self.0 {Owner::Local(_)=>None,Owner::Remote(remote)=>remote.state().continuity_loss.clone()}}
+    pub(crate) fn ack_continuity_loss(&self,id:uuid::Uuid)->Result<(),String> {match &self.0 {Owner::Local(_)=>Err("This local actor has no retained continuity loss receipt".into()),Owner::Remote(remote)=>remote.call("ack_loss",serde_json::json!([id]))}}
     pub(crate) fn retained_runs(&self)->Vec<crate::model::RunId> {match &self.0 {Owner::Local(_)=>Vec::new(),Owner::Remote(remote)=>remote.state().retained_runs.clone()}}
     pub(crate) fn attachment_snapshot(&self)->Snapshot {match &self.0 {Owner::Local(local)=>local.snapshot(None).expect("unconditional local snapshot"),Owner::Remote(remote)=>remote.attachment_snapshot()}}
     pub fn snapshot(&self,after:Option<u64>)->Option<Snapshot> {match &self.0 {Owner::Local(local)=>local.snapshot(after),Owner::Remote(remote)=>remote.snapshot(after)}}

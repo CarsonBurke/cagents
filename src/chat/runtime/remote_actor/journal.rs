@@ -37,10 +37,13 @@ pub(crate) struct InputReceipt {
     pub state: InputState,
 }
 
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
+pub(crate) struct ContinuityLoss {pub id:uuid::Uuid,pub affected_runs:Vec<crate::model::RunId>,pub reason:String,pub acknowledged:bool}
 pub(super) struct Journal {
     db: Connection,
     budget: usize,
-    last_loss:Option<String>,
+    last_loss:Option<ContinuityLoss>,
+    run_ids:std::collections::BTreeSet<crate::model::RunId>,
 }
 impl Journal {
     pub fn open(directory: &Path) -> Result<Self, String> {
@@ -60,23 +63,41 @@ impl Journal {
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL);
             INSERT INTO metadata VALUES('input_sequence','0'),('outcome_ack','0');")
             .map_err(|error| error.to_string())?;
-        Ok(Self { db, budget,last_loss:None })
+        Ok(Self { db, budget,last_loss:None,run_ids:Default::default() })
     }
-    pub fn loss(&self) -> Result<Option<String>, String> {
+    pub fn continuity_loss(&self)->Result<Option<ContinuityLoss>,String> {
         if let Some(loss)=&self.last_loss {return Ok(Some(loss.clone()));}
-        self.db.query_row("SELECT value FROM metadata WHERE key='loss'",[],|row|row.get(0))
-            .optional().map_err(|error|error.to_string())
+        let value:Option<Vec<u8>>=self.db.query_row("SELECT value FROM metadata WHERE key='continuity_loss'",[],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
+        value.map(|bytes|serde_json::from_slice(&bytes).map_err(|error|error.to_string())).transpose()
     }
-    pub fn record_loss(&mut self, reason: &str) -> Result<(), String> {
-        if self.last_loss.is_none() {self.last_loss=Some(reason.into());}
-        self.db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('loss',?1)",[reason])
-            .map_err(|error|error.to_string())?;
-        Ok(())
+    pub fn loss(&self)->Result<Option<String>,String> {Ok(self.continuity_loss()?.map(|loss|loss.reason))}
+    pub fn record_loss(&mut self,reason:&str)->Result<(),String> {
+        if self.last_loss.is_none() {self.last_loss=self.continuity_loss()?;}
+        if self.last_loss.is_none() {self.last_loss=Some(ContinuityLoss {id:uuid::Uuid::new_v4(),affected_runs:self.run_ids.iter().copied().collect(),reason:reason.chars().take(4096).collect(),acknowledged:false});}
+        let loss=self.last_loss.as_ref().unwrap();
+        self.db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('continuity_loss',?1)",[serde_json::to_vec(loss).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;Ok(())
+    }
+    pub fn ack_loss(&mut self,id:uuid::Uuid)->Result<(),String> {
+        let mut loss=self.continuity_loss()?.ok_or("No retained continuity loss exists")?;
+        if loss.id!=id {return Err("Continuity loss acknowledgement names another incident".into());}
+        loss.acknowledged=true;
+        self.db.execute("INSERT INTO metadata(key,value) VALUES('continuity_loss',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_vec(&loss).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;
+        self.last_loss=Some(loss);Ok(())
+    }
+    pub fn clear_acknowledged_loss_for_restart(&mut self)->Result<(),String> {
+        let Some(loss)=self.continuity_loss()? else {return Ok(());};
+        if !loss.acknowledged {return Err("The host has not durably acknowledged the uncertain run outcomes; explicit restart remains fenced".into());}
+        if self.acknowledged()?!=self.latest()? {return Err("Retained semantic outcomes must be durably drained before explicit restart clears this loss".into());}
+        let tx=self.db.transaction().map_err(|error|error.to_string())?;
+        for run in &loss.affected_runs {tx.execute("DELETE FROM retained_runs WHERE run=?1",[run.to_string()]).map_err(|error|error.to_string())?;}
+        tx.execute("DELETE FROM metadata WHERE key='continuity_loss'",[]).map_err(|error|error.to_string())?;tx.commit().map_err(|error|error.to_string())?;
+        for run in loss.affected_runs {self.run_ids.remove(&run);}self.last_loss=None;Ok(())
     }
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(update,Update::Execution {..}|Update::Attention(_)) { return Ok(()); }
+        if let Update::Execution {run,..}=update {self.run_ids.insert(*run);}
         if self.loss()?.is_some() { return Err("Actor outcome journal already has a recorded loss".into()); }
         let bytes = serde_json::to_vec(update).map_err(|error|error.to_string())?;
         let (count, retained):(usize,usize)=self.db.query_row(
@@ -126,7 +147,8 @@ impl Journal {
         tx.execute("DELETE FROM retained_runs WHERE finished IS NOT NULL AND finished<=?1",[through]).map_err(|error|error.to_string())?;
         tx.execute("DELETE FROM outcomes WHERE sequence<=?1",[through]).map_err(|error|error.to_string())?;
         tx.execute("UPDATE metadata SET value=?1 WHERE key='outcome_ack'",[through.to_string()]).map_err(|error|error.to_string())?;
-        tx.commit().map_err(|error|error.to_string())
+        tx.commit().map_err(|error|error.to_string())?;
+        self.run_ids=self.retained_runs()?.into_iter().collect();Ok(())
     }
     pub fn input(&self, identity:&InputIdentity) -> Result<Option<InputReceipt>,String> {
         let stored:Option<(String,Vec<u8>,Vec<u8>)>=self.db.query_row("SELECT id,hash,state FROM inputs WHERE sequence=?1",[identity.sequence],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
@@ -148,7 +170,7 @@ impl Journal {
         rows.map(|row|row.map_err(|error|error.to_string())?.parse().map_err(|_|"Invalid retained run identity".to_owned())).collect()
     }
     pub fn refuse_unexecuted_run(&mut self,run:crate::model::RunId)->Result<(),String> {
-        self.db.execute("DELETE FROM retained_runs WHERE run=?1",[run.to_string()]).map_err(|error|error.to_string())?;Ok(())
+        self.db.execute("DELETE FROM retained_runs WHERE run=?1",[run.to_string()]).map_err(|error|error.to_string())?;self.run_ids.remove(&run);Ok(())
     }
     pub fn admit(&mut self,identity:&InputIdentity) -> Result<InputReceipt,String> {self.admit_with_run(identity,None)}
     pub fn admit_with_run(&mut self,identity:&InputIdentity,run:Option<crate::model::RunId>) -> Result<InputReceipt,String> {
@@ -166,6 +188,7 @@ impl Journal {
         if let Some(run)=run {tx.execute("INSERT OR IGNORE INTO retained_runs(run,finished) VALUES(?1,NULL)",[run.to_string()]).map_err(|error|error.to_string())?;}
         tx.execute("UPDATE metadata SET value=?1 WHERE key='input_sequence'",[identity.sequence.to_string()]).map_err(|error|error.to_string())?;
         tx.commit().map_err(|error|error.to_string())?;
+        if let Some(run)=run {self.run_ids.insert(run);}
         Ok(InputReceipt {identity:identity.clone(),state})
     }
     pub fn finish(&mut self,identity:&InputIdentity,mut state:InputState)->Result<(),String> {
@@ -250,6 +273,20 @@ mod tests {
         assert!(journal.admit(&identity).is_err());
         let mut next=identity.clone();next.sequence=3;next.id=uuid::Uuid::new_v4();assert!(journal.admit(&next).is_err());
         next.sequence=2;assert!(journal.admit(&next).is_ok());
+    }
+    #[test]
+    fn typed_loss_requires_exact_durable_ack_and_explicit_restart_reset() {
+        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),1).unwrap();
+        let run=crate::model::RunId::new();let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:[3;32]};
+        journal.admit_with_run(&identity,Some(run)).unwrap();
+        assert!(journal.append(&Update::Execution {run,update:crate::agent_execution::Update::Started {provider_key:"turn".into()}}).is_err());
+        let loss=journal.continuity_loss().unwrap().unwrap();assert_eq!(loss.affected_runs,vec![run]);assert!(!loss.acknowledged);
+        journal.record_loss("later symptoms").unwrap();assert_eq!(journal.continuity_loss().unwrap().unwrap().id,loss.id);
+        assert!(journal.clear_acknowledged_loss_for_restart().is_err());assert!(journal.ack_loss(uuid::Uuid::new_v4()).is_err());
+        journal.ack_loss(loss.id).unwrap();assert!(journal.continuity_loss().unwrap().unwrap().acknowledged);
+        assert!(journal.loss().unwrap().is_some(),"host acknowledgement alone never clears a loss or admits input");
+        journal.clear_acknowledged_loss_for_restart().unwrap();assert!(journal.continuity_loss().unwrap().is_none());assert!(journal.retained_runs().unwrap().is_empty());
+        assert_eq!(journal.next_input().unwrap(),2,"explicit reset never reuses an accepted input sequence");
     }
     #[test]
     fn overflow_is_durable_and_ack_does_not_hide_the_loss() {
