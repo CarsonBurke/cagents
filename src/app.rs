@@ -15168,9 +15168,7 @@ impl Application for Cagents {
                 if self.pending_terminal_spawn(id) {
                     return self.begin_card_close(id);
                 }
-                if terminal_continuity(self.card_state(id))
-                    .and_then(TerminalContinuity::live_proof)
-                    .is_some()
+                if self.card_state(id).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(_)))
                     && !self.closed_terminal_cards.contains(&id)
                 {
                     return self.begin_card_close(id);

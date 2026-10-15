@@ -100,13 +100,14 @@ fn target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
             && intent.captured.as_ref().is_none_or(|captured| captured.source.id == session.id && captured.source.launch == session.launch))
 }
 
-fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
+// A retained worker can finish before its exit status is published. The
+// captured source/UUID still owns confirmation; missing exit data grants none.
+fn retained_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
     matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
         if session.id == intent.terminal
             && intent.captured.as_ref().is_none_or(|captured| captured.source.id == session.id && captured.source.launch == session.launch)
             && intent.completed_source.as_ref().is_none_or(|source| source == session)
-            && matches!(session.continuity,
-            TerminalContinuity::Exited { .. } | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }))
+            && session.continuity.live_proof().is_none())
 }
 
 impl Cagents {
@@ -158,7 +159,7 @@ impl Cagents {
             return;
         }
         let known = self.terminal_close_bindings.bound.get(&card);
-        if !spawned && known.is_none() && ended_terminal(self.card_state(card)).is_some() {
+        if !spawned && known.is_none() && saved.continuity.live_proof().is_none() {
             return;
         }
         if let Some(previous) = known {
@@ -400,8 +401,7 @@ impl Cagents {
         self.terminal_close
             .as_ref()
             .is_some_and(|intent| intent.card == card && intent.pending)
-            || ended_terminal(self.card_state(card))
-                .is_some_and(|session| self.terminal_close_attempts.contains(&session.id))
+            || self.card_state(card).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(session) if self.terminal_close_attempts.contains(&session.id)))
     }
 
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
@@ -470,7 +470,9 @@ impl Cagents {
         }
         self.capture_terminal_close_binding(card, false);
         let captured = self.terminal_close_bindings.bound.get(&card).cloned();
-        if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
+        // Unknown completion is not authority to discard a shared pane.
+        // Every settled non-live descriptor uses the same source/worker check.
+        if let Some(session) = settled_terminal(self.card_state(card)).filter(|session|session.continuity.live_proof().is_none()).cloned() {
             if self.terminal_close_bindings.completed_attempts.contains_key(&session.id) || !self.terminal_close_attempts.insert(session.id) {
                 self.terminal_close_attempts.insert(session.id);
                 self.stop_pane_close_batch(batch);
@@ -563,6 +565,11 @@ impl Cagents {
             }
             return self.start_terminal_close(allow_active);
         }
+        if self.card_state(card).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(_))) {
+            self.stop_pane_close_batch(batch);
+            self.status=Some(TransientNotice::warning("This terminal has no confirmed worker identity yet. Its shared pane and history were kept; reconnect or finish its startup before trying Close again."));
+            return Task::none();
+        }
         self.request_card_removal(card)
     }
 
@@ -640,7 +647,7 @@ impl Cagents {
                 let message=if offered {
                     "The saved pane is unavailable. Use Dismiss locally to hide it in this window, or refresh its connection. Shared sessions and history are preserved."
                 } else {
-                    "The saved pane is unavailable and was kept because its current local identity could not be verified. Reconnect or refresh this pane before trying again."
+                    "The saved pane is unavailable and was kept because its current local identity or completion could not be verified. Reconnect or refresh this pane before trying again."
                 };
                 self.status = Some(TransientNotice::warning(if remaining {
                     format!("{message} Other selected panes were kept; choose Close panes again to inspect them.")
@@ -737,6 +744,13 @@ impl Cagents {
             Option<(TerminalId, TerminalId)>,
         )>,
     ) -> Option<Task<Message>> {
+        if self.card_state(id).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(_))) && !self.terminal_close_bindings.removals.contains_key(&id) {
+            if self.workspace.pending_close().is_some_and(|pending|pending.unmounting==id){let _=self.workspace.cancel_close(id);}
+            self.closed_terminal_cards.remove(&id);
+            let batch=self.pane_close_batch_for(id);self.stop_pane_close_batch(batch);
+            self.status=Some(TransientNotice::warning("No verified terminal cleanup receipt is available. Its shared pane and history were kept; reconnect and choose Close again."));
+            return None;
+        }
         if let Some(expected) = self.terminal_close_bindings.removals.get(&id) {
             let matches=same_captured(Some(expected),self.terminal_close_bindings.bound.get(&id))
                 && self.surface_close_binding_current(id,Some(expected))
@@ -918,7 +932,7 @@ impl Cagents {
         // The opt-out is committed only by Close, never by toggling or Cancel.
         // Do not persist a stale target's dialog either.
         let save = if (target_matches(intent, self.card_state(intent.card))
-            || exited_target_matches(intent, self.card_state(intent.card)))
+            || retained_target_matches(intent, self.card_state(intent.card)))
             && self.terminal_close_binding_current(intent)
             && intent.dont_ask_again
         {
@@ -938,7 +952,7 @@ impl Cagents {
         }
         if !self.terminal_close_binding_current(intent)
             || (!target_matches(intent, self.card_state(intent.card))
-                && !exited_target_matches(intent, self.card_state(intent.card)))
+                && !retained_target_matches(intent, self.card_state(intent.card)))
         {
             self.terminal_close.as_mut().unwrap().detail =
                 Some("Terminal identity or daemon proof changed. Nothing was closed.".into());
@@ -1003,7 +1017,7 @@ impl Cagents {
         }
         let identity_matches = self.terminal_close_binding_current(intent)
             && (target_matches(intent, self.card_state(card))
-                || exited_target_matches(intent, self.card_state(card)));
+                || retained_target_matches(intent, self.card_state(card)));
         match outcome {
             CloseOutcome::Closed if identity_matches => {
                 if intent.active || intent.detail.is_some() {
@@ -1202,19 +1216,32 @@ mod tests {
         for (resident, successor, known) in [
             (true, false, true),
             (true, true, true),
+            (true, true, false),
             (false, false, true),
             (true, false, false),
             (false, false, false),
-        ] {
-            let (_app, _card, captured) = bound_fixture();
+        ] { for state in 0..3 {
+            let (mut app, card, captured) = bound_fixture();
+            let mut source=captured.source.clone();
+            source.continuity=match state {
+                0=>TerminalContinuity::Exited{last_exit:crate::model::TerminalExit{code:Some(0),signal:None,occurred_at_unix_ms:1}},
+                1=>TerminalContinuity::RelaunchAvailable{recipe:source.launch.clone(),last_exit:None},
+                _=>TerminalContinuity::Failed{typed_error:crate::model::RuntimeError{code:"fixture".into(),message:"unknown completion".into()},retryable:true},
+            };
+            app.card_state_mut(card).unwrap().kind=CardKind::Terminal(source.clone());
+            app.card_state_mut(card).unwrap().residency=Residency::Hot;
+            if !known {app.terminal_close_bindings.bound.remove(&card);}
+            let before=app.card_state(card).unwrap().clone();
+            drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
+            assert!(app.workspace.pending_close().is_none(),"Begin Close must not reserve shared removal without cleanup");
             let mut descriptor = descriptor_for(&captured);
-            descriptor.session.continuity = TerminalContinuity::Exited {
+            descriptor.session.continuity = if state==1 {TerminalContinuity::RelaunchAvailable{recipe:source.launch.clone(),last_exit:None}} else {TerminalContinuity::Exited {
                 last_exit: crate::model::TerminalExit {
                     code: Some(0),
                     signal: None,
                     occurred_at_unix_ms: 1,
                 },
-            };
+            }};
             if successor {
                 descriptor.execution_instance = uuid::Uuid::new_v4();
             }
@@ -1279,17 +1306,17 @@ mod tests {
             let mut client = ControlClient::from_stream(reader).unwrap();
             let outcome = close_completed_with_client(
                 &mut client,
-                &captured.source,
+                &source,
                 known.then_some(&captured),
                 true,
             );
             if resident && !successor && known {
                 assert!(
-                    matches!(outcome,Ok(CompletedCloseOutcome::ClosedWorker {execution_instance,..}) if execution_instance==captured.execution_instance)
+                    matches!(&outcome,Ok(CompletedCloseOutcome::ClosedWorker {execution_instance,..}) if *execution_instance==captured.execution_instance)
                 );
             } else if !resident {
                 assert!(matches!(
-                    outcome,
+                    &outcome,
                     Ok(CompletedCloseOutcome::Absent { .. })
                 ));
             } else {
@@ -1297,7 +1324,19 @@ mod tests {
             }
             drop(client);
             handle.join().unwrap();
-        }
+            drop(app.update(Message::CompletedTerminalClosed{card,session:source,batch:None,attempt,result:outcome}));
+            if resident && !successor && known {
+                drop(app.update(Message::CommitClose(card)));
+                assert!(!app.card_state(card).unwrap().existence.is_open(),"exact resident cleanup may commit even without published exit status");
+            }else{
+                assert_eq!(app.card_state(card),Some(&before));
+                let _=app.workspace.request_close(card);
+                assert!(app.commit_card_removal(card,None).is_none(),"a stale focus handoff cannot bypass missing cleanup authority");
+                drop(app.update(Message::CommitClose(card)));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(app.recently_closed.is_empty());assert!(!app.closed_terminal_cards.contains(&card));
+            }
+        } }
     }
 
     #[test]
