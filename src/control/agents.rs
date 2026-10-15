@@ -1466,13 +1466,15 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn presentation_repair_requires_explicit_single_agent_consent() {
         assert!(matches!(parse(&["close", "1234", "--repair-stale-presentation"]), AgentCommand::Close { repair_stale_presentation: true, .. }));
+        assert!(matches!(parse(&["close", "1234"]), AgentCommand::Close { repair_stale_presentation: false, .. }));
         for words in [
             vec!["cagents", "agent", "close", "--repair-stale-presentation"],
-            vec!["cagents", "agent", "close", "1234", "--repair-stale-presentation", "--interrupted"],
-            vec!["cagents", "agent", "close", "1234", "--repair-stale-presentation", "--all"],
+            vec!["cagents", "agent", "close", "1234", "5678", "--repair-stale-presentation"],
         ] { assert!(Cli::try_parse_from(words).is_err()); }
         let help = Cli::try_parse_from(["cagents", "agent", "close", "--help"]).unwrap_err().to_string().split_whitespace().collect::<Vec<_>>().join(" ");
         for text in ["--repair-stale-presentation", "already-closed", "historical generation", "Preserves saved results", "never stops or contacts a provider"] {
@@ -1532,8 +1534,6 @@ mod tests {
             assert!(session.repair_stale_presentation(requested).is_err()); drop(session); server.join().unwrap();
         }
     }
-
-    use super::*;
 
     #[test]
     fn stale_presentation_consent_is_not_reinspected_or_retried_after_refusal() {
