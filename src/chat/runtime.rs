@@ -1080,7 +1080,7 @@ impl LocalHandle {
         let close = self.0.close_state.lock().unwrap_or_else(|p| p.into_inner());
         let activity = if close.unobserved_native {
             ActivityState::Unknown
-        } else if (close.admitted_work || close.compacting || !state.queued.is_empty())
+        } else if (close.admitted_work || close.compacting || !state.queued_messages.is_empty())
             && !state.exited
         {
             ActivityState::Working

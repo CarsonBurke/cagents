@@ -43,6 +43,11 @@ const PROTOCOL: u32 = 1;
 const CAPABILITY: &str = "claude-actor-v1";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FRAME: usize = 34 * 1024 * 1024;
+fn payload_digest(bytes:&[u8])->[u8;32] {
+    use sha2::{Digest,Sha256};
+    Sha256::digest(bytes).into()
+}
+
 #[derive(Serialize, Deserialize)]
 enum InputPayload {
     Command {
@@ -949,7 +954,7 @@ impl RemoteActor {
             identity = InputIdentity {
                 sequence: *sequence,
                 id: uuid::Uuid::new_v4(),
-                hash: *blake3::hash(&bytes).as_bytes(),
+                hash: payload_digest(&bytes),
             };
             *sequence = sequence
                 .checked_add(1)
@@ -1487,7 +1492,7 @@ impl Server {
             .provider_process()
             .ok_or("Retained actor did not retain its exact provider process")?;
         let directory_path = registry::directory(Kind::Native)?;
-        crate::daemon::prepare_private_directory(&directory_path)
+        crate::secure_file::prepare_private_directory(&directory_path)
             .map_err(|error| error.to_string())?;
         let socket = registry::socket(&directory_path, startup.source.id);
         let listener = registry::bind(&socket).map_err(|error| error.to_string())?;
@@ -1850,8 +1855,7 @@ impl Server {
                     );
                 }
                 let (identity, payload) = decode!((InputIdentity, Value));
-                if *blake3::hash(&serde_json::to_vec(&payload).map_err(|error| error.to_string())?)
-                    .as_bytes()
+                if payload_digest(&serde_json::to_vec(&payload).map_err(|error| error.to_string())?)
                     != identity.hash
                 {
                     return Err("Retained input hash differs from its envelope".into());
@@ -2752,7 +2756,7 @@ done"#;
         assert_ne!(server.epoch,old_epoch);
         assert!(server.session_stopping,"reattachment cannot reopen admission");
         let payload=serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap();
-        let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:*blake3::hash(&serde_json::to_vec(&payload).unwrap()).as_bytes()};
+        let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:payload_digest(&serde_json::to_vec(&payload).unwrap())};
         assert!(invoke(server,"input",json!([identity,payload])).unwrap_err().contains("stopping"));
         assert_eq!(server.journal.lock().unwrap().next_input().unwrap(),1,"refused admission must not consume an input identity");
         assert!(invoke(server,"restart",Value::Null).unwrap_err().contains("stopping"));
@@ -3108,7 +3112,7 @@ done"#;
         // Stop the old proxy before observing/retiring this helper receipt.
         // Its actual actor and provider continue under the retained helper.
         actor.preserve().unwrap();
-        let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:*blake3::hash(&serde_json::to_vec(&serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap()).unwrap()).as_bytes()};
+        let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:payload_digest(&serde_json::to_vec(&serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap()).unwrap())};
         let payload=serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap();
         let _:InputReceipt=actor.call("input",json!([identity,payload])).unwrap();
         let deadline=Instant::now()+Duration::from_secs(5);
