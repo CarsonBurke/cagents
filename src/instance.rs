@@ -1354,6 +1354,11 @@ impl Drop for UiActivationListener {
 /// window even when the shell currently owns desktop focus.
 #[cfg(feature = "ui")]
 pub(crate) fn record_focused_window() -> io::Result<()> {
+    // Project-open selection currently targets local windows. A device window
+    // must not overwrite the last local window's focus hint.
+    if crate::device::is_remote() {
+        return Ok(());
+    }
     let runtime = runtime_directory()?;
     require_owned_runtime_directory(&runtime)?;
     record_focused_window_in(&runtime, window_slot())
