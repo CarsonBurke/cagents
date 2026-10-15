@@ -953,6 +953,14 @@ pub struct CommitSummary {
     pub body: String,
 }
 
+fn history_matches(commit: &CommitSummary, query: &str) -> bool {
+    commit.subject.to_lowercase().contains(query)
+        || commit.body.to_lowercase().contains(query)
+        || commit.author.name.to_lowercase().contains(query)
+        || commit.author.email.to_lowercase().contains(query)
+        || commit.oid.as_str().starts_with(query)
+}
+
 /// Which pair of trees a comparison is between.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "basis", rename_all = "snake_case")]
@@ -3903,6 +3911,36 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_history(&output.stdout);
         invalid_output(parsed, output)
+    }
+
+    /// Literal, case-insensitive OR search across message, author and SHA prefix.
+    /// Walk bounded pages on the reader worker so matches can occur anywhere in history.
+    pub fn filtered_history(
+        &self,
+        request: &HistoryRequest,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<CommitSummary>, RepositoryError> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() { return self.history(request, cancellation); }
+        let mut walk = request.clone();
+        walk.page = 0;
+        let mut skip = u64::from(request.page) * u64::from(HISTORY_PAGE_SIZE);
+        let mut matches = Vec::new();
+        loop {
+            let commits = self.history(&walk, cancellation)?;
+            let complete = commits.len() < HISTORY_PAGE_SIZE as usize;
+            for commit in commits {
+                if history_matches(&commit, &query) {
+                    if skip > 0 { skip -= 1; }
+                    else { matches.push(commit); }
+                    if matches.len() == HISTORY_PAGE_SIZE as usize { return Ok(matches); }
+                }
+            }
+            if complete { return Ok(matches); }
+            let Some(next) = walk.page.checked_add(1) else { return Ok(matches); };
+            walk.page = next;
+        }
     }
 
     /// The merge base of `base_ref` and HEAD, which is what a branch
@@ -8360,6 +8398,42 @@ mod tests {
             Some(&OsString::from("src/main.rs"))
         );
         assert_eq!(HISTORY_FORMAT.matches("%x00").count() + 1, HISTORY_FIELDS);
+    }
+
+    #[test]
+    fn history_filter_searches_beyond_the_initial_page_without_interpreting_query_options() {
+        let record = |id: u8, subject: &str, author: &str| {
+            format!("{}\0\0{}\0author@example.invalid\01700000000 +0000\0Committer\0committer@example.invalid\01700000000 +0000\0{}\0\0", oid(id), author, subject).into_bytes()
+        };
+        let first = record(1, "ordinary subject", "Grace").repeat(HISTORY_PAGE_SIZE as usize);
+        let second = record(2, "A needle beyond page one", "Ada");
+        let service = fake_service(vec![success(&first), success(&second)]);
+        let request = HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Object { oid: oid(3) }, page: 0, path: None };
+        let found = service.filtered_history(&request, "NEEDLE", &CancellationToken::new()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].oid, oid(2));
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].arguments.contains(&OsString::from("--skip=0")));
+        assert!(commands[1].arguments.contains(&OsString::from("--skip=200")));
+        drop(commands);
+        let commit = &found[0];
+        assert!(history_matches(commit, "ada"));
+        assert!(history_matches(commit, &commit.oid.as_str()[..8]));
+        assert!(!history_matches(commit, "--all --author=*"));
+    }
+
+    #[test]
+    fn history_filter_pages_matching_results_and_keeps_message_author_or_sha_semantics() {
+        let record = |id: u8, author: &str, subject: &str| format!("{}\0\0{}\0author@example.invalid\01700000000 +0000\0Committer\0committer@example.invalid\01700000000 +0000\0{}\0body\0", oid(id), author, subject).into_bytes();
+        let first = record(1, "Ada", "ordinary").repeat(HISTORY_PAGE_SIZE as usize);
+        let second = record(2, "Grace", "Ada in the message");
+        let service = fake_service(vec![success(&first), success(&second)]);
+        let found = service.filtered_history(&HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Object { oid: oid(3) }, page: 1, path: None }, "ada", &CancellationToken::new()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].oid, oid(2));
+        assert!(history_matches(&found[0], "body"));
+        assert!(!history_matches(&found[0], "unmatched"));
     }
 
     #[test]
