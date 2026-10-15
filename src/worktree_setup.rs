@@ -16,7 +16,10 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
-    os::unix::{ffi::OsStringExt, fs::{MetadataExt, PermissionsExt}},
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -86,8 +89,12 @@ impl CopyPermissions {
     }
 
     fn check(&self, source: &fs::File) -> Result<(), SetupError> {
-        if source_fingerprint(&source.metadata().map_err(error)?) != source_fingerprint(&self.metadata) {
-            return Err(error("source changed during setup copy; the worktree was kept"));
+        if source_fingerprint(&source.metadata().map_err(error)?)
+            != source_fingerprint(&self.metadata)
+        {
+            return Err(error(
+                "source changed during setup copy; the worktree was kept",
+            ));
         }
         Ok(())
     }
@@ -98,7 +105,9 @@ impl CopyPermissions {
         self.check(source)?;
         fs_safety::preserve_group(self.metadata.gid(), destination).map_err(error)?;
         self.acl.apply(destination).map_err(error)?;
-        destination.set_permissions(fs::Permissions::from_mode(self.metadata.mode() & 0o777)).map_err(error)
+        destination
+            .set_permissions(fs::Permissions::from_mode(self.metadata.mode() & 0o777))
+            .map_err(error)
     }
 }
 
@@ -748,12 +757,26 @@ mod tests {
         let snapshot = CopyPermissions::capture(&input).unwrap();
         let mut private = vec![b'p'; 65536];
         private.extend_from_slice(b"new private bytes");
-        let mut reader = RewritingReader { input: input.try_clone().unwrap(), path: path.clone(), rewrite: Some(private) };
+        let mut reader = RewritingReader {
+            input: input.try_clone().unwrap(),
+            path: path.clone(),
+            rewrite: Some(private),
+        };
         let temporary = tempfile::NamedTempFile::new_in(&fixture.destination).unwrap();
         let mut output = temporary.reopen().unwrap();
         std::io::copy(&mut reader, &mut output).unwrap();
-        assert!(fs::read(temporary.path()).unwrap().ends_with(b"new private bytes"));
-        assert!(snapshot.apply(&input, &output).unwrap_err().to_string().contains("source changed"));
+        assert!(
+            fs::read(temporary.path())
+                .unwrap()
+                .ends_with(b"new private bytes")
+        );
+        assert!(
+            snapshot
+                .apply(&input, &output)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
         assert_eq!(output.metadata().unwrap().mode() & 0o777, 0o600);
         assert!(!fixture.destination.join(".env").exists());
         assert!(fixture.destination.join("tracked").exists());
@@ -770,7 +793,13 @@ mod tests {
         let temporary = tempfile::NamedTempFile::new_in(&fixture.destination).unwrap();
         snapshot.apply(&input, temporary.as_file()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(snapshot.check(&input).unwrap_err().to_string().contains("source changed"));
+        assert!(
+            snapshot
+                .check(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
         assert!(!fixture.destination.join(".env").exists());
     }
 
