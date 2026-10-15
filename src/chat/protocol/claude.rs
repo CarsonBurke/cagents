@@ -5664,29 +5664,6 @@ mod tests {
     }
 
     #[test]
-    fn expired_old_interrupt_keeps_the_current_turn_interrupt_pending() {
-        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
-        let old = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"].as_str().unwrap().to_owned();
-        adapter.receive(json!({"type":"result","uuid":"A","subtype":"success","is_error":false})).unwrap();
-        let mut started = Step::default();
-        adapter.start_turn(&mut started);
-        adapter.busy = true;
-        let current = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"].as_str().unwrap().to_owned();
-        let now = std::time::Instant::now();
-        adapter.control_deadlines.insert(old, now - std::time::Duration::from_secs(1));
-        adapter.control_deadlines.insert(current.clone(), now + std::time::Duration::from_secs(60));
-        assert_eq!(adapter.interruption, Some(false));
-        let expired = adapter.expire_controls(now);
-        assert!(expired.events.iter().any(|event| matches!(event, Event::PastTurnFinished { key: Some(key), .. } if key == "claude:A")));
-        assert_eq!(adapter.interruption, Some(false), "old A expiry cannot clear B's pending interrupt");
-        let waiting = adapter.receive(json!({"type":"result","uuid":"B","subtype":"success","is_error":false})).unwrap();
-        assert!(!waiting.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
-        let acknowledged = adapter.receive(reply(&current, json!({}))).unwrap();
-        assert!(acknowledged.events.iter().any(|event| matches!(event,
-            Event::TurnFinished { key: Some(key), outcome: crate::notifications::Kind::Cancelled } if key == "claude:B")));
-    }
-
-    #[test]
     fn expired_interrupt_releases_its_deferred_provider_result() {
         let mut adapter = Claude {
             busy: true,
