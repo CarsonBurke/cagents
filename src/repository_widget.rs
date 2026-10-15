@@ -18033,10 +18033,10 @@ mod tests {
         let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"large.txt",&original);
         drop(runtime.update(RepositoryAction::OpenFind{card}));
         let scan=runtime.update(RepositoryAction::FindQueryChanged{card,query:"target".into()});drop(runtime.update(find_output(scan)));
-        assert_eq!(runtime.find_total,2);
+        assert_eq!(runtime.find_total,2);let previous_version=lsp_version(&runtime);
         drop(runtime.update(RepositoryAction::ReplaceQueryChanged{card,query:"value".into()}));
         let scan=runtime.update(RepositoryAction::ReplaceMatch{card,all:true});drop(runtime.update(find_output(scan)));
-        assert_eq!(buffer_text(&runtime),expected);
+        assert_eq!(buffer_text(&runtime),expected);assert_eq!(lsp_version(&runtime),previous_version+1);
         let DocumentState::Editable(document)=&runtime.document else{unreachable!()};assert!(document.history.can_undo());
         drop(runtime.update(RepositoryAction::Undo{card}));assert_eq!(buffer_text(&runtime),original);
         drop(runtime.update(RepositoryAction::Redo{card}));assert_eq!(buffer_text(&runtime),expected);

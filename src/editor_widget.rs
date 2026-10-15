@@ -4028,6 +4028,8 @@ mod tests {
         assert!(!snapshot.source.is_materialized());
         assert_eq!(snapshot.find_matches("target",||false).unwrap().len(),50_000);
         assert_eq!(snapshot.find_matches_with("tar(get)",crate::editor_search::FindOptions{regex:true,..Default::default()},||false).unwrap().unwrap().len(),50_000);
+        let edits=snapshot.replacement_edits(&[(Position{line:0,column:4},Position{line:0,column:10}),(Position{line:49_999,column:4},Position{line:49_999,column:10})],"tar(get)","new$1",crate::editor_search::FindOptions{regex:true,..Default::default()},false).unwrap();
+        assert_eq!(edits.len(),2);assert!(edits.iter().all(|(_,_,text)|text=="newget"));
         assert!(!snapshot.source.is_materialized());
         assert_eq!(take_text_call_count(),0);
     }
