@@ -22,6 +22,7 @@ impl HostState {
             .is_some_and(|retirement| retirement.handle.same_worker(handle))
     }
     pub(in crate::host) fn ensure_retention_available(&self, ids: &[TerminalId]) -> Result<(), ProtocolError> {
+        if self.terminal_retirements.is_empty() { return Ok(()); }
         if let Some(id) = ids.iter().find(|id| self.terminal_retirements.get(id).is_some_and(|retirement| {
             retirement.pending() && self.terminals.get(id)
                 .is_some_and(|record| record.handle.same_worker(&retirement.handle))
@@ -32,6 +33,7 @@ impl HostState {
         Ok(())
     }
     pub(in crate::host) fn ensure_view_retention_available(&self, edit: &ModelEdit) -> Result<(), ProtocolError> {
+        if self.terminal_retirements.is_empty() { return Ok(()); }
         let panes: &[crate::workspace_model::views::Pane] = match edit {
             ModelEdit::SeedView { panes, .. } => panes,
             ModelEdit::ChangeView { change, .. } => match change {
