@@ -298,7 +298,7 @@ pub(crate) struct HostState {
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
     /// retained conversations a restore could not reattach.
-    upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
+    pub(super) upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
 }
 
 /// A checkpoint saved and awaiting this daemon's exit.
@@ -1957,6 +1957,10 @@ fn prepare_upgrade_with_carry_policy(
                     source.id
                 )));
             }
+            crate::upgrade::handoff::validate_chat_source(&source, &launch)
+                .map_err(|reason| upgrade_error(format!(
+                    "Native chat {} cannot migrate: {reason}. Its existing provider remains active.", source.id
+                )))?;
             // The successor restarts this conversation from its terminal only
             // if that terminal is checkpointed, which a completed one is not,
             // and is restored first, which it is not for a conversation that
@@ -2032,6 +2036,7 @@ fn prepare_upgrade_with_carry_policy(
             store.path.display()
         )));
     }
+    store.preflight_recovered(&chats).map_err(upgrade_error)?;
     let mut frozen = Vec::with_capacity(terminals.len());
     let mut saved = Vec::with_capacity(terminals.len());
     // Every terminal that would refuse the upgrade is reported at once, so the
@@ -2847,6 +2852,31 @@ fn restore_upgrade_from(
             }
             super::chat::restore_upgrade(host, chat)?;
         }
+        let recovered = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            checkpoint
+                .chats
+                .iter()
+                .filter_map(|chat| {
+                    if unattached
+                        .iter()
+                        .any(|entry| entry.summary.id == chat.source.id)
+                    {
+                        return None;
+                    }
+                    let record = state.chats.get(&chat.source.id)?;
+                    let mut replacement = record.session.clone();
+                    replacement.launch.session_id = record.handle.session_id();
+                    replacement.native_continuity = record.handle.native_continuity();
+                    Some(crate::upgrade::handoff::RecoveredChat {
+                        evidence: chat.clone(),
+                        replacement,
+                        aliases: Vec::new(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        store.record_recovered(&recovered)?;
         // Until this is durable, the checkpoint is the only record of what
         // was left unattached, so it must be written before that is consumed.
         store.record_unattached(&unattached, &reattached)?;
@@ -2938,6 +2968,20 @@ fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
         .collect::<Vec<_>>();
     if let Err(error) = store.record_unattached(&[], &departed) {
         tracing::warn!(%error, "could not forget unattached conversations whose holders are gone");
+    }
+}
+
+/// Explicit conversation closure ends the need to retain its issued pane aliases.
+pub(super) fn retire_recovered_upgrade_chat(host: &SharedHost, id: TerminalId) {
+    let store = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_evidence
+        .clone();
+    if let Some(store) = store
+        && let Err(error) = store.retire_recovered(id)
+    {
+        tracing::warn!(session = %id, %error, "could not retire closed conversation recovery evidence");
     }
 }
 

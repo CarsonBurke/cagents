@@ -214,6 +214,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         }
         drop(state);
         super::super::state::retire_unattached_upgrade_chat(host, source.id);
+        super::super::state::retire_recovered_upgrade_chat(host, source.id);
     }
     result
 }

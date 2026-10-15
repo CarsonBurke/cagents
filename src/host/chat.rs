@@ -2584,6 +2584,7 @@ fn process_inner(
                 super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
             }
             drop(record);
+            super::state::retire_recovered_upgrade_chat(host, chat_id);
             Ok(ServerResponse::ChatClosed { chat_id, snapshot })
         }
         _ => Err(error("Not a native chat request")),
@@ -2594,55 +2595,47 @@ pub(super) fn resolve_upgrade(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Session, ProtocolError> {
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let sources = state.upgrade_chats.get(&source.id).ok_or_else(|| {
-        unavailable(
-            state
-                .native_adoption_failures
-                .get(source)
-                .unwrap_or("No durable upgrade replacement exists for this native chat"),
+    let (sources, evidence, session) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state.chats.get(&source.id).ok_or_else(|| unavailable(
+            state.native_adoption_failures.get(source).unwrap_or(
+                "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
+            )))?;
+        if !record.handle.owns_work() {
+            return Err(unavailable(
+                "Restored native provider has closed; no writer was restarted",
+            ));
+        }
+        let mut session = record.session.clone();
+        session.launch.session_id = record.handle.session_id();
+        session.native_continuity = record.handle.native_continuity();
+        (
+            state.upgrade_chats.get(&source.id).cloned(),
+            state.upgrade_evidence.clone(),
+            session,
         )
-    })?;
-    if !sources.iter().any(|previous| {
-        let saved = &previous.source;
-        !(source.proof.is_none()
-        || saved.proof != source.proof
-        // Presentation identities can be stale on hidden cards. The old proof,
-        // actor ID and immutable launch bind that descriptor to this lineage;
-        // only the daemon's checkpoint chooses the replacement conversation.
-        || saved.launch.provider != source.launch.provider
-        || saved.launch.recipe != source.launch.recipe
-        || saved.terminal.as_ref().map(|terminal| {
-            (
-                &terminal.id,
-                &terminal.launch,
-                terminal.continuity.live_proof(),
-            )
-        }) != source.terminal.as_ref().map(|terminal| {
-            (
-                &terminal.id,
-                &terminal.launch,
-                terminal.continuity.live_proof(),
-            )
-        }))
+    };
+    if sources.as_ref().is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|previous| crate::upgrade::handoff::issued_chat_matches(&previous.source, source))
     }) {
-        return Err(error(
-            "Native upgrade source does not match the exact former daemon conversation",
-        ));
+        return Ok(session);
     }
-    let record = state
-        .chats
-        .get(&source.id)
-        .ok_or_else(|| unavailable("Restored native chat is no longer hosted"))?;
-    if !record.handle.owns_work() {
-        return Err(unavailable(
-            "Restored native provider has closed; no writer was restarted",
-        ));
+    // An unvisited pane can predate the current in-memory checkpoint's aliases.
+    // Completed durable evidence remains authoritative only for this exact live
+    // replacement, even when the RAM map already contains newer source proofs.
+    if let Some(evidence) = evidence
+        && evidence
+            .recovered_sources(source, &session)
+            .map_err(unavailable)?
+            .is_some()
+    {
+        return Ok(session);
     }
-    let mut session = record.session.clone();
-    session.launch.session_id = record.handle.session_id();
-    session.native_continuity = record.handle.native_continuity();
-    Ok(session)
+    Err(error(
+        "Native upgrade source does not match the exact former daemon conversation",
+    ))
 }
 
 pub(super) fn paired_upgrade_recipe(
@@ -2800,16 +2793,10 @@ pub(super) fn restore_upgrade(
         return Err("The saved Claude working directory is unavailable. No provider was restarted; open the saved pane to read its conversation history.".into());
     }
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut session = saved.source.clone();
-    session.launch = saved.launch.clone();
-    // Claude/OMP restart their process, but the conversation descriptor keeps
-    // its issued recipe. Publishing the normalized resume argv instead makes
-    // the next ordinary window save look like a different conversation.
-    let restart_launch = matches!(session.launch.provider, Provider::Claude | Provider::Omp)
-        .then_some(&saved.launch);
-    if restart_launch.is_some() {
-        session.launch.recipe = saved.source.launch.recipe.clone();
-    }
+    let mut session = crate::upgrade::handoff::restored_chat(&saved.source, &saved.launch)?;
+    // Every provider keeps the descriptor already issued to windows. The
+    // checkpoint's normalized resume arguments are execution context only.
+    let restart_launch = Some(&saved.launch);
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         session.proof = Some(state.proof().clone());
@@ -3986,6 +3973,153 @@ for line in sys.stdin:
             handle.failure().is_some(),
             "the rejected session remains diagnosed"
         );
+    }
+
+    #[test]
+    fn upgrade_resolution_checks_durable_older_aliases_when_ram_has_only_newer_sources() {
+        let (directory, host, mut saved) = upgrade_fixture();
+        saved.launch.recipe = saved.launch.terminal_recipe().unwrap();
+        restore_upgrade(&host, &saved).unwrap();
+        let restored = resolve_upgrade(&host, &saved.source).unwrap();
+        let evidence = Arc::new(crate::upgrade::handoff::Store::open(directory.path()).unwrap());
+        evidence
+            .record_recovered(&[crate::upgrade::handoff::RecoveredChat {
+                evidence: saved.clone(),
+                replacement: restored.clone(),
+                aliases: Vec::new(),
+            }])
+            .unwrap();
+        let mut newer = saved.clone();
+        newer.source.proof.as_mut().unwrap().host_incarnation =
+            HostIncarnation::new("intermediate-daemon");
+        {
+            let mut state = host.lock().unwrap();
+            state.upgrade_evidence = Some(evidence);
+            state.upgrade_chats.insert(
+                saved.source.id,
+                vec![crate::upgrade::handoff::ChatSource {
+                    source: newer.source,
+                    launch: newer.launch,
+                }],
+            );
+        }
+        assert_eq!(resolve_upgrade(&host, &saved.source).unwrap(), restored);
+        for mutation in 0..3 {
+            let mut changed = saved.source.clone();
+            match mutation {
+                0 => {
+                    changed.proof.as_mut().unwrap().host_incarnation =
+                        HostIncarnation::new("unrelated-daemon")
+                }
+                1 => {
+                    changed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("HOME".into(), "/another-account".into());
+                }
+                _ => changed
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--changed-listener".into()),
+            }
+            assert!(resolve_upgrade(&host, &changed).is_err());
+        }
+        let handle = host.lock().unwrap().chats[&saved.source.id].handle.clone();
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread() {
+        use std::os::unix::net::UnixListener;
+        let (directory, host, mut saved) = upgrade_fixture();
+        let socket = directory.path().join("codex.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let home = directory.path().join("codex-home");
+        std::fs::create_dir(&home).unwrap();
+        let identity = saved.launch.session_id.clone().unwrap();
+        let expected = identity.clone();
+        let reported_home = home.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            while let Ok(message) = socket.read() {
+                let tungstenite::Message::Text(text) = message else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if frame.get("id").is_none() {
+                    continue;
+                }
+                let result = match frame["method"].as_str().unwrap() {
+                    "initialize" => {
+                        serde_json::json!({"userAgent":"cagents/0.1.0", "codexHome":reported_home})
+                    }
+                    "thread/resume" => {
+                        assert_eq!(frame["params"]["threadId"], expected);
+                        serde_json::json!({"thread":{"id":expected,"canAcceptDirectInput":true,"status":{"type":"idle"}},
+                            "model":"fixture-luna", "initialTurnsPage":{"data":[{"id":"saved-turn","status":"completed","items":[
+                                {"type":"userMessage","id":"saved-prompt","content":[{"type":"text","text":"existing prompt"}]},
+                                {"type":"agentMessage","id":"saved-answer","text":"existing exact-thread answer","phase":"final_answer"}
+                            ]}],"nextCursor":null}})
+                    }
+                    "model/list" | "skills/list" | "thread/list" | "thread/queue/list" => {
+                        serde_json::json!({"data":[],"nextCursor":null})
+                    }
+                    method => panic!("unexpected fixture method {method}"),
+                };
+                if socket
+                    .send(tungstenite::Message::Text(
+                        serde_json::json!({"id":frame["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        saved.source.launch.provider = Provider::Codex;
+        saved.source.launch.recipe.program = "codex".into();
+        saved.source.launch.recipe.arguments =
+            vec!["--remote".into(), format!("unix://{}", socket.display())];
+        saved
+            .source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.display().to_string());
+        saved.launch = saved.source.launch.clone();
+        saved.launch.recipe = saved.launch.terminal_recipe().unwrap();
+        assert_ne!(saved.launch.recipe, saved.source.launch.recipe);
+        restore_upgrade(&host, &saved).unwrap();
+        let (replacement, handle) = {
+            let state = host.lock().unwrap();
+            let record = &state.chats[&saved.source.id];
+            (record.session.clone(), record.handle.clone())
+        };
+        assert_eq!(replacement.launch.recipe, saved.source.launch.recipe);
+        assert_eq!(replacement.launch.session_id, Some(identity));
+        assert!(chat::is_upgrade_recovery(&saved.source, &replacement));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            let snapshot = handle.snapshot(None).unwrap();
+            if snapshot.ready && !snapshot.history_loading {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "exact-thread fixture did not become ready: {snapshot:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(snapshot.ready);
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content,
+            chat::ItemContent::Text { text, .. } if text == "existing exact-thread answer")));
+        handle.close().unwrap();
+        server.join().unwrap();
     }
 
     #[test]
