@@ -964,11 +964,26 @@ fn start_with_execution(
             "Native restart launch differs from its issued conversation",
         ));
     }
-    let process_launch = restart_launch.unwrap_or(&session.launch);
+    // History/title/account-root construction must see the same effective
+    // environment as the process. Keep this launch private: neither transient
+    // values nor normalized restart arguments rewrite the issued descriptor.
+    // Saved read-only history receives recorded removals, never fresh defaults
+    // or transient execution credentials.
+    let process_launch = prepare_native_process_launch(
+        restart_launch.unwrap_or(&session.launch),
+        (!saved_history_only && source.is_none()).then(|| {
+            crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
+        }),
+        if saved_history_only { &BTreeMap::new() } else { &execution_environment.0 },
+        if saved_history_only { None } else { source_execution.as_ref() },
+    )?;
+    if process_launch.provider != Provider::Codex && !saved_history_only {
+        check_launch_account(&process_launch)?;
+    }
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
-        chat::protocol::codex::create_with_listener(process_launch, owned_socket)
+        chat::protocol::codex::create_with_listener(&process_launch, owned_socket)
     } else {
-        chat::protocol::create(process_launch)
+        chat::protocol::create(&process_launch)
     }
     .map_err(|message| {
         // Removal may have won after the early check while the adapter
@@ -996,42 +1011,8 @@ fn start_with_execution(
     ) {
         check_launch_account(&session.launch)?;
     }
-    if source.is_none() && !matches!(spec.transport, chat::protocol::TransportSpec::History) {
-        // A conversation with no proven source has no proven environment to
-        // preserve, so it starts from the daemon's own native configuration
-        // whether or not it names a stopped terminal. Requiring the absence of
-        // a descriptor here left a conversation converted from a stopped agent
-        // terminal with nothing but that terminal's recorded recipe, which is
-        // empty for a terminal whose resume hint was discarded when its agent
-        // exited.
-        //
-        // Standalone conversations also receive transient execution
-        // configuration from the GUI, including credentials unavailable in the
-        // daemon environment. Keep these values in the process spec only,
-        // never the durable session. Explicit selected configuration takes
-        // precedence over daemon defaults, and the recipe's own environment
-        // takes precedence over both.
-        if execution_environment.0.iter().any(|(name, value)| {
-            !crate::model::agent_recovery::fresh_environment_key(
-                session.launch.provider,
-                name,
-                value,
-                false,
-            )
-        }) {
-            return Err(error(
-                "Native execution environment contains an unrelated or private variable",
-            ));
-        }
-        spec.environment = sourceless_environment(
-            crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false),
-            execution_environment.0,
-            std::mem::take(&mut spec.environment),
-        );
-    }
-    if let Some(environment) = &source_execution {
-        spec.environment = environment.clone();
-    }
+    // Provider-specific process fields derive from the prepared launch.
+    // No environment overlay may follow constructor history/title reads.
     spec.remove_unset_environment();
     spec.messages = host
         .lock()
@@ -2739,6 +2720,41 @@ fn sourceless_environment(
     environment
 }
 
+/// Materialize the exact constructor/process environment once, off HostLock.
+/// Source execution replaces the recorded map; sourceless precedence remains
+/// daemon, selected configuration, then recipe. Explicit and legacy account
+/// removals are applied before any adapter/history/title constructor runs.
+fn prepare_native_process_launch(
+    launch: &chat::Launch,
+    daemon: Option<BTreeMap<String, String>>,
+    selected: &BTreeMap<String, String>,
+    source: Option<&BTreeMap<String, String>>,
+) -> Result<chat::Launch, ProtocolError> {
+    let mut spec = chat::protocol::ProcessSpec::from(&launch.recipe);
+    if let Some(daemon) = daemon {
+        if selected.iter().any(|(name, value)| {
+            !crate::model::agent_recovery::fresh_environment_key(launch.provider, name, value, false)
+        }) {
+            return Err(error("Native execution environment contains an unrelated or private variable"));
+        }
+        spec.environment = sourceless_environment(daemon, selected.clone(), spec.environment);
+    }
+    if let Some(source) = source {
+        spec.environment = source.clone();
+    }
+    let mut process_launch = launch.clone();
+    process_launch.recipe.environment = spec.environment;
+    process_launch.recipe.unset_environment = spec.unset_environment;
+    // The effective home itself can select legacy managed-home removals.
+    // Resolve those now too, so ProcessSpec::from cannot later scrub a
+    // credential which a constructor already observed in the private launch.
+    process_launch.recipe.unset_environment =
+        crate::account::launch_credential_overrides(&process_launch.recipe);
+    let removed = &process_launch.recipe.unset_environment;
+    process_launch.recipe.environment.retain(|name, _| !removed.contains(name));
+    Ok(process_launch)
+}
+
 /// The environment `restore_upgrade` will start `launch` with in the next
 /// daemon. A conversation whose terminal the successor restores before it
 /// restarts from that terminal; any other, including one that merely names a
@@ -2750,14 +2766,15 @@ fn upgrade_environment(
     hosted_source: bool,
     daemon: BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
-    let (spec, _) = chat::protocol::create(launch)?;
-    let mut environment = if hosted_source {
-        spec.environment
-    } else {
-        sourceless_environment(daemon, BTreeMap::new(), spec.environment)
-    };
-    launch.recipe.remove_unset_environment(&mut environment);
-    Ok(environment)
+    let process_launch = prepare_native_process_launch(
+        launch,
+        (!hosted_source).then_some(daemon),
+        &BTreeMap::new(),
+        None,
+    ).map_err(|error| error.message)?;
+    let (mut spec, _) = chat::protocol::create(&process_launch)?;
+    spec.remove_unset_environment();
+    Ok(spec.environment)
 }
 
 pub(super) fn validate_upgrade_environment(
@@ -3060,6 +3077,94 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn native_constructor_environment_is_private_once_and_preserves_precedence_and_removals() {
+        let root = tempfile::tempdir().unwrap();
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let mut launch = chat::Launch {
+                provider, session_id: None,
+                recipe: LaunchRecipe {
+                    program: "private-fixture".into(), arguments: vec![], working_directory: root.path().into(),
+                    environment: [("HOME".into(), root.path().to_str().unwrap().into()), ("PATH".into(), "/recipe/bin".into())].into(),
+                    unset_environment: ["HTTPS_PROXY".into()].into(),
+                },
+            };
+            let issued = launch.clone();
+            let daemon = [("PATH".into(), "/daemon/bin".into()), ("HTTPS_PROXY".into(), "daemon-proxy".into())].into();
+            let selected = [("PATH".into(), "/selected/bin".into())].into();
+            let prepared = prepare_native_process_launch(&launch, Some(daemon), &selected, None).unwrap();
+            assert_eq!(prepared.recipe.environment["PATH"], "/recipe/bin");
+            assert!(!prepared.recipe.environment.contains_key("HTTPS_PROXY"));
+            assert_eq!(launch, issued);
+            let source = [("HOME".into(), root.path().to_str().unwrap().into()), ("PATH".into(), "/source/bin".into())].into();
+            let prepared = prepare_native_process_launch(&launch, None, &BTreeMap::new(), Some(&source)).unwrap();
+            assert_eq!(prepared.recipe.environment, source);
+            let spec = chat::protocol::ProcessSpec::from(&prepared.recipe);
+            assert_eq!(spec.environment, prepared.recipe.environment);
+            assert_eq!(spec.unset_environment, prepared.recipe.unset_environment);
+            assert_eq!(launch, issued);
+            launch.recipe.environment.remove("PATH");
+            assert!(prepare_native_process_launch(&launch, Some(BTreeMap::new()),
+                &[("UNRELATED_PRIVATE_FIXTURE_KEY".into(), "do-not-admit".into())].into(), None).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_constructor_history_uses_effective_source_selected_and_unset_home_without_reading_issued_home() {
+        use std::{io::Read, os::fd::{AsRawFd, FromRawFd}};
+        const CONVERSATION: &str = "12345678-1234-4234-8234-123456789abc";
+        for mode in ["source", "selected", "unset"] {
+            let root = tempfile::tempdir().unwrap();
+            let cwd = root.path().join("project");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.canonicalize().unwrap();
+            let project: String = cwd.to_str().unwrap().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+            let issued_home = root.path().join("issued-home");
+            let actual_home = root.path().join("actual-home");
+            let issued_config = issued_home.join(".claude");
+            let actual_config = actual_home.join(".claude");
+            let mut issued_file = None;
+            for (config, body) in [(&issued_config, "issued-A-body"), (&actual_config, "effective-B-body")] {
+                let path = config.join("projects").join(&project).join(format!("{CONVERSATION}.jsonl"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, json!({"type":"user","uuid":"private-prompt","parentUuid":null,"sessionId":CONVERSATION,"message":{"role":"user","content":body}}).to_string()+"\n").unwrap();
+                if config == &issued_config { issued_file = Some(path); }
+            }
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0);
+            let mut watcher = unsafe { std::fs::File::from_raw_fd(fd) };
+            let path = std::ffi::CString::new(issued_file.unwrap().as_os_str().as_encoded_bytes()).unwrap();
+            assert!(unsafe { libc::inotify_add_watch(watcher.as_raw_fd(), path.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS) } >= 0);
+            let mut launch = chat::Launch { provider: Provider::Claude, session_id: Some(CONVERSATION.into()), recipe: LaunchRecipe {
+                program: "private-claude-not-executed".into(), arguments: vec!["--resume".into(), CONVERSATION.into()], working_directory: cwd,
+                environment: [("HOME".into(), issued_home.to_str().unwrap().into()), ("CLAUDE_CONFIG_DIR".into(), issued_config.to_str().unwrap().into())].into(), unset_environment: Default::default(),
+            }};
+            let source = [("HOME".into(), actual_home.to_str().unwrap().into()), ("CLAUDE_CONFIG_DIR".into(), actual_config.to_str().unwrap().into())].into();
+            let selected = if mode == "selected" {
+                launch.recipe.environment.remove("CLAUDE_CONFIG_DIR");
+                [("CLAUDE_CONFIG_DIR".into(), actual_config.to_str().unwrap().into())].into()
+            } else { BTreeMap::new() };
+            if mode == "unset" {
+                launch.recipe.environment.insert("HOME".into(), actual_home.to_str().unwrap().into());
+                launch.recipe.unset_environment.insert("CLAUDE_CONFIG_DIR".into());
+            }
+            let issued = launch.clone();
+            let prepared = prepare_native_process_launch(&launch, (mode != "source").then(BTreeMap::new), &selected, (mode == "source").then_some(&source)).unwrap();
+            assert_eq!(Provider::Claude.session_root(&prepared.recipe), Some(actual_config.clone()));
+            let (spec, mut adapter) = chat::protocol::create(&prepared).unwrap();
+            assert_eq!(spec.environment, prepared.recipe.environment);
+            assert_eq!(spec.unset_environment, prepared.recipe.unset_environment);
+            let initial = adapter.initialize().unwrap();
+            let items: Vec<_> = initial.events.iter().filter_map(|event| if let chat::Event::History {items, ..} = event {Some(items)} else {None}).flatten().collect();
+            assert!(items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text {text, ..} if text == "effective-B-body")));
+            assert!(!items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text {text, ..} if text == "issued-A-body")));
+            let mut bytes = [0_u8; 256];
+            assert_eq!(watcher.read(&mut bytes).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "issued transcript must never be opened/indexed");
+            assert_eq!(launch, issued);
+        }
+    }
 
     #[test]
     fn removed_claude_account_is_reported_before_missing_resume_history() {
