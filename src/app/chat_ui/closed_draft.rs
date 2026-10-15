@@ -1,13 +1,20 @@
 //! A remote close is proved by canonical view retirement, not by losing a socket.
 use super::*;
 
+pub(in crate::app) fn closed_draft_source_matches(source: &chat::Session, current: &chat::Session) -> bool {
+    source.proof.as_ref().is_some_and(HostSessionProof::is_complete)
+        && crate::agent_execution::same_chat_process(source, current)
+        && source.launch.session_id == current.launch.session_id
+}
+
+
 impl Cagents {
     pub(super) fn chat_closed_elsewhere(&self, card: CardId) -> bool {
-        self.shared_views.closed_chats.get(&card).is_some_and(|id| {
-            matches!(self.card_state(card).map(|card| &card.kind), Some(CardKind::Chat(session)) if session.id == *id)
+        self.shared_views.closed_chats.get(&card).is_some_and(|source| {
+            matches!(self.card_state(card).map(|card| &card.kind), Some(CardKind::Chat(session)) if closed_draft_source_matches(source, session))
                 && !self.workspace_model.views.iter().any(|view| view.panes.iter().any(|pane| pane.id == card))
                 && match self.cards.get(&card) {
-                    Some(CardRuntime::Chat(runtime)) => runtime.session.id == *id,
+                    Some(CardRuntime::Chat(runtime)) => closed_draft_source_matches(source, &runtime.session),
                     _ => true,
                 }
         })
@@ -28,7 +35,9 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target).filter(|runtime| runtime.closed_elsewhere && runtime.revision == revision) else { return Task::none(); };
         let text = runtime.unsent_text();
         if text.is_empty() { return Task::none(); }
-        self.handle_chat_ui(Action::CopyLiteral(text))
+        let task = self.handle_chat_ui(Action::CopyLiteral(text));
+        self.status = Some(TransientNotice::success("Copied draft"));
+        task
     }
 
     pub(super) fn discard_closed_chat_draft(&mut self, target: Target, revision: u64) -> Task<Message> {
@@ -59,7 +68,7 @@ impl Runtime {
         let revision = self.revision;
         let has_text = !self.unsent_text().is_empty();
         widget::column::with_children(vec![
-            design::body("Closed in another window. Your completed report and unsent draft are kept here. Copy the draft into another conversation, or discard its text. Attachments remain until you remove them.").into(),
+            design::body("Closed in another window. Your conversation and unsent draft are kept here. Copy the draft into another conversation, or discard its text. Attachments remain until you remove them.").into(),
             widget::row::with_children(vec![
                 widget::button::custom(design::caption("Copy draft"))
                     .on_press_maybe(has_text.then(|| Message::ChatUi(Action::CopyClosedDraft(target, revision))))
@@ -87,6 +96,7 @@ mod tests {
             _ => panic!("chat runtime"),
         };
         runtime.session.launch.session_id = Some("closed-draft-thread".into());
+        runtime.session.proof = Some(HostSessionProof { host_session_id: "fixture-host".into(), boot_id: "fixture-boot".into(), host_incarnation: "fixture-incarnation".into() });
         let session = runtime.session.clone();
         let handle = Arc::new(ClientHandle::fixture(session.clone(), Snapshot {
             ready: true,
@@ -119,6 +129,7 @@ mod tests {
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.workspace_model.views = vec![view];
         app.acknowledge_view_edit(Scope::Channel(channel), None);
+        drop(app.reconcile_shared_views());
         (app, target, channel, handle)
     }
 
@@ -236,11 +247,17 @@ mod tests {
         assert!(actions(app.handle_chat_ui(Action::DiscardClosedDraft(target, revision))).is_empty());
         assert_eq!(runtime(&app, target).unsent_text(), "still mine");
         app.chat_runtime_mut(target).unwrap().pastes_pending = 0;
-        app.chat_runtime_mut(target).unwrap().session.id = TerminalId::new();
-        // A new local runtime cannot inherit the old card's retirement authority.
+        // Ready may replace the native actor before its descriptor update is
+        // acknowledged, even while retaining the old session's numeric ID.
+        let mut replacement = runtime(&app, target).session.clone();
+        replacement.launch.session_id = Some("new-native-thread-before-ack".into());
+        app.chat_runtime_mut(target).unwrap().session = replacement.clone();
+        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(replacement);
         let new_target = Target { generation: target.generation + 1, ..target };
         app.chat_runtime_mut(target).unwrap().target = new_target;
         app.sync_closed_chat_draft(target.card);
+        assert!(!app.chat_closed_elsewhere(target.card));
+        assert!(!runtime(&app, new_target).closed_elsewhere);
         assert!(actions(app.handle_chat_ui(Action::DiscardClosedDraft(target, revision))).is_empty());
         assert_eq!(runtime(&app, new_target).unsent_text(), "still mine");
     }

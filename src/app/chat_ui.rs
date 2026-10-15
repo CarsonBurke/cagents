@@ -29,6 +29,7 @@ mod permissions;
 mod prose;
 mod retained;
 mod closed_draft;
+pub(super) use closed_draft::closed_draft_source_matches;
 mod scroll;
 mod selectable_prose;
 mod selection;
@@ -369,6 +370,7 @@ impl Action {
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
+            | Self::DiscardClosedDraft(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
             | Self::Interrupt(target)
