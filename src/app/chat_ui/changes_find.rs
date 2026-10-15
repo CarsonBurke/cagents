@@ -391,8 +391,8 @@ mod tests {
         state.ready.clear();let mut pending=selection::Catalog::builder();state.selection_with_pending(&item,source.epoch,&[vec![6,0]],&mut pending);let pending=pending.finish();
         assert!(pending.is_pending(id));assert_eq!(pending.source_stamp(id),Some(expected));assert_eq!(pending.retained_plain_bytes(),0);
         edit(&request,|payload| {
-            payload.sources[0].epoch.revision+=1;
-            for page in &mut payload.sources[0].manifests {Arc::make_mut(page).epoch=payload.sources[0].epoch;}
+            payload.sources[0].epoch.revision+=1;let epoch=payload.sources[0].epoch;
+            for page in &mut payload.sources[0].manifests {Arc::make_mut(page).epoch=epoch;}
         });
         let changed=sources(&request)[0].clone();state.ready=build(&request).unwrap();
         let mut current=selection::Catalog::builder();state.selection(&item,changed.epoch,&mut current);let current=current.finish();
