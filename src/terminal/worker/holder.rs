@@ -2902,6 +2902,7 @@ mod tests {
             boot_id: boot,
             host_incarnation: final_proof.host_incarnation.clone(),
         };
+        let completed_source = completed.source.clone();
         let (exits, exited) = crossbeam_channel::bounded(1);
         let mut restored = adopt_recoverable(&socket, exits, Some(completed)).unwrap();
         assert_eq!(restored.held.child.pid(), record.root.pid);
@@ -2915,9 +2916,20 @@ mod tests {
         );
         assert!(String::from_utf8_lossy(&restored.output).contains("completed-result"));
         restored.held.holder.commit_adoption().unwrap();
-        // This fixture has observed the exact root exit and drained retained
-        // output, equivalent to the completed worker's close disposition.
-        restored.held.holder.prove_cleanup();
+        // A current daemon adopted the original process and normalized its
+        // source proof. Lose the wire ACK while preserving the real receipt.
+        drop(restored.held.holder.cleanup.take());
+        struct ResumeAdopted(File);
+        impl Drop for ResumeAdopted {fn drop(&mut self){let _=signal(&self.0,libc::SIGCONT);}}
+        let resume=ResumeAdopted(restored.held.holder.pidfd.as_ref().unwrap().try_clone().unwrap());
+        signal(&resume.0,libc::SIGSTOP).unwrap();
+        assert!(restored.held.holder.close_until(Instant::now()+Duration::from_secs(2)).is_err());
+        drop(resume);
+        assert!(exits_within(restored.held.holder.pidfd.as_ref().unwrap(),Duration::from_secs(5)).unwrap());
+        restored.held.holder.cleanup_source=Some(registry::cleanup::SourceReceipt::capture(&original).unwrap());
+        assert!(restored.held.holder.close_until(Instant::now()+Duration::from_secs(1)).is_err(),"an old daemon proof cannot claim the current lease after adoption");
+        restored.held.holder.cleanup_source=Some(registry::cleanup::SourceReceipt::capture(&completed_source).unwrap());
+        restored.held.holder.close_until(Instant::now()+Duration::from_secs(1)).unwrap();
         drop(restored);
         wait_gone(record.root.pid);
         wait_gone(record.holder.pid);
