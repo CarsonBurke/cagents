@@ -13,7 +13,7 @@ pub(super) struct SetupIntent {
 pub(super) struct State {
     pending: HashMap<PathBuf, (OperationId, CancellationToken)>,
     statuses: HashMap<PathBuf, WorktreeSetupStatus>,
-    terminals: HashMap<PathBuf, TerminalId>,
+    terminals: HashMap<PathBuf, (u64, TerminalId)>,
 }
 
 impl Drop for State {
@@ -101,14 +101,16 @@ impl Cagents {
             self.refresh_worktree_setup_rows();
             return Task::none();
         }
+        let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64).unwrap_or_default();
         let launch = LaunchRecipe {
             program: "/bin/sh".into(), arguments: vec!["-c".into(), command], working_directory: worktree.clone(),
-            environment: [("CAGENTS_WORKTREE_SETUP".into(), "1".into()), ("CAGENTS_WORKTREE_SETUP_ID".into(), operation.to_string())].into(),
+            environment: [("CAGENTS_WORKTREE_SETUP".into(), "1".into()), ("CAGENTS_WORKTREE_SETUP_ID".into(), operation.to_string()), ("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), started_at.to_string())].into(),
             unset_environment: Default::default(),
         };
         let session = fresh_terminal_session(launch);
         let terminal = session.id;
-        self.setup_ui.terminals.insert(worktree.clone(), terminal);
+        self.setup_ui.terminals.insert(worktree.clone(), (started_at, terminal));
         self.setup_ui.statuses.insert(worktree.clone(), WorktreeSetupStatus::Running);
         // The new worktree owns this card even if another channel was selected
         // while the bounded copy operation completed.
@@ -130,8 +132,9 @@ impl Cagents {
             if session.launch.environment.get("CAGENTS_WORKTREE_SETUP").map(String::as_str) != Some("1") { continue; }
             let path = &session.launch.working_directory;
             if self.setup_ui.pending.contains_key(path) { continue; }
-            if self.setup_ui.terminals.get(path).is_some_and(|known| *known != session.id) { continue; }
-            self.setup_ui.terminals.entry(path.clone()).or_insert(session.id);
+            let started_at = session.launch.environment.get("CAGENTS_WORKTREE_SETUP_STARTED_AT").and_then(|value| value.parse::<u64>().ok()).unwrap_or_default();
+            if self.setup_ui.terminals.get(path).is_some_and(|(known_at, known)| *known_at > started_at || (*known_at == started_at && *known != session.id)) { continue; }
+            self.setup_ui.terminals.insert(path.clone(), (started_at, session.id));
             self.setup_ui.statuses.insert(path.clone(), terminal_status(session, card.existence.is_open()));
         }
         let roots = self.sidebar_model.projects.iter().flat_map(|project| project.worktrees.iter().map(|worktree| worktree.path.clone())).collect::<HashSet<_>>();
@@ -159,6 +162,16 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards[0].kind = CardKind::Terminal(session);
         app.refresh_worktree_setup_rows();
         assert_eq!(app.sidebar_model.projects[0].worktrees[0].setup_status, Some(WorktreeSetupStatus::Succeeded));
+        // Reusing a checkout path must not resurrect the retained old setup
+        // result instead of showing the newly reserved terminal.
+        let mut next = app.durable.cards[0].clone(); next.id = CardId::new();
+        let mut session = fresh_terminal_session(LaunchRecipe::shell("/repo/setup".into()).unwrap());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), "10".into());
+        next.kind = CardKind::Terminal(session);
+        Arc::make_mut(&mut app.durable).cards.push(next);
+        app.refresh_worktree_setup_rows();
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].setup_status, Some(WorktreeSetupStatus::Running));
     }
 
     #[test]

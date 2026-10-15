@@ -149,10 +149,8 @@ impl Choices {
 }
 
 fn git(repository: &Path) -> CommandSpec {
-    CommandSpec::new("git").arg("-C").arg(repository.as_os_str())
-        .args(["-c", "core.fsmonitor=false"]).env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_LAZY_FETCH", "1").env("GIT_PAGER", "cat")
-        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").env_remove("GIT_COMMON_DIR")
+    crate::repository::RepositoryService::system("git").git_base(repository, false)
+        .env("GIT_NO_LAZY_FETCH", "1")
 }
 
 pub(super) fn save_prefix(repository: &Path, prefix: &str, cancellation: &CancellationToken) -> Result<(), String> {
