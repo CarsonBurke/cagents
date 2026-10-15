@@ -108,6 +108,13 @@ pub(super) fn item<'a>(id: &str, content: impl Into<Element<'a, Message>>) -> El
 pub(super) fn item_id(id: &str) -> Id {
     Id::new(format!("chat-scroll-item-{id}"))
 }
+pub(super) fn block_id(target: Target, context: Option<&str>, logical: u64) -> Id {
+    use std::hash::{Hash, Hasher};
+    let mut key = std::hash::DefaultHasher::new();
+    (target.generation, context, logical).hash(&mut key);
+    card_control_id(target.card, &format!("chat-block-scroll-{:016x}", key.finish()))
+}
+
 pub(super) fn steps_id(id: &str) -> Id {
     Id::new(format!("chat-scroll-steps-{id}"))
 }
