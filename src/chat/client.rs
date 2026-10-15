@@ -1435,6 +1435,13 @@ impl ClientHandle {
 
     /// The daemon retains and replays the resulting terminal across lost replies.
     /// Credentials stay entirely within the host's native/PTY execution context.
+    /// Exercise unavailable post-return metadata on the SAME captured handle.
+    /// This withdraws authority and never constructs a replacement binding.
+    #[cfg(test)]
+    pub(crate) fn clear_source_binding_for_test(&self) {
+        *self.inner.source_binding.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
     pub fn source_binding(&self) -> Option<crate::terminal_ipc::ChatSourceBinding> {
         self.inner
             .source_binding
