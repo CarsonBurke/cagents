@@ -1711,7 +1711,7 @@ mod tests {
         // A real child owns the endpoint and speaks framed WebSocket. It only
         // echoes fixture JSON; no installed provider/account/service is used.
         std::fs::write(&program, r##"#!/usr/bin/python3
-import base64, hashlib, json, socket, struct, sys
+import base64, hashlib, json, socket, struct, sys, pathlib, time
 path = sys.argv[sys.argv.index('--remote') + 1].removeprefix('unix://')
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 listener.settimeout(15)
@@ -1751,6 +1751,12 @@ try:
             frame(10, data)
         elif opcode == 1:
             request = json.loads(data)
+            if request['thread'] == 'first':
+                pathlib.Path('first-frame-held').write_text('actual peer waits before first confirmation')
+                until = time.monotonic() + 5
+                while not pathlib.Path('first-frame-release').exists():
+                    if time.monotonic() >= until: raise TimeoutError('first confirmation fixture release')
+                    time.sleep(0.002)
             frame(1, json.dumps({'thread': request['thread']}).encode())
 except (EOFError, BrokenPipeError, ConnectionResetError):
     pass
@@ -1835,8 +1841,20 @@ finally:
         let owner = Owner(handle.clone());
         let fixture = BackendFixture::new(source.clone(), handle.clone(), instance);
         *notifications.lock().unwrap() = Some(Arc::downgrade(&fixture.host));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !directory.path().join("first-frame-held").exists() {
+            assert!(Instant::now()<deadline,"actual owned peer never reached the pre-confirmation cut");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(handle.provider_process().is_none(), "socket connection alone cannot publish native ownership");
+        let before=Instant::now();
+        let unavailable=fixture.capture().unwrap_err();
+        assert!(unavailable.message.contains("positively confirmed concrete provider peer"),"{unavailable:?}");
+        assert!(before.elapsed()<Duration::from_millis(500),"unconfirmed active holder must refuse without orphan Inspect RPC");
+        std::fs::write(directory.path().join("first-frame-release"),b"confirm exact owned peer").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.confirmed_session_id().as_deref() != Some("first")
+        while handle.provider_process().is_none()
+            || handle.confirmed_session_id().as_deref() != Some("first")
             || !matches!(
                 handle.native_continuity(),
                 chat::NativeContinuity::Durable { .. }
@@ -1852,6 +1870,8 @@ finally:
             handle.native_continuity(),
             chat::NativeContinuity::Durable { .. }
         ));
+        let confirmed_peer = handle.provider_process().expect("positively holder-authenticated WebSocket peer");
+        assert!(confirmed_peer.is_current());
         let binding = fixture.capture().unwrap();
         assert!(fixture.validates(&binding));
         handle
@@ -1877,6 +1897,7 @@ finally:
             );
             thread::sleep(Duration::from_millis(2));
         }
+        assert_eq!(handle.provider_process(), Some(confirmed_peer), "failed confirmation cannot replace the authenticated process");
         assert_eq!(
             handle.confirmed_session_id().as_deref(),
             Some("first"),

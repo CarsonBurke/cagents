@@ -3745,7 +3745,7 @@ impl Actor {
                 .native_peer
                 .clone()
                 .ok_or("Missing verified app-server peer")?;
-            holder.confirm(thread.clone(), identity.clone(), process)?;
+            holder.confirm(thread.clone(), identity.clone(), process.clone())?;
             // Durable continuity is a claim about this thread. Name it first,
             // so nobody can observe the claim without its conversation.
             *self
@@ -3758,6 +3758,11 @@ impl Actor {
                 .native_continuity = super::NativeContinuity::Durable {
                 provider_version: version.to_owned(),
             };
+            // The live holder services its original control stream, not an
+            // orphan Inspect connection. Publish ONLY the actual WebSocket
+            // SO_PEERCRED peer which this holder just authenticated, after
+            // successful durable confirmation. Record.root is not this proof.
+            *self.provider_process.lock().unwrap_or_else(|p|p.into_inner()) = Some(process);
             self.dirty = true;
         }
         self.apply_observed_step(step, identity, backend_identity_changed)?;

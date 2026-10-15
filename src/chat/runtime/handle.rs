@@ -325,6 +325,7 @@ impl Handle {
         &self,
         proof: &crate::model::HostSessionProof,
     ) -> Result<BackendIdentity, String> {
+        if !proof.is_complete() {return Err("Backend identity requires the complete current host proof".into());}
         match &self.0 {
             Owner::Remote(remote) => {
                 // An impossible caller generation forces a fresh response (or
@@ -354,17 +355,9 @@ impl Handle {
                 if !local.backend_is_observed() {
                     return Err("The retained native backend is not observed by this actor; reattach before confirming a handoff".into());
                 }
-                let process = if let Some(process) = local.provider_process() {
-                    process
-                } else {
-                    let record = local
-                        .native_holder_record()
-                        .ok_or("Native actor has no concrete backend identity")?;
-                    let (recovery, _) = chat::native_holder::inspect(record, proof)?;
-                    recovery
-                        .server_process
-                        .ok_or("Native holder has no authenticated concrete server identity")?
-                };
+                let process = local.provider_process().ok_or(
+                    "Native actor has no positively confirmed concrete provider peer; wait for ownership confirmation",
+                )?;
                 let (conversation, conversation_revision) = local.backend_confirmation();
                 if conversation != local.confirmed_session_id() {
                     return Err("Provider identity publication is still transitioning".into());
