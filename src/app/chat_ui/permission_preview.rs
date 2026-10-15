@@ -310,7 +310,9 @@ mod tests {
         app.refresh_draft_permission_previews();
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         // The resolver cannot finish until after this actual UI input update.
+        let input_started = Instant::now();
         drop(app.update(Message::SettingsSearchChanged("input remains responsive".into())));
+        eprintln!("blocked_config_resolver_input_elapsed_us={}", input_started.elapsed().as_micros());
         assert_eq!(app.settings_search, "input remains responsive");
         release.send(()).unwrap();
     }

@@ -45,6 +45,15 @@ impl Monitor {
         {
             let mut observed = self.observed.lock().unwrap_or_else(|error| error.into_inner());
             observed.extend(results.iter().cloned());
+            if observed.is_empty() {
+                // The last local scope closed. Retire the native watcher on
+                // this blocking worker, including its helper thread.
+                drop(observed);
+                registration.watcher = None;
+                registration.paths.clear();
+                self.failed.store(false, Ordering::Release);
+                return;
+            }
         }
         if registration.watcher.is_none() {
             let observed = self.observed.clone();

@@ -2646,7 +2646,9 @@ mod owner_path_cache_tests {
         });
         let worker = std::thread::spawn(move || super::super::tests::task_app_message(task));
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let input_started = Instant::now();
         drop(app.update(Message::SettingsSearchChanged("responsive during slow ownership".into())));
+        eprintln!("blocked_twelve_owner_paths_input_elapsed_us={}", input_started.elapsed().as_micros());
         assert_eq!(app.settings_search, "responsive during slow ownership");
         release.send(()).unwrap();
         let Message::WorktreeOwnerPathsResolved { generation, paths } = worker.join().unwrap() else {
