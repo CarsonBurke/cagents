@@ -46,6 +46,8 @@ pub(crate) mod editor_history;
 #[cfg(feature = "ui")]
 pub mod editor_search;
 #[cfg(feature = "ui")]
+pub(crate) mod editor_workspace_edit;
+#[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
 pub mod file_drop;
