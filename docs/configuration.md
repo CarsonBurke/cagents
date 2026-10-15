@@ -505,3 +505,35 @@ PDF viewer commands `pdf_first_page`, `pdf_previous_page`, `pdf_next_page`, `pdf
 Diff presentation commands (`diff_unified`, `diff_split`, `diff_ignore_whitespace`, `diff_working`, `diff_staged`, `diff_branch`, `diff_history`, `diff_revert`, `diff_retry`) and explicit selected-row mutation commands (`diff_stage_selection`, `diff_unstage_selection`, `diff_revert_selection`) are unbound by default. Selection commands require actual changed rows and retain the displayed source, selected rows and layout revision through palette activation. Existing confirmation and mutation handling still apply.
 
 `stage_or_unstage_file` defaults to Ctrl+Shift+S, preferring Stage when the file has unstaged changes and otherwise Unstage. `stage_file` and `unstage_file` are separate unbound actions. These operate on the current file, including a clean native editor; the selected-row commands remain separate. Clearing or rebinding the toggle retires Ctrl+Shift+S. Toolbar hints use current configured bindings and only advertise the toggle for the direction it would perform.
+
+Diff presentation and staging commands are configurable as `diff_unified`,
+`diff_split`, `diff_ignore_whitespace`, `diff_working`, `diff_staged`,
+`diff_branch`, `diff_history`, `stage_file`, `unstage_file`,
+`stage_or_unstage_file`, `diff_revert` and `diff_retry`. Only
+`stage_or_unstage_file` starts bound (`Ctrl+Shift+S`); clearing it retires the
+old staging shortcut. Explicit selected-row actions are `diff_stage_selection`,
+`diff_unstage_selection` and `diff_revert_selection`. Current-hunk actions are
+`diff_stage_hunk`, `diff_unstage_hunk` and `diff_revert_hunk`; they are available
+only when no rows are selected. Mutation availability uses the actual current
+worktree and source/layout identity, including selection and save guards.
+
+Browser controls are `browser_back` (`Alt+Left`), `browser_forward`
+(`Alt+Right`), `browser_reload` (`Ctrl+R`, `F5`), `browser_address` (`Ctrl+L`),
+`browser_stop`, `browser_open_system` and `browser_import_logins` (the last three
+unbound). Remapping or clearing the registered navigation actions retires their
+old aliases. Native address and other text fields keep their editing keys;
+only the conventional Back/Forward action-and-chord pairs override word motion
+in browser content. Browserless mode retains saved browser descriptors and
+exposes the actual system-browser action, without embedded-runtime commands.
+
+Explicit conversation actions are `chat_send`, `chat_steer`, `chat_queue`,
+`chat_interrupt`, `chat_compact`, `chat_attach`, `chat_reasoning`, `chat_latest`,
+`chat_take_back_queued`, `chat_cancel_queued`, `chat_toggle_steering` and
+`chat_toggle_fast_mode`. They start unbound except `chat_latest` (`Ctrl+End`),
+whose original hardcoded route is retired when the binding changes. `End` is
+accepted by configured chords, menus and the recorder. These explicit aliases
+are separate from the composer's field confirmation policy: Enter versus
+Ctrl+Enter follows `enter_sends`, Ctrl+Shift+Enter selects the alternate delivery
+mode while busy, and Escape cancels through the existing confirmation flow.
+A pending-first-message cancellation retains that exact starting session;
+newly submitted messages do not inherit an older palette result's cancellation.
