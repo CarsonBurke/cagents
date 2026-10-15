@@ -385,6 +385,13 @@ fn attached_mut(
     Ok(record)
 }
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
+    if matches!(&update, Update::PastAttention(_)) {
+        // Session notifications coalesce by the current session target. An
+        // older result cannot replace a newer actionable question, nor can it
+        // borrow rich context from the current snapshot. Managed lifecycle
+        // evidence is delivered separately with its exact accepted RunId.
+        return;
+    }
     let Some(host) = host.upgrade() else {
         return;
     };

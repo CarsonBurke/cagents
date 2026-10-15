@@ -109,6 +109,10 @@ pub(crate) enum Update {
         /// Unix milliseconds at which the runtime read the report.
         observed_at: u64,
     },
+    /// Evidence for an older provider turn. It must never sample or replace
+    /// attention belonging to the current turn. Managed run lifecycle has
+    /// its own exact RunId-bearing Execution update.
+    PastAttention(crate::notifications::Evidence),
 }
 
 #[derive(Clone)]
@@ -2612,7 +2616,7 @@ impl Actor {
     }
     fn apply(&mut self, event: Event) {
         if matches!(&event,Event::PastTurnFinished {..}) {
-            if let Some(evidence)=self.attention.apply(&event) {(self.notify)(Update::Attention(evidence));}
+            if let Some(evidence)=self.attention.apply(&event) {(self.notify)(Update::PastAttention(evidence));}
             return;
         }
         if matches!(
@@ -3997,7 +4001,9 @@ mod tests {
         assert_eq!(after.outcome,before.outcome);
         assert_eq!(after.finished_at,before.finished_at);
         assert_eq!(after.activity(),ActivityState::Waiting);
-        assert!(receive.try_iter().any(|update|matches!(update,Update::Attention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
+        let updates=receive.try_iter().collect::<Vec<_>>();
+        assert!(updates.iter().any(|update|matches!(update,Update::PastAttention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
+        assert!(!updates.iter().any(|update|matches!(update,Update::Attention(evidence) if evidence.key=="old-result")),"old evidence must not enter current-session attention coalescing or sample current rich context");
         handle.close().unwrap();
     }
 
@@ -6265,6 +6271,7 @@ mod tests {
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
                 | Update::Attention(_)
+                | Update::PastAttention(_)
                 | Update::Ready
                 | Update::Execution { .. } => None,
             })
