@@ -532,7 +532,9 @@ impl Pane {
         self.settle_geometry();
         let expected = self.items.last().expect("streamed item");
         let cached = self.runtime.cache.get(&expected.id).expect("active streamed cache");
-        assert!(!cached.preparing && !cached.placeholder, "new publication must finish preparation");
+        // `preparing` also keeps a running source's canonical parser alive;
+        // it remains true after installing the exact current growing version.
+        assert!(!cached.placeholder, "new publication must have rendered content");
         assert_eq!(cached.item.as_deref(), Some(expected), "cannot time a stale rendered prefix as the new body");
         start.elapsed()
     }
