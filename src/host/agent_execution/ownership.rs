@@ -130,6 +130,23 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         let HostedSession::Chat(source) = source else {
             return Err("This agent has no native cleanup contract".into());
         };
+        // Keep the existing control -> Agent -> chat lifecycle lock order.
+        // A retained helper can restart its backend inside the same Handle and
+        // execution_instance. Capture completion/idle eligibility only after
+        // claiming that transition, and retain it through teardown.
+        #[cfg(test)]
+        {
+            let hook = BEFORE_RECONCILIATION_TRANSITION.lock().unwrap().take();
+            if let Some(hook) = hook { hook(); }
+        }
+        let transition = super::super::chat::presentation_close::transition_gate(host, source.id);
+        let transition = match transition.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err("This exact conversation has a lifecycle transition in progress; automatic cleanup was deferred".into());
+            }
+        };
         let (handle, execution_instance) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let record = state
@@ -162,12 +179,13 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         if let Some(generation) = idle_generation {
             handle.close_if_idle(generation)?;
         }
-        super::super::chat::close_captured(
+        super::super::chat::close_captured_under_transition(
             host,
             EXECUTION_CLIENT,
             source,
             &handle,
             execution_instance,
+            &transition,
         )
         .map_err(|error| error.message)?;
     } else if !retire {
@@ -232,4 +250,13 @@ pub(in crate::host) fn cancel_agent_run_under_control(
         .map(|record| record.handle.clone())
         .ok_or("The exact provider ownership is unavailable for cancellation")?;
     handle.interrupt_run(expected.id)
+}
+
+// Scheduling seam before the real lifecycle claim. The eligibility snapshot
+// is deliberately captured after this seam while the claim remains held.
+#[cfg(test)]
+static BEFORE_RECONCILIATION_TRANSITION: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(in crate::host) fn before_reconciliation_transition(hook: impl FnOnce() + Send + 'static) {
+    *BEFORE_RECONCILIATION_TRANSITION.lock().unwrap() = Some(Box::new(hook));
 }

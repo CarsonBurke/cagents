@@ -2526,6 +2526,24 @@ pub(super) fn close_captured(
     })
 }
 
+/// Automatic reconciliation already owns the Agent gate, then this chat's
+/// lifecycle claim across eligibility capture and cleanup. Do not release or
+/// recursively acquire that claim between the completed observation and close.
+pub(super) fn close_captured_under_transition(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    handle: &Handle,
+    execution_instance: uuid::Uuid,
+    transition: &std::sync::MutexGuard<'_, ()>,
+) -> Result<ServerResponse, ProtocolError> {
+    super::agent_execution::interactive(host, client,
+        ClientRequest::ChatClose { chat_id: source.id }, |request| {
+            process_inner_claimed(host, client, request,
+                Some((source, handle, execution_instance)), Some(transition))
+        })
+}
+
 /// Called only while this actor's transition gate is held. Full descriptors
 /// and privately retained restart aliases may identify the current actor;
 /// an arbitrary same-ID request cannot. Captured project rosters additionally
@@ -2573,9 +2591,21 @@ fn process_inner(
     request: ClientRequest,
     captured_close: Option<(&Session, &Handle, uuid::Uuid)>,
 ) -> Result<ServerResponse, ProtocolError> {
+    process_inner_claimed(host, client, request, captured_close, None)
+}
+
+fn process_inner_claimed(
+    host: &SharedHost,
+    client: ClientId,
+    request: ClientRequest,
+    captured_close: Option<(&Session, &Handle, uuid::Uuid)>,
+    held_transition: Option<&std::sync::MutexGuard<'_, ()>>,
+) -> Result<ServerResponse, ProtocolError> {
     // Keep explicit close/return and a restart's full pair publication mutually
     // exclusive. Weak entries retain only currently executing transitions.
-    let transition =
+    let transition = if held_transition.is_some() {
+        None
+    } else {
         match &request {
             ClientRequest::ChatStart { session, .. }
             | ClientRequest::ChatCloseSession { session } => Some(session.id),
@@ -2583,7 +2613,8 @@ fn process_inner(
             | ClientRequest::ChatReturnTerminal { chat_id } => Some(*chat_id),
             _ => None,
         }
-        .map(|id| restart::transition_gate(host, id));
+        .map(|id| restart::transition_gate(host, id))
+    };
     let _transition = match transition.as_ref().map(|gate| gate.try_lock()) {
         Some(Ok(guard)) => Some(guard),
         Some(Err(std::sync::TryLockError::Poisoned(poison))) => Some(poison.into_inner()),
