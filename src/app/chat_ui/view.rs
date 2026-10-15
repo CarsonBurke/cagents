@@ -1591,7 +1591,7 @@ impl Runtime {
                 ("selected-child-item", &item.id).hash(&mut key);
                 let mut revision = std::hash::DefaultHasher::new();
                 (
-                    cached.revision,
+                    cached.render_revision(),
                     self.expanded.contains(&item.id),
                     self.find
                         .as_ref()
@@ -3552,7 +3552,7 @@ impl Runtime {
                 .map(|cached| {
                     (
                         cached.token,
-                        cached.revision,
+                        cached.render_revision(),
                         cached.image.as_ref().map(iced::widget::image::Handle::id),
                         cached.image_source.is_some(),
                         self.preview_request.as_deref() == Some(item.id.as_str()),
@@ -3675,7 +3675,7 @@ impl Runtime {
                     .filter_map(|placed_step| placed(placed_step.index))
                     .map(|(item, cached)| {
                         let key = selection::logical_identity(&item.id, &[9]);
-                        let revision = cached.revision;
+                        let revision = cached.render_revision();
                         // Header elements are cheap owned metadata; only a
                         // mounted row creates their widget tree and geometry.
                         let row = step(item, cached);
@@ -3988,7 +3988,7 @@ impl Runtime {
                 selectable_prose::Logical {
                     identity: selection::logical_identity("queued-prompt", &[2]),
                     start: 0,
-                    paint: self.find_paint.clone(),
+                    paint: None,
                 },
             ))
             .class(design::surface(
@@ -4081,7 +4081,7 @@ impl Runtime {
         let logical = selectable_prose::Logical {
             identity: selection::logical_identity(&item.id, &[2]),
             start: 0,
-            paint: self.find_paint.clone(),
+            paint: self.find_paint_for(item),
         };
         let body: Element<'static, Message> = if attachment {
             widget::row::with_children(vec![
@@ -4212,7 +4212,7 @@ impl Runtime {
                         selectable_prose::Logical {
                             identity: selection::logical_identity(&item.id, &[2]),
                             start: 0,
-                            paint: self.find_paint.clone(),
+                            paint: self.find_paint_for(item),
                         },
                     ))
                     .width(Length::Fill)

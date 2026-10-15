@@ -303,7 +303,7 @@ pub(super) fn view(
     Renderer {
         target,
         blocks: palette(cached, cosmic::theme::is_dark()),
-        revision: cached.revision,
+        revision: cached.render_revision(),
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),
@@ -318,7 +318,7 @@ pub(super) fn view(
         path: vec![0],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
-        paint: cached.find_paint.clone(),
+        paint: cached.current_find_paint(),
     }
     .items(cached.markdown.items(), settings)
 }
@@ -336,7 +336,7 @@ pub(super) fn content_view(
     Renderer {
         target,
         blocks: palette(cached, cosmic::theme::is_dark()),
-        revision: cached.revision,
+        revision: cached.render_revision(),
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),
@@ -362,7 +362,7 @@ pub(super) fn content_view(
         ],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
-        paint: cached.find_paint.clone(),
+        paint: cached.current_find_paint(),
     }
     .items(content.items(), settings)
 }
@@ -376,7 +376,7 @@ pub(super) fn items_for_test(
     Renderer {
         target,
         blocks: palette(cached, cosmic::theme::is_dark()),
-        revision: cached.revision,
+        revision: cached.render_revision(),
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),

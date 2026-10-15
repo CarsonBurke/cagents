@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     ops::Range,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -212,11 +212,19 @@ mod tests {
 
 /// One accepted search result, shared by mounted fragments. Ranges refer to
 /// whole logical blocks; a fragment intersects them without rescanning text.
+#[derive(Clone, Debug)]
+pub(in crate::app::chat_ui) struct SourceProof {
+    pub item: Weak<crate::chat::Item>,
+    pub growing: bool,
+}
+
 #[derive(Clone, Default, Debug)]
 pub(in crate::app::chat_ui) struct Paint {
     pub generation: u64,
     pub blocks: Arc<HashMap<u64, Arc<[Range<usize>]>>>,
     pub current: Option<Match>,
+    pub sources: Arc<HashMap<String, SourceProof>>,
+    pub signatures: Arc<HashMap<Arc<str>, u64>>,
 }
 impl Paint {
     pub fn new(generation: u64, matches: &[Match], current: Option<Match>) -> Self {
@@ -236,7 +244,17 @@ impl Paint {
                     .collect(),
             ),
             current,
+            sources: Default::default(),
+            signatures: Default::default(),
         }
+    }
+    /// Byte ranges belong to the exact immutable source parsed by the worker.
+    /// A stable item/leaf ID alone is not a rendered-source revision proof.
+    pub fn for_item(self: &Arc<Self>, item: &crate::chat::Item) -> Option<Arc<Self>> {
+        self.sources.get(&item.id)
+            .filter(|source| source.item.as_ptr() == item as *const _)
+            .filter(|_| self.signatures.contains_key(item.id.as_str()))
+            .map(|_| self.clone())
     }
     pub fn fragment(
         &self,
@@ -275,6 +293,8 @@ pub(in crate::app::chat_ui) struct Results {
     pub matches: Arc<Vec<Match>>,
     pub blocks: Arc<HashMap<u64, Arc<[Range<usize>]>>>,
     pub revisions: HashMap<String, u64>,
+    pub sources: Arc<HashMap<String, SourceProof>>,
+    pub signatures: Arc<HashMap<Arc<str>, u64>>,
     pub turns: Arc<HashSet<Arc<str>>>,
     pub items: Arc<HashSet<Arc<str>>>,
     pub scope: u64,
@@ -282,6 +302,14 @@ pub(in crate::app::chat_ui) struct Results {
 }
 impl Results {
     pub fn new(matches: Vec<Match>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut item_signatures: HashMap<Arc<str>, std::hash::DefaultHasher> = HashMap::new();
+        for found in &matches {
+            (found.identity, found.range.start, found.range.end)
+                .hash(item_signatures.entry(found.item.clone()).or_default());
+        }
+        let signatures = Arc::new(item_signatures.into_iter()
+            .map(|(item, hash)| (item, hash.finish())).collect());
         let blocks = Paint::new(0, &matches, None).blocks;
         let positions = matches
             .iter()
@@ -305,6 +333,8 @@ impl Results {
             blocks,
             positions,
             revisions: HashMap::new(),
+            sources: Default::default(),
+            signatures,
             turns: Arc::new(turns),
             items: Arc::new(items),
             scope: 0,
@@ -322,6 +352,13 @@ impl Results {
             .filter(|input| matched.contains(input.item.id.as_str()))
             .map(|input| (input.item.id.clone(), input.revision))
             .collect();
+        // Negative results need source proofs too: a previously unmatched
+        // item may have changed while the worker was running.
+        result.sources = Arc::new(inputs.iter()
+            .map(|input| (input.item.id.clone(), SourceProof {
+                item: Arc::downgrade(&input.item), growing: input.growing,
+            }))
+            .collect());
         result.scope = scope;
         result
     }
@@ -346,7 +383,14 @@ pub(in crate::app::chat_ui) struct Input {
 #[derive(Default)]
 pub(in crate::app::chat_ui) struct Worker {
     index: Index,
-    documents: HashMap<String, Document>,
+    documents: HashMap<String, CachedDocument>,
+    document_revision: u64,
+}
+struct CachedDocument {
+    source: Weak<crate::chat::Item>,
+    growing: bool,
+    provider: crate::agent::Provider,
+    document: Document,
 }
 impl Worker {
     pub fn search(
@@ -367,12 +411,27 @@ impl Worker {
             if self
                 .documents
                 .get(&input.item.id)
-                .is_none_or(|document| document.revision != input.revision)
+                .is_none_or(|cached| {
+                    cached.source.as_ptr() != Arc::as_ptr(&input.item)
+                        || cached.growing != input.growing
+                        || cached.provider != provider
+                })
             {
-                self.documents
-                    .insert(input.item.id.clone(), document(input, provider));
+                // A raw append can arrive while the UI still displays its old
+                // prepared prefix and keeps that prefix's layout revision.
+                // Index the actual immutable input, and invalidate the range
+                // cache independently of that lagging presentation revision.
+                self.document_revision = self.document_revision.wrapping_add(1);
+                let mut parsed = document(input, provider);
+                parsed.revision = self.document_revision;
+                self.documents.insert(input.item.id.clone(), CachedDocument {
+                    source: Arc::downgrade(&input.item),
+                    growing: input.growing,
+                    provider,
+                    document: parsed,
+                });
             }
-            let mut document = self.documents[&input.item.id].clone();
+            let mut document = self.documents[&input.item.id].document.clone();
             document.turn.clone_from(&input.turn);
             documents.push(document);
         }
@@ -602,6 +661,48 @@ mod rendered_tests {
             crate::app::chat_ui::selection::logical_identity("rendered-item", &[3, 0])
         );
     }
+    #[test]
+    fn find_geometry_only_revision_preserves_the_parsed_document_and_match_ranges() {
+        let mut source = input(ItemContent::Text {
+            text: "A **needle** in unchanged rich prose.".repeat(400),
+            thinking: false, phase: Phase::Final,
+        });
+        let current = AtomicU64::new(1);
+        let mut worker = Worker::default();
+        let before = worker.search(std::slice::from_ref(&source), Provider::Claude, "needle", 1, &current).unwrap();
+        let blocks = worker.documents[&source.item.id].document.blocks.clone();
+        let ranges = worker.index.items[&source.item.id].ranges.clone();
+        // FlowReady invalidates retained widget geometry, not rendered text.
+        source.revision += 1;
+        let after = worker.search(std::slice::from_ref(&source), Provider::Claude, "needle", 1, &current).unwrap();
+        assert_eq!(before, after);
+        assert!(Arc::ptr_eq(&blocks, &worker.documents[&source.item.id].document.blocks),
+            "geometry completion must not reparse unchanged source");
+        assert!(Arc::ptr_eq(&ranges, &worker.index.items[&source.item.id].ranges),
+            "unchanged parsed leaves reuse their indexed occurrences");
+    }
+
+    #[test]
+    fn find_pending_markdown_append_does_not_reuse_the_old_layout_revision_document() {
+        let source = |body: &str| input(ItemContent::Text {
+            text: body.into(), thinking: false, phase: Phase::Final,
+        });
+        let current = AtomicU64::new(1);
+        let mut worker = Worker::default();
+        let mut old = source("a *needle");
+        old.growing = true;
+        let first = worker.search(std::slice::from_ref(&old), Provider::Claude, "needle", 1, &current).unwrap();
+        assert_eq!(first[0].range, 3..9);
+        let mut appended = source("a *needle*");
+        appended.growing = true;
+        assert_eq!(old.revision, appended.revision,
+            "the renderer still owns its old prepared-prefix revision");
+        let next = worker.search(&[appended], Provider::Claude, "needle", 1, &current).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].range, 2..8,
+            "closing Markdown syntax changes rendered offsets despite raw append lineage");
+    }
+
     #[test]
     fn obsolete_query_cancels_inside_one_large_block() {
         let mut checks = 0;

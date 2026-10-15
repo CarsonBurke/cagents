@@ -388,7 +388,7 @@ impl Runtime {
                         },
                     ),
                     start: 0,
-                    paint: self.find_paint.clone(),
+                    paint: self.find_paint_for(item),
                 },
                 self.scroll_memory.clone(),
                 self.selected_subagent.clone(),
@@ -404,7 +404,7 @@ impl Runtime {
                         caption,
                         design::TEXT_CAPTION,
                         iced::Font::default(),
-                        self.find_paint.clone(),
+                        self.find_paint_for(item),
                     )
                 } else {
                     design::caption(caption.to_owned()).into()
@@ -616,7 +616,7 @@ impl Runtime {
                 label.clone(),
                 design::TEXT_BODY,
                 iced::Font::default(),
-                self.find_paint.clone(),
+                self.find_paint_for(item),
             ));
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
@@ -630,7 +630,7 @@ impl Runtime {
                 label.clone(),
                 design::TEXT_BODY,
                 iced::Font::MONOSPACE,
-                self.find_paint.clone(),
+                self.find_paint_for(item),
             ));
         } else {
             preview.push(cached.preview.view());
@@ -757,7 +757,7 @@ impl Runtime {
                         self.target,
                         &item.id,
                         index,
-                        self.find_paint.clone(),
+                        self.find_paint_for(item),
                     ));
                     if !change.diff.is_empty() {
                         rows.push(self.tool_code_surface(
@@ -778,7 +778,7 @@ impl Runtime {
                     query.as_str(),
                     design::TEXT_BODY,
                     iced::Font::default(),
-                    self.find_paint.clone(),
+                    self.find_paint_for(item),
                 ));
                 if results.is_empty() {
                     rows.push(design::caption("No results were reported.").into());
@@ -789,7 +789,7 @@ impl Runtime {
                         self.target,
                         &item.id,
                         index,
-                        self.find_paint.clone(),
+                        self.find_paint_for(item),
                     )
                 }));
             }
@@ -840,7 +840,7 @@ impl Runtime {
                         description.as_str(),
                         design::TEXT_BODY,
                         iced::Font::default(),
-                        self.find_paint.clone(),
+                        self.find_paint_for(item),
                     ));
                 }
                 if path.starts_with("http://") || path.starts_with("https://") {
@@ -857,7 +857,7 @@ impl Runtime {
                         path.as_str(),
                         design::TEXT_CAPTION,
                         iced::Font::default(),
-                        self.find_paint.clone(),
+                        self.find_paint_for(item),
                     ));
                 }
             }

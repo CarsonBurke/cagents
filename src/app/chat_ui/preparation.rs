@@ -384,6 +384,13 @@ impl Prepared {
         });
     }
     pub(super) fn install(self, cached: &mut CachedItem, managed: bool) {
+        if cached.item.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &self.request.item))
+            || cached.find_source_growing != self.request.growing {
+            // Appending raw bytes can remove a Markdown delimiter; ending the
+            // same immutable source can also release provisional syntax.
+            cached.find_paint = None;
+        }
+        cached.find_source_growing = self.request.growing;
         // Move the old owned parser containers out before replacing them:
         // their destructors may visit thousands of blocks and free code.
         let retired = Retired {
@@ -965,6 +972,132 @@ mod tests {
         assert_eq!(cached.markdown.items().len(), 1);
         drop(admitted);
     }
+    #[test]
+    fn find_markdown_append_install_never_paints_the_previous_rendered_byte_ranges() {
+        use iced::advanced::{Layout, layout, mouse, renderer, widget::{Operation, Tree}};
+        fn ranges(cached: &CachedItem, target: Target) -> Vec<std::ops::Range<usize>> {
+            struct Read(Vec<std::ops::Range<usize>>);
+            impl Operation for Read {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+                fn custom(&mut self, _: Option<&iced::advanced::widget::Id>, _: iced::Rectangle, state: &mut dyn std::any::Any) {
+                    if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() { policy.visit = false; }
+                    if let Some(state) = state.downcast_ref::<selectable_prose::State>()
+                        && let Some(logical) = &state.logical
+                        && let Some(paint) = &logical.paint {
+                        self.0.extend(paint.fragment(logical.identity, logical.start, state.plain.len()).0);
+                    }
+                }
+            }
+            let mut renderer = crate::app::tests::headless_renderer();
+            let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            let mut widget = prose::view(cached, settings, target, Some("needle"));
+            let mut tree = Tree::new(&widget);
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, 400.0));
+            widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            assert!(cached.flow_cache.complete_fixture());
+            let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut read = Read(Vec::new());
+            widget.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+            widget.as_widget().draw(&tree, &mut renderer, &cosmic::Theme::dark(), &renderer::Style::default(),
+                Layout::new(&node), mouse::Cursor::Unavailable,
+                &iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(720.0, 400.0)));
+            read.0
+        }
+        let target = target();
+        let old = item("a *needle");
+        let new = item("a *needle*");
+        let theme = crate::settings::EditorSyntaxTheme::default();
+        let mut state = configured(target, &old);
+        state.stage(&old, true, theme, |_, _| false);
+        let (_, shared) = job(&state);
+        let mut cached = CachedItem::preparing(&old, theme);
+        execute(shared, permit()).unwrap().install(&mut cached, true);
+        let input = |item: &Arc<chat::Item>, revision, growing| find::Input {
+            item: item.clone(), revision, growing, turn: "turn".into(),
+        };
+        let mut worker = find::Worker::default();
+        let generation = AtomicU64::new(1);
+        let old_input = input(&old, cached.revision, true);
+        let matches = worker.search(std::slice::from_ref(&old_input), crate::agent::Provider::Claude,
+            "needle", 1, &generation).unwrap();
+        let result = find::Results::with_revisions(matches, &[old_input], 0);
+        let old_paint = Arc::new(find::Paint { generation: 1, blocks: result.blocks.clone(),
+            current: result.matches.first().cloned(), sources: result.sources.clone(), signatures: result.signatures.clone() });
+        cached.find_paint = Some(old_paint.clone());
+        assert_eq!(ranges(&cached, target), vec![3..9]);
+        state.context(target, Some("session"), None, std::slice::from_ref(&new));
+        state.stage(&new, false, theme, |previous, current| {
+            CachedItem::prose(&current.content).unwrap().starts_with(CachedItem::prose(&previous.content).unwrap())
+        });
+        let (_, shared) = job(&state);
+        execute(shared, permit()).unwrap().install(&mut cached, false);
+        assert!(old_paint.for_item(&new).is_none(), "direct item renderers reject the old immutable source too");
+        assert!(ranges(&cached, target).is_empty(),
+            "actual prepared widget must not paint stale ranges before the replacement index completes");
+        let new_input = input(&new, cached.revision, false);
+        let matches = worker.search(std::slice::from_ref(&new_input), crate::agent::Provider::Claude,
+            "needle", 1, &generation).unwrap();
+        let result = find::Results::with_revisions(matches, &[new_input], 0);
+        cached.find_paint = Some(Arc::new(find::Paint { generation: 1, blocks: result.blocks.clone(),
+            current: result.matches.first().cloned(), sources: result.sources.clone(), signatures: result.signatures.clone() }));
+        assert_eq!(ranges(&cached, target), vec![2..8], "fresh ranges follow the newly rendered emphasis");
+    }
+
+    #[test]
+    fn find_same_item_stream_finalization_fences_both_completion_orders() {
+        for index_first in [true, false] {
+            let target = target();
+            let source = item("before needle <tail");
+            let theme = crate::settings::EditorSyntaxTheme::default();
+            let mut state = configured(target, &source);
+            state.stage(&source, true, theme, |_, _| false);
+            let (_, shared) = job(&state);
+            let mut cached = CachedItem::preparing(&source, theme);
+            execute(shared, permit()).unwrap().install(&mut cached, true);
+            assert!(cached.find_source_growing);
+            let input = |growing, revision| find::Input { item: source.clone(), revision,
+                growing, turn: "turn".into() };
+            let current = AtomicU64::new(1);
+            let mut worker = find::Worker::default();
+            let growing_input = input(true, cached.revision);
+            assert!(worker.search(std::slice::from_ref(&growing_input), crate::agent::Provider::Claude,
+                "tail", 1, &current).unwrap().is_empty(), "the installed open parser holds the angle tail");
+            let old = input(true, cached.revision);
+            let old_matches = worker.search(std::slice::from_ref(&old), crate::agent::Provider::Claude,
+                "needle", 1, &current).unwrap();
+            let old_result = find::Results::with_revisions(old_matches, &[old], 0);
+            cached.find_paint = Some(Arc::new(find::Paint { generation: 1,
+                blocks: old_result.blocks, current: old_result.matches.first().cloned(),
+                sources: old_result.sources.clone(), signatures: old_result.signatures }));
+            assert!(cached.current_find_paint().is_some());
+            let finalized = |worker: &mut find::Worker, revision| {
+                let final_input = input(false, revision);
+                // Same Arc, but ending releases the provisional angle tail.
+                let final_matches = worker.search(std::slice::from_ref(&final_input), crate::agent::Provider::Claude,
+                    "tail", 1, &current).unwrap();
+                assert_eq!(final_matches.len(), 1);
+                find::Results::with_revisions(final_matches, &[final_input], 0)
+            };
+            let mut final_result = None;
+            if index_first {
+                let result = finalized(&mut worker, cached.revision);
+                assert!(!cached.accepts_find_source(&result.sources[&source.id]),
+                    "finalized search cannot bind the still-installed streaming parser");
+                final_result = Some(result);
+            }
+            state.stage(&source, false, theme, |_, _| false);
+            let (_, shared) = job(&state);
+            execute(shared, permit()).unwrap().install(&mut cached, false);
+            assert!(!cached.find_source_growing);
+            assert!(cached.find_paint.is_none(), "same-Arc semantic replacement retires old Paint");
+            assert!(!cached.accepts_find_source(&old_result.sources[&source.id]));
+            let final_result = final_result.unwrap_or_else(|| finalized(&mut worker, cached.revision));
+            assert!(cached.accepts_find_source(&final_result.sources[&source.id]),
+                "both completion orders accept only the installed finalized source");
+            assert!(Arc::ptr_eq(cached.item.as_ref().unwrap(), &source));
+        }
+    }
+
     #[test]
     fn syntax_theme_change_rejects_old_worker_palette_without_losing_input() {
         let source = item("```rust\nlet value = 42;\n```\n");
