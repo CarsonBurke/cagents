@@ -244,6 +244,11 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
+    if let Err(error) = chat::retained_actor::reconcile_startup_losses(&host) {
+        // The holder keeps its unacknowledged loss and refuses new input;
+        // another failed store must not dispose of unrelated live sessions.
+        tracing::warn!(%error, "retained actor loss remains pending durable reconciliation");
+    }
     let retained_runs = chat::retained_actor::retained_runs(&host);
     if let Ok(registry) = agent_execution::registry(&host) {
         registry

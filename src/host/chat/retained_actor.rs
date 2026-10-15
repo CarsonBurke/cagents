@@ -79,6 +79,16 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<(), String> {
         (record.handle.clone(), record.session.clone(), identity, state.notifications.clone())
     };
     let registry = super::super::agent_execution::registry(host)?;
+    let loss = handle.continuity_loss();
+    if let Some(loss) = &loss {
+        let changed = registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_loss(
+            identity.instance, &identity.record, &source, &loss.affected_runs, &loss.reason, chat::now_ms().unwrap_or(0))?;
+        if changed { super::super::agent_execution::announce(host, &registry); }
+        let current = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&id).is_some_and(|record|
+            record.handle.same_actor(&handle) && record.execution_instance == identity.instance && record.session == source);
+        if !current { return Err("Retained actor changed before continuity-loss acknowledgement".into()); }
+        handle.ack_continuity_loss(loss.id)?;
+    }
     // Always ask the HELPER for its unacknowledged page. The local cursor alone
     // cannot prove that a notification committed before a previous daemon died.
     for entry in handle.uncommitted_outcomes()? {
@@ -96,7 +106,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<(), String> {
         if changed { super::super::agent_execution::announce(host, &registry); }
         if let NativeActorEvent::Attention(evidence) = semantic {
             // Scheduled notifications are produced from committed run outcomes.
-            if !automation {
+            if !automation && !(loss.is_some() && evidence.kind == crate::notifications::Kind::Succeeded) {
                 let receipt = notifications.as_ref().ok_or("The notification journal is unavailable; attention remains retained")?.record_committed(crate::notifications::Event::session(id, source.launch.provider, source.launch.recipe.working_directory.clone(), evidence))?;
                 receipt.recv_timeout(Duration::from_secs(10)).map_err(|_| "The notification journal has not confirmed this attention outcome")??;
             }
@@ -230,4 +240,24 @@ pub(in crate::host) fn retained_runs(host: &SharedHost) -> Vec<(crate::model::Ru
     };
     actors.into_iter().flat_map(|(handle, source)| handle.retained_runs().into_iter()
         .map(move |run| (run, crate::agent_execution::HostedSession::Chat(source.clone())))).collect()
+}
+
+/// Boot must record a known loss before deciding which accepted runs remain
+/// protected by the surviving actor. Ordinary deferred delivery still retries.
+pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(), String> {
+    let actors = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.chats.values().filter_map(|record| record.handle.actor_identity().map(|identity|
+            (record.handle.clone(), record.session.clone(), identity))).collect::<Vec<_>>()
+    };
+    let registry = super::super::agent_execution::registry(host)?;
+    for (handle, source, identity) in actors {
+        if let Some(loss) = handle.continuity_loss() {
+            let changed = registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_loss(
+                identity.instance, &identity.record, &source, &loss.affected_runs, &loss.reason, chat::now_ms().unwrap_or(0))?;
+            if changed { super::super::agent_execution::announce(host, &registry); }
+            handle.ack_continuity_loss(loss.id)?;
+        }
+    }
+    Ok(())
 }

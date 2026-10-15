@@ -22,6 +22,38 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 }
 
 impl Registry {
+    /// A typed loss is already durable in the authenticated helper. Commit all
+    /// affected runs together before its separate loss ACK permits recovery.
+    /// Repeating this transaction cannot replace a committed terminal outcome.
+    pub(in crate::host) fn commit_native_actor_loss(
+        &mut self, actor: Uuid, owner: &Record, source: &chat::Session,
+        runs: &[RunId], reason: &str, now_ms: u64,
+    ) -> Result<bool, String> {
+        if actor.is_nil() || runs.len() > 4096 || reason.is_empty() || reason.len() > 4096
+            || owner.kind != Kind::Native || owner.application != crate::instance::APPLICATION_ID
+            || owner.terminal != source.id || !source.proof.as_ref().is_some_and(|proof| proof.is_complete() && proof.boot_id == owner.boot)
+        { return Err("Native actor loss has invalid exact ownership or bounds".into()); }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+        let mut changed = false;
+        for id in runs {
+            let record: String = tx.query_row("SELECT record FROM agent_runs WHERE id=?1", [id.to_string()], |row| row.get(0)).map_err(|error| error.to_string())?;
+            let run: Run = serde_json::from_str(&record).map_err(|error| error.to_string())?;
+            if run.state.is_terminal() { continue; }
+            let record: String = tx.query_row("SELECT record FROM agents WHERE id=?1", [run.agent.to_string()], |row| row.get(0)).map_err(|error| error.to_string())?;
+            let agent: crate::agent_execution::Agent = serde_json::from_str(&record).map_err(|error| error.to_string())?;
+            if agent.closed || !agent.session.as_ref().is_some_and(|expected| expected.same_process(&HostedSession::Chat(source.clone()))) {
+                return Err("Native actor loss does not belong to this exact open agent".into());
+            }
+            execution::update_agent_run_in(&tx, *id, run.revision, Update::Finished {
+                state: crate::agent_execution::State::Interrupted,
+                result: crate::agent_execution::ResultSummary { diagnostic: Some(reason.into()), ..Default::default() },
+            }, now_ms)?;
+            changed = true;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed)
+    }
+
     /// `owner` and `source` must already be authenticated by the helper socket
     /// and exact daemon lease. No user descriptor can create this authority.
     ///
