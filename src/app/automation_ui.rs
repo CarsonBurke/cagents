@@ -159,7 +159,13 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                let selected = match &agent.placement {
+                let Some(placement) = self.workspace_model.agent_view_scope(&agent).cloned() else {
+                    self.status = Some(TransientNotice::warning(
+                        "This agent's exact pane is no longer available in a single view. Its result remains available in run history.",
+                    ));
+                    return Task::none();
+                };
+                let selected = match &placement {
                     crate::agent_execution::Placement::Channel(id) => {
                         let Some(channel) = self
                             .durable
@@ -179,7 +185,7 @@ impl Cagents {
                     }
                     crate::agent_execution::Placement::Worktree { path, .. } => {
                         if self.project_ui.deleting_directory(path)
-                            || self.worktree_view_scope(path).as_ref() != Some(&agent.placement)
+                            || self.worktree_view_scope(path).as_ref() != Some(&placement)
                         {
                             self.status = Some(TransientNotice::error(
                                 "The agent's worktree view is not loaded in this window. Open its project, then try again.",
