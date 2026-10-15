@@ -1,5 +1,7 @@
 //! Small durable command/decision authority, separate from ephemeral body caches.
 use super::*;
+mod pending;
+pub(crate) use pending::PreparedCommand;
 use crate::account::scope::LaunchAccountScope;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -22,7 +24,7 @@ pub(crate) struct Store {
 pub(crate) struct PendingAttachment {
     pub attachment: OriginalAttachment,
     _lease: fs::File,
-    accepted: bool,
+    retained: bool,
     reserved_bytes:u64,
     pending_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -32,7 +34,7 @@ impl PendingText {
 }
 impl Drop for PendingAttachment {
     fn drop(&mut self) {
-        if !self.accepted {let _=fs::remove_file(&self.attachment.path);}
+        if !self.retained {let _=fs::remove_file(&self.attachment.path);}
         self.pending_bytes.fetch_sub(self.reserved_bytes,std::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -143,6 +145,9 @@ impl Store {
           CREATE TABLE IF NOT EXISTS approvals(session TEXT NOT NULL,agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,decision INTEGER NOT NULL,PRIMARY KEY(session,agent,item,request));
           CREATE TABLE IF NOT EXISTS current_approval(session TEXT NOT NULL,agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,PRIMARY KEY(session,agent,item));
           CREATE TABLE IF NOT EXISTS retained_attachments(path TEXT PRIMARY KEY,accepted INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL,session TEXT);
+          CREATE TABLE IF NOT EXISTS pending_commands(command_id TEXT PRIMARY KEY,expected_session TEXT,metadata BLOB NOT NULL);
+          CREATE INDEX IF NOT EXISTS pending_command_sessions ON pending_commands(expected_session);
+          CREATE TABLE IF NOT EXISTS command_captures(command_id TEXT NOT NULL REFERENCES pending_commands(command_id) ON DELETE CASCADE,path TEXT NOT NULL UNIQUE REFERENCES retained_attachments(path),PRIMARY KEY(command_id,path));
           CREATE INDEX IF NOT EXISTS pending_attachments ON retained_attachments(accepted) WHERE accepted=0;
           CREATE INDEX IF NOT EXISTS session_attachments ON retained_attachments(session) WHERE session IS NOT NULL;
           CREATE TABLE IF NOT EXISTS latest(session TEXT PRIMARY KEY,user_id TEXT NOT NULL); PRAGMA user_version=1;")
@@ -154,6 +159,7 @@ impl Store {
     fn purge_current_session(&mut self)->Result<(),String>{
         self.scope.revalidate()?;let session=self.confirmed()?.to_owned();
         let transaction=self.db.transaction().map_err(|e|e.to_string())?;
+        transaction.execute("DELETE FROM pending_commands WHERE expected_session=?1",[&session]).map_err(|e|e.to_string())?;
         transaction.execute("DELETE FROM prompts WHERE session=?1",[&session]).map_err(|e|e.to_string())?;
         for table in ["approvals","current_approval","latest"]{transaction.execute(&format!("DELETE FROM {table} WHERE session=?1"),[&session]).map_err(|e|e.to_string())?;}
         transaction.execute("UPDATE retained_attachments SET accepted=0,session=NULL WHERE session=?1",[&session]).map_err(|e|e.to_string())?;
@@ -168,7 +174,7 @@ impl Store {
         loop {
             let _publication=crate::instance::owned_lock(&self.directory.join("capture-publication.lock"),libc::LOCK_EX).map_err(|e|e.to_string())?;
             let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-            let mut statement=transaction.prepare("SELECT path FROM retained_attachments WHERE accepted=0 AND path>?1 ORDER BY path LIMIT 128").map_err(|e|e.to_string())?;
+            let mut statement=transaction.prepare("SELECT path FROM retained_attachments WHERE accepted=0 AND path>?1 AND NOT EXISTS(SELECT 1 FROM command_captures c WHERE c.path=retained_attachments.path) ORDER BY path LIMIT 128").map_err(|e|e.to_string())?;
             let paths=statement.query_map([&after],|row|row.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
             drop(statement);
             if paths.is_empty(){break;}
@@ -232,7 +238,7 @@ impl Store {
             if bytes!=reserved_bytes{return Err(OriginalError::Changed);}
             output.sync_all().map_err(|e|OriginalError::Unavailable(e.to_string()))?;
             fs::File::open(&self.directory).and_then(|file|file.sync_all()).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
-            Ok(PendingAttachment{attachment:OriginalAttachment{original_path:original_path.to_owned(),path:retained.clone(),bytes,sha256:hash.finalize().into()},_lease:output,accepted:false,reserved_bytes,pending_bytes:budget.clone()})
+            Ok(PendingAttachment{attachment:OriginalAttachment{original_path:original_path.to_owned(),path:retained.clone(),bytes,sha256:hash.finalize().into()},_lease:output,retained:false,reserved_bytes,pending_bytes:budget.clone()})
         })();
         if result.is_err(){if created{let _=fs::remove_file(retained);}budget.fetch_sub(reserved_bytes,Ordering::AcqRel);}
         result
@@ -241,14 +247,14 @@ impl Store {
     /// command to its real user item. Conflicting rewrites are refused.
     pub(crate) fn accept(&mut self, original:&OriginalPrompt,text:&str,aliases:&[String],captures:&mut [PendingAttachment])->Result<(),OriginalError> {
         if text.len()!=original.text_bytes{return Err(OriginalError::Changed);}
-        self.accept_reader(original,std::io::Cursor::new(text.as_bytes()),Sha256::digest(text.as_bytes()).into(),aliases,captures)
+        self.accept_reader(original,std::io::Cursor::new(text.as_bytes()),Sha256::digest(text.as_bytes()).into(),aliases,captures,None)
     }
     pub(crate) fn accept_captured(&mut self,original:&OriginalPrompt,text:&PendingText,aliases:&[String],captures:&mut[PendingAttachment])->Result<(),OriginalError>{
         if text.bytes()!=original.text_bytes||text.0.attachment.path.parent()!=Some(self.directory.as_path()){return Err(OriginalError::Changed);}
         let file=crate::secure_file::open_existing_private_file(&text.0.attachment.path).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
-        self.accept_reader(original,file,text.0.attachment.sha256,aliases,captures)
+        self.accept_reader(original,file,text.0.attachment.sha256,aliases,captures,None)
     }
-    fn accept_reader(&mut self,original:&OriginalPrompt,mut text:impl std::io::Read,text_sha:[u8;32],aliases:&[String],captures:&mut[PendingAttachment])->Result<(),OriginalError>{
+    fn accept_reader(&mut self,original:&OriginalPrompt,mut text:impl std::io::Read,text_sha:[u8;32],aliases:&[String],captures:&mut[PendingAttachment],prepared:Option<&str>)->Result<(),OriginalError>{
         self.scope.revalidate().map_err(OriginalError::Unavailable)?;
         let session=self.confirmed().map_err(OriginalError::Unavailable)?.to_owned();
         if !valid_id(&original.user_id)||!valid_id(&original.turn_id)||aliases.len()>128||aliases.iter().any(|id|!valid_id(id)) {return Err(OriginalError::TooLarge);}
@@ -282,8 +288,11 @@ impl Store {
             let name=capture.attachment.path.file_name().and_then(|name|name.to_str()).ok_or(OriginalError::Changed)?;
             if transaction.execute("UPDATE retained_attachments SET accepted=1,session=?2 WHERE path=?1 AND (session IS NULL OR session=?2)",params![name,session]).map_err(storage_error)?!=1{return Err(OriginalError::Changed);}
         }
+        if let Some(command)=prepared{
+            if transaction.execute("DELETE FROM pending_commands WHERE command_id=?1 AND (expected_session IS NULL OR expected_session=?2)",params![command,session]).map_err(storage_error)?!=1{return Err(OriginalError::Changed);}
+        }
         transaction.commit().map_err(storage_error)?;
-        for capture in captures{capture.accepted=true;}
+        for capture in captures{capture.retained=true;}
         Ok(())
     }
     /// Called only for the newest live confirmed user, in conversation order.
@@ -447,7 +456,7 @@ mod tests {
         let another=Store::at(&annotations,&account,"session").unwrap();assert!(active_path.exists(),"cold recovery must preserve a live leased capture");drop(another);
         // Model a crash by releasing the descriptor without running Drop.
         let orphan_path=active.attachment.path.clone();
-        let mut orphan=active;orphan.accepted=true;drop(orphan);drop(store);
+        let mut orphan=active;orphan.retained=true;drop(orphan);drop(store);
         let reopened=Store::at(&annotations,&account,"session").unwrap();assert!(!orphan_path.exists());assert!(accepted_path.exists());
         assert_eq!(reopened.original(Some("accepted"),0,4).unwrap().original,original);
     }
