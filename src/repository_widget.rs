@@ -3706,11 +3706,14 @@ impl RepositoryRuntime {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
 
-    /// One-based character coordinates for external editor launchers.
-    pub fn editor_caret(&self) -> Option<(usize, usize)> {
+    /// One-based scalar coordinates for callers which do not select a launcher.
+    pub fn editor_caret(&self) -> Option<(usize, usize)> { self.editor_caret_for("") }
+
+    /// Converts the native UTF-8 caret into the selected editor's column units.
+    pub fn editor_caret_for(&self, editor: &str) -> Option<(usize, usize)> {
         let DocumentState::Editable(document) = &self.document else { return None; };
         let cursor = document.content.cursor().position;
-        let column = document.content.with_line(cursor.line, |line, _| line[..cursor.column.min(line.len())].chars().count() + 1)?;
+        let column = document.content.with_line(cursor.line, |line, _| crate::external_editor::column_for_prefix(editor, &line[..char_boundary(line, cursor.column)]))?;
         Some((cursor.line + 1, column))
     }
 

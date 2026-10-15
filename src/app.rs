@@ -13889,7 +13889,7 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let selected = match self.cards.get(&card) {
-                    Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => runtime.selected_path().map(|path| (runtime.descriptor.worktree.join(path), runtime.editor_caret())),
+                    Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => runtime.selected_path().map(|path| (runtime.descriptor.worktree.join(path), runtime.editor_caret_for(&editor_id))),
                     _ => None,
                 };
                 selected.map_or_else(Task::none, |(path, caret)| self.open_file_in_editor_at(path, editor_id, caret))

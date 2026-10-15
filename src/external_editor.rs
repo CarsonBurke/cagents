@@ -154,7 +154,19 @@ pub fn launch(editor: &Editor, path: &Path) -> Result<(), String> {
     launch_at(editor, path, None)
 }
 
-/// Positions use one-based lines and columns, as external editors do.
+/// The caller passes the UTF-8 text before the caret. VS Code's model columns
+/// count UTF-16 code units; Zed and the other supported character-based
+/// launchers take character positions. Vim launch syntax uses only the line.
+pub fn column_for_prefix(editor: &str, prefix: &str) -> usize {
+    let column = match editor {
+        "code" | "codium" | "cursor" => prefix.encode_utf16().count(),
+        _ => prefix.chars().count(),
+    };
+    column.saturating_add(1)
+}
+
+/// Positions use one-based lines and editor-specific columns. Convert a native
+/// caret's line prefix with [`column_for_prefix`] before constructing them.
 pub fn arguments(editor: &str, path: &Path, position: Option<(usize, usize)>) -> Vec<OsString> {
     let Some((line, column)) = position else { return vec!["--".into(), path.into()]; };
     let (line, column) = (line.max(1), column.max(1));
@@ -199,6 +211,19 @@ pub fn launch_at(editor: &Editor, path: &Path, position: Option<(usize, usize)>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unicode_caret_columns_follow_each_editors_coordinate_system() {
+        let prefix = "a😀ébcde";
+        assert_eq!(prefix.chars().count(), 7);
+        assert_eq!(column_for_prefix("zed", prefix), 8);
+        assert_eq!(column_for_prefix("emacs", prefix), 8);
+        for editor in ["code", "codium", "cursor"] {
+            assert_eq!(column_for_prefix(editor, prefix), 9);
+            assert_eq!(arguments(editor, Path::new("/repo/unicode.rs"), Some((120, column_for_prefix(editor, prefix))))[1], "/repo/unicode.rs:120:9");
+        }
+        assert_eq!(arguments("zed", Path::new("/repo/unicode.rs"), Some((120, column_for_prefix("zed", prefix))))[1], "/repo/unicode.rs:120:8");
+    }
+
     #[test]
     fn positions_are_separate_arguments_and_known_editors_keep_the_caret() {
         let path = Path::new("/tmp/some file.rs");
