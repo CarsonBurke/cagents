@@ -1646,6 +1646,7 @@ impl MutationKind {
 /// dialog counts are exactly the paths the confirmed request destroys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscardConfirmation {
+    pub instance: crate::model::OperationId,
     pub key: ActiveWorktreeKey,
     /// The request with `confirmed` still false. Only
     /// [`SidebarAction::ConfirmDiscard`] carries the confirmed copy.
@@ -4497,6 +4498,7 @@ impl SidebarState {
             }
             SidebarAction::RequestDiscard { key, request } => {
                 self.discard = Some(DiscardConfirmation {
+                    instance: crate::model::OperationId::new(),
                     key: key.clone(),
                     request: request.clone(),
                 });
@@ -21414,6 +21416,7 @@ pub(crate) mod tests {
         let renderer = headless_renderer();
         let key = main_key();
         let pending = DiscardConfirmation {
+            instance: crate::model::OperationId::new(),
             key: key.clone(),
             request: DiscardRequest {
                 worktree: key.canonical_path.clone(),
