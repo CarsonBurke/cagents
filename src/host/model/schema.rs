@@ -211,6 +211,48 @@ mod tests {
     }
 
     #[test]
+    fn rejected_hot_journal_is_not_recovered_by_constructor_inspection() {
+        const CHILD: &str = "CAGENTS_REGISTRY_HOT_JOURNAL_FIXTURE";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = std::path::PathBuf::from(path);
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("PRAGMA cache_size=1; PRAGMA cache_spill=ON; BEGIN IMMEDIATE;
+                CREATE TABLE spill (value BLOB);
+                WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<128)
+                INSERT INTO spill SELECT randomblob(4096) FROM n;").unwrap();
+            std::fs::write(path.with_extension("ready"), b"ready").unwrap();
+            loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        legacy(&path, 12);
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 18).unwrap();
+        drop(db);
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "host::model::schema::tests::rejected_hot_journal_is_not_recovered_by_constructor_inspection", "--nocapture"])
+            .env(CHILD, &path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.with_extension("ready").exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "fixture writer exited before spilling");
+            assert!(std::time::Instant::now() < deadline, "fixture writer never spilled");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let journal = std::path::PathBuf::from(format!("{}-journal", path.display()));
+        let before = (image(&path), image(&journal));
+        assert!(!before.1.is_empty(), "fixture requires an actual hot rollback journal");
+        assert!(Registry::at(&path).is_err());
+        assert_eq!((image(&path), image(&journal)), before);
+    }
+
+    #[test]
     fn ambiguous_partial_layouts_are_refused_without_repair_or_writes() {
         for checkpoint in [12, 17] {
             let directory = tempfile::tempdir().unwrap();

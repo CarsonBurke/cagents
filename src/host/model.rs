@@ -84,6 +84,14 @@ impl Registry {
         }
         prepare_private_file(path)
             .map_err(|error| format!("cannot prepare {}: {error}", path.display()))?;
+        // An initial read-write read could recover a hot rollback journal
+        // before discovering an unsupported schema. Read-only admission may
+        // refuse recovery; it must never repair a database on this path.
+        let inspection = Connection::open_with_flags(path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).map_err(|error| error.to_string())?;
+        schema::check_readonly(&inspection)?;
+        drop(inspection);
         let db = Connection::open(path).map_err(|error| error.to_string())?;
         // Even a rejected read-write connection can checkpoint/delete a
         // pre-existing WAL on its final close. Keep rejection side-effect free
