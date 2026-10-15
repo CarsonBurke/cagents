@@ -5955,6 +5955,25 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// indicator, and "something is running here" is what the rail is for. The
 /// expanded row keeps checks as a durable badge of their own, after the
 /// reserved slot.
+fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
+    if worktree.status_error.is_some()
+        || worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0)
+    { Icon::Warning } else { Icon::Changes }
+}
+
+fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
+    if worktree.status_error.is_some() { BadgeTone::Warning }
+    else if worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) {
+        BadgeTone::Danger
+    } else { BadgeTone::Warning }
+}
+
+fn worktree_change_count(worktree: &SidebarWorktree) -> String {
+    if worktree.status_error.is_some() { return "?".to_owned(); }
+    let count = worktree.dirty.as_ref().map_or(0, dirty_count);
+    if count > 999 { "999+".to_owned() } else { count.to_string() }
+}
+
 fn worktree_indicator(
     worktree: &SidebarWorktree,
     agent_update: bool,
@@ -5976,7 +5995,7 @@ fn worktree_indicator(
     if compact && show_changes_icons {
         return indicators
             .dirty
-            .map(|label| status_icon(Icon::Changes, label.to_owned(), BadgeTone::Warning));
+            .map(|label| status_icon(worktree_change_icon(worktree), label.to_owned(), worktree_change_tone(worktree)));
     }
     None
 }
@@ -6051,10 +6070,13 @@ fn worktree_view<'a>(
     if !compact && !deleting {
         let indicators = worktree_indicators(worktree);
         if show_changes_icons && let Some(label) = indicators.dirty {
-            content = content.push(status_icon(
-                Icon::Changes,
+            content = content.push(crate::interaction::tooltip(
+                widget::row::with_capacity(2)
+                    .spacing(2)
+                    .align_y(Alignment::Center)
+                    .push(toned_icon(worktree_change_icon(worktree), worktree_change_tone(worktree)))
+                    .push(design::caption(worktree_change_count(worktree))),
                 label.to_owned(),
-                BadgeTone::Warning,
             ));
         }
         content = content.push(slot(indicators.pull_request.and_then(|pr| {
@@ -9411,7 +9433,7 @@ fn status_summary(
             if untracked_omitted { "tracked " } else { "" }
         )),
         Some(_) if untracked_omitted => parts.push("no tracked changes".to_owned()),
-        Some(_) => parts.push("clean".to_owned()),
+        Some(_) => parts.push("No changes".to_owned()),
         None => parts.push("status unavailable".to_owned()),
     }
     if detached {
@@ -15812,6 +15834,124 @@ pub(crate) mod tests {
         };
         assert_eq!(selection.len(), 501);
         assert_eq!(selection.last().unwrap().path, paths[500]);
+    }
+
+    #[test]
+    fn tracked_only_refresh_preserves_complete_untracked_count_until_next_full_read() {
+        let mut row = worktree(11, "feature/changes", false);
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        full.dirty.unstaged = 2;
+        row.apply_status(&full);
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
+        tracked.dirty.unstaged = 3;
+        row.apply_status(&tracked);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("15 changes"));
+        assert!(!row.chrome.tooltip.contains("tracked changes"));
+        row.apply_status(&StatusSnapshot::default());
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert!(row.chrome.tooltip.contains("No changes"));
+        assert!(row.chrome.dirty_badge.is_none());
+    }
+
+    #[test]
+    fn failed_status_marks_cached_clean_as_last_known_and_identical_success_clears_it() {
+        let mut row = SidebarWorktree::new(
+            WorktreeId::new(),
+            "/repo".into(),
+            Some("main".into()),
+            false,
+            false,
+            Some(DirtyState::default()),
+            None,
+            None,
+        );
+        row.apply_status_error(Some("index unavailable"));
+        assert!(matches!(worktree_change_icon(&row), Icon::Warning));
+        assert!(matches!(worktree_change_tone(&row), BadgeTone::Warning));
+        assert!(
+            row.chrome
+                .dirty_badge
+                .as_deref()
+                .unwrap()
+                .contains("Git status unavailable")
+        );
+        assert!(row.chrome.tooltip.contains("Last known: No changes"));
+        assert!(
+            row.chrome
+                .accessible_name
+                .contains("Git status unavailable")
+        );
+        assert!(
+            row.status_description().contains("index unavailable"),
+            "compact hover uses the same availability"
+        );
+        row.apply_status(&StatusSnapshot::default());
+        assert!(
+            row.status_error.is_none(),
+            "even an identical successful clean read clears error provenance"
+        );
+        assert!(row.chrome.dirty_badge.is_none());
+        assert!(!row.chrome.tooltip.contains("Git status unavailable"));
+        assert!(row.chrome.tooltip.contains("No changes"));
+
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        row.apply_status(&full);
+        row.apply_status_error(Some("full refresh failed"));
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
+        tracked.dirty.unstaged = 1;
+        row.apply_status(&tracked);
+        assert!(
+            row.status_error.is_none(),
+            "the tracked status read itself succeeded"
+        );
+        assert!(
+            row.untracked_omitted,
+            "failed refresh invalidates authority to reuse the old complete untracked count"
+        );
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert!(row.chrome.tooltip.contains("1 tracked changes"));
+        row.apply_status(&full);
+        assert!(!row.untracked_omitted);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert!(row.chrome.tooltip.contains("12 changes"));
+    }
+
+    #[test]
+    fn conflicted_rows_have_a_distinct_change_glyph_and_tone() {
+        let mut row = worktree(11, "feature/conflict", false);
+        let mut status = StatusSnapshot::default();
+        status.dirty.conflicted = 1;
+        row.apply_status(&status);
+        assert!(matches!(worktree_change_icon(&row), Icon::Warning));
+        assert!(matches!(worktree_change_tone(&row), BadgeTone::Danger));
+        status.dirty.conflicted = 0;
+        status.dirty.unstaged = 1;
+        row.apply_status(&status);
+        assert!(matches!(worktree_change_icon(&row), Icon::Changes));
+    }
+
+    #[test]
+    fn change_count_uses_a_bounded_label_and_does_not_report_unknown_as_current() {
+        let mut row = worktree(11, "feature/count", false);
+        let mut status = StatusSnapshot::default();
+        status.dirty.unstaged = 12;
+        row.apply_status(&status);
+        assert_eq!(worktree_change_count(&row), "12");
+        status.dirty.unstaged = 3323;
+        row.apply_status(&status);
+        assert_eq!(worktree_change_count(&row), "999+");
+        assert!(row.status_description().contains("3323 changes"));
+        row.apply_status_error(Some("status failed"));
+        assert_eq!(worktree_change_count(&row), "?");
     }
 
     #[test]
