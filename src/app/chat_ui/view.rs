@@ -1070,11 +1070,23 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
-        } else if let Some(outcome) = snapshot.outcome.as_ref().filter(|outcome| outcome.reason().is_some()) {
+        } else if let Some(outcome) = snapshot
+            .outcome
+            .as_ref()
+            .filter(|outcome| outcome.reason().is_some())
+        {
             (Some(Icon::Warning), outcome.label())
-        } else if matches!(&snapshot.outcome, Some(crate::agent::ActivityOutcome::Cancelled)) && (!snapshot.is_working() || snapshot.exited) {
+        } else if matches!(
+            &snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Cancelled)
+        ) && (!snapshot.is_working() || snapshot.exited)
+        {
             (Some(Icon::Cancel), "Cancelled")
-        } else if matches!(&snapshot.outcome, Some(crate::agent::ActivityOutcome::Succeeded)) && (!snapshot.is_working() || snapshot.exited) {
+        } else if matches!(
+            &snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Succeeded)
+        ) && (!snapshot.is_working() || snapshot.exited)
+        {
             (Some(Icon::Check), "Finished")
         } else if self.disconnected {
             (Some(Icon::Warning), "Disconnected")
@@ -1326,7 +1338,8 @@ impl Runtime {
                 }
             }
             if !snapshot.has_later
-                && (snapshot.activity() == crate::agent::ActivityState::Idle || (snapshot.outcome.is_some() && snapshot.exited))
+                && (snapshot.activity() == crate::agent::ActivityState::Idle
+                    || (snapshot.outcome.is_some() && snapshot.exited))
                 && snapshot.queued_messages.is_empty()
                 && self.queued.is_none()
                 && self.followups.is_empty()
@@ -1391,15 +1404,12 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill),
+                        crate::ui_controls::field::search("Find in conversation", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -2155,7 +2165,8 @@ impl Runtime {
         );
         let usage = &snapshot.usage;
         // Prefer a wider chat over hiding its status and settings behind a
-        // scrollbar. The footer wraps only when the pane itself is too narrow.
+        // scrollbar. Narrow panes keep the primary status on one line and move
+        // secondary details into the overflow control.
         // The line always says what the conversation is doing, idle
         // included: a reader glancing at a card should never have to infer
         // its state from the absence of a word. The order is the order of
@@ -2275,16 +2286,26 @@ impl Runtime {
             spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
         }
         let compact_footer = content_width < 600.0;
-        let mut secondary = if compact_footer { status.split_off(primary_status_count) } else { Vec::new() };
+        let mut secondary = if compact_footer {
+            status.split_off(primary_status_count)
+        } else {
+            Vec::new()
+        };
         let mut footer = status;
         if let Some(notice) = permissions::notice(snapshot) {
             footer.push(
                 widget::button::custom(
                     widget::row::with_children(
-                        std::iter::once(crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE))
-                            .chain((!compact_footer).then(|| design::caption(notice)
+                        std::iter::once(crate::ui_controls::passive_icon(
+                            Icon::Warning,
+                            design::COMPACT_ICON_SIZE,
+                        ))
+                        .chain((!compact_footer).then(|| {
+                            design::caption(notice)
                                 .class(cosmic::theme::Text::Custom(design::warning_text))
-                                .wrapping(iced::widget::text::Wrapping::None).into()))
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .into()
+                        })),
                     )
                     .spacing(step::GAP_XS)
                     .align_y(Alignment::Center),
@@ -2310,11 +2331,22 @@ impl Runtime {
             secondary.push(spend);
             footer.push(widget::Space::new().width(Length::Fill).into());
             footer.push(crate::ui_controls::popover(
-                icon(Icon::More, "Conversation details and settings", true,
-                    Action::FooterPicker(target, !self.footer_picker)),
-                self.footer_picker.then(|| widget::container(
-                    widget::flex_row(secondary).spacing(step::GAP_S as u16).align_items(Alignment::Center)
-                ).padding(space::S).width((content_width - 32.0).max(200.0)).into()),
+                icon(
+                    Icon::More,
+                    "Conversation details and settings",
+                    true,
+                    Action::FooterPicker(target, !self.footer_picker),
+                ),
+                self.footer_picker.then(|| {
+                    widget::container(
+                        widget::flex_row(secondary)
+                            .spacing(step::GAP_S as u16)
+                            .align_items(Alignment::Center),
+                    )
+                    .padding(space::S)
+                    .width((content_width - 32.0).max(200.0))
+                    .into()
+                }),
                 widget::popover::Position::Top,
                 action(Action::FooterPicker(target, false)),
             ));
@@ -2322,11 +2354,16 @@ impl Runtime {
             footer.push(spend);
         }
         let footer_row: Element<'_, Message> = if compact_footer {
-            widget::row::with_children(footer).spacing(step::GAP_S)
-                .align_y(Alignment::Center).width(Length::Fill).into()
+            widget::row::with_children(footer)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .width(Length::Fill)
+                .into()
         } else {
-            widget::flex_row(footer).spacing(step::GAP_S as u16)
-                .align_items(Alignment::Center).into()
+            widget::flex_row(footer)
+                .spacing(step::GAP_S as u16)
+                .align_items(Alignment::Center)
+                .into()
         };
         let footer = crate::ui_controls::popover(
             footer_row,
@@ -2888,7 +2925,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2978,14 +3020,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -4881,8 +4927,20 @@ mod tests {
         for (outcome, label, glyph) in [
             (ActivityOutcome::Succeeded, "Finished", Icon::Check),
             (ActivityOutcome::Cancelled, "Cancelled", Icon::Cancel),
-            (ActivityOutcome::Failed { reason: "Provider exited with code 3".into() }, "Failed", Icon::Warning),
-            (ActivityOutcome::Interrupted { reason: "Provider exited before its final result".into() }, "Interrupted", Icon::Warning),
+            (
+                ActivityOutcome::Failed {
+                    reason: "Provider exited with code 3".into(),
+                },
+                "Failed",
+                Icon::Warning,
+            ),
+            (
+                ActivityOutcome::Interrupted {
+                    reason: "Provider exited before its final result".into(),
+                },
+                "Interrupted",
+                Icon::Warning,
+            ),
         ] {
             let snapshot = Arc::make_mut(&mut runtime.snapshot);
             snapshot.finished_at = Some(42);
@@ -4892,7 +4950,14 @@ mod tests {
             next.generation += 1;
             _handle.replace_snapshot_for_test(next);
             runtime.refresh();
-            assert!(runtime.finished_stamp.as_ref().unwrap().1.starts_with(label));
+            assert!(
+                runtime
+                    .finished_stamp
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .starts_with(label)
+            );
             assert!(runtime.turns.iter().all(|turn| !turn.running));
         }
     }
@@ -5755,12 +5820,22 @@ mod tests {
 
     #[test]
     fn compact_chat_footer_is_one_line_at_four_hundred_fifty_pixels() {
-        use iced::advanced::{Layout, layout, widget::{Operation, Tree}};
-        struct FooterBounds { id: widget::Id, bounds: Option<iced::Rectangle> }
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct FooterBounds {
+            id: widget::Id,
+            bounds: Option<iced::Rectangle>,
+        }
         impl Operation for FooterBounds {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
             fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
-                if id == Some(&self.id) { self.bounds = Some(bounds); }
+                if id == Some(&self.id) {
+                    self.bounds = Some(bounds);
+                }
             }
         }
         let renderer = crate::app::tests::headless_renderer();
@@ -5769,18 +5844,39 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).usage.context_limit = 200_000;
         Arc::make_mut(&mut runtime.snapshot).usage.context_tokens = 100_000;
         let shortcuts = crate::settings::KeyboardShortcuts::default();
-        let mut element = runtime.view(None, false, true, &shortcuts, 450.0,
-            Place { channel: Some("A long conversation name".into()),
-                name: "A long repository name".into(), branch: Some("feature/a-long-branch-name".into()) },
-            true, None, vec![]);
+        let mut element = runtime.view(
+            None,
+            false,
+            true,
+            &shortcuts,
+            450.0,
+            Place {
+                channel: Some("A long conversation name".into()),
+                name: "A long repository name".into(),
+                branch: Some("feature/a-long-branch-name".into()),
+            },
+            true,
+            None,
+            vec![],
+        );
         let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(450.0, 700.0)));
-        let mut probe = FooterBounds { id: card_control_id(runtime.target.card, "chat-footer"), bounds: None };
-        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(450.0, 700.0)),
+        );
+        let mut probe = FooterBounds {
+            id: card_control_id(runtime.target.card, "chat-footer"),
+            bounds: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
         let bounds = probe.bounds.expect("footer mounted");
-        assert!(bounds.height <= design::PRIMARY_CONTROL_SIZE + step::GAP_M + 1.0,
-            "footer wrapped: {bounds:?}");
+        assert!(
+            bounds.height <= design::PRIMARY_CONTROL_SIZE + step::GAP_M + 1.0,
+            "footer wrapped: {bounds:?}"
+        );
         assert!(bounds.width <= 450.0);
     }
 
@@ -7434,8 +7530,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -7685,10 +7787,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(

@@ -160,10 +160,17 @@ const APPLICATION_NAME: &str = instance::APPLICATION_NAME;
 const WINDOW_TITLE_SEPARATOR: &str = " — ";
 
 fn format_window_title(header: &str, device: Option<&str>, waiting: usize) -> String {
-    let title = if header == APPLICATION_NAME { header.to_owned() }
-        else { format!("{header}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}") };
+    let title = if header == APPLICATION_NAME {
+        header.to_owned()
+    } else {
+        format!("{header}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
+    };
     let title = device.map_or(title.clone(), |device| format!("{device} · {title}"));
-    if waiting > 0 { format!("({waiting}) {title}") } else { title }
+    if waiting > 0 {
+        format!("({waiting}) {title}")
+    } else {
+        title
+    }
 }
 
 /// Embedded artwork for initial window creation, independent of icon themes.
@@ -3658,7 +3665,9 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.previous_workspace = value;
             }
             SettingsField::ShortcutNextAttention => self.keyboard_shortcuts.next_attention = value,
-            SettingsField::ShortcutPreviousAttention => self.keyboard_shortcuts.previous_attention = value,
+            SettingsField::ShortcutPreviousAttention => {
+                self.keyboard_shortcuts.previous_attention = value
+            }
             SettingsField::ShortcutNextWorkspace => {
                 self.keyboard_shortcuts.next_workspace = value;
             }
@@ -4188,8 +4197,14 @@ fn settings_update(
             next.keyboard_shortcuts.previous_workspace = settings::parse_chords(value);
             Ok(())
         }
-        SettingsField::ShortcutNextAttention => { next.keyboard_shortcuts.next_attention = settings::parse_chords(value); Ok(()) },
-        SettingsField::ShortcutPreviousAttention => { next.keyboard_shortcuts.previous_attention = settings::parse_chords(value); Ok(()) },
+        SettingsField::ShortcutNextAttention => {
+            next.keyboard_shortcuts.next_attention = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPreviousAttention => {
+            next.keyboard_shortcuts.previous_attention = settings::parse_chords(value);
+            Ok(())
+        }
         SettingsField::ShortcutNextWorkspace => {
             next.keyboard_shortcuts.next_workspace = settings::parse_chords(value);
             Ok(())
@@ -4786,7 +4801,10 @@ pub enum Message {
     RetrySessionSave,
     SessionRecovery(session_recovery::Action),
     AcknowledgeSessionRecovery,
-    AcknowledgeVisiblePane { card: CardId, epoch: u64 },
+    AcknowledgeVisiblePane {
+        card: CardId,
+        epoch: u64,
+    },
     FocusAttention(CardId),
     DismissStatus,
     /// Dismisses exactly one logged notice; a stale id is a no-op.
@@ -5013,6 +5031,32 @@ struct CardLabels {
     unavailable: &'static str,
 }
 
+/// Inputs that can change a terminal's presentation. Ordinary runtime wakes
+/// reuse the numbered title instead of allocating it again for every pane.
+struct TerminalTitleSource {
+    reported: String,
+    directory: PathBuf,
+    program: String,
+    ordinal: u32,
+    fallback: bool,
+}
+
+impl TerminalTitleSource {
+    fn fallback(title: &str) -> bool {
+        // The host supplies a process/cwd fallback when OSC is absent. A
+        // nonempty reported title is authoritative even if it is a basename.
+        title.is_empty()
+    }
+
+    fn describes(&self, title: &str, directory: &Path, program: &str, ordinal: u32) -> bool {
+        let fallback = Self::fallback(title);
+        self.reported == title
+            && self.ordinal == ordinal
+            && self.fallback == fallback
+            && (!fallback || (self.directory == directory && self.program == program))
+    }
+}
+
 /// Widget ids and accessible names for one card.
 ///
 /// Both embed the card id and title, so they are built when a card appears or
@@ -5036,6 +5080,9 @@ struct CardChrome {
     type_label: &'static str,
     title: String,
     title_width: f32,
+    compact_title: Option<String>,
+    terminal_ordinal_suffix: Option<String>,
+    terminal_title_source: Option<TerminalTitleSource>,
     focused_name: String,
     caption: String,
     unfocused_name: String,
@@ -5067,6 +5114,9 @@ impl CardChrome {
             type_label,
             title: title.to_owned(),
             title_width: chrome_ui::measure_tab_title(title),
+            compact_title: None,
+            terminal_ordinal_suffix: None,
+            terminal_title_source: None,
             caption: caption.to_owned(),
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
@@ -6185,7 +6235,11 @@ impl Cagents {
 
     fn new_pane_fraction(&self, configured: f32) -> f32 {
         let width = self.workspace.viewport_width();
-        if width > 0.0 && width < design::NARROW_WORKSPACE_WIDTH { 1.0 } else { configured }
+        if width > 0.0 && width < design::NARROW_WORKSPACE_WIDTH {
+            1.0
+        } else {
+            configured
+        }
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
@@ -6846,7 +6900,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.new_pane_fraction(self.settings.default_native_pane_fraction)),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_native_pane_fraction),
+                    ),
                 )
                 .expect("pull request card is valid"),
                 index,
@@ -7307,7 +7363,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.new_pane_fraction(self.settings.default_native_pane_fraction)),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_native_pane_fraction),
+                    ),
                 )
                 .expect("repository card is valid"),
                 index,
@@ -7418,7 +7476,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     "Browser",
-                    CardWidth::Fraction(self.new_pane_fraction(self.settings.default_column_fraction)),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_column_fraction),
+                    ),
                 )
                 .expect("browser card is valid"),
                 index,
@@ -7662,7 +7722,8 @@ impl Cagents {
         if !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
             return None;
         }
-        self.sidebar_model.worktree_at(self.unchanneled_card_worktree(state)?)
+        self.sidebar_model
+            .worktree_at(self.unchanneled_card_worktree(state)?)
     }
 
     /// Whether `project` holds the scope the workspace shows: the active
@@ -7715,14 +7776,35 @@ impl Cagents {
         card: CardId,
         activity: Option<crate::agent::Activity>,
     ) {
-        let activity = self.chat_ui.parked.get(&card).and_then(|runtime| runtime.native_activity()).or(activity);
+        let activity = self
+            .chat_ui
+            .parked
+            .get(&card)
+            .and_then(|runtime| runtime.native_activity())
+            .or(activity);
         let outcome = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime.activity_outcome(),
-            _ if self.chat_ui.parked.contains_key(&card) => self.chat_ui.parked.get(&card).and_then(|runtime| runtime.activity_outcome()),
-            _ if activity.is_some_and(|activity| activity.state == crate::agent::ActivityState::Working) => None,
+            _ if self.chat_ui.parked.contains_key(&card) => self
+                .chat_ui
+                .parked
+                .get(&card)
+                .and_then(|runtime| runtime.activity_outcome()),
+            _ if activity
+                .is_some_and(|activity| activity.state == crate::agent::ActivityState::Working) =>
+            {
+                None
+            }
             _ => self.sidebar_state.card_outcome(card).cloned(),
         };
-        let activity = activity.or_else(|| outcome.as_ref().and_then(|_| self.sidebar_state.card_activity(card)).map(|mut last| { last.state = crate::agent::ActivityState::Idle; last }));
+        let activity = activity.or_else(|| {
+            outcome
+                .as_ref()
+                .and_then(|_| self.sidebar_state.card_activity(card))
+                .map(|mut last| {
+                    last.state = crate::agent::ActivityState::Idle;
+                    last
+                })
+        });
         self.sidebar_state.set_card_outcome(card, outcome);
         let previous = self
             .sidebar_state
@@ -7819,7 +7901,9 @@ impl Cagents {
             self.select_channel(channel)
         } else {
             let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
-            directory.map_or_else(Task::none, |directory| self.select_worktree(directory, false))
+            directory.map_or_else(Task::none, |directory| {
+                self.select_worktree(directory, false)
+            })
         };
         let focus = self.focus_workspace_card(id);
         let read = self.mark_cards_read(vec![id]);
@@ -7827,19 +7911,39 @@ impl Cagents {
     }
 
     fn cycle_attention(&mut self, backwards: bool) -> Task<Message> {
-        let cards: Vec<_> = self.sidebar_state.attention_cards().into_iter()
-            .filter(|id| self.card_state(*id).is_some_and(|card| card.existence.is_open())).collect();
+        let cards: Vec<_> = self
+            .sidebar_state
+            .attention_cards()
+            .into_iter()
+            .filter(|id| {
+                self.card_state(*id)
+                    .is_some_and(|card| card.existence.is_open())
+            })
+            .collect();
         let current = self.workspace.focused();
         let next = if current.is_some_and(|current| !cards.contains(&current)) {
-            current.and_then(|current| self.attention_navigation.iter().position(|card| *card == current))
-                .and_then(|index| (1..=self.attention_navigation.len()).find_map(|step| {
-                    let len = self.attention_navigation.len();
-                    let offset = if backwards { (index + len - step) % len } else { (index + step) % len };
-                    let candidate = self.attention_navigation[offset];
-                    cards.contains(&candidate).then_some(candidate)
-                }))
+            current
+                .and_then(|current| {
+                    self.attention_navigation
+                        .iter()
+                        .position(|card| *card == current)
+                })
+                .and_then(|index| {
+                    (1..=self.attention_navigation.len()).find_map(|step| {
+                        let len = self.attention_navigation.len();
+                        let offset = if backwards {
+                            (index + len - step) % len
+                        } else {
+                            (index + step) % len
+                        };
+                        let candidate = self.attention_navigation[offset];
+                        cards.contains(&candidate).then_some(candidate)
+                    })
+                })
                 .or_else(|| sidebar::cycle_attention(&cards, current, backwards))
-        } else { sidebar::cycle_attention(&cards, current, backwards) };
+        } else {
+            sidebar::cycle_attention(&cards, current, backwards)
+        };
         self.attention_navigation = cards;
         next.map_or_else(Task::none, |card| self.focus_attention_card(card))
     }
@@ -7855,7 +7959,13 @@ impl Cagents {
         if !self.sidebar_state.has_card_update(card) {
             return Task::none();
         }
-        if let Some(channel) = self.durable.channels.iter().find(|channel| channel.cards.contains(&card)).map(|channel| channel.id) {
+        if let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card))
+            .map(|channel| channel.id)
+        {
             self.sidebar_state.retain_attention_channel(channel);
         }
         self.sidebar_state.acknowledge_agent_update(card);
@@ -7945,13 +8055,41 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+        // A moved worktree keeps its pane numbers. Reconcile its new scope's
+        // counter before minting a number, including when insertion precedes
+        // an existing pane in the saved order.
+        if self.durable.cards.iter().any(|card| {
+            matches!(card.kind, CardKind::Terminal(_))
+                && !self.chrome_ui.terminal_ordinals.contains_key(&card.id)
+        }) {
+            for card in &self.durable.cards {
+                if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id).copied() {
+                    let scope = self
+                        .unchanneled_card_worktree(card)
+                        .unwrap_or_else(|| Path::new(""))
+                        .to_owned();
+                    let next = self
+                        .chrome_ui
+                        .terminal_next_ordinals
+                        .entry(scope)
+                        .or_default();
+                    *next = (*next).max(ordinal);
+                }
+            }
+        }
         for card in &self.durable.cards {
             if matches!(card.kind, CardKind::Terminal(_))
                 && !self.chrome_ui.terminal_ordinals.contains_key(&card.id)
             {
-                let scope = self.unchanneled_card_worktree(card)
-                    .unwrap_or_else(|| Path::new("")).to_owned();
-                let next = self.chrome_ui.terminal_next_ordinals.entry(scope).or_default();
+                let scope = self
+                    .unchanneled_card_worktree(card)
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_owned();
+                let next = self
+                    .chrome_ui
+                    .terminal_next_ordinals
+                    .entry(scope)
+                    .or_default();
                 *next += 1;
                 self.chrome_ui.terminal_ordinals.insert(card.id, *next);
             }
@@ -7987,7 +8125,30 @@ impl Cagents {
                 .get(&card.id)
                 .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption))
             {
-                let chrome = CardChrome::new(card.id, type_label, &title, &caption);
+                let mut chrome = CardChrome::new(card.id, type_label, &title, &caption);
+                if matches!(card.kind, CardKind::Terminal(_))
+                    && !self.chrome_ui.user_titles.contains_key(&card.id)
+                    && let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
+                {
+                    let suffix = format!(" ({ordinal})");
+                    let base = title.strip_suffix(&suffix).unwrap_or(&title);
+                    chrome.compact_title = Some(format!("{ordinal} {base}"));
+                    chrome.terminal_ordinal_suffix = Some(suffix);
+                    if let CardKind::Terminal(session) = &card.kind {
+                        let reported = self.card_display_title(card);
+                        let directory = self
+                            .terminal_working_directories
+                            .get(&card.id)
+                            .unwrap_or(&session.launch.working_directory);
+                        chrome.terminal_title_source = Some(TerminalTitleSource {
+                            reported: reported.to_owned(),
+                            directory: directory.clone(),
+                            program: session.launch.program.clone(),
+                            ordinal: *ordinal,
+                            fallback: TerminalTitleSource::fallback(reported),
+                        });
+                    }
+                }
                 self.card_chrome.insert(card.id, chrome);
             }
         }
@@ -8025,13 +8186,28 @@ impl Cagents {
         if let CardKind::Terminal(session) = &card.kind
             && !self.chrome_ui.user_titles.contains_key(&card.id)
         {
-            let directory = self.terminal_working_directories.get(&card.id)
+            let directory = self
+                .terminal_working_directories
+                .get(&card.id)
                 .unwrap_or(&session.launch.working_directory);
+            if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
+                && let Some(chrome) = self.card_chrome.get(&card.id)
+                && chrome.terminal_title_source.as_ref().is_some_and(|source| {
+                    source.describes(title, directory, &session.launch.program, *ordinal)
+                })
+            {
+                return (Cow::Borrowed(chrome.title.as_str()), None);
+            }
             let basename = directory.file_name().unwrap_or_default().to_string_lossy();
-            let title = if title.is_empty() || title == "Terminal" || title == basename {
-                let process = Path::new(&session.launch.program).file_name().unwrap_or_default().to_string_lossy();
+            let title = if TerminalTitleSource::fallback(title) {
+                let process = Path::new(&session.launch.program)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
                 Cow::Owned(format!("{process} · {basename}"))
-            } else { Cow::Borrowed(title) };
+            } else {
+                Cow::Borrowed(title)
+            };
             if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id) {
                 return (Cow::Owned(format!("{title} ({ordinal})")), None);
             }
@@ -8049,7 +8225,10 @@ impl Cagents {
             return browser_host::TITLE;
         }
         if let CardKind::Chat(session) = &card.kind
-            && let Some(channel) = self.durable.channels.iter()
+            && let Some(channel) = self
+                .durable
+                .channels
+                .iter()
                 .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty())
             && (card.title == chat_ui::chat_card_title(session.launch.provider)
                 || (channel.title_source == crate::model::ChannelTitleSource::Manual
@@ -8101,7 +8280,10 @@ impl Cagents {
     /// unchanged title costs one string comparison and no allocation.
     fn sync_window_title(&mut self) -> Task<Message> {
         let header = {
-            let showing = self.durable.focused.and_then(|id| self.card_state(id))
+            let showing = self
+                .durable
+                .focused
+                .and_then(|id| self.card_state(id))
                 .map(|card| self.repository_chrome(card).0)
                 .unwrap_or(Cow::Borrowed(APPLICATION_NAME));
             let showing = showing.trim();
@@ -8112,7 +8294,11 @@ impl Cagents {
         let waiting = self.sidebar_state.waiting_count();
         self.window_waiting_count = waiting;
         let device = crate::device::selected();
-        let window_title = format_window_title(&header, device.as_ref().map(|device| device.name.as_str()), waiting);
+        let window_title = format_window_title(
+            &header,
+            device.as_ref().map(|device| device.name.as_str()),
+            waiting,
+        );
         self.set_header_title(header);
         match self.core.main_window_id() {
             Some(id) => self.set_window_title(window_title, id),
@@ -8630,7 +8816,9 @@ impl Cagents {
         // pane. Also revoke ownership when the terminal runtime is replaced.
         self.reconcile_terminal_review_owner();
         let focus_changed = self.durable.focused != focused;
-        if focus_changed { self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1); }
+        if focus_changed {
+            self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
+        }
         let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
         if focus_changed || exposure_changed {
             apply_durable_viewport_update(
@@ -13612,7 +13800,8 @@ impl Application for Cagents {
             app.sidebar_state.restore_view(view.sidebar);
             app.worktree_offsets = view.worktree_offsets;
         }
-        app.sidebar_state.restore_unread_updates(app.durable.agent_updates.clone());
+        app.sidebar_state
+            .restore_unread_updates(app.durable.agent_updates.clone());
         app.sidebar_model
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
@@ -13824,7 +14013,7 @@ impl Application for Cagents {
                 | Message::ChannelUi(_)
                 | Message::Sidebar(_)
                 | Message::FocusCard(_)
-        | Message::FocusAttention(_)
+                | Message::FocusAttention(_)
                 | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
@@ -15180,7 +15369,11 @@ impl Application for Cagents {
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
-                if epoch == self.attention_focus_epoch && self.pane_is_active(card) { self.acknowledge_active_pane() } else { Task::none() }
+                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
+                    self.acknowledge_active_pane()
+                } else {
+                    Task::none()
+                }
             }
             Message::FocusAttention(card) => self.focus_attention_card(card),
             Message::FocusCard(id) => {
@@ -16757,8 +16950,16 @@ impl Application for Cagents {
                             Message::AcknowledgeVisiblePane { card, epoch }
                         })
                     })
-                } else { Task::none() };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared, acknowledge])
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    refresh,
+                    self.flush_document_tone(),
+                    accounts,
+                    shared,
+                    acknowledge,
+                ])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -19150,8 +19351,10 @@ mod tests {
             assert_eq!(app.new_pane_fraction(0.5), expected);
             drop(app.add_utility_card(CardKind::Settings));
             let added = app.workspace.focused().unwrap();
-            assert_eq!(app.card_state(added).unwrap().width_fraction,
-                app.new_pane_fraction(app.settings.default_native_pane_fraction));
+            assert_eq!(
+                app.card_state(added).unwrap().width_fraction,
+                app.new_pane_fraction(app.settings.default_native_pane_fraction)
+            );
             assert_eq!(app.card_state(existing).unwrap().width_fraction, width);
         }
     }
@@ -25917,14 +26120,23 @@ mod tests {
     fn attention_window_title_tracks_count_without_renaming_the_pane() {
         let base = format!("Review{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}");
         assert_eq!(format_window_title("Review", None, 0), base);
-        assert_eq!(format_window_title("Review", Some("fw16"), 2), format!("(2) fw16 · {base}"));
+        assert_eq!(
+            format_window_title("Review", Some("fw16"), 2),
+            format!("(2) fw16 · {base}")
+        );
         assert_eq!(format_window_title("Review", None, 0), base);
         let mut app = context_inspector_test_app(true);
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         drop(app.sync_window_title());
         let header = app.core.window.header_title.clone();
         let card = app.workspace.focused().unwrap();
-        app.sidebar_state.set_card_activity(card, crate::agent::Activity { provider: Provider::Claude, state: crate::agent::ActivityState::Waiting });
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
         assert!(iced::runtime::task::into_stream(app.sync_window_title()).is_some());
         assert_eq!(app.window_waiting_count, 1);
         assert_eq!(app.core.window.header_title, header);
@@ -25940,13 +26152,25 @@ mod tests {
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         app.refresh_ui.focused = false;
         let card = app.workspace.focused().unwrap();
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
         let stale_epoch = app.attention_focus_epoch;
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, false))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
         app.observe_agent_update_for_card(card);
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
         assert_ne!(stale_epoch, app.attention_focus_epoch);
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: stale_epoch }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: stale_epoch,
+        }));
         assert!(app.sidebar_state.has_card_update(card));
         let epoch = app.attention_focus_epoch;
         drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
@@ -25966,18 +26190,40 @@ mod tests {
         let projects = [ProjectId::new(), ProjectId::new()];
         let channels = [ChannelId::new(), ChannelId::new()];
         for (index, card) in [first, second_id].into_iter().enumerate() {
-            app.sidebar_model.projects.push(SidebarProject::new(projects[index], RepositoryId::new(), format!("Project{index}"), "/tmp".into(), Vec::new(), Vec::new()));
-            Arc::make_mut(&mut app.durable).channels.push(ProjectChannel { title_source: Default::default(), id: channels[index], project_id: projects[index], title: format!("Channel{index}"), ordinal: index as u32, shared: false, cards: vec![card], focused: Some(card) });
+            app.sidebar_model.projects.push(SidebarProject::new(
+                projects[index],
+                RepositoryId::new(),
+                format!("Project{index}"),
+                "/tmp".into(),
+                Vec::new(),
+                Vec::new(),
+            ));
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(ProjectChannel {
+                    title_source: Default::default(),
+                    id: channels[index],
+                    project_id: projects[index],
+                    title: format!("Channel{index}"),
+                    ordinal: index as u32,
+                    shared: false,
+                    cards: vec![card],
+                    focused: Some(card),
+                });
         }
         drop(app.select_channel(channels[0]));
         app.sidebar_state.observe_card_update(first);
         app.sidebar_state.observe_card_update(second_id);
-        drop(app.update(Message::RunCommand(workspace_widget::GlobalShortcut::NextAttention)));
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
         assert_eq!(app.durable.active_channel, Some(channels[1]));
         assert_eq!(app.workspace.focused(), Some(second_id));
         assert!(!app.sidebar_state.has_card_update(second_id));
         assert!(app.sidebar_state.has_card_update(first));
-        drop(app.update(Message::RunCommand(workspace_widget::GlobalShortcut::NextAttention)));
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
         assert_eq!(app.durable.active_channel, Some(channels[0]));
         assert_eq!(app.workspace.focused(), Some(first));
         assert!(!app.sidebar_state.has_card_update(first));
@@ -26065,14 +26311,25 @@ mod tests {
         app.context_inspector_open = false;
         app.refresh_ui.focused = false;
         let card = app.workspace.focused().unwrap();
-        let activity = |state| Some(Activity { provider: Provider::Omp, state });
+        let activity = |state| {
+            Some(Activity {
+                provider: Provider::Omp,
+                state,
+            })
+        };
         app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
         app.observe_agent_activity_for_card(card, activity(ActivityState::Idle));
         assert!(app.sidebar_state.has_card_update(card));
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: app.attention_focus_epoch }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
         assert!(app.sidebar_state.has_card_update(card));
         app.refresh_ui.focused = true;
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: app.attention_focus_epoch }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
         assert!(!app.sidebar_state.has_card_update(card));
     }
 
