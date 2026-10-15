@@ -282,6 +282,17 @@ impl State {
                     snapshot.status_reads.entry(record.id).or_insert(loaded.status_order.listing);
                 }
                 snapshot.preserve_newer_status(previous);
+                // Status authority covers head/counts/tracking, not the
+                // loader's independently sampled lock or inventory metadata.
+                for (record, _) in &mut snapshot.worktrees {
+                    if let Some((listed, _)) = loaded.worktrees.iter().find(|(listed, _)|
+                        listed.id == record.id && listed.path == record.path) {
+                        record.lock = listed.lock.clone();
+                        record.prunable_reason = listed.prunable_reason.clone();
+                        record.created_at_unix_ms = listed.created_at_unix_ms;
+                        record.bare = listed.bare;
+                    }
+                }
             }
             for (id, update) in reload.bound {
                 if snapshot.status_reads.get(&id).is_some_and(|read| *read > update.read) { continue; }
@@ -3224,6 +3235,49 @@ mod tests {
                     assert!(!app.refresh_ui.git.reloads.contains_key(&key.project_id));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn repository_reload_keeps_listed_lock_metadata_and_newer_recovered_checkout() {
+        const TEST: &str = "app::git_ui::tests::repository_reload_keeps_listed_lock_metadata_and_newer_recovered_checkout";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for omitted in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("repository");
+            let baseline = fixture(&root);
+            let linked = directory.path().join("linked");
+            git(&root, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+            let project = ProjectId::new();
+            let (baseline, _) = read_local(project, baseline,
+                git_watch::Change { membership: true, topology: true, untracked: true, ..Default::default() },
+                CancellationToken::default()).unwrap();
+            let id = baseline.worktrees.iter().find(|(record, _)| record.path == linked).unwrap().0.id;
+            let key = ActiveWorktreeKey { project_id: project, worktree_id: id, canonical_path: linked.clone() };
+            let mut app = app_with_status_snapshot(baseline, &key);
+            app.active_workspace = Some(linked.clone());
+            app.sidebar_state.sync_active_worktree(&app.sidebar_model,
+                &SidebarFocus::Repository { worktree: linked.clone() });
+            let hidden = directory.path().join("held-linked");
+            if omitted { fs::rename(&linked, &hidden).unwrap(); }
+            else { git(&root, &["worktree", "lock", "--reason", "fresh lock", linked.to_str().unwrap()]); }
+            app.repository_generations.insert(project, 10);
+            let loaded = super::super::tests::task_app_message(app.repository_read_task(
+                root, project, 10, false, Some(ProjectKind::Git)));
+            if omitted { fs::rename(hidden, &linked).unwrap(); }
+            fs::write(linked.join("new.txt"), "new\n").unwrap();
+            let bound = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+            assert!(matches!(&bound, Message::SourceControlLoaded { result: Ok(_), .. }));
+            drop(app.update(bound));
+            drop(app.update(loaded));
+            let row = app.sidebar_model.projects[0].worktrees.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.dirty.as_ref().unwrap().untracked, 1);
+            assert_eq!(row.locked, !omitted);
+            let entry = &app.refresh_ui.git.entries[&project];
+            let (record, status) = entry.snapshot.worktrees.iter().find(|(record, _)| record.id == id).unwrap();
+            assert_eq!(record.lock.locked, !omitted);
+            if !omitted { assert_eq!(record.lock.reason.as_deref(), Some("fresh lock")); }
+            assert_eq!(status.as_ref().unwrap().dirty.untracked, 1);
         }
     }
 
