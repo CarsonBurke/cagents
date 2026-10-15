@@ -1742,6 +1742,23 @@ impl TerminalHandle {
     }
 }
 
+fn should_follow_key_input(input: &KeyInput) -> bool {
+    input.scroll_to_bottom_on_input
+            && input.action != KeyAction::Release
+            && !input.key.is_modifier()
+            && !(input.modifiers.shift
+                && !input.modifiers.control
+                && !input.modifiers.alt
+                && !input.modifiers.super_key
+                && matches!(
+                    input.key,
+                    TerminalKey::PageUp
+                        | TerminalKey::PageDown
+                        | TerminalKey::Home
+                        | TerminalKey::End
+                ))
+}
+
 fn is_interrupt_key(key: &KeyInput) -> bool {
     key.modifiers.control
         && !key.modifiers.alt
@@ -2939,38 +2956,24 @@ impl Worker {
     }
 
     fn encode_key(&mut self, input: KeyInput) {
-        let follow = input.scroll_to_bottom_on_input
-            && input.action != KeyAction::Release
-            && !input.key.is_modifier()
-            && !(input.modifiers.shift
-                && !input.modifiers.control
-                && !input.modifiers.alt
-                && !input.modifiers.super_key
-                && matches!(
-                    input.key,
-                    TerminalKey::PageUp
-                        | TerminalKey::PageDown
-                        | TerminalKey::Home
-                        | TerminalKey::End
-                ));
+        let follow = should_follow_key_input(&input);
         match encode_key_input(&self.terminal, &mut self.key_encoder, input) {
             Ok(encoded) => {
                 let admitted = self.write_pty(&encoded, "write encoded key");
-                if admitted
-                    && follow
-                    && !encoded.is_empty()
-                    && self
-                        .terminal
-                        .scrollbar()
-                        .is_ok_and(|bar| bar.offset.saturating_add(bar.len) < bar.total)
-                {
-                    self.terminal.scroll_viewport(ScrollViewport::Bottom);
-                    if self.visibility == Visibility::Visible {
-                        self.publish_snapshot(false);
-                    }
-                }
+                self.follow_admitted_input(admitted && follow && !encoded.is_empty());
             }
             Err(error) => self.error("encode key", error.to_string()),
+        }
+    }
+
+    fn follow_admitted_input(&mut self, follow: bool) {
+        if follow && self.terminal.scrollbar()
+            .is_ok_and(|bar| bar.offset.saturating_add(bar.len) < bar.total)
+        {
+            self.terminal.scroll_viewport(ScrollViewport::Bottom);
+            if self.visibility == Visibility::Visible {
+                self.publish_snapshot(false);
+            }
         }
     }
 
@@ -3660,6 +3663,7 @@ impl Worker {
                 .store(false, Ordering::Release);
             (order.generation, order.interrupt_key.take())
         };
+        let follow = key.as_ref().is_some_and(should_follow_key_input);
         let encoded = match key {
             Some(key) => match encode_key_input(&self.terminal, &mut self.key_encoder, key) {
                 Ok(encoded) => encoded,
@@ -3694,7 +3698,7 @@ impl Worker {
                 && encoded[0] != 0
                 && encoded[0] == attributes.c_cc[libc::VINTR];
         self.cancel_kernel_input();
-        if conventional_interrupt {
+        let admitted = if conventional_interrupt {
             // TIOCSIG targets the foreground group bound to this exact PTY.
             // Raw applications and extended key encodings retain their bytes.
             let result =
@@ -3705,9 +3709,11 @@ impl Worker {
                     std::io::Error::last_os_error().to_string(),
                 );
             }
+            result >= 0
         } else {
-            self.write_pty(&encoded, "interrupt terminal");
-        }
+            self.write_pty(&encoded, "interrupt terminal")
+        };
+        self.follow_admitted_input(admitted && follow && !encoded.is_empty());
         boundary
     }
 
@@ -9281,7 +9287,7 @@ mod tests {
                 unset_environment: Default::default(),
             },
             TerminalConfig {
-                max_scrollback: 1 << 20,
+                max_scrollback_bytes: 1 << 20,
                 ..TerminalConfig::default()
             },
         );
@@ -9339,6 +9345,46 @@ mod tests {
         assert_eq!(worker.terminal.scrollbar().unwrap().offset, 0);
         worker.published.request_shutdown();
         worker.run();
+    }
+
+    #[test]
+    fn priority_interrupt_follows_only_successful_enabled_input_and_never_recaptures_bottom() {
+        let (mut worker, _) = capture_worker_for(shell_session("exec sleep 60").launch);
+        worker.terminal.vt_write(&b"row\r\n".repeat(100));
+        let mut attributes: libc::termios = unsafe {std::mem::zeroed()};
+        assert_eq!(unsafe {libc::tcgetattr(worker.writer.as_raw_fd(), &mut attributes)},0);
+        attributes.c_lflag &= !libc::ISIG;
+        assert_eq!(unsafe {libc::tcsetattr(worker.writer.as_raw_fd(),libc::TCSANOW,&attributes)},0);
+        let mut input=key_input(KeyAction::Press,TerminalKey::Character('c'),Some("c"),Some('c'));
+        input.modifiers.control=true;
+        input.scroll_to_bottom_on_input=false;
+        worker.terminal.scroll_viewport(ScrollViewport::Top);
+        assert!(worker.published.request_interrupt(Some(input.clone())));
+        worker.interrupt_input();
+        assert_eq!(worker.terminal.scrollbar().unwrap().offset,0,"disabled priority input preserves review position");
+        input.scroll_to_bottom_on_input=true;
+        assert!(worker.published.request_interrupt(Some(input.clone())));
+        worker.interrupt_input();
+        let bar=worker.terminal.scrollbar().unwrap();
+        assert_eq!(bar.offset+bar.len,bar.total,"admitted raw Ctrl+C follows the prompt");
+        present(&worker);
+        let generation=worker.generation;
+        assert!(worker.published.request_interrupt(Some(input.clone())));
+        worker.interrupt_input();
+        assert_eq!(worker.generation,generation,"a key at bottom must not publish a redundant capture");
+        worker.terminal.scroll_viewport(ScrollViewport::Top);
+        attributes.c_lflag |= libc::ISIG;
+        assert_eq!(unsafe {libc::tcsetattr(worker.writer.as_raw_fd(),libc::TCSANOW,&attributes)},0);
+        assert!(worker.published.request_interrupt(Some(input.clone())));
+        worker.interrupt_input();
+        let bar=worker.terminal.scrollbar().unwrap();
+        assert_eq!(bar.offset+bar.len,bar.total,"successful out-of-band conventional interrupt follows too");
+        worker.terminal.scroll_viewport(ScrollViewport::Top);
+        worker.writer=File::open("/dev/null").unwrap();
+        assert!(worker.published.request_interrupt(Some(input)));
+        worker.interrupt_input();
+        assert_eq!(worker.terminal.scrollbar().unwrap().offset,0,"failed interrupt must not move review position");
+        worker.published.request_shutdown();worker.run();
     }
 
     #[test]
