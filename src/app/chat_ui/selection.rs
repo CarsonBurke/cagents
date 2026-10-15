@@ -2607,6 +2607,17 @@ mod tests {
             ),
             "selected"
         );
+        block = tool_text::ToolText::update(
+            Some(block),
+            "different source with an unrelated selection",
+            tool_text::Language::Plain,
+        );
+        element = surface(block.view(theme, None, target, None));
+        tree.diff(&mut element);
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let state = tree.state.downcast_ref::<State>();
+        assert_eq!((state.anchor, state.end), (None, None),
+            "an unproven rewrite must not carry source byte endpoints");
     }
 
     #[test]

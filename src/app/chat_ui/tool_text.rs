@@ -34,6 +34,9 @@ impl Language {
 
 pub(super) struct ToolText {
     key: u64,
+    // Reader identity survives body appends; source provenance decides when
+    // a rewrite must reset the native tree and its selection.
+    reader_identity: u64,
     pub(super) reader_source: reader_source::Source,
     pub(super) flow_cache: flow_layout::Cache,
     language: Language,
@@ -208,8 +211,10 @@ impl ToolText {
             .as_ref()
             .map(|previous| previous.flow_cache.clone())
             .unwrap_or_default();
+        let reader_identity = previous.as_ref().map_or(key, |previous| previous.reader_identity);
         Self {
             key,
+            reader_identity,
             reader_source,
             flow_cache,
             language,
@@ -290,7 +295,7 @@ impl ToolText {
         logical: Option<selectable_prose::Logical>,
         reader: Option<(scroll::Memory, Option<String>, u64)>,
     ) -> Element<'static, Message> {
-        let reader = Some(reader.unwrap_or_else(|| (scroll::Memory::default(), None, self.key)));
+        let reader = Some(reader.unwrap_or_else(|| (scroll::Memory::default(), None, self.reader_identity)));
         let mut syntax = self.syntax.borrow_mut();
         if self.text.len() > CachedItem::HIGHLIGHT_LIMIT {
             *syntax = None;
