@@ -465,6 +465,12 @@ impl ClientHandle {
             boot_id: crate::model::BootId::new("fixture-boot"),
             host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
         };
+        let activity = ActivityObservation {
+            generation: snapshot.generation,
+            state: snapshot.activity(),
+            outcome: snapshot.outcome.clone(),
+            pending: false,
+        };
         Self {
             inner: Arc::new(Inner {
                 id: session.id,
@@ -481,12 +487,7 @@ impl ClientHandle {
                     Instant::now(),
                 ))),
                 snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
-                activity: Arc::new(Mutex::new(ActivityObservation {
-                    generation: 0,
-                    state: ActivityState::Idle,
-                    outcome: None,
-                    pending: false,
-                })),
+                activity: Arc::new(Mutex::new(activity)),
                 observed: Arc::new(Mutex::new(OutputObservation::default())),
                 account_usage: Arc::default(),
                 next: Arc::new(AtomicU64::new(1)),
