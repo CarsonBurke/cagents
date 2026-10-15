@@ -223,6 +223,26 @@ mod tests {
     }
 
     #[test]
+    fn frame_resuming_a_ready_selection_rebinds_the_visible_scope_immediately() {
+        const TEST: &str = "app::project_activation::tests::frame_resuming_a_ready_selection_rebinds_the_visible_scope_immediately";
+        if !crate::test_git::isolated_test(TEST) { return; }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.request_project_activation(root.clone());
+        let task = app.resume_project_activation();
+        app.update_prepared = true;
+        let previous = app.active_workspace.clone();
+        complete(&mut app, task);
+        assert_eq!(app.active_workspace, previous);
+        app.update_prepared = false;
+        drop(app.update(Message::Frame(Instant::now())));
+        assert_eq!(app.active_workspace.as_ref(), Some(&root));
+        assert_eq!(app.sidebar_state.active_worktree().map(|key| &key.canonical_path), Some(&root));
+        assert_eq!(app.sidebar_model.source_control.as_ref().map(|model| &model.key.canonical_path), Some(&root));
+    }
+
+    #[test]
     fn cli_selection_waits_for_modal_and_update_admission() {
         const TEST: &str = "app::project_activation::tests::cli_selection_waits_for_modal_and_update_admission";
         if !crate::test_git::isolated_test(TEST) { return; }
