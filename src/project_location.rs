@@ -28,7 +28,10 @@ pub(crate) fn resolve(
             key: from.clone(),
             kind: project.kind,
             primary_checkout: project.primary_checkout.clone(),
-            checkout: project.checkout.clone().or_else(|| (project.kind == ProjectKind::Folder).then(|| from.clone())),
+            checkout: project
+                .checkout
+                .clone()
+                .or_else(|| (project.kind == ProjectKind::Folder).then(|| from.clone())),
         });
     }
     discover(&from)
@@ -57,10 +60,18 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
         if key.is_empty() {
             return Err("git reported an empty repository path".into());
         }
-        let key = fs::canonicalize(key).map_err(|error| format!("could not resolve Git directory {key}: {error}"))?;
+        let key = fs::canonicalize(key)
+            .map_err(|error| format!("could not resolve Git directory {key}: {error}"))?;
         let checkout = discover_checkout(&directory)?;
-        let primary_checkout = checkout.as_deref().and_then(|checkout| primary_checkout(checkout, &key));
-        return Ok(ProjectLocation { key, kind: ProjectKind::Git, checkout, primary_checkout });
+        let primary_checkout = checkout
+            .as_deref()
+            .and_then(|checkout| primary_checkout(checkout, &key));
+        return Ok(ProjectLocation {
+            key,
+            kind: ProjectKind::Git,
+            checkout,
+            primary_checkout,
+        });
     }
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     let diagnostic = diagnostic.trim();
@@ -78,7 +89,8 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
         return Ok(ProjectLocation {
             key: directory.clone(),
             kind: ProjectKind::Folder,
-            checkout: Some(directory), primary_checkout: None,
+            checkout: Some(directory),
+            primary_checkout: None,
         });
     }
     Err(format!(
@@ -91,16 +103,22 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
 fn discover_checkout(directory: &Path) -> Result<Option<PathBuf>, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--show-toplevel"])
-        .env("LC_ALL", "C").current_dir(directory).stdin(Stdio::null()).output()
+        .env("LC_ALL", "C")
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .output()
         .map_err(|error| format!("could not discover checkout: {error}"))?;
     if !output.status.success() {
         // A bare or metadata-only open has no discoverable checkout. Do not
         // guess from the metadata directory's spelling.
         return Ok(None);
     }
-    let root = String::from_utf8(output.stdout).map_err(|_| "git reported a checkout path that is not valid UTF-8")?;
+    let root = String::from_utf8(output.stdout)
+        .map_err(|_| "git reported a checkout path that is not valid UTF-8")?;
     let root = root.strip_suffix('\n').unwrap_or(&root);
-    fs::canonicalize(root).map(Some).map_err(|error| error.to_string())
+    fs::canonicalize(root)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 /// Filesystem identity for a verified checkout marker, including linked and
@@ -108,10 +126,14 @@ fn discover_checkout(directory: &Path) -> Result<Option<PathBuf>, String> {
 pub(crate) fn checkout_identity(directory: &Path) -> Option<(PathBuf, PathBuf)> {
     use std::os::unix::ffi::OsStrExt;
     fn reference(bytes: &[u8]) -> &Path {
-        Path::new(std::ffi::OsStr::from_bytes(bytes.strip_suffix(b"\n").unwrap_or(bytes)))
+        Path::new(std::ffi::OsStr::from_bytes(
+            bytes.strip_suffix(b"\n").unwrap_or(bytes),
+        ))
     }
     let marker = directory.join(".git");
-    let admin = if marker.is_dir() { fs::canonicalize(marker).ok()? } else {
+    let admin = if marker.is_dir() {
+        fs::canonicalize(marker).ok()?
+    } else {
         let content = fs::read(marker).ok()?;
         let path = reference(content.strip_prefix(b"gitdir: ")?);
         fs::canonicalize(directory.join(path)).ok()?
@@ -128,17 +150,27 @@ pub(crate) fn checkout_identity(directory: &Path) -> Option<(PathBuf, PathBuf)> 
 /// repair Git's separate-directory primary worktree record.
 pub(crate) fn primary_checkout(directory: &Path, repository: &Path) -> Option<PathBuf> {
     let (admin, common) = checkout_identity(directory)?;
-    (admin == common && common == repository).then(|| fs::canonicalize(directory).ok()).flatten()
+    (admin == common && common == repository)
+        .then(|| fs::canonicalize(directory).ok())
+        .flatten()
 }
 
 /// Choose an available checkout on the filesystem-owning worker. A retained
 /// primary may disappear independently of usable linked worktrees.
-pub(crate) fn read_checkout(repository: &Path, checkout: Option<&Path>, primary: Option<&Path>) -> Option<PathBuf> {
-    primary.and_then(|root| primary_checkout(root, repository)).or_else(|| {
-        let root = checkout?;
-        let (_, common) = checkout_identity(root)?;
-        (common == repository).then(|| fs::canonicalize(root).ok()).flatten()
-    })
+pub(crate) fn read_checkout(
+    repository: &Path,
+    checkout: Option<&Path>,
+    primary: Option<&Path>,
+) -> Option<PathBuf> {
+    primary
+        .and_then(|root| primary_checkout(root, repository))
+        .or_else(|| {
+            let root = checkout?;
+            let (_, common) = checkout_identity(root)?;
+            (common == repository)
+                .then(|| fs::canonicalize(root).ok())
+                .flatten()
+        })
 }
 
 fn exists(path: &Path) -> Result<bool, String> {
@@ -262,7 +294,8 @@ mod tests {
         assert_eq!(
             discover(&selected).unwrap(),
             ProjectLocation {
-                checkout: Some(root.path().canonicalize().unwrap()), primary_checkout: None,
+                checkout: Some(root.path().canonicalize().unwrap()),
+                primary_checkout: None,
                 key: root.path().canonicalize().unwrap(),
                 kind: ProjectKind::Folder,
             }
@@ -274,13 +307,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let checkout = root.path().join("checkout with spaces");
         let metadata = root.path().join("metadata elsewhere");
-        let output = Command::new("git").args(["init", "--separate-git-dir"])
-            .arg(&metadata).arg(&checkout).output().unwrap();
+        let output = Command::new("git")
+            .args(["init", "--separate-git-dir"])
+            .arg(&metadata)
+            .arg(&checkout)
+            .output()
+            .unwrap();
         assert!(output.status.success());
         let location = discover(&checkout).unwrap();
         assert_eq!(location.key, metadata.canonicalize().unwrap());
         assert_eq!(location.checkout, Some(checkout.canonicalize().unwrap()));
-        assert_eq!(location.primary_checkout, Some(checkout.canonicalize().unwrap()));
+        assert_eq!(
+            location.primary_checkout,
+            Some(checkout.canonicalize().unwrap())
+        );
         assert_eq!(discover(&metadata).unwrap().checkout, None);
     }
 
@@ -290,24 +330,79 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let checkout = root.path().join("checkout");
         let metadata = root.path().join("metadata");
-        assert!(Command::new("git").args(["init", "--separate-git-dir"]).arg(&metadata).arg(&checkout).output().unwrap().status.success());
-        assert!(Command::new("git").arg("-C").arg(&checkout).args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture"]).output().unwrap().status.success());
+        assert!(
+            Command::new("git")
+                .args(["init", "--separate-git-dir"])
+                .arg(&metadata)
+                .arg(&checkout)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fixture"
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         let service = crate::repository::RepositoryService::system("git");
         let cancellation = crate::repository::CancellationToken::new();
         let info = service.discover(&checkout, &cancellation).unwrap();
-        let records = service.list_worktrees_for_repository(&info, &cancellation).unwrap();
+        let records = service
+            .list_worktrees_for_repository(&info, &cancellation)
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].path, checkout.canonicalize().unwrap());
-        assert_eq!(records[0].id, crate::repository::stable_worktree_id(&records[0].path));
+        assert_eq!(
+            records[0].id,
+            crate::repository::stable_worktree_id(&records[0].path)
+        );
         let linked = root.path().join("linked");
-        assert!(Command::new("git").arg("-C").arg(&checkout).args(["worktree", "add", "-b", "linked"]).arg(&linked).output().unwrap().status.success());
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(["worktree", "add", "-b", "linked"])
+                .arg(&linked)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         let linked_location = discover(&linked).unwrap();
-        assert_eq!(linked_location.checkout, Some(linked.canonicalize().unwrap()));
+        assert_eq!(
+            linked_location.checkout,
+            Some(linked.canonicalize().unwrap())
+        );
         assert_eq!(linked_location.primary_checkout, None);
         let info = service.discover(&linked, &cancellation).unwrap();
-        let records = service.list_worktrees_for_repository(&info, &cancellation).unwrap();
-        assert!(records.iter().any(|record| record.path == linked.canonicalize().unwrap()));
-        assert!(!records.iter().any(|record| record.path == metadata.canonicalize().unwrap() && !record.bare));
+        let records = service
+            .list_worktrees_for_repository(&info, &cancellation)
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.path == linked.canonicalize().unwrap())
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.path == metadata.canonicalize().unwrap() && !record.bare)
+        );
     }
 
     #[test]
@@ -366,7 +461,8 @@ mod tests {
             "a checkout outside every open project has no project"
         );
         model.projects.push(crate::workspace_model::ModelProject {
-            checkout: None, primary_checkout: None,
+            checkout: None,
+            primary_checkout: None,
             repository: key.clone(),
             name: "repository".into(),
             kind: ProjectKind::Git,

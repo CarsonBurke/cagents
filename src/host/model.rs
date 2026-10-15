@@ -681,11 +681,11 @@ fn migrate(db: &Connection) -> Result<(), String> {
     if version < 12 {
         mailbox::migrate_attention(db)?;
     }
-    if version < 13 {
-        agent_locations::migrate(db)?;
-        project_checkout::migrate(db)?;
-    }
     if version < 14 {
+        // Schema13 may already have been published by another prerequisite.
+        // Complete every idempotent addition before stamping the union14.
+        project_checkout::migrate(db)?;
+        agent_locations::migrate(db)?;
         session_locations::migrate(db)?;
     }
     Ok(())
@@ -911,7 +911,8 @@ mod tests {
 
     fn open(repository: &str) -> ModelEdit {
         ModelEdit::OpenProject {
-            checkout: None, primary_checkout: None,
+            checkout: None,
+            primary_checkout: None,
             kind: Default::default(),
             repository: PathBuf::from(repository),
             name: repository.rsplit('/').next().unwrap().to_owned(),
@@ -936,7 +937,8 @@ mod tests {
         let path = directory.path().join("model.sqlite3");
         registry
             .apply(&ModelEdit::OpenProject {
-                checkout: None, primary_checkout: None,
+                checkout: None,
+                primary_checkout: None,
                 repository: "/folder".into(),
                 name: "Folder".into(),
                 kind: ProjectKind::Folder,
@@ -947,7 +949,8 @@ mod tests {
         let mut observed = registry.model().unwrap();
         assert_eq!(observed.projects[0].kind, ProjectKind::Folder);
         let repeat = ModelEdit::ReopenProject {
-            checkout: None, primary_checkout: None,
+            checkout: None,
+            primary_checkout: None,
             repository: "/folder".into(),
             name: "Renamed".into(),
             kind: ProjectKind::Git,
@@ -1038,7 +1041,8 @@ mod tests {
         assert_eq!(stale.model.closed_projects, [PathBuf::from("/tmp/one")]);
         let opened = registry
             .apply(&ModelEdit::ReopenProject {
-                checkout: None, primary_checkout: None,
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: PathBuf::from("/tmp/one"),
                 name: "one".into(),
