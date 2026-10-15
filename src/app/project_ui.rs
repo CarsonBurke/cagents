@@ -575,7 +575,7 @@ impl Cagents {
     /// is an explicit separate basis and never matches a newly joined registry.
     pub(super) fn join_project_close_registry(&mut self, identity: uuid::Uuid) {
         let stale=self.project_ui.closing.iter().filter(|(project,_)| {
-            self.project_ui.close_registry.get(project).is_none_or(|basis| !basis.matches(identity))
+            self.project_ui.close_registry.get(*project).is_none_or(|basis| !basis.matches(identity))
         }).map(|(_,repository)|repository.clone()).collect::<Vec<_>>();
         for repository in stale {
             self.cancel_shared_project_close(&repository);
@@ -590,7 +590,7 @@ impl Cagents {
     /// UUID stayed the same. Check before closed-path filtering hides the new row.
     pub(super) fn reconcile_project_close_instances(&mut self) {
         let stale=self.project_ui.closing.iter().filter(|(id,repository)| {
-            match self.project_ui.close_registry.get(id) {
+            match self.project_ui.close_registry.get(*id) {
                 Some(ProjectCloseRegistry::Shared {registry,ordinal}) if *registry==self.workspace_model.identity =>
                     self.workspace_model.project(repository).is_some_and(|project|project.ordinal!=*ordinal),
                 _ => false,
