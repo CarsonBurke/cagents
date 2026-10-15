@@ -210,8 +210,10 @@ pub enum Action {
     ProviderExitLoaded(
         Target,
         provider_exit::Request,
-        Result<chat::client::ProviderExitOutput, String>,
+        chat::client::DiagnosticCompletion,
     ),
+    ProviderExitCopyReady(Target, provider_exit::Request, chat::client::DiagnosticCopyCompletion),
+    ProviderExitClipboardIssued(chat::client::DiagnosticCopyReceipt),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
     ToggleTurn(Target, String),
@@ -324,6 +326,8 @@ impl Action {
             self,
             Self::Ready(..)
                 | Self::ProviderExitLoaded(..)
+                | Self::ProviderExitCopyReady(..)
+                | Self::ProviderExitClipboardIssued(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::Wake(..)
@@ -2559,7 +2563,8 @@ impl Runtime {
         {
             self.provider_exit_expanded = false;
         }
-        self.provider_exit_output.reconcile(&snapshot);
+        let actor=self.handle().map(Arc::downgrade);
+        self.provider_exit_output.reconcile(&snapshot,actor);
         self.snapshot = snapshot;
         images::sync(self);
         self.refresh_find();
@@ -7575,6 +7580,10 @@ impl Cagents {
             Action::ProviderExitLoaded(target, request, result) => {
                 return self.provider_exit_loaded(target, request, result);
             }
+            Action::ProviderExitCopyReady(target, request, result) => {
+                return self.provider_exit_copy_ready(target, request, result);
+            }
+            Action::ProviderExitClipboardIssued(receipt) => {drop(receipt);}
             Action::ProviderExitPage(target, forward) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.provider_exit_page(forward);
