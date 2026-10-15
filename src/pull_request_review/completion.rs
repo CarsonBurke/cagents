@@ -188,7 +188,7 @@ impl State {
         let Some(target)=&self.target else{return ActionTask::none();};
         let key=PullRequestKey::new(target.repository.clone(),target.pull_request.number).expect("verified PR key");
         self.completion.load_id=self.completion.load_id.wrapping_add(1);self.completion.loading=false;
-        let generation=self.generation;let api=Arc::clone(&self.api);let original=self.completion.published.as_ref().map(|edit|edit.original.clone());let expected_reviewers=self.completion.data.as_ref().map(|data|data.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>());self.completion.busy=true;self.completion.error=None;
+        let generation=self.generation;let api=Arc::clone(&self.api);let expected_head=self.context.as_ref().map(|context|context.head_oid.clone());let original=self.completion.published.as_ref().map(|edit|edit.original.clone());let expected_reviewers=self.completion.data.as_ref().map(|data|data.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>());self.completion.busy=true;self.completion.error=None;
         iced::Task::perform(async move{
             let result=tokio::task::spawn_blocking(move||{
                 let cancellation=CancellationToken::new();let fresh=api.review_controls(&key,&cancellation).map_err(|error|error.to_string())?;
@@ -201,7 +201,7 @@ impl State {
                     ReviewControlMutation::Merge{method,expected_head,..}=>{let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;if context.pending.is_some(){return Err("Submit or discard your pending review before merging.".into());}if fresh.head_oid!=*expected_head{return Err("The PR head changed; refresh and review it before merging.".into());}if let Some(reason)=fresh.merge_blocked{return Err(reason);}if !fresh.allowed_methods.contains(method){return Err("This merge method is no longer allowed by the repository.".into());}}
                     ReviewControlMutation::Reviewers(_)=>{if !fresh.is_open||!fresh.can_update||!fresh.reviewers_complete{return Err("GitHub does not permit changing this complete requested reviewer set.".into());}if Some(fresh.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>())!=expected_reviewers{return Err("Reviewer requests changed. Refresh before editing the requested set.".into());}}
                     ReviewControlMutation::Draft(_)=>{if !fresh.is_open||!fresh.can_update{return Err("GitHub does not permit changing this pull request.".into());}}
-                    ReviewControlMutation::AutoMerge{enabled:true,method}=>{let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;if context.pending.is_some(){return Err("Submit or discard your pending review before enabling auto-merge.".into());}if !fresh.is_open||!fresh.allowed_methods.contains(method)||!fresh.auto_merge_allowed || !fresh.can_enable_auto_merge{return Err("Auto-merge cannot be enabled for this pull request.".into());}}
+                    ReviewControlMutation::AutoMerge{enabled:true,method}=>{let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;if expected_head.as_deref()!=Some(fresh.head_oid.as_str())||context.head_oid!=fresh.head_oid{return Err("The PR head changed; refresh and review it before enabling auto-merge.".into());}if context.pending.is_some(){return Err("Submit or discard your pending review before enabling auto-merge.".into());}if !fresh.is_open||!fresh.allowed_methods.contains(method)||!fresh.auto_merge_allowed || !fresh.can_enable_auto_merge{return Err("Auto-merge cannot be enabled for this pull request.".into());}}
                     ReviewControlMutation::AutoMerge{enabled:false,..}=>{if !fresh.can_disable_auto_merge{return Err("Auto-merge cannot be disabled for this pull request.".into());}}
                     _=>{}
                 }
@@ -304,6 +304,17 @@ mod tests {
             while let Some(action)=stream.next().await{if let iced::runtime::Action::Output(super::super::Action::Completion(action@Action::Finished{..}))=action{return action;}}
             panic!("completion worker returned no receipt");
         })
+    }
+    #[test]
+    fn enabling_auto_merge_rejects_a_head_that_moved_after_the_displayed_review() {
+        let (mut state,api)=state();let mut fresh=controls_fixture();fresh.head_oid="b".repeat(40);
+        state.target=Some(target(1));state.context=Some(loaded(Vec::new(),Vec::new()).context);
+        state.completion.data=Some(controls_fixture());*api.controls.lock().unwrap()=Some(fresh);
+        *api.control_context.lock().unwrap()=state.context.clone();
+        let task=state.mutate_completion(ReviewControlMutation::AutoMerge{enabled:true,method:MergeMethod::Squash});
+        let outcome=receipt(task);drop(state.update_completion(outcome));
+        assert!(api.controls_written.lock().unwrap().is_empty());
+        assert!(state.completion.error.as_ref().unwrap().contains("PR head changed"));
     }
     #[test]
     fn every_control_mutation_reports_api_refusal_inline_without_changing_the_requested_action() {
