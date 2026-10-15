@@ -37,6 +37,17 @@ fn emit_bind(identity:&TurnIdentity,ids:Vec<String>,step:&mut Step){
     if !batch.is_empty(){let update=TurnUpdate::Bind{identity:identity.clone(),item_ids:batch};if update.validate().is_ok(){step.events.push(Event::TurnOutcome(update));}}
 }
 
+/// A per-invocation shell receipt, never a claim that every descendant process
+/// or every tool bound to a cancelled input has stopped.
+pub(super) fn interrupted_shell(content: &ItemContent, result: &Value) -> bool {
+    let known = matches!(content, ItemContent::Command { action: CommandAction::Run, .. })
+        || matches!(content, ItemContent::Tool { name, .. } if name == "PowerShell");
+    let absent_or_false = |field: &str| result.get(field).is_none_or(|value| value.is_null() || value.as_bool() == Some(false));
+    let no_background = result.get("backgroundTaskId").is_none_or(|value| value.is_null() || value.as_str() == Some(""));
+    known && result["interrupted"].as_bool() == Some(true) && absent_or_false("detachedToolCall")
+        && absent_or_false("backgroundedByTurnAbort") && no_background
+}
+
 impl Inputs {
     pub(super) fn submit(&mut self,uuid:&str,events:&[Event]) {
         while self.pending.len()>=PENDING {

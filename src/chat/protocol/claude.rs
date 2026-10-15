@@ -1424,6 +1424,14 @@ impl Claude {
                                 &Value::Null
                             },
                         );
+                        // Native shell output proves only this exact invocation
+                        // was interrupted. Background/detached or generic tools
+                        // never inherit their parent input's terminal status.
+                        if !history && content.len() == 1
+                            && frame["session_id"].as_str().is_some_and(|session| Some(session) == self.session_id.as_deref())
+                            && turn_outcomes::interrupted_shell(&item.content, structured_result(frame)) {
+                            item.content.set_status(ToolStatus::Stopped);
+                        }
                         if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
                         {
                             // A nested agent's progress never reaches this

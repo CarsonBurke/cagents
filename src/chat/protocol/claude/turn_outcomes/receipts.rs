@@ -229,6 +229,35 @@ mod tests {
         assert!(updates(&adapter.receive(block("stream-unowned-tool")).unwrap()).is_empty());
     }
     #[test]
+    fn actual_shell_interruption_receipt_stops_only_its_exact_known_invocation() {
+        for (name, structured, stopped) in [
+            ("Bash", json!({"interrupted":true}), true),
+            ("PowerShell", json!({"interrupted":true}), true),
+            ("CustomTool", json!({"interrupted":true}), false),
+            ("Bash", json!({"interrupted":false,"backgroundTaskId":"background-job","backgroundedByTurnAbort":true}), false),
+            ("Bash", json!({"interrupted":true,"backgroundTaskId":"background-job"}), false),
+            ("Bash", json!({"interrupted":true,"detachedToolCall":true}), false),
+            ("Bash", json!({"interrupted":"true"}), false),
+        ] {
+            let mut adapter = adapter(); let input = submit(&mut adapter); accept(&mut adapter, &input);
+            let call = json!({"type":"assistant","uuid":"tool-call","session_id":SESSION,"user_message_uuid":input,"message":{"id":"native-call","content":[{"type":"tool_use","id":"exact-tool","name":name,"input":{"command":"git status"}}]}});
+            adapter.receive(call).unwrap();
+            let step = adapter.receive(json!({"type":"user","uuid":"tool-result","session_id":SESSION,"tool_use_result":structured,"message":{"content":[{"type":"tool_result","tool_use_id":"exact-tool","is_error":true,"content":"Native tool completion"}]}})).unwrap();
+            let actual = step.events.iter().find_map(|event| match event { Event::Item(item) if item.id == "exact-tool" => item.content.status(), _ => None }).unwrap();
+            assert_eq!(actual == ToolStatus::Stopped, stopped, "{name}");
+        }
+    }
+    #[test]
+    fn parent_interruption_without_individual_tool_receipt_never_blanket_stops_tools() {
+        let mut adapter = adapter(); let input = submit(&mut adapter); accept(&mut adapter, &input);
+        adapter.receive(json!({"type":"assistant","uuid":"calls","session_id":SESSION,"user_message_uuid":input,"message":{"id":"native-calls","content":[{"type":"tool_use","id":"running-tool","name":"Bash","input":{"command":"sleep 10"}},{"type":"tool_use","id":"background-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        let step = adapter.receive(result(&input, "aborted_tools")).unwrap();
+        assert!(updates(&step).iter().any(|update| matches!(update, TurnUpdate::Finish { outcome: ActivityOutcome::Cancelled, .. })));
+        assert!(step.events.iter().all(|event| !matches!(event, Event::Item(item) if ["running-tool", "background-agent"].contains(&item.id.as_str()))));
+        assert_eq!(adapter.tools["running-tool"].content.status(), Some(ToolStatus::Running));
+    }
+
+    #[test]
     fn discarded_local_input_cannot_gain_fate_or_message_membership_from_late_receipts() {
         let mut adapter = adapter(); let input = submit(&mut adapter); adapter.turn_inputs.discard_undispatched(&input);
         adapter.receive(echo(&input)).unwrap(); adapter.receive(started(&input)).unwrap();
