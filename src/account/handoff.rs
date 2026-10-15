@@ -45,7 +45,13 @@ fn transfer(source: &Session, replacement: &Session, commit: bool) -> Result<(),
             // preserve exactly one history branch instead of guessing a slug.
             let mut found = Vec::new();
             let mut budget = ENTRY_BUDGET;
-            find(&original.join("projects"), 6, ".jsonl", &mut budget, &mut found)?;
+            find(
+                &original.join("projects"),
+                6,
+                ".jsonl",
+                &mut budget,
+                &mut found,
+            )?;
             let name = format!("{id}.jsonl");
             found.retain(|path| path.file_name().is_some_and(|file| file == name.as_str()));
             if found.len() != 1 {
@@ -400,20 +406,39 @@ mod removal_tests {
         fs::create_dir_all(history.parent().unwrap()).unwrap();
         fs::write(&history, b"saved user conversation\n").unwrap();
         let source = Session {
-            id: crate::model::TerminalId::new(), proof: None, terminal: None,
-            native_continuity: Default::default(), owned_codex_listener: None,
-            launch: crate::chat::Launch { provider: Provider::Claude, session_id: Some(id.clone()), recipe: crate::model::LaunchRecipe {
-                program: "claude".into(), arguments: Vec::new(), working_directory: root.path().join("original-project-spelling"),
-                environment: std::collections::BTreeMap::from([
-                    ("HOME".into(), root.path().to_string_lossy().into_owned()),
-                    ("CLAUDE_CONFIG_DIR".into(), source_home.to_string_lossy().into_owned()),
-                ]), unset_environment: Default::default(),
-            } },
+            id: crate::model::TerminalId::new(),
+            proof: None,
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: Provider::Claude,
+                session_id: Some(id.clone()),
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: root.path().join("original-project-spelling"),
+                    environment: std::collections::BTreeMap::from([
+                        ("HOME".into(), root.path().to_string_lossy().into_owned()),
+                        (
+                            "CLAUDE_CONFIG_DIR".into(),
+                            source_home.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                    unset_environment: Default::default(),
+                },
+            },
         };
         let mut target = source.clone();
-        target.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(), target_home.to_string_lossy().into_owned());
+        target.launch.recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            target_home.to_string_lossy().into_owned(),
+        );
         prepare(&source, &target).unwrap();
-        assert_eq!(fs::read(target_home.join(&relative)).unwrap(), b"saved user conversation\n");
+        assert_eq!(
+            fs::read(target_home.join(&relative)).unwrap(),
+            b"saved user conversation\n"
+        );
         let other = source_home.join(format!("projects/another-branch/{id}.jsonl"));
         fs::create_dir_all(other.parent().unwrap()).unwrap();
         fs::write(&other, b"another history branch\n").unwrap();

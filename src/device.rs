@@ -1576,7 +1576,10 @@ pub fn shell() -> Option<&'static str> {
         .map(String::as_str)
 }
 pub(crate) fn shell_error() -> Option<&'static str> {
-    SELECTED.get().and_then(|context| context.shell_error.get()).and_then(|error| error.as_deref())
+    SELECTED
+        .get()
+        .and_then(|context| context.shell_error.get())
+        .and_then(|error| error.as_deref())
 }
 pub fn prepare() -> io::Result<()> {
     if !is_remote() {

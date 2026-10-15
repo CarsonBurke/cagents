@@ -522,18 +522,25 @@ mod tests {
     #[test]
     fn setting_ack_never_reuses_prior_init_policy_for_the_next_original() {
         for change in [
-            Command::SetPermissionMode { mode: "bypassPermissions".into() },
+            Command::SetPermissionMode {
+                mode: "bypassPermissions".into(),
+            },
             Command::SetFastMode { enabled: true },
         ] {
             let mut adapter = adapter();
-            adapter.fast_mode = Some(chat::FastMode { state: chat::FastModeState::Off, disabled_reason: None });
+            adapter.fast_mode = Some(chat::FastMode {
+                state: chat::FastModeState::Off,
+                disabled_reason: None,
+            });
             adapter.receive(init()).unwrap();
             let control = adapter.command(change).unwrap();
             adapter.receive(json!({"type":"control_response","response":{"request_id":control.writes[0]["request_id"],"subtype":"success","response":{"mode":"bypassPermissions"}}})).unwrap();
             assert!(adapter.originals.policy.is_none());
             assert!(adapter.originals.init.is_none());
             adapter.original_command(Some("after-setting".into()));
-            let read = adapter.command(prompt("original", PromptMode::Send)).unwrap();
+            let read = adapter
+                .command(prompt("original", PromptMode::Send))
+                .unwrap();
             adapter.receive(settings_reply(&read.writes[0])).unwrap();
             let mut changed = init();
             changed["permissionMode"] = json!("bypassPermissions");
@@ -541,7 +548,15 @@ mod tests {
             adapter.receive(changed).unwrap();
             adapter.receive(started("after-setting")).unwrap();
             adapter.receive(user("after-setting")).unwrap();
-            assert!(adapter.take_original_updates().iter().all(|update| !matches!(update, OriginalUpdate::Settings { .. } | OriginalUpdate::Accepted { .. })));
+            assert!(
+                adapter
+                    .take_original_updates()
+                    .iter()
+                    .all(|update| !matches!(
+                        update,
+                        OriginalUpdate::Settings { .. } | OriginalUpdate::Accepted { .. }
+                    ))
+            );
         }
     }
 

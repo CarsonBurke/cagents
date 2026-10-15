@@ -1059,7 +1059,10 @@ mod tests {
             executable: Some(executable.to_string_lossy().into_owned()),
             model: Some("captured-history-model".into()),
             permission_mode: Some("plan".into()),
-            arguments: vec!["--append-system-prompt".into(), "captured history policy".into()],
+            arguments: vec![
+                "--append-system-prompt".into(),
+                "captured history policy".into(),
+            ],
             ..Default::default()
         };
         let seeds = resume_seeds(
@@ -1067,11 +1070,31 @@ mod tests {
             directory.path(),
             &std::collections::BTreeMap::from([("claude".into(), policy)]),
         );
-        let [seed] = seeds.as_slice() else { panic!("a valid captured policy must retain its history reader") };
+        let [seed] = seeds.as_slice() else {
+            panic!("a valid captured policy must retain its history reader")
+        };
         assert_eq!(seed.launch.recipe.program, executable.to_string_lossy());
-        assert!(seed.launch.recipe.arguments.windows(2).any(|args| args == ["--model", "captured-history-model"]));
-        assert!(seed.launch.recipe.arguments.windows(2).any(|args| args == ["--permission-mode", "plan"]));
-        assert!(seed.launch.recipe.arguments.iter().any(|arg| arg == "captured history policy"));
+        assert!(
+            seed.launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|args| args == ["--model", "captured-history-model"])
+        );
+        assert!(
+            seed.launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|args| args == ["--permission-mode", "plan"])
+        );
+        assert!(
+            seed.launch
+                .recipe
+                .arguments
+                .iter()
+                .any(|arg| arg == "captured history policy")
+        );
     }
 
     fn saved(directory: &Path) -> SavedConversation {

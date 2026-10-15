@@ -47,9 +47,9 @@ use crate::account::{
 };
 use crate::agent::Provider;
 
-mod table;
 #[cfg(test)]
 pub(in crate::app) mod acceptance_support;
+mod table;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
     operation: account::remote::Operation,
@@ -213,8 +213,10 @@ impl State {
             return ProviderReadiness::MissingHome(id.clone());
         }
         if self.login_conflict(account).is_some()
-            || account.snapshot.as_ref().is_some_and(|snapshot|
-                snapshot.status == UsageStatus::NeedsLogin)
+            || account
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.status == UsageStatus::NeedsLogin)
         {
             return ProviderReadiness::NeedsLogin(id.clone());
         }
@@ -339,8 +341,11 @@ impl State {
     }
 
     pub(super) fn needs_alternate(&self, id: &AccountId) -> bool {
-        self.account(id).is_some_and(|state| state.snapshot.as_ref().is_some_and(|snapshot|
-            account::routing::needs_alternate_for(&state.account, snapshot, now_ms())))
+        self.account(id).is_some_and(|state| {
+            state.snapshot.as_ref().is_some_and(|snapshot| {
+                account::routing::needs_alternate_for(&state.account, snapshot, now_ms())
+            })
+        })
     }
 
     fn account_mut(&mut self, id: &AccountId) -> Option<&mut AccountState> {
@@ -1056,7 +1061,11 @@ pub enum Action {
     RemoveConfirm(AccountId),
     MoveAndArchive(AccountId, AccountId),
     DeleteAccountFiles(AccountId),
-    RemovalCount(AccountId, u64, Result<account::remote::RemovalPreview, String>),
+    RemovalCount(
+        AccountId,
+        u64,
+        Result<account::remote::RemovalPreview, String>,
+    ),
     RemovalDeleteInput(String),
     RemoveCancel,
     ArchiveDuplicate(AccountId),
@@ -1906,22 +1915,38 @@ impl Cagents {
     /// A routing refresh can finish after a newer discovery request. Adopt
     /// only newer usage for the current account-home keys; it has no authority
     /// to replace installation, presence, defaults or registry observations.
-    pub(super) fn adopt_routing_accounts(&mut self, snapshot: crate::device_service::AccountSnapshot) {
-        let restored = self.account_ui.accounts.iter().filter_map(|state| {
-            let key = state.account.cache_key()?;
-            if snapshot.cache_keys.get(&state.id) != Some(&key) { return None; }
-            Some(Restored { id: state.id.clone(), present: state.present,
-                entry: snapshot.entries.get(&key).cloned() })
-        }).collect();
+    pub(super) fn adopt_routing_accounts(
+        &mut self,
+        snapshot: crate::device_service::AccountSnapshot,
+    ) {
+        let restored = self
+            .account_ui
+            .accounts
+            .iter()
+            .filter_map(|state| {
+                let key = state.account.cache_key()?;
+                if snapshot.cache_keys.get(&state.id) != Some(&key) {
+                    return None;
+                }
+                Some(Restored {
+                    id: state.id.clone(),
+                    present: state.present,
+                    entry: snapshot.entries.get(&key).cloned(),
+                })
+            })
+            .collect();
         self.account_ui.restore(restored);
-        for (provider, catalog) in snapshot.catalogs { self.account_ui.take_catalog(provider, catalog); }
+        for (provider, catalog) in snapshot.catalogs {
+            self.account_ui.take_catalog(provider, catalog);
+        }
         self.refresh_chat_drafts();
     }
 
     /// Reads the registry again, for what another window changed.
     pub(super) fn reload_registry(&mut self) -> Task<Message> {
         if crate::device::is_remote() {
-            self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
+            self.account_ui.discovery_generation =
+                self.account_ui.discovery_generation.wrapping_add(1);
             let generation = self.account_ui.discovery_generation;
             return cosmic::task::future(async move {
                 let result =
@@ -2388,7 +2413,9 @@ impl Cagents {
                 }
             },
             Action::RemoteLoaded(generation, result) => {
-                if generation != self.account_ui.discovery_generation { return Task::none(); }
+                if generation != self.account_ui.discovery_generation {
+                    return Task::none();
+                }
                 let snapshot = match result {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
@@ -2458,7 +2485,9 @@ impl Cagents {
             Action::Tick => self.probe_accounts(Trigger::Tick),
             Action::Loaded(loaded) => {
                 let current_discovery = loaded.generation == self.account_ui.discovery_generation;
-                if current_discovery { self.account_ui.installed = loaded.installed; }
+                if current_discovery {
+                    self.account_ui.installed = loaded.installed;
+                }
                 let mut migration = Task::none();
                 match loaded.registry {
                     Ok(mut registry) => {
@@ -2483,7 +2512,9 @@ impl Cagents {
                     }
                     Err(_) => {}
                 }
-                if current_discovery { self.account_ui.restore(loaded.restored); }
+                if current_discovery {
+                    self.account_ui.restore(loaded.restored);
+                }
                 for (provider, catalog) in loaded.catalogs {
                     self.account_ui.take_catalog(provider, catalog);
                 }
@@ -2699,17 +2730,29 @@ impl Cagents {
                         .map(|project| (project.id, project.repository.clone()))
                         .collect::<Vec<_>>();
                     let migrate = registry.migrate_project_ids(&projects);
-                    let before: Vec<_> = self.account_ui.accounts.iter().map(|state| state.account.clone()).collect();
+                    let before: Vec<_> = self
+                        .account_ui
+                        .accounts
+                        .iter()
+                        .map(|state| state.account.clone())
+                        .collect();
                     self.account_ui.set_registry(registry);
                     for id in std::mem::take(&mut self.account_ui.login_changes_unconfirmed) {
                         self.report_login_change(&id);
                     }
-                    let changed = self.account_ui.accounts.iter().map(|state| &state.account).ne(before.iter());
+                    let changed = self
+                        .account_ui
+                        .accounts
+                        .iter()
+                        .map(|state| &state.account)
+                        .ne(before.iter());
                     let probe = if changed {
                         // A locate already in flight captured the previous set
                         // of homes. Supersede it before asking about new IDs.
                         Task::batch([self.locate_accounts(), self.probe_accounts(Trigger::Focus)])
-                    } else { Task::none() };
+                    } else {
+                        Task::none()
+                    };
                     let save = if migrate {
                         self.save_registry(move |registry| {
                             registry.migrate_project_ids(&projects);
@@ -2967,12 +3010,20 @@ impl Cagents {
                 let cleaned = account::clean_label(&draft);
                 let mut candidate = self.account_ui.registry.clone();
                 candidate.set_label(&account, cleaned.clone());
-                let proposed_name = cleaned.clone().or_else(|| self.account_ui.account(&id)
-                    .map(|state| self.account_ui.display_name_from(state, &candidate)));
-                if proposed_name.as_ref().is_some_and(|name|
-                    self.account_ui.of(account.provider).any(|other|
-                        other.id != id && self.account_ui.display_name(other).eq_ignore_ascii_case(name)))
-                {
+                let proposed_name = cleaned.clone().or_else(|| {
+                    self.account_ui
+                        .account(&id)
+                        .map(|state| self.account_ui.display_name_from(state, &candidate))
+                });
+                if proposed_name.as_ref().is_some_and(|name| {
+                    self.account_ui.of(account.provider).any(|other| {
+                        other.id != id
+                            && self
+                                .account_ui
+                                .display_name(other)
+                                .eq_ignore_ascii_case(name)
+                    })
+                }) {
                     self.account_ui.table.rename = Some((id, draft));
                     self.status = Some(TransientNotice::warning(
                         "An account with that name already exists for this provider.",
@@ -2996,7 +3047,11 @@ impl Cagents {
                     self.account_ui.table.confirm_remove = Some(id.clone());
                     self.account_ui.table.confirm_conversations = None;
                     self.account_ui.table.confirm_home = None;
-                    self.account_ui.table.removal_preview_generation = self.account_ui.table.removal_preview_generation.wrapping_add(1);
+                    self.account_ui.table.removal_preview_generation = self
+                        .account_ui
+                        .table
+                        .removal_preview_generation
+                        .wrapping_add(1);
                     let generation = self.account_ui.table.removal_preview_generation;
                     self.account_ui.table.confirm_delete.clear();
                     return cosmic::task::future(async move {
@@ -3015,10 +3070,18 @@ impl Cagents {
                 Task::none()
             }
             Action::RemovalCount(id, generation, result) => {
-                if self.account_ui.table.confirm_remove.as_ref() == Some(&id) && self.account_ui.table.removal_preview_generation == generation {
+                if self.account_ui.table.confirm_remove.as_ref() == Some(&id)
+                    && self.account_ui.table.removal_preview_generation == generation
+                {
                     self.account_ui.table.confirm_conversations = Some(match result {
-                        Ok(preview)=>{self.account_ui.table.confirm_home=Some(preview.home);Ok(preview.conversations)},
-                        Err(error)=>{self.account_ui.table.confirm_home=None;Err(error)},
+                        Ok(preview) => {
+                            self.account_ui.table.confirm_home = Some(preview.home);
+                            Ok(preview.conversations)
+                        }
+                        Err(error) => {
+                            self.account_ui.table.confirm_home = None;
+                            Err(error)
+                        }
                     });
                 }
                 Task::none()
@@ -3032,14 +3095,24 @@ impl Cagents {
                 account::remote::Operation::MoveAndArchive { id, target },
             ),
             Action::DeleteAccountFiles(id) => {
-                if self.account_ui.table.confirm_remove.as_ref() != Some(&id) {return Task::none();}
+                if self.account_ui.table.confirm_remove.as_ref() != Some(&id) {
+                    return Task::none();
+                }
                 if self.account_ui.account(&id).is_none_or(|account| {
                     self.account_ui.table.confirm_delete != self.account_ui.display_name(account)
                 }) {
                     return Task::none();
                 }
-                let Some(home)=self.account_ui.table.confirm_home.clone() else {return Task::none();};
-                self.remove_account_with(id.clone(), account::remote::Operation::DeleteFiles { id, expected_home:Some(home) })
+                let Some(home) = self.account_ui.table.confirm_home.clone() else {
+                    return Task::none();
+                };
+                self.remove_account_with(
+                    id.clone(),
+                    account::remote::Operation::DeleteFiles {
+                        id,
+                        expected_home: Some(home),
+                    },
+                )
             }
             Action::RemoveCancel => {
                 self.account_ui.table.confirm_remove = None;
@@ -3076,7 +3149,9 @@ impl Cagents {
                 registry,
                 error,
             } => {
-                if delete_requested { self.finish_account_history_deletion(&id); }
+                if delete_requested {
+                    self.finish_account_history_deletion(&id);
+                }
                 self.account_ui.removing.remove(&id);
                 if let Some(registry) = registry {
                     self.account_ui.set_registry(registry);
@@ -4265,14 +4340,25 @@ impl Cagents {
             return Task::none();
         }
         let delete_requested = matches!(&operation, account::remote::Operation::DeleteFiles { .. });
-        if let account::remote::Operation::DeleteFiles {expected_home,..}=&operation {
-            let prepared=self.account_ui.account(&id).ok_or_else(||"The account changed; reload Accounts before deleting its files".to_owned())
-                .map(|state|state.account.provider)
-                .and_then(|provider|expected_home.as_ref().ok_or_else(||"Reload the account deletion preview before deleting files".to_owned())
-                    .and_then(|home|self.prepare_account_history_deletion(&id,provider,home)));
-            if let Err(error)=prepared {
+        if let account::remote::Operation::DeleteFiles { expected_home, .. } = &operation {
+            let prepared = self
+                .account_ui
+                .account(&id)
+                .ok_or_else(|| {
+                    "The account changed; reload Accounts before deleting its files".to_owned()
+                })
+                .map(|state| state.account.provider)
+                .and_then(|provider| {
+                    expected_home
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "Reload the account deletion preview before deleting files".to_owned()
+                        })
+                        .and_then(|home| self.prepare_account_history_deletion(&id, provider, home))
+                });
+            if let Err(error) = prepared {
                 self.account_ui.removing.remove(&id);
-                self.status=Some(TransientNotice::warning(error));
+                self.status = Some(TransientNotice::warning(error));
                 return Task::none();
             }
         }
@@ -5586,27 +5672,57 @@ mod tests {
         let now = now_ms();
         drop(app.update(Message::AccountUi(Action::Located {
             generation: latest,
-            restored: vec![Restored { id: id.clone(), present: true, entry: Some(Entry { identity: None, snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now) }) }],
+            restored: vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(Entry {
+                    identity: None,
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now),
+                }),
+            }],
             installed: BTreeMap::from([(Provider::Claude, true)]),
         })));
         drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
             generation: earlier,
             registry: Ok(app.account_ui.registry.clone()),
-            restored: vec![Restored { id: id.clone(), present: false, entry: None }],
+            restored: vec![Restored {
+                id: id.clone(),
+                present: false,
+                entry: None,
+            }],
             catalogs: Default::default(),
             installed: BTreeMap::from([(Provider::Claude, false)]),
             provisional: false,
         }))));
         assert_eq!(app.account_ui.installed.get(&Provider::Claude), Some(&true));
         assert!(app.account_ui.account(&id).unwrap().present);
-        assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().observed_at, now);
-        assert!(app.account_ui.discovery_generation > latest, "the late registry load schedules discovery for the current account set");
-        drop(app.update(Message::AccountUi(Action::RemoteLoaded(earlier, Ok(crate::device_service::AccountSnapshot {
-            registry: Registry::default(), homes: None,
-            system_homes: BTreeMap::from([(Provider::Claude, "/stale/remote/home".into())]),
-            entries: Default::default(), cache_keys: Default::default(), catalogs: Default::default(),
-            installed: BTreeMap::from([(Provider::Claude, false)]), present: Default::default(),
-        })))));
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .observed_at,
+            now
+        );
+        assert!(
+            app.account_ui.discovery_generation > latest,
+            "the late registry load schedules discovery for the current account set"
+        );
+        drop(app.update(Message::AccountUi(Action::RemoteLoaded(
+            earlier,
+            Ok(crate::device_service::AccountSnapshot {
+                registry: Registry::default(),
+                homes: None,
+                system_homes: BTreeMap::from([(Provider::Claude, "/stale/remote/home".into())]),
+                entries: Default::default(),
+                cache_keys: Default::default(),
+                catalogs: Default::default(),
+                installed: BTreeMap::from([(Provider::Claude, false)]),
+                present: Default::default(),
+            }),
+        ))));
         assert_eq!(app.account_ui.installed.get(&Provider::Claude), Some(&true));
         assert!(app.account_ui.remote_system_homes.is_empty());
         assert!(app.account_ui.account(&id).unwrap().present);
@@ -5618,19 +5734,43 @@ mod tests {
         let id = Account::system(Provider::Codex).id();
         let generation = app.account_ui.discovery_generation;
         let snapshot = crate::device_service::AccountSnapshot {
-            registry: Registry::default(), homes: None,
+            registry: Registry::default(),
+            homes: None,
             system_homes: BTreeMap::from([(Provider::Codex, "/device/missing-codex-home".into())]),
-            entries: Default::default(), cache_keys: Default::default(), catalogs: Default::default(),
-            installed: BTreeMap::from([(Provider::Codex, true)]), present: Default::default(),
+            entries: Default::default(),
+            cache_keys: Default::default(),
+            catalogs: Default::default(),
+            installed: BTreeMap::from([(Provider::Codex, true)]),
+            present: Default::default(),
         };
-        drop(app.update(Message::AccountUi(Action::RemoteLoaded(generation, Ok(snapshot.clone())))));
-        assert_eq!(app.account_ui.account_readiness(&id), ProviderReadiness::MissingHome(id.clone()));
+        drop(app.update(Message::AccountUi(Action::RemoteLoaded(
+            generation,
+            Ok(snapshot.clone()),
+        ))));
+        assert_eq!(
+            app.account_ui.account_readiness(&id),
+            ProviderReadiness::MissingHome(id.clone())
+        );
         let mut ready = snapshot;
         ready.present.insert(id.clone());
-        ready.cache_keys.insert(id.clone(), "codex:remote-fixture".into());
-        ready.entries.insert("codex:remote-fixture".into(), Entry { identity: Some(Identity::default()), snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now_ms()) });
-        drop(app.update(Message::AccountUi(Action::RemoteLoaded(generation, Ok(ready)))));
-        assert_eq!(app.account_ui.account_readiness(&id), ProviderReadiness::Ready(id));
+        ready
+            .cache_keys
+            .insert(id.clone(), "codex:remote-fixture".into());
+        ready.entries.insert(
+            "codex:remote-fixture".into(),
+            Entry {
+                identity: Some(Identity::default()),
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now_ms()),
+            },
+        );
+        drop(app.update(Message::AccountUi(Action::RemoteLoaded(
+            generation,
+            Ok(ready),
+        ))));
+        assert_eq!(
+            app.account_ui.account_readiness(&id),
+            ProviderReadiness::Ready(id)
+        );
     }
 
     #[test]
@@ -5641,16 +5781,44 @@ mod tests {
         let earlier = app.account_ui.discovery_generation;
         let mut registry = app.account_ui.registry.clone();
         registry.unregister(uuid::Uuid::from_u128(994));
-        registry.register(registry::Registered { key: uuid::Uuid::from_u128(994),
-            provider: Provider::Claude, linked_home: Some("/new/external/home".into()), label: None,
-            email: Some("moved@fixture.invalid".into()), organization: None, added_at: 0 }, &[]).unwrap();
+        registry
+            .register(
+                registry::Registered {
+                    key: uuid::Uuid::from_u128(994),
+                    provider: Provider::Claude,
+                    linked_home: Some("/new/external/home".into()),
+                    label: None,
+                    email: Some("moved@fixture.invalid".into()),
+                    organization: None,
+                    added_at: 0,
+                },
+                &[],
+            )
+            .unwrap();
         drop(app.update(Message::AccountUi(Action::RegistryLoaded(Ok(registry)))));
         assert_eq!(app.account_ui.discovery_generation, earlier + 1);
-        drop(app.update(Message::AccountUi(Action::Located { generation: earlier,
+        drop(app.update(Message::AccountUi(Action::Located {
+            generation: earlier,
             installed: BTreeMap::from([(Provider::Claude, true)]),
-            restored: vec![Restored { id: id.clone(), present: true, entry: None }] })));
-        assert_eq!(app.account_ui.account(&id).unwrap().account.resolved_home().unwrap(), PathBuf::from("/new/external/home"));
-        assert!(app.account_ui.installed.is_empty(), "the old captured account set cannot publish detection");
+            restored: vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: None,
+            }],
+        })));
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .account
+                .resolved_home()
+                .unwrap(),
+            PathBuf::from("/new/external/home")
+        );
+        assert!(
+            app.account_ui.installed.is_empty(),
+            "the old captured account set cannot publish detection"
+        );
     }
 
     #[test]
@@ -5659,17 +5827,36 @@ mod tests {
         let id = app.account_ui.add_managed_fixture(Provider::Claude, 995);
         app.account_ui.installed.insert(Provider::Claude, true);
         app.account_ui.discovery_generation = 17;
-        let key = app.account_ui.account(&id).unwrap().account.cache_key().unwrap();
+        let key = app
+            .account_ui
+            .account(&id)
+            .unwrap()
+            .account
+            .cache_key()
+            .unwrap();
         let now = now_ms();
-        app.account_ui.account_mut(&id).unwrap().snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "current", now));
+        app.account_ui.account_mut(&id).unwrap().snapshot =
+            Some(UsageSnapshot::state(UsageStatus::Ok, "current", now));
         let registry = app.account_ui.registry.clone();
         let mut snapshot = crate::device_service::AccountSnapshot {
-            registry: Registry::default(), homes: None,
+            registry: Registry::default(),
+            homes: None,
             system_homes: BTreeMap::from([(Provider::Claude, "/stale/remote/home".into())]),
-            entries: BTreeMap::from([(key.clone(), Entry { identity: Some(Identity::default()),
-                snapshot: UsageSnapshot::state(UsageStatus::Limited, "fresh daemon report", now + 1) })]),
-            cache_keys: BTreeMap::from([(id.clone(), key.clone())]), catalogs: Default::default(),
-            installed: BTreeMap::from([(Provider::Claude, false)]), present: Default::default(),
+            entries: BTreeMap::from([(
+                key.clone(),
+                Entry {
+                    identity: Some(Identity::default()),
+                    snapshot: UsageSnapshot::state(
+                        UsageStatus::Limited,
+                        "fresh daemon report",
+                        now + 1,
+                    ),
+                },
+            )]),
+            cache_keys: BTreeMap::from([(id.clone(), key.clone())]),
+            catalogs: Default::default(),
+            installed: BTreeMap::from([(Provider::Claude, false)]),
+            present: Default::default(),
         };
         app.adopt_routing_accounts(snapshot.clone());
         assert_eq!(app.account_ui.registry, registry);
@@ -5677,15 +5864,45 @@ mod tests {
         assert_eq!(app.account_ui.installed.get(&Provider::Claude), Some(&true));
         assert!(app.account_ui.account(&id).unwrap().present);
         assert!(app.account_ui.remote_system_homes.is_empty());
-        assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status, UsageStatus::Limited);
-        snapshot.entries.get_mut(&key).unwrap().snapshot = UsageSnapshot::state(UsageStatus::Ok, "old probe", now);
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .status,
+            UsageStatus::Limited
+        );
+        snapshot.entries.get_mut(&key).unwrap().snapshot =
+            UsageSnapshot::state(UsageStatus::Ok, "old probe", now);
         app.adopt_routing_accounts(snapshot.clone());
-        assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status, UsageStatus::Limited);
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .status,
+            UsageStatus::Limited
+        );
         snapshot.entries.get_mut(&key).unwrap().snapshot.observed_at = now + 2;
-        snapshot.cache_keys.insert(id.clone(), "claude:/different/home".into());
+        snapshot
+            .cache_keys
+            .insert(id.clone(), "claude:/different/home".into());
         app.adopt_routing_accounts(snapshot);
-        assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status, UsageStatus::Limited,
-            "a routing result for an old selected home must not become this home's allowance");
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .status,
+            UsageStatus::Limited,
+            "a routing result for an old selected home must not become this home's allowance"
+        );
     }
 
     #[test]
@@ -5832,13 +6049,26 @@ mod tests {
         let account = state.account_mut(&id).unwrap();
         account.sign_in_terminal = None;
         account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
-        assert_eq!(state.account_readiness(&id), ProviderReadiness::Ready(id.clone()));
+        assert_eq!(
+            state.account_readiness(&id),
+            ProviderReadiness::Ready(id.clone())
+        );
         // Some authenticated plans do not expose usage. Missing quota data
         // must not turn a valid login into an unusable first-chat draft.
-        state.account_mut(&id).unwrap().snapshot = Some(UsageSnapshot::state(UsageStatus::Unavailable, "Usage not reported for this plan", NOW));
-        assert_eq!(state.account_readiness(&id), ProviderReadiness::Ready(id.clone()));
+        state.account_mut(&id).unwrap().snapshot = Some(UsageSnapshot::state(
+            UsageStatus::Unavailable,
+            "Usage not reported for this plan",
+            NOW,
+        ));
+        assert_eq!(
+            state.account_readiness(&id),
+            ProviderReadiness::Ready(id.clone())
+        );
         state.account_mut(&id).unwrap().identity = None;
-        assert_eq!(state.account_readiness(&id), ProviderReadiness::NeedsLogin(id.clone()));
+        assert_eq!(
+            state.account_readiness(&id),
+            ProviderReadiness::NeedsLogin(id.clone())
+        );
         state.account_mut(&id).unwrap().identity = Some(Identity::default());
         // Completed async detection can mark a once-valid home absent without
         // erasing retained identity or history. Neither may imply readiness.
@@ -8039,8 +8269,13 @@ mod app_tests {
             "Work"
         );
         assert!(app.account_ui.table.rename.is_some());
-        let fallback = app.account_ui.display_name(app.account_ui.account(&second).unwrap());
-        for (id, label) in [(second.clone(), "Personal".to_owned()), (first.clone(), fallback)] {
+        let fallback = app
+            .account_ui
+            .display_name(app.account_ui.account(&second).unwrap());
+        for (id, label) in [
+            (second.clone(), "Personal".to_owned()),
+            (first.clone(), fallback),
+        ] {
             drop(app.update(Message::AccountUi(Action::Rename(id))));
             drop(app.update(Message::AccountUi(Action::RenameInput(label))));
             drop(app.update(Message::AccountUi(Action::RenameCommit)));
@@ -8048,10 +8283,13 @@ mod app_tests {
         drop(app.update(Message::AccountUi(Action::Rename(second.clone()))));
         drop(app.update(Message::AccountUi(Action::RenameInput("   ".into()))));
         drop(app.update(Message::AccountUi(Action::RenameCommit)));
-        assert_eq!(app.account_ui.display_name(app.account_ui.account(&second).unwrap()), "Personal",
-            "clearing a name must not introduce a duplicate fallback display name");
+        assert_eq!(
+            app.account_ui
+                .display_name(app.account_ui.account(&second).unwrap()),
+            "Personal",
+            "clearing a name must not introduce a duplicate fallback display name"
+        );
         assert!(app.account_ui.table.rename.is_some());
-
     }
 
     #[test]
@@ -8981,17 +9219,33 @@ mod app_tests {
 
     #[test]
     fn account_removal_preview_from_earlier_open_cannot_replace_current_daemon_identity() {
-        let mut app=crate::app::tests::context_inspector_test_app(false);
-        let id=app.account_ui.add_managed_fixture(Provider::Codex,99210);
-        app.account_ui.table.confirm_remove=Some(id.clone());
-        app.account_ui.table.removal_preview_generation=2;
-        let preview=|inode|account::remote::RemovalPreview{conversations:inode as usize,
-            home:account::remote::RemovalHome::Present(account::HomeIdentity{
-                provider:Provider::Codex,canonical_home:"/remote/attested-only".into(),device:71,inode,purge_ids:Vec::new()})};
-        drop(app.update(Message::AccountUi(Action::RemovalCount(id.clone(),2,Ok(preview(2))))));
-        drop(app.update(Message::AccountUi(Action::RemovalCount(id,1,Ok(preview(1))))));
-        assert_eq!(app.account_ui.table.confirm_conversations,Some(Ok(2)));
-        assert!(matches!(&app.account_ui.table.confirm_home,Some(account::remote::RemovalHome::Present(home)) if home.inode==2));
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 99210);
+        app.account_ui.table.confirm_remove = Some(id.clone());
+        app.account_ui.table.removal_preview_generation = 2;
+        let preview = |inode| account::remote::RemovalPreview {
+            conversations: inode as usize,
+            home: account::remote::RemovalHome::Present(account::HomeIdentity {
+                provider: Provider::Codex,
+                canonical_home: "/remote/attested-only".into(),
+                device: 71,
+                inode,
+                purge_ids: Vec::new(),
+            }),
+        };
+        drop(app.update(Message::AccountUi(Action::RemovalCount(
+            id.clone(),
+            2,
+            Ok(preview(2)),
+        ))));
+        drop(app.update(Message::AccountUi(Action::RemovalCount(
+            id,
+            1,
+            Ok(preview(1)),
+        ))));
+        assert_eq!(app.account_ui.table.confirm_conversations, Some(Ok(2)));
+        assert!(
+            matches!(&app.account_ui.table.confirm_home,Some(account::remote::RemovalHome::Present(home)) if home.inode==2)
+        );
     }
-
 }

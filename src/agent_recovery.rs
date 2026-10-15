@@ -44,7 +44,10 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
 /// A native conversation already records its provider independently of its
 /// executable. Keep a configured wrapper's name without inferring providers
 /// from arbitrary shell commands. The same conservative argv policy applies.
-pub(crate) fn resume_recipe_for_provider(launch: &LaunchRecipe, provider: Provider) -> Option<LaunchRecipe> {
+pub(crate) fn resume_recipe_for_provider(
+    launch: &LaunchRecipe,
+    provider: Provider,
+) -> Option<LaunchRecipe> {
     interactive_recipe_for_provider(launch, Selector::Exact, provider)
 }
 
@@ -98,7 +101,11 @@ fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<Launc
     interactive_recipe_for_provider(launch, selector, Provider::from_program(&launch.program)?)
 }
 
-fn interactive_recipe_for_provider(launch: &LaunchRecipe, selector: Selector, provider: Provider) -> Option<LaunchRecipe> {
+fn interactive_recipe_for_provider(
+    launch: &LaunchRecipe,
+    selector: Selector,
+    provider: Provider,
+) -> Option<LaunchRecipe> {
     if launch.arguments.len() > 128
         || launch.arguments.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES
     {

@@ -167,31 +167,69 @@ impl Registry {
         let mut keys = std::collections::BTreeSet::new();
         for account in self.accounts.iter().chain(&next.accounts) {
             if self.find(account.key) != next.find(account.key)
-                || self.is_archived(account.key) != next.is_archived(account.key) {
+                || self.is_archived(account.key) != next.is_archived(account.key)
+            {
                 keys.insert(account.key);
             }
         }
         let mut paths = Vec::new();
         for registry in [self, next] {
-            paths.extend(registry.all_accounts(homes).into_iter()
-                .filter(|account| account.registry_key().is_some_and(|key| keys.contains(&key)))
-                .filter_map(|account| account.resolved_home()));
+            paths.extend(
+                registry
+                    .all_accounts(homes)
+                    .into_iter()
+                    .filter(|account| {
+                        account
+                            .registry_key()
+                            .is_some_and(|key| keys.contains(&key))
+                    })
+                    .filter_map(|account| account.resolved_home()),
+            );
         }
         for provider in Account::PROVIDERS {
             let name = provider.executable();
-            if self.defaults.get(name) != next.defaults.get(name) || self.system_labels.get(name) != next.system_labels.get(name) {
-                paths.extend([self.default_account(provider, homes), next.default_account(provider, homes)]
-                    .into_iter().filter_map(|account| account.resolved_home()));
+            if self.defaults.get(name) != next.defaults.get(name)
+                || self.system_labels.get(name) != next.system_labels.get(name)
+            {
+                paths.extend(
+                    [
+                        self.default_account(provider, homes),
+                        next.default_account(provider, homes),
+                    ]
+                    .into_iter()
+                    .filter_map(|account| account.resolved_home()),
+                );
             }
-            for repository in self.project_defaults.keys().chain(next.project_defaults.keys()) {
-                let old = self.project_defaults.get(repository).and_then(|choices| choices.get(name));
-                let new = next.project_defaults.get(repository).and_then(|choices| choices.get(name));
+            for repository in self
+                .project_defaults
+                .keys()
+                .chain(next.project_defaults.keys())
+            {
+                let old = self
+                    .project_defaults
+                    .get(repository)
+                    .and_then(|choices| choices.get(name));
+                let new = next
+                    .project_defaults
+                    .get(repository)
+                    .and_then(|choices| choices.get(name));
                 if old != new {
-                    for value in [old,new].into_iter().flatten() {
-                        paths.extend(self.all_accounts(homes).into_iter().chain(next.all_accounts(homes))
-                            .filter(|account| account.provider == provider && (account.registry_key().map(|key| key.to_string()).as_ref() == Some(value)
-                                || (value == "system" && account.is_system())))
-                            .filter_map(|account| account.resolved_home()));
+                    for value in [old, new].into_iter().flatten() {
+                        paths.extend(
+                            self.all_accounts(homes)
+                                .into_iter()
+                                .chain(next.all_accounts(homes))
+                                .filter(|account| {
+                                    account.provider == provider
+                                        && (account
+                                            .registry_key()
+                                            .map(|key| key.to_string())
+                                            .as_ref()
+                                            == Some(value)
+                                            || (value == "system" && account.is_system()))
+                                })
+                                .filter_map(|account| account.resolved_home()),
+                        );
                     }
                 }
             }
@@ -951,7 +989,10 @@ impl Store {
             let error = if retained {
                 Some("The files were retained because another account still uses this home".into())
             } else {
-                homes.park(provider, key).err().map(|error| error.to_string())
+                homes
+                    .park(provider, key)
+                    .err()
+                    .map(|error| error.to_string())
             };
             (registry, error)
         };
@@ -1165,23 +1206,37 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("accounts"));
-        let (key, home) = store.create_pending(&homes, Provider::Claude, 1,
-            || homes.create(Provider::Claude, None)).unwrap();
+        let (key, home) = store
+            .create_pending(&homes, Provider::Claude, 1, || {
+                homes.create(Provider::Claude, None)
+            })
+            .unwrap();
         let transcript = home.join("history.jsonl");
         fs::write(&transcript, "original conversation").unwrap();
         let before = store.load().unwrap();
         let result = store.remove_home_checked(&homes, Provider::Claude, key, false, || {
-            assert!(home.is_dir(), "identity must still be provable before preparation");
+            assert!(
+                home.is_dir(),
+                "identity must still be provable before preparation"
+            );
             Err(io::Error::other("retained prompt purge refused"))
         });
         assert!(result.unwrap_err().to_string().contains("purge refused"));
         assert_eq!(store.load().unwrap(), before);
-        assert_eq!(fs::read_to_string(&transcript).unwrap(), "original conversation");
-        let (_, warning) = store.remove_home_checked(&homes, Provider::Claude, key, false, || {
-            assert!(home.is_dir());
-            assert_eq!(fs::read_to_string(&transcript).unwrap(), "original conversation");
-            Ok(())
-        }).unwrap();
+        assert_eq!(
+            fs::read_to_string(&transcript).unwrap(),
+            "original conversation"
+        );
+        let (_, warning) = store
+            .remove_home_checked(&homes, Provider::Claude, key, false, || {
+                assert!(home.is_dir());
+                assert_eq!(
+                    fs::read_to_string(&transcript).unwrap(),
+                    "original conversation"
+                );
+                Ok(())
+            })
+            .unwrap();
         assert!(warning.is_none());
         assert!(!home.exists());
         assert!(store.load().unwrap().pending().is_empty());

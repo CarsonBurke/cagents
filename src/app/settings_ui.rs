@@ -1621,13 +1621,28 @@ mod account_acceptance_tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let provider = crate::agent::Provider::Claude;
         let id = app.account_ui.add_managed_fixture(provider, 609);
-        app.account_ui.set_fixture_login_for_test(&id, "changed@example.test");
+        app.account_ui
+            .set_fixture_login_for_test(&id, "changed@example.test");
         let choices = app.default_account_choices();
-        let choices = &choices.iter().find(|(actual, _)| *actual == provider).unwrap().1;
+        let choices = &choices
+            .iter()
+            .find(|(actual, _)| *actual == provider)
+            .unwrap()
+            .1;
         let choice = choices.iter().find(|choice| choice.id == id).unwrap();
-        let reason = choice.blocked.as_ref().expect("changed login must disable the default").clone();
+        let reason = choice
+            .blocked
+            .as_ref()
+            .expect("changed login must disable the default")
+            .clone();
         let label = choice.label.clone();
-        let element = settings_group("Default accounts", "", vec![default_account_choice(provider, choices)]).view("Accounts", "").unwrap();
+        let element = settings_group(
+            "Default accounts",
+            "",
+            vec![default_account_choice(provider, choices)],
+        )
+        .view("Accounts", "")
+        .unwrap();
         let (rendered, messages) = account_ui::acceptance_support::inspect(element, Some(&label));
         assert!(rendered.0.iter().any(|(text, _)| text.contains(&reason)));
         assert!(!messages.into_iter().any(|message| matches!(message, Message::AccountUi(account_ui::Action::SetDefault(actual)) if actual == id)));

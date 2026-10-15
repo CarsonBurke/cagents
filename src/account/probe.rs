@@ -820,9 +820,12 @@ pub(super) fn lock_accounts(
 /// Keep logical names for compatible callers and also fence the actual home.
 /// Two registry IDs or providers can alias the same physical credential tree.
 /// Path and inode locks together cover aliases and pathname replacement.
-fn acquire_locks(cache: &Cache, accounts: &[&Account]) -> io::Result<Option<Vec<crate::instance::OwnedLock>>> {
-    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+fn acquire_locks(
+    cache: &Cache,
+    accounts: &[&Account],
+) -> io::Result<Option<Vec<crate::instance::OwnedLock>>> {
     use sha2::{Digest, Sha256};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
     let mut names = std::collections::BTreeSet::new();
     for account in accounts {
         names.insert(account.lock_name());
@@ -831,7 +834,11 @@ fn acquire_locks(cache: &Cache, accounts: &[&Account]) -> io::Result<Option<Vec<
             let digest = Sha256::digest(home.as_os_str().as_bytes());
             names.insert(format!("physical-path-{digest:x}"));
             if let Ok(metadata) = std::fs::metadata(&home) {
-                names.insert(format!("physical-inode-{}-{}", metadata.dev(), metadata.ino()));
+                names.insert(format!(
+                    "physical-inode-{}-{}",
+                    metadata.dev(),
+                    metadata.ino()
+                ));
             }
         }
     }

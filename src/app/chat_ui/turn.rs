@@ -436,7 +436,10 @@ pub(super) fn group<'c, T: Borrow<Item>>(
 /// Streaming prose changes its body without changing placement or a group's
 /// status/timing. Immutable unchanged items take a pointer comparison; changed
 /// steps and timestamps conservatively request normal grouping.
-pub(super) fn same_structure(previous: &[std::sync::Arc<Item>], next: &[std::sync::Arc<Item>]) -> bool {
+pub(super) fn same_structure(
+    previous: &[std::sync::Arc<Item>],
+    next: &[std::sync::Arc<Item>],
+) -> bool {
     previous.len() == next.len() && previous.iter().zip(next).all(|(old, new)| {
         std::sync::Arc::ptr_eq(old, new) || (
             old.id == new.id && old.role == new.role && old.at == new.at && old.started_at == new.started_at
@@ -808,19 +811,31 @@ mod tests {
     #[test]
     fn prose_appends_reuse_structure_but_placement_and_status_changes_do_not() {
         use std::sync::Arc;
-        let initial = vec![Arc::new(text("answer", Role::Assistant, Phase::Final, false))];
+        let initial = vec![Arc::new(text(
+            "answer",
+            Role::Assistant,
+            Phase::Final,
+            false,
+        ))];
         let mut appended = initial[0].as_ref().clone();
-        let ItemContent::Text { text, .. } = &mut appended.content else { unreachable!() };
+        let ItemContent::Text { text, .. } = &mut appended.content else {
+            unreachable!()
+        };
         text.push_str(" continued words");
         assert!(same_structure(&initial, &[Arc::new(appended.clone())]));
         appended.at = Some(42);
         assert!(!same_structure(&initial, &[Arc::new(appended.clone())]));
         appended.at = initial[0].at;
-        let ItemContent::Text { text, thinking, .. } = &mut appended.content else { unreachable!() };
+        let ItemContent::Text { text, thinking, .. } = &mut appended.content else {
+            unreachable!()
+        };
         *thinking = true;
         assert!(!same_structure(&initial, &[Arc::new(appended.clone())]));
-        let ItemContent::Text { text, thinking, .. } = &mut appended.content else { unreachable!() };
-        *thinking = false; text.clear();
+        let ItemContent::Text { text, thinking, .. } = &mut appended.content else {
+            unreachable!()
+        };
+        *thinking = false;
+        text.clear();
         assert!(!same_structure(&initial, &[Arc::new(appended)]));
         let running = vec![Arc::new(command("step", ToolStatus::Running))];
         let resolved = vec![Arc::new(command("step", ToolStatus::Succeeded))];

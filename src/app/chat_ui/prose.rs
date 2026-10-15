@@ -58,11 +58,21 @@ impl CodeBlock {
     pub(super) fn retained_span_bytes(&self) -> usize {
         let bytes = |spans: &Arc<[Span<'static, String>]>| {
             spans.len() * std::mem::size_of::<Span<'static, String>>()
-                + spans.iter().map(|span| { let text: &str = span.text.as_ref(); text.len() }).sum::<usize>()
+                + spans
+                    .iter()
+                    .map(|span| {
+                        let text: &str = span.text.as_ref();
+                        text.len()
+                    })
+                    .sum::<usize>()
         };
-        bytes(&self.spans[0]) + if Arc::ptr_eq(&self.spans[0], &self.spans[1]) { 0 } else { bytes(&self.spans[1]) }
+        bytes(&self.spans[0])
+            + if Arc::ptr_eq(&self.spans[0], &self.spans[1]) {
+                0
+            } else {
+                bytes(&self.spans[1])
+            }
     }
-
 
     /// The font a block's paragraph is set in. Its spans name their own only
     /// where highlighting or [`monospace`] chose one, relative to this.
@@ -252,10 +262,23 @@ pub(super) fn view(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        blocks: cached
+            .blocks
+            .iter()
+            .map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone()))
+            .collect::<HashMap<_, _>>()
+            .into(),
         revision: cached.revision,
-        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
-        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
         path: vec![0],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
@@ -275,11 +298,35 @@ pub(super) fn content_view(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        blocks: cached
+            .blocks
+            .iter()
+            .map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone()))
+            .collect::<HashMap<_, _>>()
+            .into(),
         revision: cached.revision,
-        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
-        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
-        path: vec![1, cached.coordination.as_ref().and_then(|coordinated| coordinated.contents().position(|candidate| std::ptr::eq(candidate, content))).unwrap_or_default() as u32],
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
+        path: vec![
+            1,
+            cached
+                .coordination
+                .as_ref()
+                .and_then(|coordinated| {
+                    coordinated
+                        .contents()
+                        .position(|candidate| std::ptr::eq(candidate, content))
+                })
+                .unwrap_or_default() as u32,
+        ],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
     }
@@ -294,10 +341,23 @@ pub(super) fn items_for_test(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        blocks: cached
+            .blocks
+            .iter()
+            .map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone()))
+            .collect::<HashMap<_, _>>()
+            .into(),
         revision: cached.revision,
-        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
-        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
         path: vec![0],
         dark: true,
         find: None,
@@ -327,45 +387,91 @@ impl Renderer {
     /// can realize the correct nested row before measuring its exact glyph.
     fn logical_descendants(&self, items: &[markdown::Item]) -> Vec<virtualized::LogicalRange> {
         let mut leaves = Vec::new();
-        for (index, item) in items.iter().enumerate() { self.child(index as u32).describe(item, &mut leaves); }
+        for (index, item) in items.iter().enumerate() {
+            self.child(index as u32).describe(item, &mut leaves);
+        }
         leaves
     }
     fn describe(&self, item: &markdown::Item, leaves: &mut Vec<virtualized::LogicalRange>) {
         let length = match item {
             markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => Some(text.len()),
-            markdown::Item::CodeBlock { code, .. } => Some(code.len()), _ => None,
+            markdown::Item::CodeBlock { code, .. } => Some(code.len()),
+            _ => None,
         };
         if let Some(length) = length {
-            leaves.push(virtualized::LogicalRange { identity: selection::logical_identity(&self.item, &self.path), bytes: 0..length, chunk: false });
+            leaves.push(virtualized::LogicalRange {
+                identity: selection::logical_identity(&self.item, &self.path),
+                bytes: 0..length,
+                chunk: false,
+            });
             return;
         }
         match item {
             markdown::Item::Quote(items) => leaves.extend(self.logical_descendants(items)),
-            markdown::Item::List { bullets, .. } => for (index, bullet) in bullets.iter().enumerate() {
-                let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) = bullet;
-                leaves.extend(self.child(index as u32).logical_descendants(items));
-            },
+            markdown::Item::List { bullets, .. } => {
+                for (index, bullet) in bullets.iter().enumerate() {
+                    let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
+                        bullet;
+                    leaves.extend(self.child(index as u32).logical_descendants(items));
+                }
+            }
             markdown::Item::Table { columns, rows } => {
-                for (column, header) in columns.iter().enumerate() { leaves.extend(self.child(0).child(column as u32).logical_descendants(&header.header)); }
-                for (row, cells) in rows.iter().enumerate() { for (column, cells) in cells.cells.iter().enumerate() {
-                    leaves.extend(self.child(row as u32 + 1).child(column as u32).logical_descendants(cells));
-                } }
+                for (column, header) in columns.iter().enumerate() {
+                    leaves.extend(
+                        self.child(0)
+                            .child(column as u32)
+                            .logical_descendants(&header.header),
+                    );
+                }
+                for (row, cells) in rows.iter().enumerate() {
+                    for (column, cells) in cells.cells.iter().enumerate() {
+                        leaves.extend(
+                            self.child(row as u32 + 1)
+                                .child(column as u32)
+                                .logical_descendants(cells),
+                        );
+                    }
+                }
             }
             markdown::Item::Image { alt, title, .. } => {
-                if alt.len() > 0 { leaves.push(virtualized::LogicalRange { identity: selection::logical_identity(&self.item, &self.child(0).path), bytes: 0..alt.len(), chunk: false }); }
-                if !title.is_empty() { leaves.push(virtualized::LogicalRange { identity: selection::logical_identity(&self.item, &self.child(1).path), bytes: 0..title.len(), chunk: false }); }
+                if alt.len() > 0 {
+                    leaves.push(virtualized::LogicalRange {
+                        identity: selection::logical_identity(&self.item, &self.child(0).path),
+                        bytes: 0..alt.len(),
+                        chunk: false,
+                    });
+                }
+                if !title.is_empty() {
+                    leaves.push(virtualized::LogicalRange {
+                        identity: selection::logical_identity(&self.item, &self.child(1).path),
+                        bytes: 0..title.len(),
+                        chunk: false,
+                    });
+                }
             }
             _ => {}
         }
     }
     fn child(&self, index: u32) -> Self {
-        let mut path = self.path.clone(); path.push(index);
-        Self { item: self.item.clone(), path, find: self.find.clone(), target: self.target,
-            reader_memory: self.reader_memory.clone(), reader_context: self.reader_context.clone(),
-            blocks: self.blocks.clone(), revision: self.revision, dark: self.dark }
+        let mut path = self.path.clone();
+        path.push(index);
+        Self {
+            item: self.item.clone(),
+            path,
+            find: self.find.clone(),
+            target: self.target,
+            reader_memory: self.reader_memory.clone(),
+            reader_context: self.reader_context.clone(),
+            blocks: self.blocks.clone(),
+            revision: self.revision,
+            dark: self.dark,
+        }
     }
     fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical {
-        selectable_prose::Logical { identity: selection::logical_identity(&self.item, &self.path), start }
+        selectable_prose::Logical {
+            identity: selection::logical_identity(&self.item, &self.path),
+            start,
+        }
     }
     fn items(
         &self,
@@ -373,39 +479,87 @@ impl Renderer {
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
         if items.len() <= 4 {
-            return widget::column::with_children(items.iter().enumerate()
-                .map(|(index, item)| self.child(index as u32).item(item, index, settings)).collect::<Vec<_>>())
-                .spacing(settings.spacing.0).into();
+            return widget::column::with_children(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| self.child(index as u32).item(item, index, settings))
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(settings.spacing.0)
+            .into();
         }
-        let rows = items.iter().enumerate().map(|(index, item)| {
-            use std::hash::{Hash, Hasher};
-            let renderer = self.child(index as u32);
-            let key = selection::logical_identity(&renderer.item, &renderer.path);
-            let mut revision = std::hash::DefaultHasher::new();
-            (self.revision, settings.text_size.0.to_bits(), settings.style.font, &self.find, self.dark).hash(&mut revision);
-            let revision = revision.finish();
-            let estimate = match item {
-                markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) =>
-                    (text.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE).ceil().max(1.0) * settings.text_size.0 * 1.3,
-                markdown::Item::CodeBlock { code, .. } => (code.bytes().filter(|byte| *byte == b'\n').count().max(1) as f32) * settings.code_size.0 * 1.3 + 48.0,
-                _ => 80.0,
-            } + if index == 0 { 0.0 } else { settings.spacing.0 };
-            let logical_len = match item {
-                markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => Some(text.len()),
-                markdown::Item::CodeBlock { code, .. } => Some(code.len()), _ => None,
-            };
-            let descendants = if logical_len.is_none() { let mut leaves = Vec::new(); renderer.describe(item, &mut leaves); leaves } else { vec![] };
-            let item = item.clone();
-            let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
-                let renderer = renderer.clone(); let item = item.clone();
-                retained::kept(revision, move || widget::container(renderer.item(&item, index, settings))
-                    .padding(iced::Padding::ZERO.top(if index == 0 { 0.0 } else { settings.spacing.0 })).into())
-            });
-            row.anchor = true;
-            row.descendants = descendants;
-            row.logical = logical_len.map(|len| virtualized::LogicalRange { identity: key, bytes: 0..len, chunk: false });
-            row
-        }).collect();
+        let rows = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                use std::hash::{Hash, Hasher};
+                let renderer = self.child(index as u32);
+                let key = selection::logical_identity(&renderer.item, &renderer.path);
+                let mut revision = std::hash::DefaultHasher::new();
+                (
+                    self.revision,
+                    settings.text_size.0.to_bits(),
+                    settings.style.font,
+                    &self.find,
+                    self.dark,
+                )
+                    .hash(&mut revision);
+                let revision = revision.finish();
+                let estimate = match item {
+                    markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
+                        (text.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE)
+                            .ceil()
+                            .max(1.0)
+                            * settings.text_size.0
+                            * 1.3
+                    }
+                    markdown::Item::CodeBlock { code, .. } => {
+                        (code.bytes().filter(|byte| *byte == b'\n').count().max(1) as f32)
+                            * settings.code_size.0
+                            * 1.3
+                            + 48.0
+                    }
+                    _ => 80.0,
+                } + if index == 0 { 0.0 } else { settings.spacing.0 };
+                let logical_len = match item {
+                    markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
+                        Some(text.len())
+                    }
+                    markdown::Item::CodeBlock { code, .. } => Some(code.len()),
+                    _ => None,
+                };
+                let descendants = if logical_len.is_none() {
+                    let mut leaves = Vec::new();
+                    renderer.describe(item, &mut leaves);
+                    leaves
+                } else {
+                    vec![]
+                };
+                let item = item.clone();
+                let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+                    let renderer = renderer.clone();
+                    let item = item.clone();
+                    retained::kept(revision, move || {
+                        widget::container(renderer.item(&item, index, settings))
+                            .padding(iced::Padding::ZERO.top(if index == 0 {
+                                0.0
+                            } else {
+                                settings.spacing.0
+                            }))
+                            .into()
+                    })
+                });
+                row.anchor = true;
+                row.descendants = descendants;
+                row.logical = logical_len.map(|len| virtualized::LogicalRange {
+                    identity: key,
+                    bytes: 0..len,
+                    chunk: false,
+                });
+                row
+            })
+            .collect();
         virtualized::column(rows, Default::default())
     }
 
@@ -417,10 +571,22 @@ impl Renderer {
     ) -> Element<'static, Message> {
         use markdown::Item;
         match item {
-            Item::Heading(level, text) => {
-                heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0)))
-            }
-            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0))),
+            Item::Heading(level, text) => heading(
+                settings,
+                *level,
+                text,
+                index,
+                self.target,
+                self.find.as_deref(),
+                Some(self.logical(text.plain(), 0)),
+            ),
+            Item::Paragraph(text) => paragraph(
+                settings,
+                text,
+                self.target,
+                self.find.as_deref(),
+                Some(self.logical(text.plain(), 0)),
+            ),
             Item::CodeBlock { language, code, .. } => {
                 self.code_block(settings, language.as_deref(), code)
             }
@@ -488,46 +654,86 @@ impl Renderer {
                 .log10()
                 .ceil()
         });
-        let rows = bullets.iter().enumerate().map(|(index, bullet)| {
-            let renderer = self.clone();
-            let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) = bullet;
-            let descendants = self.child(index as u32).logical_descendants(items);
-            let bullet = bullet.clone();
-            let key = selection::logical_identity(&self.item, &self.child(index as u32).path);
-            let mut descriptor = virtualized::Row::new(key, self.revision, 64.0 + settings.spacing.0 * 0.75, None, move || {
-                let (marker, items): (Element<'static, Message>, _) = match (&bullet, start) {
-                    (markdown::Bullet::Point { items }, Some(start))
-                    | (markdown::Bullet::Task { items, .. }, Some(start)) => (
-                        iced::widget::text(format!("{}.", index as u64 + start))
-                            .size(settings.text_size)
-                            .align_x(iced::alignment::Horizontal::Right)
-                            .width(settings.text_size * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0))
-                            .into(), items,
-                    ),
-                    (markdown::Bullet::Point { items }, None) => (
-                        iced::widget::text("•").size(settings.text_size).into(), items,
-                    ),
-                    (markdown::Bullet::Task { items, done }, None) => (
-                        widget::container(iced::widget::checkbox(*done).size(settings.text_size))
-                            .center_y(iced::widget::text::LineHeight::default().to_absolute(settings.text_size))
-                            .into(), items,
-                    ),
-                };
-                let mut prefix = start.map_or_else(|| "-".to_owned(), |start| format!("{}.", index as u64 + start));
-                if let markdown::Bullet::Task { done, .. } = &bullet {
-                    prefix.push_str(if *done { " [x]" } else { " [ ]" });
-                }
-                widget::container(iced::widget::row![marker,
-                    selection::wrap(renderer.child(index as u32).items(items, nested), selection::Kind::ListItem(prefix))
-                ].spacing(settings.spacing.0))
-                    .padding(iced::Padding::ZERO.bottom(settings.spacing.0 * 0.75)).into()
-            });
-            descriptor.descendants = descendants;
-            descriptor.anchor = true;
-            descriptor
-        }).collect();
+        let rows = bullets
+            .iter()
+            .enumerate()
+            .map(|(index, bullet)| {
+                let renderer = self.clone();
+                let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
+                    bullet;
+                let descendants = self.child(index as u32).logical_descendants(items);
+                let bullet = bullet.clone();
+                let key = selection::logical_identity(&self.item, &self.child(index as u32).path);
+                let mut descriptor = virtualized::Row::new(
+                    key,
+                    self.revision,
+                    64.0 + settings.spacing.0 * 0.75,
+                    None,
+                    move || {
+                        let (marker, items): (Element<'static, Message>, _) = match (&bullet, start)
+                        {
+                            (markdown::Bullet::Point { items }, Some(start))
+                            | (markdown::Bullet::Task { items, .. }, Some(start)) => (
+                                iced::widget::text(format!("{}.", index as u64 + start))
+                                    .size(settings.text_size)
+                                    .align_x(iced::alignment::Horizontal::Right)
+                                    .width(
+                                        settings.text_size
+                                            * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0),
+                                    )
+                                    .into(),
+                                items,
+                            ),
+                            (markdown::Bullet::Point { items }, None) => (
+                                iced::widget::text("•").size(settings.text_size).into(),
+                                items,
+                            ),
+                            (markdown::Bullet::Task { items, done }, None) => (
+                                widget::container(
+                                    iced::widget::checkbox(*done).size(settings.text_size),
+                                )
+                                .center_y(
+                                    iced::widget::text::LineHeight::default()
+                                        .to_absolute(settings.text_size),
+                                )
+                                .into(),
+                                items,
+                            ),
+                        };
+                        let mut prefix = start.map_or_else(
+                            || "-".to_owned(),
+                            |start| format!("{}.", index as u64 + start),
+                        );
+                        if let markdown::Bullet::Task { done, .. } = &bullet {
+                            prefix.push_str(if *done { " [x]" } else { " [ ]" });
+                        }
+                        widget::container(
+                            iced::widget::row![
+                                marker,
+                                selection::wrap(
+                                    renderer.child(index as u32).items(items, nested),
+                                    selection::Kind::ListItem(prefix)
+                                )
+                            ]
+                            .spacing(settings.spacing.0),
+                        )
+                        .padding(iced::Padding::ZERO.bottom(settings.spacing.0 * 0.75))
+                        .into()
+                    },
+                );
+                descriptor.descendants = descendants;
+                descriptor.anchor = true;
+                descriptor
+            })
+            .collect();
         widget::container(virtualized::column(rows, Default::default()))
-            .padding(if start.is_none() { iced::Padding::ZERO.left(settings.spacing.0).right(settings.spacing.0) } else { iced::Padding::ZERO })
+            .padding(if start.is_none() {
+                iced::Padding::ZERO
+                    .left(settings.spacing.0)
+                    .right(settings.spacing.0)
+            } else {
+                iced::Padding::ZERO
+            })
             .into()
     }
 
@@ -541,47 +747,98 @@ impl Renderer {
         // shaping every hidden cell to discover its natural width.
         let width = 240.0;
         let alignments: Arc<[_]> = columns.iter().map(alignment).collect::<Vec<_>>().into();
-        let header = columns.iter().map(|column| column.header.clone()).collect::<Vec<_>>();
-        let descriptors = std::iter::once(header).chain(rows.iter().map(|row| row.cells.clone()))
-            .enumerate().map(|(row, cells)| {
+        let header = columns
+            .iter()
+            .map(|column| column.header.clone())
+            .collect::<Vec<_>>();
+        let descriptors = std::iter::once(header)
+            .chain(rows.iter().map(|row| row.cells.clone()))
+            .enumerate()
+            .map(|(row, cells)| {
                 let renderer = self.child(row as u32);
                 let key = selection::logical_identity(&self.item, &renderer.path);
-                let descendants = cells.iter().enumerate().flat_map(|(column, cells)| renderer.child(column as u32).logical_descendants(cells)).collect();
+                let descendants = cells
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(column, cells)| {
+                        renderer.child(column as u32).logical_descendants(cells)
+                    })
+                    .collect();
                 let alignments = alignments.clone();
-                let mut descriptor = virtualized::Row::new(key, self.revision, 48.0 + settings.spacing.0, None, move || {
-                    let descriptors = alignments.iter().enumerate().map(|(column, alignment)| {
-                        let renderer = renderer.child(column as u32);
-                        let key = selection::logical_identity(&renderer.item, &renderer.path);
-                        let alignment = *alignment;
-                        let cells = cells.get(column).cloned().unwrap_or_default();
-                        let mut descendants = renderer.logical_descendants(&cells);
-                        // Horizontal estimates can realize a far-away cell
-                        // before an exact glyph exists in the mounted tree.
-                        for logical in &mut descendants { logical.chunk = true; }
-                        let mut descriptor = virtualized::Row::new(key, renderer.revision, width, None, move || {
-                            let content = renderer.items(&cells, settings);
-                            widget::container(selection::wrap(content, selection::Kind::Cell { row, column }))
-                                .width(width).align_x(alignment)
-                                .padding([settings.spacing.0 / 2.0, settings.spacing.0]).into()
-                        });
-                        descriptor.descendants = descendants;
-                        descriptor
-                    }).collect();
-                    virtualized::row(descriptors, 48.0 + settings.spacing.0, Default::default())
-                });
+                let mut descriptor = virtualized::Row::new(
+                    key,
+                    self.revision,
+                    48.0 + settings.spacing.0,
+                    None,
+                    move || {
+                        let descriptors = alignments
+                            .iter()
+                            .enumerate()
+                            .map(|(column, alignment)| {
+                                let renderer = renderer.child(column as u32);
+                                let key =
+                                    selection::logical_identity(&renderer.item, &renderer.path);
+                                let alignment = *alignment;
+                                let cells = cells.get(column).cloned().unwrap_or_default();
+                                let mut descendants = renderer.logical_descendants(&cells);
+                                // Horizontal estimates can realize a far-away cell
+                                // before an exact glyph exists in the mounted tree.
+                                for logical in &mut descendants {
+                                    logical.chunk = true;
+                                }
+                                let mut descriptor = virtualized::Row::new(
+                                    key,
+                                    renderer.revision,
+                                    width,
+                                    None,
+                                    move || {
+                                        let content = renderer.items(&cells, settings);
+                                        widget::container(selection::wrap(
+                                            content,
+                                            selection::Kind::Cell { row, column },
+                                        ))
+                                        .width(width)
+                                        .align_x(alignment)
+                                        .padding([settings.spacing.0 / 2.0, settings.spacing.0])
+                                        .into()
+                                    },
+                                );
+                                descriptor.descendants = descendants;
+                                descriptor
+                            })
+                            .collect();
+                        virtualized::row(descriptors, 48.0 + settings.spacing.0, Default::default())
+                    },
+                );
                 descriptor.descendants = descendants;
                 descriptor.anchor = true;
                 descriptor
-            }).collect();
+            })
+            .collect();
         let table = widget::container(virtualized::column(descriptors, Default::default()))
             .width(width * columns.len().max(1) as f32);
-        scroll::block(iced::widget::scrollable(selection::wrap(table, selection::Kind::Table {
-            columns: columns.len(), rows: rows.len() + 1,
-        }))
-            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
-            .id(scroll::block_id(self.target, self.reader_context.as_deref(), selection::logical_identity(&self.item, &self.path)))
-            .spacing(settings.spacing.0 / 2.0), self.reader_memory.clone(), self.reader_context.clone(),
-            selection::logical_identity(&self.item, &self.path), false)
+        scroll::block(
+            iced::widget::scrollable(selection::wrap(
+                table,
+                selection::Kind::Table {
+                    columns: columns.len(),
+                    rows: rows.len() + 1,
+                },
+            ))
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                design::scrollbar(),
+            ))
+            .id(scroll::block_id(
+                self.target,
+                self.reader_context.as_deref(),
+                selection::logical_identity(&self.item, &self.path),
+            ))
+            .spacing(settings.spacing.0 / 2.0),
+            self.reader_memory.clone(),
+            self.reader_context.clone(),
+            selection::logical_identity(&self.item, &self.path),
+            false,
+        )
     }
 
     /// A fenced block on the sunken surface commands and outputs use, drawn
@@ -593,9 +850,20 @@ impl Renderer {
         language: Option<&str>,
         code: &str,
     ) -> Element<'static, Message> {
-        let spans = (code.len() <= CachedItem::HIGHLIGHT_LIMIT).then(|| self.blocks.get(&fence_key(language.unwrap_or_default(), code))).flatten()
+        let spans = (code.len() <= CachedItem::HIGHLIGHT_LIMIT)
+            .then(|| {
+                self.blocks
+                    .get(&fence_key(language.unwrap_or_default(), code))
+            })
+            .flatten()
             .cloned()
-            .unwrap_or_else(|| if code.len() > 2048 { Arc::from([]) } else { vec![Span::new(code.to_owned())].into() });
+            .unwrap_or_else(|| {
+                if code.len() > 2048 {
+                    Arc::from([])
+                } else {
+                    vec![Span::new(code.to_owned())].into()
+                }
+            });
         let text = code_text(
             Arc::from(code),
             spans,
@@ -606,13 +874,23 @@ impl Renderer {
             Some(self.logical(Arc::from(""), 0)),
         );
         step::code_frame(
-            scroll::block(widget::scrollable(
-                widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
-            )
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                design::scrollbar(),
-            )).id(scroll::block_id(self.target, self.reader_context.as_deref(), selection::logical_identity(&self.item, &self.path))), self.reader_memory.clone(), self.reader_context.clone(),
-                selection::logical_identity(&self.item, &self.path), false),
+            scroll::block(
+                widget::scrollable(
+                    widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
+                )
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    design::scrollbar(),
+                ))
+                .id(scroll::block_id(
+                    self.target,
+                    self.reader_context.as_deref(),
+                    selection::logical_identity(&self.item, &self.path),
+                )),
+                self.reader_memory.clone(),
+                self.reader_context.clone(),
+                selection::logical_identity(&self.item, &self.path),
+                false,
+            ),
             Some(
                 language
                     .and_then(fence_language)
@@ -634,16 +912,24 @@ fn heading(
     logical: Option<selectable_prose::Logical>,
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
-    widget::container(paragraph(markdown::Settings {
-        text_size: match level {
-            HeadingLevel::H1 => settings.h1_size,
-            HeadingLevel::H2 => settings.h2_size,
-            HeadingLevel::H3 => settings.h3_size,
-            HeadingLevel::H4 => settings.h4_size,
-            HeadingLevel::H5 => settings.h5_size,
-            HeadingLevel::H6 => settings.h6_size,
-        }, style: heading_style(settings, level), ..settings
-    }, text, target, find, logical))
+    widget::container(paragraph(
+        markdown::Settings {
+            text_size: match level {
+                HeadingLevel::H1 => settings.h1_size,
+                HeadingLevel::H2 => settings.h2_size,
+                HeadingLevel::H3 => settings.h3_size,
+                HeadingLevel::H4 => settings.h4_size,
+                HeadingLevel::H5 => settings.h5_size,
+                HeadingLevel::H6 => settings.h6_size,
+            },
+            style: heading_style(settings, level),
+            ..settings
+        },
+        text,
+        target,
+        find,
+        logical,
+    ))
     .padding(iced::Padding::ZERO.top(if index > 0 {
         settings.text_size.0 / 2.0
     } else {
@@ -672,107 +958,236 @@ fn heading_style(settings: markdown::Settings, level: markdown::HeadingLevel) ->
     }
 }
 
-fn leaf_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels, font: iced::Font,
-    target: Target, find: Option<&str>, logical: Option<selectable_prose::Logical>) -> Element<'static, Message> {
-    if let Some(logical) = logical { selectable_prose::logical_text(spans, size, font, target, find, logical) }
-    else { selectable_prose::text(spans, size, font, target, find) }
+fn leaf_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
+) -> Element<'static, Message> {
+    if let Some(logical) = logical {
+        selectable_prose::logical_text(spans, size, font, target, find, logical)
+    } else {
+        selectable_prose::text(spans, size, font, target, find)
+    }
 }
 
 /// Read-only code shares one source, and only styles/shapes bounded mounted
 /// ranges. The logical block keeps source newlines intact for selection/copy.
 pub(super) fn code_text(
-    text: Arc<str>, spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Option<selectable_prose::Logical>,
+    text: Arc<str>,
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
 ) -> Element<'static, Message> {
     if text.len() <= 2048 {
-        let spans = if spans.is_empty() { vec![Span::new(text.to_string())].into() } else { spans };
+        let spans = if spans.is_empty() {
+            vec![Span::new(text.to_string())].into()
+        } else {
+            spans
+        };
         return leaf_text(spans, size, font, target, find, logical);
     }
     let mut starts = Vec::with_capacity(spans.len() + 1);
     starts.push(0usize);
-    for span in spans.iter() { starts.push(starts.last().copied().unwrap() + span.text.len()); }
+    for span in spans.iter() {
+        starts.push(starts.last().copied().unwrap() + span.text.len());
+    }
     let starts: Arc<[usize]> = starts.into();
     let find: Option<Arc<str>> = find.map(Arc::from);
     let mut ranges = Vec::new();
     let mut start = 0;
-    for line in text.split_inclusive('\n') { ranges.push(start..start + line.len()); start += line.len(); }
-    if text.ends_with('\n') { ranges.push(text.len()..text.len()); }
-    let rows = ranges.into_iter().map(|range| {
-        use std::hash::{Hash, Hasher};
-        let mut key = std::hash::DefaultHasher::new();
-        (logical.as_ref().map(|logical| logical.identity), range.start).hash(&mut key);
-        let key = key.finish();
-        let mut revision = std::hash::DefaultHasher::new();
-        (Arc::as_ptr(&text) as *const u8 as usize, &range, &find, font, size.0.to_bits()).hash(&mut revision);
-        let revision = revision.finish();
-        let text = text.clone(); let spans = spans.clone(); let starts = starts.clone(); let find = find.clone();
-        let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
-            identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: false });
-        let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
-        let mut row = virtualized::Row::new(key, revision, size.0 * 1.3, None, move || {
-            // Newlines belong to the logical document. Each physical line
-            // contributes one visual row, including the real terminal empty
-            // line, instead of an extra empty paragraph at every chunk seam.
-            let mut display = range.clone();
-            if text[display.clone()].ends_with('\n') {
-                display.end -= 1;
-                if text[display.clone()].ends_with('\r') { display.end -= 1; }
-            }
-            if display.is_empty() { return widget::Space::new().height(size.0 * 1.3).into(); }
-            code_line(text.clone(), spans.clone(), starts.clone(), display,
-                size, font, target, find.clone(), logical.clone())
-        });
-        row.anchor = true; row.logical = descriptor; row
-    }).collect();
+    for line in text.split_inclusive('\n') {
+        ranges.push(start..start + line.len());
+        start += line.len();
+    }
+    if text.ends_with('\n') {
+        ranges.push(text.len()..text.len());
+    }
+    let rows = ranges
+        .into_iter()
+        .map(|range| {
+            use std::hash::{Hash, Hasher};
+            let mut key = std::hash::DefaultHasher::new();
+            (
+                logical.as_ref().map(|logical| logical.identity),
+                range.start,
+            )
+                .hash(&mut key);
+            let key = key.finish();
+            let mut revision = std::hash::DefaultHasher::new();
+            (
+                Arc::as_ptr(&text) as *const u8 as usize,
+                &range,
+                &find,
+                font,
+                size.0.to_bits(),
+            )
+                .hash(&mut revision);
+            let revision = revision.finish();
+            let text = text.clone();
+            let spans = spans.clone();
+            let starts = starts.clone();
+            let find = find.clone();
+            let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
+                identity: logical.identity,
+                bytes: logical.start + range.start..logical.start + range.end,
+                chunk: false,
+            });
+            let logical = logical.clone().map(|mut logical| {
+                logical.start += range.start;
+                logical
+            });
+            let mut row = virtualized::Row::new(key, revision, size.0 * 1.3, None, move || {
+                // Newlines belong to the logical document. Each physical line
+                // contributes one visual row, including the real terminal empty
+                // line, instead of an extra empty paragraph at every chunk seam.
+                let mut display = range.clone();
+                if text[display.clone()].ends_with('\n') {
+                    display.end -= 1;
+                    if text[display.clone()].ends_with('\r') {
+                        display.end -= 1;
+                    }
+                }
+                if display.is_empty() {
+                    return widget::Space::new().height(size.0 * 1.3).into();
+                }
+                code_line(
+                    text.clone(),
+                    spans.clone(),
+                    starts.clone(),
+                    display,
+                    size,
+                    font,
+                    target,
+                    find.clone(),
+                    logical.clone(),
+                )
+            });
+            row.anchor = true;
+            row.logical = descriptor;
+            row
+        })
+        .collect();
     virtualized::column(rows, Default::default())
 }
 
-fn code_line(text: Arc<str>, spans: Arc<[Span<'static, String>]>, starts: Arc<[usize]>, range: std::ops::Range<usize>,
-    size: iced::Pixels, font: iced::Font, target: Target, find: Option<Arc<str>>, logical: Option<selectable_prose::Logical>) -> Element<'static, Message> {
+fn code_line(
+    text: Arc<str>,
+    spans: Arc<[Span<'static, String>]>,
+    starts: Arc<[usize]>,
+    range: std::ops::Range<usize>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<Arc<str>>,
+    logical: Option<selectable_prose::Logical>,
+) -> Element<'static, Message> {
     // The pinned shaping API has no context-aware horizontal range layout.
     // Preserve physical-line Bidi, joining, clusters and tab origin rather
     // than independently shaping a complex run at artificial boundaries.
     // These lines remain an explicit performance qualification requirement.
-    let pieces = if range.len() <= 2048 || !text[range.clone()].is_ascii() || text[range.clone()].contains('\t') {
+    let pieces = if range.len() <= 2048
+        || !text[range.clone()].is_ascii()
+        || text[range.clone()].contains('\t')
+    {
         vec![0..range.len()]
-    } else { chunk_ranges(&text[range.clone()]) };
-    let chunks = pieces.into_iter().map(|piece| {
-        use std::hash::{Hash, Hasher};
-        let source = range.start + piece.start..range.start + piece.end;
-        let mut hash = std::hash::DefaultHasher::new();
-        (logical.as_ref().map(|logical| logical.identity), source.start).hash(&mut hash);
-        let key = hash.finish();
-        (Arc::as_ptr(&text) as *const u8 as usize, &source, &find, font, size.0.to_bits()).hash(&mut hash);
-        let revision = hash.finish();
-        let estimate = unicode_width::UnicodeWidthStr::width(&text[source.clone()]) as f32 * size.0 * 0.6;
-        let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
-            identity: logical.identity, bytes: logical.start + piece.start..logical.start + piece.end, chunk: true });
-        let logical = logical.clone().map(|mut logical| { logical.start += piece.start; logical });
-        let text = text.clone(); let spans = spans.clone(); let starts = starts.clone(); let find = find.clone();
-        let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
-            let text = text.clone(); let spans = spans.clone(); let starts = starts.clone();
-            let find = find.clone(); let logical = logical.clone(); let source = source.clone();
-            retained::kept(revision, move || {
-                let styled = if spans.is_empty() { vec![Span::new(text[source.clone()].to_owned())].into() }
-                    else { sliced_spans(&spans, &starts, source.clone()) };
-                leaf_text(styled, size, font, target, find.as_deref(), logical.clone())
-            })
-        });
-        row.logical = descriptor; row
-    }).collect();
+    } else {
+        chunk_ranges(&text[range.clone()])
+    };
+    let chunks = pieces
+        .into_iter()
+        .map(|piece| {
+            use std::hash::{Hash, Hasher};
+            let source = range.start + piece.start..range.start + piece.end;
+            let mut hash = std::hash::DefaultHasher::new();
+            (
+                logical.as_ref().map(|logical| logical.identity),
+                source.start,
+            )
+                .hash(&mut hash);
+            let key = hash.finish();
+            (
+                Arc::as_ptr(&text) as *const u8 as usize,
+                &source,
+                &find,
+                font,
+                size.0.to_bits(),
+            )
+                .hash(&mut hash);
+            let revision = hash.finish();
+            let estimate =
+                unicode_width::UnicodeWidthStr::width(&text[source.clone()]) as f32 * size.0 * 0.6;
+            let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
+                identity: logical.identity,
+                bytes: logical.start + piece.start..logical.start + piece.end,
+                chunk: true,
+            });
+            let logical = logical.clone().map(|mut logical| {
+                logical.start += piece.start;
+                logical
+            });
+            let text = text.clone();
+            let spans = spans.clone();
+            let starts = starts.clone();
+            let find = find.clone();
+            let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+                let text = text.clone();
+                let spans = spans.clone();
+                let starts = starts.clone();
+                let find = find.clone();
+                let logical = logical.clone();
+                let source = source.clone();
+                retained::kept(revision, move || {
+                    let styled = if spans.is_empty() {
+                        vec![Span::new(text[source.clone()].to_owned())].into()
+                    } else {
+                        sliced_spans(&spans, &starts, source.clone())
+                    };
+                    leaf_text(styled, size, font, target, find.as_deref(), logical.clone())
+                })
+            });
+            row.logical = descriptor;
+            row
+        })
+        .collect();
     virtualized::row(chunks, size.0 * 1.3, Default::default())
 }
 
-fn sliced_spans(spans: &[Span<'static, String>], starts: &[usize], range: std::ops::Range<usize>) -> Arc<[Span<'static, String>]> {
-    let first = starts.partition_point(|start| *start <= range.start).saturating_sub(1);
-    spans.iter().enumerate().skip(first).take_while(|(index, _)| starts[*index] < range.end)
+fn sliced_spans(
+    spans: &[Span<'static, String>],
+    starts: &[usize],
+    range: std::ops::Range<usize>,
+) -> Arc<[Span<'static, String>]> {
+    let first = starts
+        .partition_point(|start| *start <= range.start)
+        .saturating_sub(1);
+    spans
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take_while(|(index, _)| starts[*index] < range.end)
         .filter_map(|(index, span)| {
             let start = range.start.saturating_sub(starts[index]);
             let end = range.end.saturating_sub(starts[index]).min(span.text.len());
-            (start < end).then(|| Span { text: span.text[start..end].to_owned().into(), size: span.size,
-                line_height: span.line_height, font: span.font, color: span.color, link: span.link.clone(),
-                highlight: span.highlight, padding: span.padding, underline: span.underline, strikethrough: span.strikethrough })
-        }).collect()
+            (start < end).then(|| Span {
+                text: span.text[start..end].to_owned().into(),
+                size: span.size,
+                line_height: span.line_height,
+                font: span.font,
+                color: span.color,
+                link: span.link.clone(),
+                highlight: span.highlight,
+                padding: span.padding,
+                underline: span.underline,
+                strikethrough: span.strikethrough,
+            })
+        })
+        .collect()
 }
 
 /// A bounded visual chunk. Copy and selection keep the original logical
@@ -785,18 +1200,36 @@ pub(super) fn chunk_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     while start < text.len() {
         let mut end = (start + BYTES).min(text.len());
         use unicode_segmentation::UnicodeSegmentation;
-        let boundary = text[start..].grapheme_indices(true).map(|(at, _)| start + at).chain(std::iter::once(text.len()))
-            .take_while(|at| *at <= end).last().unwrap_or(start);
-        if boundary > start { end = boundary; }
-        else { end = start + text[start..].graphemes(true).next().map_or(0, str::len); }
-        if let Some((line, _)) = text[start..end].match_indices('\n').nth(LINES - 1) { end = start + line + 1; }
+        let boundary = text[start..]
+            .grapheme_indices(true)
+            .map(|(at, _)| start + at)
+            .chain(std::iter::once(text.len()))
+            .take_while(|at| *at <= end)
+            .last()
+            .unwrap_or(start);
+        if boundary > start {
+            end = boundary;
+        } else {
+            end = start + text[start..].graphemes(true).next().map_or(0, str::len);
+        }
+        if let Some((line, _)) = text[start..end].match_indices('\n').nth(LINES - 1) {
+            end = start + line + 1;
+        }
         // Prefer a source whitespace boundary near the cap. A giant token is
         // still bounded and wraps with the same glyph fallback as short prose.
-        if end < text.len() && let Some((at, grapheme)) = text[start..end].grapheme_indices(true).rev().find(|(_, grapheme)| grapheme.chars().all(char::is_whitespace)) {
+        if end < text.len()
+            && let Some((at, grapheme)) = text[start..end]
+                .grapheme_indices(true)
+                .rev()
+                .find(|(_, grapheme)| grapheme.chars().all(char::is_whitespace))
+        {
             let boundary = start + at + grapheme.len();
-            if boundary >= start + BYTES / 2 { end = boundary; }
+            if boundary >= start + BYTES / 2 {
+                end = boundary;
+            }
         }
-        ranges.push(start..end); start = end;
+        ranges.push(start..end);
+        start = end;
     }
     ranges
 }
@@ -809,37 +1242,78 @@ fn paragraph(
     logical: Option<selectable_prose::Logical>,
 ) -> Element<'static, Message> {
     if text.len() <= 2048 || !text.plain().is_ascii() || text.plain().contains('\t') {
-        return leaf_text(text.spans(settings.style), settings.text_size, settings.style.font, target, find, logical);
+        return leaf_text(
+            text.spans(settings.style),
+            settings.text_size,
+            settings.style.font,
+            target,
+            find,
+            logical,
+        );
     }
     let plain = text.plain();
     let text = Arc::new(text.clone());
     let find: Option<Arc<str>> = find.map(Arc::from);
-    let rows = chunk_ranges(&plain).into_iter().map(|range| {
-        use std::hash::{Hash, Hasher};
-        let mut key = std::hash::DefaultHasher::new();
-        (logical.as_ref().map(|logical| logical.identity), range.start).hash(&mut key);
-        let key = key.finish();
-        let mut revision = std::hash::DefaultHasher::new();
-        (&plain[range.clone()], &find, settings.style.font, settings.text_size.0.to_bits(), cosmic::theme::is_dark()).hash(&mut revision);
-        let revision = revision.finish();
-        let estimate = ((range.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE).ceil().max(1.0)
-            + plain[range.clone()].matches('\n').count() as f32) * settings.text_size.0 * 1.3;
-        let text = text.clone(); let find = find.clone();
-        let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
-            identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: true });
-        let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
-        let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
-            let text = text.clone(); let find = find.clone();
-            let logical = logical.clone(); let range = range.clone();
-            retained::kept(revision, move || {
-                leaf_text(text.spans_range(settings.style, range.clone()), settings.text_size, settings.style.font,
-                    target, find.as_deref(), logical.clone())
-            })
-        });
-        row.anchor = true;
-        row.logical = descriptor;
-        row
-    }).collect();
+    let rows = chunk_ranges(&plain)
+        .into_iter()
+        .map(|range| {
+            use std::hash::{Hash, Hasher};
+            let mut key = std::hash::DefaultHasher::new();
+            (
+                logical.as_ref().map(|logical| logical.identity),
+                range.start,
+            )
+                .hash(&mut key);
+            let key = key.finish();
+            let mut revision = std::hash::DefaultHasher::new();
+            (
+                &plain[range.clone()],
+                &find,
+                settings.style.font,
+                settings.text_size.0.to_bits(),
+                cosmic::theme::is_dark(),
+            )
+                .hash(&mut revision);
+            let revision = revision.finish();
+            let estimate = ((range.len() as f32 * settings.text_size.0 * 0.5
+                / design::READABLE_MEASURE)
+                .ceil()
+                .max(1.0)
+                + plain[range.clone()].matches('\n').count() as f32)
+                * settings.text_size.0
+                * 1.3;
+            let text = text.clone();
+            let find = find.clone();
+            let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
+                identity: logical.identity,
+                bytes: logical.start + range.start..logical.start + range.end,
+                chunk: true,
+            });
+            let logical = logical.clone().map(|mut logical| {
+                logical.start += range.start;
+                logical
+            });
+            let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+                let text = text.clone();
+                let find = find.clone();
+                let logical = logical.clone();
+                let range = range.clone();
+                retained::kept(revision, move || {
+                    leaf_text(
+                        text.spans_range(settings.style, range.clone()),
+                        settings.text_size,
+                        settings.style.font,
+                        target,
+                        find.as_deref(),
+                        logical.clone(),
+                    )
+                })
+            });
+            row.anchor = true;
+            row.logical = descriptor;
+            row
+        })
+        .collect();
     virtualized::column(rows, Default::default())
 }
 
@@ -864,43 +1338,79 @@ mod tests {
     fn giant_single_list_table_and_heading_keep_only_viewport_widget_trees() {
         use iced::advanced::{layout, widget::Tree};
         fn residents(tree: &Tree) -> (usize, usize) {
-            let prose = usize::from(tree.tag == iced::advanced::widget::tree::Tag::of::<selectable_prose::State>());
-            tree.children.iter().fold((1, prose), |(widgets, prose), child| {
-                let (children, leaves) = residents(child);
-                (widgets + children, prose + leaves)
-            })
+            let prose = usize::from(
+                tree.tag == iced::advanced::widget::tree::Tag::of::<selectable_prose::State>(),
+            );
+            tree.children
+                .iter()
+                .fold((1, prose), |(widgets, prose), child| {
+                    let (children, leaves) = residents(child);
+                    (widgets + children, prose + leaves)
+                })
         }
         let renderer = crate::app::tests::headless_renderer();
         let sources = [
             "- list row with meaningful text\n".repeat(20_000),
-            format!("| First | Second |\n| --- | --- |\n{}", "| table cell | other cell |\n".repeat(20_000)),
+            format!(
+                "| First | Second |\n| --- | --- |\n{}",
+                "| table cell | other cell |\n".repeat(20_000)
+            ),
             format!("# {}", "heading-word ".repeat(40_000)),
         ];
         for source in sources {
-            let cached = CachedItem::new(&ItemContent::Text { text: source,
-                thinking: false, phase: chat::Phase::Final }, crate::settings::EditorSyntaxTheme::Auto);
-            assert_eq!(cached.markdown.items().len(), 1, "adversarial single top-level item");
-            let mut element = view(&cached,
+            let cached = CachedItem::new(
+                &ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            assert_eq!(
+                cached.markdown.items().len(),
+                1,
+                "adversarial single top-level item"
+            );
+            let mut element = view(
+                &cached,
                 design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
-                Target { card: CardId::new(), generation: 0 }, None);
+                Target {
+                    card: CardId::new(),
+                    generation: 0,
+                },
+                None,
+            );
             let mut tree = Tree::new(&element);
-            element.as_widget_mut().layout(&mut tree, &renderer,
-                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)));
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)),
+            );
             let (widgets, prose) = residents(&tree);
-            assert!(prose < 100, "hidden leaf shaping escaped viewport bound: {prose}");
-            assert!(widgets < 2000, "hidden widget construction escaped viewport bound: {widgets}");
+            assert!(
+                prose < 100,
+                "hidden leaf shaping escaped viewport bound: {prose}"
+            );
+            assert!(
+                widgets < 2000,
+                "hidden widget construction escaped viewport bound: {widgets}"
+            );
         }
     }
-
 
     #[test]
     fn physical_code_lines_keep_height_and_horizontal_extent() {
         use iced::advanced::{layout, widget::Tree};
         let renderer = crate::app::tests::headless_renderer();
-        let target = Target { card: CardId::new(), generation: 0 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
         let size: iced::Pixels = 14.0.into();
-        let limits = layout::Limits::new(iced::Size::ZERO,
-            iced::Size::new(f32::INFINITY, f32::INFINITY));
+        let limits = layout::Limits::new(
+            iced::Size::ZERO,
+            iced::Size::new(f32::INFINITY, f32::INFINITY),
+        );
         for source in [
             "a".repeat(6000),
             format!("{}e\u{301}{}", "a".repeat(2047), "z".repeat(4000)),
@@ -911,21 +1421,46 @@ mod tests {
             "first\n\nthird\n".repeat(400),
             "first\r\nsecond\r\n".repeat(400),
         ] {
-            let mut reference = leaf_text(vec![Span::new(source.clone())].into(), size,
-                CodeBlock::FONT, target, None, None);
+            let mut reference = leaf_text(
+                vec![Span::new(source.clone())].into(),
+                size,
+                CodeBlock::FONT,
+                target,
+                None,
+                None,
+            );
             let mut reference_tree = Tree::new(&reference);
-            let reference_node = reference.as_widget_mut().layout(&mut reference_tree, &renderer, &limits);
-            let mut actual = code_text(Arc::from(source.as_str()), Arc::from([]), size,
-                CodeBlock::FONT, target, None, None);
+            let reference_node =
+                reference
+                    .as_widget_mut()
+                    .layout(&mut reference_tree, &renderer, &limits);
+            let mut actual = code_text(
+                Arc::from(source.as_str()),
+                Arc::from([]),
+                size,
+                CodeBlock::FONT,
+                target,
+                None,
+                None,
+            );
             let mut tree = Tree::new(&actual);
             let node = actual.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            assert!((node.size().height - reference_node.size().height).abs() < 1.0,
-                "physical line count changed: {:?} vs {:?}", node.size(), reference_node.size());
+            assert!(
+                (node.size().height - reference_node.size().height).abs() < 1.0,
+                "physical line count changed: {:?} vs {:?}",
+                node.size(),
+                reference_node.size()
+            );
             if !source.contains('\n') {
-                assert!(node.size().width > 3000.0 * size.0,
-                    "one physical line must extend horizontally: {:?}", node.size());
-                assert!((node.size().width / reference_node.size().width - 1.0).abs() < 0.03,
-                    "horizontal estimates must preserve physical extent");
+                assert!(
+                    node.size().width > 3000.0 * size.0,
+                    "one physical line must extend horizontally: {:?}",
+                    node.size()
+                );
+                assert!(
+                    (node.size().width / reference_node.size().width - 1.0).abs() < 0.03,
+                    "horizontal estimates must preserve physical extent"
+                );
             }
         }
     }
@@ -934,11 +1469,24 @@ mod tests {
     fn chunk_boundaries_preserve_complete_graphemes() {
         use unicode_segmentation::UnicodeSegmentation;
         for seam in ["e\u{301}", "👩‍💻", "🇨🇦", "\r\n", " \u{301}"] {
-            let source = format!("{}{seam}{}", "a".repeat(if seam.starts_with(' ') { 1500 } else { 2047 }), "z".repeat(4096));
-            let boundaries: HashSet<_> = source.grapheme_indices(true)
-                .map(|(at, _)| at).chain(std::iter::once(source.len())).collect();
+            let source = format!(
+                "{}{seam}{}",
+                "a".repeat(if seam.starts_with(' ') { 1500 } else { 2047 }),
+                "z".repeat(4096)
+            );
+            let boundaries: HashSet<_> = source
+                .grapheme_indices(true)
+                .map(|(at, _)| at)
+                .chain(std::iter::once(source.len()))
+                .collect();
             let ranges = chunk_ranges(&source);
-            assert_eq!(ranges.iter().map(|range| &source[range.clone()]).collect::<String>(), source);
+            assert_eq!(
+                ranges
+                    .iter()
+                    .map(|range| &source[range.clone()])
+                    .collect::<String>(),
+                source
+            );
             for range in ranges {
                 assert!(boundaries.contains(&range.start) && boundaries.contains(&range.end));
             }
@@ -948,20 +1496,41 @@ mod tests {
     #[test]
     fn wide_table_only_shapes_cells_near_horizontal_viewport() {
         use iced::advanced::{layout, widget::Tree};
-        let source = format!("|{}|\n|{}|\n|{}|", "cell|".repeat(10000),
-            "---|".repeat(10000), "value|".repeat(10000));
-        let cached = CachedItem::new(&ItemContent::Text { text: source,
-            thinking: false, phase: chat::Phase::Final }, crate::settings::EditorSyntaxTheme::Auto);
-        let mut element = view(&cached,
+        let source = format!(
+            "|{}|\n|{}|\n|{}|",
+            "cell|".repeat(10000),
+            "---|".repeat(10000),
+            "value|".repeat(10000)
+        );
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: source,
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let mut element = view(
+            &cached,
             design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
-            Target { card: CardId::new(), generation: 0 }, None);
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+        );
         let renderer = crate::app::tests::headless_renderer();
         let mut tree = Tree::new(&element);
         let before = virtualized::constructed_rows();
-        element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)));
-        assert!(virtualized::constructed_rows() - before < 100,
-            "wide rows must not instantiate all cells");
+        element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)),
+        );
+        assert!(
+            virtualized::constructed_rows() - before < 100,
+            "wide rows must not instantiate all cells"
+        );
     }
 
     #[test]

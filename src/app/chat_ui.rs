@@ -1,5 +1,5 @@
-mod session_links;
 mod account_history;
+mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
@@ -739,7 +739,12 @@ impl ChangeToken {
     fn appended<'a>(&self, previous: &str, content: &'a ItemContent) -> Option<&'a str> {
         self.appended_known(previous, content, false)
     }
-    fn appended_known<'a>(&self, previous: &str, content: &'a ItemContent, proven: bool) -> Option<&'a str> {
+    fn appended_known<'a>(
+        &self,
+        previous: &str,
+        content: &'a ItemContent,
+        proven: bool,
+    ) -> Option<&'a str> {
         let ItemContent::Text {
             text,
             thinking,
@@ -752,7 +757,9 @@ impl ChangeToken {
             return None;
         }
         // `get` also rejects a rewrite that left the old length mid-character.
-        if proven { return Some(text.as_str()); }
+        if proven {
+            return Some(text.as_str());
+        }
         let parsed = text.get(..self.body)?;
         (parsed == previous).then_some(text.as_str())
     }
@@ -1057,8 +1064,13 @@ impl CachedItem {
         coordination: Option<chat::coordination::Coordination>,
     ) -> Self {
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
-        let reader_memory = previous.as_ref().map(|cached| cached.reader_memory.clone()).unwrap_or_default();
-        let reader_context = previous.as_ref().and_then(|cached| cached.reader_context.clone());
+        let reader_memory = previous
+            .as_ref()
+            .map(|cached| cached.reader_memory.clone())
+            .unwrap_or_default();
+        let reader_context = previous
+            .as_ref()
+            .and_then(|cached| cached.reader_context.clone());
         let (
             image,
             image_source,
@@ -1137,7 +1149,8 @@ impl CachedItem {
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
-            reader_memory, reader_context,
+            reader_memory,
+            reader_context,
             blocks: HashMap::new(),
             open: None,
             detail: None,
@@ -1277,7 +1290,9 @@ impl CachedItem {
             &mut |language, code| {
                 // Above the syntax budget, raw bounded visible chunks are
                 // prepared by prose. Do not hash/copy the full growing fence.
-                if code.len() > Self::HIGHLIGHT_LIMIT { return; }
+                if code.len() > Self::HIGHLIGHT_LIMIT {
+                    return;
+                }
                 let key = fence_key(language.unwrap_or_default(), code);
                 last = Some(key);
                 if blocks.contains_key(&key) {
@@ -1329,7 +1344,9 @@ impl CachedItem {
     /// The fence whose info string is `language` and whose text is `code`,
     /// where the cache holds it.
     fn block(&self, language: Option<&str>, code: &str) -> Option<&prose::CodeBlock> {
-        if code.len() > Self::HIGHLIGHT_LIMIT { return None; }
+        if code.len() > Self::HIGHLIGHT_LIMIT {
+            return None;
+        }
         self.blocks
             .get(&fence_key(language.unwrap_or_default(), code))
     }
@@ -1633,7 +1650,9 @@ pub(super) struct Runtime {
     /// the walk goes past the newest message.
     history_stash: Option<text_editor::Content<cosmic::Renderer>>,
     /// The most recent transcript viewport, used for history pagination.
-    selection_bookmarks: std::cell::RefCell<HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>>,
+    selection_bookmarks: std::cell::RefCell<
+        HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>,
+    >,
     selection_document: std::cell::RefCell<Option<(u64, Arc<selection::Catalog>)>>,
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
@@ -2316,8 +2335,10 @@ impl Runtime {
         self.handle().and_then(|handle| handle.account_home())
     }
     pub(super) fn local_history_is_read_only(&self) -> bool {
-        self.handle().map_or(self.snapshot.exited || self.snapshot.read_only_reason.is_some(),
-            |handle| handle.local_history_is_read_only())
+        self.handle().map_or(
+            self.snapshot.exited || self.snapshot.read_only_reason.is_some(),
+            |handle| handle.local_history_is_read_only(),
+        )
     }
     pub(super) fn has_local_history_handle(&self) -> bool {
         self.handle().is_some()
@@ -2350,15 +2371,21 @@ impl Runtime {
     }
 
     fn parent_scroll(&self) -> view::Scroll {
-        self.observed_scroll.borrow().get(&None).copied().unwrap_or(self.scroll)
+        self.observed_scroll
+            .borrow()
+            .get(&None)
+            .copied()
+            .unwrap_or(self.scroll)
     }
     fn active_scroll(&self) -> view::Scroll {
-        self.observed_scroll.borrow().get(&self.selected_subagent).copied().unwrap_or_else(|| {
-            match self.selected_subagent.as_ref() {
+        self.observed_scroll
+            .borrow()
+            .get(&self.selected_subagent)
+            .copied()
+            .unwrap_or_else(|| match self.selected_subagent.as_ref() {
                 Some(id) => self.subagent_scroll.get(id).copied().unwrap_or_default(),
                 None => self.scroll,
-            }
-        })
+            })
     }
     pub(super) fn memory_diagnostics(&self) -> crate::inspector::ChatMemory {
         fn payload(item: &chat::Item) -> usize {
@@ -2366,16 +2393,32 @@ impl Runtime {
                 ItemContent::Text { text, .. } => text.len(),
                 ItemContent::Command { output, .. } => output.len(),
                 ItemContent::Tool { input, output, .. } => input.len() + output.len(),
-                ItemContent::Changes { changes, .. } => changes.iter().map(|change| change.diff.len()).sum(),
+                ItemContent::Changes { changes, .. } => {
+                    changes.iter().map(|change| change.diff.len()).sum()
+                }
                 ItemContent::Delivery { body, .. } => body.len(),
                 _ => 0,
             }
         }
         crate::inspector::ChatMemory {
-            source_bytes: self.snapshot.items.iter().chain(self.snapshot.subagents.iter().flat_map(|agent| &agent.items))
-                .map(|item| payload(item)).sum(),
+            source_bytes: self
+                .snapshot
+                .items
+                .iter()
+                .chain(
+                    self.snapshot
+                        .subagents
+                        .iter()
+                        .flat_map(|agent| &agent.items),
+                )
+                .map(|item| payload(item))
+                .sum(),
             presentation_bytes: self.cache.values().map(CachedItem::retained_bytes).sum(),
-            selection_bytes: self.selection_document.borrow().as_ref().map_or(0, |(_, catalog)| catalog.retained_plain_bytes()),
+            selection_bytes: self
+                .selection_document
+                .borrow()
+                .as_ref()
+                .map_or(0, |(_, catalog)| catalog.retained_plain_bytes()),
             prepared_items: self.cache.len(),
         }
     }
@@ -2385,17 +2428,30 @@ impl Runtime {
         // Each transcript has its own streaming lifecycle: a child can keep
         // running after the parent finishes. Only its newest item can grow;
         // older items release their parser and highlighter continuation.
-        let selected = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
-        let (items, busy) = selected.map_or((snapshot.items.as_slice(), snapshot.busy),
-            |agent| (agent.items.as_slice(), agent.status == chat::ToolStatus::Running));
+        let selected = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let (items, busy) = selected.map_or((snapshot.items.as_slice(), snapshot.busy), |agent| {
+            (
+                agent.items.as_slice(),
+                agent.status == chat::ToolStatus::Running,
+            )
+        });
         let newest = items.len().wrapping_sub(1);
         for (index, item) in items.iter().enumerate() {
             let growing = busy && index == newest;
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
-            let append_proven = self.cache.get(&item.id).and_then(|cached| cached.item.as_ref())
+            let append_proven = self
+                .cache
+                .get(&item.id)
+                .and_then(|cached| cached.item.as_ref())
                 .filter(|previous| !Arc::ptr_eq(previous, item))
-                .is_some_and(|previous| self.handle().is_some_and(|handle| handle.known_append(previous, item)));
+                .is_some_and(|previous| {
+                    self.handle()
+                        .is_some_and(|handle| handle.known_append(previous, item))
+                });
             if let Some(cached) = self.cache.get_mut(&item.id) {
                 cached.reader_memory = self.scroll_memory.clone();
                 cached.reader_context.clone_from(&self.selected_subagent);
@@ -2425,7 +2481,10 @@ impl Runtime {
                 }
                 if let Some(previous) = cached.item.as_ref()
                     && let ItemContent::Text { text, .. } = &previous.content
-                    && let Some(body) = cached.token.appended_known(text, &item.content, append_proven)
+                    && let Some(body) =
+                        cached
+                            .token
+                            .appended_known(text, &item.content, append_proven)
                 {
                     cached.extend(body, growing, self.syntax_theme);
                     presentation_changed = true;
@@ -2453,7 +2512,9 @@ impl Runtime {
             self.cache.insert(item.id.clone(), cached);
             presentation_changed = true;
         }
-        if presentation_changed { self.presentation_revision = self.presentation_revision.wrapping_add(1); }
+        if presentation_changed {
+            self.presentation_revision = self.presentation_revision.wrapping_add(1);
+        }
     }
 
     fn refresh(&mut self) {
@@ -2501,10 +2562,17 @@ impl Runtime {
             self.earlier_asked = None;
             self.later_asked = None;
         }
-        let selected_items = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id))
+        let selected_items = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id))
             .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice());
-        if !self.presentation_evicted && self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
-            && selected_items.iter().all(|item| self.cache.contains_key(&item.id))
+        if !self.presentation_evicted
+            && self.snapshot.generation == snapshot.generation
+            && Arc::ptr_eq(&self.snapshot, &snapshot)
+            && selected_items
+                .iter()
+                .all(|item| self.cache.contains_key(&item.id))
         {
             return;
         }
@@ -2523,8 +2591,14 @@ impl Runtime {
         }
         self.subagent_scroll
             .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
-        self.observed_scroll.borrow_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
-        self.selection_bookmarks.get_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
+        self.observed_scroll.borrow_mut().retain(|id, _| {
+            id.as_ref()
+                .is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id))
+        });
+        self.selection_bookmarks.get_mut().retain(|id, _| {
+            id.as_ref()
+                .is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id))
+        });
         self.scroll_memory.retain_children(&snapshot.subagents);
         self.settle_recalls(&snapshot);
         self.taken_back.retain(|id| {
@@ -2561,37 +2635,74 @@ impl Runtime {
         // Preserve a recalled index while the reader is walking it.
         if self.history_cursor.is_none() {
             let mut count = 0;
-            for text in snapshot.items.iter().filter_map(|item| match (&item.role, &item.content) {
-                (chat::Role::User, ItemContent::Text { text, .. }) if !text.trim().is_empty() => Some(text),
-                _ => None,
-            }) {
+            for text in snapshot
+                .items
+                .iter()
+                .filter_map(|item| match (&item.role, &item.content) {
+                    (chat::Role::User, ItemContent::Text { text, .. })
+                        if !text.trim().is_empty() =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+            {
                 if let Some(previous) = self.history.get_mut(count) {
-                    if previous != text { previous.clone_from(text); }
-                } else { self.history.push(text.clone()); }
+                    if previous != text {
+                        previous.clone_from(text);
+                    }
+                } else {
+                    self.history.push(text.clone());
+                }
                 count += 1;
             }
             self.history.truncate(count);
         }
-        if self.selected_subagent.as_ref().is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id)) {
+        if self
+            .selected_subagent
+            .as_ref()
+            .is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id))
+        {
             self.selected_subagent = None;
         }
-        let selected = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
-        let previous_selected = self.selected_subagent.as_ref().and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
-        let same_ids = |old: &[Arc<chat::Item>], new: &[Arc<chat::Item>]| old.len() == new.len()
-            && old.iter().zip(new).all(|(old, new)| old.id == new.id);
+        let selected = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let previous_selected = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let same_ids = |old: &[Arc<chat::Item>], new: &[Arc<chat::Item>]| {
+            old.len() == new.len() && old.iter().zip(new).all(|(old, new)| old.id == new.id)
+        };
         if !same_ids(&self.snapshot.items, &snapshot.items)
-            || !same_ids(previous_selected.map_or(&[], |agent| agent.items.as_slice()), selected.map_or(&[], |agent| agent.items.as_slice())) {
-            self.cache.retain(|id, _| selected.map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice()).iter().any(|item| &item.id == id));
+            || !same_ids(
+                previous_selected.map_or(&[], |agent| agent.items.as_slice()),
+                selected.map_or(&[], |agent| agent.items.as_slice()),
+            )
+        {
+            self.cache.retain(|id, _| {
+                selected
+                    .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
+                    .iter()
+                    .any(|item| &item.id == id)
+            });
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
         }
         // Rare disclosure-budget pruning can inspect all raw identities;
         // ordinary streaming refreshes need no newly allocated ID HashSet.
         if self.expanded.len() > 4096 {
-            let live_ids: HashSet<_> = snapshot.items.iter().chain(snapshot.subagents.iter().flat_map(|agent| &agent.items))
-                .map(|item| item.id.as_str()).collect();
+            let live_ids: HashSet<_> = snapshot
+                .items
+                .iter()
+                .chain(snapshot.subagents.iter().flat_map(|agent| &agent.items))
+                .map(|item| item.id.as_str())
+                .collect();
             self.expanded.retain(|id| live_ids.contains(id.as_str()));
         }
-        self.asked_after.retain(|id| snapshot.items.iter().any(|item| &item.id == id));
+        self.asked_after
+            .retain(|id| snapshot.items.iter().any(|item| &item.id == id));
         self.prepare_transcript_cache(&snapshot);
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
@@ -2691,12 +2802,22 @@ impl Runtime {
         }
         self.source_clock = source_clock;
         let cache = &self.cache;
-        let turns = (grouping_dirty || !turn::same_structure(&self.snapshot.items, &snapshot.items)).then(|| {
-            turn::group(&snapshot.items, &self.asked_after, |item| cache.get(&item.id)?.coordination.as_deref())
+        let turns = (grouping_dirty
+            || !turn::same_structure(&self.snapshot.items, &snapshot.items))
+        .then(|| {
+            turn::group(&snapshot.items, &self.asked_after, |item| {
+                cache.get(&item.id)?.coordination.as_deref()
+            })
         });
         if let Some(turns) = &turns {
-            carry_step_disclosures(&mut self.opened, &mut self.find_disclosure,
-                &self.turns, &self.snapshot.items, turns, &snapshot.items);
+            carry_step_disclosures(
+                &mut self.opened,
+                &mut self.find_disclosure,
+                &self.turns,
+                &self.snapshot.items,
+                turns,
+                &snapshot.items,
+            );
         }
         let current_anchor = self.turns.last().map(|turn| turn.key.as_str());
         if self
@@ -2711,7 +2832,12 @@ impl Runtime {
             && !snapshot.exited
             && snapshot.turn_generation == self.snapshot.turn_generation
             && snapshot.session_id == self.snapshot.session_id
-            && current_anchor == turns.as_deref().unwrap_or(&self.turns).last().map(|turn| turn.key.as_str())
+            && current_anchor
+                == turns
+                    .as_deref()
+                    .unwrap_or(&self.turns)
+                    .last()
+                    .map(|turn| turn.key.as_str())
         {
             let provider = self.session.launch.provider;
             self.failures.retain(|(anchor, message)| {
@@ -2837,8 +2963,10 @@ impl Runtime {
                     .any(|child| !child.items.is_empty()))
         {
             self.release_transcript_presentation();
-        } else if !visible && self.handle().is_some()
-            && (!self.cache.is_empty() || self.selection_document.borrow().is_some()) {
+        } else if !visible
+            && self.handle().is_some()
+            && (!self.cache.is_empty() || self.selection_document.borrow().is_some())
+        {
             // An unreachable daemon cannot restore its body yet. Keep that
             // last readable publication, but shed render-ready amplification.
             self.release_transcript_caches();
@@ -2858,7 +2986,9 @@ impl Runtime {
     /// Explicit account/history deletion invalidates both the visible reader
     /// and its private offline fallback. Ordinary archive/move never calls it.
     pub(super) fn revoke_local_history(&mut self) {
-        if let Some(handle) = self.handle() { handle.revoke_local_history(); }
+        if let Some(handle) = self.handle() {
+            handle.revoke_local_history();
+        }
         self.release_transcript_presentation();
         self.history = Vec::new();
         self.history_cursor = None;
@@ -4025,7 +4155,10 @@ impl Cagents {
             .get(settings::agents::provider_key(account.provider))
             .cloned()
             .unwrap_or_default();
-        let account_name = self.account_ui.account_label(&id).unwrap_or_else(|| id.to_string());
+        let account_name = self
+            .account_ui
+            .account_label(&id)
+            .unwrap_or_else(|| id.to_string());
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -6208,7 +6341,9 @@ impl Cagents {
         if let Some(page) = page {
             runtime.page_request = Some((page, runtime.snapshot.generation));
             match page {
-                view::Page::Earlier => runtime.earlier_asked = Some(runtime.parent_scroll().content()),
+                view::Page::Earlier => {
+                    runtime.earlier_asked = Some(runtime.parent_scroll().content())
+                }
                 view::Page::Newer | view::Page::Latest => {
                     runtime.later_asked = Some(runtime.parent_scroll().content())
                 }
@@ -6635,8 +6770,13 @@ impl Cagents {
                 // attachment to retirement or asynchronous persistence. Keep
                 // the fence until final adoption because persistence may send
                 // the same Ready handle back through this handler.
-                let history_adoption_allowed=result.as_ref().ok().is_none_or(|handle|self.fence_account_history_ready(target,handle));
-                if result.is_err() {self.finish_account_history_ready(target);}
+                let history_adoption_allowed = result
+                    .as_ref()
+                    .ok()
+                    .is_none_or(|handle| self.fence_account_history_ready(target, handle));
+                if result.is_err() {
+                    self.finish_account_history_ready(target);
+                }
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     self.finish_account_history_ready(target);
                     // The card was closed while this start was in flight.
@@ -6821,23 +6961,34 @@ impl Cagents {
                         // cannot install a late local body after deletion intent.
                         self.finish_account_history_ready(target);
                         if !history_adoption_allowed {
-                            let mut session=handle.session();
-                            session.proof=handle.proof();
-                            session.launch.session_id=handle.snapshot().session_id.clone().or(session.launch.session_id);
-                            self.commit_chat_session(target.card,session.clone());
+                            let mut session = handle.session();
+                            session.proof = handle.proof();
+                            session.launch.session_id = handle
+                                .snapshot()
+                                .session_id
+                                .clone()
+                                .or(session.launch.session_id);
+                            self.commit_chat_session(target.card, session.clone());
                             let message="The conversation stayed running, but its account could not be verified after an account deletion request. Reconnect it before retrying deletion.".to_owned();
-                            if let Some(CardRuntime::Chat(runtime))=self.cards.get_mut(&target.card) {
+                            if let Some(CardRuntime::Chat(runtime)) =
+                                self.cards.get_mut(&target.card)
+                            {
                                 runtime.unqueue();
                                 runtime.release_transcript_presentation();
-                                runtime.snapshot=Arc::new(Snapshot {session_id:session.launch.session_id.clone(),..Snapshot::default()});
-                                runtime.session=session;
-                                runtime.target=target;
-                                runtime.connection=Connection::Draft;
-                                runtime.error=Some(message.clone());
-                                runtime.disconnected=true;
-                                runtime.pending=None;
-                            } else { self.fail_runtime(target.card,message.clone()); }
-                            self.status=Some(TransientNotice::warning(message));
+                                runtime.snapshot = Arc::new(Snapshot {
+                                    session_id: session.launch.session_id.clone(),
+                                    ..Snapshot::default()
+                                });
+                                runtime.session = session;
+                                runtime.target = target;
+                                runtime.connection = Connection::Draft;
+                                runtime.error = Some(message.clone());
+                                runtime.disconnected = true;
+                                runtime.pending = None;
+                            } else {
+                                self.fail_runtime(target.card, message.clone());
+                            }
+                            self.status = Some(TransientNotice::warning(message));
                             // Dropping this UI attachment only detaches. Never
                             // retire/stop the provider or replay its first prompt.
                             return Task::none();
@@ -7638,7 +7789,9 @@ impl Cagents {
                                 runtime.session.launch.provider,
                                 &runtime.session.launch.recipe,
                             )?;
-                            self.account_ui.needs_alternate(&id).then_some((id, runtime.revision))
+                            self.account_ui
+                                .needs_alternate(&id)
+                                .then_some((id, runtime.revision))
                         }
                         _ => None,
                     })
@@ -8328,7 +8481,9 @@ impl Cagents {
                             .iter()
                             .any(|agent| &agent.id == id)
                     });
-                    if runtime.selected_subagent != selected { runtime.cache.clear(); }
+                    if runtime.selected_subagent != selected {
+                        runtime.cache.clear();
+                    }
                     runtime.selected_subagent = selected;
                     runtime.deferred_page = None;
                     runtime.selection_document.get_mut().take();
@@ -10659,30 +10814,64 @@ mod tests {
         let card = live_chat(&mut app, Some("lazy-child-cache"));
         let target = chat_runtime(&app, card).target;
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
-        let children = (0..5).map(|index| chat::Subagent {
-            id: format!("child-{index}"), kind: "fixture".into(), description: "Lazy child".into(),
-            status: chat::ToolStatus::Running, background: true, model: None, waiting: false, detail: String::new(),
-            items: vec![Arc::new(chat::Item { id: format!("body-{index}"), role: chat::Role::Assistant,
-                content: text(&"source ".repeat(20000)), started_at: None, at: None })],
-        }).collect();
-        handle.publish_snapshot_for_test(Snapshot { generation: 20, ready: true, subagents: children,
-            items: vec![Arc::new(chat::Item { id: "body-2".into(), role: chat::Role::Assistant,
-                content: text("Parent source"), started_at: None, at: None })], ..Snapshot::default() });
-        let runtime = app.chat_runtime_mut(target).unwrap(); runtime.visible.store(true, Ordering::Relaxed); runtime.refresh();
-        assert_eq!(runtime.cache.len(), 1, "only parent source is prepared before child selection");
+        let children = (0..5)
+            .map(|index| chat::Subagent {
+                id: format!("child-{index}"),
+                kind: "fixture".into(),
+                description: "Lazy child".into(),
+                status: chat::ToolStatus::Running,
+                background: true,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                items: vec![Arc::new(chat::Item {
+                    id: format!("body-{index}"),
+                    role: chat::Role::Assistant,
+                    content: text(&"source ".repeat(20000)),
+                    started_at: None,
+                    at: None,
+                })],
+            })
+            .collect();
+        handle.publish_snapshot_for_test(Snapshot {
+            generation: 20,
+            ready: true,
+            subagents: children,
+            items: vec![Arc::new(chat::Item {
+                id: "body-2".into(),
+                role: chat::Role::Assistant,
+                content: text("Parent source"),
+                started_at: None,
+                at: None,
+            })],
+            ..Snapshot::default()
+        });
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.visible.store(true, Ordering::Relaxed);
+        runtime.refresh();
+        assert_eq!(
+            runtime.cache.len(),
+            1,
+            "only parent source is prepared before child selection"
+        );
         assert!(runtime.cache["body-2"].markdown.items().len() > 0);
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-2".into()))));
         assert_eq!(chat_runtime(&app, card).cache.len(), 1);
         assert!(chat_runtime(&app, card).cache.contains_key("body-2"));
-        assert!(matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
-            ItemContent::Text { text, .. } if text.len() > 10000), "identical parent/child provider IDs cannot reuse the wrong scope");
+        assert!(
+            matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
+            ItemContent::Text { text, .. } if text.len() > 10000),
+            "identical parent/child provider IDs cannot reuse the wrong scope"
+        );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-3".into()))));
         assert_eq!(chat_runtime(&app, card).cache.len(), 1);
         assert!(chat_runtime(&app, card).cache.contains_key("body-3"));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
         assert_eq!(chat_runtime(&app, card).cache.len(), 1);
-        assert!(matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
-            ItemContent::Text { text, .. } if text == "Parent source"));
+        assert!(
+            matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
+            ItemContent::Text { text, .. } if text == "Parent source")
+        );
     }
 
     #[test]
@@ -10746,7 +10935,10 @@ mod tests {
             "an idle parent must not retire its running child's fence"
         );
         assert!(runtime.cache["parent"].open.is_none());
-        assert!(!runtime.cache.contains_key("finished"), "hidden child presentation is not prepared");
+        assert!(
+            !runtime.cache.contains_key("finished"),
+            "hidden child presentation is not prepared"
+        );
         // An unchanged snapshot must also preserve the child's continuation.
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
@@ -12150,8 +12342,14 @@ mod tests {
         let new_card = app.workspace.focused().unwrap();
         assert_ne!(new_card, card);
         assert!(chat_runtime(&app, new_card).is_draft());
-        assert_eq!(chat_runtime(&app, new_card).attachments, chat_runtime(&app, card).attachments);
-        assert_eq!(paths(&chat_runtime(&app, new_card).attachments), [Path::new("/fixture/unsent-account-context.png")]);
+        assert_eq!(
+            chat_runtime(&app, new_card).attachments,
+            chat_runtime(&app, card).attachments
+        );
+        assert_eq!(
+            paths(&chat_runtime(&app, new_card).attachments),
+            [Path::new("/fixture/unsent-account-context.png")]
+        );
         assert!(
             chat_runtime(&app, new_card)
                 .composer
@@ -13575,30 +13773,49 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
-        show_chat_snapshot_for_test(&mut app, card, Snapshot {
-            generation: 19, session_id: Some(KNOWN_THREAD.into()), ready: true,
-            items: vec![Arc::new(chat::Item { id: "parked-body".into(), role: chat::Role::Assistant,
-                content: text("History from before the connection ended"), started_at: None, at: None })],
-            ..Default::default()
-        });
+        show_chat_snapshot_for_test(
+            &mut app,
+            card,
+            Snapshot {
+                generation: 19,
+                session_id: Some(KNOWN_THREAD.into()),
+                ready: true,
+                items: vec![Arc::new(chat::Item {
+                    id: "parked-body".into(),
+                    role: chat::Role::Assistant,
+                    content: text("History from before the connection ended"),
+                    started_at: None,
+                    at: None,
+                })],
+                ..Default::default()
+            },
+        );
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.replace_draft(text_editor::Content::with_text("Unsent while parked"));
         runtime.scroll = view::Scroll::new(120.0, 800.0, 400.0);
         let saved_scroll = runtime.scroll;
         let handle = runtime.handle().unwrap().clone();
         runtime.set_visible(false).unwrap();
-        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat"); };
+        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+            panic!("chat");
+        };
         app.chat_ui.parked.insert(card, runtime);
         // The client test separately drives real Unix socket EOF. Here its
         // disconnected publication enters the actual parked-runtime handler.
         handle.disconnect_for_test();
-        drop(app.handle_chat_action(Action::Wake(target, Wake::Disconnected("fixture EOF".into()))));
+        drop(app.handle_chat_action(Action::Wake(
+            target,
+            Wake::Disconnected("fixture EOF".into()),
+        )));
         let mut runtime = app.chat_ui.parked.remove(&card).unwrap();
         assert!(runtime.disconnected);
         runtime.set_visible(true).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while handle.resident_snapshot_with_clock().is_none() {
-            assert!(std::time::Instant::now() < deadline, "parked view did not rehydrate");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parked view did not rehydrate"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         runtime.refresh();
@@ -13607,7 +13824,10 @@ mod tests {
         assert!(runtime.snapshot.read_only_reason.is_some());
         assert_eq!(runtime.composer.text().trim_end(), "Unsent while parked");
         assert_eq!(runtime.scroll, saved_scroll);
-        assert!(runtime.disconnected, "cached text never grants send authority");
+        assert!(
+            runtime.disconnected,
+            "cached text never grants send authority"
+        );
         runtime.revoke_local_history();
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert!(runtime.cache.is_empty());
@@ -13667,11 +13887,16 @@ mod tests {
         let weak_document = Arc::downgrade(&document);
         let (anchor, end) = document.endpoints().unwrap();
         let bookmark = std::rc::Rc::new(std::cell::RefCell::new(selection::Bookmark {
-            anchor: Some(anchor), end: Some(end),
-            anchor_prefix: document.fingerprint(anchor), end_prefix: document.fingerprint(end),
+            anchor: Some(anchor),
+            end: Some(end),
+            anchor_prefix: document.fingerprint(anchor),
+            end_prefix: document.fingerprint(end),
         }));
         runtime.selection_document.get_mut().replace((99, document));
-        runtime.selection_bookmarks.get_mut().insert(Some("child".into()), bookmark.clone());
+        runtime
+            .selection_bookmarks
+            .get_mut()
+            .insert(Some("child".into()), bookmark.clone());
         runtime.scroll = view::Scroll::new(200.0, 1000.0, 400.0);
         runtime
             .subagent_scroll
@@ -13689,9 +13914,18 @@ mod tests {
         runtime.set_visible(false).unwrap();
         assert!(runtime.cache.is_empty());
         assert!(runtime.selection_document.borrow().is_none());
-        assert!(weak_document.upgrade().is_none(), "the logical selection catalog must be released");
-        assert!(weak_plain.upgrade().is_none(), "selection must not retain hidden rendered text");
-        assert!(std::rc::Rc::ptr_eq(&runtime.selection_bookmarks.borrow()[&Some("child".into())], &bookmark));
+        assert!(
+            weak_document.upgrade().is_none(),
+            "the logical selection catalog must be released"
+        );
+        assert!(
+            weak_plain.upgrade().is_none(),
+            "selection must not retain hidden rendered text"
+        );
+        assert!(std::rc::Rc::ptr_eq(
+            &runtime.selection_bookmarks.borrow()[&Some("child".into())],
+            &bookmark
+        ));
         assert_eq!(bookmark.borrow().anchor, Some(anchor));
         assert_eq!(bookmark.borrow().end, Some(end));
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
@@ -13699,7 +13933,10 @@ mod tests {
         assert!(handle.resident_snapshot_with_clock().is_none());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while parent.upgrade().is_some() || child.upgrade().is_some() {
-            assert!(std::time::Instant::now() < deadline, "offline spill must release queued raw owners");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "offline spill must release queued raw owners"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(
@@ -13715,7 +13952,10 @@ mod tests {
         assert_eq!(runtime.subagent_scroll, child_scroll);
         assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
         runtime.set_visible(true).unwrap();
-        assert!(runtime.cache.is_empty(), "reveal waits for an authoritative body");
+        assert!(
+            runtime.cache.is_empty(),
+            "reveal waits for an authoritative body"
+        );
         // The daemon answers the unconditional read at the same generation.
         handle.replace_snapshot_for_test(snapshot());
         runtime.refresh();
@@ -18211,157 +18451,281 @@ mod tests {
         }
     }
 
-    fn account_privacy_handle(app: &Cagents, card: CardId, home: Option<account::HomeIdentity>, read_only: bool) -> Arc<ClientHandle> {
-        let session=fixture_handle(app,card,Some(KNOWN_THREAD)).session();
-        Arc::new(ClientHandle::fixture_account_home(session,Snapshot {
-            ready:true, session_id:Some(KNOWN_THREAD.into()),exited:read_only,
-            items:vec![Arc::new(chat::Item {id:"private-account-body".into(),role:chat::Role::Assistant,
-                content:text("private retained account text"),started_at:None,at:None})],
-            ..Snapshot::default()
-        },home))
+    fn account_privacy_handle(
+        app: &Cagents,
+        card: CardId,
+        home: Option<account::HomeIdentity>,
+        read_only: bool,
+    ) -> Arc<ClientHandle> {
+        let session = fixture_handle(app, card, Some(KNOWN_THREAD)).session();
+        Arc::new(ClientHandle::fixture_account_home(
+            session,
+            Snapshot {
+                ready: true,
+                session_id: Some(KNOWN_THREAD.into()),
+                exited: read_only,
+                items: vec![Arc::new(chat::Item {
+                    id: "private-account-body".into(),
+                    role: chat::Role::Assistant,
+                    content: text("private retained account text"),
+                    started_at: None,
+                    at: None,
+                })],
+                ..Snapshot::default()
+            },
+            home,
+        ))
     }
 
-    fn account_privacy_home(inode:u64)->account::HomeIdentity {
+    fn account_privacy_home(inode: u64) -> account::HomeIdentity {
         // An attested remote path deliberately does not exist in the window's
         // filesystem. Purge aliases may be absent on a pre-registration actor.
-        account::HomeIdentity {provider:Provider::Codex,canonical_home:format!("/remote-private-fixture/account-{inode}").into(),
-            device:731,inode,purge_ids:Vec::new()}
+        account::HomeIdentity {
+            provider: Provider::Codex,
+            canonical_home: format!("/remote-private-fixture/account-{inode}").into(),
+            device: 731,
+            inode,
+            purge_ids: Vec::new(),
+        }
     }
 
-    fn complete_account_privacy_intent(app:&mut Cagents,id:&AccountId) {
+    fn complete_account_privacy_intent(app: &mut Cagents, id: &AccountId) {
         // Exercise the normal completion dispatch, including partial failure.
         // Its UI revocation must not depend on successful physical deletion.
-        drop(app.update(Message::AccountUi(super::super::account_ui::Action::Removed {
-            id:id.clone(),delete_requested:true,registry:None,error:Some("fixture deletion refused by an active owner".into()),
-        })));
+        drop(app.update(Message::AccountUi(
+            super::super::account_ui::Action::Removed {
+                id: id.clone(),
+                delete_requested: true,
+                registry: None,
+                error: Some("fixture deletion refused by an active owner".into()),
+            },
+        )));
     }
 
     #[test]
-    fn account_delete_intent_removed_then_late_ready_revokes_only_matching_or_unknown_read_only_bodies() {
-        for (home,read_only,revoke) in [
-            (Some(account_privacy_home(11)),false,true),
-            (Some(account_privacy_home(12)),true,false),
-            (None,true,true),
+    fn account_delete_intent_removed_then_late_ready_revokes_only_matching_or_unknown_read_only_bodies()
+     {
+        for (home, read_only, revoke) in [
+            (Some(account_privacy_home(11)), false, true),
+            (Some(account_privacy_home(12)), true, false),
+            (None, true, true),
         ] {
-            let mut app=crate::app::tests::context_inspector_test_app(false);
-            let id=app.account_ui.add_managed_fixture(Provider::Codex,99201);
-            let (card,target)=starting_chat(&mut app);
-            let handle=account_privacy_handle(&app,card,home,read_only);
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Codex, 99201);
+            let (card, target) = starting_chat(&mut app);
+            let handle = account_privacy_handle(&app, card, home, read_only);
             assert!(!handle.snapshot().items.is_empty());
-            app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
-            complete_account_privacy_intent(&mut app,&id);
-            answer_start(&mut app,target,Ok(handle.clone()));
-            assert!(app.chat_ui.retiring.is_empty(),"deletion privacy must not stop or retire provider work");
-            let runtime=chat_runtime(&app,card);
+            app.prepare_account_history_deletion(
+                &id,
+                Provider::Codex,
+                &account::remote::RemovalHome::Present(account_privacy_home(11)),
+            )
+            .unwrap();
+            complete_account_privacy_intent(&mut app, &id);
+            answer_start(&mut app, target, Ok(handle.clone()));
+            assert!(
+                app.chat_ui.retiring.is_empty(),
+                "deletion privacy must not stop or retire provider work"
+            );
+            let runtime = chat_runtime(&app, card);
             assert!(runtime.has_local_history_handle());
             if revoke {
-                assert!(handle.snapshot().items.is_empty(),"late Ready cannot reinstall revoked local text");
+                assert!(
+                    handle.snapshot().items.is_empty(),
+                    "late Ready cannot reinstall revoked local text"
+                );
                 assert!(runtime.snapshot.items.is_empty());
             } else {
-                assert_eq!(handle.snapshot().items.len(),1,"known remote account B keeps its local text");
+                assert_eq!(
+                    handle.snapshot().items.len(),
+                    1,
+                    "known remote account B keeps its local text"
+                );
             }
         }
     }
 
     #[test]
     fn account_delete_intent_gates_late_unknown_live_attachment_and_restores_unsent_composer() {
-        let mut app=crate::app::tests::context_inspector_test_app(false);
-        let id=app.account_ui.add_managed_fixture(Provider::Codex,99202);
-        let (card,target)=starting_chat(&mut app);
-        let handle=account_privacy_handle(&app,card,None,false);
-        let mut admitted=handle.session();
-        admitted.launch.session_id=Some(KNOWN_THREAD.into());
-        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
-        complete_account_privacy_intent(&mut app,&id);
-        answer_start(&mut app,target,Ok(handle.clone()));
-        let runtime=chat_runtime(&app,card);
-        assert!(!runtime.has_local_history_handle(),"unknown live Ready must not install a local body");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 99202);
+        let (card, target) = starting_chat(&mut app);
+        let handle = account_privacy_handle(&app, card, None, false);
+        let mut admitted = handle.session();
+        admitted.launch.session_id = Some(KNOWN_THREAD.into());
+        app.prepare_account_history_deletion(
+            &id,
+            Provider::Codex,
+            &account::remote::RemovalHome::Present(account_privacy_home(11)),
+        )
+        .unwrap();
+        complete_account_privacy_intent(&mut app, &id);
+        answer_start(&mut app, target, Ok(handle.clone()));
+        let runtime = chat_runtime(&app, card);
+        assert!(
+            !runtime.has_local_history_handle(),
+            "unknown live Ready must not install a local body"
+        );
         assert!(runtime.snapshot.items.is_empty());
         assert!(runtime.disconnected);
-        assert!(runtime.error.as_deref().unwrap().contains("account could not be verified"));
-        assert_eq!(runtime.composer.text().trim(),"hello","the unsent first prompt stays editable");
+        assert!(
+            runtime
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("account could not be verified")
+        );
+        assert_eq!(
+            runtime.composer.text().trim(),
+            "hello",
+            "the unsent first prompt stays editable"
+        );
         assert!(runtime.queued.is_none());
-        assert_eq!(runtime.session,admitted,"reconnect must use the admitted descriptor and confirmed native session");
+        assert_eq!(
+            runtime.session, admitted,
+            "reconnect must use the admitted descriptor and confirmed native session"
+        );
         assert!(app.chat_ui.retiring.is_empty());
-        assert!(matches!(&app.card_state(card).unwrap().kind,CardKind::Chat(session) if session==&admitted),
-            "retain the running actor's descriptor for an explicit reconnect");
-        assert_eq!(handle.snapshot().items.len(),1,"refusing presentation does not mutate or stop unrelated provider state");
+        assert!(
+            matches!(&app.card_state(card).unwrap().kind,CardKind::Chat(session) if session==&admitted),
+            "retain the running actor's descriptor for an explicit reconnect"
+        );
+        assert_eq!(
+            handle.snapshot().items.len(),
+            1,
+            "refusing presentation does not mutate or stop unrelated provider state"
+        );
         drop(app.handle_chat_ui(Action::Reconnect(target)));
-        assert_eq!(app.chat_ui.attempt(card).unwrap().session,admitted);
-        assert_eq!(chat_runtime(&app,card).composer.text().trim(),"hello");
+        assert_eq!(app.chat_ui.attempt(card).unwrap().session, admitted);
+        assert_eq!(chat_runtime(&app, card).composer.text().trim(), "hello");
     }
 
     #[test]
     fn account_delete_intent_revokes_parked_known_a_but_preserves_known_b_and_unsent_text() {
-        let mut app=crate::app::tests::context_inspector_test_app(false);
-        let id=app.account_ui.add_managed_fixture(Provider::Codex,99203);
-        let (card,target)=starting_chat(&mut app);
-        let a=account_privacy_handle(&app,card,Some(account_privacy_home(11)),true);
-        answer_start(&mut app,target,Ok(a.clone()));
-        write(&mut app,card,"unsent composer survives");
-        let (other,other_target)=starting_chat(&mut app);
-        let b=account_privacy_handle(&app,other,Some(account_privacy_home(12)),true);
-        answer_start(&mut app,other_target,Ok(b.clone()));
-        let Some(CardRuntime::Chat(runtime))=app.cards.remove(&card) else {panic!("chat runtime")};
-        app.chat_ui.parked.insert(card,runtime);
-        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
-        complete_account_privacy_intent(&mut app,&id);
-        let parked=app.chat_ui.parked.get(&card).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 99203);
+        let (card, target) = starting_chat(&mut app);
+        let a = account_privacy_handle(&app, card, Some(account_privacy_home(11)), true);
+        answer_start(&mut app, target, Ok(a.clone()));
+        write(&mut app, card, "unsent composer survives");
+        let (other, other_target) = starting_chat(&mut app);
+        let b = account_privacy_handle(&app, other, Some(account_privacy_home(12)), true);
+        answer_start(&mut app, other_target, Ok(b.clone()));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+            panic!("chat runtime")
+        };
+        app.chat_ui.parked.insert(card, runtime);
+        app.prepare_account_history_deletion(
+            &id,
+            Provider::Codex,
+            &account::remote::RemovalHome::Present(account_privacy_home(11)),
+        )
+        .unwrap();
+        complete_account_privacy_intent(&mut app, &id);
+        let parked = app.chat_ui.parked.get(&card).unwrap();
         assert!(a.snapshot().items.is_empty());
         assert!(parked.snapshot.items.is_empty());
-        assert_eq!(parked.composer.text().trim(),"unsent composer survives");
-        assert_eq!(b.snapshot().items.len(),1);
+        assert_eq!(parked.composer.text().trim(), "unsent composer survives");
+        assert_eq!(b.snapshot().items.len(), 1);
         assert!(app.chat_ui.retiring.is_empty());
     }
 
-
     #[test]
     fn account_delete_intent_revokes_abandoned_ready_before_retirement_captures_handle() {
-        let mut app=crate::app::tests::context_inspector_test_app(false);
-        let id=app.account_ui.add_managed_fixture(Provider::Codex,99204);
-        let (card,target)=starting_chat(&mut app);
-        let handle=account_privacy_handle(&app,card,Some(account_privacy_home(11)),false);
-        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
-        close_chat(&mut app,card);
-        complete_account_privacy_intent(&mut app,&id);
-        answer_start(&mut app,target,Ok(handle.clone()));
-        assert!(handle.snapshot().items.is_empty(),"retirement's pending task must not retain deleted-account plaintext");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 99204);
+        let (card, target) = starting_chat(&mut app);
+        let handle = account_privacy_handle(&app, card, Some(account_privacy_home(11)), false);
+        app.prepare_account_history_deletion(
+            &id,
+            Provider::Codex,
+            &account::remote::RemovalHome::Present(account_privacy_home(11)),
+        )
+        .unwrap();
+        close_chat(&mut app, card);
+        complete_account_privacy_intent(&mut app, &id);
+        answer_start(&mut app, target, Ok(handle.clone()));
+        assert!(
+            handle.snapshot().items.is_empty(),
+            "retirement's pending task must not retain deleted-account plaintext"
+        );
         assert!(!app.cards.contains_key(&card));
-        assert_eq!(app.chat_ui.retiring.len(),1,"the existing explicit close still retires its own actor");
+        assert_eq!(
+            app.chat_ui.retiring.len(),
+            1,
+            "the existing explicit close still retires its own actor"
+        );
     }
-
 
     #[test]
     fn account_delete_intent_revokes_ready_before_account_persistence_holds_the_attachment() {
-        let mut app=crate::app::tests::context_inspector_test_app(false);
-        let card=live_chat(&mut app,Some(KNOWN_THREAD));
-        let mut source=chat_runtime(&app,card).session.clone();
-        source.launch.recipe.environment.insert("CODEX_HOME".into(),"/removed-account".into());
-        app.install_chat_session(card,source.clone());
-        let directory=tempfile::tempdir().unwrap();
-        let (writer,_)=crate::session::SessionRuntime::open(directory.path().join("state.sqlite3"),crate::model::BootId::new("privacy-persist-fixture")).unwrap();
-        app.session=Some(writer);
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let mut source = chat_runtime(&app, card).session.clone();
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/removed-account".into());
+        app.install_chat_session(card, source.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("privacy-persist-fixture"),
+        )
+        .unwrap();
+        app.session = Some(writer);
         app.persist();
-        app.session.as_ref().unwrap().flush(Duration::from_secs(10)).unwrap();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
         app.chat_forget(card);
-        app.cards.insert(card,CardRuntime::Loading);
-        drop(app.open_chat(card,source,chat::Intent::Restore));
-        let failed=chat_runtime_attempt(&app,card);
-        answer_start(&mut app,failed,Err(chat::StartFailure{message:"The saved account was removed".into(),recovery:chat::Recovery::Account}));
-        drop(app.update(Message::ChatUi(Action::RecoverAccount(card,Account::system(Provider::Codex).id()))));
-        let target=chat_runtime_attempt(&app,card);
-        let handle=account_privacy_handle(&app,card,Some(account_privacy_home(11)),false);
-        let id=app.account_ui.add_managed_fixture(Provider::Codex,99205);
-        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
-        complete_account_privacy_intent(&mut app,&id);
-        let task=app.update(Message::ChatUi(Action::Ready(target,Ready(Arc::new(Mutex::new(Some(Ok(handle.clone()))))))));
-        assert!(app.chat_start_pending(card),"account persistence still holds Ready before acknowledgment");
-        assert!(handle.snapshot().items.is_empty(),"pending persistence cannot retain deleted-account plaintext");
-        let reply=account_commit_reply(task);
-        assert!(matches!(&reply,Message::ChatUi(Action::AccountCommitted(_,_,Ok(())))));
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.open_chat(card, source, chat::Intent::Restore));
+        let failed = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            failed,
+            Err(chat::StartFailure {
+                message: "The saved account was removed".into(),
+                recovery: chat::Recovery::Account,
+            }),
+        );
+        drop(app.update(Message::ChatUi(Action::RecoverAccount(
+            card,
+            Account::system(Provider::Codex).id(),
+        ))));
+        let target = chat_runtime_attempt(&app, card);
+        let handle = account_privacy_handle(&app, card, Some(account_privacy_home(11)), false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 99205);
+        app.prepare_account_history_deletion(
+            &id,
+            Provider::Codex,
+            &account::remote::RemovalHome::Present(account_privacy_home(11)),
+        )
+        .unwrap();
+        complete_account_privacy_intent(&mut app, &id);
+        let task = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle.clone()))))),
+        )));
+        assert!(
+            app.chat_start_pending(card),
+            "account persistence still holds Ready before acknowledgment"
+        );
+        assert!(
+            handle.snapshot().items.is_empty(),
+            "pending persistence cannot retain deleted-account plaintext"
+        );
+        let reply = account_commit_reply(task);
+        assert!(matches!(
+            &reply,
+            Message::ChatUi(Action::AccountCommitted(_, _, Ok(())))
+        ));
         drop(app.update(reply));
         assert!(handle.snapshot().items.is_empty());
-        assert!(chat_runtime(&app,card).snapshot.items.is_empty());
+        assert!(chat_runtime(&app, card).snapshot.items.is_empty());
     }
-
 }

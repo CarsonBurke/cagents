@@ -553,8 +553,16 @@ fn session_snapshot(record: &Record) -> ServerResponse {
     let mut session = record.session.clone();
     session.launch.session_id = snapshot.session_id.clone();
     session.native_continuity = snapshot.native_continuity.clone();
-    let account_home = record.handle.launch_account_scope().ok().map(crate::account::HomeIdentity::from);
-    ServerResponse::ChatAttached { session, snapshot, account_home }
+    let account_home = record
+        .handle
+        .launch_account_scope()
+        .ok()
+        .map(crate::account::HomeIdentity::from);
+    ServerResponse::ChatAttached {
+        session,
+        snapshot,
+        account_home,
+    }
 }
 fn same_conversation(a: &chat::Launch, b: &chat::Launch) -> bool {
     a.provider == b.provider && a.session_id.is_some() && a.session_id == b.session_id
@@ -1183,7 +1191,13 @@ fn start_with_execution(
     }
     spec.remove_unset_environment();
     if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
-        super::account_lifecycle::ensure_launch(host, &spec.working_directory, &spec.environment, &spec.unset_environment, false)?;
+        super::account_lifecycle::ensure_launch(
+            host,
+            &spec.working_directory,
+            &spec.environment,
+            &spec.unset_environment,
+            false,
+        )?;
     }
     spec.messages = host
         .lock()
@@ -2084,22 +2098,28 @@ fn recover_account(
             ));
         }
     }
-    if automatic && !explicit
-            && source
-                .launch
-                .recipe
-                .environment
-                .get(crate::account::routing::AUTOMATIC_MARKER)
-                .map(String::as_str)
-                != Some("1")
-        {
-            return Err(error("This conversation has an explicitly pinned account"));
-        }
+    if automatic
+        && !explicit
+        && source
+            .launch
+            .recipe
+            .environment
+            .get(crate::account::routing::AUTOMATIC_MARKER)
+            .map(String::as_str)
+            != Some("1")
+    {
+        return Err(error("This conversation has an explicitly pinned account"));
+    }
     // A lifecycle reservation must be rejected before history copying or source
     // teardown, not merely at the successor's eventual spawn.
     for launch in [&source.launch, &replacement.launch] {
-        super::account_lifecycle::ensure_launch(host, &launch.recipe.working_directory,
-            &launch.recipe.environment, &launch.recipe.unset_environment, false)?;
+        super::account_lifecycle::ensure_launch(
+            host,
+            &launch.recipe.working_directory,
+            &launch.recipe.environment,
+            &launch.recipe.unset_environment,
+            false,
+        )?;
     }
     // Check all other writers before touching either history or stopping the
     // source. The final start guard is too late to protect a live target's files.
@@ -2107,24 +2127,37 @@ fn recover_account(
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         ensure_account_handoff_unowned(&state, &source, &replacement)?;
     }
-    let source_handle = host.lock().unwrap_or_else(|p| p.into_inner())
-        .chats.get(&source.id).map(|record| record.handle.clone());
+    let source_handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&source.id)
+        .map(|record| record.handle.clone());
     // Keep the original approved directory pinned before stopping its actor or
     // copying history. The successor's issued recipe remains immutable.
     let operational_directory = if let Some(handle) = &source_handle {
-        Some(super::session_locations::verified_chat_directory(host, &source, handle)
-            .map_err(unavailable)?)
+        Some(
+            super::session_locations::verified_chat_directory(host, &source, handle)
+                .map_err(unavailable)?,
+        )
     } else {
         let registry = super::agent_execution::registry(host).map_err(unavailable)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        if registry.session_location(&crate::agent_execution::HostedSession::Chat(source.clone()))
-            .map_err(unavailable)?.is_some() {
-            return Err(unavailable("The saved conversation has an operational directory binding but its original provider directory pin is unavailable. Reattach its original provider or continue in a new conversation explicitly."));
+        if registry
+            .session_location(&crate::agent_execution::HostedSession::Chat(source.clone()))
+            .map_err(unavailable)?
+            .is_some()
+        {
+            return Err(unavailable(
+                "The saved conversation has an operational directory binding but its original provider directory pin is unavailable. Reattach its original provider or continue in a new conversation explicitly.",
+            ));
         }
         None
     };
     let mut reservation = None;
-    let mut current_options = source_handle.as_ref().and_then(Handle::completed_account_options);
+    let mut current_options = source_handle
+        .as_ref()
+        .and_then(Handle::completed_account_options);
     if let Some(generation) = idle_generation {
         let handle = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -2226,10 +2259,24 @@ fn recover_account(
     // conversation ID intentionally matches it.
     drop(reservation.take());
     if let Some((directory, context)) = operational_directory {
-        start_at_execution_directory(host, client, replacement.clone(), execution_environment,
-            context, &directory)?;
+        start_at_execution_directory(
+            host,
+            client,
+            replacement.clone(),
+            execution_environment,
+            context,
+            &directory,
+        )?;
     } else {
-        start(host, client, replacement.clone(), None, false, None, execution_environment)?;
+        start(
+            host,
+            client,
+            replacement.clone(),
+            None,
+            false,
+            None,
+            execution_environment,
+        )?;
     }
     let handle = host
         .lock()
@@ -4594,7 +4641,8 @@ done
         process_recipe.program = "/bin/cat".into();
         let mut spec = ProcessSpec::from(&process_recipe);
         let context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
-            std::fs::File::open(&process_recipe.working_directory).unwrap()))));
+            std::fs::File::open(&process_recipe.working_directory).unwrap(),
+        ))));
         let identity = context.directory_identity().unwrap().unwrap();
         spec.execution = Some(context);
         let mut initial = Step {
@@ -4617,25 +4665,41 @@ done
             |_| {},
         )
         .unwrap();
-        let mut registry = super::super::model::Registry::at(&directory.path().join("workspace.sqlite3")).unwrap();
-        registry.apply(&crate::workspace_model::ModelEdit::OpenProject {
-            repository: source.launch.recipe.working_directory.clone(), name: "Account project".into(),
-            kind: crate::model::ProjectKind::Folder,
-        }).unwrap();
-        registry.apply(&crate::workspace_model::ModelEdit::SeedView {
-            scope: crate::workspace_model::views::Scope::Worktree {
+        let mut registry =
+            super::super::model::Registry::at(&directory.path().join("workspace.sqlite3")).unwrap();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
                 repository: source.launch.recipe.working_directory.clone(),
-                path: source.launch.recipe.working_directory.clone(),
-            },
-            panes: vec![crate::workspace_model::views::Pane {
-                id: crate::model::CardId::new(), title: "Account fixture".into(), user_title: None,
-                pending_terminal_start: false, width_fraction: 0.5,
-                kind: crate::model::CardKind::Chat(source.clone()),
-                scope: Some(source.launch.recipe.working_directory.clone()),
-            }], closed: Vec::new(),
-        }).unwrap();
-        registry.bind_session_location(&crate::agent_execution::HostedSession::Chat(source.clone()),
-            None, &source.launch.recipe.working_directory, identity).unwrap();
+                name: "Account project".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::SeedView {
+                scope: crate::workspace_model::views::Scope::Worktree {
+                    repository: source.launch.recipe.working_directory.clone(),
+                    path: source.launch.recipe.working_directory.clone(),
+                },
+                panes: vec![crate::workspace_model::views::Pane {
+                    id: crate::model::CardId::new(),
+                    title: "Account fixture".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 0.5,
+                    kind: crate::model::CardKind::Chat(source.clone()),
+                    scope: Some(source.launch.recipe.working_directory.clone()),
+                }],
+                closed: Vec::new(),
+            })
+            .unwrap();
+        registry
+            .bind_session_location(
+                &crate::agent_execution::HostedSession::Chat(source.clone()),
+                None,
+                &source.launch.recipe.working_directory,
+                identity,
+            )
+            .unwrap();
         {
             let mut state = host.lock().unwrap();
             state.install_model(registry);
@@ -4791,19 +4855,41 @@ done
             let moved_directory = directory.path().join("moved-project");
             std::fs::rename(&actual_directory, &moved_directory).unwrap();
             std::fs::create_dir(&actual_directory).unwrap();
-            let failure = recover_account(&host, 1, source.clone(), replacement.clone(),
-                Some(generation), true, Default::default()).unwrap_err();
+            let failure = recover_account(
+                &host,
+                1,
+                source.clone(),
+                replacement.clone(),
+                Some(generation),
+                true,
+                Default::default(),
+            )
+            .unwrap_err();
             assert!(failure.message.contains("directory"), "{}", failure.message);
-            assert!(!handle.is_completed(), "an unapproved path must not close the source");
+            assert!(
+                !handle.is_completed(),
+                "an unapproved path must not close the source"
+            );
             assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
-            let response = super::super::client::process_request(&host, 1,
-                ClientRequest::EditWorkspaceModel { edit: crate::workspace_model::ModelEdit::RelocateProject {
-                    relocation: crate::project_recovery::Relocation {
-                        repository: actual_directory.clone(), destination: moved_directory.clone(),
-                        old_root: actual_directory.clone(), new_root: moved_directory.clone(),
+            let response = super::super::client::process_request(
+                &host,
+                1,
+                ClientRequest::EditWorkspaceModel {
+                    edit: crate::workspace_model::ModelEdit::RelocateProject {
+                        relocation: crate::project_recovery::Relocation {
+                            repository: actual_directory.clone(),
+                            destination: moved_directory.clone(),
+                            old_root: actual_directory.clone(),
+                            new_root: moved_directory.clone(),
+                        },
                     },
-                }}).unwrap().0;
-            let ServerResponse::WorkspaceModel { model } = response else { panic!("Locate model reply"); };
+                },
+            )
+            .unwrap()
+            .0;
+            let ServerResponse::WorkspaceModel { model } = response else {
+                panic!("Locate model reply");
+            };
             assert!(model.session_location_refusals.is_empty());
             actual_directory = moved_directory;
             generation = handle.account_switch_generation().unwrap().unwrap();
@@ -4811,17 +4897,37 @@ done
         if completed {
             handle.close().unwrap();
             let record = host.lock().unwrap().chats.remove(&source.id).unwrap();
-            let failure = recover_account(&host, 1, source.clone(), replacement.clone(),
-                None, true, Default::default()).unwrap_err();
-            assert!(failure.message.contains("directory pin is unavailable"), "{}", failure.message);
+            let failure = recover_account(
+                &host,
+                1,
+                source.clone(),
+                replacement.clone(),
+                None,
+                true,
+                Default::default(),
+            )
+            .unwrap_err();
+            assert!(
+                failure.message.contains("directory pin is unavailable"),
+                "{}",
+                failure.message
+            );
             assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
             host.lock().unwrap().chats.insert(source.id, record);
         }
         if replaced {
             std::fs::rename(&actual_directory, directory.path().join("retired-project")).unwrap();
             std::fs::create_dir(&actual_directory).unwrap();
-            let failure = recover_account(&host, 1, source.clone(), replacement,
-                None, true, Default::default()).unwrap_err();
+            let failure = recover_account(
+                &host,
+                1,
+                source.clone(),
+                replacement,
+                None,
+                true,
+                Default::default(),
+            )
+            .unwrap_err();
             assert!(failure.message.contains("directory"), "{}", failure.message);
             assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
             assert_eq!(std::fs::read(&transcript).unwrap(), b"{}\n");
@@ -4837,16 +4943,23 @@ done
             Default::default(),
         )
         .unwrap();
-        let ServerResponse::ChatAttached { session, snapshot, .. } = response else {
+        let ServerResponse::ChatAttached {
+            session, snapshot, ..
+        } = response
+        else {
             panic!("Expected confirmed account attachment")
         };
         assert_eq!(session.launch.session_id.as_deref(), Some(conversation));
         assert_eq!(snapshot.session_id.as_deref(), Some(conversation));
         let successor = host.lock().unwrap().chats[&session.id].handle.clone();
-        let proof = successor.capture_execution_directory(&actual_directory).unwrap();
+        let proof = successor
+            .capture_execution_directory(&actual_directory)
+            .unwrap();
         assert_eq!(proof.identity, identity);
-        assert_eq!(session.launch.recipe.working_directory, source.launch.recipe.working_directory,
-            "operational relocation must not rewrite the issued account-switch recipe");
+        assert_eq!(
+            session.launch.recipe.working_directory, source.launch.recipe.working_directory,
+            "operational relocation must not rewrite the issued account-switch recipe"
+        );
 
         if explicit {
             assert_eq!(
@@ -5653,50 +5766,116 @@ done
         use crate::chat::protocol::{Adapter, ProcessSpec, Step};
         struct Quiet;
         impl Adapter for Quiet {
-            fn initialize(&mut self) -> Result<Step,String> { Ok(Step::default()) }
-            fn command(&mut self,_:chat::Command) -> Result<Step,String> { Ok(Step::default()) }
-            fn receive(&mut self,_:serde_json::Value) -> Result<Step,String> { Ok(Step::default()) }
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: chat::Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
         let root = tempfile::tempdir().unwrap();
         use std::os::unix::ffi::OsStringExt;
-        let actual = root.path().join(std::ffi::OsString::from_vec(b"actual-b-\xff".to_vec()));
+        let actual = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"actual-b-\xff".to_vec()));
         std::fs::create_dir(&actual).unwrap();
         let selected = root.path().join("selected-b");
-        std::os::unix::fs::symlink(&actual,&selected).unwrap();
-        let source = Session { id:TerminalId::new(),proof:None,terminal:None,
-            native_continuity:Default::default(),owned_codex_listener:None,
-            launch:chat::Launch { provider:Provider::Claude,session_id:None,
-                recipe:crate::model::LaunchRecipe { program:"/bin/cat".into(),arguments:Vec::new(),
-                    working_directory:root.path().into(),environment:BTreeMap::new(),unset_environment:Default::default() } } };
+        std::os::unix::fs::symlink(&actual, &selected).unwrap();
+        let source = Session {
+            id: TerminalId::new(),
+            proof: None,
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                session_id: None,
+                recipe: crate::model::LaunchRecipe {
+                    program: "/bin/cat".into(),
+                    arguments: Vec::new(),
+                    working_directory: root.path().into(),
+                    environment: BTreeMap::new(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
         let mut spec = ProcessSpec::from(&source.launch.recipe);
-        spec.environment.insert("CLAUDE_CONFIG_DIR".into(),selected.to_str().unwrap().into());
+        spec.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            selected.to_str().unwrap().into(),
+        );
         let mut initial = Step::default();
-        let store = chat::runtime::preflight(&spec,&mut initial).unwrap();
-        let handle = Handle::start_owned(spec,Box::new(Quiet),initial,store,source.clone(),Default::default(),|_|{}).unwrap();
-        let record = Record { execution_instance:uuid::Uuid::nil(),console_recipe:None,paired_terminal:None,
-            session:source.clone(),handle:handle.clone(),source_process:None,subscribers:BTreeMap::new(),
-            observations:BTreeMap::new(),completion_observed:false,returning_terminal:false };
-        let reply=session_snapshot(&record);
-        let binary=postcard::to_allocvec(&reply).unwrap();
-        let decoded:ServerResponse=postcard::from_bytes(&binary).unwrap();
-        let json=serde_json::to_vec(&reply).unwrap();
-        let json_decoded:ServerResponse=serde_json::from_slice(&json).unwrap();
-        let ServerResponse::ChatAttached {account_home:Some(json_home),..}=json_decoded else {panic!("JSON attachment metadata expected");};
-        let ServerResponse::ChatAttached {session,account_home,..} = decoded else { panic!("attachment expected"); };
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start_owned(
+            spec,
+            Box::new(Quiet),
+            initial,
+            store,
+            source.clone(),
+            Default::default(),
+            |_| {},
+        )
+        .unwrap();
+        let record = Record {
+            execution_instance: uuid::Uuid::nil(),
+            console_recipe: None,
+            paired_terminal: None,
+            session: source.clone(),
+            handle: handle.clone(),
+            source_process: None,
+            subscribers: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            completion_observed: false,
+            returning_terminal: false,
+        };
+        let reply = session_snapshot(&record);
+        let binary = postcard::to_allocvec(&reply).unwrap();
+        let decoded: ServerResponse = postcard::from_bytes(&binary).unwrap();
+        let json = serde_json::to_vec(&reply).unwrap();
+        let json_decoded: ServerResponse = serde_json::from_slice(&json).unwrap();
+        let ServerResponse::ChatAttached {
+            account_home: Some(json_home),
+            ..
+        } = json_decoded
+        else {
+            panic!("JSON attachment metadata expected");
+        };
+        let ServerResponse::ChatAttached {
+            session,
+            account_home,
+            ..
+        } = decoded
+        else {
+            panic!("attachment expected");
+        };
         let captured = account_home.unwrap();
-        assert_eq!(captured,json_home);
-        assert!(session.launch.recipe.environment.is_empty(),"issued provenance remains unchanged");
-        assert_eq!(captured.canonical_home,actual.canonicalize().unwrap());
+        assert_eq!(captured, json_home);
+        assert!(
+            session.launch.recipe.environment.is_empty(),
+            "issued provenance remains unchanged"
+        );
+        assert_eq!(captured.canonical_home, actual.canonicalize().unwrap());
         use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::metadata(&actual).unwrap();
-        assert_eq!((captured.device,captured.inode),(metadata.dev(),metadata.ino()));
+        assert_eq!(
+            (captured.device, captured.inode),
+            (metadata.dev(), metadata.ino())
+        );
         // Replacing the path cannot rewrite an existing attachment's identity.
-        std::fs::rename(&actual,root.path().join("retained-b")).unwrap();
+        std::fs::rename(&actual, root.path().join("retained-b")).unwrap();
         std::fs::create_dir(&actual).unwrap();
-        let ServerResponse::ChatAttached {account_home:Some(repeated),..}=session_snapshot(&record) else { panic!("captured association expected"); };
-        assert_eq!(captured,repeated);
-        assert_ne!(captured.inode,std::fs::metadata(&actual).unwrap().ino());
+        let ServerResponse::ChatAttached {
+            account_home: Some(repeated),
+            ..
+        } = session_snapshot(&record)
+        else {
+            panic!("captured association expected");
+        };
+        assert_eq!(captured, repeated);
+        assert_ne!(captured.inode, std::fs::metadata(&actual).unwrap().ino());
         handle.close().unwrap();
     }
-
 }

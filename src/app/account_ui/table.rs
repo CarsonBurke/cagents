@@ -1523,32 +1523,61 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let id = app.account_ui.add_managed_fixture(Provider::Claude, 606);
         app.account_ui.installed.insert(Provider::Claude, true);
-        app.account_ui.account_mut(&id).unwrap().failure = Some("Fixture provider could not connect".into());
+        app.account_ui.account_mut(&id).unwrap().failure =
+            Some("Fixture provider could not connect".into());
         let (rendered, _) = super::super::acceptance_support::inspect(table(&app, 1100.0), None);
-        assert!(rendered.0.iter().any(|(text, _)| text.contains("Managed by Omp")));
-        assert!(rendered.0.iter().any(|(text, _)| text.contains("Fixture provider could not connect")));
+        assert!(
+            rendered
+                .0
+                .iter()
+                .any(|(text, _)| text.contains("Managed by Omp"))
+        );
+        assert!(
+            rendered
+                .0
+                .iter()
+                .any(|(text, _)| text.contains("Fixture provider could not connect"))
+        );
         let account = app.account_ui.account_mut(&id).unwrap();
         account.failure = None;
-        let mut snapshot = UsageSnapshot::state(UsageStatus::Unavailable, "Usage not reported for this plan", now_ms());
+        let mut snapshot = UsageSnapshot::state(
+            UsageStatus::Unavailable,
+            "Usage not reported for this plan",
+            now_ms(),
+        );
         snapshot.detail = Some("Usage not reported for this plan".into());
         account.snapshot = Some(snapshot);
         let (rendered, _) = super::super::acceptance_support::inspect(table(&app, 1100.0), None);
-        assert!(rendered.0.iter().any(|(text, _)| text.contains("Usage not reported for this plan")));
+        assert!(
+            rendered
+                .0
+                .iter()
+                .any(|(text, _)| text.contains("Usage not reported for this plan"))
+        );
     }
 
     #[test]
     fn inline_sign_in_click_starts_preparation_for_that_account() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let id = app.account_ui.add_managed_fixture(Provider::Claude, 607);
-        app.account_ui.account_mut(&id).unwrap().snapshot = Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "Signed out", now_ms()));
+        app.account_ui.account_mut(&id).unwrap().snapshot = Some(UsageSnapshot::state(
+            UsageStatus::NeedsLogin,
+            "Signed out",
+            now_ms(),
+        ));
         let owner = app.account_ui.account(&id).unwrap().owner;
         let (_, messages) = super::super::acceptance_support::inspect(
-            actions(&app, app.account_ui.account(&id).unwrap(), now_ms(), None), Some("Sign in"));
+            actions(&app, app.account_ui.account(&id).unwrap(), now_ms(), None),
+            Some("Sign in"),
+        );
         let message = messages.into_iter().find(|message| matches!(message, Message::AccountUi(Action::SignIn(actual)) if actual == &id))
             .expect("one direct click must target this account's sign-in");
         drop(app.update(message));
         assert!(app.account_ui.preparing_logins.contains(&owner));
-        assert!(app.account_ui.table.menu.is_none(), "sign-in needs no account menu");
+        assert!(
+            app.account_ui.table.menu.is_none(),
+            "sign-in needs no account menu"
+        );
     }
 
     #[test]
@@ -1557,9 +1586,21 @@ mod tests {
         let id = app.account_ui.add_managed_fixture(Provider::Claude, 608);
         app.account_ui.table.confirm_remove = Some(id.clone());
         app.account_ui.table.confirm_conversations = Some(Ok(3));
-        let (rendered, _) = super::super::acceptance_support::inspect(menu(&app, app.account_ui.account(&id).unwrap(), None), None);
-        for expected in ["3 saved conversation(s)", "Archive signs out", "All transcripts and files stay on disk", "Delete files permanently removes", "Type the account name"] {
-            assert!(rendered.0.iter().any(|(text, _)| text.contains(expected)), "missing dialog text {expected:?}");
+        let (rendered, _) = super::super::acceptance_support::inspect(
+            menu(&app, app.account_ui.account(&id).unwrap(), None),
+            None,
+        );
+        for expected in [
+            "3 saved conversation(s)",
+            "Archive signs out",
+            "All transcripts and files stay on disk",
+            "Delete files permanently removes",
+            "Type the account name",
+        ] {
+            assert!(
+                rendered.0.iter().any(|(text, _)| text.contains(expected)),
+                "missing dialog text {expected:?}"
+            );
         }
     }
 }

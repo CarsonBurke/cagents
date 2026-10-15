@@ -71,8 +71,13 @@ impl From<&scope::LaunchAccountScope> for HomeIdentity {
         purge_ids.extend(scope.registered_id.iter().cloned());
         purge_ids.sort();
         purge_ids.dedup();
-        Self { provider: scope.provider, canonical_home: scope.canonical_home.clone(),
-            device: scope.device, inode: scope.inode, purge_ids }
+        Self {
+            provider: scope.provider,
+            canonical_home: scope.canonical_home.clone(),
+            device: scope.device,
+            inode: scope.inode,
+            purge_ids,
+        }
     }
 }
 

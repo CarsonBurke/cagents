@@ -346,7 +346,9 @@ impl Pane {
     }
 
     /// One frame: the refresh, the view, its diff and layout, and its draw.
-    fn frame(&mut self) -> [Duration; 4] { self.frame_with_pointer(false) }
+    fn frame(&mut self) -> [Duration; 4] {
+        self.frame_with_pointer(false)
+    }
 
     fn frame_with_pointer(&mut self, pointer_event: bool) -> [Duration; 4] {
         let clock = Instant::now();
@@ -380,9 +382,15 @@ impl Pane {
         let clock = Instant::now();
         if pointer_event {
             let point = cosmic::iced::Point::new(400.0, 400.0);
-            ui.update(&[cosmic::iced::Event::Mouse(mouse::Event::CursorMoved { position: point })],
-                mouse::Cursor::Available(point), &mut self.renderer,
-                &mut cosmic::iced::advanced::clipboard::Null, &mut Vec::new());
+            ui.update(
+                &[cosmic::iced::Event::Mouse(mouse::Event::CursorMoved {
+                    position: point,
+                })],
+                mouse::Cursor::Available(point),
+                &mut self.renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Vec::new(),
+            );
         }
         ui.draw(
             &mut self.renderer,
@@ -898,7 +906,10 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
 #[test]
 #[ignore = "optimized viewport scaling measurement; records fixed budget and size ratio"]
 fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
-    assert!(!cfg!(debug_assertions), "use optimized dev-runtime with opt-level2");
+    assert!(
+        !cfg!(debug_assertions),
+        "use optimized dev-runtime with opt-level2"
+    );
     let mut medians = Vec::new();
     for (name, bytes, tools, form) in [
         ("small", 16_usize * 1024, 10, 0),
@@ -906,24 +917,47 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
         ("many paragraphs", 1024 * 1024, 300, 1),
         ("giant fence", 1024 * 1024, 300, 2),
     ] {
-        let mut items = vec![item("viewport-prompt".into(), chat::Role::User,
-            prose("Inspect the transcript.".into(), false, chat::Phase::Final))];
+        let mut items = vec![item(
+            "viewport-prompt".into(),
+            chat::Role::User,
+            prose("Inspect the transcript.".into(), false, chat::Phase::Final),
+        )];
         for index in 0..tools {
-            items.push(item(format!("viewport-tool-{index}"), chat::Role::Assistant,
-                ItemContent::Command { label: String::new(), command: format!("read file-{index}.rs"),
-                    working_directory: "/fixture".into(), action: chat::CommandAction::Read,
-                    status: chat::ToolStatus::Succeeded, exit_code: Some(0), duration_ms: Some(1),
-                    output: "fixture output\n".repeat(8) }));
+            items.push(item(
+                format!("viewport-tool-{index}"),
+                chat::Role::Assistant,
+                ItemContent::Command {
+                    label: String::new(),
+                    command: format!("read file-{index}.rs"),
+                    working_directory: "/fixture".into(),
+                    action: chat::CommandAction::Read,
+                    status: chat::ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    output: "fixture output\n".repeat(8),
+                },
+            ));
         }
-        let atom = if form == 1 { "Measured plain paragraph.\n\n" } else { "Measured plain paragraph. " };
+        let atom = if form == 1 {
+            "Measured plain paragraph.\n\n"
+        } else {
+            "Measured plain paragraph. "
+        };
         let mut body = atom.repeat(bytes.div_ceil(atom.len()));
         body.truncate(bytes);
-        if form == 2 { body = format!("```text\n{body}\n```\n"); }
-        items.push(item("viewport-answer".into(), chat::Role::Assistant,
-            prose(body, false, chat::Phase::Final)));
+        if form == 2 {
+            body = format!("```text\n{body}\n```\n");
+        }
+        items.push(item(
+            "viewport-answer".into(),
+            chat::Role::Assistant,
+            prose(body, false, chat::Phase::Final),
+        ));
         let mut pane = Pane::new(items);
         pane.runtime.tool_groups_expanded = true;
-        for _ in 0..WARMUP { pane.frame_with_pointer(true); }
+        for _ in 0..WARMUP {
+            pane.frame_with_pointer(true);
+        }
         let mut totals = Stage::default();
         let mut stages = Stages::default();
         for _ in 0..SAMPLES {
@@ -938,8 +972,18 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
     }
     let small = medians[0].1;
     for (name, median) in medians {
-        println!("{name}: event median {:.3}ms, ratio {:.3}", median.as_secs_f64()*1000.0, median.as_secs_f64()/small.as_secs_f64());
-        assert!(median <= Duration::from_millis(2), "{name} exceeded2ms viewport budget: {median:?}");
-        assert!(median <= small * 2, "{name} exceeded2x fixed-viewport scaling budget");
+        println!(
+            "{name}: event median {:.3}ms, ratio {:.3}",
+            median.as_secs_f64() * 1000.0,
+            median.as_secs_f64() / small.as_secs_f64()
+        );
+        assert!(
+            median <= Duration::from_millis(2),
+            "{name} exceeded2ms viewport budget: {median:?}"
+        );
+        assert!(
+            median <= small * 2,
+            "{name} exceeded2x fixed-viewport scaling budget"
+        );
     }
 }

@@ -4,11 +4,11 @@ use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 pub mod annotations;
+pub mod annotations;
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod original;
 pub mod presentation;
-pub mod annotations;
 pub mod pricing;
 
 pub const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
@@ -2792,11 +2792,20 @@ pub(crate) fn fresh_session_configured(
     // Explicit conversation choices supersede saved defaults, including a
     // retained default from a newer build. Validate only the effective policy.
     let mut effective = configuration.clone();
-    if overrides.model.is_some() { effective.model = None; }
-    if overrides.effort.is_some() { effective.effort = None; }
-    if overrides.permission_mode.is_some() { effective.permission_mode = None; }
+    if overrides.model.is_some() {
+        effective.model = None;
+    }
+    if overrides.effort.is_some() {
+        effective.effort = None;
+    }
+    if overrides.permission_mode.is_some() {
+        effective.permission_mode = None;
+    }
     effective.validate(provider)?;
-    for value in [overrides.model, overrides.effort, overrides.permission_mode].into_iter().flatten() {
+    for value in [overrides.model, overrides.effort, overrides.permission_mode]
+        .into_iter()
+        .flatten()
+    {
         if value.trim().is_empty() || value.chars().any(char::is_control) {
             return Err("Conversation model, effort and permission choices must be non-empty names without control characters.".into());
         }

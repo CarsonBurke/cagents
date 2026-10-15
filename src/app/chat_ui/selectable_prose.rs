@@ -1,7 +1,7 @@
 //! Owned selectable rich text: selection uses the same shaped paragraph as prose.
 use super::*;
-use iced::advanced::text::{Paragraph, Renderer as TextRenderer};
 use iced::advanced::Renderer as _;
+use iced::advanced::text::{Paragraph, Renderer as TextRenderer};
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
@@ -105,21 +105,32 @@ impl State {
     /// existing bounded paragraph and never shapes an offscreen source.
     pub(super) fn logical_byte_bounds(&self, identity: u64, byte: usize) -> Option<Rectangle> {
         let logical = self.logical.as_ref()?;
-        if logical.identity != identity || byte < logical.start { return None; }
+        if logical.identity != identity || byte < logical.start {
+            return None;
+        }
         let byte = byte - logical.start;
-        if byte > self.plain.len() { return None; }
+        if byte > self.plain.len() {
+            return None;
+        }
         let paragraph = self.paragraph();
         let mut prefixes = Vec::with_capacity(paragraph.buffer().lines.len());
         let mut offset = 0;
         for line in &paragraph.buffer().lines {
-            prefixes.push(offset); offset += line.text().len() + line.ending().as_str().len();
+            prefixes.push(offset);
+            offset += line.text().len() + line.ending().as_str().len();
         }
         let mut last = None;
         for run in paragraph.buffer().layout_runs() {
             for glyph in run.glyphs {
-                let bounds = Rectangle::new(Point::new(glyph.x.min(glyph.x + glyph.w), run.line_top),
-                    Size::new(glyph.w.abs(), run.line_height));
-                if prefixes[run.line_i] + glyph.start <= byte && byte < prefixes[run.line_i] + glyph.end { return Some(bounds); }
+                let bounds = Rectangle::new(
+                    Point::new(glyph.x.min(glyph.x + glyph.w), run.line_top),
+                    Size::new(glyph.w.abs(), run.line_height),
+                );
+                if prefixes[run.line_i] + glyph.start <= byte
+                    && byte < prefixes[run.line_i] + glyph.end
+                {
+                    return Some(bounds);
+                }
                 last = Some(bounds);
             }
         }
@@ -162,8 +173,14 @@ pub(super) struct Logical {
     pub start: usize,
 }
 
-pub(super) fn logical_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Logical) -> Element<'static, Message> {
+pub(super) fn logical_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, Some(logical))
 }
 
@@ -176,8 +193,14 @@ pub(super) fn text(
 ) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, None)
 }
-fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>) -> Element<'static, Message> {
+fn build_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<Logical>,
+) -> Element<'static, Message> {
     let plain: Arc<str> = spans
         .iter()
         .map(|span| span.text.as_ref())
@@ -294,17 +317,36 @@ impl Selectable {
 
 /// Paint byte-range backgrounds against the existing shaped glyph runs. This
 /// is independent of syntax span count and never reshapes selected text.
-fn paint_ranges(renderer: &mut cosmic::Renderer, paragraph: &ParagraphBuffer,
-    ranges: &[std::ops::Range<usize>], translation: iced::Vector, color: iced::Color) {
+fn paint_ranges(
+    renderer: &mut cosmic::Renderer,
+    paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>],
+    translation: iced::Vector,
+    color: iced::Color,
+) {
     visit_range_bounds(paragraph, ranges, |bounds| {
-        renderer.fill_quad(renderer::Quad { bounds: Rectangle { x: bounds.x + translation.x,
-            y: bounds.y + translation.y, ..bounds }, ..Default::default() }, color);
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: Rectangle {
+                    x: bounds.x + translation.x,
+                    y: bounds.y + translation.y,
+                    ..bounds
+                },
+                ..Default::default()
+            },
+            color,
+        );
     });
 }
 
-fn visit_range_bounds(paragraph: &ParagraphBuffer, ranges: &[std::ops::Range<usize>],
-    mut paint: impl FnMut(Rectangle)) {
-    if ranges.is_empty() { return; }
+fn visit_range_bounds(
+    paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>],
+    mut paint: impl FnMut(Rectangle),
+) {
+    if ranges.is_empty() {
+        return;
+    }
     let mut starts = Vec::with_capacity(paragraph.buffer().lines.len());
     let mut offset = 0;
     for line in &paragraph.buffer().lines {
@@ -316,8 +358,10 @@ fn visit_range_bounds(paragraph: &ParagraphBuffer, ranges: &[std::ops::Range<usi
         let mut bounds: Option<(f32, f32)> = None;
         let mut flush = |bounds: &mut Option<(f32, f32)>| {
             if let Some((left, right)) = bounds.take() {
-                paint(Rectangle::new(Point::new(left, run.line_top),
-                    Size::new(right - left, run.line_height)));
+                paint(Rectangle::new(
+                    Point::new(left, run.line_top),
+                    Size::new(right - left, run.line_height),
+                ));
             }
         };
         for glyph in run.glyphs {
@@ -327,9 +371,15 @@ fn visit_range_bounds(paragraph: &ParagraphBuffer, ranges: &[std::ops::Range<usi
             if ranges.get(found).is_some_and(|range| range.start < end) {
                 let left = glyph.x.min(glyph.x + glyph.w);
                 let right = glyph.x.max(glyph.x + glyph.w);
-                if let Some((lo, hi)) = bounds.as_mut() { *lo = lo.min(left); *hi = hi.max(right); }
-                else { bounds = Some((left, right)); }
-            } else { flush(&mut bounds); }
+                if let Some((lo, hi)) = bounds.as_mut() {
+                    *lo = lo.min(left);
+                    *hi = hi.max(right);
+                } else {
+                    bounds = Some((left, right));
+                }
+            } else {
+                flush(&mut bounds);
+            }
         }
         flush(&mut bounds);
     }
@@ -385,7 +435,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     fn state(&self) -> tree::State {
         tree::State::new(State::default())
     }
-    fn children(&self) -> Vec<Tree> { vec![] }
+    fn children(&self) -> Vec<Tree> {
+        vec![]
+    }
     fn diff(&mut self, _tree: &mut Tree) {}
     fn size(&self) -> Size<Length> {
         Size::new(Length::Shrink, Length::Shrink)
@@ -437,7 +489,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
         }
         state.shape = Some(shape);
-        layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, state.paragraph().min_bounds()))
+        layout::Node::new(limits.resolve(
+            Length::Shrink,
+            Length::Shrink,
+            state.paragraph().min_bounds(),
+        ))
     }
     fn operate(
         &mut self,
@@ -459,39 +515,73 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        if layout.bounds().intersection(viewport).is_none() { return; }
+        if layout.bounds().intersection(viewport).is_none() {
+            return;
+        }
         let state = tree.state.downcast_ref::<State>();
         let paragraph = state.paragraph();
         let translation = layout.position() - Point::ORIGIN;
         // Preserve inline code surfaces, emphasis, links and strike-throughs
         // without allocating a second rich-text widget or shaped buffer.
         for (index, span) in self.spans.iter().enumerate() {
-            if span.highlight.is_none() && !span.underline && !span.strikethrough { continue; }
+            if span.highlight.is_none() && !span.underline && !span.strikethrough {
+                continue;
+            }
             for bounds in paragraph.span_bounds(index) {
                 if let Some(highlight) = span.highlight {
-                    renderer.fill_quad(renderer::Quad {
-                        bounds: Rectangle::new(bounds.position() - iced::Vector::new(span.padding.left, span.padding.top),
-                            bounds.size() + Size::new(span.padding.x(), span.padding.y())) + translation,
-                        border: highlight.border, ..Default::default()
-                    }, highlight.background);
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle::new(
+                                bounds.position()
+                                    - iced::Vector::new(span.padding.left, span.padding.top),
+                                bounds.size() + Size::new(span.padding.x(), span.padding.y()),
+                            ) + translation,
+                            border: highlight.border,
+                            ..Default::default()
+                        },
+                        highlight.background,
+                    );
                 }
                 let size = span.size.unwrap_or(self.size);
                 let line_height = span.line_height.unwrap_or_default().to_absolute(size).0;
                 let baseline = size.0 + (line_height - size.0) / 2.0;
-                for (draw, shift) in [(span.underline, size.0 * 0.08), (span.strikethrough, size.0 / 2.0)] {
+                for (draw, shift) in [
+                    (span.underline, size.0 * 0.08),
+                    (span.strikethrough, size.0 / 2.0),
+                ] {
                     if draw {
-                        renderer.fill_quad(renderer::Quad {
-                            bounds: Rectangle::new(bounds.position() + translation + iced::Vector::new(0.0, baseline - shift),
-                                Size::new(bounds.width, 1.0)), ..Default::default()
-                        }, span.color.unwrap_or(defaults.text_color));
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: Rectangle::new(
+                                    bounds.position()
+                                        + translation
+                                        + iced::Vector::new(0.0, baseline - shift),
+                                    Size::new(bounds.width, 1.0),
+                                ),
+                                ..Default::default()
+                            },
+                            span.color.unwrap_or(defaults.text_color),
+                        );
                     }
                 }
             }
         }
-        paint_ranges(renderer, paragraph, &self.matches, translation, design::accent_wash(theme));
+        paint_ranges(
+            renderer,
+            paragraph,
+            &self.matches,
+            translation,
+            design::accent_wash(theme),
+        );
         let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
         if !selection.is_empty() {
-            paint_ranges(renderer, paragraph, &[selection], translation, design::accent_color(theme));
+            paint_ranges(
+                renderer,
+                paragraph,
+                &[selection],
+                translation,
+                design::accent_color(theme),
+            );
         }
         renderer.fill_paragraph(paragraph, layout.position(), defaults.text_color, *viewport);
     }
@@ -595,8 +685,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             && let Some(position) = cursor.position_in(layout.bounds())
         {
             let state = tree.state.downcast_ref::<State>();
-            if state.link(position).is_some()
-            {
+            if state.link(position).is_some() {
                 mouse::Interaction::Pointer
             } else {
                 mouse::Interaction::Text
@@ -659,7 +748,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            };
+        };
         let state = State {
             spans: Some(spans),
             shape: Some(Shape {
@@ -691,50 +780,94 @@ mod tests {
         let renderer = crate::app::tests::headless_renderer();
         let source = "Latin fi e\u{301} αβ العربية text";
         let identity = 0x1234;
-        let mut element = logical_text(vec![Span::new(source.to_owned())].into(),
-            design::TEXT_PROSE.into(), iced::Font::default(),
-            Target { card: CardId::new(), generation: 0 }, None, Logical { identity, start: 100 });
+        let mut element = logical_text(
+            vec![Span::new(source.to_owned())].into(),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+            Logical {
+                identity,
+                start: 100,
+            },
+        );
         let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(150.0, f32::INFINITY)));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(150.0, f32::INFINITY)),
+        );
         let state = tree.state.downcast_ref::<State>();
         for (byte, ch) in source.char_indices().filter(|(_, ch)| !ch.is_whitespace()) {
             let mut painted = Vec::new();
-            visit_range_bounds(state.paragraph(), &[byte..byte + ch.len_utf8()], |bounds| painted.push(bounds));
-            assert!(!painted.is_empty(), "every selected grapheme paints its existing cluster");
+            visit_range_bounds(state.paragraph(), &[byte..byte + ch.len_utf8()], |bounds| {
+                painted.push(bounds)
+            });
+            assert!(
+                !painted.is_empty(),
+                "every selected grapheme paints its existing cluster"
+            );
             for bounds in painted {
-                assert!(bounds.x >= -0.5 && bounds.x + bounds.width <=150.5);
-                assert!(bounds.y >= -0.5 && bounds.y + bounds.height <= node.size().height +0.5);
+                assert!(bounds.x >= -0.5 && bounds.x + bounds.width <= 150.5);
+                assert!(bounds.y >= -0.5 && bounds.y + bounds.height <= node.size().height + 0.5);
             }
             assert!(state.logical_byte_bounds(identity, 100 + byte).is_some());
         }
         assert!(state.logical_byte_bounds(identity, 99).is_none());
-        assert!(state.logical_byte_bounds(identity +1, 100).is_none());
-        assert_eq!(state.paragraph_builds.get(), 1, "paint/navigation reuse the same paragraph");
+        assert!(state.logical_byte_bounds(identity + 1, 100).is_none());
+        assert_eq!(
+            state.paragraph_builds.get(),
+            1,
+            "paint/navigation reuse the same paragraph"
+        );
     }
 
     #[test]
     fn selection_reuses_the_paragraph_used_for_drawing_and_hit_testing() {
         let renderer = crate::app::tests::headless_renderer();
-        let mut element = text(vec![Span::new("linked α prose ".repeat(100)).link("source.rs".to_owned())].into(),
-            design::TEXT_PROSE.into(), iced::Font::default(),
-            Target { card: CardId::new(), generation: 0 }, Some("prose"));
+        let mut element = text(
+            vec![Span::new("linked α prose ".repeat(100)).link("source.rs".to_owned())].into(),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            Some("prose"),
+        );
         let mut tree = Tree::new(&element);
         let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, f32::INFINITY));
-        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
         let state = tree.state.downcast_ref::<State>();
         let buffer = state.paragraph().buffer() as *const _ as usize;
         assert_eq!(state.paragraph_builds.get(), 1);
-        assert!(tree.children.is_empty(), "no second rich-text paragraph tree");
+        assert!(
+            tree.children.is_empty(),
+            "no second rich-text paragraph tree"
+        );
         for end in [1, 20, 100, 300] {
             let state = tree.state.downcast_mut::<State>();
             state.anchor = 0;
             state.end = end;
-            element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
             let state = tree.state.downcast_ref::<State>();
-            assert_eq!(state.paragraph_builds.get(), 1, "selection does not construct another paragraph");
-            assert_eq!(buffer, state.paragraph().buffer() as *const _ as usize,
-                "selection changes paint bounds instead of reshaping spans");
+            assert_eq!(
+                state.paragraph_builds.get(),
+                1,
+                "selection does not construct another paragraph"
+            );
+            assert_eq!(
+                buffer,
+                state.paragraph().buffer() as *const _ as usize,
+                "selection changes paint bounds instead of reshaping spans"
+            );
         }
     }
 
@@ -872,7 +1005,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            };
+        };
         let state = State {
             anchor: "before ".len(),
             end: "before αβ".len(),
@@ -915,7 +1048,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            };
+        };
         assert_eq!(
             selectable
                 .selected_spans(&State::default())
@@ -940,7 +1073,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            };
+        };
         let spans = selectable.selected_spans(&State::default());
         assert_eq!(
             spans

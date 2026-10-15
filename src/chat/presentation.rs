@@ -200,7 +200,12 @@ impl Presentation {
     /// Consuming the update avoids cloning catalogs or transcript payloads.
     pub(crate) fn metadata_for(mut self, previous: &Snapshot) -> Result<Snapshot, &'static str> {
         self.restore_metadata(previous)?;
-        if self.metadata.subagents.iter().any(|agent| !agent.items.is_empty()) {
+        if self
+            .metadata
+            .subagents
+            .iter()
+            .any(|agent| !agent.items.is_empty())
+        {
             return Err("Unexpected child transcript body");
         }
         Ok(self.metadata)
@@ -490,8 +495,10 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&summary, &hidden.file_changes));
         let mut wrong_base = previous.clone();
         wrong_base.generation = 0;
-        assert!(update.clone().metadata_for(&wrong_base).is_err(),
-            "hidden subscribers cannot retain a summary from another revision");
+        assert!(
+            update.clone().metadata_for(&wrong_base).is_err(),
+            "hidden subscribers cannot retain a summary from another revision"
+        );
         let mut stale = update.clone();
         stale.metadata.generation = previous.generation;
         assert!(stale.metadata_for(&previous).is_err());

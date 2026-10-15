@@ -20,8 +20,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-mod directory;
 mod annotations;
+mod directory;
 mod execution;
 mod store;
 mod websocket;
@@ -1182,8 +1182,9 @@ impl Handle {
     /// A completed source has no further actor publications. Retain its last
     /// actor-published controls when its approved directory pin can be handed on.
     pub(crate) fn completed_account_options(&self) -> Option<AccountSwitchOptions> {
-        self.is_completed().then(|| AccountSwitchOptions::capture(
-            &self.0.state.lock().unwrap_or_else(|p| p.into_inner())))
+        self.is_completed().then(|| {
+            AccountSwitchOptions::capture(&self.0.state.lock().unwrap_or_else(|p| p.into_inner()))
+        })
     }
 
     pub(crate) fn launch_account_scope(
