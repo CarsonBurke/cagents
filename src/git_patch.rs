@@ -15,6 +15,7 @@ pub struct Patch {
     pub(crate) expected_head: Option<GitHeadGuard>,
     /// Exact replacement for a dirty live buffer's single undo transaction.
     pub(crate) working_text: Option<Arc<String>>,
+    pub(crate) buffer_change: Option<Arc<crate::editor_history::TextChange>>,
 }
 
 /// A selected change is rebuilt from exact immutable source strings. The
@@ -47,7 +48,7 @@ pub(crate) fn selected_patch(
     };
     let patch = mode_aware_patch(old_path, new_path, before, after, modes)?;
     (!patch.is_empty()).then_some(Patch { patch: patch.into(), cached: kind != Kind::Revert, reverse: undo,
-        expected_head, working_text: (kind == Kind::Revert).then(|| Arc::new(desired)) })
+        expected_head, working_text: (kind == Kind::Revert).then(|| Arc::new(desired)), buffer_change: None })
 }
 
 

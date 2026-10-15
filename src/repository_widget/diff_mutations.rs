@@ -21,12 +21,19 @@ pub(crate) struct Capture {
     pub old_path: RepoPath,
     pub new_path: RepoPath,
     pub buffer_revision: Option<u64>,
+    buffer_snapshot: Option<text_editor::TextSnapshot>,
 }
 
 impl Capture {
     pub fn build(self) -> Option<(AsyncIdentity, Option<u64>, git_patch::Patch)> {
-        let patch = git_patch::selected_patch(&self.model, &self.old_path, &self.new_path,
+        let mut patch = git_patch::selected_patch(&self.model, &self.old_path, &self.new_path,
             self.mode, self.rows, self.kind)?;
+        if let Some(snapshot) = self.buffer_snapshot {
+            if snapshot.text().as_ref() != self.model.after.as_ref() { return None; }
+            let replacement = patch.working_text.take()?;
+            patch.buffer_change = Some(Arc::new(buffer_change(&snapshot, replacement.as_str())?));
+        }
+        patch.working_text = None;
         Some((self.identity, self.buffer_revision, patch))
     }
 }
@@ -79,34 +86,52 @@ impl RepositoryRuntime {
         let path = self.selected_path()?.to_owned();
         let file = self.subject_file()?;
         let old_path = file.previous_path(&self.diff_basis).unwrap_or_else(|| path.clone());
-        let buffer_revision = if kind == git_patch::Kind::Revert && self.is_dirty() {
-            match &self.document { DocumentState::Editable(document) => Some(document.revision), _ => return None }
-        } else { None };
+        let (buffer_revision, buffer_snapshot) = if kind == git_patch::Kind::Revert && self.is_dirty() {
+            match &self.document { DocumentState::Editable(document) => (Some(document.revision), Some(document.content.text_snapshot())), _ => return None }
+        } else { (None, None) };
         Some(Capture { identity: self.current_identity(card, path.clone()), model, kind,
             mode: self.diff_mode, rows, old_path: RepoPath::parse(old_path).ok()?,
-            new_path: RepoPath::parse(path).ok()?, buffer_revision })
+            new_path: RepoPath::parse(path).ok()?, buffer_revision, buffer_snapshot })
     }
 
     /// A delayed revert must not overwrite typing performed while its patch
-    /// was prepared. Native Paste records this replacement as one undo step.
+    /// was prepared. The worker measured one native replacement; applying it
+    /// touches only that span and records the original caret for one undo step.
     pub(crate) fn apply_diff_buffer_revert(
         &mut self,
         identity: &AsyncIdentity,
         revision: u64,
-        replacement: Arc<String>,
+        change: Arc<TextChange>,
     ) -> Result<(), String> {
         if !self.accepts_selected(identity) || self.is_saving() { return Err("The file changed while Revert was prepared. Try again.".into()); }
         let DocumentState::Editable(document) = &mut self.document else { return Err("The editable file is no longer open.".into()); };
         if document.revision != revision { return Err("The buffer changed while Revert was prepared. Try again.".into()); }
         let cursor = document.content.cursor();
         let scroll = document.content.scroll_position();
-        document.content.perform(text_editor::Action::SelectAll);
-        document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(replacement)));
+        let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
+        if !buffer.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks) {
+            return Err("The selected change no longer matches the buffer. Try again.".into());
+        }
+        let edits = buffer.edits;
         document.content.set_cursor(cursor);
         document.content.restore_scroll_position(scroll);
-        self.push_lsp_change(None);
+        document.history.record_group(vec![Arc::unwrap_or_clone(change)], cursor, document.content.cursor(), Instant::now());
+        document.text_changed();
+        self.push_lsp_edits(edits);
         Ok(())
     }
+}
+
+/// Preserve the native line map in the removed fragments, including adjacent
+/// CR/LF endings retained by earlier edits. CPU scanning and text copies stay
+/// on the worker; the application receives only the minimal replacement.
+fn buffer_change(snapshot: &text_editor::TextSnapshot, replacement: &str) -> Option<TextChange> {
+    let mut before = crate::editor_history::Excerpt::new(0);
+    for index in 0..snapshot.line_count() {
+        let line = snapshot.line(index)?;
+        before.push_line(&line.text, line.ending.as_str());
+    }
+    crate::editor_history::replacement(&before, &crate::editor_history::Excerpt::document(replacement), usize::MAX)
 }
 
 pub(super) const GUTTER_WIDTH: f32 = 44.0;
@@ -163,4 +188,48 @@ pub(super) fn gutter<'a>(
     if !staged { controls.push(button(git_patch::Kind::Revert, Icon::RevertFile, "Revert this hunk")); }
     widget::container(widget::row::with_children(controls).spacing(2.0))
         .center_y(height).width(GUTTER_WIDTH).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_change_buffer_revert_is_one_undo_step_with_exact_crlf_and_caret() {
+        let card = CardId::new();
+        let after = "first\r\nCHANGE\r\nkeep another hunk\r\nno final newline";
+        let desired = "first\r\noriginal\r\nkeep another hunk\r\nno final newline";
+        let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.txt", after);
+        let DocumentState::Editable(document) = &mut runtime.document else { panic!("expected editable fixture"); };
+        let cursor = text_editor::Cursor { position: text_editor::Position { line: 2, column: 4 }, selection: None };
+        document.content.set_cursor(cursor);
+        let revision = document.revision;
+        let change = buffer_change(&document.content.text_snapshot(), desired).unwrap();
+        assert_eq!(change.start.line, 1);
+        assert!(!change.removed.contains("first") && !change.removed.contains("another hunk"));
+        assert!(!document.history.can_undo());
+        runtime.apply_diff_buffer_revert(&identity, revision, Arc::new(change)).unwrap();
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+        assert_eq!(document.content.text(), desired);
+        assert_eq!(document.content.cursor(), cursor);
+        assert!(document.step_history(false).is_some());
+        assert_eq!(document.content.text(), after);
+        assert_eq!(document.content.cursor(), cursor);
+        assert!(!document.history.can_undo());
+        assert!(document.step_history(true).is_some());
+        assert_eq!(document.content.text(), desired);
+    }
+
+    #[test]
+    fn partial_change_buffer_revert_refuses_later_typing_without_losing_it() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.txt", "changed\n");
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+        let revision = document.revision;
+        let change = buffer_change(&document.content.text_snapshot(), "original\n").unwrap();
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('!')));
+        let typed = document.content.text();
+        assert!(runtime.apply_diff_buffer_revert(&identity, revision, Arc::new(change)).is_err());
+        assert_eq!(runtime.editor_text().unwrap(), typed);
+    }
 }
