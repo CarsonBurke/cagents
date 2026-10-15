@@ -8922,7 +8922,7 @@ mod tests {
             fn execute(&self, command: &CommandSpec, cancellation: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
                 self.commands.lock().unwrap().push(command.clone());
                 if self.legacy_attribute_vars && command.arguments.windows(2).any(|pair| pair[0] == "var" && (pair[1] == "GIT_ATTR_SYSTEM" || pair[1] == "GIT_ATTR_GLOBAL")) {
-                    return Ok(exit(129, b""));
+                    return exit(129, b"");
                 }
                 IsolatedExecutor.execute(command, cancellation)
             }
