@@ -2298,111 +2298,9 @@ impl Runtime {
             }
         })
     }
-    fn refresh(&mut self) {
-        self.refresh_session();
-        if !self.visible.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(handle) = self.handle() else {
-            return;
-        };
-        let (mut snapshot, source_clock) = handle.snapshot_with_clock();
-        if self.page_request.is_some_and(|(_, generation)| {
-            snapshot.generation > generation && !snapshot.history_loading
-        }) && self
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.page.is_none())
-        {
-            self.page_request = None;
-            self.earlier_asked = None;
-            self.later_asked = None;
-        }
-        if self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
-        {
-            return;
-        }
-        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
-            self.finished_stamp = snapshot.finished_at.and_then(|at| {
-                let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
-                let full = format!(
-                    "{:04}-{:02}-{:02} {}",
-                    time.year + 1900,
-                    time.month + 1,
-                    time.day,
-                    time.clock()
-                );
-                Some((at, format!("Finished at {}", time.clock()), full))
-            });
-        }
-        self.subagent_scroll
-            .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
-        self.observed_scroll.borrow_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
-        self.settle_recalls(&snapshot);
-        self.taken_back.retain(|id| {
-            snapshot
-                .queued_messages
-                .iter()
-                .any(|message| &message.id == id)
-        });
-        if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
-            Arc::make_mut(&mut snapshot).permission_mode =
-                self.snapshot.permission_mode.clone().or_else(|| {
-                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
-                });
-        }
-        if !self.parent_scroll().at_bottom()
-            && !snapshot.has_later
-            && self.page_request.is_none()
-            && !snapshot.history_loading
-            && snapshot.items.last().is_some_and(|item| {
-                self.cache
-                    .get(&item.id)
-                    .is_none_or(|cached| cached.token != ChangeToken::of(&item.content))
-            })
-        {
-            self.unseen_activity = true;
-        }
-        // Restored and paged conversations carry their own prompt history.
-        // Preserve a recalled index while the reader is walking it.
-        if self.history_cursor.is_none() {
-            let mut count = 0;
-            for text in snapshot.items.iter().filter_map(|item| match (&item.role, &item.content) {
-                (chat::Role::User, ItemContent::Text { text, .. }) if !text.trim().is_empty() => Some(text),
-                _ => None,
-            }) {
-                if let Some(previous) = self.history.get_mut(count) {
-                    if previous != text { previous.clone_from(text); }
-                } else { self.history.push(text.clone()); }
-                count += 1;
-            }
-            self.history.truncate(count);
-        }
-        let live_ids: HashSet<&str> = snapshot
-            .items
-            .iter()
-            .chain(
-                snapshot
-                    .subagents
-                    .iter()
-                    .flat_map(|agent| agent.items.iter()),
-            )
-            .map(|item| item.id.as_str())
-            .collect();
-        if self
-            .selected_subagent
-            .as_ref()
-            .is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id))
-        {
-            self.selected_subagent = None;
-        }
-        self.cache.retain(|id, _| live_ids.contains(id.as_str()));
-        // Keep disclosure choices across page eviction, with a bounded budget.
-        // Question anchors only describe the currently loaded window.
-        if self.expanded.len() > 4096 {
-            self.expanded.retain(|id| live_ids.contains(id.as_str()));
-        }
-        self.asked_after.retain(|id| live_ids.contains(id.as_str()));
+    /// Prepare parent grouping metadata and only the currently selected
+    /// child's presentation. Hidden children keep no Markdown/highlight cache.
+    fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) {
         // Each transcript has its own streaming lifecycle: a child can keep
         // running after the parent finishes. Only its newest item can grow;
         // older items release their parser and highlighter continuation.
@@ -2412,7 +2310,7 @@ impl Runtime {
             .iter()
             .enumerate()
             .map(|(index, item)| (item, snapshot.busy && index == newest))
-            .chain(snapshot.subagents.iter().flat_map(|agent| {
+            .chain(snapshot.subagents.iter().filter(|agent| self.selected_subagent.as_ref() == Some(&agent.id)).flat_map(|agent| {
                 let newest = agent.items.len().wrapping_sub(1);
                 agent.items.iter().enumerate().map(move |(index, item)| {
                     (
@@ -2473,6 +2371,111 @@ impl Runtime {
             cached.item = Some(item.clone());
             self.cache.insert(item.id.clone(), cached);
         }
+    }
+
+    fn refresh(&mut self) {
+        self.refresh_session();
+        if !self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(handle) = self.handle() else {
+            return;
+        };
+        let (mut snapshot, source_clock) = handle.snapshot_with_clock();
+        if self.page_request.is_some_and(|(_, generation)| {
+            snapshot.generation > generation && !snapshot.history_loading
+        }) && self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.page.is_none())
+        {
+            self.page_request = None;
+            self.earlier_asked = None;
+            self.later_asked = None;
+        }
+        let selected_items = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id))
+            .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice());
+        if self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
+            && selected_items.iter().all(|item| self.cache.contains_key(&item.id))
+        {
+            return;
+        }
+        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
+            self.finished_stamp = snapshot.finished_at.and_then(|at| {
+                let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
+                let full = format!(
+                    "{:04}-{:02}-{:02} {}",
+                    time.year + 1900,
+                    time.month + 1,
+                    time.day,
+                    time.clock()
+                );
+                Some((at, format!("Finished at {}", time.clock()), full))
+            });
+        }
+        self.subagent_scroll
+            .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
+        self.observed_scroll.borrow_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
+        self.settle_recalls(&snapshot);
+        self.taken_back.retain(|id| {
+            snapshot
+                .queued_messages
+                .iter()
+                .any(|message| &message.id == id)
+        });
+        if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
+            Arc::make_mut(&mut snapshot).permission_mode =
+                self.snapshot.permission_mode.clone().or_else(|| {
+                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
+                });
+        }
+        if !self.parent_scroll().at_bottom()
+            && !snapshot.has_later
+            && self.page_request.is_none()
+            && !snapshot.history_loading
+            && snapshot.items.last().is_some_and(|item| {
+                self.cache
+                    .get(&item.id)
+                    .is_none_or(|cached| cached.token != ChangeToken::of(&item.content))
+            })
+        {
+            self.unseen_activity = true;
+        }
+        // Restored and paged conversations carry their own prompt history.
+        // Preserve a recalled index while the reader is walking it.
+        if self.history_cursor.is_none() {
+            let mut count = 0;
+            for text in snapshot.items.iter().filter_map(|item| match (&item.role, &item.content) {
+                (chat::Role::User, ItemContent::Text { text, .. }) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            }) {
+                if let Some(previous) = self.history.get_mut(count) {
+                    if previous != text { previous.clone_from(text); }
+                } else { self.history.push(text.clone()); }
+                count += 1;
+            }
+            self.history.truncate(count);
+        }
+        if self.selected_subagent.as_ref().is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id)) {
+            self.selected_subagent = None;
+        }
+        let selected = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let previous_selected = self.selected_subagent.as_ref().and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let same_ids = |old: &[Arc<chat::Item>], new: &[Arc<chat::Item>]| old.len() == new.len()
+            && old.iter().zip(new).all(|(old, new)| old.id == new.id);
+        if !same_ids(&self.snapshot.items, &snapshot.items)
+            || !same_ids(previous_selected.map_or(&[], |agent| agent.items.as_slice()), selected.map_or(&[], |agent| agent.items.as_slice())) {
+            self.cache.retain(|id, _| snapshot.items.iter().chain(selected.into_iter().flat_map(|agent| &agent.items)).any(|item| &item.id == id));
+        }
+        // Rare disclosure-budget pruning can inspect all raw identities;
+        // ordinary streaming refreshes need no newly allocated ID HashSet.
+        if self.expanded.len() > 4096 {
+            let live_ids: HashSet<_> = snapshot.items.iter().chain(snapshot.subagents.iter().flat_map(|agent| &agent.items))
+                .map(|item| item.id.as_str()).collect();
+            self.expanded.retain(|id| live_ids.contains(id.as_str()));
+        }
+        self.asked_after.retain(|id| snapshot.items.iter().any(|item| &item.id == id));
+        self.prepare_transcript_cache(&snapshot);
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
         for item in snapshot.items.iter() {
@@ -7715,6 +7718,10 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     runtime.deferred_page = None;
+                    runtime.cache.retain(|id, _| runtime.snapshot.items.iter().any(|item| &item.id == id));
+                    runtime.selection_document.get_mut().take();
+                    let snapshot = runtime.snapshot.clone();
+                    runtime.prepare_transcript_cache(&snapshot);
                     if runtime.find.is_some() {
                         runtime.find_disclosure.restore(&mut runtime.expanded,&mut runtime.unfolded,&mut runtime.opened);
                         runtime.find_generation.fetch_add(1,Ordering::Relaxed);
@@ -9956,6 +9963,31 @@ mod tests {
     }
 
     #[test]
+    fn hidden_children_prepare_no_transcript_cache_until_their_tab_is_selected() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("lazy-child-cache"));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let children = (0..5).map(|index| chat::Subagent {
+            id: format!("child-{index}"), kind: "fixture".into(), description: "Lazy child".into(),
+            status: chat::ToolStatus::Running, background: true, model: None, waiting: false, detail: String::new(),
+            items: vec![Arc::new(chat::Item { id: format!("body-{index}"), role: chat::Role::Assistant,
+                content: text(&"source ".repeat(20000)), started_at: None, at: None })],
+        }).collect();
+        handle.publish_snapshot_for_test(Snapshot { generation: 20, ready: true, subagents: children, ..Snapshot::default() });
+        let runtime = app.chat_runtime_mut(target).unwrap(); runtime.visible.store(true, Ordering::Relaxed); runtime.refresh();
+        assert!(runtime.cache.is_empty(), "hidden child source has no parsed or highlighted presentation");
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-2".into()))));
+        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
+        assert!(chat_runtime(&app, card).cache.contains_key("body-2"));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-3".into()))));
+        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
+        assert!(chat_runtime(&app, card).cache.contains_key("body-3"));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        assert!(chat_runtime(&app, card).cache.is_empty());
+    }
+
+    #[test]
     fn streaming_children_keep_only_their_newest_fence_live_after_parent_completion() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("streaming-children"));
@@ -10008,6 +10040,7 @@ mod tests {
             runtime.visible.store(true, Ordering::Relaxed);
             runtime.refresh();
         };
+        app.chat_runtime_mut(target).unwrap().selected_subagent = Some("running-child".into());
         publish(&mut app, &snapshot);
         let runtime = chat_runtime(&app, card);
         assert!(
@@ -10015,7 +10048,7 @@ mod tests {
             "an idle parent must not retire its running child's fence"
         );
         assert!(runtime.cache["parent"].open.is_none());
-        assert!(runtime.cache["finished"].open.is_none());
+        assert!(!runtime.cache.contains_key("finished"), "hidden child presentation is not prepared");
         // An unchanged snapshot must also preserve the child's continuation.
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
@@ -10146,6 +10179,7 @@ mod tests {
                 runtime.visible.store(true, Ordering::Relaxed);
                 runtime.refresh();
             };
+            app.chat_runtime_mut(target).unwrap().selected_subagent = Some("child".into());
             publish(&mut app, &snapshot);
             assert!(
                 chat_runtime(&app, card).cache["unfinished"]
