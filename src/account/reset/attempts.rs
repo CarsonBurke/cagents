@@ -96,7 +96,7 @@ impl Ledger {
 
     pub(crate) fn begin_available(&mut self, credit_id: &str, now_ms: u64, fresh: &Allowance) -> Result<Admission, String> {
         self.ensure_usable()?;
-        if !self.state.attempts.iter().any(|attempt| attempt.credit_id == credit_id) {
+        if !self.state.attempts.iter().any(|attempt| attempt.credit_id == credit_id && !matches!(attempt.outcome, Some(Outcome::NothingToReset | Outcome::NoCredit))) {
             let matching = fresh.account.as_ref().is_some_and(|account| account.account_id == self.state.account_id && account.backend_origin == self.state.backend_origin);
             let eligible = fresh.reset_credits.as_ref().filter(|credits| credits.available_count > 0)
                 .and_then(|credits| credits.details.as_ref()).is_some_and(|rows| rows.iter().any(|credit|
@@ -111,11 +111,19 @@ impl Ledger {
     pub(crate) fn begin(&mut self, credit_id: &str, now_ms: u64) -> Result<Admission, String> {
         self.ensure_usable()?;
         identifier_str(credit_id)?;
-        if let Some(attempt) = self.state.attempts.iter().find(|attempt| attempt.credit_id == credit_id) {
-            return Ok(match attempt.outcome {
-                Some(outcome) => Admission::Complete(outcome),
-                None => Admission::Pending {idempotency_key:attempt.idempotency_key.clone(), reconcile_first:true},
-            });
+        if let Some(index) = self.state.attempts.iter().position(|attempt| attempt.credit_id == credit_id) {
+            let attempt = &mut self.state.attempts[index];
+            let key = attempt.idempotency_key.clone();
+            match attempt.outcome {
+                Some(Outcome::Reset | Outcome::AlreadyRedeemed) => return Ok(Admission::Complete(attempt.outcome.unwrap())),
+                None => return Ok(Admission::Pending {idempotency_key:key, reconcile_first:true}),
+                Some(Outcome::NothingToReset | Outcome::NoCredit) => {
+                    attempt.outcome = None;
+                    attempt.started_at_ms = now_ms;
+                    self.save()?;
+                    return Ok(Admission::Pending {idempotency_key:key, reconcile_first:false});
+                }
+            }
         }
         if self.state.attempts.iter().any(|attempt| attempt.outcome.is_none()) {
             return Err("A previous reset has an uncertain outcome; reconcile that credit before selecting another".into());
@@ -198,6 +206,18 @@ mod tests {
         drop(ledger);
         let mut restarted = Ledger::open(root.path(), &account()).unwrap();
         assert_eq!(restarted.begin("credit-one", 1200).unwrap(), Admission::Complete(Outcome::Reset));
+    }
+    #[test]
+    fn nonconsuming_provider_outcome_can_retry_later_fresh_credit_using_the_same_key() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(root.path(), &account()).unwrap();
+        let Admission::Pending {idempotency_key:key, ..} = ledger.begin("credit-one", 1000).unwrap() else {panic!()};
+        let mut fresh = Allowance {observed_at_ms:1100, account:Some(account()), account_binding_detail:None, windows:vec![], reset_credits:Some(super::super::ResetCredits {available_count:1, details:Some(vec![super::super::ResetCredit {id:"credit-one".into(), supported_type:true, available:true, expires_at_ms:None}])})};
+        ledger.finish("credit-one", Outcome::NothingToReset, &fresh).unwrap();
+        drop(ledger);
+        let mut ledger = Ledger::open(root.path(), &account()).unwrap();
+        fresh.observed_at_ms = 2000;
+        assert_eq!(ledger.begin_available("credit-one", 2000, &fresh).unwrap(), Admission::Pending {idempotency_key:key, reconcile_first:false});
     }
     #[test]
     fn corrupt_or_future_attempt_state_never_becomes_an_empty_new_history() {
