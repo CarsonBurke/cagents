@@ -55,9 +55,6 @@ fn interactive_inner(
     nonblocking: bool,
     apply: impl FnOnce(ClientRequest) -> Result<ServerResponse, ProtocolError>,
 ) -> Result<ServerResponse, ProtocolError> {
-    if client == EXECUTION_CLIENT {
-        return apply(request);
-    }
     let (id, claims) = match &request {
         ClientRequest::ChatCommand { chat_id, command } => (
             *chat_id,
@@ -74,20 +71,27 @@ fn interactive_inner(
         ClientRequest::ChatCloseSession { session } => (session.id, false),
         _ => return apply(request),
     };
-    let registry = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .execution_registry
-        .clone();
+    let unavailable =
+        |message: String| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
+    let executable = super::super::chat::executable_automation_sessions(&request);
+    let registry = if claims || !executable.is_empty() {
+        // Both synchronous and deferred commands enter this same admission.
+        // A missing managed store cannot silently skip ownership/NoStart.
+        // ID-only Interrupt has no independent emergency permission: an exact
+        // conditional actor primitive is not itself permission to use it.
+        super::super::session_locations::observer_registry(host).map_err(unavailable)?
+    } else {
+        host.lock().unwrap_or_else(|p| p.into_inner()).execution_registry.clone()
+    };
+    if client == EXECUTION_CLIENT {
+        return apply(request);
+    }
     let Some(registry) = registry else {
         return apply(request);
     };
-    let unavailable =
-        |message: String| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
     let agent = admission_lock(&registry, nonblocking)?
         .agent_for_session(id)
         .map_err(unavailable)?;
-    let executable = super::super::chat::executable_automation_sessions(&request);
     let mut owners = agent.iter().map(|agent| agent.id).collect::<Vec<_>>();
     {
         let registry = admission_lock(&registry, nonblocking)?;
@@ -421,4 +425,82 @@ static AFTER_RECONCILIATION_ELIGIBILITY: std::sync::Mutex<Option<Box<dyn FnOnce(
 #[cfg(test)]
 pub(in crate::host) fn after_reconciliation_eligibility(hook: impl FnOnce() + Send + 'static) {
     *AFTER_RECONCILIATION_ELIGIBILITY.lock().unwrap() = Some(Box::new(hook));
+}
+
+#[cfg(test)]
+mod managed_control_admission_tests {
+    use super::*;
+
+    fn controls() -> Vec<Command> {
+        vec![
+            Command::SetModel { model: "next".into(), reasoning: Some("low".into()) },
+            Command::SetFastMode { enabled: true },
+            Command::SetPermissionMode { mode: "readOnly".into() },
+            Command::RefreshPermissions,
+            Command::SetInterruptMode { mode: "immediate".into() },
+            Command::Interrupt,
+        ]
+    }
+
+    #[test]
+    fn unavailable_managed_store_refuses_synchronous_and_deferred_controls_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        for phase in 0..3 {
+            let host = crate::host::service::test_host();
+            {
+                let mut state = host.lock().unwrap();
+                match phase {
+                    0 => state.expect_model(),
+                    1 => state.model_open_failed(),
+                    _ => {
+                        state.install_model(Registry::at(&directory.path().join("managed.sqlite3")).unwrap());
+                        assert!(state.execution_registry.take().is_some());
+                    }
+                }
+            }
+            for command in controls() {
+                let request = ClientRequest::ChatCommand { chat_id: TerminalId::new(), command };
+                // Use both actual ownership entry paths. Even the internal
+                // execution subscriber cannot skip this storage preflight.
+                for client in [1, EXECUTION_CLIENT] {
+                    let called = std::cell::Cell::new(false);
+                    let failure = interactive(&host, client, request.clone(), |_| {
+                        called.set(true); Ok(ServerResponse::Accepted)
+                    }).unwrap_err();
+                    assert!(failure.message.contains("metadata storage is unavailable"), "{failure:?}");
+                    assert!(!called.get());
+                    let called = std::cell::Cell::new(false);
+                    let failure = try_interactive(&host, client, request.clone(), |_| {
+                        called.set(true); Ok(ServerResponse::Accepted)
+                    }).unwrap_err();
+                    assert!(failure.message.contains("metadata storage is unavailable"), "{failure:?}");
+                    assert!(!called.get());
+                }
+                // The real deferred dispatch path previously skipped chat's
+                // synchronous guard before trying its attached provider.
+                let failure = crate::host::chat::enqueue_deferred(&host, 1, request).unwrap_err();
+                assert!(failure.message.contains("metadata storage is unavailable"), "{failure:?}");
+            }
+            assert!(host.lock().unwrap().chats.is_empty());
+            assert!(host.lock().unwrap().chat_spawning.is_empty());
+        }
+    }
+
+    #[test]
+    fn cached_reads_and_genuinely_unmanaged_control_admission_keep_their_existing_policy() {
+        let host = crate::host::service::test_host();
+        for command in controls() {
+            let request = ClientRequest::ChatCommand { chat_id: TerminalId::new(), command };
+            assert!(interactive(&host, 1, request.clone(), |_| Ok(ServerResponse::Accepted)).is_ok());
+            assert!(try_interactive(&host, 1, request, |_| Ok(ServerResponse::Accepted)).is_ok());
+        }
+        host.lock().unwrap().model_open_failed();
+        for command in [Command::Refresh, Command::LoadEarlier] {
+            let request = ClientRequest::ChatCommand { chat_id: TerminalId::new(), command };
+            assert!(interactive(&host, 1, request.clone(), |_| Ok(ServerResponse::Accepted)).is_ok());
+            assert!(try_interactive(&host, 1, request, |_| Ok(ServerResponse::Accepted)).is_ok());
+        }
+        // These positive controls concern admission only. No provider or
+        // unavailable-store emergency authority is claimed by this fixture.
+    }
 }
