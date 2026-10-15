@@ -468,6 +468,13 @@ pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
 /// An older independent editor has no interpretable directory inventory.
 /// Preserve all candidates while any local editor cannot prove readiness.
 /// Never inspect its buffers, environment, cwd or command arguments.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported,
+        "authenticated window/editor ownership for automatic cleanup requires a supported platform backend"))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
@@ -522,7 +529,6 @@ fn editor_executable(
 }
 
 fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
-    use std::os::fd::FromRawFd;
     let mut editors = Vec::new();
     for entry in fs::read_dir(proc_root)? {
         let entry = entry?;
@@ -566,13 +572,7 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
                 "independent editor protection cannot be authenticated",
             ));
         }
-        // SAFETY: pidfd_open returns a fresh descriptor or -1.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if raw == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: ownership of the successful descriptor is transferred.
-        let pidfd = unsafe { File::from_raw_fd(raw as i32) };
+        let pidfd = capture_window_lifetime(pid)?;
         let editor = VerifiedWindow {
             executable,
             pidfd,
@@ -605,6 +605,20 @@ pub(crate) fn worktree_mutation_launch_fence() -> io::Result<OwnedLock> {
         &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
         libc::LOCK_EX | libc::LOCK_NB,
     )
+}
+
+#[cfg(target_os = "linux")]
+fn capture_window_lifetime(pid: u32) -> io::Result<File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: successful pidfd_open returns a new owned original-process descriptor.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw == -1 { return Err(io::Error::last_os_error()); }
+    Ok(unsafe { File::from_raw_fd(raw as i32) })
+}
+#[cfg(not(target_os = "linux"))]
+fn capture_window_lifetime(_pid: u32) -> io::Result<File> {
+    Err(io::Error::new(io::ErrorKind::Unsupported,
+        "captured window lifetime requires a supported platform backend"))
 }
 
 pub(crate) struct VerifiedWindow {
@@ -672,12 +686,26 @@ impl VerifiedWindow {
 /// Contention alone is not ownership: require the exact exclusive flock in the
 /// process's fdinfo, then pin its lifetime before trusting its executable.
 /// The caller must hold the update launch fence throughout use of this proof.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verified_running_windows() -> io::Result<Vec<VerifiedWindow>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported,
+        "authenticated window/editor ownership for automatic cleanup requires a supported platform backend"))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn verified_running_windows() -> io::Result<Vec<VerifiedWindow>> {
     verified_windows_in(&runtime_directory()?, Path::new("/proc"))
 }
 
 /// A staged installer itself holds the shared legacy fence. Its validated
 /// exclusive launch guard already rules out a legacy exclusive UI owner.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported,
+        "authenticated window/editor ownership for automatic cleanup requires a supported platform backend"))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
     validate_stage_guard()?;
     verified_window_lease_owners_in(&runtime_directory()?, Path::new("/proc"))
@@ -726,7 +754,6 @@ fn verified_window_lease_owners_in(
     runtime: &Path,
     proc_root: &Path,
 ) -> io::Result<Vec<VerifiedWindow>> {
-    use std::os::fd::FromRawFd;
     let slots = running_window_slots(runtime)?;
     let mut owners = Vec::new();
     let kernel_locks = fs::read_to_string(proc_root.join("locks"))?;
@@ -757,13 +784,7 @@ fn verified_window_lease_owners_in(
             {
                 continue;
             }
-            // SAFETY: pidfd_open returns a fresh owned descriptor or -1.
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-            if raw == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: successful pidfd_open transferred ownership to us.
-            let pidfd = unsafe { File::from_raw_fd(raw as i32) };
+            let pidfd = capture_window_lifetime(pid)?;
             let executable = fs::read_link(process.join("exe"))?;
             let verified = VerifiedWindow {
                 executable,
@@ -1900,6 +1921,23 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn unsupported_owner_census_preserves_ordinary_window_slot_locking() {
+        let root = tempdir().unwrap();
+        validate_window_slot(PRIMARY_WINDOW).unwrap();
+        let path = root.path().join(slot_lock_name(PRIMARY_WINDOW));
+        let ordinary = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        for census in [verified_running_windows, verified_staged_windows, verified_running_editors] {
+            let error = census().err().expect("unimplemented owner proof must refuse explicitly");
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        }
+        assert_eq!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).err().unwrap().kind(), io::ErrorKind::WouldBlock,
+            "protected cleanup refusal must not release ordinary startup's lock");
+        drop(ordinary);
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
     // Isolate the main thread name from parallel lease/peer tests.
     #[cfg(all(feature = "ui", target_os = "linux"))]
     #[test]
@@ -1931,6 +1969,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn verified_window_requires_its_exact_kernel_flock_not_an_open_descriptor() {
         let runtime = tempfile::tempdir().unwrap();
         let path = runtime.path().join(slot_lock_name(PRIMARY_WINDOW));
@@ -1973,6 +2012,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn window_ownership_cannot_combine_different_descriptors() {
         let root = tempfile::tempdir().unwrap();
         let held = owned_lock(&root.path().join("lease"), libc::LOCK_EX | libc::LOCK_NB).unwrap();

@@ -1347,6 +1347,7 @@ fn gh_request(
 
 /// Stream a subprocess into sealed storage without buffering a release binary
 /// in memory. Extraction and candidate probes share the downloader's limits.
+#[cfg(target_os = "linux")]
 fn bounded_command(
     command: &mut Command,
     operation: &'static str,
@@ -1428,14 +1429,33 @@ fn bounded_command(
     }
 }
 
+// Darwin already refuses this operation at anonymous_file before spawning a
+// downloader. Keep that boundary explicit: a PID wait is not a substitute for
+// the Linux captured-child capability and sealed release storage.
+#[cfg(not(target_os = "linux"))]
+fn bounded_command(
+    _command: &mut Command,
+    _operation: &'static str,
+    _limit: u64,
+    _timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<File, UpdateError> {
+    if cancellation.cancelled() {
+        return Err(UpdateError::Cancelled);
+    }
+    Err(io::Error::new(io::ErrorKind::Unsupported, "self-update requires Linux").into())
+}
+
 /// Sole owner of the streaming command. No observation releases its leader
 /// until every operation that can still fail and require group cleanup ends.
+#[cfg(target_os = "linux")]
 struct StreamingChild {
     child: std::process::Child,
     identity: OwnedFd,
     finished: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl StreamingChild {
     fn new(child: std::process::Child) -> io::Result<Self> {
         // Capture before the freshly spawned child can be reaped or handed off.
@@ -1592,6 +1612,7 @@ impl StreamingChild {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for StreamingChild {
     fn drop(&mut self) {
         let _ = self.finish(true);
@@ -1674,8 +1695,26 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn unsupported_streaming_update_refuses_before_command_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("must-not-exist");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "touch \"$1\"", "fixture"]).arg(&marker);
+        let error = bounded_command(&mut command, "unsupported fixture", 1024,
+            Duration::from_secs(1), &CancellationToken::new()).unwrap_err();
+        assert!(matches!(error, UpdateError::Io(ref error) if error.kind() == io::ErrorKind::Unsupported));
+        assert!(!marker.exists(), "unsupported updater must not create an unowned child");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(bounded_command(&mut command, "unsupported fixture", 1024,
+            Duration::from_secs(1), &cancellation), Err(UpdateError::Cancelled)));
+        assert!(!marker.exists());
+    }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn streaming_capture_failure_cleans_fresh_original_before_returning_error() {
         let child = Command::new("/bin/sleep")
             .arg("30")
@@ -1712,6 +1751,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn bounded_stream_preserves_success_and_size_failure() {
         let mut file = bounded_command(
             Command::new("/bin/sh").args(["-c", "printf fixture"]),
@@ -1739,6 +1779,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn bounded_stream_keeps_live_timeout_and_cancellation_cleanup() {
         let cancellation = CancellationToken::new();
         let started = Instant::now();
@@ -1773,6 +1814,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn streaming_child_observation_keeps_leader_until_final_cleanup() {
         let child = Command::new("/bin/sh")
             .args(["-c", "exit 7"])
@@ -1803,6 +1845,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn streaming_signal_error_reaps_exited_leader_and_refuses_live_wait() {
         let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
         let mut child = StreamingChild::new(child).unwrap();
@@ -1891,6 +1934,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn bounded_failed_stream_cleans_owned_descendants_after_exit() {
         const MARKER: &str = "CAGENTS_UPDATE_DESCENDANT_CHILD";
         const TEST: &str =
@@ -1989,6 +2033,7 @@ sys.exit(7)
 
     #[test]
     #[ignore = "requires an owned user/PID namespace and namespace-local PID allocation control"]
+    #[cfg(target_os = "linux")]
     fn streaming_child_refuses_a_kernel_reused_original_pid() {
         const MARKER: &str = "CAGENTS_UPDATE_FIXED_REUSE_CHILD";
         const NS: &str = "CAGENTS_UPDATE_FIXED_OUTER_NS";
