@@ -6388,6 +6388,7 @@ impl RepositoryRuntime {
     }
 
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
+        if self.editor_root_unbound() { return Task::none(); }
         // Explicit Save after a completed removal means create the open file
         // again. Debounced autosave never manufactures that user intent.
         if let DocumentState::Editable(document) = &mut self.document
@@ -6415,7 +6416,7 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
-        if self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
+        if self.is_read_only_source() || self.editor_root_unbound() || self.workspace_edit_pending() { return Task::none(); }
         if let DocumentState::Editable(document) = &mut self.document {
             document.prune_restorations();
             if document.active_save.is_none()
@@ -14046,12 +14047,33 @@ mod tests {
         finish_navigation_task(&mut runtime, rebind).await;
         assert!(runtime.observes_open_sources()); assert!(runtime.save_error().is_none());
         assert!(runtime.can_step_editor_history(false));
+        // Produce a real saved absence before checking the public Save path,
+        // whose explicit recreation intent must also stay paused by relocation.
+        let identity = runtime.current_identity(card, "a.rs".into());
+        let DocumentState::Editable(document) = &runtime.document else { panic!() };
+        let revision = document.revision; let change = document.content.replacement_to_text("").unwrap();
+        runtime.apply_diff_buffer_revert_with_presence(&identity, revision, Some(Arc::new(change)), false, Some(0o100644)).unwrap();
+        let task = runtime.request_save_inner(card, false, false); finish_navigation_task(&mut runtime, task).await;
+        assert!(!runtime.saved_file_present());
         // Locate may accept a replacement clone as a project. That does not
         // give its files authority over the already-mounted original buffer.
         std::fs::create_dir(&old).unwrap(); std::fs::write(old.join("a.rs"), "clone").unwrap();
         runtime.descriptor.worktree = old; runtime.generation += 1;
-        let rebind = runtime.rebind_editor_root_after_relocation(card); finish_navigation_task(&mut runtime, rebind).await;
-        assert_eq!(runtime.editor_text().as_deref(), Some(saved.as_str()));
+        let rebind = runtime.rebind_editor_root_after_relocation(card);
+        fn assert_save_paused(runtime: &mut RepositoryRuntime, card: CardId) {
+            let checkpoint = match &runtime.document { DocumentState::Editable(document) => (document.revision, document.history.revision(), document.presence_id), _ => panic!() };
+            for overwrite in [false, true] {
+                drop(runtime.update(RepositoryAction::Save { card, overwrite }));
+                let DocumentState::Editable(document) = &runtime.document else { panic!() };
+                assert_eq!((document.revision, document.history.revision(), document.presence_id), checkpoint);
+                assert!(!document.present && !document.saved_present && document.active_save.is_none());
+                assert!(document.content.is_empty());
+            }
+        }
+        assert_save_paused(&mut runtime, card);
+        finish_navigation_task(&mut runtime, rebind).await;
+        assert_save_paused(&mut runtime, card);
+        assert_eq!(runtime.editor_text().as_deref(), Some(""));
         assert!(!runtime.observes_open_sources()); assert!(runtime.save_error().is_some());
         assert!(!runtime.workspace_edit_snapshot().unwrap().1.writable);
         assert!(!runtime.is_saving());
