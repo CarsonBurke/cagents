@@ -49,6 +49,10 @@ pub use crate::process::{
 #[path = "repository_stash.rs"]
 mod stash_mutations;
 
+#[path = "repository_recovery.rs"]
+mod recovery;
+pub use recovery::{DiscardRecovery, DiscardRecoveryEntry, RecoverableDiscard, SavedEntry, TrashReceipt};
+
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
 
 /// Commits returned by one [`RepositoryService::history`] page.
@@ -5761,14 +5765,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .collect())
     }
 
-    /// Restores tracked paths from the index and deletes untracked files.
+    /// Saves tracked contents in Git, restores the index version, and moves
+    /// untracked entries to the system Trash.
     ///
-    /// This destroys work that exists nowhere else, so it refuses to run
-    /// without the caller's confirmation and never removes a directory.
-    pub fn discard(
+    /// Confirmation is required. Selected directories are refused; directories
+    /// emptied by removed files are pruned below the worktree root.
+    pub fn discard(&self, request: &DiscardRequest, cancellation: &CancellationToken) -> Result<MutationOutcome, RepositoryError> {
+        self.discard_recoverable(request, cancellation).map(|result| result.outcome)
+    }
+
+    fn discard_mutation(
         &self,
         request: &DiscardRequest,
         cancellation: &CancellationToken,
+        trashed: &mut Vec<TrashReceipt>,
+        captured_root: &fs_safety::Root,
+        captured_versions: &recovery::CaptureVersions,
     ) -> Result<MutationOutcome, RepositoryError> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
@@ -5794,6 +5806,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection.into());
         }
 
+        if let Err(reason) = recovery::verify_captured_versions(captured_root, captured_versions, cancellation) {
+            return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason } });
+        }
         let mut applied = Vec::new();
         if !tracked.is_empty() {
             let command =
@@ -5852,6 +5867,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     );
                 }
             };
+            if let Err(reason) = recovery::verify_recovery_root(captured_root) {
+                return discard_failures(&untracked, reason);
+            }
             // A refused directory does not prevent independent selected files
             // being attempted. Cancellation or loss of the index lock ends the
             // remaining batch, whose paths are still known untouched.
@@ -5874,8 +5892,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     });
                     continue;
                 }
-                match delete_untracked(&root, path) {
-                    Ok(()) => applied.push(path.clone()),
+                match recovery::trash_untracked(&root, path) {
+                    Ok(receipt) => {
+                        if let Some(receipt) = receipt {
+                            if let Some(reason) = receipt.warning.as_ref() { failures.push(MutationFailure::Path { path: path.clone(), reason: reason.clone() }); }
+                            trashed.push(receipt);
+                        }
+                        applied.push(path.clone());
+                    },
                     Err(failure) => failures.push(failure),
                 }
             }
@@ -7815,6 +7839,9 @@ mod tests {
             command: &CommandSpec,
             _cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
+            if command.arguments.iter().any(|argument| argument == "hash-object") {
+                return SystemProcessExecutor.execute(command, _cancellation);
+            }
             self.commands.lock().unwrap().push(command.clone());
             self.outputs.lock().unwrap().pop().unwrap()
         }
@@ -10199,7 +10226,7 @@ mod tests {
             }
         );
         assert!(!worktree.path().join("keep/file.txt").exists());
-        assert!(worktree.path().join("keep").is_dir());
+        assert!(!worktree.path().join("keep").exists(), "discard prunes the newly empty parent");
     }
 
     #[cfg(unix)]
@@ -10284,13 +10311,18 @@ mod tests {
             (0..=ROUNDS).map(|_| success(b"")).collect(),
         );
         for _ in 0..ROUNDS {
+            // Recoverable discard also prunes emptied parents, so recreate
+            // this fixture directory when a previous raced round removed it.
+            let _ = fs::create_dir(&parked_directory);
             let _ = fs::write(parked_directory.join("victim.txt"), b"inside");
-            let _ = fs::write(active.join("victim.txt"), b"inside");
+            // Never seed through the raced active name: it may currently
+            // be the link to the outside fixture itself.
             let _ = service.discard(&request, &CancellationToken::new());
             assert!(
                 hostage.exists(),
                 "discard followed a swapped ancestor out of the worktree"
             );
+            assert_eq!(fs::read(&hostage).unwrap(), b"outside");
         }
 
         stop.store(true, Ordering::Relaxed);
@@ -10300,6 +10332,11 @@ mod tests {
         // prepared entries where they started. This quiescent round proves the
         // deletion the loop above was racing really happens, rather than being
         // refused every time.
+        if let Ok(metadata) = fs::symlink_metadata(&active) {
+            if metadata.file_type().is_symlink() { fs::remove_file(&active).unwrap(); }
+            else { fs::remove_dir_all(&active).unwrap(); }
+        }
+        fs::create_dir_all(&parked_directory).unwrap();
         fs::rename(&parked_directory, &active).unwrap();
         fs::write(active.join("victim.txt"), b"inside").unwrap();
         let outcome = service
