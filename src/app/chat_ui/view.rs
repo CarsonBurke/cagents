@@ -3181,16 +3181,6 @@ impl Runtime {
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
         self.find.as_ref().filter(|_| self.find_turn_matches(&turn.key)).hash(&mut hasher);
-        // Only reasoning uses the transcript's busy state to decide whether
-        // its disclosure has finished. Other rows derive activity from their
-        // own items and the group's status and duration.
-        if turn
-            .prose
-            .iter()
-            .any(|placed| placed.slot == turn::Slot::Thinking)
-        {
-            self.snapshot.busy.hash(&mut hasher);
-        }
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
@@ -3212,6 +3202,11 @@ impl Runtime {
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
             (&item.id, item.started_at.or(item.at), slot, self.expanded.contains(&item.id)).hash(&mut hasher);
+            if slot == Some(turn::Slot::Thinking) {
+                // A newer turn starting does not revive old reasoning that
+                // already has a final answer or later prompt after it.
+                reasoning_finished(&self.snapshot.items, self.snapshot.busy, &item.id).hash(&mut hasher);
+            }
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied
@@ -6521,6 +6516,16 @@ mod tests {
             .iter()
             .map(|turn| runtime.turn_fingerprint(turn, dark))
             .collect()
+    }
+
+    #[test]
+    fn new_turn_activity_keeps_completed_historical_reasoning_retained() {
+        let items = frame_cost::transcript(3);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let idle = fingerprints(&runtime, true);
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        assert_eq!(idle, fingerprints(&runtime, true),
+            "all fixture reasoning already has a later final answer");
     }
 
     #[test]
