@@ -15608,6 +15608,7 @@ fn information_state_height<'a>(
 
 #[cfg(test)]
 mod tests {
+    use cosmic::iced::mouse;
     async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
         use cosmic::iced::futures::StreamExt;
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
