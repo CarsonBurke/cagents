@@ -1521,8 +1521,34 @@ pub(crate) mod tests {
     /// Sets `user.note` on `path`, reporting whether the filesystem supports
     /// extended attributes at all.
     fn tag(path: &Path) -> bool {
-        let file = File::open(path).expect("fixture source");
-        write_attribute(&file, c"user.note", b"keepme").is_ok()
+        let path = c_path(path).expect("fixture path");
+        // Seed through the independent path API: a broken descriptor-based
+        // write implementation must not silently skip its own coverage.
+        // SAFETY: the path/name are C strings and the value is six live bytes.
+        let status = unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.note".as_ptr(),
+                    b"keepme".as_ptr().cast(),
+                    6,
+                    0,
+                    0,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.note".as_ptr(),
+                    b"keepme".as_ptr().cast(),
+                    6,
+                    0,
+                )
+            }
+        };
+        status == 0
     }
 
     #[cfg(target_os = "linux")]

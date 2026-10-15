@@ -172,3 +172,70 @@ pub(super) fn copy_access_acl(source: &File, destination: &File) -> io::Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, process::Command};
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(descriptor: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        fn acl_to_text(acl: *mut libc::c_void, length: *mut libc::ssize_t) -> *mut libc::c_char;
+    }
+
+    // The fixture uses the independent ACL reader, rather than the filesec
+    // functions used by the implementation, to observe the retained inode.
+    fn acl_text(file: &File) -> Option<Vec<u8>> {
+        // SAFETY: the descriptor remains live and the type is Darwin's ACL.
+        let acl = Acl(unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) });
+        if acl.0.is_null() {
+            let error = io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::ENOENT), "read native ACL: {error}");
+            return None;
+        }
+        let mut length = 0;
+        // SAFETY: ACL is live and length points to caller-owned output storage.
+        let text = unsafe { acl_to_text(acl.0, &mut length) };
+        assert!(!text.is_null() && length >= 0, "format native ACL: {}", io::Error::last_os_error());
+        // SAFETY: acl_to_text allocated exactly the returned readable length.
+        let value = unsafe { std::slice::from_raw_parts(text.cast(), length as usize) }.to_vec();
+        // SAFETY: ACL text is an independently allocated native ACL buffer.
+        assert_eq!(unsafe { acl_free(text.cast()) }, 0);
+        Some(value)
+    }
+
+    #[test]
+    fn native_access_acl_copy_replaces_existing_acl_and_removes_observed_absence() {
+        let directory = tempfile::tempdir().expect("owned native ACL fixture");
+        let source_path = directory.path().join("source");
+        let destination_path = directory.path().join("replacement");
+        fs::write(&source_path, b"source contents").unwrap();
+        fs::write(&destination_path, b"replacement contents").unwrap();
+        let source = File::open(&source_path).unwrap();
+        let destination = File::options().read(true).write(true).open(&destination_path).unwrap();
+        let identity = Command::new("/usr/bin/id").arg("-un").output().unwrap();
+        assert!(identity.status.success());
+        let username = String::from_utf8(identity.stdout).unwrap();
+        let username = username.trim_end_matches(['\n', '\r']);
+        assert!(!username.is_empty() && !username.contains([':', '\n', '\r']));
+        // Colon delimiters preserve usernames containing spaces. chmod's ACL
+        // parser resolves a username, so use the actual account name.
+        let entry = format!("user:{username}:allow:read,readattr,readextattr,readsecurity");
+        assert!(Command::new("/bin/chmod").args(["+a", &entry]).arg(&source_path).status().unwrap().success());
+        let expected = acl_text(&source);
+        assert!(expected.is_some(), "fixture must install an explicit ACL");
+        assert_ne!(expected, acl_text(&destination), "fixture must establish distinct native access control");
+        copy_access_acl(&source, &destination).expect("preserve explicit native ACL");
+        assert_eq!(acl_text(&destination), expected);
+
+        assert!(Command::new("/bin/chmod").arg("-N").arg(&source_path).status().unwrap().success());
+        let absent = acl_text(&source);
+        assert!(absent.is_none(), "fixture must remove the source ACL");
+        assert_ne!(absent, acl_text(&destination), "replacement still carries the previously installed ACL");
+        copy_access_acl(&source, &destination).expect("remove inherited or previous native ACL");
+        assert_eq!(acl_text(&destination), absent);
+        assert_eq!(fs::read(&destination_path).unwrap(), b"replacement contents");
+    }
+}
