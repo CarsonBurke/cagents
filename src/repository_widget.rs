@@ -2185,7 +2185,7 @@ impl RepositoryRuntime {
     pub fn is_read_only_source(&self) -> bool { self.external_source.is_some() }
 
     pub fn source_tab_path(&self) -> Option<PathBuf> {
-        self.external_source.clone().or_else(|| self.descriptor.selected_file.as_ref().map(|path| self.descriptor.worktree.join(path))).or_else(|| self.workspace_edit_source())
+        self.external_source.clone().or_else(|| self.workspace_edit_source()).or_else(|| self.descriptor.selected_file.as_ref().map(|path| self.descriptor.worktree.join(path)))
     }
 
 
