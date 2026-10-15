@@ -117,6 +117,15 @@ impl Receipts {
             _ => return,
         }.filter(|id| crate::chat::protocol::input_proof::valid_id(id));
         let Some(native) = native else { return; };
+        if frame.get("user_message_uuid").is_some() && primary.is_none() {
+            // An explicit unknown/invalid owner is contradictory evidence,
+            // never an unstamped continuation of an earlier owner.
+            if let Some(message) = self.messages.iter_mut().find(|message| message.native == native && message.session == session) {
+                message.input = None;
+                message.aliases.clear();
+            }
+            return;
+        }
         if let Some(input) = primary {
             if let Some(message) = self.messages.iter_mut().find(|message| message.native == native && message.session == session) {
                 if message.input.as_deref() != Some(input) { message.input = None; message.aliases.clear(); }
@@ -193,6 +202,21 @@ mod tests {
         let step = adapter.receive(assistant("native-message", "same-message-tool", false)).unwrap();
         assert!(updates(&step).iter().any(|update| matches!(update, TurnUpdate::Bind { item_ids, .. } if item_ids.contains(&"same-message-tool".to_owned()))));
     }
+    #[test]
+    fn explicit_unknown_or_invalid_stamp_cannot_borrow_an_existing_message_owner() {
+        for stamp in [json!("unsubmitted"), json!(""), Value::Null, json!(false)] {
+            let mut adapter = adapter(); let input = submit(&mut adapter); accept(&mut adapter, &input);
+            let mut assistant = json!({"type":"assistant","uuid":"carrier","session_id":SESSION,"user_message_uuid":input,"message":{"id":"same-native-message","role":"assistant","content":[{"type":"tool_use","id":"original-tool","name":"Bash","input":{}}]}});
+            let first = adapter.receive(assistant.clone()).unwrap(); assert!(!updates(&first).is_empty());
+            assistant["user_message_uuid"] = stamp;
+            assistant["message"]["content"][0]["id"] = json!("contradictory-tool");
+            assert!(updates(&adapter.receive(assistant.clone()).unwrap()).is_empty());
+            assistant.as_object_mut().unwrap().remove("user_message_uuid");
+            assistant["message"]["content"][0]["id"] = json!("after-conflict-tool");
+            assert!(updates(&adapter.receive(assistant).unwrap()).is_empty(), "conflicting message proof must stay unqualified");
+        }
+    }
+
     #[test]
     fn stamped_stream_start_proves_only_that_native_messages_continuations() {
         let mut adapter = adapter(); let input = submit(&mut adapter); accept(&mut adapter, &input);
