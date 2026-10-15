@@ -16,58 +16,80 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 FIELD = re.compile(r'\b([a-z_]+)=("[^"\n]*"|[^\s,]+)')
 HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+)\s")
 METRICS = ("Rss", "Pss", "Anonymous", "Swap")
+OWNER_COUNTERS = {
+    "chat_runtime": ("resident_bytes", "cache_entries", "exposed_presentation_bytes"),
+    "chat_client": ("resident_bytes",),
+    "ipc": ("read_capacity", "write_capacity"),
+}
 
 
 def trace_owners(log, pid=None):
     owners = {"chat_runtime": {}, "chat_client": {}, "ipc": {}}
     stacks = {}
-    matched_lines = 0
-    missing_process_id = 0
-    for line in log.open(errors="replace"):
-        if "cagents::memory" not in line:
-            continue
-        fields = {key: value.strip('"') for key, value in FIELD.findall(ANSI.sub("", line))}
-        if pid is not None:
-            if "process_id" not in fields:
-                missing_process_id += 1
+    coverage = {"matched_lines": 0, "missing_process_id_lines": 0,
+                "complete_owner_events": 0, "incomplete_owner_events": 0,
+                "incomplete_stack_events": 0}
+    with log.open(errors="replace") as source:
+        for line in source:
+            if "cagents::memory" not in line:
                 continue
-            if fields["process_id"] != str(pid):
-                continue
-        matched_lines += 1
-        owner = fields.get("owner")
-        if owner == "thread_stack":
-            try:
-                thread = int(fields["thread_id"])
-                base = int(fields["stack_base"])
-                size = int(fields["reserved_stack_bytes"])
-                guard = int(fields["guard_bytes"])
-                role = fields["role"]
-            except (KeyError, ValueError):
-                continue
-            if role in ("chat_reader", "chat_visibility"):
-                stacks.pop((thread, base), None)
-                stacks[(thread, base)] = (size, guard, role)
-        elif owner in owners:
-            identity = fields.get("codec" if owner == "ipc" else "chat_id")
-            if identity is None:
-                continue
-            if fields.get("released") == "true":
-                owners[owner].pop((fields.get("process_id"), identity), None)
-            else:
-                # All current owner events contain complete exposed counters.
-                owners[owner][(fields.get("process_id"), identity)] = fields
-    if pid is not None and matched_lines == 0:
-        raise SystemExit("no memory traces for the requested UI PID; missing process_id lines=" + str(missing_process_id))
-    return owners, stacks
+            fields = {key: value.strip('"') for key, value in FIELD.findall(ANSI.sub("", line))}
+            if pid is not None:
+                if "process_id" not in fields:
+                    coverage["missing_process_id_lines"] += 1
+                    continue
+                if fields["process_id"] != str(pid):
+                    continue
+            coverage["matched_lines"] += 1
+            owner = fields.get("owner")
+            if owner == "thread_stack":
+                try:
+                    if not line.endswith("\n"):
+                        raise ValueError("unfinished event")
+                    thread = int(fields["thread_id"])
+                    base = int(fields["stack_base"])
+                    size = int(fields["reserved_stack_bytes"])
+                    guard = int(fields["guard_bytes"])
+                    role = fields["role"]
+                    if min(thread, base, size) <= 0 or guard < 0:
+                        raise ValueError("invalid stack range")
+                except (KeyError, ValueError):
+                    coverage["incomplete_stack_events"] += 1
+                    continue
+                if role in ("chat_reader", "chat_visibility"):
+                    stacks.pop((thread, base), None)
+                    stacks[(thread, base)] = (size, guard, role)
+            elif owner in owners:
+                identity = fields.get("codec" if owner == "ipc" else "chat_id")
+                try:
+                    if not identity or not line.endswith("\n"):
+                        raise ValueError("unfinished owner event")
+                    # A partial write or a probe schema mismatch must not turn a
+                    # previously measured owner into a fabricated zero-byte owner.
+                    counters = [int(fields[key]) for key in OWNER_COUNTERS[owner]]
+                    if any(value < 0 for value in counters):
+                        raise ValueError("negative capacity")
+                    if "released" in fields and fields["released"] not in ("true", "false"):
+                        raise ValueError("incomplete release marker")
+                except (KeyError, ValueError):
+                    coverage["incomplete_owner_events"] += 1
+                    continue
+                coverage["complete_owner_events"] += 1
+                if fields.get("released") == "true":
+                    owners[owner].pop((fields.get("process_id"), identity), None)
+                else:
+                    # All current owner events contain complete exposed counters.
+                    owners[owner][(fields.get("process_id"), identity)] = fields
+    if pid is not None and coverage["complete_owner_events"] == 0:
+        raise SystemExit("no complete owner memory events for the requested UI PID; coverage=" + json.dumps(coverage))
+    return owners, stacks, coverage
 
 
 def owner_totals(owners):
     result = {}
     for owner, records in owners.items():
-        keys = ("read_capacity", "write_capacity") if owner == "ipc" else (
-            ("resident_bytes", "cache_entries", "exposed_presentation_bytes")
-            if owner == "chat_runtime" else ("resident_bytes",))
-        totals = {key: sum(int(fields.get(key, 0)) for fields in records.values()) for key in keys}
+        keys = OWNER_COUNTERS[owner]
+        totals = {key: sum(int(fields[key]) for fields in records.values()) for key in keys}
         result[owner] = {"owners": len(records), **totals}
     return result
 
@@ -154,8 +176,10 @@ def main():
     parser.add_argument("--pid", type=int)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    owners, stacks = trace_owners(args.log, args.pid)
-    report = {"schema_version": 1, "owner_totals": owner_totals(owners),
+    owners, stacks, coverage = trace_owners(args.log, args.pid)
+    report = {"schema_version": 2, "owner_totals": owner_totals(owners),
+              "trace_coverage": coverage,
+              "incomplete_events_preserve_last_complete_owner_sample": True,
               "body_bytes_are_arc_references_not_unique_heap": True,
               "exposed_presentation_bytes_omit_opaque_parser_and_renderer": True}
     if args.pid:
