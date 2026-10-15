@@ -2957,6 +2957,7 @@ fn confirmed_removal_operation(target: &Target, confirmed: &WorktreeSafetySnapsh
         repository: target.repository.clone(), target: path.to_owned(),
         force: confirmed.files_to_discard() > 0, delete_branch: false,
         expected_fingerprint: Some(confirmed.fingerprint.clone()),
+        resolved_path: None,
     })
 }
 
