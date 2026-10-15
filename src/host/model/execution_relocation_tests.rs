@@ -200,3 +200,49 @@ fn arbitrary_relaunch_directory_edits_do_not_acquire_locate_provenance() {
     assert_eq!(registry.model().unwrap(), before);
     assert!(!registry.agent(accepted.agent.id).unwrap().closed);
 }
+
+#[test]
+fn schema17_upgrade_preserves_issued_end_and_all_stored_authority_before_locate() {
+    use crate::workspace_model::views::Scope;
+    let (mut registry, directory, accepted, pane, relocation) = located_console_fixture();
+    let scope = Scope::Channel(accepted.agent.channel().unwrap());
+    registry.apply(&ModelEdit::SeedView { scope: scope.clone(), panes: vec![pane.clone()], closed: vec![] }).unwrap();
+    publish_console(&mut registry, &scope, &pane, &ended_console(&pane)).unwrap();
+    let agent = registry.agent(accepted.agent.id).unwrap();
+    let source = serde_json::to_string(agent.session.as_ref().unwrap()).unwrap();
+    // Populate the non-presentation selected rows too: upgrading their schema
+    // must neither rotate an owner/cursor nor fabricate new runtime authority.
+    registry.db.execute("INSERT INTO session_locations(session,source,directory,previous_sources) VALUES(?1,?2,?3,'[]')",
+        params![pane.id.to_string(), source, relocation.old_root.to_str().unwrap()]).unwrap();
+    registry.db.execute("INSERT INTO native_actor_cursors(actor,owner,sequence,digest) VALUES(?1,?2,7,?3)",
+        params!["preserved-actor", "preserved-owner", vec![23u8; 32]]).unwrap();
+    registry.db.execute("INSERT INTO session_observer_owners(session,instance,stamp,source) VALUES(?1,?2,?3,?4)",
+        params![pane.id.to_string(), uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), source]).unwrap();
+    for table in ["agent_locations", "session_locations", "native_actor_cursors", "shared_view_terminal_sources", "session_observer_owners"] {
+        let count: u64 = registry.db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap();
+        assert!(count > 0, "preservation fixture must populate {table}");
+    }
+    registry.db.pragma_update(None, "user_version", 17).unwrap();
+    let before = super::super::schema::stored_contents(&registry.db);
+    let issued = located_source_json(&registry, pane.id);
+    assert!(issued.get("historical_end").is_none(), "schema17 fixture retains its original issued-source JSON");
+    let run = registry.agent_run(accepted.run.id).unwrap();
+    drop(registry);
+    let path = directory.path().join("model.sqlite3");
+    for _ in 0..2 {
+        let registry = Registry::at(&path).unwrap();
+        assert_eq!(registry.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 18);
+        assert_eq!(super::super::schema::stored_contents(&registry.db), before);
+        assert_eq!(registry.agent(accepted.agent.id).unwrap(), agent);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+        assert_eq!(located_source_json(&registry, pane.id), issued);
+    }
+    let mut registry = Registry::at(&path).unwrap();
+    std::fs::rename(&relocation.old_root, &relocation.new_root).unwrap();
+    registry.apply(&ModelEdit::RelocateProject { relocation }).unwrap();
+    assert_eq!(located_source_json(&registry, pane.id)["source"], issued);
+    assert_eq!(registry.agent(accepted.agent.id).unwrap(), agent);
+    registry.close_agent(&Origin::User, accepted.agent.id).unwrap();
+    assert!(super::super::views::read(&registry.db, &scope).unwrap().panes.is_empty());
+    assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+}

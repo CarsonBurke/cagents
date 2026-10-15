@@ -1,5 +1,6 @@
-//! One admitted writer owns the cumulative schema17 upgrade. Private source
-//! forks13–16 are deliberately unsupported; their numbers prove no table set.
+//! One admitted writer owns the cumulative schema18 upgrade. Exact schema17
+//! stores preserve their rows; schema18 also permits Located terminal history.
+//! Private forks13–16 remain unsupported: their numbers prove no table set.
 use super::{SCHEMA_VERSION, agent_locations, migrate_legacy};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -32,11 +33,16 @@ fn version(db: &Connection) -> Result<u32, String> {
 }
 
 fn admit(current: u32) -> Result<(), String> {
+    admit_for(current, SCHEMA_VERSION)
+}
+
+fn admit_for(current: u32, supported: u32) -> Result<(), String> {
     match current {
         0..=12 => Ok(()),
-        SCHEMA_VERSION => Ok(()),
+        17 if supported >= 17 => Ok(()),
+        current if current == supported => Ok(()),
         13..=16 => Err(format!("workspace registry schema {current} is an unpublished ambiguous fork; this build cannot migrate it safely")),
-        _ => Err(format!("workspace registry schema {current} is newer than supported schema {SCHEMA_VERSION}")),
+        _ => Err(format!("workspace registry schema {current} is newer than supported schema {supported}")),
     }
 }
 
@@ -88,8 +94,12 @@ fn validate_selected(db: &Connection, current: u32) -> Result<(), String> {
 /// This guard precedes persistent journal configuration. Writer admission below
 /// repeats it after locking; this first read is never upgrade authority.
 pub(super) fn check_readonly(db: &Connection) -> Result<(), String> {
+    check_readonly_for(db, SCHEMA_VERSION)
+}
+
+fn check_readonly_for(db: &Connection, supported: u32) -> Result<(), String> {
     let current = version(db)?;
-    admit(current)?;
+    admit_for(current, supported)?;
     validate_selected(db, current)
 }
 
@@ -132,17 +142,23 @@ fn migrate_with_admission_hooks(db: &Connection, after_read: impl FnOnce() -> Re
     if current == SCHEMA_VERSION {
         return tx.commit().map_err(|error| error.to_string());
     }
-    migrate_legacy(&tx, current, 12)?;
-    for (index, (table, ddl)) in TABLES.into_iter().enumerate() {
-        tx.execute_batch(ddl).map_err(|error| error.to_string())?;
-        if table == "agent_locations" {
-            // Only immutable accepted targets are copied. No legacy process,
-            // inode, cursor, observer stamp or ended-pane proof is fabricated.
-            agent_locations::backfill(&tx)?;
+    if current <= 12 {
+        migrate_legacy(&tx, current, 12)?;
+        for (index, (table, ddl)) in TABLES.into_iter().enumerate() {
+            tx.execute_batch(ddl).map_err(|error| error.to_string())?;
+            if table == "agent_locations" {
+                // Only immutable accepted targets are copied. No legacy process,
+                // inode, cursor, observer stamp or ended-pane proof is fabricated.
+                agent_locations::backfill(&tx)?;
+            }
+            after_table(index)?;
         }
-        after_table(index)?;
     }
+    // Schema17 has exactly these five tables. Its issued-source JSON remains
+    // readable; only new schema18 writers may emit Located provenance. Keep
+    // every old row and all authority unchanged rather than rebuilding tables.
     validate_selected(&tx, SCHEMA_VERSION)?;
+    after_table(TABLES.len())?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())
 }
@@ -152,6 +168,22 @@ pub(super) fn discard_selected_for_legacy_fixture(db: &Connection) {
     for (table, _) in TABLES {
         db.execute_batch(&format!("DROP TABLE IF EXISTS {table}")).unwrap();
     }
+}
+
+/// Exact stored values and definitions, excluding the separate version header.
+#[cfg(test)]
+pub(super) fn stored_contents(db: &Connection) -> Vec<(String, String, Vec<Vec<rusqlite::types::Value>>)> {
+    let mut query = db.prepare("SELECT name,sql FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap();
+    let tables = query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    tables.into_iter().map(|(name, ddl)| {
+        let mut query = db.prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""))).unwrap();
+        let mut rows = query.query_map([], |row| (0..row.as_ref().column_count())
+            .map(|column| row.get::<_, rusqlite::types::Value>(column)).collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        rows.sort_by_key(|row| format!("{row:?}"));
+        (name, ddl, rows)
+    }).collect()
 }
 
 #[cfg(test)]
@@ -180,7 +212,7 @@ mod tests {
             let path = directory.path().join("registry.sqlite3");
             legacy(&path, checkpoint);
             let registry = Registry::at(&path).unwrap();
-            assert_eq!(version(&registry.db).unwrap(), 17, "from {checkpoint}");
+            assert_eq!(version(&registry.db).unwrap(), SCHEMA_VERSION, "from {checkpoint}");
             assert_eq!(registry.db.query_row("SELECT name FROM projects WHERE repository='/fixture'", [], |row| row.get::<_, String>(0)).unwrap(), "preserved");
             let identity: String = registry.db.query_row("SELECT identity FROM metadata", [], |row| row.get(0)).unwrap();
             for (table, _) in TABLES {
@@ -190,15 +222,61 @@ mod tests {
             drop(registry);
             for _ in 0..2 {
                 let registry = Registry::at(&path).unwrap();
-                assert_eq!(version(&registry.db).unwrap(), 17);
+                assert_eq!(version(&registry.db).unwrap(), SCHEMA_VERSION);
                 assert_eq!(registry.db.query_row("SELECT identity FROM metadata", [], |row| row.get::<_, String>(0)).unwrap(), identity);
             }
         }
     }
 
     #[test]
+    fn exact_schema17_interruption_keeps_rows_and_checkpoint_until_final_stamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let registry = Registry::at(&path).unwrap();
+        registry.db.pragma_update(None, "user_version", 17).unwrap();
+        drop(registry);
+        let before = image(&path);
+        let db = Connection::open(&path).unwrap();
+        let contents = stored_contents(&db);
+        let error = migrate_with_hooks(&db, || Ok(()), |step| {
+            assert_eq!(step, TABLES.len(), "schema17 must never recreate or backfill a selected table");
+            assert_eq!(version(&db).unwrap(), 17, "stamp must be the final write");
+            Err("injected before schema18 stamp".into())
+        }).unwrap_err();
+        assert!(error.contains("injected before schema18 stamp"));
+        assert_eq!(version(&db).unwrap(), 17);
+        assert_eq!(stored_contents(&db), contents);
+        drop(db);
+        assert_eq!(image(&path), before);
+        let registry = Registry::at(&path).unwrap();
+        assert_eq!(version(&registry.db).unwrap(), 18);
+        assert_eq!(stored_contents(&registry.db), contents);
+    }
+
+    #[test]
+    fn schema17_reader_policy_refuses_schema18_before_layout_or_payload_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let registry = Registry::at(&path).unwrap();
+        registry.db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
+        registry.db.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        registry.db.execute("UPDATE metadata SET sequence=sequence+1", []).unwrap();
+        drop(registry);
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let before = (image(&path), image(&wal));
+        assert!(!before.1.is_empty());
+        let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        // Exercise the same admission guard with the frozen schema17 reader
+        // ceiling. This is a policy fixture, not execution of an old binary.
+        let error = check_readonly_for(&db, 17).unwrap_err();
+        assert!(error.contains("schema 18 is newer than supported schema 17"));
+        drop(db);
+        assert_eq!((image(&path), image(&wal)), before);
+    }
+
+    #[test]
     fn unpublished_and_future_versions_preserve_database_bytes() {
-        for checkpoint in [13, 14, 15, 16, 18, 99] {
+        for checkpoint in [13, 14, 15, 16, 19, 99] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("registry.sqlite3");
             legacy(&path, 12);
@@ -213,7 +291,7 @@ mod tests {
 
     #[test]
     fn rejected_wal_databases_keep_primary_and_committed_wal_bytes() {
-        for checkpoint in [13, 16, 18] {
+        for checkpoint in [13, 16, 19] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("registry.sqlite3");
             legacy(&path, 12);
@@ -232,7 +310,7 @@ mod tests {
 
     #[test]
     fn constructor_read_pin_prevents_foreign_future_commit_and_preserves_its_journal() {
-        for checkpoint in [13, 18] {
+        for checkpoint in [13, 19] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("registry.sqlite3");
             legacy(&path, 12);
@@ -271,7 +349,7 @@ mod tests {
             // also proves the successful path releases it before its own
             // rollback-journal COMMIT rather than blocking itself indefinitely.
             let registry = Registry::at(&path).unwrap();
-            assert_eq!(version(&registry.db).unwrap(), 17);
+            assert_eq!(version(&registry.db).unwrap(), SCHEMA_VERSION);
             assert_eq!(registry.db.query_row("SELECT name FROM projects WHERE repository='/fixture'", [],
                 |row| row.get::<_, String>(0)).unwrap(), "preserved");
         }
@@ -294,7 +372,7 @@ mod tests {
                 let writer = Connection::open(&path).unwrap();
                 writer.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
                 let tx = writer.unchecked_transaction().unwrap();
-                tx.pragma_update(None, "user_version", 18).unwrap();
+                tx.pragma_update(None, "user_version", 19).unwrap();
                 tx.execute("UPDATE projects SET name='newer writer owns this image'", []).unwrap();
                 tx.commit().unwrap();
                 drop(writer);
@@ -325,7 +403,7 @@ mod tests {
         let path = directory.path().join("registry.sqlite3");
         legacy(&path, 12);
         let db = Connection::open(&path).unwrap();
-        db.pragma_update(None, "user_version", 18).unwrap();
+        db.pragma_update(None, "user_version", 19).unwrap();
         drop(db);
         struct Child(std::process::Child);
         impl Drop for Child {
@@ -352,7 +430,7 @@ mod tests {
 
     #[test]
     fn ambiguous_partial_layouts_are_refused_without_repair_or_writes() {
-        for checkpoint in [12, 17] {
+        for checkpoint in [12, 17, SCHEMA_VERSION] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("registry.sqlite3");
             legacy(&path, 12);
@@ -395,7 +473,7 @@ mod tests {
 
     #[test]
     fn writer_admission_rechecks_after_another_connection_advances() {
-        for checkpoint in [13, 16, 18] {
+        for checkpoint in [13, 16, 19] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("registry.sqlite3");
             legacy(&path, 12);
@@ -418,7 +496,7 @@ mod tests {
 
     #[test]
     fn every_interrupted_selected_step_rolls_back_to_the_same_published_image() {
-        for fail_at in 0..TABLES.len() {
+        for fail_at in 0..=TABLES.len() {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("registry.sqlite3");
             legacy(&path, 12);
@@ -431,7 +509,7 @@ mod tests {
             drop(db);
             assert_eq!(image(&path), before, "rollback step {fail_at}");
             let registry = Registry::at(&path).unwrap();
-            assert_eq!(version(&registry.db).unwrap(), 17);
+            assert_eq!(version(&registry.db).unwrap(), SCHEMA_VERSION);
         }
     }
 }
