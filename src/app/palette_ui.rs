@@ -242,17 +242,23 @@ impl Cagents {
         match action {
             Action::Record(field) => {
                 self.palette.recording = Some(field);
+                self.palette.filtering_key = false;
+                self.palette.query = None;
                 self.palette.recording_error = None;
                 self.palette.reassign = None;
                 Task::none()
             }
             Action::FilterKey => {
                 self.palette.filtering_key = true;
+                self.palette.recording = None;
+                self.palette.query = None;
+                self.palette.reassign = None;
                 self.palette.recording_error = None;
                 Task::none()
             }
             Action::Reassign => {
                 let Some((field, chord, owner)) = self.palette.reassign.take() else { return Task::none(); };
+                if self.palette.recording != Some(field) { return Task::none(); }
                 let binding = settings::parse_shortcut(&chord).expect("recorded chord");
                 let mut next = self.settings.clone();
                 let drafts = self.settings_draft.keyboard_shortcuts.shortcut_values();
@@ -310,6 +316,8 @@ impl Cagents {
                 self.palette.recording = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
+                self.palette.reassign = None;
+                self.palette.recording_error = None;
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
                         .map(cosmic::Action::App)
@@ -406,6 +414,8 @@ impl Cagents {
             if is_escape_press(event) {
                 self.palette.recording = None;
                 self.palette.filtering_key = false;
+                self.palette.reassign = None;
+                self.palette.recording_error = None;
                 return Some(Task::none());
             }
             if let keyboard::Event::KeyPressed { key, modifiers, .. } = event {
@@ -2227,6 +2237,30 @@ mod settings_recorder_tests {
             assert_eq!(app.palette.recording, Some(field));
             assert_eq!(app.settings_draft.keyboard_shortcuts.toggle_projects, original);
         }
+    }
+
+    #[test]
+    fn cancelling_a_recording_cannot_reassign_its_conflict_from_key_filter_mode() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let original = app.settings.keyboard_shortcuts.clone();
+        let field = SettingsField::ShortcutToggleProjects;
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        drop(app.update_palette(Action::Record(field)));
+        drop(app.record_shortcut(field, chord));
+        assert!(app.palette.reassign.is_some());
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+        };
+        drop(app.palette_key_event(&escape));
+        assert!(app.palette.reassign.is_none());
+        drop(app.update_palette(Action::FilterKey));
+        assert!(app.palette.recording.is_none());
+        assert!(app.palette.reassign.is_none());
+        drop(app.update_palette(Action::Reassign));
+        assert_eq!(app.settings.keyboard_shortcuts, original);
     }
 
     #[test]
