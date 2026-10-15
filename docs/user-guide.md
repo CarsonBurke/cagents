@@ -50,13 +50,19 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
   reach offscreen panes, or press **Escape** to cancel.
-- Drag a project header to reorder projects; the order survives restarts. Newly opened projects append in opening order. `cagents project list` lists shared projects by creation rank, newest first, independently of each window's custom sidebar order. `cagents project open PATH` selects its primary worktree in the most recently focused running window.
+- Drag a project header to reorder projects; the order survives restarts. Newly opened projects append in opening order. `cagents project list` lists shared projects by creation rank, newest first, independently of each window's custom sidebar order. `cagents project open PATH` selects a local project's primary worktree in the most recently focused running local window.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,
   or name.
-- Worktree labels prefer the matching pull request title and fall back to a
-  readable branch basename; tooltips and search keep the full branch name.
-  Rows show matching pull requests and their CI status. Unread updates stay
+- Worktree labels show the literal branch name, including prefixes and punctuation.
+  Detached worktrees show their directory name. The inspector's Copy branch action
+  copies the actual branch name. Matching pull request titles remain searchable and
+  appear in tooltips; rows retain pull request and CI indicators.
+  Change badges show counts up to **999+**, with distinct conflict and merge/rebase
+  indicators. Clean worktrees say **No changes** in their tooltip.
+  Compact projects keep their avatar or show stable coloured initials; hover or
+  keyboard focus identifies the project and worktree status. Attention badges stay
+  visible on the compact project. Unread updates stay
   emphasized until acknowledged. **Waiting for input** stays visible until the
   agent resumes or finishes. The All, Attention, and Pull requests views keep separate
   scroll positions.
