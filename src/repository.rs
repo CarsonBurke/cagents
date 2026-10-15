@@ -4999,6 +4999,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         deleted || entry.kind == ChangeKind::Deleted,
                     )
                 });
+            // Commands explicitly select --find-renames, not copy detection.
             // Without an addition/deletion pair, rename detection cannot
             // change another row's count. A capped prefix cannot prove the
             // opposite half is absent, so keep its non-modification reads full.
@@ -9641,6 +9642,43 @@ mod tests {
                     .iter()
                     .all(|command| !command.arguments.iter().any(|arg| arg == "--"))
             );
+        }
+
+        #[test]
+        fn cached_numstat_explicit_rename_policy_scopes_additions_with_copy_config() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            let original: String = (0..100).map(|index| format!("line {index}\n")).collect();
+            fs::write(root.join("a"), &original).unwrap();
+            git(root, &["add", "a"]);
+            git(root, &["commit", "-m", "initial"]);
+            git(root, &["config", "status.renames", "false"]);
+            git(root, &["config", "diff.renames", "copies"]);
+            fs::write(root.join("a"), format!("{original}extra\n")).unwrap();
+            git(root, &["add", "a"]);
+            let executor = Arc::new(RecordingExecutor::default());
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions { untracked_files: false, ..Default::default() };
+            let initial = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&initial, "a", ChangeArea::Staged), (Some(1), Some(0)));
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("b"), &original).unwrap();
+            git(root, &["add", "b"]);
+            let added = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&added, "a", ChangeArea::Staged), (Some(1), Some(0)));
+            assert_eq!(measured(&added, "b", ChangeArea::Staged), (Some(100), Some(0)));
+            let commands = executor.commands.lock().unwrap().clone();
+            let counts: Vec<_> = commands.iter().filter(|command| command.arguments.iter().any(|arg| arg == "--numstat")).collect();
+            assert_eq!(counts.len(), 1);
+            assert!(counts[0].arguments.iter().any(|arg| arg == "--find-renames"));
+            assert_eq!(counts[0].arguments.last(), Some(&OsString::from("b")));
+            let full = service.run_checked(&service.numstat_command(root, true), &cancel).unwrap();
+            let full = parse_numstat(&full.stdout).unwrap();
+            let full = full.iter().find(|entry| entry.path == path("b")).unwrap();
+            assert_eq!(measured(&added, "b", ChangeArea::Staged), (full.added, full.removed));
         }
 
         #[test]
