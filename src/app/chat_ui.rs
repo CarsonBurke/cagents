@@ -5152,6 +5152,10 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
         let Some(handle) = runtime.handle() else { return Task::none(); };
         let snapshot = handle.snapshot();
+        if !snapshot.native_helper.as_ref().is_some_and(|helper| helper.outdated) {
+            runtime.helper_restart_requested = false;
+            return Task::none();
+        }
         if !runtime.helper_restart_requested || snapshot.activity() != ActivityState::Idle
             || !snapshot.ready || snapshot.exited || runtime.pending.is_some()
             || runtime.queued.is_some() || !runtime.followups.is_empty()
@@ -6263,6 +6267,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.target = target;
                             runtime.connection = Connection::Live(handle);
+                            runtime.helper_restart_requested = false;
                             runtime.model_picker = None;
                             runtime.account_picker = false;
                             runtime.reasoning_picker = false;
