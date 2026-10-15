@@ -2280,6 +2280,17 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    pub(super) fn local_history_account_home(&self) -> Option<&crate::account::HomeIdentity> {
+        self.handle().and_then(|handle| handle.account_home())
+    }
+    pub(super) fn local_history_is_read_only(&self) -> bool {
+        self.handle().map_or(self.snapshot.exited || self.snapshot.read_only_reason.is_some(),
+            |handle| handle.local_history_is_read_only())
+    }
+    pub(super) fn has_local_history_handle(&self) -> bool {
+        self.handle().is_some()
+    }
+
     /// Whether nothing has started yet, a start for the first message
     /// included.
     fn is_draft(&self) -> bool {

@@ -164,6 +164,7 @@ impl SourceClock {
 struct Inner {
     id: TerminalId,
     session: Session,
+    account_home: Option<crate::account::HomeIdentity>,
     upgrade_recovery: Option<(Session, Session)>,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
@@ -526,6 +527,7 @@ impl ClientHandle {
         let inner = Arc::new(Inner {
                 id: session.id,
                 session,
+                account_home: None,
                 upgrade_recovery: None,
                 proof,
                 wire: Arc::new(Mutex::new(Wire {
@@ -908,7 +910,7 @@ impl ClientHandle {
         let mut early_activity = None;
         let mut early_observed = OutputObservation::default();
         let mut early_usage = AccountUsage::default();
-        let (session, initial) = loop {
+        let (session, initial, account_home) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
             let frame = codec.read(&mut stream);
@@ -954,11 +956,11 @@ impl ClientHandle {
                     early_usage.push(report, observed_at);
                 }
                 ServerMessage::Response {
-                    response: ServerResponse::ChatAttached { session, snapshot },
+                    response: ServerResponse::ChatAttached { session, snapshot, account_home },
                 } if session.id == id && envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
-                    break (session, snapshot);
+                    break (session, snapshot, account_home);
                 }
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
@@ -1029,6 +1031,7 @@ impl ClientHandle {
         let inner = Arc::new(Inner {
             id,
             session,
+            account_home,
             upgrade_recovery,
             proof: proof.clone(),
             wire: wire.clone(),
@@ -1327,6 +1330,17 @@ impl ClientHandle {
         *inner.reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(Self { inner })
     }
+    /// Captured backend association for local deletion only. This is not a
+    /// provider-read capability and never follows mutable recipe paths.
+    pub(crate) fn account_home(&self) -> Option<&crate::account::HomeIdentity> {
+        self.inner.account_home.as_ref()
+    }
+    pub(crate) fn local_history_is_read_only(&self) -> bool {
+        if !self.inner.alive.load(Ordering::Acquire) { return true; }
+        let snapshot = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        snapshot.exited || snapshot.read_only_reason.is_some()
+    }
+
     /// The durable descriptor for this chat, with the conversation the
     /// provider has confirmed.
     ///
@@ -1806,6 +1820,8 @@ mod tests {
             let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
             let ClientRequest::ChatStart { session, .. } = attach.request else { panic!("start"); };
             respond(&mut codec, &mut server, attach.request_id, ServerResponse::ChatAttached {
+                account_home: Some(crate::account::HomeIdentity { provider: crate::agent::Provider::Omp,
+                    canonical_home: "/immutable/backend/home".into(), device: 11, inode: 22, purge_ids: vec![] }),
                 session, snapshot: Snapshot { generation: 77, session_id: Some("cached-exact-session".into()), ready: true,
                     items: vec![Arc::new(super::super::Item { id: "offline-item".into(), role: super::super::Role::Assistant,
                         content: super::super::ItemContent::Text { text: "private cached words".repeat(8192), thinking: false, phase: Default::default() },
@@ -1820,10 +1836,18 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = ClientHandle::connect_on(client, omp_card(None, None), Intent::Start,
             None, false, None, None, move |wake| { let _ = tx.send(wake); }).unwrap();
+        let captured_home = handle.account_home().unwrap().clone();
+        assert_eq!(captured_home.canonical_home, std::path::Path::new("/immutable/backend/home"));
+        assert!(!handle.local_history_is_read_only());
+        let mut presentation_recipe = handle.session();
+        presentation_recipe.launch.recipe.environment.insert("PI_CODING_AGENT_DIR".into(), "/different/current/path".into());
+        assert_eq!(handle.account_home(), Some(&captured_home), "a recipe copy cannot rewrite backend provenance");
         let weak_body = Arc::downgrade(&handle.snapshot().items[0]);
         handle.set_visible(false).unwrap();
         while !matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(_)) {}
         assert!(handle.resident_snapshot_with_clock().is_none());
+        assert!(handle.local_history_is_read_only());
+        assert_eq!(handle.account_home(), Some(&captured_home));
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
         let deadline = Instant::now() + Duration::from_secs(5);
         while weak_body.upgrade().is_some() {
@@ -2966,7 +2990,7 @@ mod tests {
                         _ => {}
                     }
                     ServerMessage::Response {
-                        response: ServerResponse::ChatAttached { session, snapshot },
+                        response: ServerResponse::ChatAttached { session, snapshot, account_home: None },
                     }
                 });
             if mismatch == 0 {
@@ -3022,6 +3046,7 @@ mod tests {
                 };
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached {
+                        account_home: None,
                         session,
                         snapshot: Snapshot::default(),
                     },
@@ -3101,6 +3126,7 @@ mod tests {
                 Some(start.request_id),
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached {
+                        account_home: None,
                         session,
                         snapshot: snapshot(),
                     },
@@ -3261,6 +3287,7 @@ mod tests {
                 Some(start.request_id),
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached {
+                        account_home: None,
                         session,
                         snapshot: Snapshot {
                             generation: 1,
@@ -3582,6 +3609,7 @@ mod tests {
                 Some(start.request_id),
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached {
+                        account_home: None,
                         session,
                         snapshot: initial,
                     },
@@ -3772,6 +3800,7 @@ mod tests {
                     &mut server,
                     Some(start.request_id),
                     ServerResponse::ChatAttached {
+                        account_home: None,
                         session,
                         snapshot: Snapshot {
                             generation: 1,
