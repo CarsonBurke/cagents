@@ -415,16 +415,30 @@ fn ensure_account_homes_unused_inner(
         };
         // Copy small ownership metadata under HostState. Resolving aliases and
         // reading retained checkpoints happens after releasing that mutex.
-        let (mut paths, scopes, closing, upgrade, registry) = {
+        let (mut paths, scopes, closing, upgrade, registry, effective_terminals) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut paths = Vec::new();
             let mut scopes = Vec::new();
+            let mut effective_terminals = Vec::new();
             let mut unresolved_native = false;
-            for (_id, record) in state
+            for (id, record) in state
                 .terminals
                 .iter()
                 .filter(|(id, _)| state.account_terminal_in_use(**id))
             {
+                let captured_home = record.execution_environment.as_ref().and_then(|environment| {
+                    crate::account::home_variable(account.provider)
+                        .and_then(|name| environment.0.get(name))
+                        .filter(|value| !value.is_empty())
+                        .or_else(|| environment.0.get("HOME").filter(|value| !value.is_empty()))
+                });
+                if !conservative_pending && captured_home.is_some_and(|value| !std::path::Path::new(value).is_absolute()) {
+                    // The operational directory may have moved independently
+                    // of immutable launch.cwd. Joining a relative account home
+                    // against that old recipe would invent physical scope.
+                    return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                        "A terminal has relative account-home metadata without captured physical scope; close it before deleting account files", false));
+                }
                 for provider in crate::account::Account::PROVIDERS {
                     if conservative_pending || record.execution_environment.is_none() {
                         paths.extend(selected_recipe(provider, &record.session.launch));
@@ -462,12 +476,32 @@ fn ensure_account_homes_unused_inner(
                         {
                             environment.remove(&name);
                         }
+                        if !conservative_pending && provider == account.provider
+                            && crate::account::home_variable(provider).and_then(|name| environment.get(name))
+                                .filter(|value| !value.is_empty())
+                                .or_else(|| environment.get("HOME").filter(|value| !value.is_empty()))
+                                .is_some_and(|value| !std::path::Path::new(value).is_absolute())
+                        {
+                            return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                                "A terminal has relative account-home metadata without captured physical scope; close it before deleting account files", false));
+                        }
                         paths.extend(selected_home(
                             provider,
                             &environment,
                             &record.session.launch.working_directory,
                         ));
                     }
+                }
+                // A native-to-terminal handoff keeps its issued recipe while
+                // the worker uses a separately captured, cleared environment.
+                // Discharge only this exact current descriptor when the
+                // selected provider's effective credential home is known.
+                if !conservative_pending
+                    && captured_home.is_some()
+                    && let Ok(descriptor) = state.descriptor(0, *id)
+                    && descriptor.session.continuity.live_proof().is_some_and(|proof| proof.is_complete())
+                {
+                    effective_terminals.push(descriptor.session);
                 }
             }
             for record in state
@@ -511,6 +545,7 @@ fn ensure_account_homes_unused_inner(
                         .any(|pending| pending.may_own_provider(account.provider)),
                 state.account_cleanup_evidence(),
                 state.execution_registry.clone(),
+                effective_terminals,
             )
         };
         // Shared model membership also covers another window's parked or
@@ -541,6 +576,16 @@ fn ensure_account_homes_unused_inner(
                         // against exact captured current/durable ownership.
                     }
                     crate::model::CardKind::Terminal(session) => {
+                        let captured = effective_terminals.iter().any(|current| {
+                            let Some(proof) = current.continuity.live_proof().filter(|proof| proof.is_complete()) else { return false; };
+                            if session.continuity.live_proof().as_ref() != Some(&proof) { return false; }
+                            let mut normalized = current.clone();
+                            // Live/Detached is presentation of the exact same
+                            // owned worker. Every issued field remains exact.
+                            normalized.continuity = session.continuity.clone();
+                            normalized == session
+                        });
+                        if captured { continue; }
                         for provider in crate::account::Account::PROVIDERS {
                             paths.extend(selected_recipe(provider, &session.launch));
                         }

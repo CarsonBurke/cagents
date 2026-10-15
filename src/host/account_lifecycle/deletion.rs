@@ -734,7 +734,64 @@ mod tests {
         {
             let mut registry=registry.lock().unwrap();
             let revision=registry.view_revision(&view_scope).unwrap();
-            registry.apply(&crate::workspace_model::ModelEdit::ChangeView {scope:view_scope,expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Update {before:unknown_pane,pane}}).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::ChangeView {scope:view_scope.clone(),expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Update {before:unknown_pane,pane}}).unwrap();
+        }
+        permit.authorize_scope(&scope).unwrap();
+        // A real native-handoff terminal executes captured B even when its
+        // immutable issued recipe still names A. Saved pane association must
+        // match the current proof and every issued field before discharge.
+        let mut issued_terminal=terminal.clone();
+        issued_terminal.id=crate::model::TerminalId::new();
+        issued_terminal.launch.environment.insert("CLAUDE_CONFIG_DIR".into(),path.display().to_string());
+        let effective=crate::terminal_ipc::ChatExecutionEnvironment([
+            ("CLAUDE_CONFIG_DIR".into(),foreign_path.display().to_string()),
+            ("HOME".into(),root.join("home").display().to_string()),
+            ("PATH".into(),"/usr/bin:/bin".into()),
+        ].into());
+        let handle=crate::terminal::TerminalHandle::spawn(issued_terminal.clone(),crate::terminal::TerminalConfig {
+            execution_environment:Some(effective.clone()),
+            holder_recovery:Some(crate::terminal::holder::Recovery {source:issued_terminal.clone(),previous_sources:Vec::new(),relaunches:Vec::new(),options:Default::default(),execution_environment:Some(effective.clone())}),
+            ..Default::default()
+        },|_|{}).unwrap();
+        let descriptor={
+            let mut state=host.lock().unwrap();
+            let descriptor=state.finish_spawn(0,issued_terminal.clone(),handle.clone(),true).unwrap();
+            state.terminals.get_mut(&issued_terminal.id).unwrap().execution_environment=Some(effective.clone());
+            descriptor.session
+        };
+        let terminal_pane=crate::workspace_model::views::Pane {id:crate::model::CardId::new(),title:"effective B".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,scope:None,kind:crate::model::CardKind::Terminal(descriptor.clone())};
+        {
+            let mut registry=registry.lock().unwrap();
+            let revision=registry.view_revision(&view_scope).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::ChangeView {scope:view_scope.clone(),expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Insert {pane:terminal_pane.clone(),before:None}}).unwrap();
+        }
+        permit.authorize_scope(&scope).unwrap();
+        let mut unknown_terminal=terminal_pane.clone();
+        let crate::model::CardKind::Terminal(unknown)=&mut unknown_terminal.kind else {unreachable!()};
+        unknown.launch.arguments.push("unissued".into());
+        {
+            let mut registry=registry.lock().unwrap();
+            let revision=registry.view_revision(&view_scope).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::ChangeView {scope:view_scope.clone(),expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Update {before:terminal_pane.clone(),pane:unknown_terminal.clone()}}).unwrap();
+        }
+        assert!(permit.verify().is_err(),"same terminal ID cannot discharge changed saved provenance");
+        {
+            let mut registry=registry.lock().unwrap();
+            let revision=registry.view_revision(&view_scope).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::ChangeView {scope:view_scope.clone(),expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Update {before:unknown_terminal,pane:terminal_pane.clone()}}).unwrap();
+        }
+        host.lock().unwrap().terminals.get_mut(&issued_terminal.id).unwrap().execution_environment.as_mut().unwrap().0.insert("CLAUDE_CONFIG_DIR".into(),"relative-home".into());
+        assert!(permit.verify().is_err(),"relative effective home cannot be resolved through immutable old cwd");
+        host.lock().unwrap().terminals.get_mut(&issued_terminal.id).unwrap().execution_environment=Some(effective);
+        permit.authorize_scope(&scope).unwrap();
+        let removed=host.lock().unwrap().terminals.remove(&issued_terminal.id).unwrap();
+        assert!(permit.verify().is_err(),"nonresident saved terminal cannot borrow a removed worker's environment");
+        handle.close_with_receipt(&issued_terminal,&proof).unwrap();
+        drop(removed);drop(handle);
+        {
+            let mut registry=registry.lock().unwrap();
+            let revision=registry.view_revision(&view_scope).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::ChangeView {scope:view_scope.clone(),expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Remove {id:terminal_pane.id}}).unwrap();
         }
         permit.authorize_scope(&scope).unwrap();
         // A stale registration/path and a released lease independently revoke
