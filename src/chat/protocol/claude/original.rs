@@ -260,13 +260,14 @@ impl Claude {
             return;
         }
         // Optional predictions and child frames cannot establish or alter
-        // foreground input authority. Only the main decoder's verified native
-        // identity is eligible; a raw frame session is not sufficient.
+        // foreground input authority. This actual frame's session was already
+        // validated by the main decoder. Its routing field self.session_id can
+        // still be only a local --session-id, so never inherit it as proof.
         if frame["type"] == "prompt_suggestion" || !frame["parent_tool_use_id"].is_null() {
             return;
         }
-        if let Some(session) = &self.session_id {
-            self.originals.confirmed_session = Some(session.clone());
+        if let Some(session) = frame["session_id"].as_str() {
+            self.originals.confirmed_session = Some(session.into());
         }
         if frame["type"] == "system" && frame["subtype"] == "init" {
             let mut init = serde_json::Map::new();
@@ -474,6 +475,18 @@ mod tests {
         adapter.receive(user("exact-command")).unwrap();
         adapter.receive(started("exact-command")).unwrap();
         assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Accepted{command_id,session_id,..} if command_id=="exact-command"&&session_id=="00000000-0000-4000-8000-000000000001")));
+    }
+
+    #[test]
+    fn configured_launch_session_is_not_original_acceptance_evidence() {
+        let mut adapter=adapter();adapter.session_id=Some("00000000-0000-4000-8000-000000000001".into());
+        adapter.original_command(Some("exact-command".into()));
+        let read=adapter.command(prompt("original",PromptMode::Send)).unwrap();
+        adapter.receive(settings_reply(&read.writes[0])).unwrap();
+        let mut echo=user("exact-command");echo.as_object_mut().unwrap().remove("session_id");
+        adapter.receive(echo).unwrap();adapter.receive(started("exact-command")).unwrap();
+        assert!(adapter.originals.confirmed_session.is_none());
+        assert!(adapter.take_original_updates().iter().all(|update|!matches!(update,OriginalUpdate::Accepted{..}|OriginalUpdate::Latest{..})));
     }
 
     #[test]
