@@ -22,6 +22,7 @@ struct VisualLine {
     physical: usize,
     layout: usize,
     source_start: usize,
+    source_end: usize,
     top: f32,
     height: f32,
     glyph_index: Option<GlyphIndex>,
@@ -143,7 +144,7 @@ impl LayoutSnapshot {
         for (physical, line) in lines.iter().enumerate() {
             for (layout, row) in line.layout.iter().enumerate() {
                 let height = row.line_height_opt.unwrap_or(metrics.line_height);
-                visual.push(VisualLine { physical, layout, source_start, top, height,
+                visual.push(VisualLine { physical, layout, source_start, source_end:source_start+row.glyphs.iter().map(|glyph|glyph.end).max().unwrap_or(0), top, height,
                     glyph_index: (row.glyphs.len() > INDEX_THRESHOLD).then(|| GlyphIndex::new(&row.glyphs)) });
                 top += height;
             }
@@ -234,6 +235,21 @@ impl LayoutSnapshot {
         }
         indices.sort_unstable();
         Some(indices)
+    }
+
+    /// The engine's caret result when x does not intersect any glyph advance
+    /// in this visual row. Callers first query glyphs_in_x and test advances.
+    /// Retaining the original first glyph and logical end preserves RTL and
+    /// mixed-direction blank-edge behavior without projecting the whole row.
+    pub fn caret_outside_x(&self,visual:usize,x:f32)->Option<usize> {
+        let row=self.visual.get(visual)?;
+        let source=&self.lines[row.physical];
+        if let Some(first)=source.layout[row.layout].glyphs.first() {
+            if (source.rtl && x>first.x) || (!source.rtl && x<0.0) {
+                return Some(row.source_start+first.start);
+            }
+        }
+        Some(row.source_end)
     }
 
     /// Original glyphs intersecting placed advance bounds, returned in original
