@@ -4921,6 +4921,9 @@ impl Cagents {
                 needed.then(|| (*card, *agent, session.clone()))
             })
             .collect::<Vec<_>>();
+        if cards.is_empty() {
+            return Task::none();
+        }
         Task::batch(
             cards
                 .into_iter()
@@ -17600,7 +17603,14 @@ mod tests {
                 .automation_archives
                 .insert(card, id);
             assert!(app.can_present_automation_archive(card, &agent));
-            assert!(app.prepare_automation_archive(card, &agent));
+            assert!(
+                !app.prepare_automation_archive(card, &agent),
+                "an existing Chat keeps its durable descriptor; only its runtime becomes read-only"
+            );
+            assert!(matches!(
+                chat_runtime(&app, card).connection,
+                Connection::Archived
+            ));
             assert_eq!(
                 app.archived_pane_readiness(card),
                 Ok(Some(false)),
@@ -17648,7 +17658,10 @@ mod tests {
     #[test]
     fn a_late_live_attachment_cannot_replace_an_archived_automation_pane() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace.resize_viewport(1600.0);
         let (card, target) = starting_chat(&mut app);
+        app.workspace.resize_viewport(1600.0);
+        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
         let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
         Arc::make_mut(&mut app.durable)
             .automation_archives
@@ -17703,7 +17716,10 @@ mod tests {
     #[test]
     fn reconnecting_a_completed_automation_only_reloads_its_saved_view() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace.resize_viewport(1600.0);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        app.workspace.resize_viewport(1600.0);
+        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
         Arc::make_mut(&mut app.durable)
             .automation_archives
             .insert(card, crate::model::AgentId::new());
