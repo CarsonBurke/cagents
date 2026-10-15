@@ -912,7 +912,9 @@ impl Cagents {
                 );
                 let view = if let Some(setup) = self.chat_draft_setup_view(runtime) {
                     widget::column::with_children(vec![setup, view]).into()
-                } else { view };
+                } else {
+                    view
+                };
                 if let Some(recovery) = self.account_recovery_controls(card) {
                     widget::column::with_children(vec![recovery, view]).into()
                 } else {
@@ -2148,7 +2150,9 @@ impl Runtime {
         // sessions, that something is being sent, that the agent has stopped
         // or failed, that it is waiting on them, that it is working.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        let (glyph, state) = match setup.as_ref().filter(|_| self.is_draft() && !transitioning && self.error.is_none() && snapshot.error.is_none()) {
+        let (glyph, state) = match setup.as_ref().filter(|_| {
+            self.is_draft() && !transitioning && self.error.is_none() && snapshot.error.is_none()
+        }) {
             Some(readiness) => (None, readiness.draft_status()),
             None => self.conversation_status(transitioning),
         };
@@ -4775,7 +4779,7 @@ mod tests {
                 .summary
                 .clone();
             let mut element = runtime.view(
-                    None,
+                None,
                 None,
                 false,
                 true,
@@ -4949,7 +4953,7 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).subagents.push(child);
         let shortcuts = crate::settings::KeyboardShortcuts::default();
         let mut element = runtime.view(
-                    None,
+            None,
             None,
             false,
             true,
@@ -5692,7 +5696,7 @@ mod tests {
         let (runtime, _handle) = frame_cost::live_runtime(&items);
         let shortcuts = crate::settings::KeyboardShortcuts::default();
         let mut element = runtime.view(
-                    None,
+            None,
             None,
             false,
             true,
@@ -7352,7 +7356,7 @@ mod tests {
             drop(selected);
             let shortcuts = crate::settings::KeyboardShortcuts::default();
             let mut full = runtime.view(
-                    None,
+                None,
                 None,
                 false,
                 true,
@@ -7582,7 +7586,7 @@ mod tests {
             let target = runtime.target;
             let shortcuts = crate::settings::KeyboardShortcuts::default();
             let mut element = runtime.view(
-                    None,
+                None,
                 None,
                 false,
                 true,

@@ -192,8 +192,13 @@ fn restore_authenticated(
         .clone();
     let execution_context = spec.execution.clone();
     let mut initial = adapter.initialize()?;
-    let previous = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&source.id)
-        .filter(|record| record.handle.is_completed()).map(|record| record.handle.clone());
+    let previous = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&source.id)
+        .filter(|record| record.handle.is_completed())
+        .map(|record| record.handle.clone());
     let store = match previous.as_ref() {
         Some(previous) => chat::runtime::preflight_retained_restart(&spec, &mut initial, previous)?,
         None => chat::runtime::preflight_retained(&spec, &mut initial)?,

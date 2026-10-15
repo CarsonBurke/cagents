@@ -866,8 +866,11 @@ fn settled(host: &SharedHost, run: RunId) -> Run {
 
 #[test]
 fn recovery_cli_followup_restarts_a_failed_never_opened_provider_on_its_confirmed_thread() {
-    const NAME: &str = "recovery_cli_followup_restarts_a_failed_never_opened_provider_on_its_confirmed_thread";
-    if isolated(NAME).is_some() { return; }
+    const NAME: &str =
+        "recovery_cli_followup_restarts_a_failed_never_opened_provider_on_its_confirmed_thread";
+    if isolated(NAME).is_some() {
+        return;
+    }
     let (host, request, path) = fixture();
     let root = path.parent().unwrap();
     let executable = root.join("bin/claude");
@@ -880,33 +883,78 @@ fn recovery_cli_followup_restarts_a_failed_never_opened_provider_on_its_confirme
     std::fs::write(root.join("exit-after-result"), b"exit").unwrap();
     let first = submit(&host, &Authority::default(), request).unwrap();
     assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
-    let source = registry(&host).unwrap().lock().unwrap().agent(first.agent.id).unwrap().session.unwrap();
-    let HostedSession::Chat(source) = source else { unreachable!() };
-    let thread = source.launch.session_id.clone().expect("daemon retains identity without a presentation subscriber");
+    let source = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(first.agent.id)
+        .unwrap()
+        .session
+        .unwrap();
+    let HostedSession::Chat(source) = source else {
+        unreachable!()
+    };
+    let thread = source
+        .launch
+        .session_id
+        .clone()
+        .expect("daemon retains identity without a presentation subscriber");
     let previous = host.lock().unwrap().chats[&source.id].handle.clone();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !previous.is_completed() {
         assert!(Instant::now() < deadline, "fixture provider never exited");
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(previous.failure().is_some(), "actual exit3 must retain diagnostics");
-    let project: String = source.launch.recipe.working_directory.to_str().unwrap().chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    assert!(
+        previous.failure().is_some(),
+        "actual exit3 must retain diagnostics"
+    );
+    let project: String = source
+        .launch
+        .recipe
+        .working_directory
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     let history = root.join("home/.claude/projects").join(project);
     std::fs::create_dir_all(&history).unwrap();
     std::fs::write(history.join(format!("{thread}.jsonl")), b"").unwrap();
-    let followup = submit(&host, &Authority::default(), Submit {
-        name: None, destination: Destination::Existing(first.agent.id), prompt: "Explicit follow-up after crash".into(), idempotency_key: "after-crash".into(),
-    }).unwrap();
+    let followup = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(first.agent.id),
+            prompt: "Explicit follow-up after crash".into(),
+            idempotency_key: "after-crash".into(),
+        },
+    )
+    .unwrap();
     let done = settled(&host, followup.run.id);
     assert_eq!(done.state, State::Succeeded, "{done:?}");
-    let agent = registry(&host).unwrap().lock().unwrap().agent(first.agent.id).unwrap();
-    let Some(HostedSession::Chat(current)) = agent.session else { unreachable!() };
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(first.agent.id)
+        .unwrap();
+    let Some(HostedSession::Chat(current)) = agent.session else {
+        unreachable!()
+    };
     assert_eq!(current.id, source.id);
     assert_eq!(current.launch.session_id.as_ref(), Some(&thread));
     assert_eq!(current.launch.recipe, source.launch.recipe);
-    assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap(), "spawn\nspawn\n");
-    assert_eq!(std::fs::read_to_string(root.join("prompts")).unwrap(), "prompt\nprompt\n", "only the explicit follow-up is submitted; the prior turn is never replayed");
+    assert_eq!(
+        std::fs::read_to_string(root.join("spawns")).unwrap(),
+        "spawn\nspawn\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts")).unwrap(),
+        "prompt\nprompt\n",
+        "only the explicit follow-up is submitted; the prior turn is never replayed"
+    );
     close(&host, &Authority::default(), first.agent.id).unwrap();
 }
 

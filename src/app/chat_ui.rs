@@ -4089,7 +4089,8 @@ impl Cagents {
 
     fn preferred_chat_provider(&self) -> Provider {
         if let Some(directory) = self.terminal_directory()
-            && let Some(provider) = self.usable_chat_provider_for_directory(&directory) {
+            && let Some(provider) = self.usable_chat_provider_for_directory(&directory)
+        {
             return provider;
         }
         self.workspace
@@ -4563,7 +4564,10 @@ impl Cagents {
         self.card_chrome.remove(&card);
         self.cards
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
-        Task::batch([self.load_draft_skills(target), self.refresh_draft_accounts()])
+        Task::batch([
+            self.load_draft_skills(target),
+            self.refresh_draft_accounts(),
+        ])
     }
 
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
@@ -4665,7 +4669,8 @@ impl Cagents {
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
         self.notices.resolve(&format!("chat-resume:{card}"));
-        self.notices.resolve_target("daemon-interrupted-turns", card);
+        self.notices
+            .resolve_target("daemon-interrupted-turns", card);
         self.notices.resolve_target("daemon-chat-reconnect", card);
         self.cancel_chat_reconnect(card);
         self.chat_ui.default_chats.remove(&card);
@@ -5184,8 +5189,11 @@ impl Cagents {
                 let CardRuntime::Chat(runtime) = runtime else {
                     return None;
                 };
-                (runtime.disconnected && runtime.reconnect_attempts < 4 && !runtime.is_draft() && !self.chat_start_pending(*card))
-                    .then(|| (!runtime.visible.load(Ordering::Relaxed), runtime.target))
+                (runtime.disconnected
+                    && runtime.reconnect_attempts < 4
+                    && !runtime.is_draft()
+                    && !self.chat_start_pending(*card))
+                .then(|| (!runtime.visible.load(Ordering::Relaxed), runtime.target))
             })
             .collect();
         chats.sort_by_key(|(hidden, _)| *hidden);
@@ -5215,10 +5223,17 @@ impl Cagents {
             .or_insert(runtime.snapshot.busy);
     }
 
-    fn finish_chat_reconnect(&mut self, card: CardId, succeeded: bool, outcome: Option<&crate::agent::ActivityOutcome>) {
+    fn finish_chat_reconnect(
+        &mut self,
+        card: CardId,
+        succeeded: bool,
+        outcome: Option<&crate::agent::ActivityOutcome>,
+    ) {
         // Manual retry after the automatic budget has expired has no batch.
         // Its confirmed attachment still resolves this card's failure alone.
-        if succeeded { self.notices.resolve_target("daemon-chat-reconnect", card); }
+        if succeeded {
+            self.notices.resolve_target("daemon-chat-reconnect", card);
+        }
         let Some(batch) = self.chat_ui.reconnecting.as_mut() else {
             return;
         };
@@ -5227,7 +5242,10 @@ impl Cagents {
         };
         if succeeded {
             batch.reconnected += 1;
-            if matches!(outcome, Some(crate::agent::ActivityOutcome::Interrupted { .. })) {
+            if matches!(
+                outcome,
+                Some(crate::agent::ActivityOutcome::Interrupted { .. })
+            ) {
                 batch.interrupted.push(card);
             }
         } else {
@@ -5246,7 +5264,12 @@ impl Cagents {
     }
 
     fn report_chat_reconnect_batch(&mut self) {
-        if !self.chat_ui.reconnecting.as_ref().is_some_and(|batch| batch.pending.is_empty()) {
+        if !self
+            .chat_ui
+            .reconnecting
+            .as_ref()
+            .is_some_and(|batch| batch.pending.is_empty())
+        {
             return;
         }
         let batch = self.chat_ui.reconnecting.take().unwrap();
@@ -5254,28 +5277,46 @@ impl Cagents {
             let key = "daemon-interrupted-turns";
             // A second transport loss must retain earlier chats that have not
             // received a successful user command or been dismissed yet.
-            let mut targets = self.notices.entries.iter()
+            let mut targets = self
+                .notices
+                .entries
+                .iter()
                 .filter(|entry| entry.notice.key.as_deref() == Some(key))
                 .flat_map(|entry| entry.notice.targets.iter().copied())
-                .chain(batch.interrupted).collect::<Vec<_>>();
+                .chain(batch.interrupted)
+                .collect::<Vec<_>>();
             targets.sort();
             targets.dedup();
             self.notices.record(TransientNotice::warning("Turns were interrupted while the daemon was disconnected. Open an affected chat to restart its session.").key(key).targets(targets));
         }
         if !batch.failed.is_empty() {
             let key = "daemon-chat-reconnect";
-            let mut targets = self.notices.entries.iter()
+            let mut targets = self
+                .notices
+                .entries
+                .iter()
                 .filter(|entry| entry.notice.key.as_deref() == Some(key))
                 .flat_map(|entry| entry.notice.targets.iter().copied())
-                .chain(batch.failed).collect::<Vec<_>>();
+                .chain(batch.failed)
+                .collect::<Vec<_>>();
             targets.sort();
             targets.dedup();
-            self.notices.record(TransientNotice::warning("Some chats could not reconnect automatically. Open an affected chat to retry.").key(key).targets(targets));
+            self.notices.record(
+                TransientNotice::warning(
+                    "Some chats could not reconnect automatically. Open an affected chat to retry.",
+                )
+                .key(key)
+                .targets(targets),
+            );
         }
         if batch.reconnected > 0 {
-            self.status = Some(TransientNotice::success(format!(
-                "Daemon reconnected {} chats.", batch.reconnected
-            )).key("daemon-connectivity"));
+            self.status = Some(
+                TransientNotice::success(format!(
+                    "Daemon reconnected {} chats.",
+                    batch.reconnected
+                ))
+                .key("daemon-connectivity"),
+            );
         }
     }
 
@@ -5312,7 +5353,9 @@ impl Cagents {
         terminate_source: bool,
     ) -> Task<Message> {
         let selection = None;
-        if matches!(intent, chat::Intent::Start) { self.cancel_chat_reconnect(card); }
+        if matches!(intent, chat::Intent::Start) {
+            self.cancel_chat_reconnect(card);
+        }
         if self.chat_start_pending(card) {
             return Task::none();
         }
@@ -6288,16 +6331,26 @@ impl Cagents {
                 }
                 if let Err(failure) = &mut result
                     && attempt.session.launch.provider == Provider::Codex
-                    && failure.message.starts_with("Cannot verify Codex account directory ")
+                    && failure
+                        .message
+                        .starts_with("Cannot verify Codex account directory ")
                     && failure.message.contains("os error 2")
                 {
-                    let account = self.chat_account(Provider::Codex, &attempt.session.launch.recipe)
+                    let account = self
+                        .chat_account(Provider::Codex, &attempt.session.launch.recipe)
                         .unwrap_or_else(|| Account::system(Provider::Codex).id());
                     self.note_missing_draft_account_home(&account);
-                    let raw = std::mem::replace(&mut failure.message,
-                        "Codex's account setup isn't available. Sign in or choose another account.".into());
-                    self.notices.record(TransientNotice::warning(failure.message.clone())
-                        .key(format!("chat-setup:{}", target.card)).details(raw).targets([target.card]));
+                    let raw = std::mem::replace(
+                        &mut failure.message,
+                        "Codex's account setup isn't available. Sign in or choose another account."
+                            .into(),
+                    );
+                    self.notices.record(
+                        TransientNotice::warning(failure.message.clone())
+                            .key(format!("chat-setup:{}", target.card))
+                            .details(raw)
+                            .targets([target.card]),
+                    );
                 }
                 match result {
                     Ok(handle) => {
@@ -6400,7 +6453,11 @@ impl Cagents {
                                 });
                             }
                         }
-                        self.finish_chat_reconnect(target.card, true, handle.activity_outcome().as_ref());
+                        self.finish_chat_reconnect(
+                            target.card,
+                            true,
+                            handle.activity_outcome().as_ref(),
+                        );
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
                         let mut session = handle.session();
@@ -6457,7 +6514,8 @@ impl Cagents {
                                 self.retire_switched_terminal(terminal, &session);
                             }
                         }
-                        self.notices.resolve(&format!("chat-resume:{}", target.card));
+                        self.notices
+                            .resolve(&format!("chat-resume:{}", target.card));
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
@@ -6584,7 +6642,11 @@ impl Cagents {
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.error = Some("Couldn’t reopen this conversation. Open application notices for details.".into());
-                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
+                            self.status = Some(
+                                TransientNotice::error("Couldn’t reopen this conversation")
+                                    .key(format!("chat-resume:{}", target.card))
+                                    .details(failure.message),
+                            );
                             runtime.disconnected = true;
                             self.observe_agent_activity_for_card(target.card, None);
                         } else if matches!(
@@ -6592,12 +6654,20 @@ impl Cagents {
                             Some(CardKind::Chat(_))
                         ) {
                             self.fail_runtime(target.card, "Couldn’t reopen this conversation. Open application notices for details.".into());
-                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
+                            self.status = Some(
+                                TransientNotice::error("Couldn’t reopen this conversation")
+                                    .key(format!("chat-resume:{}", target.card))
+                                    .details(failure.message),
+                            );
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
                             self.chat_ui.fresh_offers.remove(&target.card);
-                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
+                            self.status = Some(
+                                TransientNotice::error("Couldn’t reopen this conversation")
+                                    .key(format!("chat-resume:{}", target.card))
+                                    .details(failure.message),
+                            );
                         }
                         let cleanup = if account_source.is_some() {
                             self.retire_chat(target.card, None, Some(attempt.session))
@@ -6874,7 +6944,9 @@ impl Cagents {
                 return self.resume_after_sign_in(target);
             }
             Action::RestoreDisconnected(target) => {
-                if self.daemon_health_ui.health.unavailable() || self.chat_start_pending(target.card) {
+                if self.daemon_health_ui.health.unavailable()
+                    || self.chat_start_pending(target.card)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7177,13 +7249,28 @@ impl Cagents {
                     );
                 }
                 let setup = match self.cards.get(&target.card) {
-                    Some(CardRuntime::Chat(runtime)) if runtime.target == target
-                        && !runtime.composer.text().trim_start().starts_with('/') => self.chat_draft_readiness(runtime),
+                    Some(CardRuntime::Chat(runtime))
+                        if runtime.target == target
+                            && !runtime.composer.text().trim_start().starts_with('/') =>
+                    {
+                        self.chat_draft_readiness(runtime)
+                    }
                     _ => None,
                 };
-                if matches!(setup, Some(account_ui::ProviderReadiness::MissingCli | account_ui::ProviderReadiness::MissingHome(_) | account_ui::ProviderReadiness::NeedsLogin(_) | account_ui::ProviderReadiness::LoginBusy(_))) {
+                if matches!(
+                    setup,
+                    Some(
+                        account_ui::ProviderReadiness::MissingCli
+                            | account_ui::ProviderReadiness::MissingHome(_)
+                            | account_ui::ProviderReadiness::NeedsLogin(_)
+                            | account_ui::ProviderReadiness::LoginBusy(_)
+                    )
+                ) {
                     if let Some(runtime) = self.chat_runtime_mut(target) {
-                        runtime.error = Some(format!("{} setup is not ready. Sign in or choose another provider or account; your draft is retained.", runtime.session.launch.provider.label()));
+                        runtime.error = Some(format!(
+                            "{} setup is not ready. Sign in or choose another provider or account; your draft is retained.",
+                            runtime.session.launch.provider.label()
+                        ));
                     }
                     return self.refresh_draft_accounts();
                 }
@@ -7715,7 +7802,8 @@ impl Cagents {
                 let pending = runtime.pending.take().unwrap();
                 let provider = runtime.session.launch.provider;
                 if result.is_ok() && pending.sent.is_some() {
-                    self.notices.resolve_target("daemon-interrupted-turns", target.card);
+                    self.notices
+                        .resolve_target("daemon-interrupted-turns", target.card);
                 }
                 if result.is_ok()
                     && let Some((model, reasoning)) = pending.model.clone()
@@ -12901,19 +12989,38 @@ mod tests {
         assert!(runtime.error.as_deref().unwrap().contains("Sign in"));
         assert!(!runtime.error.as_deref().unwrap().contains("os error"));
         assert_eq!(runtime.composer.text().trim(), "hello");
-        let notice = app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(&format!("chat-setup:{card}"))).unwrap();
+        let notice = app
+            .notices
+            .entries
+            .iter()
+            .find(|entry| entry.notice.key.as_deref() == Some(&format!("chat-setup:{card}")))
+            .unwrap();
         assert_eq!(notice.notice.details.as_deref(), Some(raw));
         assert_eq!(notice.notice.targets, vec![card]);
         let retirement = retired(&mut app, card);
         drop(app.handle_chat_ui(Action::Retired(retirement, Ok(()))));
         app.deliver_ready_draft_setup_for_test(Provider::Codex);
         let runtime = chat_runtime(&app, card);
-        assert!(matches!(app.chat_draft_readiness(runtime), Some(account_ui::ProviderReadiness::Ready(_))));
-        assert!(runtime.error.is_none(), "completed new discovery clears only the setup failure");
+        assert!(matches!(
+            app.chat_draft_readiness(runtime),
+            Some(account_ui::ProviderReadiness::Ready(_))
+        ));
+        assert!(
+            runtime.error.is_none(),
+            "completed new discovery clears only the setup failure"
+        );
         assert_eq!(runtime.composer.text().trim(), "hello");
-        assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some(&format!("chat-setup:{card}"))));
+        assert!(
+            !app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.key.as_deref() == Some(&format!("chat-setup:{card}")))
+        );
         submit(&mut app, card);
-        assert!(app.chat_ui.attempt(card).is_some(), "the same draft can send after sign-in; the old error cannot veto it");
+        assert!(
+            app.chat_ui.attempt(card).is_some(),
+            "the same draft can send after sign-in; the old error cannot veto it"
+        );
     }
 
     #[test]
@@ -12929,27 +13036,77 @@ mod tests {
             Arc::make_mut(&mut runtime.snapshot).busy = true;
         }
         app.begin_chat_reconnect(chat_runtime(&app, first).target);
-        app.finish_chat_reconnect(first, true, Some(&crate::agent::ActivityOutcome::Interrupted { reason: "Fixture interrupted first turn".into() }));
+        app.finish_chat_reconnect(
+            first,
+            true,
+            Some(&crate::agent::ActivityOutcome::Interrupted {
+                reason: "Fixture interrupted first turn".into(),
+            }),
+        );
         let key = "daemon-interrupted-turns";
-        assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![first]);
+        assert_eq!(
+            app.notices
+                .entries
+                .iter()
+                .find(|entry| entry.notice.key.as_deref() == Some(key))
+                .unwrap()
+                .notice
+                .targets,
+            vec![first]
+        );
         app.begin_chat_reconnect(chat_runtime(&app, second).target);
         app.begin_chat_reconnect(chat_runtime(&app, failed).target);
-        app.finish_chat_reconnect(second, true, Some(&crate::agent::ActivityOutcome::Interrupted { reason: "Fixture interrupted second turn".into() }));
-        assert!(app.chat_ui.reconnecting.is_some(), "wait for every affected chat");
+        app.finish_chat_reconnect(
+            second,
+            true,
+            Some(&crate::agent::ActivityOutcome::Interrupted {
+                reason: "Fixture interrupted second turn".into(),
+            }),
+        );
+        assert!(
+            app.chat_ui.reconnecting.is_some(),
+            "wait for every affected chat"
+        );
         app.finish_chat_reconnect(failed, false, None);
-        let warning = app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap();
+        let warning = app
+            .notices
+            .entries
+            .iter()
+            .find(|entry| entry.notice.key.as_deref() == Some(key))
+            .unwrap();
         assert_eq!(warning.notice.targets.len(), 2);
         assert!(warning.notice.targets.contains(&first));
         assert!(warning.notice.targets.contains(&second));
-        assert!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("daemon-chat-reconnect") && entry.notice.targets == vec![failed]));
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(
+                    |entry| entry.notice.key.as_deref() == Some("daemon-chat-reconnect")
+                        && entry.notice.targets == vec![failed]
+                )
+        );
         app.notices.resolve_target(key, first);
-        assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![second]);
+        assert_eq!(
+            app.notices
+                .entries
+                .iter()
+                .find(|entry| entry.notice.key.as_deref() == Some(key))
+                .unwrap()
+                .notice
+                .targets,
+            vec![second]
+        );
     }
 
     #[test]
     fn reconnect_failures_remain_until_each_failed_chat_recovers_or_is_discarded() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let cards = [live_chat(&mut app, Some(KNOWN_THREAD)), live_chat(&mut app, Some(KNOWN_THREAD)), live_chat(&mut app, Some(KNOWN_THREAD))];
+        let cards = [
+            live_chat(&mut app, Some(KNOWN_THREAD)),
+            live_chat(&mut app, Some(KNOWN_THREAD)),
+            live_chat(&mut app, Some(KNOWN_THREAD)),
+        ];
         for card in cards {
             let target = chat_runtime(&app, card).target;
             app.chat_runtime_mut(target).unwrap().disconnected = true;
@@ -12958,31 +13115,75 @@ mod tests {
         for (index, succeeded) in [(0, false), (1, true), (2, false)] {
             app.begin_chat_reconnect(chat_runtime(&app, cards[index]).target);
             app.finish_chat_reconnect(cards[index], succeeded, None);
-            let targets = &app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets;
-            assert!(targets.contains(&cards[0]), "another chat's success/failure cannot erase this failure");
+            let targets = &app
+                .notices
+                .entries
+                .iter()
+                .find(|entry| entry.notice.key.as_deref() == Some(key))
+                .unwrap()
+                .notice
+                .targets;
+            assert!(
+                targets.contains(&cards[0]),
+                "another chat's success/failure cannot erase this failure"
+            );
             assert!(!targets.contains(&cards[1]));
         }
         assert!(app.chat_ui.reconnecting.is_none());
         app.finish_chat_reconnect(cards[0], true, None);
-        assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![cards[2]]);
+        assert_eq!(
+            app.notices
+                .entries
+                .iter()
+                .find(|entry| entry.notice.key.as_deref() == Some(key))
+                .unwrap()
+                .notice
+                .targets,
+            vec![cards[2]]
+        );
         app.chat_discard(cards[2]);
-        assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some(key)));
+        assert!(
+            !app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.key.as_deref() == Some(key))
+        );
     }
 
     #[test]
-    fn reconnect_interruption_notice_uses_authoritative_outcome_for_both_durable_and_legacy_chats() {
+    fn reconnect_interruption_notice_uses_authoritative_outcome_for_both_durable_and_legacy_chats()
+    {
         for durable in [false, true] {
-            for outcome in [None, Some(crate::agent::ActivityOutcome::Succeeded), Some(crate::agent::ActivityOutcome::Interrupted { reason: "Confirmed provider turn interruption".into() })] {
+            for outcome in [
+                None,
+                Some(crate::agent::ActivityOutcome::Succeeded),
+                Some(crate::agent::ActivityOutcome::Interrupted {
+                    reason: "Confirmed provider turn interruption".into(),
+                }),
+            ] {
                 let mut app = crate::app::tests::context_inspector_test_app(false);
                 let card = live_chat(&mut app, Some(KNOWN_THREAD));
                 let target = chat_runtime(&app, card).target;
                 let runtime = app.chat_runtime_mut(target).unwrap();
                 runtime.disconnected = true;
                 Arc::make_mut(&mut runtime.snapshot).busy = true;
-                if durable { runtime.session.native_continuity = chat::NativeContinuity::Durable { provider_version: "0.162.0".into() }; }
+                if durable {
+                    runtime.session.native_continuity = chat::NativeContinuity::Durable {
+                        provider_version: "0.162.0".into(),
+                    };
+                }
                 app.begin_chat_reconnect(target);
                 app.finish_chat_reconnect(card, true, outcome.as_ref());
-                assert_eq!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("daemon-interrupted-turns")), matches!(outcome, Some(crate::agent::ActivityOutcome::Interrupted { .. })), "ownership/busy cannot replace an authoritative outcome");
+                assert_eq!(
+                    app.notices.entries.iter().any(
+                        |entry| entry.notice.key.as_deref() == Some("daemon-interrupted-turns")
+                    ),
+                    matches!(
+                        outcome,
+                        Some(crate::agent::ActivityOutcome::Interrupted { .. })
+                    ),
+                    "ownership/busy cannot replace an authoritative outcome"
+                );
             }
         }
     }
@@ -12997,7 +13198,12 @@ mod tests {
         assert!(app.chat_ui.reconnecting.is_some());
         app.chat_discard(card);
         assert!(app.chat_ui.reconnecting.is_none());
-        assert!(!app.notices.entries.iter().any(|entry| entry.notice.targets.contains(&card)));
+        assert!(
+            !app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.targets.contains(&card))
+        );
     }
 
     #[test]
@@ -13009,7 +13215,10 @@ mod tests {
         app.begin_chat_reconnect(target);
         app.cards.insert(card, CardRuntime::Loading);
         drop(app.handle_chat_ui(Action::RestoreDisconnected(target)));
-        assert!(app.chat_ui.reconnecting.is_none(), "stale target cannot pin the batch");
+        assert!(
+            app.chat_ui.reconnecting.is_none(),
+            "stale target cannot pin the batch"
+        );
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let runtime = app.chat_runtime_mut(target).unwrap();
@@ -13019,7 +13228,10 @@ mod tests {
         drop(app.handle_chat_ui(Action::RestoreDisconnected(target)));
         assert!(app.chat_ui.reconnecting.is_none());
         drop(app.restore_disconnected_chats());
-        assert!(app.chat_ui.reconnecting.is_none(), "healthy polling must not reset exhausted attempts");
+        assert!(
+            app.chat_ui.reconnecting.is_none(),
+            "healthy polling must not reset exhausted attempts"
+        );
     }
 
     #[test]
@@ -13154,16 +13366,28 @@ mod tests {
         app.chat_runtime_mut(target).unwrap().disconnected = true;
         drop(app.update(Message::ChatUi(Action::Reconnect(target))));
         let attempt = chat_runtime_attempt(&app, card);
-        answer_start(&mut app, attempt, Err(chat::StartFailure::retry("Exact native chat not found")));
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::retry("Exact native chat not found")),
+        );
         let key = format!("chat-resume:{card}");
-        assert!(app.notices.recent().any(|entry| entry.notice.key.as_deref() == Some(key.as_str())));
+        assert!(
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.key.as_deref() == Some(key.as_str()))
+        );
         let retry = chat_runtime(&app, card).target;
         drop(app.update(Message::ChatUi(Action::Reconnect(retry))));
         let attempt = chat_runtime_attempt(&app, card);
         let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
         answer_start(&mut app, attempt, Ok(handle));
         assert!(chat_runtime(&app, card).connected());
-        assert!(!app.notices.recent().any(|entry| entry.notice.key.as_deref() == Some(key.as_str())));
+        assert!(
+            !app.notices
+                .recent()
+                .any(|entry| entry.notice.key.as_deref() == Some(key.as_str()))
+        );
     }
 
     #[test]
@@ -16188,7 +16412,11 @@ mod tests {
             "a failed attachment can be retried"
         );
         assert_eq!(errors(&app), ["Couldn’t reopen this conversation"]);
-        let notice = app.notices.recent().find(|entry| entry.notice.key.as_deref() == Some(format!("chat-resume:{id}").as_str())).unwrap();
+        let notice = app
+            .notices
+            .recent()
+            .find(|entry| entry.notice.key.as_deref() == Some(format!("chat-resume:{id}").as_str()))
+            .unwrap();
         assert_eq!(notice.notice.details.as_deref(), Some(reason));
         assert!(
             matches!(

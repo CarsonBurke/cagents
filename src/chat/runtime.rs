@@ -1165,14 +1165,23 @@ pub(crate) fn preflight_restart(
     preflight_with_previous(spec, initial, previous, false)
 }
 
-pub(crate) fn preflight_retained_restart(spec: &ProcessSpec, initial: &mut Step, previous: &Handle) -> Result<Store, String> {
+pub(crate) fn preflight_retained_restart(
+    spec: &ProcessSpec,
+    initial: &mut Step,
+    previous: &Handle,
+) -> Result<Store, String> {
     if !matches!(spec.transport, TransportSpec::UnixWebSocket { .. }) {
         return Err("Retained preflight cannot launch a provider".into());
     }
     preflight_with_previous(spec, initial, previous, true)
 }
 
-fn preflight_with_previous(spec: &ProcessSpec, initial: &mut Step, previous: &Handle, retained: bool) -> Result<Store, String> {
+fn preflight_with_previous(
+    spec: &ProcessSpec,
+    initial: &mut Step,
+    previous: &Handle,
+    retained: bool,
+) -> Result<Store, String> {
     if !previous.is_completed() {
         return Err("The previous provider still owns this conversation".into());
     }

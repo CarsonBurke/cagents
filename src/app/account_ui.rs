@@ -185,13 +185,18 @@ impl OmpRecord {
 impl State {
     pub(super) fn account_readiness(&self, id: &AccountId) -> ProviderReadiness {
         let Some(account) = self.account(id) else {
-            return if self.installed.is_empty() { ProviderReadiness::Checking }
-                else { ProviderReadiness::MissingHome(id.clone()) };
+            return if self.installed.is_empty() {
+                ProviderReadiness::Checking
+            } else {
+                ProviderReadiness::MissingHome(id.clone())
+            };
         };
         if self.preparing_logins.contains(&account.owner)
             || account.sign_in_terminal.is_some()
-            || self.logins.iter().any(|login| login.provider == account.account.provider
-                && Some(&login.home) == account.account.resolved_home().as_ref())
+            || self.logins.iter().any(|login| {
+                login.provider == account.account.provider
+                    && Some(&login.home) == account.account.resolved_home().as_ref()
+            })
         {
             return ProviderReadiness::LoginBusy(id.clone());
         }
@@ -206,14 +211,22 @@ impl State {
             return ProviderReadiness::MissingHome(id.clone());
         }
         if self.login_conflict(account).is_some()
-            || account.snapshot.as_ref().is_some_and(|snapshot|
-                matches!(snapshot.status, UsageStatus::NeedsLogin | UsageStatus::Unavailable))
+            || account.snapshot.as_ref().is_some_and(|snapshot| {
+                matches!(
+                    snapshot.status,
+                    UsageStatus::NeedsLogin | UsageStatus::Unavailable
+                )
+            })
         {
             return ProviderReadiness::NeedsLogin(id.clone());
         }
         if account.identity.is_some()
-            || account.snapshot.as_ref().is_some_and(|snapshot|
-                matches!(snapshot.status, UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited))
+            || account.snapshot.as_ref().is_some_and(|snapshot| {
+                matches!(
+                    snapshot.status,
+                    UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+                )
+            })
         {
             return ProviderReadiness::Ready(id.clone());
         }
@@ -238,7 +251,8 @@ impl State {
             Some(false) => "CLI not found on PATH",
             Some(true)
                 if self.of(provider).any(|account| {
-                    account.present && account.identity.is_some()
+                    account.present
+                        && account.identity.is_some()
                         && self.login_conflict(account).is_none()
                         && !account
                             .snapshot
@@ -1908,7 +1922,9 @@ impl Cagents {
 
     /// The status bar was shown or hidden, or the Accounts pane opened.
     pub(super) fn accounts_surface_changed(&mut self) -> Task<Message> {
-        if !self.settings.show_status_bar { self.account_ui.popover = None; }
+        if !self.settings.show_status_bar {
+            self.account_ui.popover = None;
+        }
         self.refresh_draft_accounts()
     }
 
@@ -1925,7 +1941,9 @@ impl Cagents {
             self.account_ui.popover = None;
             self.account_ui.table.close_popups();
         }
-        if !regained { return Task::none(); }
+        if !regained {
+            return Task::none();
+        }
         self.refresh_draft_accounts()
     }
 
@@ -1953,18 +1971,29 @@ impl Cagents {
     /// hidden. This reads durable descriptors and resident account metadata;
     /// it neither hydrates a transcript nor touches the filesystem.
     fn probe_visible_draft_accounts(&mut self) -> Task<Message> {
-        let ids: BTreeSet<AccountId> = self.durable.cards.iter()
-            .filter(|card| card.existence.is_open()
-                && self.workspace.visibility(card.id) == Some(VisibilityClass::Visible))
+        let ids: BTreeSet<AccountId> = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| {
+                card.existence.is_open()
+                    && self.workspace.visibility(card.id) == Some(VisibilityClass::Visible)
+            })
             .filter_map(|card| match &card.kind {
-                CardKind::Chat(session) if session.launch.session_id.is_none()
-                    && !self.chat_start_pending(card.id) =>
-                    self.chat_account(session.launch.provider, &session.launch.recipe),
+                CardKind::Chat(session)
+                    if session.launch.session_id.is_none() && !self.chat_start_pending(card.id) =>
+                {
+                    self.chat_account(session.launch.provider, &session.launch.recipe)
+                }
                 _ => None,
-            }).collect();
+            })
+            .collect();
         let now = now_ms();
         self.account_ui.now_ms = now;
-        Task::batch(ids.into_iter().filter_map(|id| self.probe_account(&id, Trigger::Focus, now)))
+        Task::batch(
+            ids.into_iter()
+                .filter_map(|id| self.probe_account(&id, Trigger::Focus, now)),
+        )
     }
 
     fn probe_accounts(&mut self, trigger: Trigger) -> Task<Message> {
@@ -2391,17 +2420,27 @@ impl Cagents {
                 } else {
                     Task::none()
                 };
-                Task::batch([self.probe_accounts(Trigger::Focus), self.probe_visible_draft_accounts(), locate, migration])
+                Task::batch([
+                    self.probe_accounts(Trigger::Focus),
+                    self.probe_visible_draft_accounts(),
+                    locate,
+                    migration,
+                ])
             }
             Action::Located {
                 generation,
                 restored,
                 installed,
             } => {
-                if generation != self.account_ui.discovery_generation { return Task::none(); }
+                if generation != self.account_ui.discovery_generation {
+                    return Task::none();
+                }
                 self.account_ui.installed = installed;
                 self.account_ui.restore(restored);
-                Task::batch([self.probe_accounts(Trigger::Focus), self.probe_visible_draft_accounts()])
+                Task::batch([
+                    self.probe_accounts(Trigger::Focus),
+                    self.probe_visible_draft_accounts(),
+                ])
             }
             Action::Probed { owner, id, outcome } => self.account_probed(id, owner, outcome),
             Action::OmpRead(history) => {
@@ -2630,8 +2669,10 @@ impl Cagents {
                     Ok(registry) => {
                         self.account_ui.set_registry(registry);
                         self.account_ui.table.link = None;
-                        self.status =
-                            Some(TransientNotice::success("Existing account home added.").key(format!("account-added:{key:?}")));
+                        self.status = Some(
+                            TransientNotice::success("Existing account home added.")
+                                .key(format!("account-added:{key:?}")),
+                        );
                         let id = self
                             .account_ui
                             .accounts
@@ -4005,7 +4046,10 @@ impl Cagents {
                     }
                     state.identity = identity;
                 }
-                self.status = Some(TransientNotice::success(format!("{name} was added.")).key(format!("account-added:{id:?}")));
+                self.status = Some(
+                    TransientNotice::success(format!("{name} was added."))
+                        .key(format!("account-added:{id:?}")),
+                );
                 self.close_settled_sign_in(login.provider, &login.home)
             }
             Ok(Settled::Duplicate { existing, registry }) => {
@@ -4303,9 +4347,14 @@ impl Cagents {
         if !self.account_ui.installed.contains_key(&provider) {
             return ProviderReadiness::Checking;
         }
-        let selected = chosen.cloned().unwrap_or_else(||
-            self.default_account_for_directory(provider, directory).id());
-        if self.account_ui.account(&selected).is_some_and(|state| state.account.provider != provider) {
+        let selected = chosen
+            .cloned()
+            .unwrap_or_else(|| self.default_account_for_directory(provider, directory).id());
+        if self
+            .account_ui
+            .account(&selected)
+            .is_some_and(|state| state.account.provider != provider)
+        {
             return ProviderReadiness::MissingHome(selected);
         }
         self.account_ui.account_readiness(&selected)
@@ -4315,8 +4364,14 @@ impl Cagents {
     pub(super) fn deliver_ready_draft_setup_for_test(&mut self, provider: Provider) {
         let action = Action::Located {
             generation: self.account_ui.discovery_generation,
-            restored: vec![Restored { id: Account::system(provider).id(), present: true,
-                entry: Some(Entry { identity: None, snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now_ms()) }) }],
+            restored: vec![Restored {
+                id: Account::system(provider).id(),
+                present: true,
+                entry: Some(Entry {
+                    identity: None,
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now_ms()),
+                }),
+            }],
             installed: BTreeMap::from([(provider, true)]),
         };
         drop(self.update(Message::AccountUi(action)));
@@ -4336,16 +4391,22 @@ impl Cagents {
         directory: &Path,
     ) -> Option<Account> {
         let account = self.default_account_for_directory(provider, directory);
-        matches!(self.account_ui.account_readiness(&account.id()), ProviderReadiness::Ready(_))
-            .then_some(account)
+        matches!(
+            self.account_ui.account_readiness(&account.id()),
+            ProviderReadiness::Ready(_)
+        )
+        .then_some(account)
     }
 
     /// Call once when opening a new draft or explicitly refreshing setup.
     /// Discovery/home reads run on the async worker; Located then schedules
     /// bounded probes. Calling a view or switching focus never reads a path.
     pub(super) fn refresh_draft_accounts(&mut self) -> Task<Message> {
-        if crate::device::is_remote() { self.reload_registry() }
-        else { Task::batch([self.reload_registry(), self.locate_accounts()]) }
+        if crate::device::is_remote() {
+            self.reload_registry()
+        } else {
+            Task::batch([self.reload_registry(), self.locate_accounts()])
+        }
     }
 
     pub(super) fn default_account_for_directory(
@@ -5350,9 +5411,11 @@ mod tests {
         assert_eq!(app.account_ui.discovery_generation, before);
         drop(app.accounts_focus_changed(true, true));
         assert_eq!(app.account_ui.discovery_generation, before + 1);
-        assert!(app.account_ui.installed.is_empty(), "async setup is not performed by the view/focus handler");
+        assert!(
+            app.account_ui.installed.is_empty(),
+            "async setup is not performed by the view/focus handler"
+        );
     }
-
 
     #[test]
     fn older_discovery_cannot_undo_newer_cli_home_and_daemon_usage_evidence() {
@@ -5365,12 +5428,28 @@ mod tests {
         let now = now_ms();
         let located = |generation, present, status, observed_at| Action::Located {
             generation,
-            restored: vec![Restored { id: id.clone(), present, entry: Some(Entry { identity: None,
-                snapshot: UsageSnapshot::state(status, "", observed_at) }) }],
+            restored: vec![Restored {
+                id: id.clone(),
+                present,
+                entry: Some(Entry {
+                    identity: None,
+                    snapshot: UsageSnapshot::state(status, "", observed_at),
+                }),
+            }],
             installed: BTreeMap::from([(Provider::Claude, present)]),
         };
-        drop(app.update(Message::AccountUi(located(latest, true, UsageStatus::Ok, now))));
-        drop(app.update(Message::AccountUi(located(earlier, false, UsageStatus::Limited, 0))));
+        drop(app.update(Message::AccountUi(located(
+            latest,
+            true,
+            UsageStatus::Ok,
+            now,
+        ))));
+        drop(app.update(Message::AccountUi(located(
+            earlier,
+            false,
+            UsageStatus::Limited,
+            0,
+        ))));
         assert_eq!(app.account_ui.installed.get(&Provider::Claude), Some(&true));
         let account = app.account_ui.account(&id).unwrap();
         assert!(account.present);
@@ -5383,28 +5462,64 @@ mod tests {
         let mut app = context_inspector_test_app(false);
         app.settings.show_status_bar = false;
         app.refresh_ui.focused = true;
-        for provider in Account::PROVIDERS { app.account_ui.registry.set_default(&Account::system(provider)); }
+        for provider in Account::PROVIDERS {
+            app.account_ui
+                .registry
+                .set_default(&Account::system(provider));
+        }
         let provider = Provider::Codex;
         let id = app.account_ui.add_managed_fixture(provider, 997);
         let account = app.known_account(&id).unwrap();
-        let session = crate::chat::Session { id: TerminalId::new(), proof: None, terminal: None,
-            native_continuity: Default::default(), owned_codex_listener: None,
-            launch: crate::chat::Launch { provider, session_id: None,
-                recipe: LaunchRecipe { program: "codex".into(), arguments: Vec::new(), working_directory: "/fixture/project".into(),
-                    environment: BTreeMap::from([("CODEX_HOME".into(), account.resolved_home().unwrap().to_string_lossy().into_owned())]),
-                    unset_environment: Default::default() } } };
+        let session = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: None,
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider,
+                session_id: None,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/fixture/project".into(),
+                    environment: BTreeMap::from([(
+                        "CODEX_HOME".into(),
+                        account
+                            .resolved_home()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    )]),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
         drop(app.insert_chat_card(session, None, None));
         assert!(!app.settings.show_status_bar);
         let generation = app.account_ui.discovery_generation;
-        drop(app.update(Message::AccountUi(Action::Located { generation,
-            restored: vec![Restored { id: id.clone(), present: true, entry: None }],
+        drop(app.update(Message::AccountUi(Action::Located {
+            generation,
+            restored: vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: None,
+            }],
             installed: BTreeMap::from([(provider, true)]),
         })));
         let now = app.account_ui.now_ms;
-        assert!(app.account_ui.account(&id).unwrap().schedule.in_flight(now),
-            "a visible new draft needs authentication evidence even without the usage surface");
-        assert!(!app.account_ui.account(&Account::system(provider).id()).unwrap().schedule.in_flight(now),
-            "draft setup must not probe unrelated accounts");
+        assert!(
+            app.account_ui.account(&id).unwrap().schedule.in_flight(now),
+            "a visible new draft needs authentication evidence even without the usage surface"
+        );
+        assert!(
+            !app.account_ui
+                .account(&Account::system(provider).id())
+                .unwrap()
+                .schedule
+                .in_flight(now),
+            "draft setup must not probe unrelated accounts"
+        );
     }
 
     #[test]
@@ -5415,24 +5530,47 @@ mod tests {
         let provider = Provider::Claude;
         let id = Account::system(provider).id();
         app.account_ui.installed.insert(provider, true);
-        app.account_ui.account_mut(&id).unwrap().account.home = account::AccountHome::SystemAt { path: missing.clone() };
-        assert_eq!(app.account_ui.account_readiness(&id), ProviderReadiness::MissingHome(id.clone()));
+        app.account_ui.account_mut(&id).unwrap().account.home = account::AccountHome::SystemAt {
+            path: missing.clone(),
+        };
+        assert_eq!(
+            app.account_ui.account_readiness(&id),
+            ProviderReadiness::MissingHome(id.clone())
+        );
         assert!(!missing.exists());
         drop(app.update(Message::AccountUi(Action::SignIn(id.clone()))));
         let owner = app.account_ui.account(&id).unwrap().owner;
-        drop(app.update(Message::AccountUi(Action::LoginReady { owner, id: id.clone(), provider, device: false,
+        drop(app.update(Message::AccountUi(Action::LoginReady {
+            owner,
+            id: id.clone(),
+            provider,
+            device: false,
             program: Ok(PathBuf::from("/fixture/claude").into()),
         })));
-        let launch = app.durable.cards.iter().find_map(|card| match &card.kind {
-            CardKind::Terminal(session) if session.launch.program == "/fixture/claude" => Some(&session.launch),
-            _ => None,
-        }).expect("explicit Sign in opens the provider setup terminal even without its home");
-        assert_eq!(launch.environment.get("CLAUDE_CONFIG_DIR").map(PathBuf::from), Some(missing.clone()));
+        let launch = app
+            .durable
+            .cards
+            .iter()
+            .find_map(|card| match &card.kind {
+                CardKind::Terminal(session) if session.launch.program == "/fixture/claude" => {
+                    Some(&session.launch)
+                }
+                _ => None,
+            })
+            .expect("explicit Sign in opens the provider setup terminal even without its home");
+        assert_eq!(
+            launch
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from),
+            Some(missing.clone())
+        );
         assert!(is_sign_in(launch));
-        assert!(!missing.exists(), "the view/preparation leaves creation to the explicitly started provider login");
+        assert!(
+            !missing.exists(),
+            "the view/preparation leaves creation to the explicitly started provider login"
+        );
     }
-
-
 
     #[test]
     fn cached_readiness_distinguishes_detection_home_login_and_retained_identity() {
@@ -5442,23 +5580,38 @@ mod tests {
         state.installed.insert(Provider::Claude, false);
         assert_eq!(state.account_readiness(&id), ProviderReadiness::MissingCli);
         state.installed.insert(Provider::Claude, true);
-        assert_eq!(state.account_readiness(&id), ProviderReadiness::MissingHome(id.clone()));
+        assert_eq!(
+            state.account_readiness(&id),
+            ProviderReadiness::MissingHome(id.clone())
+        );
         let account = state.account_mut(&id).unwrap();
         account.present = true;
         account.identity = Some(Identity::default());
         account.snapshot = Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW));
-        assert_eq!(state.account_readiness(&id), ProviderReadiness::NeedsLogin(id.clone()));
+        assert_eq!(
+            state.account_readiness(&id),
+            ProviderReadiness::NeedsLogin(id.clone())
+        );
         let account = state.account_mut(&id).unwrap();
         account.sign_in_terminal = Some(TerminalId::new());
-        assert_eq!(state.account_readiness(&id), ProviderReadiness::LoginBusy(id.clone()));
+        assert_eq!(
+            state.account_readiness(&id),
+            ProviderReadiness::LoginBusy(id.clone())
+        );
         let account = state.account_mut(&id).unwrap();
         account.sign_in_terminal = None;
         account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
-        assert_eq!(state.account_readiness(&id), ProviderReadiness::Ready(id.clone()));
+        assert_eq!(
+            state.account_readiness(&id),
+            ProviderReadiness::Ready(id.clone())
+        );
         // Completed async detection can mark a once-valid home absent without
         // erasing retained identity or history. Neither may imply readiness.
         state.account_mut(&id).unwrap().present = false;
-        assert_eq!(state.account_readiness(&id), ProviderReadiness::MissingHome(id));
+        assert_eq!(
+            state.account_readiness(&id),
+            ProviderReadiness::MissingHome(id)
+        );
         assert_ne!(state.provider_status(Provider::Claude), "Account available");
     }
 
@@ -5474,16 +5627,27 @@ mod tests {
         let system = Account::system(provider);
         app.account_ui.registry.set_default(&system);
         let directory = Path::new("/fixture/no-filesystem-read-is-needed");
-        assert_eq!(app.draft_account_readiness(provider, directory, None),
-            ProviderReadiness::MissingHome(system.id()));
-        assert!(app.usable_default_account_for_directory(provider, directory).is_none());
-        assert_eq!(app.draft_account_readiness(provider, directory, Some(&selected)),
-            ProviderReadiness::Ready(selected.clone()));
+        assert_eq!(
+            app.draft_account_readiness(provider, directory, None),
+            ProviderReadiness::MissingHome(system.id())
+        );
+        assert!(
+            app.usable_default_account_for_directory(provider, directory)
+                .is_none()
+        );
+        assert_eq!(
+            app.draft_account_readiness(provider, directory, Some(&selected)),
+            ProviderReadiness::Ready(selected.clone())
+        );
         let chosen = app.known_account(&selected).unwrap();
         app.account_ui.registry.set_default(&chosen);
-        assert_eq!(app.usable_default_account_for_directory(provider, directory).unwrap().id(), selected);
+        assert_eq!(
+            app.usable_default_account_for_directory(provider, directory)
+                .unwrap()
+                .id(),
+            selected
+        );
     }
-
 
     #[test]
     fn provider_status_does_not_treat_retained_signed_out_identity_as_available() {

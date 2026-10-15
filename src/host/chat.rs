@@ -1098,7 +1098,8 @@ fn start_with_execution(
         for record in state.chats.values() {
             let mut launch = record.session.launch.clone();
             launch.session_id = record.handle.session_id();
-            if same_conversation(&launch, &session.launch) && record.handle.owns_work()
+            if same_conversation(&launch, &session.launch)
+                && record.handle.owns_work()
                 && !(recovering && record.session.id == session.id && record.handle.is_completed())
             {
                 return Err(error(
@@ -2063,21 +2064,39 @@ pub(super) fn restart_completed_with_execution(
         (session, record.handle.restart_environment())
     };
     let mut replacement = replacement;
-    if matches!(replacement.0.native_continuity, chat::NativeContinuity::Durable { .. }) {
+    if matches!(
+        replacement.0.native_continuity,
+        chat::NativeContinuity::Durable { .. }
+    ) {
         use crate::daemon::holder_registry::{self as registry, Kind};
         let directory = registry::directory(Kind::Native).map_err(unavailable)?;
-        if let Some(owner) = registry::evidence(&registry::socket(&directory, source.id), Kind::Native).map_err(unavailable)? {
-            let (_, exited) = chat::native_holder::inspect(&owner, replacement.0.proof.as_ref().unwrap()).map_err(unavailable)?;
+        if let Some(owner) =
+            registry::evidence(&registry::socket(&directory, source.id), Kind::Native)
+                .map_err(unavailable)?
+        {
+            let (_, exited) =
+                chat::native_holder::inspect(&owner, replacement.0.proof.as_ref().unwrap())
+                    .map_err(unavailable)?;
             if !exited {
-                return native_recovery::restore(host, client, &replacement.0).map(Some).map_err(unavailable);
+                return native_recovery::restore(host, client, &replacement.0)
+                    .map(Some)
+                    .map_err(unavailable);
             }
         }
         // This also closes the exact paired console and records proof. It
         // deliberately retains the old actor/store and accepted agent binding.
         check_launch_account(&replacement.0.launch)?;
         native_cleanup::close_for_restart(host, &replacement.0).map_err(unavailable)?;
-        if !chat::native_holder::closed_source(&replacement.0, replacement.0.proof.as_ref().unwrap()).map_err(unavailable)?.is_some_and(|(_, pair_closed)| pair_closed) {
-            return Err(unavailable("Native restart lacks its exact completed provider and paired console receipt"));
+        if !chat::native_holder::closed_source(
+            &replacement.0,
+            replacement.0.proof.as_ref().unwrap(),
+        )
+        .map_err(unavailable)?
+        .is_some_and(|(_, pair_closed)| pair_closed)
+        {
+            return Err(unavailable(
+                "Native restart lacks its exact completed provider and paired console receipt",
+            ));
         }
         replacement.0.native_continuity = chat::NativeContinuity::ReconnectOnly;
     }

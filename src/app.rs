@@ -304,19 +304,23 @@ struct NoticeLog {
 
 impl NoticeLog {
     fn resolve(&mut self, key: &str) {
-        self.entries.retain(|entry| entry.notice.key.as_deref() != Some(key));
+        self.entries
+            .retain(|entry| entry.notice.key.as_deref() != Some(key));
     }
 
     fn resolve_target(&mut self, key: &str, card: CardId) {
         self.entries.retain_mut(|entry| {
-            if entry.notice.key.as_deref() != Some(key) { return true; }
+            if entry.notice.key.as_deref() != Some(key) {
+                return true;
+            }
             entry.notice.targets.retain(|target| *target != card);
             !entry.notice.targets.is_empty()
         });
     }
 
     fn expire(&mut self, now: Instant) {
-        self.entries.retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
+        self.entries
+            .retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
     }
 
     fn record(&mut self, notice: TransientNotice) {
@@ -324,8 +328,8 @@ impl NoticeLog {
     }
 
     fn record_at(&mut self, notice: TransientNotice, now: Instant) {
-        let expires_at = (notice.severity == NoticeSeverity::Success)
-            .then(|| now + Duration::from_secs(6));
+        let expires_at =
+            (notice.severity == NoticeSeverity::Success).then(|| now + Duration::from_secs(6));
         if let Some(key) = notice.key.as_deref() {
             self.resolve(key);
         }
@@ -2672,7 +2676,9 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::PullRequestUi(
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
             )
-            | Message::ChromeUi(chrome_ui::Action::Launch(_) | chrome_ui::Action::FocusNoticeCard(_))
+            | Message::ChromeUi(
+                chrome_ui::Action::Launch(_) | chrome_ui::Action::FocusNoticeCard(_)
+            )
             | Message::FocusCard(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
@@ -16178,7 +16184,7 @@ impl Application for Cagents {
                 let update = self.update_account_ui(action);
                 self.reconcile_ready_draft_setup();
                 Task::batch([update, self.reconcile_usable_default_chats()])
-            },
+            }
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::GitUi(action) => self.update_git(action),
@@ -16300,7 +16306,9 @@ impl Application for Cagents {
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
-                if !health.unavailable() { self.notices.resolve("daemon-connectivity"); }
+                if !health.unavailable() {
+                    self.notices.resolve("daemon-connectivity");
+                }
                 self.daemon_health_ui.health = health;
                 if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
                 {
@@ -16571,9 +16579,16 @@ impl Application for Cagents {
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
-            if self.notices.entries.iter().any(|entry| entry.expires_at.is_some()) {
+            if self
+                .notices
+                .entries
+                .iter()
+                .any(|entry| entry.expires_at.is_some())
+            {
                 iced::time::every(Duration::from_secs(1)).map(Message::ExpireNotices)
-            } else { Subscription::none() },
+            } else {
+                Subscription::none()
+            },
             self.chat_subscription(),
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
@@ -19957,8 +19972,16 @@ mod tests {
     #[test]
     fn unkeyed_notices_keep_distinct_object_details() {
         let mut log = NoticeLog::default();
-        log.record(TransientNotice::warning("Interrupted").details("first").targets([CardId::new()]));
-        log.record(TransientNotice::warning("Interrupted").details("second").targets([CardId::new()]));
+        log.record(
+            TransientNotice::warning("Interrupted")
+                .details("first")
+                .targets([CardId::new()]),
+        );
+        log.record(
+            TransientNotice::warning("Interrupted")
+                .details("second")
+                .targets([CardId::new()]),
+        );
         assert_eq!(log.len(), 2);
     }
 
@@ -19967,7 +19990,11 @@ mod tests {
         let first = CardId::new();
         let second = CardId::new();
         let mut log = NoticeLog::default();
-        log.record(TransientNotice::warning("Some turns were interrupted").key("daemon-interrupted-turns").targets([first, second]));
+        log.record(
+            TransientNotice::warning("Some turns were interrupted")
+                .key("daemon-interrupted-turns")
+                .targets([first, second]),
+        );
         log.resolve_target("daemon-interrupted-turns", first);
         assert_eq!(log.len(), 1);
         assert_eq!(log.recent().next().unwrap().notice.targets, [second]);

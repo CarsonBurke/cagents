@@ -88,7 +88,9 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
         if let Some((record, true)) = &receipt {
-            if !restart { retire_closed_execution(host, source, record, &proof)?; }
+            if !restart {
+                retire_closed_execution(host, source, record, &proof)?;
+            }
             return Ok(());
         }
         let mut pending = match pending {
@@ -120,7 +122,9 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
                 let record = registry::evidence(&socket, Kind::Native)?
                     .ok_or("No exact native holder or confirmed close receipt is available")?;
                 let (recovery, exited) = chat::native_holder::inspect(&record, &proof)?;
-                if restart && !exited { return Err("The retained provider is still alive; reattach its existing session instead of starting another writer".into()); }
+                if restart && !exited {
+                    return Err("The retained provider is still alive; reattach its existing session instead of starting another writer".into());
+                }
                 if &recovery.source != source && !recovery.previous_sources.contains(source) {
                     return Err(
                         "Native holder does not recognize this exact issued descriptor".into(),
@@ -201,7 +205,9 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
         chat::native_holder::confirm_pair_closed(source, &proof)?;
         // Keep the proved owner while durable retirement is retryable. An SQL
         // failure cannot force a second Release or lose its cleanup evidence.
-        if !restart { retire_closed_execution(host, source, &pending.owner.record, &proof)?; }
+        if !restart {
+            retire_closed_execution(host, source, &pending.owner.record, &proof)?;
+        }
         Ok(())
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -219,15 +225,21 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
                         .into(),
                 );
             }
-            if !restart { state.chats.remove(&source.id); }
+            if !restart {
+                state.chats.remove(&source.id);
+            }
         }
         state.native_closing.remove(&source.id);
         state.native_adoption_failures.clear(source.id);
         if !restart {
-            if let Some(notifications) = &state.notifications { notifications.retire(source.id); }
+            if let Some(notifications) = &state.notifications {
+                notifications.retire(source.id);
+            }
         }
         drop(state);
-        if !restart { super::super::state::retire_unattached_upgrade_chat(host, source.id); }
+        if !restart {
+            super::super::state::retire_unattached_upgrade_chat(host, source.id);
+        }
     }
     result
 }
