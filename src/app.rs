@@ -16785,26 +16785,19 @@ impl Application for Cagents {
                 // generation. Watcher scalar updates do not restart it under
                 // continuous writes; only row/cache facts use the shared order.
                 if let Ok(read) = &result
-                    && self.refresh_ui.git.accept_bound_status(
-                        &key,
-                        &read.status,
-                        read.operation,
-                        read.read,
-                    )
-                    && let Some(worktree) = self
-                        .sidebar_model
-                        .projects
-                        .iter_mut()
-                        .find(|project| project.id == key.project_id)
-                        .and_then(|project| {
-                            project
-                                .worktrees
-                                .iter_mut()
-                                .find(|worktree| worktree.id == key.worktree_id)
-                        })
+                    && self.refresh_ui.git.accept_bound_status(&key, &read.status, read.operation, read.read)
                 {
-                    worktree.apply_status(&read.status);
-                    worktree.apply_operation(read.operation);
+                    let head_repository = self.refresh_ui.git.cached_head_repository(&key);
+                    if let Some(worktree) = self.sidebar_model.projects.iter_mut()
+                        .find(|project| project.id == key.project_id)
+                        .and_then(|project| project.worktrees.iter_mut().find(|worktree| worktree.id == key.worktree_id))
+                    {
+                        worktree.apply_status(&read.status);
+                        worktree.apply_status_head(&read.status.head);
+                        if worktree.head_repository != head_repository { worktree.clear_pull_request(); }
+                        worktree.head_repository = head_repository;
+                        worktree.apply_operation(read.operation);
+                    }
                 }
                 if matches!(&result, Ok(read) if read.prepared.is_none()) {
                     if let Some(source) = self.sidebar_model.source_control.as_mut() {

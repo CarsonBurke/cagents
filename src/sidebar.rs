@@ -927,6 +927,26 @@ impl SidebarWorktree {
         self.refresh_status_chrome();
     }
 
+    /// A successful bound read can repair a missed HEAD event without a new
+    /// worktree listing. This changes presentation only, never path/identity or
+    /// the retained authority used by mutation workers.
+    pub fn apply_status_head(&mut self, head: &crate::repository::HeadState) {
+        let (branch, detached) = match head {
+            crate::repository::HeadState::Branch { name, .. } => (Some(name.as_str()), false),
+            crate::repository::HeadState::Unborn { branch } => (branch.as_deref(), false),
+            crate::repository::HeadState::Detached { .. } => (None, true),
+            crate::repository::HeadState::Unknown => return,
+        };
+        if self.branch.as_deref() != branch || self.detached != detached {
+            self.clear_pull_request();
+            self.head_repository = None;
+            self.branch = branch.map(str::to_owned);
+            self.detached = detached;
+            self.chrome.folded_branch = self.branch.as_deref().map(fold);
+            self.refresh_status_chrome();
+        }
+    }
+
     pub fn apply_operation(&mut self, operation: Option<crate::repository::GitOperationKind>) {
         if self.operation != operation {
             self.operation = operation;
@@ -12160,6 +12180,37 @@ pub(crate) mod tests {
             worktree_display_name(Path::new("/repo/no-branch"), None, false),
             "no-branch"
         );
+    }
+
+    #[test]
+    fn bound_head_repairs_visible_branch_and_detach_without_changing_worktree_identity() {
+        let project = project();
+        let pr = project.pull_requests[0].clone();
+        let mut row = worktree(72, &pr.head_ref, false);
+        let identity = (row.id, row.path.clone());
+        row.set_pull_request(pr.clone());
+        row.apply_status_head(&HeadState::Branch { name: pr.head_ref.clone(), oid: "a".repeat(40) });
+        assert!(row.pull_request().is_some(), "same branch retains attached authority");
+        row.apply_status_head(&HeadState::Branch { name: "feature/learned-name".into(), oid: "b".repeat(40) });
+        assert_eq!(row.branch.as_deref(), Some("feature/learned-name"));
+        assert_eq!(row.label(), "feature/learned-name");
+        assert_eq!(row.chrome.folded_branch.as_deref(), Some("feature/learned-name"));
+        assert!(row.matches("learned"));
+        assert!(row.chrome.tooltip.contains("Branch: feature/learned-name"));
+        assert!(row.chrome.accessible_name.contains("feature/learned-name"));
+        assert!(row.pull_request().is_none());
+        assert!(row.pull_request_state.is_none());
+        assert_eq!((row.id, row.path.clone()), identity);
+        row.apply_status_head(&HeadState::Unknown);
+        assert_eq!(row.label(), "feature/learned-name", "unknown cannot erase a known head");
+        row.apply_status_head(&HeadState::Detached { oid: "c".repeat(40) });
+        assert!(row.detached);
+        assert!(row.branch.is_none());
+        assert_eq!(row.label(), worktree_display_name(&row.path, None, true));
+        row.apply_status_head(&HeadState::Unborn { branch: Some("new/unborn-name".into()) });
+        assert!(!row.detached);
+        assert_eq!(row.label(), "new/unborn-name");
+        assert_eq!((row.id, row.path.clone()), identity);
     }
 
     #[test]
