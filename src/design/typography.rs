@@ -319,6 +319,54 @@ mod settings_typography_tests {
     use super::*;
 
     #[test]
+    fn interface_preferences_reach_stock_inputs_and_multiline_form_fields() {
+        use cosmic::iced::{Length, Size, advanced::{layout, text, widget::Tree}};
+        let _restore = typography_test_guard();
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let label = "Input label iii WWWW 0123456789";
+        let lay_out = |mut element: cosmic::Element<'_, ()>| {
+            let mut tree = Tree::new(element.as_widget());
+            element.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(900.0, 500.0)))
+        };
+        let label_size = |font, size| lay_out(
+            cosmic::widget::text(label).font(font).size(size)
+                .line_height(LineHeight::default()).shaping(text::Shaping::Advanced).into()
+        ).size();
+        let families = installed_font_families(false);
+        let first = families.first().expect("fixture requires installed fonts");
+        let first_font = Font::with_name(first.as_str());
+        let first_width = label_size(first_font, 24.0).width;
+        let second = families.iter().find(|family| {
+            (label_size(Font::with_name(family.as_str()), 24.0).width - first_width).abs() > 0.5
+        }).expect("fixture requires two installed families with different glyph metrics");
+        let input = || lay_out(cosmic::widget::text_input("Query", "value")
+            .label(label).padding(4.0).on_input(|_| ()).into());
+        let fixed_input = || lay_out(cosmic::widget::text_input("Query", "value")
+            .font(Font::MONOSPACE).size(17.0).padding(4.0).on_input(|_| ()).into()).size();
+        let content = cosmic::iced::widget::text_editor::Content::<cosmic::Renderer>::with_text("Form text\nsecond line");
+        let form_size = || lay_out(crate::ui_controls::field::editor("Instructions", &content)
+            .height(Length::Shrink).padding(4.0).on_action(|_| ()).into()).size();
+        configure_typography(first, 13.0, "", 14.0);
+        let small_input = input();
+        let small_form = form_size();
+        let fixed = fixed_input();
+        for family in [first, second] {
+            configure_typography(family, 24.0, "", 14.0);
+            let actual = input();
+            let expected = label_size(cosmic::font::default(), interface_size());
+            let native_label = actual.children().first().expect("stock input label is mounted").size();
+            assert!((native_label.width - expected.width).abs() < 0.1,
+                "raw input must shape its label with selected interface family: {family}");
+            assert!((native_label.height - expected.height).abs() < 0.1);
+            assert!(actual.size().height > small_input.size().height + 10.0);
+            assert!(form_size().height > small_form.height + 10.0,
+                "unsized automation/description fields inherit current interface size");
+            assert_eq!(fixed_input(), fixed, "explicit input typography retains its override");
+        }
+    }
+
+    #[test]
     fn interface_size_reaches_toolkit_text_and_actual_context_menu_layout() {
         use cosmic::iced::{
             Event, Point, Rectangle, Size, Vector,
