@@ -267,7 +267,7 @@ fn publish_with_hooks(
         ));
     }
     let acquired_identity = fs_safety::metadata_beneath(&holding.root, Path::new(previous));
-    let verify = (|| {
+    let verify: Result<(File, fs::Metadata), FileIoError> = (|| {
         acquired_identity
             .as_ref()
             .map_err(|error| FileIoError::Io(error.to_string()))?;
