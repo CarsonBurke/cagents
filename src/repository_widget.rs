@@ -38,7 +38,7 @@ use crate::{
     diff_view::{
         DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffRowKind, DiffSyntax,
         InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan,
-        highlighter_settings, build_document_diff_with_options, load_repository_diff_with_options,
+        highlighter_settings, build_document_diff_sources, build_line_changes, load_repository_diff_with_options,
     },
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
@@ -490,7 +490,7 @@ pub enum RepositoryAction {
         revision: u64,
         ticket: u64,
         before: Arc<str>,
-        result: Result<Option<DiffModel>, String>,
+        result: Result<Option<WorkingDiffOutput>, String>,
     },
     EditorAction {
         card: CardId,
@@ -1677,6 +1677,14 @@ impl Drop for DiffState {
         }
     }
 }
+/// A debounce result carries gutter marks in both lanes; a full comparison is
+/// built only when the reader can see the diff surface.
+#[derive(Debug, Clone)]
+pub struct WorkingDiffOutput {
+    model: Option<DiffModel>,
+    additions: Vec<usize>,
+}
+
 /// One immutable snapshot is in flight; further edits only advance the desired
 /// revision/deadline. Cancellation does not release the slot until it returns.
 struct WorkingDiffJob {
@@ -1684,6 +1692,7 @@ struct WorkingDiffJob {
     revision: u64,
     ticket: u64,
     before: Arc<str>,
+    rich: bool,
     cancellation: CancellationToken,
 }
 
@@ -1699,6 +1708,8 @@ struct WorkingDiffRefresh {
     next_ticket: u64,
     desired: Option<(u64, u64, Arc<str>)>,
     applied: Option<(u64, u64, Arc<str>)>,
+    desired_rich: bool,
+    applied_rich: bool,
     deadline: Option<Instant>,
     active: Option<WorkingDiffJob>,
     error: Option<String>,
@@ -1749,6 +1760,18 @@ fn added_source_lines(model: &DiffModel) -> Vec<usize> {
         }
     }
     additions
+}
+
+fn native_added_lines(snapshot: &text_editor::TextSnapshot, additions: Vec<usize>) -> Vec<usize> {
+    if snapshot.protocol_compatible_lines() { return additions; }
+    let count = snapshot.line_count();
+    let mut source = 0;
+    let mut output = Vec::new();
+    for native in 0..count {
+        if additions.binary_search(&source).is_ok() { output.push(native); }
+        if native + 1 == count || snapshot.line(native).is_some_and(|line| line.ending.as_str().contains('\n')) { source += 1; }
+    }
+    output
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1962,6 +1985,7 @@ pub struct RepositoryRuntime {
     /// name and an object id.
     diffs: Vec<(DiffBasis, DiffState)>,
     working_diff: WorkingDiffRefresh,
+    diff_surface_visible: bool,
     source_surface: SourceSurface,
     markdown_mode: MarkdownMode,
     pending_fragment: Option<String>,
@@ -2148,6 +2172,7 @@ impl RepositoryRuntime {
             document: DocumentState::None,
             diffs: Vec::new(),
             working_diff: WorkingDiffRefresh::default(),
+            diff_surface_visible: true,
             next_diff_request: 0,
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
@@ -2898,7 +2923,8 @@ impl RepositoryRuntime {
     /// Poll only visible panes. Keep the mounted list, viewport, and document
     /// intact while discovering external changes, and never overlap a read.
     pub fn refresh_visible(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let diff = self.ensure_current_diff(card);
+        self.set_diff_surface_visible(true);
+        let diff = Task::batch([self.ensure_current_diff(card), self.working_diff_task(card)]);
         if self.descriptor.selected_file.is_some() || self.file_list_read_outstanding() { return diff; }
         self.background_file_refresh = true;
         let files = self.load_files(card);
@@ -4186,14 +4212,33 @@ impl RepositoryRuntime {
         .flatten()
     }
 
+    pub fn set_diff_surface_visible(&mut self, visible: bool) {
+        self.diff_surface_visible = visible;
+        if !visible && let Some(active) = &self.working_diff.active && active.rich {
+            active.cancellation.cancel();
+        }
+    }
+
+    fn wants_rich_working_diff(&self) -> bool {
+        self.diff_surface_visible && self.source_surface == SourceSurface::Diff
+    }
+
+    fn working_diff_current(&self) -> bool {
+        same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
+            && (!self.working_diff.desired_rich || self.working_diff.applied_rich)
+    }
+
     /// Call after repository actions and LSP edits, alongside autosave. At most
     /// one timer or one immutable CPU snapshot exists, even under continuous
     /// typing or selection/basis churn. The timer observes the latest deadline.
     pub fn working_diff_task(&mut self, card: CardId) -> Task<RepositoryAction> {
         let wanted = self.wanted_working_diff();
-        if !same_diff_revision(&wanted, &self.working_diff.desired) {
+        let revision_changed = !same_diff_revision(&wanted, &self.working_diff.desired);
+        let rich = self.wants_rich_working_diff();
+        if revision_changed || rich != self.working_diff.desired_rich {
             self.working_diff.desired = wanted;
-            self.working_diff.deadline = Some(Instant::now() + Duration::from_millis(180));
+            self.working_diff.desired_rich = rich;
+            self.working_diff.deadline = Some(Instant::now() + if revision_changed { Duration::from_millis(180) } else { Duration::ZERO });
             if self.working_diff.error.take().is_some() {
                 self.working_diff.applied = None;
             }
@@ -4204,7 +4249,7 @@ impl RepositoryRuntime {
         if self.working_diff.active.is_some()
             || self.working_diff.timer.is_some()
             || self.working_diff.desired.is_none()
-            || same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
+            || self.working_diff_current()
         {
             return Task::none();
         }
@@ -4239,7 +4284,7 @@ impl RepositoryRuntime {
             return Task::none();
         };
         if self.working_diff.active.is_some()
-            || same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
+            || self.working_diff_current()
         {
             return Task::none();
         }
@@ -4250,29 +4295,49 @@ impl RepositoryRuntime {
         // Highlighting follows the bytes, which is the source; the identity
         // stays the row, which is what the result is matched against.
         let source = document.source.clone();
-        // Only the debounce boundary serializes the native buffer. No Git is
-        // invoked, no second editable Content is created, and queued edits do
-        // not retain copies of superseded text.
-        let after = document.content.text();
-        if after.len() as u64 > MAX_DIFF_SIDE_BYTES {
+        // Capturing a persistent revision is constant time. Materialization
+        // belongs to the CPU worker, never the native event loop.
+        let snapshot_started = Instant::now();
+        let snapshot = document.content.text_snapshot();
+        let rich = self.wants_rich_working_diff();
+        tracing::debug!(target: "cagents::diff", snapshot_us = snapshot_started.elapsed().as_micros() as u64,
+            revision, rich, bytes = snapshot.len(), "captured diff revision");
+        if snapshot.len() as u64 > MAX_DIFF_SIDE_BYTES {
             self.working_diff.applied = self.working_diff.desired.clone();
+            self.working_diff.applied_rich = true;
             self.working_diff.error = Some("The unsaved buffer exceeds the diff size limit. Editing and safe saving remain available.".into());
             return Task::none();
         }
         let cancellation = CancellationToken::new();
         let syntax_theme = self.syntax_theme;
         let ignore_whitespace = self.diff_ignore_whitespace;
+        let present = [self.diff_model().is_none_or(|model| model.present[0]), true];
         self.working_diff.active = Some(WorkingDiffJob {
             identity: identity.clone(),
             revision,
             ticket,
             before: Arc::clone(&before),
+            rich,
             cancellation: cancellation.clone(),
         });
         cosmic::task::future(async move {
             let baseline = Arc::clone(&before);
             let result = tokio::task::spawn_blocking(move || {
-                build_document_diff_with_options(baseline, &after, &source, syntax_theme, ignore_whitespace, &cancellation)
+                let started = Instant::now();
+                if cancellation.is_cancelled() { return None; }
+                let after = snapshot.text();
+                let serialized_us = started.elapsed().as_micros() as u64;
+                let model = if rich {
+                    let mut model = build_document_diff_sources(Arc::clone(&baseline), Arc::clone(&after), &source, syntax_theme, ignore_whitespace, &cancellation)?;
+                    model.present = present;
+                    Some(model)
+                } else { None };
+                let additions = if let Some(model) = &model { added_source_lines(model) }
+                    else { build_line_changes(&baseline, &after, ignore_whitespace, &cancellation)? };
+                let additions = native_added_lines(&snapshot, additions);
+                tracing::debug!(target: "cagents::diff", worker_us = started.elapsed().as_micros() as u64,
+                    serialized_us, revision, rich, "computed diff revision");
+                Some(WorkingDiffOutput { model, additions })
             })
             .await
             .map_err(|error| format!("Diff worker failed: {error}"));
@@ -4292,7 +4357,7 @@ impl RepositoryRuntime {
         revision: u64,
         ticket: u64,
         before: Arc<str>,
-        result: Result<Option<DiffModel>, String>,
+        result: Result<Option<WorkingDiffOutput>, String>,
     ) -> Task<RepositoryAction> {
         let matches_active = self.working_diff.active.as_ref().is_some_and(|active| {
             active.ticket == ticket
@@ -4316,36 +4381,29 @@ impl RepositoryRuntime {
             && same_diff_revision(&completed, &self.wanted_working_diff())
         {
             match result {
-                Ok(Some(mut model)) => {
-                    model.before = before;
-                    self.working_diff.additions = added_source_lines(&model);
-                    if let DocumentState::Editable(document) = &self.document {
-                        let lines = document.content.source_line_ranges();
-                        self.working_diff.additions = self
-                            .working_diff
-                            .additions
-                            .iter()
-                            .filter_map(|line| lines.get(*line))
-                            .cloned()
-                            .flatten()
-                            .collect();
-                    }
+                Ok(Some(output)) => {
+                    self.working_diff.additions = output.additions;
                     self.working_diff.applied = completed;
+                    self.working_diff.applied_rich = output.model.is_some();
                     self.working_diff.error = None;
-                    self.set_diff_state(
-                        DiffBasis::IndexToWorktree,
-                        DiffState::ready(RenderedDiff::Text {
-                            model,
-                            old_label: "Index".into(),
-                            new_label: "Working buffer".into(),
-                        }),
-                    );
-                    self.diff_change = self.diff_change.min(self.change_count().saturating_sub(1));
-                    installed = true;
+                    if let Some(mut model) = output.model {
+                        model.before = before;
+                        self.set_diff_state(
+                            DiffBasis::IndexToWorktree,
+                            DiffState::ready(RenderedDiff::Text {
+                                model,
+                                old_label: "Index".into(),
+                                new_label: "Working buffer".into(),
+                            }),
+                        );
+                        self.diff_change = self.diff_change.min(self.change_count().saturating_sub(1));
+                        installed = true;
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
                     self.working_diff.applied = completed;
+                    self.working_diff.applied_rich = true;
                     self.working_diff.error = Some(error);
                 }
             }
@@ -11067,6 +11125,10 @@ mod tests {
     use crate::lsp::{LspRange, LspSnippet, LspSnippetStop};
     use crate::model::ProjectId;
 
+    fn test_working_output(model: DiffModel) -> WorkingDiffOutput {
+        WorkingDiffOutput { additions: added_source_lines(&model), model: Some(model) }
+    }
+
     /// A runtime whose working-tree comparison describes the live buffer.
     ///
     /// The file is open for editing and the index baseline is known, which is
@@ -11087,6 +11149,8 @@ mod tests {
         );
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
+        runtime.working_diff.applied_rich = true;
+        runtime.working_diff.desired_rich = true;
         (runtime, identity)
     }
 
@@ -11207,7 +11271,7 @@ mod tests {
             revision,
             timer,
             before.clone(),
-            Ok(Some(crate::diff_view::build_diff(&before, "obsolete\n"))),
+            Ok(Some(test_working_output(crate::diff_view::build_diff(&before, "obsolete\n")))),
         ));
         assert!(runtime.working_diff.applied.is_none());
         let next = runtime.working_diff.timer.unwrap();
@@ -11221,7 +11285,7 @@ mod tests {
         };
         let text = document.content.text();
         let model = crate::diff_view::build_diff(&before, &text);
-        drop(runtime.finish_working_diff(identity, revision, next, before, Ok(Some(model))));
+        drop(runtime.finish_working_diff(identity, revision, next, before, Ok(Some(test_working_output(model)))));
         assert!(runtime.working_annotations_current());
         assert!(runtime.working_diff.timer.is_none());
         assert!(runtime.working_diff.active.is_none());
@@ -11229,6 +11293,70 @@ mod tests {
             panic!("native buffer")
         };
         assert_eq!(document.content.text(), text);
+    }
+
+    #[tokio::test]
+    async fn gutter_only_diff_materializes_on_worker_and_upgrades_when_revealed() {
+        use cosmic::iced::futures::StreamExt;
+        let card = CardId::new();
+        let (mut runtime,_) = working_diff_runtime(card,"old\n", "new\n");
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.working_diff.applied = None;
+        let snapshot = match &runtime.document { DocumentState::Editable(document) => document.content.text_snapshot(),_ => unreachable!() };
+        assert!(!snapshot.is_materialized());
+        drop(runtime.working_diff_task(card));
+        let ticket = runtime.working_diff.timer.unwrap();
+        runtime.working_diff.deadline = Some(Instant::now());
+        let task = runtime.start_working_diff(card,ticket);
+        assert!(!snapshot.is_materialized(),"capturing a debounce must not serialize on the UI thread");
+        assert!(!runtime.working_diff.active.as_ref().unwrap().rich);
+        let mut stream = iced::runtime::task::into_stream(task).unwrap();
+        let iced::runtime::Action::Output(action) = stream.next().await.unwrap() else { panic!("diff output") };
+        assert!(snapshot.is_materialized());
+        let RepositoryAction::WorkingDiffLoaded { result:Ok(Some(output)),.. } = &action else { panic!("successful gutter output") };
+        assert!(output.model.is_none(),"gutter lane must not build rich rows, syntax, or shape widths");
+        assert_eq!(output.additions,vec![0]);
+        drop(runtime.update(action));
+        assert!(runtime.working_annotations_current());
+        assert!(!runtime.working_diff.applied_rich);
+        runtime.source_surface = SourceSurface::Diff;
+        drop(runtime.working_diff_task(card));
+        let ticket = runtime.working_diff.timer.expect("revealing a stale rich comparison upgrades without another edit");
+        let task = runtime.start_working_diff(card,ticket);
+        assert!(runtime.working_diff.active.as_ref().unwrap().rich);
+        finish_navigation_task(&mut runtime,task).await;
+        assert!(runtime.working_diff.applied_rich);
+        assert!(runtime.working_diff_current());
+        assert_eq!(runtime.diff_model().unwrap().after.as_ref(),"new\n");
+    }
+
+    #[tokio::test]
+    async fn hidden_diff_surface_uses_gutter_lane_until_visible() {
+        let card = CardId::new();
+        let (mut runtime,_) = working_diff_runtime(card,"old\n", "new\n");
+        runtime.set_diff_surface_visible(false);
+        runtime.working_diff.applied = None;
+        drop(runtime.working_diff_task(card));
+        let ticket = runtime.working_diff.timer.unwrap();
+        runtime.working_diff.deadline = Some(Instant::now());
+        let task = runtime.start_working_diff(card,ticket);
+        assert!(!runtime.working_diff.active.as_ref().unwrap().rich);
+        finish_navigation_task(&mut runtime,task).await;
+        assert!(!runtime.working_diff.applied_rich);
+        runtime.set_diff_surface_visible(true);
+        drop(runtime.working_diff_task(card));
+        let ticket = runtime.working_diff.timer.unwrap();
+        let task = runtime.start_working_diff(card,ticket);
+        assert!(runtime.working_diff.active.as_ref().unwrap().rich);
+        finish_navigation_task(&mut runtime,task).await;
+        assert!(runtime.working_diff.applied_rich);
+    }
+
+    #[test]
+    fn diff_gutter_maps_source_lines_to_native_bare_cr_lines() {
+        let content = text_editor::Content::<cosmic::Renderer>::with_text("first\rsecond\nthird\r\nlast");
+        assert_eq!(native_added_lines(&content.text_snapshot(),vec![0]),vec![0,1]);
+        assert_eq!(native_added_lines(&content.text_snapshot(),vec![1,2]),vec![2,3]);
     }
 
     #[test]
@@ -11252,7 +11380,7 @@ mod tests {
             0,
             ticket,
             before,
-            Ok(Some(crate::diff_view::build_diff("old\n", "obsolete\n"))),
+            Ok(Some(test_working_output(crate::diff_view::build_diff("old\n", "obsolete\n")))),
         ));
         assert!(runtime.working_diff.applied.is_none());
         assert_eq!(
