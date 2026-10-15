@@ -160,6 +160,9 @@ impl ExecutionContext {
         if self.directory_identity()?.is_some_and(|approved| approved != identity) {
             return Err("The owned process directory differs from its approved launch identity".into());
         }
+        // A fresh launch already retains this exact inode. Avoid adding a
+        // second long-lived descriptor merely because Locate verified it.
+        if self.directory.is_some() { return Ok(()); }
         let mut pinned = self.owned_directory.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(previous) = pinned.as_ref()
             && crate::agent_execution::DirectoryIdentity::from_metadata(&previous.metadata().map_err(|error| error.to_string())?) != identity {
