@@ -351,9 +351,16 @@ impl GlobalShortcut {
                     | Self::DiffOpenInEditor
                     | Self::OpenFile
                     | Self::DeleteChannel
-                | Self::StageFile | Self::UnstageFile | Self::StageOrUnstageFile
-                | Self::DiffStageSelection | Self::DiffUnstageSelection | Self::DiffRevertSelection | Self::DiffRevert
-                | Self::DiffStageHunk | Self::DiffUnstageHunk | Self::DiffRevertHunk
+                    | Self::StageFile
+                    | Self::UnstageFile
+                    | Self::StageOrUnstageFile
+                    | Self::DiffStageSelection
+                    | Self::DiffUnstageSelection
+                    | Self::DiffRevertSelection
+                    | Self::DiffRevert
+                    | Self::DiffStageHunk
+                    | Self::DiffUnstageHunk
+                    | Self::DiffRevertHunk
             )
     }
 
@@ -732,8 +739,15 @@ pub struct CommandContext {
 }
 
 /// Display order shared by the Keyboard table and its registry coverage checks.
-pub const SHORTCUT_CATEGORIES: [&str; 7] =
-    ["Panes", "Navigation", "Chat", "Review", "Editor", "Git", "Browser"];
+pub const SHORTCUT_CATEGORIES: [&str; 7] = [
+    "Panes",
+    "Navigation",
+    "Chat",
+    "Review",
+    "Editor",
+    "Git",
+    "Browser",
+];
 
 impl ShortcutDescriptor {
     pub const fn id(self) -> &'static str {
@@ -741,7 +755,14 @@ impl ShortcutDescriptor {
     }
 
     pub fn category(self) -> &'static str {
-        if matches!(self.action, GlobalShortcut::StageFile | GlobalShortcut::UnstageFile | GlobalShortcut::StageOrUnstageFile) { return "Git"; }
+        if matches!(
+            self.action,
+            GlobalShortcut::StageFile
+                | GlobalShortcut::UnstageFile
+                | GlobalShortcut::StageOrUnstageFile
+        ) {
+            return "Git";
+        }
         if self.id().starts_with("git_") {
             return "Git";
         }
@@ -835,14 +856,24 @@ impl ShortcutDescriptor {
         if let Some(bit) = diff_command_bit(self.action) {
             return context.diff_commands & bit != 0;
         }
-        if let Some(bit) = diff_presentation_command_bit(self.action) { return context.diff_presentation_commands & bit != 0; }
-        if let Some(bit) = diff_selection_command_bit(self.action) { return context.diff_selection_commands & bit != 0; }
-        if let Some(bit) = diff_hunk_command_bit(self.action) { return context.diff_hunk_commands & bit != 0; }
+        if let Some(bit) = diff_presentation_command_bit(self.action) {
+            return context.diff_presentation_commands & bit != 0;
+        }
+        if let Some(bit) = diff_selection_command_bit(self.action) {
+            return context.diff_selection_commands & bit != 0;
+        }
+        if let Some(bit) = diff_hunk_command_bit(self.action) {
+            return context.diff_hunk_commands & bit != 0;
+        }
         if let Some(bit) = editor_language_command_bit(self.action) {
             return context.editor_language_commands & bit != 0;
         }
-        if let Some(bit) = chat_user_command_bit(self.action) { return context.chat_user_commands & bit != 0; }
-        if let Some(bit) = browser_command_bit(self.action) { return context.browser_commands & bit != 0; }
+        if let Some(bit) = chat_user_command_bit(self.action) {
+            return context.chat_user_commands & bit != 0;
+        }
+        if let Some(bit) = browser_command_bit(self.action) {
+            return context.browser_commands & bit != 0;
+        }
         if let Some(bit) = pdf_command_bit(self.action) {
             return context.pdf_commands & bit != 0;
         }
@@ -1858,43 +1889,228 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Repository,
     },
-    ShortcutDescriptor { action: GlobalShortcut::DiffUnified, label: "Unified diff", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffSplit, label: "Side-by-side diff", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffIgnoreWhitespace, label: "Toggle ignored diff whitespace", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffWorking, label: "Compare index with working tree", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::DiffStaged, label: "Compare HEAD with index", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::DiffBranch, label: "Compare branch with base", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::DiffHistory, label: "Compare last commit with parent", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::StageFile, label: "Stage file", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::UnstageFile, label: "Unstage file", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::StageOrUnstageFile, label: "Stage or unstage file", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::DiffRevert, label: "Revert file changes", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffRetry, label: "Retry diff", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffStageSelection, label: "Stage selected diff rows", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffUnstageSelection, label: "Unstage selected diff rows", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffRevertSelection, label: "Revert selected diff rows", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffStageHunk, label: "Stage current diff hunk", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffUnstageHunk, label: "Unstage current diff hunk", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffRevertHunk, label: "Revert current diff hunk", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::BrowserBack, label: "Browser back", repeatable: false, scope: ShortcutScope::Browser },
-    ShortcutDescriptor { action: GlobalShortcut::BrowserForward, label: "Browser forward", repeatable: false, scope: ShortcutScope::Browser },
-    ShortcutDescriptor { action: GlobalShortcut::BrowserReload, label: "Reload browser page", repeatable: false, scope: ShortcutScope::Browser },
-    ShortcutDescriptor { action: GlobalShortcut::BrowserStop, label: "Stop loading browser page", repeatable: false, scope: ShortcutScope::Browser },
-    ShortcutDescriptor { action: GlobalShortcut::BrowserAddress, label: "Focus browser address", repeatable: false, scope: ShortcutScope::Browser },
-    ShortcutDescriptor { action: GlobalShortcut::BrowserOpenSystem, label: "Open page in system browser", repeatable: false, scope: ShortcutScope::Browser },
-    ShortcutDescriptor { action: GlobalShortcut::BrowserImportLogins, label: "Import browser logins", repeatable: false, scope: ShortcutScope::Browser },
-    ShortcutDescriptor { action: GlobalShortcut::ChatSend, label: "Send chat message", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatSteer, label: "Steer active chat turn", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatQueue, label: "Queue chat message", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatInterrupt, label: "Interrupt active chat turn", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatCompact, label: "Compact conversation", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatAttach, label: "Attach files to chat", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatReasoning, label: "Choose chat reasoning effort", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatLatest, label: "Jump to latest chat activity", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatTakeBackQueued, label: "Take back newest queued message", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatCancelQueued, label: "Take back pending first message", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatToggleSteering, label: "Toggle chat steering timing", repeatable: false, scope: ShortcutScope::Chat },
-    ShortcutDescriptor { action: GlobalShortcut::ChatToggleFastMode, label: "Toggle chat fast mode", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffUnified,
+        label: "Unified diff",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffSplit,
+        label: "Side-by-side diff",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffIgnoreWhitespace,
+        label: "Toggle ignored diff whitespace",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffWorking,
+        label: "Compare index with working tree",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffStaged,
+        label: "Compare HEAD with index",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffBranch,
+        label: "Compare branch with base",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffHistory,
+        label: "Compare last commit with parent",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::StageFile,
+        label: "Stage file",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::UnstageFile,
+        label: "Unstage file",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::StageOrUnstageFile,
+        label: "Stage or unstage file",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffRevert,
+        label: "Revert file changes",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffRetry,
+        label: "Retry diff",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffStageSelection,
+        label: "Stage selected diff rows",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffUnstageSelection,
+        label: "Unstage selected diff rows",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffRevertSelection,
+        label: "Revert selected diff rows",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffStageHunk,
+        label: "Stage current diff hunk",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffUnstageHunk,
+        label: "Unstage current diff hunk",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffRevertHunk,
+        label: "Revert current diff hunk",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::BrowserBack,
+        label: "Browser back",
+        repeatable: false,
+        scope: ShortcutScope::Browser,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::BrowserForward,
+        label: "Browser forward",
+        repeatable: false,
+        scope: ShortcutScope::Browser,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::BrowserReload,
+        label: "Reload browser page",
+        repeatable: false,
+        scope: ShortcutScope::Browser,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::BrowserStop,
+        label: "Stop loading browser page",
+        repeatable: false,
+        scope: ShortcutScope::Browser,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::BrowserAddress,
+        label: "Focus browser address",
+        repeatable: false,
+        scope: ShortcutScope::Browser,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::BrowserOpenSystem,
+        label: "Open page in system browser",
+        repeatable: false,
+        scope: ShortcutScope::Browser,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::BrowserImportLogins,
+        label: "Import browser logins",
+        repeatable: false,
+        scope: ShortcutScope::Browser,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatSend,
+        label: "Send chat message",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatSteer,
+        label: "Steer active chat turn",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatQueue,
+        label: "Queue chat message",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatInterrupt,
+        label: "Interrupt active chat turn",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatCompact,
+        label: "Compact conversation",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatAttach,
+        label: "Attach files to chat",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatReasoning,
+        label: "Choose chat reasoning effort",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatLatest,
+        label: "Jump to latest chat activity",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatTakeBackQueued,
+        label: "Take back newest queued message",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatCancelQueued,
+        label: "Take back pending first message",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatToggleSteering,
+        label: "Toggle chat steering timing",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatToggleFastMode,
+        label: "Toggle chat fast mode",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
@@ -2472,9 +2688,30 @@ fn text_editing_conflict(
     physical: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
 ) -> bool {
-    if action == GlobalShortcut::ChatLatest && modifiers.control() && !modifiers.alt() && !modifiers.shift() && !modifiers.logo() && matches!(key, keyboard::Key::Named(keyboard::key::Named::End)) { return false; }
-    if modifiers.alt() && !modifiers.control() && !modifiers.shift() && !modifiers.logo()
-        && matches!((action, key.as_ref()), (GlobalShortcut::BrowserBack, keyboard::Key::Named(keyboard::key::Named::ArrowLeft)) | (GlobalShortcut::BrowserForward, keyboard::Key::Named(keyboard::key::Named::ArrowRight))) {
+    if action == GlobalShortcut::ChatLatest
+        && modifiers.control()
+        && !modifiers.alt()
+        && !modifiers.shift()
+        && !modifiers.logo()
+        && matches!(key, keyboard::Key::Named(keyboard::key::Named::End))
+    {
+        return false;
+    }
+    if modifiers.alt()
+        && !modifiers.control()
+        && !modifiers.shift()
+        && !modifiers.logo()
+        && matches!(
+            (action, key.as_ref()),
+            (
+                GlobalShortcut::BrowserBack,
+                keyboard::Key::Named(keyboard::key::Named::ArrowLeft)
+            ) | (
+                GlobalShortcut::BrowserForward,
+                keyboard::Key::Named(keyboard::key::Named::ArrowRight)
+            )
+        )
+    {
         return false;
     }
     text_editing_chord(key, physical, modifiers)
@@ -2629,36 +2866,79 @@ pub fn shortcut_descriptor_by_id(id: &str) -> Option<&'static ShortcutDescriptor
         .find(|descriptor| descriptor.id() == id)
 }
 
-pub const DIFF_PRESENTATION_COMMANDS: [GlobalShortcut; 12] = [GlobalShortcut::DiffUnified, GlobalShortcut::DiffSplit, GlobalShortcut::DiffIgnoreWhitespace, GlobalShortcut::DiffWorking, GlobalShortcut::DiffStaged, GlobalShortcut::DiffBranch, GlobalShortcut::DiffHistory, GlobalShortcut::StageFile, GlobalShortcut::UnstageFile, GlobalShortcut::StageOrUnstageFile, GlobalShortcut::DiffRevert, GlobalShortcut::DiffRetry];
-pub const fn diff_presentation_command(command: GlobalShortcut) -> Option<crate::repository_widget::DiffPresentationCommand> {
+pub const DIFF_PRESENTATION_COMMANDS: [GlobalShortcut; 12] = [
+    GlobalShortcut::DiffUnified,
+    GlobalShortcut::DiffSplit,
+    GlobalShortcut::DiffIgnoreWhitespace,
+    GlobalShortcut::DiffWorking,
+    GlobalShortcut::DiffStaged,
+    GlobalShortcut::DiffBranch,
+    GlobalShortcut::DiffHistory,
+    GlobalShortcut::StageFile,
+    GlobalShortcut::UnstageFile,
+    GlobalShortcut::StageOrUnstageFile,
+    GlobalShortcut::DiffRevert,
+    GlobalShortcut::DiffRetry,
+];
+pub const fn diff_presentation_command(
+    command: GlobalShortcut,
+) -> Option<crate::repository_widget::DiffPresentationCommand> {
     match command {
-        GlobalShortcut::DiffUnified => Some(crate::repository_widget::DiffPresentationCommand::Unified),
+        GlobalShortcut::DiffUnified => {
+            Some(crate::repository_widget::DiffPresentationCommand::Unified)
+        }
         GlobalShortcut::DiffSplit => Some(crate::repository_widget::DiffPresentationCommand::Split),
-        GlobalShortcut::DiffIgnoreWhitespace => Some(crate::repository_widget::DiffPresentationCommand::IgnoreWhitespace),
-        GlobalShortcut::DiffWorking => Some(crate::repository_widget::DiffPresentationCommand::Working),
-        GlobalShortcut::DiffStaged => Some(crate::repository_widget::DiffPresentationCommand::Staged),
-        GlobalShortcut::DiffBranch => Some(crate::repository_widget::DiffPresentationCommand::Branch),
-        GlobalShortcut::DiffHistory => Some(crate::repository_widget::DiffPresentationCommand::History),
-        GlobalShortcut::StageFile => Some(crate::repository_widget::DiffPresentationCommand::StageFile),
-        GlobalShortcut::UnstageFile => Some(crate::repository_widget::DiffPresentationCommand::UnstageFile),
-        GlobalShortcut::StageOrUnstageFile => Some(crate::repository_widget::DiffPresentationCommand::StageOrUnstageFile),
-        GlobalShortcut::DiffRevert => Some(crate::repository_widget::DiffPresentationCommand::Revert),
+        GlobalShortcut::DiffIgnoreWhitespace => {
+            Some(crate::repository_widget::DiffPresentationCommand::IgnoreWhitespace)
+        }
+        GlobalShortcut::DiffWorking => {
+            Some(crate::repository_widget::DiffPresentationCommand::Working)
+        }
+        GlobalShortcut::DiffStaged => {
+            Some(crate::repository_widget::DiffPresentationCommand::Staged)
+        }
+        GlobalShortcut::DiffBranch => {
+            Some(crate::repository_widget::DiffPresentationCommand::Branch)
+        }
+        GlobalShortcut::DiffHistory => {
+            Some(crate::repository_widget::DiffPresentationCommand::History)
+        }
+        GlobalShortcut::StageFile => {
+            Some(crate::repository_widget::DiffPresentationCommand::StageFile)
+        }
+        GlobalShortcut::UnstageFile => {
+            Some(crate::repository_widget::DiffPresentationCommand::UnstageFile)
+        }
+        GlobalShortcut::StageOrUnstageFile => {
+            Some(crate::repository_widget::DiffPresentationCommand::StageOrUnstageFile)
+        }
+        GlobalShortcut::DiffRevert => {
+            Some(crate::repository_widget::DiffPresentationCommand::Revert)
+        }
         GlobalShortcut::DiffRetry => Some(crate::repository_widget::DiffPresentationCommand::Retry),
         _ => None,
     }
 }
-pub const fn diff_presentation_registry_command(command: crate::repository_widget::DiffPresentationCommand) -> GlobalShortcut {
+pub const fn diff_presentation_registry_command(
+    command: crate::repository_widget::DiffPresentationCommand,
+) -> GlobalShortcut {
     match command {
         crate::repository_widget::DiffPresentationCommand::Unified => GlobalShortcut::DiffUnified,
         crate::repository_widget::DiffPresentationCommand::Split => GlobalShortcut::DiffSplit,
-        crate::repository_widget::DiffPresentationCommand::IgnoreWhitespace => GlobalShortcut::DiffIgnoreWhitespace,
+        crate::repository_widget::DiffPresentationCommand::IgnoreWhitespace => {
+            GlobalShortcut::DiffIgnoreWhitespace
+        }
         crate::repository_widget::DiffPresentationCommand::Working => GlobalShortcut::DiffWorking,
         crate::repository_widget::DiffPresentationCommand::Staged => GlobalShortcut::DiffStaged,
         crate::repository_widget::DiffPresentationCommand::Branch => GlobalShortcut::DiffBranch,
         crate::repository_widget::DiffPresentationCommand::History => GlobalShortcut::DiffHistory,
         crate::repository_widget::DiffPresentationCommand::StageFile => GlobalShortcut::StageFile,
-        crate::repository_widget::DiffPresentationCommand::UnstageFile => GlobalShortcut::UnstageFile,
-        crate::repository_widget::DiffPresentationCommand::StageOrUnstageFile => GlobalShortcut::StageOrUnstageFile,
+        crate::repository_widget::DiffPresentationCommand::UnstageFile => {
+            GlobalShortcut::UnstageFile
+        }
+        crate::repository_widget::DiffPresentationCommand::StageOrUnstageFile => {
+            GlobalShortcut::StageOrUnstageFile
+        }
         crate::repository_widget::DiffPresentationCommand::Revert => GlobalShortcut::DiffRevert,
         crate::repository_widget::DiffPresentationCommand::Retry => GlobalShortcut::DiffRetry,
     }
@@ -2680,8 +2960,14 @@ pub const fn diff_presentation_command_bit(command: GlobalShortcut) -> Option<u1
         _ => None,
     }
 }
-pub const DIFF_SELECTION_COMMANDS: [GlobalShortcut; 3] = [GlobalShortcut::DiffStageSelection, GlobalShortcut::DiffUnstageSelection, GlobalShortcut::DiffRevertSelection];
-pub const fn diff_selection_command_kind(command: GlobalShortcut) -> Option<crate::git_patch::Kind> {
+pub const DIFF_SELECTION_COMMANDS: [GlobalShortcut; 3] = [
+    GlobalShortcut::DiffStageSelection,
+    GlobalShortcut::DiffUnstageSelection,
+    GlobalShortcut::DiffRevertSelection,
+];
+pub const fn diff_selection_command_kind(
+    command: GlobalShortcut,
+) -> Option<crate::git_patch::Kind> {
     match command {
         GlobalShortcut::DiffStageSelection => Some(crate::git_patch::Kind::Stage),
         GlobalShortcut::DiffUnstageSelection => Some(crate::git_patch::Kind::Unstage),
@@ -2698,7 +2984,11 @@ pub const fn diff_selection_command_bit(command: GlobalShortcut) -> Option<u8> {
     }
 }
 
-pub const DIFF_HUNK_COMMANDS: [GlobalShortcut; 3] = [GlobalShortcut::DiffStageHunk, GlobalShortcut::DiffUnstageHunk, GlobalShortcut::DiffRevertHunk];
+pub const DIFF_HUNK_COMMANDS: [GlobalShortcut; 3] = [
+    GlobalShortcut::DiffStageHunk,
+    GlobalShortcut::DiffUnstageHunk,
+    GlobalShortcut::DiffRevertHunk,
+];
 pub const fn diff_hunk_command_kind(command: GlobalShortcut) -> Option<crate::git_patch::Kind> {
     match command {
         GlobalShortcut::DiffStageHunk => Some(crate::git_patch::Kind::Stage),
@@ -2715,7 +3005,10 @@ pub const fn diff_hunk_command_bit(command: GlobalShortcut) -> Option<u8> {
         _ => None,
     }
 }
-pub const fn diff_mutation_registry_command(kind: crate::git_patch::Kind, selection: bool) -> GlobalShortcut {
+pub const fn diff_mutation_registry_command(
+    kind: crate::git_patch::Kind,
+    selection: bool,
+) -> GlobalShortcut {
     match (kind, selection) {
         (crate::git_patch::Kind::Stage, true) => GlobalShortcut::DiffStageSelection,
         (crate::git_patch::Kind::Unstage, true) => GlobalShortcut::DiffUnstageSelection,
@@ -2726,26 +3019,57 @@ pub const fn diff_mutation_registry_command(kind: crate::git_patch::Kind, select
     }
 }
 
-pub const CHAT_USER_COMMANDS: [GlobalShortcut; 12] = [GlobalShortcut::ChatSend, GlobalShortcut::ChatSteer, GlobalShortcut::ChatQueue, GlobalShortcut::ChatInterrupt, GlobalShortcut::ChatCompact, GlobalShortcut::ChatAttach, GlobalShortcut::ChatReasoning, GlobalShortcut::ChatLatest, GlobalShortcut::ChatTakeBackQueued, GlobalShortcut::ChatCancelQueued, GlobalShortcut::ChatToggleSteering, GlobalShortcut::ChatToggleFastMode];
+pub const CHAT_USER_COMMANDS: [GlobalShortcut; 12] = [
+    GlobalShortcut::ChatSend,
+    GlobalShortcut::ChatSteer,
+    GlobalShortcut::ChatQueue,
+    GlobalShortcut::ChatInterrupt,
+    GlobalShortcut::ChatCompact,
+    GlobalShortcut::ChatAttach,
+    GlobalShortcut::ChatReasoning,
+    GlobalShortcut::ChatLatest,
+    GlobalShortcut::ChatTakeBackQueued,
+    GlobalShortcut::ChatCancelQueued,
+    GlobalShortcut::ChatToggleSteering,
+    GlobalShortcut::ChatToggleFastMode,
+];
 pub const fn chat_user_command_bit(command: GlobalShortcut) -> Option<u16> {
     match command {
-        GlobalShortcut::ChatSend => Some(1 << 0), GlobalShortcut::ChatSteer => Some(1 << 1),
-        GlobalShortcut::ChatQueue => Some(1 << 2), GlobalShortcut::ChatInterrupt => Some(1 << 3),
-        GlobalShortcut::ChatCompact => Some(1 << 4), GlobalShortcut::ChatAttach => Some(1 << 5),
-        GlobalShortcut::ChatReasoning => Some(1 << 6), GlobalShortcut::ChatLatest => Some(1 << 7),
-        GlobalShortcut::ChatTakeBackQueued => Some(1 << 8), GlobalShortcut::ChatCancelQueued => Some(1 << 9),
-        GlobalShortcut::ChatToggleSteering => Some(1 << 10), GlobalShortcut::ChatToggleFastMode => Some(1 << 11),
+        GlobalShortcut::ChatSend => Some(1 << 0),
+        GlobalShortcut::ChatSteer => Some(1 << 1),
+        GlobalShortcut::ChatQueue => Some(1 << 2),
+        GlobalShortcut::ChatInterrupt => Some(1 << 3),
+        GlobalShortcut::ChatCompact => Some(1 << 4),
+        GlobalShortcut::ChatAttach => Some(1 << 5),
+        GlobalShortcut::ChatReasoning => Some(1 << 6),
+        GlobalShortcut::ChatLatest => Some(1 << 7),
+        GlobalShortcut::ChatTakeBackQueued => Some(1 << 8),
+        GlobalShortcut::ChatCancelQueued => Some(1 << 9),
+        GlobalShortcut::ChatToggleSteering => Some(1 << 10),
+        GlobalShortcut::ChatToggleFastMode => Some(1 << 11),
         _ => None,
     }
 }
 
-pub const BROWSER_COMMANDS: [GlobalShortcut; 7] = [GlobalShortcut::BrowserBack, GlobalShortcut::BrowserForward, GlobalShortcut::BrowserReload, GlobalShortcut::BrowserStop, GlobalShortcut::BrowserAddress, GlobalShortcut::BrowserOpenSystem, GlobalShortcut::BrowserImportLogins];
+pub const BROWSER_COMMANDS: [GlobalShortcut; 7] = [
+    GlobalShortcut::BrowserBack,
+    GlobalShortcut::BrowserForward,
+    GlobalShortcut::BrowserReload,
+    GlobalShortcut::BrowserStop,
+    GlobalShortcut::BrowserAddress,
+    GlobalShortcut::BrowserOpenSystem,
+    GlobalShortcut::BrowserImportLogins,
+];
 pub const fn browser_command_bit(command: GlobalShortcut) -> Option<u8> {
     match command {
-        GlobalShortcut::BrowserBack => Some(1 << 0), GlobalShortcut::BrowserForward => Some(1 << 1),
-        GlobalShortcut::BrowserReload => Some(1 << 2), GlobalShortcut::BrowserStop => Some(1 << 3),
-        GlobalShortcut::BrowserAddress => Some(1 << 4), GlobalShortcut::BrowserOpenSystem => Some(1 << 5),
-        GlobalShortcut::BrowserImportLogins => Some(1 << 6), _ => None,
+        GlobalShortcut::BrowserBack => Some(1 << 0),
+        GlobalShortcut::BrowserForward => Some(1 << 1),
+        GlobalShortcut::BrowserReload => Some(1 << 2),
+        GlobalShortcut::BrowserStop => Some(1 << 3),
+        GlobalShortcut::BrowserAddress => Some(1 << 4),
+        GlobalShortcut::BrowserOpenSystem => Some(1 << 5),
+        GlobalShortcut::BrowserImportLogins => Some(1 << 6),
+        _ => None,
     }
 }
 
@@ -2872,7 +3196,10 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageDown)
             ),
-            ShortcutKey::End => matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::End)),
+            ShortcutKey::End => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::End)
+            ),
             ShortcutKey::Function(number) => {
                 use keyboard::key::Named;
                 let keys = [
@@ -7207,96 +7534,310 @@ mod tests {
     fn configured_file_stage_toggle_retires_fixed_keys_and_respects_native_focus() {
         use keyboard::key::{Code, Physical};
         let mut shortcuts = KeyboardShortcuts::default();
-        let key = key_press("s", Code::KeyS, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, false);
+        let key = key_press(
+            "s",
+            Code::KeyS,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
         assert!(shortcuts.fault().is_none());
-        for focused in [FocusedPane::RepositoryPane, FocusedPane::Editor, FocusedPane::Review, FocusedPane::WorkingDiff] {
-            assert_eq!(global_shortcut(&key, &shortcuts, focused), Some(GlobalShortcut::StageOrUnstageFile));
+        for focused in [
+            FocusedPane::RepositoryPane,
+            FocusedPane::Editor,
+            FocusedPane::Review,
+            FocusedPane::WorkingDiff,
+        ] {
+            assert_eq!(
+                global_shortcut(&key, &shortcuts, focused),
+                Some(GlobalShortcut::StageOrUnstageFile)
+            );
         }
-        for focused in [FocusedPane::TextInput, FocusedPane::Terminal, FocusedPane::Chat, FocusedPane::SidebarRows, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges] {
+        for focused in [
+            FocusedPane::TextInput,
+            FocusedPane::Terminal,
+            FocusedPane::Chat,
+            FocusedPane::SidebarRows,
+            FocusedPane::SidebarFiles,
+            FocusedPane::SidebarChanges,
+        ] {
             assert_eq!(global_shortcut(&key, &shortcuts, focused), None);
         }
         shortcuts.stage_or_unstage_file.clear();
         assert_eq!(global_shortcut(&key, &shortcuts, FocusedPane::Editor), None);
         shortcuts.command_palette = vec!["Ctrl+Shift+S".into()];
-        assert!(shortcuts.fault().is_none(), "the retired native reservation must not retain this chord");
-        assert_eq!(global_shortcut(&key, &shortcuts, FocusedPane::Editor), Some(GlobalShortcut::CommandPalette));
+        assert!(
+            shortcuts.fault().is_none(),
+            "the retired native reservation must not retain this chord"
+        );
+        assert_eq!(
+            global_shortcut(&key, &shortcuts, FocusedPane::Editor),
+            Some(GlobalShortcut::CommandPalette)
+        );
         shortcuts.command_palette = KeyboardShortcuts::default().command_palette;
         shortcuts.stage_or_unstage_file = vec!["Alt+F9".into()];
-        assert_eq!(global_shortcut(&key, &shortcuts, FocusedPane::RepositoryPane), None);
-        assert_eq!(editor_shortcut(&keyboard::Key::Named(keyboard::key::Named::F9), Physical::Code(Code::F9), keyboard::Modifiers::ALT, &shortcuts), None, "repository actions stay root-owned");
+        assert_eq!(
+            global_shortcut(&key, &shortcuts, FocusedPane::RepositoryPane),
+            None
+        );
+        assert_eq!(
+            editor_shortcut(
+                &keyboard::Key::Named(keyboard::key::Named::F9),
+                Physical::Code(Code::F9),
+                keyboard::Modifiers::ALT,
+                &shortcuts
+            ),
+            None,
+            "repository actions stay root-owned"
+        );
         let mut editing = KeyboardShortcuts::default();
         editing.editor_redo = vec!["Alt+Left".into()];
         editing.editor_save = vec!["Alt+Left".into()];
-        assert!(editing.fault().is_none(), "native word motion remains protected in editable content");
-        let word = keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::ArrowLeft), modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowLeft), physical_key: Physical::Code(Code::ArrowLeft), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::ALT, text: None, repeat: false };
-        assert_eq!(global_shortcut(&word, &editing, FocusedPane::Editor), Some(GlobalShortcut::EditorRedo));
-        assert_eq!(global_shortcut(&word, &editing, FocusedPane::RepositoryPane), Some(GlobalShortcut::EditorSave));
+        assert!(
+            editing.fault().is_none(),
+            "native word motion remains protected in editable content"
+        );
+        let word = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::ArrowLeft),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowLeft),
+            physical_key: Physical::Code(Code::ArrowLeft),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::ALT,
+            text: None,
+            repeat: false,
+        };
+        assert_eq!(
+            global_shortcut(&word, &editing, FocusedPane::Editor),
+            Some(GlobalShortcut::EditorRedo)
+        );
+        assert_eq!(
+            global_shortcut(&word, &editing, FocusedPane::RepositoryPane),
+            Some(GlobalShortcut::EditorSave)
+        );
         editing.editor_redo.clear();
         assert_eq!(global_shortcut(&word, &editing, FocusedPane::Editor), None);
-        assert_eq!(global_shortcut(&word, &editing, FocusedPane::RepositoryPane), Some(GlobalShortcut::EditorSave));
+        assert_eq!(
+            global_shortcut(&word, &editing, FocusedPane::RepositoryPane),
+            Some(GlobalShortcut::EditorSave)
+        );
     }
 
     #[test]
     fn registered_chat_latest_can_be_cleared_and_remapped_without_claiming_native_submit() {
-        use keyboard::key::{Code, Physical, Named};
-        let end = keyboard::Event::KeyPressed { key: keyboard::Key::Named(Named::End), modified_key: keyboard::Key::Named(Named::End), physical_key: Physical::Code(Code::End), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false };
+        use keyboard::key::{Code, Named, Physical};
+        let end = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(Named::End),
+            modified_key: keyboard::Key::Named(Named::End),
+            physical_key: Physical::Code(Code::End),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        };
         let mut shortcuts = KeyboardShortcuts::default();
         assert!(shortcuts.fault().is_none());
         for focused in [FocusedPane::Chat, FocusedPane::ChatPane] {
-            assert_eq!(global_shortcut(&end, &shortcuts, focused), Some(GlobalShortcut::ChatLatest));
-            assert!(is_global_shortcut_chord(&keyboard::Key::Named(Named::End), Physical::Code(Code::End), keyboard::Modifiers::CTRL, &shortcuts, focused));
+            assert_eq!(
+                global_shortcut(&end, &shortcuts, focused),
+                Some(GlobalShortcut::ChatLatest)
+            );
+            assert!(is_global_shortcut_chord(
+                &keyboard::Key::Named(Named::End),
+                Physical::Code(Code::End),
+                keyboard::Modifiers::CTRL,
+                &shortcuts,
+                focused
+            ));
         }
-        for focused in [FocusedPane::TextInput, FocusedPane::Editor, FocusedPane::Terminal, FocusedPane::SidebarRows] {
+        for focused in [
+            FocusedPane::TextInput,
+            FocusedPane::Editor,
+            FocusedPane::Terminal,
+            FocusedPane::SidebarRows,
+        ] {
             assert_eq!(global_shortcut(&end, &shortcuts, focused), None);
-            assert!(!is_global_shortcut_chord(&keyboard::Key::Named(Named::End), Physical::Code(Code::End), keyboard::Modifiers::CTRL, &shortcuts, focused));
+            assert!(!is_global_shortcut_chord(
+                &keyboard::Key::Named(Named::End),
+                Physical::Code(Code::End),
+                keyboard::Modifiers::CTRL,
+                &shortcuts,
+                focused
+            ));
         }
-        assert!(crate::settings::text_editing_shortcut_conflict_for("chat_latest", parse_shortcut("Ctrl+End").unwrap()).is_none());
-        assert!(crate::settings::text_editing_shortcut_conflict_for("chat_send", parse_shortcut("Ctrl+End").unwrap()).is_some());
+        assert!(
+            crate::settings::text_editing_shortcut_conflict_for(
+                "chat_latest",
+                parse_shortcut("Ctrl+End").unwrap()
+            )
+            .is_none()
+        );
+        assert!(
+            crate::settings::text_editing_shortcut_conflict_for(
+                "chat_send",
+                parse_shortcut("Ctrl+End").unwrap()
+            )
+            .is_some()
+        );
         shortcuts.chat_latest.clear();
         assert_eq!(global_shortcut(&end, &shortcuts, FocusedPane::Chat), None);
         shortcuts.chat_latest = vec!["Alt+F9".into()];
-        let remapped = keyboard::Event::KeyPressed { key: keyboard::Key::Named(Named::F9), modified_key: keyboard::Key::Named(Named::F9), physical_key: Physical::Code(Code::F9), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::ALT, text: None, repeat: false };
+        let remapped = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(Named::F9),
+            modified_key: keyboard::Key::Named(Named::F9),
+            physical_key: Physical::Code(Code::F9),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::ALT,
+            text: None,
+            repeat: false,
+        };
         assert!(shortcuts.fault().is_none());
-        assert_eq!(global_shortcut(&remapped, &shortcuts, FocusedPane::Chat), Some(GlobalShortcut::ChatLatest));
+        assert_eq!(
+            global_shortcut(&remapped, &shortcuts, FocusedPane::Chat),
+            Some(GlobalShortcut::ChatLatest)
+        );
         assert_eq!(global_shortcut(&end, &shortcuts, FocusedPane::Chat), None);
-        for command in [GlobalShortcut::ChatSend, GlobalShortcut::ChatSteer, GlobalShortcut::ChatQueue, GlobalShortcut::ChatInterrupt] {
-            assert!(shortcut_keys(command, &KeyboardShortcuts::default()).is_empty(), "explicit aliases are distinct from native composer confirmation/cancel policy");
+        for command in [
+            GlobalShortcut::ChatSend,
+            GlobalShortcut::ChatSteer,
+            GlobalShortcut::ChatQueue,
+            GlobalShortcut::ChatInterrupt,
+        ] {
+            assert!(
+                shortcut_keys(command, &KeyboardShortcuts::default()).is_empty(),
+                "explicit aliases are distinct from native composer confirmation/cancel policy"
+            );
         }
     }
 
     #[test]
     fn registered_browser_navigation_retires_old_aliases_and_preserves_native_fields() {
         use keyboard::key::{Code, Physical};
-        let event = |named, code, modifiers| keyboard::Event::KeyPressed { key: keyboard::Key::Named(named), modified_key: keyboard::Key::Named(named), physical_key: Physical::Code(code), location: keyboard::Location::Standard, modifiers, text: None, repeat: false };
+        let event = |named, code, modifiers| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(named),
+            modified_key: keyboard::Key::Named(named),
+            physical_key: Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
         let mut shortcuts = KeyboardShortcuts::default();
-        let back = event(keyboard::key::Named::ArrowLeft, Code::ArrowLeft, keyboard::Modifiers::ALT);
-        let forward = event(keyboard::key::Named::ArrowRight, Code::ArrowRight, keyboard::Modifiers::ALT);
-        for (press, command) in [(&back, GlobalShortcut::BrowserBack), (&forward, GlobalShortcut::BrowserForward)] {
-            assert_eq!(global_shortcut(press, &shortcuts, FocusedPane::Browser), Some(command));
-            let keyboard::Event::KeyPressed { key, physical_key, modifiers, .. } = press else { unreachable!() };
-            assert!(is_global_shortcut_chord(key, *physical_key, *modifiers, &shortcuts, FocusedPane::Browser));
-            for focus in [FocusedPane::TextInput, FocusedPane::Editor, FocusedPane::Chat, FocusedPane::Terminal, FocusedPane::SidebarFiles] {
-                assert_eq!(global_shortcut(press, &shortcuts, focus), None, "{focus:?} retains its native motion");
+        let back = event(
+            keyboard::key::Named::ArrowLeft,
+            Code::ArrowLeft,
+            keyboard::Modifiers::ALT,
+        );
+        let forward = event(
+            keyboard::key::Named::ArrowRight,
+            Code::ArrowRight,
+            keyboard::Modifiers::ALT,
+        );
+        for (press, command) in [
+            (&back, GlobalShortcut::BrowserBack),
+            (&forward, GlobalShortcut::BrowserForward),
+        ] {
+            assert_eq!(
+                global_shortcut(press, &shortcuts, FocusedPane::Browser),
+                Some(command)
+            );
+            let keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            } = press
+            else {
+                unreachable!()
+            };
+            assert!(is_global_shortcut_chord(
+                key,
+                *physical_key,
+                *modifiers,
+                &shortcuts,
+                FocusedPane::Browser
+            ));
+            for focus in [
+                FocusedPane::TextInput,
+                FocusedPane::Editor,
+                FocusedPane::Chat,
+                FocusedPane::Terminal,
+                FocusedPane::SidebarFiles,
+            ] {
+                assert_eq!(
+                    global_shortcut(press, &shortcuts, focus),
+                    None,
+                    "{focus:?} retains its native motion"
+                );
             }
         }
-        for (press, command) in [(key_press("l", Code::KeyL, keyboard::Modifiers::CTRL, false), GlobalShortcut::BrowserAddress), (key_press("r", Code::KeyR, keyboard::Modifiers::CTRL, false), GlobalShortcut::BrowserReload), (event(keyboard::key::Named::F5, Code::F5, keyboard::Modifiers::empty()), GlobalShortcut::BrowserReload)] {
-            assert_eq!(global_shortcut(&press, &shortcuts, FocusedPane::Browser), Some(command));
-            assert_eq!(global_shortcut(&press, &shortcuts, FocusedPane::TextInput), None);
+        for (press, command) in [
+            (
+                key_press("l", Code::KeyL, keyboard::Modifiers::CTRL, false),
+                GlobalShortcut::BrowserAddress,
+            ),
+            (
+                key_press("r", Code::KeyR, keyboard::Modifiers::CTRL, false),
+                GlobalShortcut::BrowserReload,
+            ),
+            (
+                event(
+                    keyboard::key::Named::F5,
+                    Code::F5,
+                    keyboard::Modifiers::empty(),
+                ),
+                GlobalShortcut::BrowserReload,
+            ),
+        ] {
+            assert_eq!(
+                global_shortcut(&press, &shortcuts, FocusedPane::Browser),
+                Some(command)
+            );
+            assert_eq!(
+                global_shortcut(&press, &shortcuts, FocusedPane::TextInput),
+                None
+            );
         }
         shortcuts.browser_back.clear();
         shortcuts.browser_reload.clear();
-        assert_eq!(global_shortcut(&back, &shortcuts, FocusedPane::Browser), None);
-        assert_eq!(global_shortcut(&event(keyboard::key::Named::F5, Code::F5, keyboard::Modifiers::empty()), &shortcuts, FocusedPane::Browser), None);
+        assert_eq!(
+            global_shortcut(&back, &shortcuts, FocusedPane::Browser),
+            None
+        );
+        assert_eq!(
+            global_shortcut(
+                &event(
+                    keyboard::key::Named::F5,
+                    Code::F5,
+                    keyboard::Modifiers::empty()
+                ),
+                &shortcuts,
+                FocusedPane::Browser
+            ),
+            None
+        );
         shortcuts.browser_back = vec!["Alt+F9".into()];
         assert!(shortcuts.fault().is_none());
-        assert_eq!(global_shortcut(&event(keyboard::key::Named::F9, Code::F9, keyboard::Modifiers::ALT), &shortcuts, FocusedPane::Browser), Some(GlobalShortcut::BrowserBack));
+        assert_eq!(
+            global_shortcut(
+                &event(keyboard::key::Named::F9, Code::F9, keyboard::Modifiers::ALT),
+                &shortcuts,
+                FocusedPane::Browser
+            ),
+            Some(GlobalShortcut::BrowserBack)
+        );
         shortcuts.browser_back = vec!["Alt+Right".into()];
         shortcuts.browser_forward.clear();
         assert!(shortcuts.fault().is_none());
-        assert_eq!(global_shortcut(&forward, &shortcuts, FocusedPane::Browser), None, "only the conventional action/chord pair owns DOM word navigation");
+        assert_eq!(
+            global_shortcut(&forward, &shortcuts, FocusedPane::Browser),
+            None,
+            "only the conventional action/chord pair owns DOM word navigation"
+        );
         for chord in ["Ctrl+Z", "Ctrl+Shift+Z", "Ctrl+A", "Ctrl+V", "Ctrl+Left"] {
             let binding = parse_shortcut(chord).unwrap();
-            assert!(crate::settings::text_editing_shortcut_conflict_for("browser_reload", binding).is_some());
+            assert!(
+                crate::settings::text_editing_shortcut_conflict_for("browser_reload", binding)
+                    .is_some()
+            );
         }
     }
 

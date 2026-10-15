@@ -86,8 +86,12 @@ fn entry_category(message: &Message) -> char {
 
 fn entry_key(message: &Message) -> String {
     match message {
-        Message::Palette(Action::RunChatUser(request)) => format!("command:{}", request.command.id()),
-        Message::RunCommand(command) | Message::Palette(Action::RunDiffMutation(command, _)) => format!("command:{}", command.id()),
+        Message::Palette(Action::RunChatUser(request)) => {
+            format!("command:{}", request.command.id())
+        }
+        Message::RunCommand(command) | Message::Palette(Action::RunDiffMutation(command, _)) => {
+            format!("command:{}", command.id())
+        }
         Message::Palette(Action::RunGitStash(_, command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::MovePaneToChannel(_, _)) => {
             format!("command:{}", Command::MovePaneToChannel.id())
@@ -112,12 +116,32 @@ fn entry_key(message: &Message) -> String {
 /// Compare captured intent without formatting IDs or cloning target snapshots.
 fn same_palette_entry(left: &Message, right: &Message) -> bool {
     match (left, right) {
-        (Message::Palette(Action::RunChatUser(left)), Message::Palette(Action::RunChatUser(right))) => left == right,
+        (
+            Message::Palette(Action::RunChatUser(left)),
+            Message::Palette(Action::RunChatUser(right)),
+        ) => left == right,
         (Message::RunCommand(left), Message::RunCommand(right)) => left == right,
-        (Message::Palette(Action::RunDiffMutation(lc, la)), Message::Palette(Action::RunDiffMutation(rc, ra))) => lc == rc && match (la.as_ref(), ra.as_ref()) {
-            (RepositoryAction::ApplyDiffHunk { card: left, kind: lk, request: lr }, RepositoryAction::ApplyDiffHunk { card: right, kind: rk, request: rr }) => left == right && lk == rk && lr == rr,
-            _ => false,
-        },
+        (
+            Message::Palette(Action::RunDiffMutation(lc, la)),
+            Message::Palette(Action::RunDiffMutation(rc, ra)),
+        ) => {
+            lc == rc
+                && match (la.as_ref(), ra.as_ref()) {
+                    (
+                        RepositoryAction::ApplyDiffHunk {
+                            card: left,
+                            kind: lk,
+                            request: lr,
+                        },
+                        RepositoryAction::ApplyDiffHunk {
+                            card: right,
+                            kind: rk,
+                            request: rr,
+                        },
+                    ) => left == right && lk == rk && lr == rr,
+                    _ => false,
+                }
+        }
         (
             Message::Palette(Action::RunGitStash(lt, lc, le)),
             Message::Palette(Action::RunGitStash(rt, rc, re)),
@@ -319,7 +343,13 @@ fn settings_command_category(command: Command) -> Option<SettingsCategory> {
 /// Embedded controls use the live runtime's loading state and the durable
 /// history cursor. Saved descriptors without that runtime never call this.
 #[cfg(any(test, feature = "integrated-browser"))]
-fn browser_embedded_command_available(command: Command, history_index: usize, history_len: usize, loading: bool, import_busy: bool) -> bool {
+fn browser_embedded_command_available(
+    command: Command,
+    history_index: usize,
+    history_len: usize,
+    loading: bool,
+    import_busy: bool,
+) -> bool {
     match command {
         Command::BrowserBack => history_index > 0,
         Command::BrowserForward => history_index.saturating_add(1) < history_len,
@@ -463,24 +493,50 @@ impl Cagents {
                     .chain(self.reveal_palette_selection())
             }
             Action::RunChatUser(request) => {
-                if self.workspace_inputs_blocked() || self.registered_chat_request(request.target.card, request.command).as_ref() != Some(&request) {
-                    self.status = Some(TransientNotice::warning("The conversation action changed; choose it again"));
+                if self.workspace_inputs_blocked()
+                    || self
+                        .registered_chat_request(request.target.card, request.command)
+                        .as_ref()
+                        != Some(&request)
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "The conversation action changed; choose it again",
+                    ));
                     return Task::none();
                 }
-                request.action().map_or_else(Task::none, |action| self.update(Message::ChatUi(action)))
+                request
+                    .action()
+                    .map_or_else(Task::none, |action| self.update(Message::ChatUi(action)))
             }
             Action::RunDiffMutation(command, action) => {
                 let current = match action.as_ref() {
-                    RepositoryAction::ApplyDiffHunk { card, kind, request } if self.diff_mutation_source(*card).is_some() => {
+                    RepositoryAction::ApplyDiffHunk {
+                        card,
+                        kind,
+                        request,
+                    } if self.diff_mutation_source(*card).is_some() => {
                         match self.registered_diff_mutation_action(*card, command) {
-                            Some(RepositoryAction::ApplyDiffHunk { card: current_card, kind: current_kind, request: current_request }) => current_card == *card && current_kind == *kind && current_request == *request,
+                            Some(RepositoryAction::ApplyDiffHunk {
+                                card: current_card,
+                                kind: current_kind,
+                                request: current_request,
+                            }) => {
+                                current_card == *card
+                                    && current_kind == *kind
+                                    && current_request == *request
+                            }
                             _ => false,
                         }
                     }
                     _ => false,
                 };
-                if !current || self.focused_repository_is_saving() || self.workspace_inputs_blocked() {
-                    self.status = Some(TransientNotice::warning("The selected diff changed; select its rows again"));
+                if !current
+                    || self.focused_repository_is_saving()
+                    || self.workspace_inputs_blocked()
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "The selected diff changed; select its rows again",
+                    ));
                     return Task::none();
                 }
                 // Keep the captured source, row coordinates and layout revision.
@@ -866,7 +922,10 @@ impl Cagents {
             } else {
                 match message {
                     Message::FocusAttention(_) => "Needs attention",
-                    Message::RunCommand(_) | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_)) => "Commands",
+                    Message::RunCommand(_)
+                    | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_)) => {
+                        "Commands"
+                    }
                     Message::Palette(Action::FocusPane(_)) => "Panes",
                     _ => "Workspaces",
                 }
@@ -1046,33 +1105,48 @@ impl Cagents {
                 .collect();
         }
         let (category, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
-        let mut entries: Vec<_> =
-            if !self.palette.panes_only && category.is_none_or(|category| category == '>') {
-                let context = self.command_context(self.workspace.focused());
-                workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
-                    .iter()
-                    .filter(|descriptor| descriptor.action != Command::CommandPalette)
-                    .filter(|descriptor| descriptor.available(&context))
-                    .filter_map(|descriptor| {
-                        let message = if workspace_widget::chat_user_command_bit(descriptor.action).is_some() {
-                            Message::Palette(Action::RunChatUser(self.workspace.focused().and_then(|card| self.registered_chat_request(card, descriptor.action))?))
-                        } else if workspace_widget::diff_selection_command_kind(descriptor.action).is_some() || workspace_widget::diff_hunk_command_kind(descriptor.action).is_some() {
-                            let action = self.workspace.focused().and_then(|card| self.registered_diff_mutation_action(card, descriptor.action))?;
-                            Message::Palette(Action::RunDiffMutation(descriptor.action, Box::new(action)))
-                        } else { Message::RunCommand(descriptor.action) };
-                        Some((
-                            descriptor.label.to_owned(),
-                            workspace_widget::shortcut_chords(
-                                descriptor.action,
-                                &self.settings.keyboard_shortcuts,
-                            ),
-                            message,
+        let mut entries: Vec<_> = if !self.palette.panes_only
+            && category.is_none_or(|category| category == '>')
+        {
+            let context = self.command_context(self.workspace.focused());
+            workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
+                .iter()
+                .filter(|descriptor| descriptor.action != Command::CommandPalette)
+                .filter(|descriptor| descriptor.available(&context))
+                .filter_map(|descriptor| {
+                    let message = if workspace_widget::chat_user_command_bit(descriptor.action)
+                        .is_some()
+                    {
+                        Message::Palette(Action::RunChatUser(self.workspace.focused().and_then(
+                            |card| self.registered_chat_request(card, descriptor.action),
+                        )?))
+                    } else if workspace_widget::diff_selection_command_kind(descriptor.action)
+                        .is_some()
+                        || workspace_widget::diff_hunk_command_kind(descriptor.action).is_some()
+                    {
+                        let action = self.workspace.focused().and_then(|card| {
+                            self.registered_diff_mutation_action(card, descriptor.action)
+                        })?;
+                        Message::Palette(Action::RunDiffMutation(
+                            descriptor.action,
+                            Box::new(action),
                         ))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+                    } else {
+                        Message::RunCommand(descriptor.action)
+                    };
+                    Some((
+                        descriptor.label.to_owned(),
+                        workspace_widget::shortcut_chords(
+                            descriptor.action,
+                            &self.settings.keyboard_shortcuts,
+                        ),
+                        message,
+                    ))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let attention = if !self.palette.panes_only && category.is_none() && query.is_empty() {
             self.sidebar_state.attention_cards()
         } else {
@@ -1184,7 +1258,10 @@ impl Cagents {
                         } else {
                             match message {
                                 Message::FocusAttention(_) => 1,
-                                Message::RunCommand(_) | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_)) => 2,
+                                Message::RunCommand(_)
+                                | Message::Palette(
+                                    Action::RunDiffMutation(_, _) | Action::RunChatUser(_),
+                                ) => 2,
                                 Message::Palette(Action::FocusPane(_)) => 3,
                                 _ => 4,
                             }
@@ -1791,103 +1868,205 @@ impl Cagents {
     }
 
     fn diff_mutation_source(&self, card: CardId) -> Option<&sidebar::SourceControlModel> {
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return None; };
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
         self.sidebar_model.source_control.as_ref().filter(|source| {
             source.key.canonical_path == runtime.descriptor.worktree
                 && self.sidebar_state.active_worktree() == Some(&source.key)
                 && self.sidebar_model.contains_worktree(&source.key)
                 && matches!(source.data_state, sidebar::SidebarDataState::Ready)
-                && !source.reloading && !source.busy()
+                && !source.reloading
+                && !source.busy()
         })
     }
 
     fn diff_selection_command_capabilities(&self, card: CardId) -> u8 {
-        if self.diff_mutation_source(card).is_none() { return 0; }
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return 0; };
-        workspace_widget::DIFF_SELECTION_COMMANDS.into_iter().filter_map(|command| {
-            let kind = workspace_widget::diff_selection_command_kind(command)?;
-            runtime.can_apply_diff_selection(kind).then(|| workspace_widget::diff_selection_command_bit(command)).flatten()
-        }).fold(0, |mask, bit| mask | bit)
+        if self.diff_mutation_source(card).is_none() {
+            return 0;
+        }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return 0;
+        };
+        workspace_widget::DIFF_SELECTION_COMMANDS
+            .into_iter()
+            .filter_map(|command| {
+                let kind = workspace_widget::diff_selection_command_kind(command)?;
+                runtime
+                    .can_apply_diff_selection(kind)
+                    .then(|| workspace_widget::diff_selection_command_bit(command))
+                    .flatten()
+            })
+            .fold(0, |mask, bit| mask | bit)
     }
 
-    pub(super) fn registered_browser_action(&self, card: CardId, command: Command) -> Option<Message> {
-        let state = self.card_state(card).filter(|state| state.existence.is_open())?;
-        let CardKind::Browser(session) = &state.kind else { return None; };
+    pub(super) fn registered_browser_action(
+        &self,
+        card: CardId,
+        command: Command,
+    ) -> Option<Message> {
+        let state = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())?;
+        let CardKind::Browser(session) = &state.kind else {
+            return None;
+        };
         if command == Command::BrowserOpenSystem {
-            return self.browser_system_request(card).map(|_| Message::OpenBrowserInSystem(card));
+            return self
+                .browser_system_request(card)
+                .map(|_| Message::OpenBrowserInSystem(card));
         }
         #[cfg(feature = "integrated-browser")]
         {
-            let Some(CardRuntime::Browser(runtime)) = self.cards.get(&card) else { return None; };
-            let loading = runtime.lifecycle == BrowserLifecycle::Restoring || runtime.load_state.is_some();
-            if !browser_embedded_command_available(command, session.history_index, session.history.len(), loading, self.browser_import.busy()) { return None; }
+            let Some(CardRuntime::Browser(runtime)) = self.cards.get(&card) else {
+                return None;
+            };
+            let loading =
+                runtime.lifecycle == BrowserLifecycle::Restoring || runtime.load_state.is_some();
+            if !browser_embedded_command_available(
+                command,
+                session.history_index,
+                session.history.len(),
+                loading,
+                self.browser_import.busy(),
+            ) {
+                return None;
+            }
             match command {
                 Command::BrowserBack => Some(Message::BrowserBack(card)),
                 Command::BrowserForward => Some(Message::BrowserForward(card)),
                 Command::BrowserReload => Some(Message::BrowserReload(card)),
                 Command::BrowserStop => Some(Message::BrowserStop(card)),
                 Command::BrowserAddress => Some(Message::FocusBrowserAddress(card)),
-                Command::BrowserImportLogins => Some(Message::BrowserImport(browser_import_ui::Action::Open)),
+                Command::BrowserImportLogins => {
+                    Some(Message::BrowserImport(browser_import_ui::Action::Open))
+                }
                 _ => None,
             }
-
         }
         #[cfg(not(feature = "integrated-browser"))]
-        { let _ = session; None }
+        {
+            let _ = session;
+            None
+        }
     }
 
     fn browser_command_capabilities(&self, card: CardId) -> u8 {
-        workspace_widget::BROWSER_COMMANDS.into_iter().filter_map(|command| self.registered_browser_action(card, command).and_then(|_| workspace_widget::browser_command_bit(command))).fold(0, |mask, bit| mask | bit)
+        workspace_widget::BROWSER_COMMANDS
+            .into_iter()
+            .filter_map(|command| {
+                self.registered_browser_action(card, command)
+                    .and_then(|_| workspace_widget::browser_command_bit(command))
+            })
+            .fold(0, |mask, bit| mask | bit)
     }
 
-    fn registered_diff_mutation_action(&self, card: CardId, command: Command) -> Option<RepositoryAction> {
+    fn registered_diff_mutation_action(
+        &self,
+        card: CardId,
+        command: Command,
+    ) -> Option<RepositoryAction> {
         self.diff_mutation_source(card)?;
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return None; };
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
         if let Some(kind) = workspace_widget::diff_selection_command_kind(command) {
             runtime.diff_selection_mutation_action(card, kind)
         } else {
-            runtime.diff_hunk_mutation_action(card, workspace_widget::diff_hunk_command_kind(command)?)
+            runtime
+                .diff_hunk_mutation_action(card, workspace_widget::diff_hunk_command_kind(command)?)
         }
     }
 
     fn diff_hunk_command_capabilities(&self, card: CardId) -> u8 {
-        if self.diff_mutation_source(card).is_none() { return 0; }
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return 0; };
-        workspace_widget::DIFF_HUNK_COMMANDS.into_iter().filter_map(|command| {
-            let kind = workspace_widget::diff_hunk_command_kind(command)?;
-            runtime.can_apply_diff_hunk(kind).then(|| workspace_widget::diff_hunk_command_bit(command)).flatten()
-        }).fold(0, |mask, bit| mask | bit)
+        if self.diff_mutation_source(card).is_none() {
+            return 0;
+        }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return 0;
+        };
+        workspace_widget::DIFF_HUNK_COMMANDS
+            .into_iter()
+            .filter_map(|command| {
+                let kind = workspace_widget::diff_hunk_command_kind(command)?;
+                runtime
+                    .can_apply_diff_hunk(kind)
+                    .then(|| workspace_widget::diff_hunk_command_bit(command))
+                    .flatten()
+            })
+            .fold(0, |mask, bit| mask | bit)
     }
 
     fn diff_presentation_command_capabilities(&self, card: CardId) -> u16 {
         let runtime = match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) => runtime.as_ref(), Some(CardRuntime::PullRequests(pane)) => &pane.runtime, _ => return 0,
+            Some(CardRuntime::Repository(runtime)) => runtime.as_ref(),
+            Some(CardRuntime::PullRequests(pane)) => &pane.runtime,
+            _ => return 0,
         };
-        workspace_widget::DIFF_PRESENTATION_COMMANDS.into_iter().filter_map(|command| {
-            let action = runtime.diff_presentation_action(card, workspace_widget::diff_presentation_command(command)?)?;
-            if matches!(action, RepositoryAction::StageSelected { .. } | RepositoryAction::RevertFile { .. }) && self.diff_mutation_source(card).is_none() { return None; }
-            workspace_widget::diff_presentation_command_bit(command)
-        }).fold(0, |mask, bit| mask | bit)
+        workspace_widget::DIFF_PRESENTATION_COMMANDS
+            .into_iter()
+            .filter_map(|command| {
+                let action = runtime.diff_presentation_action(
+                    card,
+                    workspace_widget::diff_presentation_command(command)?,
+                )?;
+                if matches!(
+                    action,
+                    RepositoryAction::StageSelected { .. } | RepositoryAction::RevertFile { .. }
+                ) && self.diff_mutation_source(card).is_none()
+                {
+                    return None;
+                }
+                workspace_widget::diff_presentation_command_bit(command)
+            })
+            .fold(0, |mask, bit| mask | bit)
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
         if workspace_widget::chat_user_command_bit(command).is_some() {
-            return self.workspace.focused().and_then(|card| self.registered_chat_request(card, command)).and_then(|request| request.action()).map_or_else(Task::none, |action| self.update(Message::ChatUi(action)));
+            return self
+                .workspace
+                .focused()
+                .and_then(|card| self.registered_chat_request(card, command))
+                .and_then(|request| request.action())
+                .map_or_else(Task::none, |action| self.update(Message::ChatUi(action)));
         }
 
         if workspace_widget::browser_command_bit(command).is_some() {
-            return self.workspace.focused().and_then(|card| self.registered_browser_action(card, command)).map_or_else(Task::none, |message| self.update(message));
+            return self
+                .workspace
+                .focused()
+                .and_then(|card| self.registered_browser_action(card, command))
+                .map_or_else(Task::none, |message| self.update(message));
         }
 
         if let Some(kind) = workspace_widget::diff_presentation_command(command) {
-            let action = self.workspace.focused().and_then(|card| match self.cards.get(&card) {
-                Some(CardRuntime::Repository(runtime)) => runtime.diff_presentation_action(card, kind), Some(CardRuntime::PullRequests(pane)) => pane.runtime.diff_presentation_action(card, kind), _ => None,
+            let action = self
+                .workspace
+                .focused()
+                .and_then(|card| match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        runtime.diff_presentation_action(card, kind)
+                    }
+                    Some(CardRuntime::PullRequests(pane)) => {
+                        pane.runtime.diff_presentation_action(card, kind)
+                    }
+                    _ => None,
+                });
+            return action.map_or_else(Task::none, |action| {
+                self.update(Message::Repository(action))
             });
-            return action.map_or_else(Task::none, |action| self.update(Message::Repository(action)));
         }
-        if workspace_widget::diff_selection_command_kind(command).is_some() || workspace_widget::diff_hunk_command_kind(command).is_some() {
-            let action = self.workspace.focused().and_then(|card| self.registered_diff_mutation_action(card, command));
-            return action.map_or_else(Task::none, |action| self.update(Message::Repository(action)));
+        if workspace_widget::diff_selection_command_kind(command).is_some()
+            || workspace_widget::diff_hunk_command_kind(command).is_some()
+        {
+            let action = self
+                .workspace
+                .focused()
+                .and_then(|card| self.registered_diff_mutation_action(card, command));
+            return action.map_or_else(Task::none, |action| {
+                self.update(Message::Repository(action))
+            });
         }
 
         if workspace_widget::editor_surface_command_bit(command).is_some() {
@@ -2285,8 +2464,7 @@ impl Cagents {
             | Command::ChatTakeBackQueued
             | Command::ChatCancelQueued
             | Command::ChatToggleSteering
-            | Command::ChatToggleFastMode
-            => self.run_registered_command(command),
+            | Command::ChatToggleFastMode => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -2850,19 +3028,34 @@ impl ShortcutDraft {
             (Command::PdfToggleColors, self.pdf_toggle_colors.as_str()),
             (Command::DiffUnified, self.diff_unified.as_str()),
             (Command::DiffSplit, self.diff_split.as_str()),
-            (Command::DiffIgnoreWhitespace, self.diff_ignore_whitespace.as_str()),
+            (
+                Command::DiffIgnoreWhitespace,
+                self.diff_ignore_whitespace.as_str(),
+            ),
             (Command::DiffWorking, self.diff_working.as_str()),
             (Command::DiffStaged, self.diff_staged.as_str()),
             (Command::DiffBranch, self.diff_branch.as_str()),
             (Command::DiffHistory, self.diff_history.as_str()),
             (Command::StageFile, self.stage_file.as_str()),
             (Command::UnstageFile, self.unstage_file.as_str()),
-            (Command::StageOrUnstageFile, self.stage_or_unstage_file.as_str()),
+            (
+                Command::StageOrUnstageFile,
+                self.stage_or_unstage_file.as_str(),
+            ),
             (Command::DiffRevert, self.diff_revert.as_str()),
             (Command::DiffRetry, self.diff_retry.as_str()),
-            (Command::DiffStageSelection, self.diff_stage_selection.as_str()),
-            (Command::DiffUnstageSelection, self.diff_unstage_selection.as_str()),
-            (Command::DiffRevertSelection, self.diff_revert_selection.as_str()),
+            (
+                Command::DiffStageSelection,
+                self.diff_stage_selection.as_str(),
+            ),
+            (
+                Command::DiffUnstageSelection,
+                self.diff_unstage_selection.as_str(),
+            ),
+            (
+                Command::DiffRevertSelection,
+                self.diff_revert_selection.as_str(),
+            ),
             (Command::DiffStageHunk, self.diff_stage_hunk.as_str()),
             (Command::DiffUnstageHunk, self.diff_unstage_hunk.as_str()),
             (Command::DiffRevertHunk, self.diff_revert_hunk.as_str()),
@@ -2871,8 +3064,14 @@ impl ShortcutDraft {
             (Command::BrowserReload, self.browser_reload.as_str()),
             (Command::BrowserStop, self.browser_stop.as_str()),
             (Command::BrowserAddress, self.browser_address.as_str()),
-            (Command::BrowserOpenSystem, self.browser_open_system.as_str()),
-            (Command::BrowserImportLogins, self.browser_import_logins.as_str()),
+            (
+                Command::BrowserOpenSystem,
+                self.browser_open_system.as_str(),
+            ),
+            (
+                Command::BrowserImportLogins,
+                self.browser_import_logins.as_str(),
+            ),
             (Command::ChatSend, self.chat_send.as_str()),
             (Command::ChatSteer, self.chat_steer.as_str()),
             (Command::ChatQueue, self.chat_queue.as_str()),
@@ -2881,10 +3080,19 @@ impl ShortcutDraft {
             (Command::ChatAttach, self.chat_attach.as_str()),
             (Command::ChatReasoning, self.chat_reasoning.as_str()),
             (Command::ChatLatest, self.chat_latest.as_str()),
-            (Command::ChatTakeBackQueued, self.chat_take_back_queued.as_str()),
+            (
+                Command::ChatTakeBackQueued,
+                self.chat_take_back_queued.as_str(),
+            ),
             (Command::ChatCancelQueued, self.chat_cancel_queued.as_str()),
-            (Command::ChatToggleSteering, self.chat_toggle_steering.as_str()),
-            (Command::ChatToggleFastMode, self.chat_toggle_fast_mode.as_str()),
+            (
+                Command::ChatToggleSteering,
+                self.chat_toggle_steering.as_str(),
+            ),
+            (
+                Command::ChatToggleFastMode,
+                self.chat_toggle_fast_mode.as_str(),
+            ),
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
             (Command::ClonePane, self.clone_pane.as_str()),
@@ -3891,7 +4099,8 @@ mod tests {
         runtime.descriptor.project = key.project_id;
         runtime.descriptor.worktree = key.canonical_path.clone();
         app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
         (app, card, key)
     }
 
@@ -3903,41 +4112,117 @@ mod tests {
         drop(app.update_palette(Action::Open));
         drop(app.update_palette(Action::Query(">stage selected diff rows".into())));
         let entries = app.palette_entries();
-        let Message::Palette(Action::RunDiffMutation(command, action)) = entries[0].2.clone() else { panic!("selection must carry its captured request"); };
+        let Message::Palette(Action::RunDiffMutation(command, action)) = entries[0].2.clone()
+        else {
+            panic!("selection must carry its captured request");
+        };
         assert_eq!(command, Command::DiffStageSelection);
-        let RepositoryAction::ApplyDiffHunk { request, kind, .. } = action.as_ref() else { panic!("source-bound mutation"); };
+        let RepositoryAction::ApplyDiffHunk { request, kind, .. } = action.as_ref() else {
+            panic!("source-bound mutation");
+        };
         let rows = request.rows.clone();
         assert_eq!(*kind, crate::git_patch::Kind::Stage);
-        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.capture_diff_mutation(card, *kind, Some(request)).is_some()));
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else { unreachable!() };
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.capture_diff_mutation(card, *kind, Some(request)).is_some())
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
         drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
-        assert_eq!(request.rows, rows, "a later layout cannot rewrite the captured row range");
-        assert!(app.palette_selection_index(&app.palette_entries()).is_none(), "new coordinates cannot replace the selected action");
+        assert_eq!(
+            request.rows, rows,
+            "a later layout cannot rewrite the captured row range"
+        );
+        assert!(
+            app.palette_selection_index(&app.palette_entries())
+                .is_none(),
+            "new coordinates cannot replace the selected action"
+        );
         drop(app.update_palette(Action::Submit));
         assert!(app.palette.is_open());
         assert!(app.source_control_mutations.is_empty());
         drop(app.update_palette(Action::Close));
         drop(app.update_palette(Action::RunDiffMutation(command, action)));
-        assert!(app.notices.recent().any(|entry| entry.notice.message.contains("selected diff changed")) || app.status.as_ref().is_some_and(|notice| notice.message.contains("selected diff changed")));
+        assert!(
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.message.contains("selected diff changed"))
+                || app
+                    .status
+                    .as_ref()
+                    .is_some_and(|notice| notice.message.contains("selected diff changed"))
+        );
         let (mut app, _, _) = diff_command_fixture();
         app.sidebar_model.source_control.as_mut().unwrap().reloading = true;
         assert!(!app.command_available(Command::DiffStageSelection));
         app.sidebar_model.source_control = None;
-        for command in [Command::DiffStageSelection, Command::DiffUnstageSelection, Command::DiffRevertSelection, Command::StageFile, Command::UnstageFile, Command::StageOrUnstageFile] { assert!(!app.command_available(command), "{command:?} needs the actual current worktree source"); }
-        assert!(app.command_available(Command::DiffSplit), "presentation remains usable without mutation authority");
+        for command in [
+            Command::DiffStageSelection,
+            Command::DiffUnstageSelection,
+            Command::DiffRevertSelection,
+            Command::StageFile,
+            Command::UnstageFile,
+            Command::StageOrUnstageFile,
+        ] {
+            assert!(
+                !app.command_available(command),
+                "{command:?} needs the actual current worktree source"
+            );
+        }
+        assert!(
+            app.command_available(Command::DiffSplit),
+            "presentation remains usable without mutation authority"
+        );
     }
 
     #[test]
     fn embedded_browser_command_boundaries_follow_actual_history_and_loading() {
-        for (index, count, back, forward) in [(0, 0, false, false), (0, 1, false, false), (0, 3, false, true), (1, 3, true, true), (2, 3, true, false), (usize::MAX, usize::MAX, true, false)] {
-            assert_eq!(browser_embedded_command_available(Command::BrowserBack, index, count, false, false), back);
-            assert_eq!(browser_embedded_command_available(Command::BrowserForward, index, count, false, false), forward);
+        for (index, count, back, forward) in [
+            (0, 0, false, false),
+            (0, 1, false, false),
+            (0, 3, false, true),
+            (1, 3, true, true),
+            (2, 3, true, false),
+            (usize::MAX, usize::MAX, true, false),
+        ] {
+            assert_eq!(
+                browser_embedded_command_available(
+                    Command::BrowserBack,
+                    index,
+                    count,
+                    false,
+                    false
+                ),
+                back
+            );
+            assert_eq!(
+                browser_embedded_command_available(
+                    Command::BrowserForward,
+                    index,
+                    count,
+                    false,
+                    false
+                ),
+                forward
+            );
         }
         for loading in [false, true] {
-            assert_eq!(browser_embedded_command_available(Command::BrowserStop, 0, 1, loading, false), loading);
-            assert!(browser_embedded_command_available(Command::BrowserReload, 0, 1, loading, false), "an explicit reload remains available while loading");
+            assert_eq!(
+                browser_embedded_command_available(Command::BrowserStop, 0, 1, loading, false),
+                loading
+            );
+            assert!(
+                browser_embedded_command_available(Command::BrowserReload, 0, 1, loading, false),
+                "an explicit reload remains available while loading"
+            );
         }
-        assert!(!browser_embedded_command_available(Command::BrowserImportLogins, 0, 1, false, true));
+        assert!(!browser_embedded_command_available(
+            Command::BrowserImportLogins,
+            0,
+            1,
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -3946,19 +4231,36 @@ mod tests {
         let card = app.workspace.focused().unwrap();
         let url = Url::parse("https://example.test/saved").unwrap();
         let session = crate::model::BrowserSession {
-            id: crate::model::BrowserId::new(), current_url: url.clone(), history: vec![url], history_index: 0,
-            scroll_x: 12.0, scroll_y: 34.0, fidelity: crate::model::BrowserRestoreFidelity::HistoryAndScroll,
+            id: crate::model::BrowserId::new(),
+            current_url: url.clone(),
+            history: vec![url],
+            history_index: 0,
+            scroll_x: 12.0,
+            scroll_y: 34.0,
+            fidelity: crate::model::BrowserRestoreFidelity::HistoryAndScroll,
         };
         app.card_state_mut(card).unwrap().kind = CardKind::Browser(session.clone());
         app.cards.remove(&card);
         assert!(app.command_available(Command::BrowserOpenSystem));
-        assert!(matches!(app.registered_browser_action(card, Command::BrowserOpenSystem), Some(Message::OpenBrowserInSystem(target)) if target == card));
-        for command in [Command::BrowserBack, Command::BrowserForward, Command::BrowserReload, Command::BrowserStop, Command::BrowserAddress, Command::BrowserImportLogins] {
+        assert!(
+            matches!(app.registered_browser_action(card, Command::BrowserOpenSystem), Some(Message::OpenBrowserInSystem(target)) if target == card)
+        );
+        for command in [
+            Command::BrowserBack,
+            Command::BrowserForward,
+            Command::BrowserReload,
+            Command::BrowserStop,
+            Command::BrowserAddress,
+            Command::BrowserImportLogins,
+        ] {
             assert!(!app.command_available(command));
             assert!(app.registered_browser_action(card, command).is_none());
             drop(app.run_workspace_command(command, keyboard::Modifiers::empty()));
         }
-        assert!(matches!(&app.card_state(card).unwrap().kind, CardKind::Browser(saved) if *saved == session), "browserless and loading lanes retain the complete descriptor");
+        assert!(
+            matches!(&app.card_state(card).unwrap().kind, CardKind::Browser(saved) if *saved == session),
+            "browserless and loading lanes retain the complete descriptor"
+        );
     }
 
     #[test]
@@ -3966,7 +4268,9 @@ mod tests {
         let (mut app, card, _) = diff_command_fixture();
         assert!(app.command_available(Command::DiffStageSelection));
         assert!(!app.command_available(Command::DiffStageHunk));
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else { unreachable!() };
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
         drop(runtime.update(RepositoryAction::ClearDiffSelection { card }));
         assert!(!app.command_available(Command::DiffStageSelection));
         assert!(app.command_available(Command::DiffStageHunk));
@@ -3975,55 +4279,144 @@ mod tests {
         drop(app.update_palette(Action::Open));
         drop(app.update_palette(Action::Query(">stage current diff hunk".into())));
         let entries = app.palette_entries();
-        let Message::Palette(Action::RunDiffMutation(command, action)) = entries[0].2.clone() else { panic!("hunk must carry its captured request"); };
+        let Message::Palette(Action::RunDiffMutation(command, action)) = entries[0].2.clone()
+        else {
+            panic!("hunk must carry its captured request");
+        };
         assert_eq!(command, Command::DiffStageHunk);
-        let RepositoryAction::ApplyDiffHunk { request, .. } = action.as_ref() else { panic!("source-bound hunk"); };
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else { unreachable!() };
+        let RepositoryAction::ApplyDiffHunk { request, .. } = action.as_ref() else {
+            panic!("source-bound hunk");
+        };
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
         drop(runtime.update(RepositoryAction::SelectDiffRow {
-            identity: request.identity.clone(), basis: request.basis.clone(), mode: request.mode,
-            revision: request.layout_revision, row: request.rows.start,
-            side: crate::diff_interaction::Side::New, extend: false, context: false, drag: false,
+            identity: request.identity.clone(),
+            basis: request.basis.clone(),
+            mode: request.mode,
+            revision: request.layout_revision,
+            row: request.rows.start,
+            side: crate::diff_interaction::Side::New,
+            extend: false,
+            context: false,
+            drag: false,
         }));
         assert!(!app.command_available(Command::DiffStageHunk));
         assert!(app.command_available(Command::DiffStageSelection));
         drop(app.update_palette(Action::Submit));
-        assert!(app.palette.is_open(), "selection cannot replace a previously shown hunk command");
+        assert!(
+            app.palette.is_open(),
+            "selection cannot replace a previously shown hunk command"
+        );
         assert!(app.source_control_mutations.is_empty());
         drop(app.update_palette(Action::Close));
         drop(app.update_palette(Action::RunDiffMutation(command, action)));
         assert!(app.source_control_mutations.is_empty());
-        assert!(app.notices.recent().any(|entry| entry.notice.message.contains("selected diff changed")) || app.status.as_ref().is_some_and(|notice| notice.message.contains("selected diff changed")));
+        assert!(
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.message.contains("selected diff changed"))
+                || app
+                    .status
+                    .as_ref()
+                    .is_some_and(|notice| notice.message.contains("selected diff changed"))
+        );
     }
 
     #[test]
     fn file_stage_shortcut_rebinding_uses_actual_root_routing_and_never_background_fields() {
         let press = |app: &mut Cagents, card, pane, f9| {
-            let event = if f9 { keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F9), modified_key: keyboard::Key::Named(keyboard::key::Named::F9), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F9), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::ALT, text: None, repeat: false } }
-            else { keyboard::Event::KeyPressed { key: keyboard::Key::Character("s".into()), modified_key: keyboard::Key::Character("S".into()), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, text: None, repeat: false } };
-            drop(app.update(Message::RoutedKeyEvent { event, captured: true, region: crate::input_trace::KeyboardRegion { pane, card: Some(card) }, widget: None }));
+            let event = if f9 {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::F9),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::F9),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F9),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::ALT,
+                    text: None,
+                    repeat: false,
+                }
+            } else {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("s".into()),
+                    modified_key: keyboard::Key::Character("S".into()),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    text: None,
+                    repeat: false,
+                }
+            };
+            drop(app.update(Message::RoutedKeyEvent {
+                event,
+                captured: true,
+                region: crate::input_trace::KeyboardRegion {
+                    pane,
+                    card: Some(card),
+                },
+                widget: None,
+            }));
         };
-        for pane in [workspace_widget::FocusedPane::RepositoryPane, workspace_widget::FocusedPane::Editor, workspace_widget::FocusedPane::WorkingDiff] {
+        for pane in [
+            workspace_widget::FocusedPane::RepositoryPane,
+            workspace_widget::FocusedPane::Editor,
+            workspace_widget::FocusedPane::WorkingDiff,
+        ] {
             let (mut app, card, key) = diff_command_fixture();
-            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else { unreachable!() };
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                unreachable!()
+            };
             drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: false }));
             assert!(app.command_available(Command::StageOrUnstageFile));
             press(&mut app, card, pane, false);
-            assert!(app.source_control_mutations.contains_key(&key.canonical_path), "{pane:?} queues the actual file mutation");
+            assert!(
+                app.source_control_mutations
+                    .contains_key(&key.canonical_path),
+                "{pane:?} queues the actual file mutation"
+            );
         }
-        for pane in [workspace_widget::FocusedPane::TextInput, workspace_widget::FocusedPane::SidebarRows, workspace_widget::FocusedPane::SidebarFiles, workspace_widget::FocusedPane::SidebarChanges, workspace_widget::FocusedPane::Chat, workspace_widget::FocusedPane::Terminal] {
+        for pane in [
+            workspace_widget::FocusedPane::TextInput,
+            workspace_widget::FocusedPane::SidebarRows,
+            workspace_widget::FocusedPane::SidebarFiles,
+            workspace_widget::FocusedPane::SidebarChanges,
+            workspace_widget::FocusedPane::Chat,
+            workspace_widget::FocusedPane::Terminal,
+        ] {
             let (mut app, card, _) = diff_command_fixture();
             press(&mut app, card, pane, false);
-            assert!(app.source_control_mutations.is_empty(), "{pane:?} cannot stage a background file");
+            assert!(
+                app.source_control_mutations.is_empty(),
+                "{pane:?} cannot stage a background file"
+            );
         }
         let (mut app, card, _) = diff_command_fixture();
-        app.settings.keyboard_shortcuts.stage_or_unstage_file.clear();
-        press(&mut app, card, workspace_widget::FocusedPane::WorkingDiff, false);
+        app.settings
+            .keyboard_shortcuts
+            .stage_or_unstage_file
+            .clear();
+        press(
+            &mut app,
+            card,
+            workspace_widget::FocusedPane::WorkingDiff,
+            false,
+        );
         assert!(app.source_control_mutations.is_empty());
         app.settings.keyboard_shortcuts.stage_or_unstage_file = vec!["Alt+F9".into()];
         assert!(app.settings.clone().validate().is_ok());
-        press(&mut app, card, workspace_widget::FocusedPane::WorkingDiff, false);
+        press(
+            &mut app,
+            card,
+            workspace_widget::FocusedPane::WorkingDiff,
+            false,
+        );
         assert!(app.source_control_mutations.is_empty());
-        press(&mut app, card, workspace_widget::FocusedPane::WorkingDiff, true);
+        press(
+            &mut app,
+            card,
+            workspace_widget::FocusedPane::WorkingDiff,
+            true,
+        );
         assert!(!app.source_control_mutations.is_empty());
     }
 

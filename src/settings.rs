@@ -1494,7 +1494,22 @@ pub fn text_editing_shortcut_conflict_for(
 /// History bindings must therefore collide with it even though ordinary native
 /// editor commands are disjoint from immutable review surfaces.
 pub fn is_review_command(action: &str) -> bool {
-    if matches!(action, "diff_unified" | "diff_split" | "diff_ignore_whitespace" | "diff_revert" | "diff_retry" | "diff_stage_selection" | "diff_unstage_selection" | "diff_revert_selection" | "diff_stage_hunk" | "diff_unstage_hunk" | "diff_revert_hunk") { return true; }
+    if matches!(
+        action,
+        "diff_unified"
+            | "diff_split"
+            | "diff_ignore_whitespace"
+            | "diff_revert"
+            | "diff_retry"
+            | "diff_stage_selection"
+            | "diff_unstage_selection"
+            | "diff_revert_selection"
+            | "diff_stage_hunk"
+            | "diff_unstage_hunk"
+            | "diff_revert_hunk"
+    ) {
+        return true;
+    }
     matches!(
         action,
         "review_toggle_viewed"

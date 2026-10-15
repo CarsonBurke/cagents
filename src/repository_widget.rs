@@ -4331,7 +4331,8 @@ impl RepositoryRuntime {
     // synthetic fallback used by subject_file().
     fn subject_file_ref(&self) -> Option<&RepositoryFile> {
         let selected = self.selected.as_ref()?;
-        self.followed_source().map_or(Some(selected), |source| self.file(source))
+        self.followed_source()
+            .map_or(Some(selected), |source| self.file(source))
     }
 
     /// Git's facts for the open buffer.
@@ -9150,11 +9151,31 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     // retain followed-target, saving and mutation behavior in every surface.
     if !runtime.reviews_pull_request() {
         for (stage, icon, label, command) in [
-            (true, Icon::Plus, "Stage file changes", DiffPresentationCommand::StageFile),
-            (false, Icon::Minus, "Unstage file changes", DiffPresentationCommand::UnstageFile),
+            (
+                true,
+                Icon::Plus,
+                "Stage file changes",
+                DiffPresentationCommand::StageFile,
+            ),
+            (
+                false,
+                Icon::Minus,
+                "Unstage file changes",
+                DiffPresentationCommand::UnstageFile,
+            ),
         ] {
-            document_actions.push(icon_button(icon, registered_command_hint(runtime, stage_file_hint_command(card, runtime, stage), label))
-                .on_press_maybe(runtime.diff_presentation_action(card, command)).into());
+            document_actions.push(
+                icon_button(
+                    icon,
+                    registered_command_hint(
+                        runtime,
+                        stage_file_hint_command(card, runtime, stage),
+                        label,
+                    ),
+                )
+                .on_press_maybe(runtime.diff_presentation_action(card, command))
+                .into(),
+            );
         }
     }
     if !document_actions.is_empty() && runtime.source_surface != SourceSurface::Diff {
@@ -10150,36 +10171,82 @@ fn registered_diff_control<'a>(
     action: Option<RepositoryAction>,
 ) -> Element<'a, RepositoryAction> {
     use crate::workspace_widget::GlobalShortcut as Command;
-    let command = action.as_ref().and_then(|action| Some(match action {
-        RepositoryAction::ApplyDiffMode { split, .. } => if *split { Command::DiffSplit } else { Command::DiffUnified },
-        RepositoryAction::ToggleDiffWhitespace { .. } => Command::DiffIgnoreWhitespace,
-        RepositoryAction::ApplyDiffBasis { basis: DiffBasis::IndexToWorktree, .. } => Command::DiffWorking,
-        RepositoryAction::ApplyDiffBasis { basis: DiffBasis::HeadToIndex, .. } => Command::DiffStaged,
-        RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::Branch, .. } => Command::DiffBranch,
-        RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::LastCommit, .. } => Command::DiffHistory,
-        RepositoryAction::StageSelected { card, stage } => stage_file_hint_command(*card, runtime, *stage),
-        RepositoryAction::DiscardEdits { .. } | RepositoryAction::RevertFile { .. } => Command::DiffRevert,
-        RepositoryAction::PreviousChange { .. } => Command::ReviewPreviousChange,
-        RepositoryAction::NextChange { .. } => Command::ReviewNextChange,
-        RepositoryAction::RetryDiff { .. } => Command::DiffRetry,
-        _ => return None,
-    }));
+    let command = action.as_ref().and_then(|action| {
+        Some(match action {
+            RepositoryAction::ApplyDiffMode { split, .. } => {
+                if *split {
+                    Command::DiffSplit
+                } else {
+                    Command::DiffUnified
+                }
+            }
+            RepositoryAction::ToggleDiffWhitespace { .. } => Command::DiffIgnoreWhitespace,
+            RepositoryAction::ApplyDiffBasis {
+                basis: DiffBasis::IndexToWorktree,
+                ..
+            } => Command::DiffWorking,
+            RepositoryAction::ApplyDiffBasis {
+                basis: DiffBasis::HeadToIndex,
+                ..
+            } => Command::DiffStaged,
+            RepositoryAction::SelectCommittedBasis {
+                choice: CommittedChoice::Branch,
+                ..
+            } => Command::DiffBranch,
+            RepositoryAction::SelectCommittedBasis {
+                choice: CommittedChoice::LastCommit,
+                ..
+            } => Command::DiffHistory,
+            RepositoryAction::StageSelected { card, stage } => {
+                stage_file_hint_command(*card, runtime, *stage)
+            }
+            RepositoryAction::DiscardEdits { .. } | RepositoryAction::RevertFile { .. } => {
+                Command::DiffRevert
+            }
+            RepositoryAction::PreviousChange { .. } => Command::ReviewPreviousChange,
+            RepositoryAction::NextChange { .. } => Command::ReviewNextChange,
+            RepositoryAction::RetryDiff { .. } => Command::DiffRetry,
+            _ => return None,
+        })
+    });
     let tooltip = tooltip.into();
-    let tooltip = command.map_or_else(|| tooltip.to_string(), |command| registered_command_hint(runtime, command, &tooltip));
+    let tooltip = command.map_or_else(
+        || tooltip.to_string(),
+        |command| registered_command_hint(runtime, command, &tooltip),
+    );
     labelled_diff_control(label, tooltip, selected, action)
 }
 
-fn registered_command_hint(runtime: &RepositoryRuntime, command: crate::workspace_widget::GlobalShortcut, label: &str) -> String {
-    if crate::workspace_widget::shortcut_keys(command, &runtime.keyboard_shortcuts).is_empty() { label.to_owned() }
-    else { crate::workspace_widget::shortcut_tooltip_named(command, &runtime.keyboard_shortcuts, label) }
+fn registered_command_hint(
+    runtime: &RepositoryRuntime,
+    command: crate::workspace_widget::GlobalShortcut,
+    label: &str,
+) -> String {
+    if crate::workspace_widget::shortcut_keys(command, &runtime.keyboard_shortcuts).is_empty() {
+        label.to_owned()
+    } else {
+        crate::workspace_widget::shortcut_tooltip_named(command, &runtime.keyboard_shortcuts, label)
+    }
 }
 
-fn stage_file_hint_command(card: CardId, runtime: &RepositoryRuntime, stage: bool) -> crate::workspace_widget::GlobalShortcut {
+fn stage_file_hint_command(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+    stage: bool,
+) -> crate::workspace_widget::GlobalShortcut {
     use crate::workspace_widget::GlobalShortcut as Command;
-    let explicit = if stage { Command::StageFile } else { Command::UnstageFile };
+    let explicit = if stage {
+        Command::StageFile
+    } else {
+        Command::UnstageFile
+    };
     if crate::workspace_widget::shortcut_keys(explicit, &runtime.keyboard_shortcuts).is_empty()
         && matches!(runtime.diff_presentation_action(card, DiffPresentationCommand::StageOrUnstageFile), Some(RepositoryAction::StageSelected { stage: actual, .. }) if actual == stage)
-    { Command::StageOrUnstageFile } else { explicit }
+    {
+        Command::StageOrUnstageFile
+    } else {
+        explicit
+    }
 }
 
 fn labelled_diff_control<'a>(
@@ -10209,13 +10276,34 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
     };
     let mut controls = Vec::new();
     for (label, tip, choice, command) in [
-        ("Working", "Compare index with working tree", BasisChoice::Unstaged, DiffPresentationCommand::Working),
-        ("Staged", "Compare HEAD with index", BasisChoice::Staged, DiffPresentationCommand::Staged),
-        ("Branch", "Compare branch with base", BasisChoice::Committed(CommittedChoice::Branch), DiffPresentationCommand::Branch),
-        ("History", "Compare last commit with its parent", BasisChoice::Committed(CommittedChoice::LastCommit), DiffPresentationCommand::History),
+        (
+            "Working",
+            "Compare index with working tree",
+            BasisChoice::Unstaged,
+            DiffPresentationCommand::Working,
+        ),
+        (
+            "Staged",
+            "Compare HEAD with index",
+            BasisChoice::Staged,
+            DiffPresentationCommand::Staged,
+        ),
+        (
+            "Branch",
+            "Compare branch with base",
+            BasisChoice::Committed(CommittedChoice::Branch),
+            DiffPresentationCommand::Branch,
+        ),
+        (
+            "History",
+            "Compare last commit with its parent",
+            BasisChoice::Committed(CommittedChoice::LastCommit),
+            DiffPresentationCommand::History,
+        ),
     ] {
         let action = runtime.diff_presentation_action(card, command);
-        controls.push(registered_diff_control(runtime,
+        controls.push(registered_diff_control(
+            runtime,
             label,
             tip,
             action.is_some() && selected == Some(choice),
@@ -10234,13 +10322,27 @@ fn diff_action_toolbar(
     let mut actions = Vec::new();
     if !runtime.reviews_pull_request() {
         for (command, label, tooltip) in [
-            (DiffPresentationCommand::StageFile, "Stage", "Stage file changes"),
-            (DiffPresentationCommand::UnstageFile, "Unstage", "Unstage file changes"),
+            (
+                DiffPresentationCommand::StageFile,
+                "Stage",
+                "Stage file changes",
+            ),
+            (
+                DiffPresentationCommand::UnstageFile,
+                "Unstage",
+                "Unstage file changes",
+            ),
         ] {
-            actions.push(registered_diff_control(runtime, label, tooltip, false,
-                runtime.diff_presentation_action(card, command)));
+            actions.push(registered_diff_control(
+                runtime,
+                label,
+                tooltip,
+                false,
+                runtime.diff_presentation_action(card, command),
+            ));
         }
-        actions.push(registered_diff_control(runtime,
+        actions.push(registered_diff_control(
+            runtime,
             "Revert",
             if runtime.can_discard_edits() {
                 "Discard unsaved edits"
@@ -10251,7 +10353,8 @@ fn diff_action_toolbar(
             runtime.diff_presentation_action(card, DiffPresentationCommand::Revert),
         ));
     }
-    actions.push(registered_diff_control(runtime,
+    actions.push(registered_diff_control(
+        runtime,
         "Ignore whitespace",
         "Ignore horizontal whitespace in every diff",
         runtime.diff_ignore_whitespace,
@@ -10297,7 +10400,8 @@ fn diff_action_toolbar(
             .into()
     } else {
         crate::ui_controls::popover(
-            registered_diff_control(runtime,
+            registered_diff_control(
+                runtime,
                 "Diff actions ⋮",
                 "Diff actions",
                 runtime.toolbar_overflow_open,
@@ -10344,13 +10448,15 @@ fn diff_review_controls(
             "Refreshing diff",
         ),
         crate::ui_controls::segmented_controls(vec![
-            registered_diff_control(runtime,
+            registered_diff_control(
+                runtime,
                 "Unified",
                 "Unified diff",
                 runtime.diff_mode == DiffMode::Inline,
                 runtime.diff_presentation_action(card, DiffPresentationCommand::Unified),
             ),
-            registered_diff_control(runtime,
+            registered_diff_control(
+                runtime,
                 "Split",
                 "Side-by-side diff",
                 runtime.diff_mode == DiffMode::Split,
@@ -10359,7 +10465,8 @@ fn diff_review_controls(
         ]),
         // Navigation commands are a plain cluster, distinct from mode choices.
         toolbar_group(vec![
-            registered_diff_control(runtime,
+            registered_diff_control(
+                runtime,
                 "Previous",
                 "Previous hunk",
                 false,
@@ -10383,7 +10490,8 @@ fn diff_review_controls(
                 .width(Length::Fixed(crate::design::STEPPER_LABEL_WIDTH)),
                 basis_label(&runtime.diff_basis),
             ),
-            registered_diff_control(runtime,
+            registered_diff_control(
+                runtime,
                 "Next",
                 "Next hunk",
                 false,
@@ -10393,9 +10501,16 @@ fn diff_review_controls(
     ];
     if let Some(action) = runtime.diff_presentation_action(card, DiffPresentationCommand::Retry) {
         controls.push(toolbar_group(vec![
-            icon_button(Icon::Refresh, registered_command_hint(runtime, crate::workspace_widget::GlobalShortcut::DiffRetry, "Retry diff"))
-                .on_press(action)
-                .into(),
+            icon_button(
+                Icon::Refresh,
+                registered_command_hint(
+                    runtime,
+                    crate::workspace_widget::GlobalShortcut::DiffRetry,
+                    "Retry diff",
+                ),
+            )
+            .on_press(action)
+            .into(),
         ]));
     }
     widget::row::with_children(controls)
@@ -12653,29 +12768,83 @@ mod tests {
             let mut toolbar = selected_file_toolbar(card, &runtime).unwrap();
             let mut tree = Tree::new(toolbar.as_widget());
             let viewport = iced::Rectangle::with_size(iced::Size::new(760.0, 160.0));
-            let node = toolbar.as_widget_mut().layout(&mut tree, &renderer,
-                &layout::Limits::new(iced::Size::ZERO, viewport.size()));
+            let node = toolbar.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
             let point = {
-                let accessible = toolbar.as_widget().a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-                let button = accessible.root().iter().chain(accessible.children())
-                    .find(|entry| entry.node().label()==Some(label)).expect("editor basis button is mounted");
-                assert!(!button.node().is_disabled(), "{label} must be enabled while editing");
+                let accessible = toolbar.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                );
+                let button = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .find(|entry| entry.node().label() == Some(label))
+                    .expect("editor basis button is mounted");
+                assert!(
+                    !button.node().is_disabled(),
+                    "{label} must be enabled while editing"
+                );
                 let bounds = button.node().bounds().unwrap();
-                iced::Point::new(((bounds.x0+bounds.x1)/2.0) as f32, ((bounds.y0+bounds.y1)/2.0) as f32)
+                iced::Point::new(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                )
             };
             let mut messages = Vec::new();
-            for event in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left), iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
-                toolbar.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node), mouse::Cursor::Available(point),
-                    &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            for event in [
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ] {
+                toolbar.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(event),
+                    Layout::new(&node),
+                    mouse::Cursor::Available(point),
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
             }
             drop(toolbar);
-            let action = messages.pop().expect("actual toolbar click emits its basis action");
+            let action = messages
+                .pop()
+                .expect("actual toolbar click emits its basis action");
             assert!(messages.is_empty());
             match (&action, command) {
-                (RepositoryAction::ApplyDiffBasis { basis: DiffBasis::IndexToWorktree,.. }, DiffPresentationCommand::Working)
-                | (RepositoryAction::ApplyDiffBasis { basis: DiffBasis::HeadToIndex,.. }, DiffPresentationCommand::Staged)
-                | (RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::Branch,.. }, DiffPresentationCommand::Branch)
-                | (RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::LastCommit,.. }, DiffPresentationCommand::History) => {}
+                (
+                    RepositoryAction::ApplyDiffBasis {
+                        basis: DiffBasis::IndexToWorktree,
+                        ..
+                    },
+                    DiffPresentationCommand::Working,
+                )
+                | (
+                    RepositoryAction::ApplyDiffBasis {
+                        basis: DiffBasis::HeadToIndex,
+                        ..
+                    },
+                    DiffPresentationCommand::Staged,
+                )
+                | (
+                    RepositoryAction::SelectCommittedBasis {
+                        choice: CommittedChoice::Branch,
+                        ..
+                    },
+                    DiffPresentationCommand::Branch,
+                )
+                | (
+                    RepositoryAction::SelectCommittedBasis {
+                        choice: CommittedChoice::LastCommit,
+                        ..
+                    },
+                    DiffPresentationCommand::History,
+                ) => {}
                 _ => panic!("toolbar action must retain requested basis"),
             }
             drop(runtime.update(action));

@@ -4491,29 +4491,51 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutDiffUnified => self.keyboard_shortcuts.diff_unified = value,
             SettingsField::ShortcutDiffSplit => self.keyboard_shortcuts.diff_split = value,
-            SettingsField::ShortcutDiffIgnoreWhitespace => self.keyboard_shortcuts.diff_ignore_whitespace = value,
+            SettingsField::ShortcutDiffIgnoreWhitespace => {
+                self.keyboard_shortcuts.diff_ignore_whitespace = value
+            }
             SettingsField::ShortcutDiffWorking => self.keyboard_shortcuts.diff_working = value,
             SettingsField::ShortcutDiffStaged => self.keyboard_shortcuts.diff_staged = value,
             SettingsField::ShortcutDiffBranch => self.keyboard_shortcuts.diff_branch = value,
             SettingsField::ShortcutDiffHistory => self.keyboard_shortcuts.diff_history = value,
             SettingsField::ShortcutStageFile => self.keyboard_shortcuts.stage_file = value,
             SettingsField::ShortcutUnstageFile => self.keyboard_shortcuts.unstage_file = value,
-            SettingsField::ShortcutStageOrUnstageFile => self.keyboard_shortcuts.stage_or_unstage_file = value,
+            SettingsField::ShortcutStageOrUnstageFile => {
+                self.keyboard_shortcuts.stage_or_unstage_file = value
+            }
             SettingsField::ShortcutDiffRevert => self.keyboard_shortcuts.diff_revert = value,
             SettingsField::ShortcutDiffRetry => self.keyboard_shortcuts.diff_retry = value,
-            SettingsField::ShortcutDiffStageSelection => self.keyboard_shortcuts.diff_stage_selection = value,
-            SettingsField::ShortcutDiffUnstageSelection => self.keyboard_shortcuts.diff_unstage_selection = value,
-            SettingsField::ShortcutDiffRevertSelection => self.keyboard_shortcuts.diff_revert_selection = value,
+            SettingsField::ShortcutDiffStageSelection => {
+                self.keyboard_shortcuts.diff_stage_selection = value
+            }
+            SettingsField::ShortcutDiffUnstageSelection => {
+                self.keyboard_shortcuts.diff_unstage_selection = value
+            }
+            SettingsField::ShortcutDiffRevertSelection => {
+                self.keyboard_shortcuts.diff_revert_selection = value
+            }
             SettingsField::ShortcutDiffStageHunk => self.keyboard_shortcuts.diff_stage_hunk = value,
-            SettingsField::ShortcutDiffUnstageHunk => self.keyboard_shortcuts.diff_unstage_hunk = value,
-            SettingsField::ShortcutDiffRevertHunk => self.keyboard_shortcuts.diff_revert_hunk = value,
+            SettingsField::ShortcutDiffUnstageHunk => {
+                self.keyboard_shortcuts.diff_unstage_hunk = value
+            }
+            SettingsField::ShortcutDiffRevertHunk => {
+                self.keyboard_shortcuts.diff_revert_hunk = value
+            }
             SettingsField::ShortcutBrowserBack => self.keyboard_shortcuts.browser_back = value,
-            SettingsField::ShortcutBrowserForward => self.keyboard_shortcuts.browser_forward = value,
+            SettingsField::ShortcutBrowserForward => {
+                self.keyboard_shortcuts.browser_forward = value
+            }
             SettingsField::ShortcutBrowserReload => self.keyboard_shortcuts.browser_reload = value,
             SettingsField::ShortcutBrowserStop => self.keyboard_shortcuts.browser_stop = value,
-            SettingsField::ShortcutBrowserAddress => self.keyboard_shortcuts.browser_address = value,
-            SettingsField::ShortcutBrowserOpenSystem => self.keyboard_shortcuts.browser_open_system = value,
-            SettingsField::ShortcutBrowserImportLogins => self.keyboard_shortcuts.browser_import_logins = value,
+            SettingsField::ShortcutBrowserAddress => {
+                self.keyboard_shortcuts.browser_address = value
+            }
+            SettingsField::ShortcutBrowserOpenSystem => {
+                self.keyboard_shortcuts.browser_open_system = value
+            }
+            SettingsField::ShortcutBrowserImportLogins => {
+                self.keyboard_shortcuts.browser_import_logins = value
+            }
             SettingsField::ShortcutChatSend => self.keyboard_shortcuts.chat_send = value,
             SettingsField::ShortcutChatSteer => self.keyboard_shortcuts.chat_steer = value,
             SettingsField::ShortcutChatQueue => self.keyboard_shortcuts.chat_queue = value,
@@ -4522,10 +4544,18 @@ impl SettingsDraft {
             SettingsField::ShortcutChatAttach => self.keyboard_shortcuts.chat_attach = value,
             SettingsField::ShortcutChatReasoning => self.keyboard_shortcuts.chat_reasoning = value,
             SettingsField::ShortcutChatLatest => self.keyboard_shortcuts.chat_latest = value,
-            SettingsField::ShortcutChatTakeBackQueued => self.keyboard_shortcuts.chat_take_back_queued = value,
-            SettingsField::ShortcutChatCancelQueued => self.keyboard_shortcuts.chat_cancel_queued = value,
-            SettingsField::ShortcutChatToggleSteering => self.keyboard_shortcuts.chat_toggle_steering = value,
-            SettingsField::ShortcutChatToggleFastMode => self.keyboard_shortcuts.chat_toggle_fast_mode = value,
+            SettingsField::ShortcutChatTakeBackQueued => {
+                self.keyboard_shortcuts.chat_take_back_queued = value
+            }
+            SettingsField::ShortcutChatCancelQueued => {
+                self.keyboard_shortcuts.chat_cancel_queued = value
+            }
+            SettingsField::ShortcutChatToggleSteering => {
+                self.keyboard_shortcuts.chat_toggle_steering = value
+            }
+            SettingsField::ShortcutChatToggleFastMode => {
+                self.keyboard_shortcuts.chat_toggle_fast_mode = value
+            }
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5090,43 +5120,154 @@ fn settings_update(
             next.keyboard_shortcuts.pdf_toggle_colors = settings::parse_chords(value);
             Ok(())
         }
-        SettingsField::ShortcutDiffUnified => { next.keyboard_shortcuts.diff_unified = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffSplit => { next.keyboard_shortcuts.diff_split = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffIgnoreWhitespace => { next.keyboard_shortcuts.diff_ignore_whitespace = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffWorking => { next.keyboard_shortcuts.diff_working = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffStaged => { next.keyboard_shortcuts.diff_staged = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffBranch => { next.keyboard_shortcuts.diff_branch = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffHistory => { next.keyboard_shortcuts.diff_history = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutStageFile => { next.keyboard_shortcuts.stage_file = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutUnstageFile => { next.keyboard_shortcuts.unstage_file = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutStageOrUnstageFile => { next.keyboard_shortcuts.stage_or_unstage_file = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffRevert => { next.keyboard_shortcuts.diff_revert = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffRetry => { next.keyboard_shortcuts.diff_retry = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffStageSelection => { next.keyboard_shortcuts.diff_stage_selection = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffUnstageSelection => { next.keyboard_shortcuts.diff_unstage_selection = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffRevertSelection => { next.keyboard_shortcuts.diff_revert_selection = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffStageHunk => { next.keyboard_shortcuts.diff_stage_hunk = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffUnstageHunk => { next.keyboard_shortcuts.diff_unstage_hunk = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutDiffRevertHunk => { next.keyboard_shortcuts.diff_revert_hunk = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutBrowserBack => { next.keyboard_shortcuts.browser_back = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutBrowserForward => { next.keyboard_shortcuts.browser_forward = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutBrowserReload => { next.keyboard_shortcuts.browser_reload = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutBrowserStop => { next.keyboard_shortcuts.browser_stop = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutBrowserAddress => { next.keyboard_shortcuts.browser_address = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutBrowserOpenSystem => { next.keyboard_shortcuts.browser_open_system = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutBrowserImportLogins => { next.keyboard_shortcuts.browser_import_logins = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatSend => { next.keyboard_shortcuts.chat_send = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatSteer => { next.keyboard_shortcuts.chat_steer = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatQueue => { next.keyboard_shortcuts.chat_queue = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatInterrupt => { next.keyboard_shortcuts.chat_interrupt = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatCompact => { next.keyboard_shortcuts.chat_compact = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatAttach => { next.keyboard_shortcuts.chat_attach = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatReasoning => { next.keyboard_shortcuts.chat_reasoning = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatLatest => { next.keyboard_shortcuts.chat_latest = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatTakeBackQueued => { next.keyboard_shortcuts.chat_take_back_queued = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatCancelQueued => { next.keyboard_shortcuts.chat_cancel_queued = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatToggleSteering => { next.keyboard_shortcuts.chat_toggle_steering = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutChatToggleFastMode => { next.keyboard_shortcuts.chat_toggle_fast_mode = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffUnified => {
+            next.keyboard_shortcuts.diff_unified = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffSplit => {
+            next.keyboard_shortcuts.diff_split = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffIgnoreWhitespace => {
+            next.keyboard_shortcuts.diff_ignore_whitespace = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffWorking => {
+            next.keyboard_shortcuts.diff_working = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffStaged => {
+            next.keyboard_shortcuts.diff_staged = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffBranch => {
+            next.keyboard_shortcuts.diff_branch = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffHistory => {
+            next.keyboard_shortcuts.diff_history = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutStageFile => {
+            next.keyboard_shortcuts.stage_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutUnstageFile => {
+            next.keyboard_shortcuts.unstage_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutStageOrUnstageFile => {
+            next.keyboard_shortcuts.stage_or_unstage_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffRevert => {
+            next.keyboard_shortcuts.diff_revert = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffRetry => {
+            next.keyboard_shortcuts.diff_retry = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffStageSelection => {
+            next.keyboard_shortcuts.diff_stage_selection = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffUnstageSelection => {
+            next.keyboard_shortcuts.diff_unstage_selection = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffRevertSelection => {
+            next.keyboard_shortcuts.diff_revert_selection = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffStageHunk => {
+            next.keyboard_shortcuts.diff_stage_hunk = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffUnstageHunk => {
+            next.keyboard_shortcuts.diff_unstage_hunk = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffRevertHunk => {
+            next.keyboard_shortcuts.diff_revert_hunk = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutBrowserBack => {
+            next.keyboard_shortcuts.browser_back = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutBrowserForward => {
+            next.keyboard_shortcuts.browser_forward = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutBrowserReload => {
+            next.keyboard_shortcuts.browser_reload = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutBrowserStop => {
+            next.keyboard_shortcuts.browser_stop = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutBrowserAddress => {
+            next.keyboard_shortcuts.browser_address = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutBrowserOpenSystem => {
+            next.keyboard_shortcuts.browser_open_system = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutBrowserImportLogins => {
+            next.keyboard_shortcuts.browser_import_logins = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatSend => {
+            next.keyboard_shortcuts.chat_send = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatSteer => {
+            next.keyboard_shortcuts.chat_steer = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatQueue => {
+            next.keyboard_shortcuts.chat_queue = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatInterrupt => {
+            next.keyboard_shortcuts.chat_interrupt = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatCompact => {
+            next.keyboard_shortcuts.chat_compact = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatAttach => {
+            next.keyboard_shortcuts.chat_attach = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatReasoning => {
+            next.keyboard_shortcuts.chat_reasoning = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatLatest => {
+            next.keyboard_shortcuts.chat_latest = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatTakeBackQueued => {
+            next.keyboard_shortcuts.chat_take_back_queued = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatCancelQueued => {
+            next.keyboard_shortcuts.chat_cancel_queued = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatToggleSteering => {
+            next.keyboard_shortcuts.chat_toggle_steering = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatToggleFastMode => {
+            next.keyboard_shortcuts.chat_toggle_fast_mode = settings::parse_chords(value);
+            Ok(())
+        }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -8421,7 +8562,12 @@ impl Cagents {
             {
                 workspace_widget::FocusedPane::ChatPane
             }
-            _ if self.card_state(card).is_some_and(|state| matches!(state.kind, CardKind::Browser(_))) => workspace_widget::FocusedPane::Browser,
+            _ if self
+                .card_state(card)
+                .is_some_and(|state| matches!(state.kind, CardKind::Browser(_))) =>
+            {
+                workspace_widget::FocusedPane::Browser
+            }
             _ => workspace_widget::FocusedPane::Other,
         }
     }
@@ -11191,8 +11337,14 @@ impl Cagents {
                             .name("Back")
                             .width(ICON_CONTROL_SIZE)
                             .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(self.registered_browser_action(id, BrowserCommand::BrowserBack)),
-                        workspace_widget::shortcut_tooltip_named(BrowserCommand::BrowserBack, &self.settings.keyboard_shortcuts, "Back"),
+                            .on_press_maybe(
+                                self.registered_browser_action(id, BrowserCommand::BrowserBack),
+                            ),
+                        workspace_widget::shortcut_tooltip_named(
+                            BrowserCommand::BrowserBack,
+                            &self.settings.keyboard_shortcuts,
+                            "Back",
+                        ),
                     ),
                     crate::interaction::tooltip_above(
                         widget::button::icon(Icon::ChevronRight)
@@ -11203,8 +11355,14 @@ impl Cagents {
                             .name("Forward")
                             .width(ICON_CONTROL_SIZE)
                             .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(self.registered_browser_action(id, BrowserCommand::BrowserForward)),
-                        workspace_widget::shortcut_tooltip_named(BrowserCommand::BrowserForward, &self.settings.keyboard_shortcuts, "Forward"),
+                            .on_press_maybe(
+                                self.registered_browser_action(id, BrowserCommand::BrowserForward),
+                            ),
+                        workspace_widget::shortcut_tooltip_named(
+                            BrowserCommand::BrowserForward,
+                            &self.settings.keyboard_shortcuts,
+                            "Forward",
+                        ),
                     ),
                     crate::interaction::tooltip_above(
                         widget::button::icon(if browser_loading {
@@ -11219,13 +11377,31 @@ impl Cagents {
                         .name(if browser_loading { "Stop" } else { "Reload" })
                         .width(ICON_CONTROL_SIZE)
                         .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(self.registered_browser_action(id, if browser_loading { BrowserCommand::BrowserStop } else { BrowserCommand::BrowserReload })),
-                        workspace_widget::shortcut_tooltip_named(if browser_loading { BrowserCommand::BrowserStop } else { BrowserCommand::BrowserReload }, &self.settings.keyboard_shortcuts, if browser_loading { "Stop" } else { "Reload" }),
+                        .on_press_maybe(self.registered_browser_action(
+                            id,
+                            if browser_loading {
+                                BrowserCommand::BrowserStop
+                            } else {
+                                BrowserCommand::BrowserReload
+                            },
+                        )),
+                        workspace_widget::shortcut_tooltip_named(
+                            if browser_loading {
+                                BrowserCommand::BrowserStop
+                            } else {
+                                BrowserCommand::BrowserReload
+                            },
+                            &self.settings.keyboard_shortcuts,
+                            if browser_loading { "Stop" } else { "Reload" },
+                        ),
                     ),
                     address_input.into(),
                     crate::ui_controls::button::secondary("Open in system browser")
                         .id(card_control_id(id, "browser.system"))
-                        .on_press_maybe(self.registered_browser_action(id, workspace_widget::GlobalShortcut::BrowserOpenSystem))
+                        .on_press_maybe(self.registered_browser_action(
+                            id,
+                            workspace_widget::GlobalShortcut::BrowserOpenSystem,
+                        ))
                         .into(),
                     crate::interaction::tooltip_above(
                         widget::button::icon(Icon::Import)
@@ -11233,7 +11409,10 @@ impl Cagents {
                             .name("Import browser logins")
                             .width(ICON_CONTROL_SIZE)
                             .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(self.registered_browser_action(id, BrowserCommand::BrowserImportLogins)),
+                            .on_press_maybe(self.registered_browser_action(
+                                id,
+                                BrowserCommand::BrowserImportLogins,
+                            )),
                         "Import browser logins",
                     ),
                 ])
@@ -11314,7 +11493,10 @@ impl Cagents {
                     address.into(),
                     crate::ui_controls::button::primary("Open in system browser")
                         .id(card_control_id(id, "browser.system"))
-                        .on_press_maybe(self.registered_browser_action(id, workspace_widget::GlobalShortcut::BrowserOpenSystem))
+                        .on_press_maybe(self.registered_browser_action(
+                            id,
+                            workspace_widget::GlobalShortcut::BrowserOpenSystem,
+                        ))
                         .into(),
                 ])
                 .align_y(Alignment::Center)
@@ -30233,10 +30415,24 @@ mod tests {
     fn configured_command_can_reclaim_the_retired_file_staging_chord() {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
-        app.settings.keyboard_shortcuts.stage_or_unstage_file.clear();
+        app.settings
+            .keyboard_shortcuts
+            .stage_or_unstage_file
+            .clear();
         app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
         assert!(app.settings.clone().validate().is_ok());
-        drop(app.update(Message::KeyEvent { event: keyboard::Event::KeyPressed { key: keyboard::Key::Character("s".into()), modified_key: keyboard::Key::Character("S".into()), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, text: None, repeat: false }, captured: false }));
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("s".into()),
+                modified_key: keyboard::Key::Character("S".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        }));
         assert!(app.palette.is_open());
         assert!(app.source_control_mutations.is_empty());
     }

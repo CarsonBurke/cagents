@@ -67,8 +67,13 @@ impl RepositoryRuntime {
     /// save, mutation and asynchronous-result fences.
     pub fn diff_presentation_available(&self, command: DiffPresentationCommand) -> bool {
         use DiffPresentationCommand::*;
-        if !matches!(command, Working | Staged | Branch | History | StageFile | UnstageFile | StageOrUnstageFile)
-            && !self.shows_diff() { return false; }
+        if !matches!(
+            command,
+            Working | Staged | Branch | History | StageFile | UnstageFile | StageOrUnstageFile
+        ) && !self.shows_diff()
+        {
+            return false;
+        }
         match command {
             Unified | Split => self.can_change_diff_layout(),
             IgnoreWhitespace => true,
@@ -77,16 +82,21 @@ impl RepositoryRuntime {
             Staged => self.can_select_diff_basis(&DiffBasis::HeadToIndex),
             Branch => self.can_select_committed_basis(CommittedChoice::Branch),
             History => self.can_select_committed_basis(CommittedChoice::LastCommit),
-            StageFile | UnstageFile | StageOrUnstageFile => !self.reviews_pull_request()
-                && !self.mutation_refresh_pending && !self.blocks_navigation()
-                && self.subject_file_ref().is_some_and(|file| match command {
-                    StageFile => file.unstaged,
-                    UnstageFile => file.staged,
-                    StageOrUnstageFile => file.unstaged || file.staged,
-                    _ => unreachable!(),
-                }),
-            Revert => !self.reviews_pull_request() && (self.can_discard_edits()
-                || self.selected_discard_request().is_some()),
+            StageFile | UnstageFile | StageOrUnstageFile => {
+                !self.reviews_pull_request()
+                    && !self.mutation_refresh_pending
+                    && !self.blocks_navigation()
+                    && self.subject_file_ref().is_some_and(|file| match command {
+                        StageFile => file.unstaged,
+                        UnstageFile => file.staged,
+                        StageOrUnstageFile => file.unstaged || file.staged,
+                        _ => unreachable!(),
+                    })
+            }
+            Revert => {
+                !self.reviews_pull_request()
+                    && (self.can_discard_edits() || self.selected_discard_request().is_some())
+            }
             Retry => self.can_retry_diff(),
         }
     }
@@ -97,18 +107,36 @@ impl RepositoryRuntime {
         command: DiffPresentationCommand,
     ) -> Option<RepositoryAction> {
         use DiffPresentationCommand::*;
-        if !self.diff_presentation_available(command) { return None; }
+        if !self.diff_presentation_available(command) {
+            return None;
+        }
         Some(match command {
-            Unified | Split => RepositoryAction::ApplyDiffMode { card, split: command == Split },
+            Unified | Split => RepositoryAction::ApplyDiffMode {
+                card,
+                split: command == Split,
+            },
             IgnoreWhitespace => RepositoryAction::ToggleDiffWhitespace { card },
-            Working => RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::IndexToWorktree },
-            Staged => RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::HeadToIndex },
-            Branch => RepositoryAction::SelectCommittedBasis { card, choice: CommittedChoice::Branch },
-            History => RepositoryAction::SelectCommittedBasis { card, choice: CommittedChoice::LastCommit },
+            Working => RepositoryAction::ApplyDiffBasis {
+                card,
+                basis: DiffBasis::IndexToWorktree,
+            },
+            Staged => RepositoryAction::ApplyDiffBasis {
+                card,
+                basis: DiffBasis::HeadToIndex,
+            },
+            Branch => RepositoryAction::SelectCommittedBasis {
+                card,
+                choice: CommittedChoice::Branch,
+            },
+            History => RepositoryAction::SelectCommittedBasis {
+                card,
+                choice: CommittedChoice::LastCommit,
+            },
             StageFile | UnstageFile | StageOrUnstageFile => RepositoryAction::StageSelected {
                 card,
-                stage: command == StageFile || (command == StageOrUnstageFile
-                    && self.diff_presentation_available(StageFile)),
+                stage: command == StageFile
+                    || (command == StageOrUnstageFile
+                        && self.diff_presentation_available(StageFile)),
             },
             Revert if self.can_discard_edits() => RepositoryAction::DiscardEdits { card },
             Revert => RepositoryAction::RevertFile { card },
@@ -1051,32 +1079,116 @@ mod tests {
         let file = runtime.selected.as_mut().unwrap();
         file.staged = true;
         file.unstaged = true;
-        assert!(matches!(runtime.diff_presentation_action(card, Unified), Some(RepositoryAction::ApplyDiffMode { split: false, .. })));
-        assert!(matches!(runtime.diff_presentation_action(card, Split), Some(RepositoryAction::ApplyDiffMode { split: true, .. })));
-        assert!(matches!(runtime.diff_presentation_action(card, Working), Some(RepositoryAction::ApplyDiffBasis { basis: DiffBasis::IndexToWorktree, .. })));
-        assert!(matches!(runtime.diff_presentation_action(card, Staged), Some(RepositoryAction::ApplyDiffBasis { basis: DiffBasis::HeadToIndex, .. })));
-        assert!(matches!(runtime.diff_presentation_action(card, Branch), Some(RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::Branch, .. })));
-        assert!(matches!(runtime.diff_presentation_action(card, History), Some(RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::LastCommit, .. })));
-        assert!(matches!(runtime.diff_presentation_action(card, StageFile), Some(RepositoryAction::StageSelected { stage: true, .. })));
-        assert!(matches!(runtime.diff_presentation_action(card, UnstageFile), Some(RepositoryAction::StageSelected { stage: false, .. })));
-        assert!(matches!(runtime.diff_presentation_action(card, Revert), Some(RepositoryAction::RevertFile { .. })));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, Unified),
+            Some(RepositoryAction::ApplyDiffMode { split: false, .. })
+        ));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, Split),
+            Some(RepositoryAction::ApplyDiffMode { split: true, .. })
+        ));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, Working),
+            Some(RepositoryAction::ApplyDiffBasis {
+                basis: DiffBasis::IndexToWorktree,
+                ..
+            })
+        ));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, Staged),
+            Some(RepositoryAction::ApplyDiffBasis {
+                basis: DiffBasis::HeadToIndex,
+                ..
+            })
+        ));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, Branch),
+            Some(RepositoryAction::SelectCommittedBasis {
+                choice: CommittedChoice::Branch,
+                ..
+            })
+        ));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, History),
+            Some(RepositoryAction::SelectCommittedBasis {
+                choice: CommittedChoice::LastCommit,
+                ..
+            })
+        ));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, StageFile),
+            Some(RepositoryAction::StageSelected { stage: true, .. })
+        ));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, UnstageFile),
+            Some(RepositoryAction::StageSelected { stage: false, .. })
+        ));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, Revert),
+            Some(RepositoryAction::RevertFile { .. })
+        ));
         runtime.mutation_refresh_pending = true;
-        for command in [Working, Staged, StageFile, UnstageFile, StageOrUnstageFile, Revert] {
+        for command in [
+            Working,
+            Staged,
+            StageFile,
+            UnstageFile,
+            StageOrUnstageFile,
+            Revert,
+        ] {
             assert!(runtime.diff_presentation_action(card, command).is_none());
         }
         assert!(runtime.diff_presentation_available(Branch));
         runtime.mutation_refresh_pending = false;
-        let DocumentState::Editable(document) = &mut runtime.document else { panic!("editable fixture") };
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!("editable fixture")
+        };
         document.dirty = true;
-        assert!(matches!(runtime.diff_presentation_action(card, Revert), Some(RepositoryAction::DiscardEdits { .. })));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, Revert),
+            Some(RepositoryAction::DiscardEdits { .. })
+        ));
         assert!(!runtime.diff_presentation_available(StageFile));
-        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
-        document.active_save = Some(SaveTicket { id: 1, identity, revision: document.revision, history_revision: document.history.revision(), snapshot_source: document.content.text_snapshot(), snapshot: document.content.text() });
-        for command in [Unified, Split, Working, Staged, Branch, History, StageFile, UnstageFile, StageOrUnstageFile, Revert] {
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
+        document.active_save = Some(SaveTicket {
+            id: 1,
+            identity,
+            revision: document.revision,
+            history_revision: document.history.revision(),
+            snapshot_source: document.content.text_snapshot(),
+            snapshot: document.content.text(),
+        });
+        for command in [
+            Unified,
+            Split,
+            Working,
+            Staged,
+            Branch,
+            History,
+            StageFile,
+            UnstageFile,
+            StageOrUnstageFile,
+            Revert,
+        ] {
             assert!(runtime.diff_presentation_action(card, command).is_none());
         }
         runtime.source_surface = SourceSurface::Editor;
-        for command in [Unified, Split, IgnoreWhitespace, Working, Staged, Branch, History, StageFile, UnstageFile, StageOrUnstageFile, Revert, Retry] {
+        for command in [
+            Unified,
+            Split,
+            IgnoreWhitespace,
+            Working,
+            Staged,
+            Branch,
+            History,
+            StageFile,
+            UnstageFile,
+            StageOrUnstageFile,
+            Revert,
+            Retry,
+        ] {
             assert!(!runtime.diff_presentation_available(command));
         }
     }
@@ -1091,15 +1203,25 @@ mod tests {
         file.unstaged = true;
         assert!(runtime.selected_staging_selection(true).is_some());
         assert!(runtime.selected_staging_selection(false).is_some());
-        assert!(matches!(runtime.diff_presentation_action(card, StageOrUnstageFile), Some(RepositoryAction::StageSelected { stage: true, .. })));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, StageOrUnstageFile),
+            Some(RepositoryAction::StageSelected { stage: true, .. })
+        ));
         assert!(runtime.diff_presentation_available(StageFile));
         assert!(runtime.diff_presentation_available(UnstageFile));
         assert!(!runtime.diff_presentation_available(Split));
         runtime.selected.as_mut().unwrap().unstaged = false;
-        assert!(matches!(runtime.diff_presentation_action(card, StageOrUnstageFile), Some(RepositoryAction::StageSelected { stage: false, .. })));
+        assert!(matches!(
+            runtime.diff_presentation_action(card, StageOrUnstageFile),
+            Some(RepositoryAction::StageSelected { stage: false, .. })
+        ));
         assert!(!runtime.diff_presentation_available(StageFile));
         runtime.selected.as_mut().unwrap().staged = false;
-        assert!(runtime.diff_presentation_action(card, StageOrUnstageFile).is_none());
+        assert!(
+            runtime
+                .diff_presentation_action(card, StageOrUnstageFile)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1117,7 +1239,16 @@ mod tests {
         for command in [Unified, Split, IgnoreWhitespace] {
             assert!(runtime.diff_presentation_action(card, command).is_some());
         }
-        for command in [Working, Staged, Branch, History, StageFile, UnstageFile, StageOrUnstageFile, Revert] {
+        for command in [
+            Working,
+            Staged,
+            Branch,
+            History,
+            StageFile,
+            UnstageFile,
+            StageOrUnstageFile,
+            Revert,
+        ] {
             assert!(runtime.diff_presentation_action(card, command).is_none());
         }
     }
