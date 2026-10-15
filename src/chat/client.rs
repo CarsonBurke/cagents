@@ -132,7 +132,6 @@ fn valid_source_binding(binding: &crate::terminal_ipc::ChatSourceBinding, source
         && binding.source.id == source.id && binding.source.proof.as_ref() == Some(proof)
         && binding.source.launch.provider == source.launch.provider
         && binding.source.launch.recipe == source.launch.recipe
-        && source.launch.session_id.as_ref().is_none_or(|thread| binding.source.launch.session_id.as_ref() == Some(thread))
 }
 
 struct Inner {
@@ -928,7 +927,8 @@ impl ClientHandle {
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
                     if execution_instance.is_nil() { return Err("Native attachment has no exact actor incarnation".into()); }
-                    if binding.as_ref().is_some_and(|binding| !valid_source_binding(binding, &session, execution_instance, &proof)) {
+                    if binding.as_ref().is_some_and(|binding| !valid_source_binding(binding, &session, execution_instance, &proof)
+                        || session.launch.session_id.as_ref().is_some_and(|thread| binding.source.launch.session_id.as_ref() != Some(thread))) {
                         return Err("Native attachment has inconsistent backend authority".into());
                     }
                     break (session, snapshot, execution_instance, binding);
@@ -1590,6 +1590,65 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_same_record_thread_refresh_preserves_captured_return_intents() {
+        let proof = host_proof("live-thread-binding");
+        let source = omp_card(Some("thread-a"), Some(proof.clone()));
+        let instance = uuid::Uuid::new_v4();
+        let a = crate::terminal_ipc::ChatSourceBinding { source: source.clone(), execution_instance: instance, backend: uuid::Uuid::new_v4() };
+        let mut b = a.clone(); b.source.launch.session_id = Some("thread-b".into()); b.backend = uuid::Uuid::new_v4();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (advance, ready) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let sent_a = a.clone(); let sent_b = b.clone();
+        let worker = thread::spawn(move || {
+            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            handoff_reply(&mut server, &mut codec, Some(connect.request_id), &proof,
+                ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: Vec::new() } });
+            let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            handoff_reply(&mut server, &mut codec, Some(attach.request_id), &proof,
+                ServerMessage::Response { response: ServerResponse::ChatAttached {
+                    session: sent_a.source.clone(), execution_instance: instance, binding: Some(sent_a.clone()),
+                    snapshot: Snapshot { generation: 1, session_id: Some("thread-a".into()), ..Default::default() },
+                } });
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            loop {
+                let visibility: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                if matches!(visibility.request, ClientRequest::ChatVisibility { visible: true, .. }) { break; }
+            }
+            handoff_reply(&mut server, &mut codec, None, &proof, ServerMessage::ChatChanged { chat_id: sent_a.source.id });
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+            handoff_reply(&mut server, &mut codec, Some(read.request_id), &proof,
+                ServerMessage::Response { response: ServerResponse::ChatSnapshot {
+                    chat_id: sent_a.source.id, execution_instance: instance, binding: Some(sent_b.clone()),
+                    snapshot: Some(Snapshot { generation: 2, session_id: Some("thread-b".into()), ..Default::default() }),
+                } });
+            for (expected, reason) in [(sent_a, "old captured intent refused"), (sent_b, "new captured intent reached host")] {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::ChatReturnTerminal { expected: ref actual, .. } if *actual == expected));
+                handoff_reply(&mut server, &mut codec, Some(request.request_id), &proof,
+                    ServerMessage::Error(ipc::ProtocolError::new(ipc::ProtocolErrorCode::InvalidRequest, reason, false)));
+            }
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle = ClientHandle::connect_on(client, source, Intent::Start, None, false, None, None, |_| {}).unwrap();
+        assert_eq!(handle.source_binding(), Some(a.clone()));
+        handle.set_visible(true).unwrap(); advance.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.source_binding() != Some(b.clone()) || handle.session().launch.session_id.as_deref() != Some("thread-b") {
+            assert!(Instant::now() < deadline, "same Record refresh did not publish B"); thread::yield_now();
+        }
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+        assert_eq!(handle.return_terminal(a).unwrap_err(), "old captured intent refused");
+        assert_eq!(handle.return_terminal(b).unwrap_err(), "new captured intent reached host");
+        assert!(handle.inner.alive.load(Ordering::Acquire)); assert!(handle.snapshot().error.is_none());
+        finish.send(()).unwrap(); worker.join().unwrap();
+    }
 
     #[test]
     fn handled_command_refusals_do_not_become_shared_snapshot_errors() {
