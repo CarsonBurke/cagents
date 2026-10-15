@@ -4944,6 +4944,21 @@ impl Cagents {
         if !request.current(self, card) { self.stop_pane_close_batch(request.batch); return Task::none(); }
         let batch = request.batch;
         self.remember_conversation_draft(card);
+        // This capability was captured only from a fully qualified read-only
+        // report and its exact canonical shared source. Ending that saved view
+        // never asks a provider or terminal to stop and never deletes a report.
+        if request.archived_metadata_only() {
+            if self.chat_start_pending(card) || !matches!(self.archived_pane_readiness(card), Ok(Some(true))) {
+                self.stop_pane_close_batch(batch);
+                self.status = Some(TransientNotice::warning("The saved run report is no longer ready. Its pane was kept."));
+                return Task::none();
+            }
+            if !request.install_removal_source(self, card) { return Task::none(); }
+            return self.remove_chat_card_for(card, None, batch).unwrap_or_else(|| {
+                self.stop_pane_close_batch(batch);
+                Task::none()
+            });
+        }
         if let Some(Phase::Closing { target, restart: None }) = self.chat_ui.phases.get(&card) {
             if self.chat_ui.end_requests.get(target).is_none_or(|pending| pending.batch != batch) {
                 self.stop_pane_close_batch(batch);

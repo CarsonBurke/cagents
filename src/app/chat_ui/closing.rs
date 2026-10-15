@@ -60,6 +60,9 @@ impl EndRequest {
         } else { None };
         Some(Self { registry: app.workspace_model.identity, batch, kind, session, shared_source, paired_terminal })
     }
+    pub(super) fn archived_metadata_only(&self) -> bool {
+        self.shared_source.as_ref().is_some_and(shared_views::RemovalSource::is_archived_automation)
+    }
     pub(super) fn source_current(&self, app: &Cagents, card: CardId) -> bool {
         if self.registry != app.workspace_model.identity { return false; }
         let Some(state) = app.card_state(card).filter(|state| state.existence.is_open()) else { return false; };
