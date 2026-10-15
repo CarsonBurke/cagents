@@ -3,6 +3,15 @@
 //! transaction and the original grant's first-effect gate remain mandatory.
 use super::*;
 
+/// In-process producer evidence only. There is no Deserialize or public row
+/// constructor. The authenticated bridge must still bind its serialized bytes
+/// to the original UI peer, operation and one-use challenge.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedCreationOperation { row: PendingOperation }
+impl ValidatedCreationOperation {
+    pub(crate) fn operation(&self) -> &PendingOperation { &self.row }
+}
+
 pub(crate) struct ReceivedCreationScopes {
     operation: PendingOperation,
     record: WorktreeRecord,
@@ -69,6 +78,11 @@ impl ReceivedCreationScopes {
         let source = WorktreeAuthority::from_retained_roots(source_root, source_admin, source_common)?;
         let destination = WorktreeAuthority::from_retained_roots(destination_root, destination_admin, destination_common)?;
         Ok(Self {operation: saved, record, source, destination})
+    }
+    /// Used only by the original retained UI producer after validating against
+    /// its privately held original Arc<StateStore> and the SAME six held roles.
+    pub(super) fn into_validated_operation(self) -> ValidatedCreationOperation {
+        ValidatedCreationOperation {row:self.operation}
     }
     pub(crate) fn operation(&self) -> OperationId { self.operation.id }
     pub(crate) fn generation(&self) -> u64 { self.operation.base_generation }

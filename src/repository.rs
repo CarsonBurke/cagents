@@ -23,7 +23,7 @@ pub use authority::{WorktreeAuthority, WorktreeExecutor};
 mod creation_authority;
 mod creation_retention;
 mod creation_receiver;
-pub(crate) use creation_receiver::ReceivedCreationScopes;
+pub(crate) use creation_receiver::{ReceivedCreationScopes, ValidatedCreationOperation};
 pub use creation_retention::{RetainedWorktreeCreation, CreationRetention, SettledCreatedWorktree};
 pub(crate) use creation_retention::SettledCreationRoots;
 mod branch_transaction;
