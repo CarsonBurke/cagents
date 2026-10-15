@@ -94,8 +94,16 @@ impl Ledger {
         Ok(Self {_lock:lock, root:root.to_owned(), path, state, failed:false})
     }
 
+    pub(crate) fn uncertain_credit(&self) -> Result<Option<&str>, String> {
+        self.ensure_usable()?;
+        Ok(self.state.attempts.iter().find(|attempt| attempt.outcome.is_none()).map(|attempt| attempt.credit_id.as_str()))
+    }
+
     pub(crate) fn begin_available(&mut self, credit_id: &str, now_ms: u64, fresh: &Allowance) -> Result<Admission, String> {
         self.ensure_usable()?;
+        if self.uncertain_credit()?.is_some_and(|pending| pending != credit_id) {
+            return Err("Another reset credit has an uncertain outcome; reconcile that original attempt before selecting a different credit".into());
+        }
         if !self.state.attempts.iter().any(|attempt| attempt.credit_id == credit_id && !matches!(attempt.outcome, Some(Outcome::NothingToReset | Outcome::NoCredit))) {
             let matching = fresh.account.as_ref().is_some_and(|account| account.account_id == self.state.account_id && account.backend_origin == self.state.backend_origin);
             let eligible = fresh.reset_credits.as_ref().filter(|credits| credits.available_count > 0)
@@ -231,6 +239,7 @@ mod tests {
         let fresh = Allowance {observed_at_ms:1100, account:Some(account()), account_binding_detail:None, windows:vec![], reset_credits:Some(super::super::ResetCredits {available_count:2, details:Some(vec![super::super::ResetCredit {id:"credit-a".into(), supported_type:true, available:true, expires_at_ms:None}])})};
         ledger.finish("credit-a", Outcome::NothingToReset, &fresh).unwrap();
         ledger.begin("credit-b", 1100).unwrap();
+        assert_eq!(ledger.uncertain_credit().unwrap(), Some("credit-b"));
         let before = fs::read(&ledger.path).unwrap();
         assert!(ledger.begin_available("credit-a", 1200, &fresh).unwrap_err().contains("uncertain"));
         assert_eq!(fs::read(&ledger.path).unwrap(), before);

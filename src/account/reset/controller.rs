@@ -27,6 +27,10 @@ pub(crate) fn execute(handle: &Handle, request: Request, root: &Path, expires: I
             Some(condition) => matches!(super::decision(&allowance, now, condition.max_age_ms, condition.used_percent, true)?, super::Decision::Eligible {..}),
             None => true,
         };
+        if !meets_condition && ledger.uncertain_credit()?.is_some() {
+            current()?;
+            return Err("An earlier reset attempt remains uncertain although current usage is below the monitor condition. No consuming request was sent; explicitly reconcile the original account and credit before retrying".into());
+        }
         if meets_condition {
         match ledger.begin_available(&credit_id, now, &allowance)? {
             Admission::Complete(prior) => { outcome = Some(prior); reconciled = true; }
