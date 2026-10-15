@@ -395,6 +395,7 @@ pub(super) fn restore(
         completion_observed: false,
         returning_terminal: false,
     };
+    register_ownership(host, &handle, &record.session)?;
     let response = session_snapshot(&record);
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged = match (&record.session.terminal, &paired) {
@@ -505,7 +506,7 @@ pub(in crate::host) fn finish_close(
         // A failed terminal spawn may retry after the previous close already
         // committed every outcome and retired the helper. Only its separate
         // exact semantic-retirement receipt can authorize this fast path.
-        return handle.finish_retained_close();
+        return publish_retirement(host, handle, requested);
     }
     let (proof, notifications) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -639,5 +640,31 @@ pub(in crate::host) fn finish_close(
             }
         }
     }
-    handle.finish_retained_close()
+    publish_retirement(host, handle, &source)
+}
+
+/// Transfer the exact final proof before native cleanup consumes its temporary
+/// file. Missing account/confirmed identity keeps session deletion unavailable;
+/// ordinary close can still release an actor that never established that scope.
+fn publish_retirement(host: &SharedHost, handle: &Handle, source: &Session) -> Result<(), String> {
+    handle.finish_retained_close()?;
+    let identity = handle.actor_identity().ok_or("Final retirement lost its exact retained actor identity")?;
+    let Ok(scope) = handle.launch_account_scope() else {
+        tracing::debug!(id=%source.id, "closed retained actor has no qualified account/session deletion evidence");
+        return Ok(());
+    };
+    let registry = super::super::agent_execution::registry(host)?;
+    registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_retirement(
+        identity.instance, &identity.record, source, scope, handle.confirmed_session_id().as_deref(),
+    )
+}
+
+/// No global state lock is held across the durable census publication. A
+/// failed publication leaves the exact helper owned, without exposing input.
+pub(super) fn register_ownership(host: &SharedHost, handle: &Handle, source: &Session) -> Result<(), String> {
+    let identity = handle.actor_identity().ok_or("Retained actor registration has no authenticated helper identity")?;
+    let registry=super::super::agent_execution::registry(host)?;
+    registry.lock().unwrap_or_else(|p|p.into_inner()).register_native_actor_ownership(
+        identity.instance,&identity.record,source,handle.launch_account_scope(),
+    )
 }

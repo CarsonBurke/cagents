@@ -1015,5 +1015,10 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     handle.close().unwrap();
     retained_actor::finish_close(&successor, &handle, &replacement).unwrap();
     assert!(!identity.record.root.is_current() && !identity.record.holder.is_current());
+    let registry=super::super::agent_execution::registry(&successor).unwrap();
+    let retirement=registry.lock().unwrap().native_actor_retirement(identity.instance).unwrap().unwrap();
+    assert_eq!(retirement.owner(), &identity.record);
+    assert_eq!(retirement.confirmed_session(), handle.confirmed_session_id().as_deref());
+    assert_eq!(retirement.scope(), handle.launch_account_scope().unwrap());
     drop(lease);
 }

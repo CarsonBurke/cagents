@@ -1509,6 +1509,7 @@ fn start_with_execution(
                 )
                 .map_err(unavailable)?;
             session = published;
+            retained_actor::register_ownership(host, &handle, &session).map_err(unavailable)?;
         }
         let execution_instance = handle
             .actor_identity()
