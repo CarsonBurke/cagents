@@ -375,7 +375,8 @@ impl Cagents {
         {
             previous.cancel();
         }
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // Logical identity lookup only; physical discovery stays on the worker.
+        let canonical = path.clone();
         let kind = kind
             .or_else(|| {
                 self.sidebar_model
@@ -389,20 +390,33 @@ impl Cagents {
                     .project(&canonical)
                     .map(|project| project.kind)
             });
+        let prepared = (|| {
+            let endpoint = crate::recovery_domain::LocalRecoveryEndpoint::capture(
+                (self.workspace_model.identity != crate::workspace_model::NO_REGISTRY)
+                    .then_some(self.workspace_model.identity),
+            ).map_err(|error| error.to_string());
+            // A retained source uses its original endpoint/lease, and display-only
+            // folders/bare repositories need no new endpoint. Only a fresh Git
+            // admission consumes this captured result on its worker.
+            let ticket = self.edited_root_admissions.lock()
+                .map_err(|_| ProjectPreparationFailure::before_reservation("Window root custody is unavailable."))?
+                .reserve().map_err(ProjectPreparationFailure::before_reservation)?;
+            let work = ticket.begin_preparation().map_err(|error|
+                ProjectPreparationFailure::with_ticket(ticket.clone(), error))?;
+            Ok::<_, ProjectPreparationFailure>((endpoint, ticket, work))
+        })();
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                load_project_with_source(&path, Some(project_id), cancellation, kind, creation_source)
-            })
-            .await
-            .map_err(|error| format!("repository loader join failed: {error}"))
-            .and_then(|result| result)
-            .map(Box::new);
-            Message::RepositoryLoaded {
-                open_cards,
-                project_id,
-                generation,
-                result,
-            }
+            let result = match prepared {
+                Err(error) => Err(error),
+                Ok((endpoint, ticket, work)) => tokio::task::spawn_blocking(move || {
+                    project_source_admission::prepare_project_repository(&path, project_id,
+                        cancellation, kind, creation_source, endpoint, work,
+                        Instant::now() + Duration::from_secs(30))
+                }).await.map_err(|error|
+                    ProjectPreparationFailure::with_ticket(ticket, format!("Repository preparation worker interrupted: {error}")))
+                    .and_then(|result| result).map(Box::new),
+            };
+            Message::RepositoryPrepared { open_cards, project_id, generation, result }
         })
     }
 }

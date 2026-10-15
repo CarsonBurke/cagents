@@ -296,6 +296,7 @@ impl AdmissionTicket {
 #[derive(Debug)]
 pub struct PreparationWork { ticket: AdmissionTicket, finished: bool }
 impl PreparationWork {
+    pub fn ticket(&self) -> &AdmissionTicket { &self.ticket }
     /// Store actual client.prepare_edited_root_owner result BEFORE any enroll
     /// RPC. Even a later panic or lost message leaves the window's SAME owner.
     pub fn prepared(mut self, owner: Arc<EditedRootLease>) -> PreparedRoot {

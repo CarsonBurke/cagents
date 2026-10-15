@@ -34,6 +34,8 @@ mod onboarding_ui;
 mod palette_ui;
 mod project_ui;
 mod project_creation;
+mod project_source_admission;
+use project_source_admission::{PreparedProjectRepository, ProjectPreparationFailure};
 mod recovery_placement;
 mod pull_request_ui;
 mod refresh_ui;
@@ -6910,6 +6912,12 @@ pub enum Message {
         project_id: ProjectId,
         generation: u64,
         result: Result<crate::device_service::Navigation, String>,
+    },
+    RepositoryPrepared {
+        open_cards: bool,
+        project_id: ProjectId,
+        generation: u64,
+        result: Result<Box<PreparedProjectRepository>, ProjectPreparationFailure>,
     },
     RepositoryLoaded {
         open_cards: bool,
