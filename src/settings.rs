@@ -1068,7 +1068,7 @@ pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'stat
 /// Native code-buffer actions have a narrower scope than workspace actions.
 /// Ordinary text controls and shells keep their own editing commands.
 pub fn is_editor_command(action: &str) -> bool {
-    matches!(action, "editor_undo" | "editor_redo" | "editor_cut" | "editor_copy" | "editor_paste" | "editor_select_all")
+    matches!(action, "editor_undo" | "editor_redo" | "editor_cut" | "editor_copy" | "editor_paste" | "editor_select_all" | "next_diagnostic" | "previous_diagnostic")
 }
 
 pub fn text_editing_shortcut_conflict_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
@@ -1083,7 +1083,8 @@ pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBind
     let editor_left = is_editor_command(left);
     let editor_right = is_editor_command(right);
     let outside = if editor_left { right } else { left };
-    !(editor_left != editor_right && text_editing_shortcut_conflict_for(outside, binding).is_some())
+    !(editor_left != editor_right && SHORTCUT_ACTIONS.contains(&outside)
+        && text_editing_shortcut_conflict_for(outside, binding).is_some())
 }
 
 pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
@@ -3670,6 +3671,9 @@ mod tests {
         assert!(shortcuts.fault().is_some_and(|fault| fault.conflicts_with.is_some()));
         shortcuts.find_in_pane = vec!["Ctrl+Alt+G".into()];
         assert!(shortcuts.fault().is_none());
+        shortcuts.next_diagnostic = vec!["Ctrl+Z".into()];
+        assert!(shortcuts.fault().is_some_and(|fault| fault.conflicts_with.is_some()), "two native editor commands cannot share Undo");
+        assert!(shortcut_binding_conflicts("editor_undo", "future_editor_action", parse_shortcut("Ctrl+Z").unwrap()), "an unknown future scope is preserved conservatively");
     }
 
     #[test]

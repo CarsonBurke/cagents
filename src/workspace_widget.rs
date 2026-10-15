@@ -5835,6 +5835,7 @@ mod tests {
         for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
             assert!(!descriptor.label.is_empty());
             assert!(identities.insert(descriptor.id()), "registered IDs are unique");
+            assert_eq!(descriptor.scope == ShortcutScope::Editor, crate::settings::is_editor_command(descriptor.id()), "native keyboard routing and configuration share the editor scope for {}", descriptor.id());
             let index = KeyboardShortcuts::action_names().iter().position(|id| *id == descriptor.id()).expect("every descriptor is configurable");
             let keys = shortcut_keys(descriptor.action, &shortcuts);
             assert_eq!(keys, shortcuts.actions()[index]);
