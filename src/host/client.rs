@@ -1166,6 +1166,7 @@ pub(super) fn process_request(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .handle(client_id, terminal_id)?;
+            super::chat::preflight_for_terminal_close(host, terminal_id, &handle)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock()
