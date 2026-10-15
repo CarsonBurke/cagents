@@ -384,6 +384,11 @@ impl CommandTarget {
             return None;
         }
         let current = source.group(row.area)?.visible_path(&row.path)?;
+        if !source.mutations_available() && matches!(command,
+            Command::StageSelectedChanges | Command::UnstageSelectedChanges
+            | Command::DiscardSelectedChanges | Command::IgnoreChangePath
+            | Command::GitAcceptOurs | Command::GitAcceptTheirs)
+        { return None; }
         match command {
             Command::CopyRelativePath => {
                 return Some(SidebarAction::FileCommand {
@@ -632,6 +637,35 @@ mod change_target_tests {
 #[cfg(test)]
 mod change_navigation_target_tests {
     use super::*;
+    #[test]
+    fn read_only_git_invalidates_captured_mutations_without_hiding_open_or_copy() {
+        let mut model = super::super::tests::panel_model();
+        let state = super::super::tests::panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        let row = source.group(ChangeArea::Untracked).unwrap().rows()[0].entry.clone();
+        let target = CommandTarget::Changes {
+            key: source.key.clone(), row: ChangeSelectionRow { area: row.area, path: row.path },
+            selection_revision: state.change_selection_revision(),
+        };
+        let group = GroupTarget::capture(&model, &state).unwrap();
+        for command in [Command::StageSelectedChanges, Command::DiscardSelectedChanges, Command::IgnoreChangePath] {
+            assert!(target.resolve_in(&model, &state, command).is_some(), "writable positive: {command:?}");
+        }
+        for command in crate::workspace_widget::GIT_GROUP_COMMANDS {
+            assert!(group.available(&model, &state, command, false), "writable whole area: {command:?}");
+        }
+        model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from("Read-only Git host")));
+        for command in [Command::StageSelectedChanges, Command::DiscardSelectedChanges, Command::IgnoreChangePath] {
+            assert!(target.resolve_in(&model, &state, command).is_none(), "captured mutation must be revalidated: {command:?}");
+        }
+        for command in crate::workspace_widget::GIT_GROUP_COMMANDS {
+            assert!(group.action(&model, &state, command, false).is_none(), "captured whole-area action must be revalidated: {command:?}");
+        }
+        for command in [Command::OpenFile, Command::RevealInFiles, Command::CopyRelativePath] {
+            assert!(target.resolve_in(&model, &state, command).is_some(), "read-only operation remains available: {command:?}");
+        }
+    }
+
     #[test]
     fn every_change_navigation_template_uses_current_row_and_captured_revision() {
         let model = super::super::tests::panel_model();

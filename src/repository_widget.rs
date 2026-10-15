@@ -2261,6 +2261,7 @@ pub struct RepositoryRuntime {
     standalone: bool,
     external_editors: crate::sidebar::SidebarEditors,
     keyboard_shortcuts: Arc<crate::settings::KeyboardShortcuts>,
+    git_mutation_unavailable_reason: Option<Arc<str>>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
     /// document operation.
@@ -2493,6 +2494,7 @@ impl RepositoryRuntime {
             standalone: false,
             external_editors: crate::sidebar::SidebarEditors::default(),
             keyboard_shortcuts: Arc::new(crate::settings::KeyboardShortcuts::default()),
+            git_mutation_unavailable_reason: None,
             generation: 0,
             file_list_generation: 0,
             pdf_request: 0,
@@ -2600,6 +2602,12 @@ impl RepositoryRuntime {
 
     pub fn set_keyboard_shortcuts(&mut self, shortcuts: Arc<crate::settings::KeyboardShortcuts>) {
         self.keyboard_shortcuts = shortcuts;
+    }
+
+    /// A host may offer portable reads/editing without a strong Git writer.
+    /// This does not restrict native file editing, saving, or its Undo history.
+    pub fn set_git_mutation_unavailable_reason(&mut self, reason: Option<Arc<str>>) {
+        self.git_mutation_unavailable_reason = reason;
     }
 
     /// History remains attached to the live native buffer while its working
@@ -4595,7 +4603,8 @@ impl RepositoryRuntime {
     ) -> Option<crate::repository::PathSelection> {
         use crate::repository::{PathSelection, RepoPath};
         let file = self.subject_file()?;
-        if self.mutation_refresh_pending
+        if self.git_mutation_unavailable_reason.is_some()
+            || self.mutation_refresh_pending
             || self.blocks_navigation()
             || !(if stage { file.unstaged } else { file.staged })
         {

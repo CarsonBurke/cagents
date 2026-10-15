@@ -52,6 +52,26 @@ fn display_snapshot_options(status_limit: usize) -> cagents::repository::Snapsho
     }
 }
 
+/// Platform read fallback is deliberately separate from mutation authority.
+/// A supported backend's capture/runtime failure never reaches this fallback.
+fn read_display_snapshot(root: &Path, status_limit: usize, authority: Option<WorktreeAuthority>) -> Result<RepositorySnapshot, String> {
+    let service = RepositoryService::system("git");
+    let cancellation = CancellationToken::default();
+    match authority {
+        Some(authority) => {
+            let snapshot = service.with_worktree_authority(authority.clone()).and_then(|service| service.snapshot_with_options(root, display_snapshot_options(status_limit), &cancellation)).map_err(|error| error.to_string())?;
+            authority.validate().map_err(|error| error.to_string())?;
+            Ok(snapshot)
+        }
+        None if !WorktreeAuthority::supported() => read_portable_display_snapshot(root, status_limit),
+        None => Err("The original worktree binding is unavailable. Reopen the worktree before reading Git changes.".into()),
+    }
+}
+
+fn read_portable_display_snapshot(root: &Path, status_limit: usize) -> Result<RepositorySnapshot, String> {
+    RepositoryService::system("git").snapshot_with_options(root, display_snapshot_options(status_limit), &CancellationToken::default()).map_err(|error| error.to_string())
+}
+
 mod checkout;
 mod git_review;
 mod git_mutations;
@@ -1301,15 +1321,10 @@ impl Editor {
         // Discovery failure does not prevent editing an ordinary folder.
         let repository = service.discover(&directory, &token).ok();
         let repository_root = repository.and_then(|info| info.worktree_root);
-        let authority = repository_root.as_deref().map(WorktreeAuthority::capture).transpose().map_err(|error| error.to_string())?;
-        let snapshot = repository_root
-            .as_ref()
-            .map(|root| {
-                service.with_worktree_authority(authority.clone().expect("discovered repository has retained authority"))
-                    .and_then(|service| service.snapshot_with_options(root, display_snapshot_options(status_limit), &token))
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?;
+        let authority = if WorktreeAuthority::supported() {
+            repository_root.as_deref().map(WorktreeAuthority::capture).transpose().map_err(|error| error.to_string())?
+        } else { None };
+        let snapshot = repository_root.as_ref().map(|root| read_display_snapshot(root, status_limit, authority.clone())).transpose()?;
         let root = repository_root.unwrap_or(directory);
         let file = (!path.is_dir())
             .then(|| path.strip_prefix(&root).map(Path::to_path_buf))
@@ -1501,6 +1516,7 @@ impl Editor {
             RepositoryRuntime::new_directory(descriptor)
         };
         runtime.set_standalone(true);
+        runtime.set_git_mutation_unavailable_reason(WorktreeAuthority::unsupported_reason().map(Arc::from));
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
@@ -1532,6 +1548,7 @@ impl Editor {
             .find_map(|tab| tab.mutation);
         if let Some(source) = sidebar.source_control.as_mut() {
             source.set_mutation(mutation);
+            source.set_mutation_unavailable_reason(WorktreeAuthority::unsupported_reason().map(Arc::from));
         }
         let mut navigation = SidebarState::default();
         let pending_file = opened.file.map(|path| PendingFile {
@@ -2390,11 +2407,7 @@ impl Editor {
         let authority = tab.worktree_authority.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let authority = authority.ok_or("The original worktree authority is unavailable")?;
-                let mut snapshot = RepositoryService::system("git")
-                    .with_worktree_authority(authority.clone()).map_err(|error| error.to_string())?
-                    .snapshot_with_options(&root, display_snapshot_options(status_limit), &CancellationToken::default())
-                    .map_err(|error| error.to_string())?;
+                let mut snapshot = read_display_snapshot(&root, status_limit, authority.clone())?;
                 let target = worker_path
                     .as_ref()
                     .map(|path| {
@@ -2402,7 +2415,7 @@ impl Editor {
                     })
                     .transpose()?
                     .flatten();
-                authority.validate().map_err(|error| error.to_string())?;
+                if let Some(authority) = authority { authority.validate().map_err(|error| error.to_string())?; }
                 Ok((snapshot, target))
             })
             .await
@@ -2752,6 +2765,11 @@ impl Editor {
         self.stage_selection(id, stage, vec![selection])
     }
 
+    fn refuse_git_mutation(&mut self, card: CardId) -> Task<Message> {
+        self.notice = Some(self.tab(card).and_then(|tab| tab.sidebar.source_control.as_ref()).and_then(SourceControlModel::mutation_unavailable_reason).or_else(WorktreeAuthority::unsupported_reason).unwrap_or("The original worktree binding is unavailable. Reopen the worktree before changing Git state.").into());
+        Task::none()
+    }
+
     /// A worktree may have several file tabs. Guard and refresh all of them,
     /// including unsaved buffers that are not currently visible.
     fn begin_mutation(&mut self, id: CardId, kind: MutationKind) -> Option<PathBuf> {
@@ -2761,6 +2779,14 @@ impl Editor {
     fn begin_mutation_with_buffer_policy(&mut self, id: CardId, kind: MutationKind, index_only_stage: bool, queue_turn: Option<u64>) -> Option<PathBuf> {
         let tab = self.tab(id)?;
         if !tab.git {
+            return None;
+        }
+        if let Some(reason) = tab.sidebar.source_control.as_ref().and_then(SourceControlModel::mutation_unavailable_reason) {
+            self.notice = Some(reason.into());
+            return None;
+        }
+        if tab.worktree_authority.is_none() {
+            self.notice = Some(WorktreeAuthority::unsupported_reason().unwrap_or("The original worktree binding is unavailable. Reopen the worktree before changing Git state.").into());
             return None;
         }
         let root = tab.runtime.descriptor.worktree.clone();
@@ -2863,8 +2889,7 @@ impl Editor {
             return Task::none();
         }
         let Some(authority) = self.tab(id).and_then(|tab| tab.worktree_authority.clone()) else {
-            self.notice = Some("The original worktree authority is unavailable.".into());
-            return Task::none();
+            return self.refuse_git_mutation(id);
         };
         let kind = if stage {
             MutationKind::Stage
@@ -4061,7 +4086,7 @@ impl Application for Editor {
                         }
                         SidebarAction::UndoDiscard { .. } => {
                             let Some(recovery) = tab.discard_recovery.clone().filter(|recovery| recovery.can_undo()) else { return Task::none(); };
-                            let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
+                            let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(id); };
                             if self.begin_mutation(id, MutationKind::Discard).is_none() { return Task::none(); }
                             let cancellation = self.mutation_cancellation(id).expect("admitted mutation has cancellation");
                             let expires_unix_ms = recovery.expires_unix_ms;
@@ -4162,7 +4187,7 @@ impl Application for Editor {
                                     return Task::none();
                                 }
                             }
-                            let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
+                            let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(id); };
                             let Some(worktree) = self.begin_mutation(id, MutationKind::Other)
                             else {
                                 return Task::none();
@@ -4189,7 +4214,7 @@ impl Application for Editor {
                             })
                         }
                         SidebarAction::Push { branch, target, .. } => {
-                            let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
+                            let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(id); };
                             let Some(worktree) = self.begin_mutation(id, MutationKind::Push) else {
                                 return Task::none();
                             };
@@ -4263,7 +4288,7 @@ impl Application for Editor {
                             if !eligible {
                                 return Task::none();
                             }
-                            let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
+                            let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(id); };
                             let Some(root) = self.begin_mutation(id, MutationKind::Other) else {
                                 return Task::none();
                             };
@@ -4468,6 +4493,7 @@ impl Application for Editor {
                                     if let Some(previous) = tab.sidebar.source_control.as_ref() {
                                         previous.carry_mutation_into(&mut source);
                                     }
+                                    if let Some(reason) = WorktreeAuthority::unsupported_reason() { source.set_mutation_unavailable_reason(Some(Arc::from(reason))); }
                                     source.set_mutation(tab.mutation);
                                     tab.navigation.reconcile_change_rows(&source);
                                     tab.change_source_revision = tab.change_source_revision.wrapping_add(1);
@@ -8339,6 +8365,59 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         std::fs::rename(parked, root).unwrap();
         assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[test]
+    fn portable_git_snapshot_read_keeps_caps_and_supported_binding_errors_do_not_fallback() {
+        let directory = git_fixture();
+        let root = directory.path();
+        for name in ["first.txt", "second.txt"] { std::fs::write(root.join(name), name).unwrap(); }
+        let snapshot = read_portable_display_snapshot(root, 1).unwrap();
+        assert!(snapshot.status.listing_truncated);
+        assert_eq!(snapshot.status.entries.len(), 1);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        if WorktreeAuthority::supported() {
+            assert!(read_display_snapshot(root, 1, None).is_err(), "missing supported binding never selects portable fallback");
+            let authority = WorktreeAuthority::capture(root).unwrap();
+            let original = root.join(".git-original");
+            std::fs::rename(root.join(".git"), &original).unwrap();
+            git(root, &["init", "-b", "foreign"]);
+            assert!(read_display_snapshot(root, 1, Some(authority)).is_err(), "replaced metadata never retries through unpinned reads");
+        }
+    }
+
+    #[test]
+    fn read_only_git_capability_keeps_native_file_editing_and_refuses_stale_mutation_messages() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "working text\n").unwrap();
+        let mut app = editor();
+        app.settings.editor_auto_save = false;
+        let id = open_real_git(&mut app, root, Some("tracked.txt"));
+        let reason: Arc<str> = Arc::from("Git mutations are unavailable in this fixture; file editing and Git reads remain enabled.");
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        {
+            let tab = app.tab_mut(id).unwrap();
+            tab.worktree_authority = None;
+            tab.runtime.set_git_mutation_unavailable_reason(Some(reason.clone()));
+            tab.sidebar.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason.clone()));
+        }
+        assert!(app.tab(id).unwrap().git, "read-only Git remains a Git source");
+        let source = app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap();
+        assert!(!source.mutations_available());
+        assert!(!source.can_commit("message"));
+        assert!(!sidebar::whole_change_group_available(&app.tab(id).unwrap().sidebar, &app.tab(id).unwrap().navigation, cagents::repository::ChangeArea::Unstaged, sidebar::ChangeGroupCommand::Stage, false));
+        sidebar_action(&mut app, SidebarAction::Stage { key: key.clone(), selection: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())] });
+        assert_eq!(app.notice.as_deref(), Some(reason.as_ref()));
+        sidebar_action(&mut app, SidebarAction::Commit { key, message: "must refuse".into(), amend: false });
+        assert_eq!(app.notice.as_deref(), Some(reason.as_ref()));
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        let edit = app.update(Message::Repository(RepositoryAction::EditorAction { card: id, action: EditorAction::Edit(EditorEdit::Paste(Arc::new("editable ".into()))) }));
+        run_tasks(&mut app, edit);
+        assert!(app.tab(id).unwrap().runtime.editor_text().unwrap().contains("editable"));
+        let save = app.update(Message::Repository(RepositoryAction::Save { card: id, overwrite: false }));
+        run_tasks(&mut app, save);
+        assert!(std::fs::read_to_string(root.join("tracked.txt")).unwrap().contains("editable"));
     }
 
     #[test]

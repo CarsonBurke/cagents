@@ -18,7 +18,7 @@ impl Cagents {
                 matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked)
             }
         };
-        if !allowed {
+        if !allowed || self.git_mutation_unavailable(&key) {
             return Task::none();
         }
         let Some(group) = self
