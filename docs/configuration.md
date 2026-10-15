@@ -70,6 +70,10 @@ hibernation_delay_ms = 30000
 focus_follows_mouse = false
 app_theme = "system"
 ui_scale = 1.0
+interface_font_family = ""
+interface_font_size = 13.0
+chat_font_family = ""
+chat_font_size = 14.0
 terminal_line_height = 1.286
 terminal_scroll_speed = 1.0
 terminal_padding = 8.0
@@ -144,6 +148,10 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `focus_follows_mouse` | boolean | `false` | Activates a pane after the pointer crosses into it and stays for 300 ms. Typing cancels the pending activation |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |
+| `interface_font_family` | string | `""` | Empty follows the desktop interface family; otherwise a family name up to 128 bytes. Settings lists installed families and warns when a saved family is unavailable |
+| `interface_font_size` | float | `13.0` | `10.0` through `24.0` logical pixels for workbench labels and controls |
+| `chat_font_family` | string | `""` | Empty follows the interface family; otherwise a family name up to 128 bytes. Applies to transcript prose and Markdown; code stays monospace |
+| `chat_font_size` | float | `14.0` | `8.0` through `40.0` logical pixels. Applies to existing transcript messages and the composer |
 | `terminal_line_height` | float | `1.286` | `1.0` through `2.0`, relative to the font size |
 | `terminal_scroll_speed` | float | `1.0` | `0.25` through `4.0`. Multiplies wheel and trackpad scrolling. Mouse wheel events sent to applications that track the mouse are not scaled |
 | `terminal_padding` | float | `8.0` | `0.0` through `24.0` logical pixels |
@@ -260,6 +268,12 @@ ansi = [
   "#8fbcdb", "#c5a0c0", "#93ccdc", "#eceff4",
 ]
 ```
+
+The settings pane presents width fractions as percentages and hibernation delays
+in seconds. The file keeps the documented fractional widths and millisecond
+duration so existing configuration continues to round-trip unchanged. Font
+selectors accept a typed family as well as an installed choice. An unavailable
+family remains saved, with a visible fallback warning.
 
 ## Language servers
 

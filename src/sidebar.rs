@@ -3925,7 +3925,12 @@ fn view_inner<'a>(
                 && !matches!(model.data_state, SidebarDataState::Error(_))
             {
                 cosmic::iced::widget::lazy(
-                    (cache.generation(model, state), compact, modal_open),
+                    (
+                        cache.generation(model, state),
+                        compact,
+                        modal_open,
+                        crate::design::typography_revision(),
+                    ),
                     move |_| project_list(model, state, compact, modal_open),
                 )
                 .into()

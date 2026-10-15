@@ -30,8 +30,11 @@ pub fn text<'a, Message: Clone + 'static>(
     value: impl Into<Cow<'a, str>>,
 ) -> TextInput<'a, Message> {
     TextInput::new(placeholder, value)
-        .size(design::TEXT_BODY)
-        .line_height(iced::widget::text::LineHeight::Absolute(LINE_HEIGHT.into()))
+        .font(design::interface_font())
+        .size(design::interface_size())
+        .line_height(iced::widget::text::LineHeight::Absolute(
+            (design::interface_size() + 5.0).into(),
+        ))
         .padding([INSET_Y, space::S])
         .style(style())
 }
@@ -84,7 +87,7 @@ where
     Message: Clone + 'static,
 {
     widget::dropdown(options, selected, on_select)
-        .text_size(design::TEXT_BODY)
+        .text_size(design::interface_size())
         .padding([INSET_Y, space::S])
 }
 
