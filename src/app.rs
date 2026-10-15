@@ -3935,6 +3935,36 @@ fn grouped_digits(value: usize) -> String {
 }
 
 #[derive(Debug, Clone)]
+pub struct SourceControlRead {
+    prepared: Option<Box<(RepositorySnapshot, SourceControlModel)>>,
+    status: StatusSnapshot,
+    head_repository: Option<GitHubRepoKey>,
+    read: u64,
+}
+
+/// A panel failure only changes sidebar status authority when the worker
+/// specifically observed its status command/parser fail. Later Files/metadata
+/// failures retain their own panel error without asserting status was unreadable.
+#[derive(Debug, Clone)]
+pub struct SourceControlReadFailure {
+    message: String,
+    status_read: Option<u64>,
+}
+impl From<String> for SourceControlReadFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            status_read: None,
+        }
+    }
+}
+impl From<&str> for SourceControlReadFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Message {
     Device(device_ui::Action),
     ReviewFilePanelToggle {
@@ -3959,7 +3989,7 @@ pub enum Message {
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel)>>, String>,
+        result: Result<SourceControlRead, SourceControlReadFailure>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -11090,16 +11120,36 @@ impl Cagents {
                 if invalidation != 0 {
                     cache.invalidate(invalidation & 2 != 0);
                 }
-                let Some(mut snapshot) = service
+                let status_read = git_ui::next_status_read();
+                let snapshot = service
                     .snapshot_cached(&worktree, options, &cancellation, &mut cache)
-                    .map_err(|error| error.to_string())?
-                else {
-                    return Ok(None);
-                };
+                    .map_err(|error| SourceControlReadFailure {
+                        message: error.to_string(),
+                        status_read: cache.status_attempt_failed().then_some(status_read),
+                    })?;
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
-                    return Err("source-control read cancelled".to_owned());
+                    return Err("source-control read cancelled".into());
                 }
+                let status = cache.row_status().ok_or_else(|| {
+                    "successful source-control read did not expose display status".to_owned()
+                })?;
+                let head_repository = cache.publication_remote().and_then(|remote| {
+                    remote
+                        .push_url
+                        .as_deref()
+                        .or(remote.fetch_url.as_deref())
+                        .and_then(crate::github::remote_repository_key)
+                });
+                let mut read = SourceControlRead {
+                    prepared: None,
+                    status: status.clone(),
+                    head_repository,
+                    read: status_read,
+                };
+                let Some(mut snapshot) = snapshot else {
+                    return Ok(read);
+                };
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
@@ -11122,12 +11172,17 @@ impl Cagents {
                 let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
-                    return Err("source-control read cancelled".to_owned());
+                    return Err("source-control read cancelled".into());
                 }
-                Ok(Some(Box::new((snapshot, model))))
+                read.prepared = Some(Box::new((snapshot, model)));
+                Ok(read)
             })
             .await
-            .map_err(|error| format!("source-control reader join failed: {error}"))
+            .map_err(|error| {
+                SourceControlReadFailure::from(format!(
+                    "source-control reader join failed: {error}"
+                ))
+            })
             .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
@@ -16453,14 +16508,19 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.source_cancel = None;
-                if matches!(result, Ok(None)) {
-                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                        source.set_reloading(false);
-                    }
-                    return self.reload_pending_source_control(&key);
-                }
-                if let Ok(Some(prepared)) = &result
-                    && let Some(worktree) = self
+                // The expensive panel model follows its existing request
+                // generation. Watcher scalar updates do not restart it under
+                // continuous writes; only row/cache facts use the shared order.
+                if let Ok(read) = &result
+                    && self.refresh_ui.git.accept_bound_status(
+                        &key,
+                        &read.status,
+                        read.head_repository.as_ref(),
+                        read.read,
+                    )
+                {
+                    let head_repository = read.head_repository.clone();
+                    if let Some(worktree) = self
                         .sidebar_model
                         .projects
                         .iter_mut()
@@ -16471,16 +16531,51 @@ impl Application for Cagents {
                                 .iter_mut()
                                 .find(|worktree| worktree.id == key.worktree_id)
                         })
+                    {
+                        worktree.apply_status(&read.status);
+                        worktree.apply_status_head(&read.status.head);
+                        if head_repository.is_none() || worktree.head_repository != head_repository
+                        {
+                            worktree.clear_pull_request();
+                        }
+                        worktree.head_repository = head_repository;
+                    }
+                }
+                if let Err(failure) = &result
+                    && let Some(read) = failure.status_read
                 {
-                    worktree.apply_status(&prepared.0.status);
+                    let display_error: String = failure.message.chars().take(512).collect();
+                    if self
+                        .refresh_ui
+                        .git
+                        .accept_bound_status_error(&key, &display_error, read)
+                        && let Some(worktree) = self
+                            .sidebar_model
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == key.project_id)
+                            .and_then(|project| {
+                                project.worktrees.iter_mut().find(|row| {
+                                    row.id == key.worktree_id && row.path == key.canonical_path
+                                })
+                            })
+                    {
+                        worktree.apply_status_error(Some(&display_error));
+                    }
+                }
+                if matches!(&result, Ok(read) if read.prepared.is_none()) {
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_reloading(false);
+                    }
+                    return self.reload_pending_source_control();
                 }
                 let (snapshot, mut next) = match result {
-                    Ok(Some(prepared)) => {
-                        let (snapshot, model) = *prepared;
+                    Ok(read) => {
+                        let (snapshot, model) =
+                            *read.prepared.expect("unchanged reads returned above");
                         (Some(snapshot), model)
                     }
-                    Ok(None) => unreachable!(),
-                    Err(error) => (None, SourceControlModel::failed(key.clone(), error)),
+                    Err(error) => (None, SourceControlModel::failed(key, error.message)),
                 };
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
@@ -16489,14 +16584,14 @@ impl Application for Cagents {
                     previous.carry_mutation_into(&mut next);
                 }
                 self.sidebar_model.source_control = Some(next);
-                let accepted = match snapshot {
+                let task = match snapshot {
                     Some(snapshot) => self.refresh_branch_changes(&snapshot),
                     None => {
                         self.cancel_branch_changes();
                         Task::none()
                     }
                 };
-                Task::batch([accepted, self.reload_pending_source_control(&key)])
+                Task::batch([task, self.reload_pending_source_control()])
             }
             Message::SourceControlHistory {
                 generation,
@@ -17688,8 +17783,9 @@ fn load_repository(
             let status = (!worktree.bare)
                 .then(|| {
                     service
-                        .status_with_untracked(&worktree.path, false, &cancellation)
+                        .status_with_untracked(&worktree.path, true, &cancellation)
                         .ok()
+                        .map(|status| status.display_summary())
                 })
                 .flatten();
             (worktree, status)
@@ -27727,6 +27823,15 @@ mod tests {
         );
         let _ = project;
     }
+    fn unchanged_source_control_proof() -> SourceControlRead {
+        SourceControlRead {
+            prepared: None,
+            status: crate::repository::StatusSnapshot::default(),
+            head_repository: None,
+            read: git_ui::next_status_read(),
+        }
+    }
+
     #[test]
     fn watcher_refresh_bursts_keep_the_active_read_and_drain_one_followup() {
         let mut app = context_inspector_test_app(false);
@@ -27761,9 +27866,9 @@ mod tests {
         };
         let model = SourceControlModel::ready(key.clone(), &snapshot);
         let followup = app.update(Message::SourceControlLoaded {
-            key: key.clone(),
-            request: generation,
-            result: Ok(Some(Box::new((snapshot, model)))),
+            key: key.clone(), request: generation,
+            result: Ok(SourceControlRead { status: snapshot.status.display_summary(),
+                prepared: Some(Box::new((snapshot, model))), head_repository: None, read: git_ui::next_status_read() }),
         });
         assert_eq!(
             app.sidebar_model
@@ -27784,15 +27889,8 @@ mod tests {
         assert!(app.refresh_ui.source_cancel.is_some());
         assert!(!active.is_cancelled());
         let next = app.refresh_ui.source_generation;
-        drop(app.update(Message::SourceControlLoaded {
-            key,
-            request: next,
-            result: Ok(None),
-        }));
-        assert_eq!(
-            app.refresh_ui.source_generation, next,
-            "no trailing reload after the pending edge was consumed"
-        );
+        drop(app.update(Message::SourceControlLoaded { key, request: next, result: Ok(unchanged_source_control_proof()) }));
+        assert_eq!(app.refresh_ui.source_generation, next, "no trailing reload after the pending edge was consumed");
         assert!(app.refresh_ui.source_cancel.is_none());
     }
 
@@ -27807,20 +27905,9 @@ mod tests {
             let generation = app.refresh_ui.source_generation;
             app.refresh_ui.source_cancel = Some(CancellationToken::default());
             drop(app.reload_source_control_from_event(&key));
-            let result = if failed {
-                Err("transient read failure".to_owned())
-            } else {
-                Ok(None)
-            };
-            let followup = app.update(Message::SourceControlLoaded {
-                key,
-                request: generation,
-                result,
-            });
-            assert!(
-                cosmic::iced::runtime::task::into_stream(followup).is_some(),
-                "pending invalidation survives failed={failed}"
-            );
+            let result = if failed { Err("transient read failure".into()) } else { Ok(unchanged_source_control_proof()) };
+            let followup = app.update(Message::SourceControlLoaded { key, request: generation, result });
+            assert!(cosmic::iced::runtime::task::into_stream(followup).is_some(), "pending invalidation survives failed={failed}");
             assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1));
             assert!(!app.refresh_ui.source_reload_pending);
             assert!(app.refresh_ui.source_cancel.is_some());
@@ -27847,15 +27934,8 @@ mod tests {
         assert!(active.is_cancelled());
         assert!(!app.refresh_ui.source_reload_pending);
         assert!(app.refresh_ui.source_cancel.is_none());
-        drop(app.update(Message::SourceControlLoaded {
-            key,
-            request: retired,
-            result: Ok(None),
-        }));
-        assert!(
-            app.refresh_ui.source_cancel.is_none(),
-            "retired callback cannot start a new read"
-        );
+        drop(app.update(Message::SourceControlLoaded { key, request: retired, result: Ok(unchanged_source_control_proof()) }));
+        assert!(app.refresh_ui.source_cancel.is_none(), "retired callback cannot start a new read");
         assert!(!app.refresh_ui.source_reload_pending);
     }
 }

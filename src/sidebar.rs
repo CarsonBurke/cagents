@@ -699,6 +699,8 @@ pub struct SidebarWorktree {
     pub locked: bool,
     pub dirty: Option<DirtyState>,
     pub untracked_omitted: bool,
+    untracked_complete: bool,
+    pub status_error: Option<String>,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
@@ -721,6 +723,7 @@ impl SidebarWorktree {
         ahead: Option<u64>,
         behind: Option<u64>,
     ) -> Self {
+        let untracked_complete = dirty.is_some();
         let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
         let status = status_summary(detached, locked, dirty.as_ref(), false, ahead, behind);
@@ -758,6 +761,8 @@ impl SidebarWorktree {
             locked,
             dirty,
             untracked_omitted: false,
+            untracked_complete,
+            status_error: None,
             ahead,
             behind,
             created_at_unix_ms: None,
@@ -802,6 +807,7 @@ impl SidebarWorktree {
             behind,
         );
         row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
+        row.untracked_complete = status.is_some_and(|status| !status.untracked_omitted);
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row
@@ -829,21 +835,61 @@ impl SidebarWorktree {
         self.refresh_status_chrome();
     }
 
+    /// A successful bound read can repair a missed HEAD event without a new
+    /// worktree listing. This changes presentation only, never path/identity or
+    /// the retained authority used by mutation workers.
+    pub fn apply_status_head(&mut self, head: &crate::repository::HeadState) {
+        let (branch, detached) = match head {
+            crate::repository::HeadState::Branch { name, .. } => (Some(name.as_str()), false),
+            crate::repository::HeadState::Unborn { branch } => (branch.as_deref(), false),
+            crate::repository::HeadState::Detached { .. } => (None, true),
+            crate::repository::HeadState::Unknown => return,
+        };
+        if self.branch.as_deref() != branch || self.detached != detached {
+            self.clear_pull_request();
+            self.head_repository = None;
+            self.branch = branch.map(str::to_owned);
+            self.detached = detached;
+            self.chrome.folded_branch = self.branch.as_deref().map(fold);
+            self.refresh_status_chrome();
+        }
+    }
+
+    pub fn apply_status_error(&mut self, error: Option<&str>) {
+        let error = error.map(|error| error.chars().take(512).collect::<String>());
+        if self.status_error != error {
+            self.status_error = error;
+            self.refresh_status_chrome();
+        }
+    }
+
     /// Apply each authoritative read, including the transition back to clean.
     pub fn apply_status(&mut self, status: &StatusSnapshot) {
         let (ahead, behind) = match &status.tracking {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
         };
-        if self.untracked_omitted == status.untracked_omitted
-            && self.dirty.as_ref() == Some(&status.dirty)
+        // A -uno watcher read has no authority over the last complete untracked
+        // count. Reuse it until a full read replaces it or a failed read makes
+        // that old count explicitly last-known rather than current.
+        let mut dirty = status.dirty.clone();
+        let untracked_omitted = status.untracked_omitted
+            && (!self.untracked_complete || self.status_error.is_some());
+        if status.untracked_omitted && !untracked_omitted {
+            dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
+        }
+        if self.status_error.is_none()
+            && self.untracked_omitted == untracked_omitted
+            && self.dirty.as_ref() == Some(&dirty)
             && self.ahead == ahead
             && self.behind == behind
         {
             return;
         }
-        self.dirty = Some(status.dirty.clone());
-        self.untracked_omitted = status.untracked_omitted;
+        self.untracked_complete = !untracked_omitted;
+        self.status_error = None;
+        self.dirty = Some(dirty);
+        self.untracked_omitted = untracked_omitted;
         self.ahead = ahead;
         self.behind = behind;
         self.refresh_status_chrome();
@@ -891,6 +937,30 @@ impl SidebarWorktree {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn status_tooltip_for_test(&self) -> &str {
+        &self.chrome.tooltip
+    }
+
+    fn status_description(&self) -> String {
+        let mut status = status_summary(
+            self.detached,
+            self.locked,
+            self.dirty.as_ref(),
+            self.untracked_omitted,
+            self.ahead,
+            self.behind,
+        );
+        if let Some(error) = &self.status_error {
+            status = if self.dirty.is_some() {
+                format!("Git status unavailable: {error}. Last known: {status}")
+            } else {
+                format!("Git status unavailable: {error}")
+            };
+        }
+        status
+    }
+
     fn refresh_status_chrome(&mut self) {
         let label = self
             .chrome
@@ -923,14 +993,13 @@ impl SidebarWorktree {
                     )
                     .into_boxed_str()
                 });
-        let mut status = status_summary(
-            self.detached,
-            self.locked,
-            self.dirty.as_ref(),
-            self.untracked_omitted,
-            self.ahead,
-            self.behind,
-        );
+        if self.status_error.is_some() {
+            self.chrome.dirty_badge = Some(match self.chrome.dirty_badge.take() {
+                Some(badge) => format!("Last known: {badge}").into_boxed_str(),
+                None => "Git status unavailable".into(),
+            });
+        }
+        let mut status = self.status_description();
         if let Some(pr) = &self.chrome.pull_request {
             use std::fmt::Write as _;
             let state = match pr.state {
@@ -15766,6 +15835,34 @@ pub(crate) mod tests {
         status.untracked_omitted = false;
         worktree.apply_status(&status);
         assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("1 changes"));
+    }
+
+    #[test]
+    fn failed_status_revokes_full_untracked_count_until_a_new_full_read() {
+        let mut row = SidebarWorktree::from_durable(
+            WorktreeId::new(), "/repo".into(), Some("main".into()));
+        let mut status = StatusSnapshot::default();
+        status.dirty.untracked = 12;
+        row.apply_status(&status);
+        assert!(!row.untracked_omitted);
+        row.apply_status_error(Some("index unreadable"));
+        assert!(row.status_tooltip_for_test().contains("Last known:"));
+        status.untracked_omitted = true;
+        status.dirty.untracked = 0;
+        row.apply_status(&status);
+        assert!(row.status_error.is_none(), "successful tracked read clears its error");
+        assert!(row.untracked_omitted, "the stale full count is no longer authoritative");
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        status.untracked_omitted = false;
+        status.dirty.untracked = 3;
+        row.apply_status(&status);
+        assert!(!row.untracked_omitted);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 3);
+        status.untracked_omitted = true;
+        status.dirty.untracked = 0;
+        row.apply_status(&status);
+        assert!(!row.untracked_omitted, "ordinary tracked reads preserve a trustworthy full count");
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 3);
     }
 
     #[test]

@@ -8316,6 +8316,9 @@ mod tests {
         status
     }
 
+    // FakeExecutor answers the installation-only GIT_CONFIG_SYSTEM query
+    // directly while recording it. These rows describe repository commands;
+    // total command assertions still count that one cold installation query.
     fn cached_snapshot_outputs(
         entries: &[u8],
         files: &[u8],
@@ -8326,7 +8329,6 @@ mod tests {
             success(b""), // staged numstat
             success(b""), // unstaged numstat
             success(files),
-            success(b""), // cached installation system-config path discovery
             exit(1, b""), // no remotes
             success(b""), // no refs
         ]
@@ -8338,7 +8340,6 @@ mod tests {
         outputs.push(success(&snapshot_status(b"")));
         let mut metadata_outputs = cached_snapshot_outputs(b"", b"");
         metadata_outputs.drain(2..4);
-        metadata_outputs.remove(3); // installation path already cached
         outputs.extend(metadata_outputs);
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
@@ -8445,7 +8446,7 @@ mod tests {
                 .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new())
                 .unwrap();
             let status = b"# branch.oid (initial)\0# branch.head main\0";
-            let mut outputs = (0..8).map(|_| success(b"")).collect::<Vec<_>>();
+            let mut outputs = (0..7).map(|_| success(b"")).collect::<Vec<_>>();
             outputs[1] = success(status);
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
@@ -8462,7 +8463,7 @@ mod tests {
                 observed.extend_from_slice(record);
                 observed.push(0);
             }
-            outputs[6] = success(&observed);
+            outputs[5] = success(&observed);
             outputs.push(success(status));
             let executor = Arc::new(FakeExecutor::with_outputs(outputs));
             let service = RepositoryService::new("git", executor.clone());
@@ -9252,7 +9253,6 @@ mod tests {
             let mut outputs = cached_snapshot_outputs(b"", b"");
             let mut recovered = cached_snapshot_outputs(b"", b"");
             recovered.drain(2..4);
-            recovered.remove(3); // installation path already cached
             outputs.extend(recovered);
             outputs.push(success(&snapshot_status(b"")));
             let executor = Arc::new(FakeExecutor::with_outputs(outputs));
