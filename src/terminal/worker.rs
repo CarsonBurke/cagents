@@ -2360,15 +2360,14 @@ impl Worker {
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
         // A tracked reference follows the same existing row even when a full
-        // history prunes and appends while its total stays unchanged. Tracking
-        // the active bottom row avoids traversing the history to create a pin.
+        // history prunes and appends while its total stays unchanged. Pin the
+        // newest history row: active rows can move inside scrolling regions
+        // without removing any history, so they cannot measure global pruning.
         use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
-        let before_rows = self.terminal.total_rows().unwrap_or(0) as u64;
-        let marker = self.terminal.rows().ok().and_then(|rows| {
-            self.terminal.track_grid_ref(Point::Active(PointCoordinate {
-                x: 0, y: u32::from(rows.saturating_sub(1)),
-            })).ok()
-        });
+        let marker_row = self.terminal.scrollback_rows().unwrap_or(0).saturating_sub(1);
+        let marker = self.terminal.track_grid_ref(Point::Screen(PointCoordinate {
+            x: 0, y: u32::try_from(marker_row).unwrap_or(u32::MAX),
+        })).ok();
         let screen = self.terminal.active_screen().ok();
         self.terminal.vt_write(&bytes);
         if screen != self.terminal.active_screen().ok() {
@@ -2377,7 +2376,7 @@ impl Worker {
             .and_then(|pin| pin.point(PointSpace::Screen).ok().flatten())
         {
             self.history_position.dropped = self.history_position.dropped.saturating_add(
-                before_rows.saturating_sub(1).saturating_sub(u64::from(point.y)));
+                marker_row.saturating_sub(u64::from(point.y)));
         } else {
             // No previous cell survives: an unknown number of newly-created
             // rows may also have been pruned within this batch. A fresh epoch
@@ -6112,6 +6111,19 @@ mod tests {
         present(&worker);
         worker.publish_snapshot(true);
         assert_eq!(worker.published.snapshot.load().scroll.history, worker.history_position);
+        worker.run();
+    }
+
+    #[test]
+    fn active_scrolling_regions_do_not_rebase_unchanged_history() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"history\r\n".repeat(100));
+        let origin = worker.history_position;
+        let total = worker.terminal.total_rows().unwrap();
+        worker.process_output(b"\x1b[12;24r\x1b[24;1H".to_vec());
+        for _ in 0..10 { worker.process_output(b"region\r\n".to_vec()); }
+        assert_eq!(worker.terminal.total_rows().unwrap(), total);
+        assert_eq!(worker.history_position, origin, "moving active rows cannot remove older history");
         worker.run();
     }
 
