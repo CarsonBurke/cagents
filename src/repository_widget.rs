@@ -4562,6 +4562,8 @@ impl RepositoryRuntime {
         let ignore_whitespace = self.diff_ignore_whitespace;
         let font = self.editor_font;
         let present = [self.diff_model().is_none_or(|model| model.present[0]), true];
+        let source_head = self.diff_model().and_then(|model| model.source_head.clone());
+        let modes = self.diff_model().map_or([None; 2], |model| model.modes);
         self.working_diff.active = Some(WorkingDiffJob {
             identity: identity.clone(),
             revision,
@@ -4580,6 +4582,8 @@ impl RepositoryRuntime {
                 let model = if rich {
                     let mut model = build_document_diff_sources_with_font(Arc::clone(&baseline), Arc::clone(&after), &source, syntax_theme, ignore_whitespace, font, &cancellation)?;
                     model.present = present;
+                    model.source_head = source_head;
+                    model.modes = modes;
                     Some(model)
                 } else { None };
                 let additions = if let Some(model) = &model { added_source_lines(model) }
@@ -9950,6 +9954,7 @@ fn no_text_view_height(
             new,
             old_label,
             new_label,
+            ..
         } => information_state_height(
             format!("No text diff between {old_label} and {new_label}"),
             [(old_label, old), (new_label, new)]
@@ -13299,6 +13304,8 @@ mod tests {
                     },
                     old_label: "old".into(),
                     new_label: "new".into(),
+                    source_head: None,
+                    modes: [None; 2],
                 },
                 Path::new("kernel.cu"),
                 crate::settings::EditorSyntaxTheme::Auto,
@@ -14778,6 +14785,8 @@ mod tests {
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
                 present: [true; 2],
+                source_head: None,
+                modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: Vec::new(),
@@ -15655,6 +15664,8 @@ mod tests {
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
                 present: [true; 2],
+                source_head: None,
+                modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: vec![inline; 100_000],
@@ -16161,6 +16172,8 @@ mod tests {
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
                 present: [true; 2],
+                source_head: None,
+                modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: vec![
@@ -18298,6 +18311,8 @@ mod tests {
                     new,
                     old_label: "Index".into(),
                     new_label: "Working tree".into(),
+                    source_head: None,
+                    modes: [None; 2],
                 })),
             );
             assert_eq!(runtime.inspector_context().diff_state, Some(expected));
@@ -18354,6 +18369,8 @@ mod tests {
         DiffModel {
             line_counts: [0; 2],
             present: [true; 2],
+            source_head: None,
+            modes: [None; 2],
             before: Arc::from(""),
             after: Arc::from(""),
             inline_rows: Vec::new(),

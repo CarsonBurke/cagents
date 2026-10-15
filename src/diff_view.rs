@@ -138,6 +138,10 @@ pub struct DiffModel {
     pub line_counts: [usize; 2],
     /// Whether each side exists; an empty file differs from an absent side.
     pub present: [bool; 2],
+    /// Reader-pinned HEAD revision for mutations of a staged comparison.
+    pub source_head: Option<crate::repository::GitHeadGuard>,
+    /// File modes read with the sources; unknown for pure in-memory builders.
+    pub modes: [Option<u32>; 2],
     /// Exact source baseline, including original line endings and final newline.
     pub before: Arc<str>,
     /// Exact new-side source, retained for patch and selection operations.
@@ -1349,6 +1353,8 @@ impl RenderedDiff {
                 new,
                 old_label,
                 new_label,
+                source_head,
+                modes,
             } => {
                 if !old.is_diffable() || !new.is_diffable() {
                     return Self::NoText(DiffContent::Comparison {
@@ -1356,6 +1362,8 @@ impl RenderedDiff {
                         new,
                         old_label,
                         new_label,
+                        source_head,
+                        modes,
                     });
                 }
                 let present = [
@@ -1375,6 +1383,8 @@ impl RenderedDiff {
                     None => return Self::Error("repository operation cancelled".into()),
                 };
                 model.present = present;
+                model.source_head = source_head;
+                model.modes = modes;
                 Self::Text {
                     model: Arc::new(model),
                     old_label,
@@ -1571,6 +1581,8 @@ fn build_diff_rows_from_sources(
         let mut model = DiffModel {
             line_counts: [lines.len(); 2],
             present: [true; 2],
+            source_head: None,
+            modes: [None; 2],
             before: Arc::clone(before),
             after: Arc::clone(after_source),
             inline_rows: Vec::with_capacity(lines.len()),
@@ -1787,6 +1799,8 @@ fn build_diff_rows_from_sources(
     Ok(DiffModel {
         line_counts: [before_lines.len(), after_lines.len()],
         present: [true; 2],
+        source_head: None,
+        modes: [None; 2],
         before: Arc::clone(before),
         after: Arc::clone(after_source),
         inline_rows,
@@ -2468,6 +2482,8 @@ mod tests {
                 },
                 old_label: "old".into(),
                 new_label: "new".into(),
+                source_head: None,
+                modes: [None; 2],
             },
             Path::new("sample.rs"),
             AUTO,
@@ -3005,6 +3021,8 @@ mod tests {
                     new,
                     old_label: "old".into(),
                     new_label: "new".into(),
+                    source_head: None,
+                    modes: [None; 2],
                 },
                 Path::new("sample.txt"),
                 AUTO,
