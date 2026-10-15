@@ -1607,6 +1607,30 @@ mod tests {
     }
 
     #[test]
+    fn move_picker_enter_keeps_the_shown_channel_across_newer_model_destinations() {
+        for remove_original in [false, true] {
+            let (mut app, source, destination, pane) = channel_move_fixture();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
+            let mut replacement = app.workspace_model.channels.iter().find(|channel| channel.id == destination).unwrap().clone();
+            replacement.id = ChannelId::new();
+            replacement.ordinal = 99;
+            if remove_original { app.workspace_model.channels.retain(|channel| channel.id != destination); }
+            app.workspace_model.channels.push(replacement);
+            app.workspace_model.sequence += 1;
+            drop(app.update_palette(super::super::palette_ui::Action::Submit));
+            if remove_original {
+                assert!(rx.try_recv().is_err(), "a vanished target cannot be replaced by the new channel at the same index");
+                assert!(!app.pane_transfer_pending(pane.id));
+                assert!(app.status.as_ref().unwrap().message.contains("Choose another channel"));
+            } else {
+                assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView { scope: Scope::Channel(from), change: Change::Transfer { destination: Scope::Channel(to), .. }, .. } if from == source && to == destination), "Enter retains the originally shown target even when a newer channel sorts first");
+            }
+        }
+    }
+
+    #[test]
     fn a_queued_channel_drop_from_an_old_workspace_is_ignored() {
         let (mut app, _, destination, pane) = channel_move_fixture();
         let (tx, rx) = async_channel::unbounded();

@@ -12,6 +12,7 @@ pub(super) struct State {
     panes_only: bool,
     sidebar_target: Option<sidebar::commands::CommandTarget>,
     move_pane: Option<CardId>,
+    move_destinations: Vec<(crate::model::ChannelId, String)>,
     git_target: Option<sidebar::git_commands::GitTarget>,
     git_captured: bool,
     stash_picker: Option<Command>,
@@ -373,6 +374,7 @@ impl Cagents {
                 self.palette.query = Some(String::new());
                 self.palette.selected = 0;
                 self.palette.move_pane = None;
+                self.palette.move_destinations.clear();
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
@@ -390,11 +392,13 @@ impl Cagents {
             }
             Action::MovePaneToChannel(card, channel) => self.update(Message::MovePaneToChannel { card, channel }),
             Action::MovePane(card) => {
-                if self.workspace_inputs_blocked() || self.pane_move_destinations(card).is_empty() {
-                    return Task::none();
-                }
+                if self.workspace_inputs_blocked() { return Task::none(); }
+                let destinations: Vec<_> = self.pane_move_destinations(card).into_iter()
+                    .map(|channel| (channel.id, self.pane_move_destination_label(channel).into_owned())).collect();
+                if destinations.is_empty() { return Task::none(); }
                 let task = self.update_palette(Action::Open);
                 self.palette.move_pane = Some(card);
+                self.palette.move_destinations = destinations;
                 task
             }
             Action::Close => {
@@ -409,6 +413,7 @@ impl Cagents {
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
                 self.palette.move_pane = None;
+                self.palette.move_destinations.clear();
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
                         .map(cosmic::Action::App)
@@ -485,6 +490,7 @@ impl Cagents {
         self.settings.palette_recents.truncate(24);
         self.palette.query = None;
         self.palette.move_pane = None;
+        self.palette.move_destinations.clear();
         self.palette.stash_picker = None;
         let command = self.update(message);
         self.palette.sidebar_target = None;
@@ -738,9 +744,8 @@ impl Cagents {
         }
         if let Some(card) = self.palette.move_pane {
             let (_, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
-            let mut entries: Vec<_> = self.pane_move_destinations(card).into_iter().filter_map(|channel| {
-                let label = self.pane_move_destination_label(channel).into_owned();
-                match_score(&label, query).map(|score| (score, label, Message::Palette(Action::MovePaneToChannel(card, channel.id))))
+            let mut entries: Vec<_> = self.palette.move_destinations.iter().filter_map(|(channel, label)| {
+                match_score(label, query).map(|score| (score, label.clone(), Message::Palette(Action::MovePaneToChannel(card, *channel))))
             }).collect();
             if !query.is_empty() { entries.sort_by_key(|entry| entry.0); }
             return entries.into_iter().map(|(_, label, message)| (label, String::new(), message)).collect();
@@ -925,6 +930,7 @@ impl Cagents {
             .flat_map(|(index, (label, chord, message))| {
                 let enabled = match &message {
                     Message::Palette(Action::RunGitStash(target, command, entry)) => target.stash_action(&self.sidebar_model, &self.sidebar_state, *command, entry).is_some(),
+                    Message::Palette(Action::MovePaneToChannel(card, channel)) => self.can_move_pane_to_channel(*card, *channel),
                     _ => true,
                 };
                 let next_section = self.palette_section(&message);

@@ -109,7 +109,8 @@ mod tests {
                     Layout::new(&node), mouse::Cursor::Available(Point::new(80.0, 16.0)), &renderer,
                     &mut clipboard::Null, &mut Shell::new(&mut Vec::new()), &viewport);
             }
-            header.as_widget_mut().overlay(tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).is_some()
+            let open = header.as_widget_mut().overlay(tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).is_some();
+            open
         };
         let header = app.column_header(id, true, 320.0);
         let mut tree = Tree::new(header.as_widget());
