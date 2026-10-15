@@ -350,62 +350,94 @@ fn ensure_account_homes_unused(
     accounts: impl IntoIterator<Item = crate::account::Account>,
 ) -> Result<(), ProtocolError> {
     for account in accounts {
-        let variable = crate::account::home_variable(account.provider).unwrap();
         let home = account.resolved_home().unwrap();
-        let selected_home = |environment: &std::collections::BTreeMap<String, String>,
+        let selected_home = |provider: crate::agent::Provider, environment: &std::collections::BTreeMap<String, String>,
                              cwd: &std::path::Path| {
+            let variable = crate::account::home_variable(provider)?;
             environment.get(variable).filter(|path| !path.is_empty())
                 .map(|path| cwd.join(path))
                 .or_else(|| environment.get("HOME").filter(|path| !path.is_empty())
-                    .map(|path| cwd.join(path).join(if account.provider == crate::agent::Provider::Claude {
+                    .map(|path| cwd.join(path).join(if provider == crate::agent::Provider::Claude {
                         ".claude"
                     } else { ".codex" })))
         };
-        let selected_recipe = |recipe: &crate::model::LaunchRecipe| {
-            let mut environment = recipe.environment.clone();
+        let selected_recipe = |provider, recipe: &crate::model::LaunchRecipe| {
+            let mut environment:std::collections::BTreeMap<String,String>=["HOME","CLAUDE_CONFIG_DIR","CODEX_HOME"].into_iter()
+                .filter_map(|name|recipe.environment.get(name).map(|value|(name.into(),value.clone()))).collect();
             for name in &recipe.unset_environment { environment.remove(name); }
-            selected_home(&environment, &recipe.working_directory)
+            selected_home(provider, &environment, &recipe.working_directory)
         };
         // Copy small ownership metadata under HostState. Resolving aliases and
         // reading retained checkpoints happens after releasing that mutex.
-        let (paths, scopes, closing, upgrade) = {
+        let (mut paths, scopes, closing, upgrade, registry) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut paths = Vec::new();
             let mut scopes = Vec::new();
-            for record in state.terminals.values().filter(|record| !record.handle.is_completed()) {
-                paths.extend(selected_recipe(&record.session.launch));
-                if let Some(environment) = &record.execution_environment {
-                    paths.extend(selected_home(&environment.0, &record.session.launch.working_directory));
+            let mut unresolved_native = false;
+            for (_id, record) in state.terminals.iter().filter(|(id, _)| state.account_terminal_in_use(**id)) {
+                for provider in crate::account::Account::PROVIDERS {
+                    paths.extend(selected_recipe(provider, &record.session.launch));
+                    if let Some(environment) = &record.execution_environment {
+                        paths.extend(selected_home(provider, &environment.0, &record.session.launch.working_directory));
+                    } else {
+                        // Ordinary PTYs inherit these nonsecret homes. A bare
+                        // recipe omits them, but that omission is not disuse.
+                        let mut environment:std::collections::BTreeMap<String,String>=["HOME","CLAUDE_CONFIG_DIR","CODEX_HOME"].into_iter()
+                            .filter_map(|name|std::env::var(name).ok().map(|value|(name.into(),value))).collect();
+                        environment.extend(["HOME","CLAUDE_CONFIG_DIR","CODEX_HOME"].into_iter()
+                            .filter_map(|name|record.session.launch.environment.get(name).map(|value|(name.into(),value.clone()))));
+                        for name in crate::account::launch_credential_overrides(&record.session.launch) {environment.remove(&name);}
+                        paths.extend(selected_home(provider,&environment,&record.session.launch.working_directory));
+                    }
                 }
             }
-            for record in state.chats.values().filter(|record| record.handle.owns_work()) {
-                paths.extend(selected_recipe(&record.session.launch.recipe));
-                paths.extend(selected_home(&record.handle.execution_environment().0,
-                    &record.session.launch.recipe.working_directory));
-                if let Ok(scope) = record.handle.launch_account_scope() {
-                    scopes.push(scope.clone());
+            for record in state.chats.values().filter(|record| record.handle.owns_work() || !record.subscribers.is_empty()) {
+                paths.extend(selected_recipe(record.session.launch.provider, &record.session.launch.recipe));
+                match record.handle.launch_account_scope() {
+                    Ok(scope) => scopes.push(scope.clone()),
+                    Err(_) if record.session.launch.provider == account.provider => unresolved_native = true,
+                    Err(_) => {},
                 }
             }
             for session in state.chat_spawning.values() {
-                paths.extend(selected_recipe(&session.launch.recipe));
+                paths.extend(selected_recipe(session.launch.provider, &session.launch.recipe));
             }
             for pending in state.chat_handoffs.values() {
-                paths.extend(selected_recipe(&pending.source().launch.recipe));
-                paths.extend(selected_recipe(&pending.replacement().launch));
+                paths.extend(selected_recipe(pending.source().launch.provider, &pending.source().launch.recipe));
+                for provider in crate::account::Account::PROVIDERS {
+                    paths.extend(selected_recipe(provider, &pending.replacement().launch));
+                }
             }
-            (paths, scopes, state.native_closing.values()
-                .any(|pending| pending.may_own_provider(account.provider)), state.account_cleanup_evidence())
+            (paths, scopes, unresolved_native || state.native_closing.values()
+                .any(|pending| pending.may_own_provider(account.provider)), state.account_cleanup_evidence(), state.execution_registry.clone())
         };
+        // Shared model membership also covers another window's parked or
+        // completed panes. Read the independent connection outside HostState.
+        if let Some(registry) = registry {
+            let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()
+                .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                    format!("Cannot verify open account panes: {message}"), false))?;
+            for pane in model.views.into_iter().flat_map(|view| view.panes) {
+                match pane.kind {
+                    crate::model::CardKind::Chat(session) => paths.extend(selected_recipe(session.launch.provider, &session.launch.recipe)),
+                    crate::model::CardKind::Terminal(session) => {
+                        for provider in crate::account::Account::PROVIDERS { paths.extend(selected_recipe(provider, &session.launch)); }
+                    },
+                    _ => {},
+                }
+            }
+        }
         use std::os::unix::fs::MetadataExt;
         let identity = std::fs::metadata(&home).ok().filter(|metadata| metadata.is_dir())
             .map(|metadata| (metadata.dev(), metadata.ino()));
         let uses_path = |path: &std::path::Path| {
-            path == home || identity.is_some_and(|identity| std::fs::metadata(path).ok()
+            path.starts_with(&home) || home.starts_with(path)
+                || path.canonicalize().ok().zip(home.canonicalize().ok()).is_some_and(|(path,home)| path.starts_with(&home) || home.starts_with(&path))
+                || identity.is_some_and(|identity| std::fs::metadata(path).ok()
                 .is_some_and(|metadata| metadata.is_dir() && (metadata.dev(), metadata.ino()) == identity))
         };
         if closing || paths.iter().any(|path| uses_path(path)) || scopes.iter().any(|scope| {
-            scope.provider == account.provider &&
-                (scope.canonical_home == home || identity == Some((scope.device, scope.inode)))
+            scope.canonical_home.starts_with(&home) || home.starts_with(&scope.canonical_home) || identity == Some((scope.device, scope.inode))
         }) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
@@ -453,6 +485,27 @@ pub(super) fn process_request(
         let model = super::session_locations::relocate(host, client_id, relocation.clone())?;
         return Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false));
     }
+    // Reserve affected physical homes under a short writer, then release it
+    // before provider probes/logout, transcript movement and tree sweeping.
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::AccountLifecycle { operation },
+    } = &request {
+        let reservation = {
+            let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+            let accounts = crate::account::remote::affected_accounts(operation)
+                .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
+            ensure_account_homes_unused(host, accounts.clone())?;
+            super::account_lifecycle::Reservation::install(host, &accounts)?
+        };
+        let reply = crate::account::remote::execute_reserved(operation.clone(), gate.clone(), || {
+            ensure_control_open(host).map_err(|error| error.message)?;
+            reservation.verify()
+        }).map(crate::device_service::Reply::AccountLifecycle)
+            .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
+        return Ok((ServerResponse::DeviceOperation { reply }, Vec::new(), false));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
@@ -496,23 +549,51 @@ pub(super) fn process_request(
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
             | ClientRequest::ChatRecoverAccount { .. }
-            | ClientRequest::DeviceOperation {
-                operation: crate::device_service::Operation::AccountLifecycle { .. }
-            }
+
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
+    if exclusive && matches!(&request, ClientRequest::PrepareUpgrade {..} | ClientRequest::PrepareConfirmedUpgrade {..} | ClientRequest::Shutdown | ClientRequest::ShutdownV1 {..}) {
+        super::account_lifecycle::ensure_idle(host)?;
+    }
     super::agent_execution::terminals::admit(host, client_id, &request)?;
+    match &request {
+        ClientRequest::Attach {terminal_id, ..} => super::account_lifecycle::ensure_terminal(host,*terminal_id)?,
+        ClientRequest::ChatAttach {session} => {
+            let actual = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&session.id)
+                .and_then(|record| record.handle.launch_account_scope().ok()).map(|scope| scope.canonical_home.clone());
+            super::account_lifecycle::ensure_paths(host,actual)?;
+            super::account_lifecycle::ensure_launch(host,&session.launch.recipe.working_directory,
+                &session.launch.recipe.environment,&session.launch.recipe.unset_environment,false)?;
+        }
+        ClientRequest::EditWorkspaceModel {edit: crate::workspace_model::ModelEdit::SeedView {panes,..}} => {
+            for pane in panes { super::account_lifecycle::ensure_pane(host,pane)?; }
+        }
+        ClientRequest::EditWorkspaceModel {edit: crate::workspace_model::ModelEdit::ChangeView {change,..}} => {
+            use crate::workspace_model::views::Change;
+            match change {
+                Change::Insert {pane,..} | Change::InsertIfEmpty {pane} | Change::Update {pane,..} => super::account_lifecycle::ensure_pane(host,pane)?,
+                _ => {},
+            }
+        }
+        _ => {},
+    }
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
-            if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
-                let accounts =
-                    crate::account::remote::affected_accounts(operation).map_err(|message| {
-                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            match &operation {
+                crate::device_service::Operation::AccountsUpdate { registry, .. } => {
+                    let proposed = serde_json::from_value(registry.clone()).map_err(|error| {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, format!("Invalid account preferences: {error}"), false)
                     })?;
-                ensure_account_homes_unused(host, accounts)?;
+                    super::account_lifecycle::ensure_update(host, &proposed)?;
+                }
+                crate::device_service::Operation::AccountLogin { account }
+                | crate::device_service::Operation::AccountProbe { account, .. } => {
+                    super::account_lifecycle::ensure_paths(host, account.resolved_home())?;
+                }
+                _ => {}
             }
             let reply = crate::device_service::execute(operation).map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -1325,6 +1406,7 @@ fn prepare_resume(
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
+        if super::account_lifecycle::ensure_terminal(host,cursor.terminal_id).is_err() { continue; }
         let (terminal, events) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {

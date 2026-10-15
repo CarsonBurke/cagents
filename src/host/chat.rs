@@ -1182,6 +1182,9 @@ fn start_with_execution(
         spec.environment = environment.clone();
     }
     spec.remove_unset_environment();
+    if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
+        super::account_lifecycle::ensure_launch(host, &spec.working_directory, &spec.environment, &spec.unset_environment, false)?;
+    }
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2092,6 +2095,12 @@ fn recover_account(
         {
             return Err(error("This conversation has an explicitly pinned account"));
         }
+    // A lifecycle reservation must be rejected before history copying or source
+    // teardown, not merely at the successor's eventual spawn.
+    for launch in [&source.launch, &replacement.launch] {
+        super::account_lifecycle::ensure_launch(host, &launch.recipe.working_directory,
+            &launch.recipe.environment, &launch.recipe.unset_environment, false)?;
+    }
     // Check all other writers before touching either history or stopping the
     // source. The final start guard is too late to protect a live target's files.
     {

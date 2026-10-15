@@ -255,6 +255,7 @@ pub(crate) struct HostState {
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
     pub(super) automations: Option<super::automations::Handle>,
+    pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     pub(super) account_routing: Option<Arc<super::accounts::Signal>>,
     /// Wakes the courier that hands messages to idle conversations.
     pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
@@ -324,6 +325,11 @@ struct PreparedUpgrade {
 }
 
 impl HostState {
+    pub(super) fn account_terminal_in_use(&self, id: TerminalId) -> bool {
+        self.terminals.get(&id).is_some_and(|record| !record.handle.is_completed())
+            || self.subscriptions.by_terminal.get(&id).is_some_and(|clients| !clients.is_empty())
+    }
+
     pub(super) fn account_cleanup_evidence(&self) -> Option<Arc<crate::upgrade::handoff::Store>> {
         self.upgrade_evidence.clone()
     }
@@ -371,6 +377,7 @@ impl HostState {
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
             control_gate: Arc::new(RwLock::new(())),
+            account_lifecycle: Default::default(),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
             upgrade_evidence: None,
@@ -3560,6 +3567,10 @@ fn start_terminal_view_owned(
     if let Some(environment) = &mut execution_environment {
         session.launch.remove_unset_environment(&mut environment.0);
     }
+    let effective = execution_environment.as_ref().map(|environment| &environment.0)
+        .unwrap_or(&session.launch.environment);
+    super::account_lifecycle::ensure_launch(shared, &session.launch.working_directory,
+        effective, &crate::account::launch_credential_overrides(&session.launch), execution_environment.is_none())?;
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();

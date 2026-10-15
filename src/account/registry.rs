@@ -154,12 +154,51 @@ impl Registry {
                 || account
                     .linked_home
                     .as_ref()
-                    .is_some_and(|linked| linked == &path)
+                    .is_some_and(|linked| linked.starts_with(&path))
         }) || self
             .pending
             .iter()
             .any(|pending| pending.provider == provider && pending.key == key)
     }
+    /// Credential homes affected by an externally proposed preference edit.
+    /// Include physical aliases and both ends of changed routing preferences.
+    #[cfg(feature = "host")]
+    pub(crate) fn changed_account_homes(&self, next: &Self, homes: Option<&Homes>) -> Vec<PathBuf> {
+        let mut keys = std::collections::BTreeSet::new();
+        for account in self.accounts.iter().chain(&next.accounts) {
+            if self.find(account.key) != next.find(account.key)
+                || self.is_archived(account.key) != next.is_archived(account.key) {
+                keys.insert(account.key);
+            }
+        }
+        let mut paths = Vec::new();
+        for registry in [self, next] {
+            paths.extend(registry.all_accounts(homes).into_iter()
+                .filter(|account| account.registry_key().is_some_and(|key| keys.contains(&key)))
+                .filter_map(|account| account.resolved_home()));
+        }
+        for provider in Account::PROVIDERS {
+            let name = provider.executable();
+            if self.defaults.get(name) != next.defaults.get(name) || self.system_labels.get(name) != next.system_labels.get(name) {
+                paths.extend([self.default_account(provider, homes), next.default_account(provider, homes)]
+                    .into_iter().filter_map(|account| account.resolved_home()));
+            }
+            for repository in self.project_defaults.keys().chain(next.project_defaults.keys()) {
+                let old = self.project_defaults.get(repository).and_then(|choices| choices.get(name));
+                let new = next.project_defaults.get(repository).and_then(|choices| choices.get(name));
+                if old != new {
+                    for value in [old,new].into_iter().flatten() {
+                        paths.extend(self.all_accounts(homes).into_iter().chain(next.all_accounts(homes))
+                            .filter(|account| account.provider == provider && (account.registry_key().map(|key| key.to_string()).as_ref() == Some(value)
+                                || (value == "system" && account.is_system())))
+                            .filter_map(|account| account.resolved_home()));
+                    }
+                }
+            }
+        }
+        paths
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -880,6 +919,21 @@ impl Store {
         registered: bool,
         before_removal: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<(Registry, Option<String>)> {
+        let result = self.park_home_checked(homes, provider, key, registered, before_removal)?;
+        homes.finish_removals();
+        Ok(result)
+    }
+
+    /// Short ownership/registration transaction. Tree sweeping belongs outside
+    /// daemon admission and does not make the parked name launchable again.
+    pub(crate) fn park_home_checked(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        key: Uuid,
+        registered: bool,
+        before_removal: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<(Registry, Option<String>)> {
         let (registry, error) = {
             let _lifecycle = homes.lifecycle_lock()?;
             let (registry, retained) = self.update_checked(|registry| {
@@ -901,7 +955,6 @@ impl Store {
             };
             (registry, error)
         };
-        homes.finish_removals();
         Ok((registry, error))
     }
 

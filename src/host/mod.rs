@@ -1,3 +1,4 @@
+mod account_lifecycle;
 mod accounts;
 mod activity;
 mod agent_execution;
