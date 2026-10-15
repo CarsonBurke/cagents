@@ -12,7 +12,9 @@ pub(crate) use model::inspect_archive_report_in;
 /// Upper bound accepted by read-only source archive qualification.
 pub(crate) const WORKSPACE_REGISTRY_SCHEMA_VERSION: u32 = model::SCHEMA_VERSION;
 mod notifications;
+mod project_removal;
 mod service;
+mod session_locations;
 mod state;
 
 use std::{

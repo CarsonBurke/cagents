@@ -31,10 +31,17 @@ pub const PENDING_ORDINAL: u32 = u32::MAX;
 ///
 /// The canonical repository path is the key because a [`crate::model::ProjectId`]
 /// is minted per window and re-keying one would cascade through the `worktrees`
-/// foreign key. A path is the real identity of a project and needs no migration.
+/// foreign key. Explicit Locate edits migrate this key atomically while preserving
+/// channel, view and pane identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProject {
     pub repository: PathBuf,
+    /// Verified checkout used to discover this project; identity stays repository.
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+    /// Verified primary checkout, retained when a linked checkout becomes current.
+    #[serde(default)]
+    pub primary_checkout: Option<PathBuf>,
     pub name: String,
     #[serde(default)]
     pub kind: ProjectKind,
@@ -156,6 +163,33 @@ pub fn reorder_navigation(
     true
 }
 
+/// Current logical ownership and the verified operational spelling of one
+/// accepted agent's directory. Its immutable launch spec remains provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLocation {
+    pub agent: crate::model::AgentId,
+    pub repository: PathBuf,
+    pub directory: PathBuf,
+    pub blocked_directory: Option<PathBuf>,
+}
+
+/// Actionable location failures only. Private launch/process/directory proof
+/// records remain in the daemon and never cross the presentation boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLocationRefusal {
+    pub session: crate::model::TerminalId,
+    pub directory: PathBuf,
+    pub reason: String,
+}
+
+impl AgentLocation {
+    /// Logical placement can be restored even when process authority refuses
+    /// to move to a replacement inode. This path grants no execution authority.
+    pub fn logical_directory(&self) -> &Path {
+        self.blocked_directory.as_deref().unwrap_or(&self.directory)
+    }
+}
+
 /// The shared sidebar model as the registry currently holds it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceModel {
@@ -202,6 +236,10 @@ pub struct WorkspaceModel {
     /// First bounded page of pending consent summaries from every project.
     #[serde(default)]
     pub pending_automation_proposals: Vec<crate::automations::ProposalSummary>,
+    #[serde(default)]
+    pub agent_locations: Vec<AgentLocation>,
+    #[serde(default)]
+    pub session_location_refusals: Vec<SessionLocationRefusal>,
 }
 
 impl WorkspaceModel {
@@ -244,11 +282,15 @@ impl WorkspaceModel {
             | ModelEdit::ChangeView { .. } => {}
             ModelEdit::OpenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             }
             | ModelEdit::ReopenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             } => {
@@ -258,8 +300,18 @@ impl WorkspaceModel {
                     .iter_mut()
                     .find(|project| project.repository == *repository)
                 {
-                    Some(project) => project.name = name.clone(),
+                    Some(project) => {
+                        project.name = name.clone();
+                        if let Some(checkout) = checkout {
+                            project.checkout = Some(checkout.clone());
+                        }
+                        if let Some(primary) = primary_checkout {
+                            project.primary_checkout = Some(primary.clone());
+                        }
+                    }
                     None => self.projects.push(ModelProject {
+                        checkout: checkout.clone(),
+                        primary_checkout: primary_checkout.clone(),
                         repository: repository.clone(),
                         name: name.clone(),
                         kind: *kind,
@@ -267,7 +319,98 @@ impl WorkspaceModel {
                     }),
                 }
             }
-            ModelEdit::CloseProject { repository } => {
+            ModelEdit::RelocateProject { relocation } => {
+                if relocation.verification_only()
+                    || (relocation.repository != relocation.destination
+                        && self
+                            .projects
+                            .iter()
+                            .any(|project| project.repository == relocation.destination))
+                {
+                    return;
+                }
+                for project in &mut self.projects {
+                    if project.repository == relocation.repository {
+                        project.repository = relocation.destination.clone();
+                        if let Some(checkout) = &mut project.checkout {
+                            relocation.path(checkout);
+                        }
+                        if let Some(primary) = &mut project.primary_checkout {
+                            relocation.path(primary);
+                        }
+                    }
+                }
+                let channels = self
+                    .channels
+                    .iter()
+                    .filter(|channel| channel.repository == relocation.repository)
+                    .map(|channel| channel.id)
+                    .collect::<std::collections::HashSet<_>>();
+                for channel in &mut self.channels {
+                    if channel.repository == relocation.repository {
+                        channel.repository = relocation.destination.clone();
+                    }
+                }
+                for order in &mut self.navigation_orders {
+                    if order.repository == relocation.repository {
+                        order.repository = relocation.destination.clone();
+                        for item in &mut order.items {
+                            if let NavigationItem::Worktree(path) = item {
+                                relocation.path(path);
+                            }
+                        }
+                    }
+                }
+                for view in &mut self.views {
+                    let owned = match &view.scope {
+                        views::Scope::Channel(channel) => channels.contains(channel),
+                        views::Scope::Worktree { repository, .. } => {
+                            *repository == relocation.repository
+                        }
+                    };
+                    if owned {
+                        relocation.view(view);
+                        view.revision = view.revision.saturating_add(1);
+                    }
+                }
+                let owned_agents = self
+                    .agent_locations
+                    .iter()
+                    .filter(|location| location.repository == relocation.repository)
+                    .map(|location| location.agent)
+                    .collect::<std::collections::HashSet<_>>();
+                for location in &mut self.agent_locations {
+                    if location.repository == relocation.repository {
+                        location.repository = relocation.destination.clone();
+                    }
+                }
+                for agent in &mut self.agents {
+                    if owned_agents.contains(&agent.id)
+                        || agent.spec.target.repository == relocation.repository
+                    {
+                        relocation.agent(agent);
+                    }
+                }
+                if relocation.repository != relocation.destination {
+                    self.closed_projects
+                        .retain(|path| *path != relocation.destination);
+                    if !self.closed_projects.contains(&relocation.repository) {
+                        self.closed_projects.push(relocation.repository.clone());
+                    }
+                }
+            }
+            ModelEdit::CloseProject { repository }
+            | ModelEdit::CloseProjectInstance {
+                project: crate::project_recovery::ProjectInstance { repository, .. },
+            } => {
+                if let ModelEdit::CloseProjectInstance { project } = edit
+                    && (self.identity != project.registry
+                        || self
+                            .project(repository)
+                            .is_none_or(|current| current.ordinal != project.ordinal))
+                {
+                    return;
+                }
                 self.navigation_orders
                     .retain(|order| order.repository != *repository);
                 if !self.closed_projects.contains(repository) {
@@ -354,6 +497,10 @@ pub enum ModelEdit {
     /// Upsert by path. A repeat updates the name and keeps the kind and rank.
     OpenProject {
         repository: PathBuf,
+        #[serde(default)]
+        checkout: Option<PathBuf>,
+        #[serde(default)]
+        primary_checkout: Option<PathBuf>,
         name: String,
         #[serde(default)]
         kind: ProjectKind,
@@ -362,6 +509,10 @@ pub enum ModelEdit {
     /// sync upserts cannot, because one may have been queued before the close.
     ReopenProject {
         repository: PathBuf,
+        #[serde(default)]
+        checkout: Option<PathBuf>,
+        #[serde(default)]
+        primary_checkout: Option<PathBuf>,
         name: String,
         #[serde(default)]
         kind: ProjectKind,
@@ -369,6 +520,10 @@ pub enum ModelEdit {
     /// Removes the project and every channel inside it. A project nobody has
     /// open cannot keep channels reachable.
     CloseProject { repository: PathBuf },
+    /// Atomically preserve project/channel/pane identity at a located path.
+    RelocateProject {
+        relocation: crate::project_recovery::Relocation,
+    },
     /// Idempotent by id. The id is minted by the client, the rank by the
     /// registry.
     CreateChannel {
@@ -413,6 +568,27 @@ pub enum ModelEdit {
         operation: Uuid,
         change: views::Change,
     },
+    /// Remove only the exact registry/project incarnation the user selected.
+    CloseProjectInstance {
+        project: crate::project_recovery::ProjectInstance,
+    },
+}
+
+fn verified_primary_checkout(
+    repository: &Path,
+    primary: Option<PathBuf>,
+    checkout: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let repository = canonical_repository(repository)?;
+    // Retained discovery metadata may become stale after a checkout is removed,
+    // unmounted, or reused. An unavailable primary must not block a valid linked
+    // open; absent updates preserve the registry's prior discovery information.
+    Ok(primary
+        .as_deref()
+        .and_then(|root| crate::project_location::primary_checkout(root, &repository))
+        .or_else(|| {
+            checkout.and_then(|root| crate::project_location::primary_checkout(root, &repository))
+        }))
 }
 
 impl ModelEdit {
@@ -425,19 +601,39 @@ impl ModelEdit {
         Ok(match self {
             Self::OpenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             } => Self::OpenProject {
                 repository: canonical_repository(&repository)?,
+                primary_checkout: verified_primary_checkout(
+                    &repository,
+                    primary_checkout,
+                    checkout.as_deref(),
+                )?,
+                checkout: checkout
+                    .map(|path| std::fs::canonicalize(&path).map_err(|error| error.to_string()))
+                    .transpose()?,
                 name,
                 kind,
             },
             Self::ReopenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             } => Self::ReopenProject {
                 repository: canonical_repository(&repository)?,
+                primary_checkout: verified_primary_checkout(
+                    &repository,
+                    primary_checkout,
+                    checkout.as_deref(),
+                )?,
+                checkout: checkout
+                    .map(|path| std::fs::canonicalize(&path).map_err(|error| error.to_string()))
+                    .transpose()?,
                 name,
                 kind,
             },
@@ -455,6 +651,21 @@ impl ModelEdit {
                 before,
                 fallback,
             },
+            Self::RelocateProject { relocation } => {
+                relocation.validate()?;
+                Self::RelocateProject {
+                    relocation: crate::project_recovery::Relocation {
+                        repository: canonical_repository(&relocation.repository)?,
+                        destination: canonical_repository(&relocation.destination)?,
+                        old_root: canonical_repository(&relocation.old_root)?,
+                        new_root: canonical_repository(&relocation.new_root)?,
+                    },
+                }
+            }
+            Self::CloseProjectInstance { project } => {
+                project.validate()?;
+                Self::CloseProjectInstance { project }
+            }
             Self::CloseProject { repository } => Self::CloseProject {
                 repository: canonical_repository(&repository)?,
             },
@@ -719,6 +930,89 @@ mod tests {
             Some(&worktree),
             "terminal presentation follows its console pane, not its native chat source"
         );
+    }
+
+    #[test]
+    fn session_location_refusals_roundtrip_and_missing_legacy_field_defaults_empty() {
+        let model = WorkspaceModel {
+            session_location_refusals: vec![SessionLocationRefusal {
+                session: crate::model::TerminalId::new(),
+                directory: "/located/project".into(),
+                reason: "Recover the original provider or close this pane explicitly".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::from_slice::<WorkspaceModel>(&serde_json::to_vec(&model).unwrap()).unwrap(),
+            model
+        );
+        assert_eq!(
+            postcard::from_bytes::<WorkspaceModel>(&postcard::to_stdvec(&model).unwrap()).unwrap(),
+            model
+        );
+        let mut legacy = serde_json::to_value(&model).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("session_location_refusals");
+        assert!(
+            serde_json::from_value::<WorkspaceModel>(legacy)
+                .unwrap()
+                .session_location_refusals
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn legacy_project_metadata_defaults_checkout_and_none_updates_preserve_it() {
+        let legacy: ModelProject = serde_json::from_value(serde_json::json!({
+            "repository": "/metadata/project.git", "name": "project", "ordinal": 7
+        }))
+        .unwrap();
+        assert_eq!(legacy.checkout, None);
+        assert_eq!(legacy.primary_checkout, None);
+        let mut model = WorkspaceModel {
+            projects: vec![legacy],
+            ..Default::default()
+        };
+        model.fold(
+            1,
+            &ModelEdit::OpenProject {
+                repository: "/metadata/project.git".into(),
+                checkout: Some("/checkouts/project".into()),
+                primary_checkout: Some("/checkouts/project".into()),
+                name: "project".into(),
+                kind: ProjectKind::Git,
+            },
+        );
+        let legacy_edit: ModelEdit = serde_json::from_value(serde_json::json!({
+            "OpenProject": { "repository": "/metadata/project.git", "name": "renamed", "kind": "Git" }
+        })).unwrap();
+        model.fold(2, &legacy_edit);
+        assert_eq!(
+            model.projects[0].checkout.as_deref(),
+            Some(Path::new("/checkouts/project"))
+        );
+        model.fold(
+            3,
+            &ModelEdit::OpenProject {
+                repository: "/metadata/project.git".into(),
+                checkout: Some("/checkouts/linked".into()),
+                primary_checkout: None,
+                name: "renamed".into(),
+                kind: ProjectKind::Git,
+            },
+        );
+        assert_eq!(
+            model.projects[0].checkout.as_deref(),
+            Some(Path::new("/checkouts/linked"))
+        );
+        assert_eq!(
+            model.projects[0].primary_checkout.as_deref(),
+            Some(Path::new("/checkouts/project"))
+        );
+        assert_eq!(model.projects[0].ordinal, 7);
+        assert_eq!(model.projects[0].name, "renamed");
     }
 
     #[test]

@@ -404,7 +404,7 @@ fn pending_spawn_close_does_not_remove_card_or_reject_future_completion() {
         }
     ));
     let _ = app.update(Message::CloseCard(card));
-    let _ = app.update(Message::CommitClose(card));
+    let _ = app.update(app.commit_close_message(card));
     assert!(app.card_state(card).unwrap().existence.is_open());
     assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
     assert!(app.terminal_close_attempts.is_empty());

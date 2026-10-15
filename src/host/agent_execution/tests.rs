@@ -815,6 +815,8 @@ fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
     let mut registry = Registry::at(&path).unwrap();
     registry
         .apply(&ModelEdit::OpenProject {
+            checkout: None,
+            primary_checkout: None,
             repository: root.join("project"),
             name: "Service fixture".into(),
             kind: ProjectKind::Folder,

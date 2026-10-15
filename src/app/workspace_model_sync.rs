@@ -33,6 +33,10 @@ pub enum ModelUpdate {
     Connected(WorkspaceModel),
     /// A fresh read, taken because an edge does not carry the ranks it changed.
     Read(WorkspaceModel),
+    Relocated {
+        relocation: crate::project_recovery::Relocation,
+        model: WorkspaceModel,
+    },
     Reopened {
         repository: PathBuf,
         model: WorkspaceModel,
@@ -54,6 +58,12 @@ pub enum ModelUpdate {
         scope: crate::workspace_model::views::Scope,
         operation: Option<uuid::Uuid>,
         model: WorkspaceModel,
+    },
+    ViewRemovalRefused {
+        scope: crate::workspace_model::views::Scope,
+        operation: uuid::Uuid,
+        model: WorkspaceModel,
+        error: String,
     },
     NavigationFailed(String),
     PaneTransferFailed {
@@ -126,6 +136,15 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             sender
                 .send_blocking(ModelUpdate::Read(model))
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+        if let ModelEdit::RelocateProject { relocation } = edit {
+            let model = client
+                .read_workspace_model()
+                .map_err(|error| error.to_string())?;
+            sender
+                .send_blocking(ModelUpdate::Relocated { relocation, model })
                 .map_err(|error| error.to_string())?;
             continue;
         }
@@ -264,6 +283,21 @@ fn send(
         _ => None,
     };
     let mut request = edit;
+    let removal = matches!(
+        &request,
+        ModelEdit::ChangeView {
+            change: crate::workspace_model::views::Change::RemoveSource { .. }
+                | crate::workspace_model::views::Change::Remove { .. },
+            ..
+        }
+    );
+    if removal {
+        let model = client.read_workspace_model()?;
+        if !prepare_removal_request(&mut request, &model) {
+            refuse_removal(request, model, updates);
+            return Ok(());
+        }
+    }
     let mut conflicts = 0;
     let model = loop {
         match client.edit_workspace_model(request.clone()) {
@@ -280,6 +314,10 @@ fn send(
                 }
                 std::thread::sleep(Duration::from_millis(20 * conflicts));
                 let model = client.read_workspace_model()?;
+                if removal && !prepare_removal_request(&mut request, &model) {
+                    refuse_removal(request, model, updates);
+                    return Ok(());
+                }
                 if let ModelEdit::ChangeView {
                     scope,
                     expected_revision,
@@ -293,6 +331,13 @@ fn send(
                         .map(|view| view.revision)
                         .unwrap_or(0);
                 }
+            }
+            Err(ControlError::Remote {
+                retryable: false, ..
+            }) if removal => {
+                let model = client.read_workspace_model()?;
+                refuse_removal(request, model, updates);
+                return Ok(());
             }
             Err(error) => return Err(error),
         }
@@ -322,6 +367,73 @@ fn send(
         let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
     }
     Ok(())
+}
+
+/// The original source travels in the typed request through every transport
+/// reconnect and revision retry. A fresh revision never grants a fresh source.
+fn prepare_removal_request(edit: &mut ModelEdit, model: &WorkspaceModel) -> bool {
+    let ModelEdit::ChangeView {
+        scope,
+        expected_revision,
+        change,
+        ..
+    } = edit
+    else {
+        return true;
+    };
+    if !super::shared_views::removal_current(model, scope, change) {
+        // A lost ACK can leave our original operation durably applied. Probe
+        // only that same typed operation; the server's atomic source check
+        // refuses an unrecorded absent removal without consuming its receipt.
+        let crate::workspace_model::views::Change::RemoveSource {
+            registry,
+            repository,
+            before,
+            ..
+        } = change
+        else {
+            return false;
+        };
+        let owner = match &*scope {
+            crate::workspace_model::views::Scope::Channel(id) => {
+                model.channel(*id).map(|channel| &channel.repository)
+            }
+            crate::workspace_model::views::Scope::Worktree { repository, .. } => Some(repository),
+        };
+        if model.identity != *registry
+            || *registry == crate::workspace_model::NO_REGISTRY
+            || owner != Some(repository)
+            || model
+                .views
+                .iter()
+                .any(|view| view.panes.iter().any(|pane| pane.id == before.id))
+        {
+            return false;
+        }
+    }
+    let Some(view) = model.views.iter().find(|view| &view.scope == scope) else {
+        return false;
+    };
+    *expected_revision = view.revision;
+    true
+}
+fn refuse_removal(
+    edit: ModelEdit,
+    model: WorkspaceModel,
+    updates: &async_channel::Sender<ModelUpdate>,
+) {
+    if let ModelEdit::ChangeView {
+        scope, operation, ..
+    } = edit
+    {
+        let _ = updates.send_blocking(ModelUpdate::ViewRemovalRefused {
+            scope,
+            operation,
+            model,
+            error: "The original shared Close source changed; the current pane was preserved."
+                .into(),
+        });
+    }
 }
 
 /// What adopting one shared row asked of the window.
@@ -440,6 +552,21 @@ impl Cagents {
                 )));
                 Task::none()
             }
+            ModelUpdate::ViewRemovalRefused {
+                scope,
+                operation,
+                model,
+                error,
+            } => {
+                self.acknowledge_view_edit(scope, Some(operation));
+                if self.workspace_model.identity == model.identity
+                    && model.sequence >= self.workspace_model.sequence
+                {
+                    self.workspace_model = model;
+                }
+                self.status = Some(TransientNotice::warning(error));
+                self.reconcile_workspace_model()
+            }
             ModelUpdate::ViewApplied {
                 scope,
                 operation,
@@ -475,9 +602,21 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                self.join_workspace_model(model.identity);
                 self.workspace_model = model;
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
+            }
+            ModelUpdate::Relocated { relocation, model } => {
+                if model.identity != self.workspace_model.identity
+                    || model.sequence < self.workspace_model.sequence
+                {
+                    return Task::none();
+                }
+                self.workspace_model = model;
+                let relocated = self.apply_project_relocation(&relocation);
+                let closed = self.apply_closed_project_tombstones();
+                Task::batch([relocated, closed, self.reconcile_workspace_model()])
             }
             ModelUpdate::Reopened { repository, model } => {
                 if model.identity == self.workspace_model.identity
@@ -522,7 +661,10 @@ impl Cagents {
                     _ => None,
                 };
                 let closing = match &edit {
-                    ModelEdit::CloseProject { repository } => Some(repository.clone()),
+                    ModelEdit::CloseProject { repository }
+                    | ModelEdit::CloseProjectInstance {
+                        project: crate::project_recovery::ProjectInstance { repository, .. },
+                    } => Some(repository.clone()),
                     ModelEdit::ReopenProject { repository, .. } => {
                         self.cancel_shared_project_close(repository);
                         self.project_ui.closed.remove(repository);
@@ -535,6 +677,11 @@ impl Cagents {
                     _ => None,
                 };
                 self.workspace_model.fold(sequence, &edit);
+                let relocation = if let ModelEdit::RelocateProject { relocation } = &edit {
+                    self.apply_project_relocation(relocation)
+                } else {
+                    Task::none()
+                };
                 let removed = closing.map_or_else(Task::none, |repository| {
                     self.close_shared_project(&repository)
                 });
@@ -551,7 +698,12 @@ impl Cagents {
                     }
                     self.retire_peer_channel(id)
                 });
-                Task::batch([removed, retired, self.reconcile_workspace_model()])
+                Task::batch([
+                    relocation,
+                    removed,
+                    retired,
+                    self.reconcile_workspace_model(),
+                ])
             }
             ModelUpdate::Ranked { channel, ordinal } => {
                 let Some(index) = self
@@ -589,6 +741,7 @@ impl Cagents {
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
+        let relocated = self.recover_shared_project_relocations();
         let closed = self
             .workspace_model
             .closed_projects
@@ -600,9 +753,11 @@ impl Cagents {
             .cloned()
             .collect::<Vec<_>>();
         Task::batch(
-            closed
-                .into_iter()
-                .map(|repository| self.close_shared_project(&repository)),
+            std::iter::once(relocated).chain(
+                closed
+                    .into_iter()
+                    .map(|repository| self.close_shared_project(&repository)),
+            ),
         )
     }
 
@@ -622,6 +777,7 @@ impl Cagents {
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
+        durable.shared_project_bindings.clear();
         for channel in durable.channels.iter_mut() {
             channel.shared = false;
         }
@@ -1112,9 +1268,36 @@ impl Cagents {
         if self.project_ui.closed.contains(&shared.repository) {
             return Adoption::Retained;
         }
+        let primary_changed = shared.primary_checkout.as_ref().is_some_and(|checkout| {
+            self.project_ui
+                .primary_checkout_roots
+                .insert(shared.repository.clone(), checkout.clone())
+                .as_ref()
+                != Some(checkout)
+        });
+        let checkout_changed = shared.checkout.as_ref().is_some_and(|checkout| {
+            self.project_ui
+                .checkout_roots
+                .insert(shared.repository.clone(), checkout.clone())
+                .as_ref()
+                != Some(checkout)
+        });
         if let Some(project_id) = self.project_for_repository(&shared.repository) {
-            if crate::device::is_remote()
-                && !self.workspace_model_opens.contains(&shared.repository)
+            self.remember_project_binding(project_id, shared);
+            let needs_checkout_read = primary_changed
+                || (checkout_changed
+                    && self
+                        .sidebar_model
+                        .project(project_id)
+                        .is_some_and(|project| {
+                            project.kind == ProjectKind::Git
+                                && (project.unreachable.is_some()
+                                    || project.worktrees.is_empty()
+                                    || project.reloading)
+                        }));
+            if needs_checkout_read
+                || (crate::device::is_remote()
+                    && !self.workspace_model_opens.contains(&shared.repository))
             {
                 return Adoption::Opening(self.project_load_task(
                     shared.repository.clone(),
@@ -1169,6 +1352,7 @@ impl Cagents {
         self.sidebar_model
             .apply_project_order(&self.durable.project_order);
         self.sidebar_model.data_state = SidebarDataState::Ready;
+        self.remember_project_binding(project.id, shared);
         Adoption::Opening(self.project_load_task(
             shared.repository.clone(),
             Some(project.id),
@@ -1278,10 +1462,26 @@ impl Cagents {
         let repository = project.repository.clone();
         let name = project.name.clone();
         let kind = project.kind;
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
         // The project first: a channel in a repository no project owns is
         // reachable from no sidebar. Both edits go through one queue, so the
         // registry sees them in this order.
         self.publish_model_edit(ModelEdit::OpenProject {
+            checkout: checkout.clone(),
+            primary_checkout: primary_checkout.clone(),
             kind,
             repository: repository.clone(),
             name,
@@ -1313,7 +1513,23 @@ impl Cagents {
         }
         let name = project.name.clone();
         let kind = project.kind;
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
         self.publish_model_edit(ModelEdit::OpenProject {
+            checkout: checkout.clone(),
+            primary_checkout: primary_checkout.clone(),
             kind,
             repository: repository.clone(),
             name,
@@ -1340,14 +1556,32 @@ impl Cagents {
         let repository = project.repository.clone();
         let name = project.name.clone();
         let kind = project.kind;
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
         let edit = if self.project_ui.is_reopening(&repository) {
             ModelEdit::ReopenProject {
+                checkout: checkout.clone(),
+                primary_checkout: primary_checkout.clone(),
                 repository,
                 name,
                 kind,
             }
         } else {
             ModelEdit::OpenProject {
+                checkout: checkout.clone(),
+                primary_checkout: primary_checkout.clone(),
                 repository,
                 name,
                 kind,
@@ -1382,6 +1616,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linked_checkout_keeps_primary_read_root_without_changing_actual_checkout() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let repository = PathBuf::from("/metadata/separate.git");
+        let primary = PathBuf::from("/checkouts/primary");
+        let linked = PathBuf::from("/checkouts/linked");
+        let shared = ModelProject {
+            repository: repository.clone(),
+            checkout: Some(linked.clone()),
+            primary_checkout: Some(primary.clone()),
+            name: "project".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        };
+        drop(app.adopt_shared_project(&shared));
+        let project = ProjectId::new();
+        assert_eq!(
+            app.known_project_checkout(&repository, project),
+            Some((linked.clone(), repository.clone()))
+        );
+        assert_eq!(
+            app.project_ui.primary_checkout_roots.get(&repository),
+            Some(&primary)
+        );
+        assert_eq!(
+            app.project_ui.checkout_roots.get(&repository),
+            Some(&linked)
+        );
+    }
+
+    #[test]
+    fn shared_checkout_metadata_is_kept_separate_from_project_identity() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let repository = PathBuf::from("/metadata/separate.git");
+        let checkout = PathBuf::from("/checkouts/project");
+        let shared = ModelProject {
+            repository: repository.clone(),
+            checkout: Some(checkout.clone()),
+            primary_checkout: None,
+            name: "project".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        };
+        // Unavailable roots remain absent rather than becoming local folders.
+        drop(app.adopt_shared_project(&shared));
+        assert_eq!(
+            app.project_ui.checkout_roots.get(&repository),
+            Some(&checkout)
+        );
+        assert!(app.project_for_repository(&checkout).is_none());
+    }
+
+    #[test]
     fn device_project_metadata_creates_durable_sidebar_without_local_filesystem() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let storage = tempfile::tempdir().unwrap();
@@ -1401,6 +1687,8 @@ mod tests {
             "fixture must be absent on the displaying host"
         );
         let metadata = ModelProject {
+            checkout: None,
+            primary_checkout: None,
             repository: repository.clone(),
             name: "Device repository".into(),
             kind: ProjectKind::Git,
@@ -2190,6 +2478,8 @@ mod tests {
             pending_automation_proposal_count: 0,
             automation_proposal_sequence: 0,
             automation_archive_sequence: 0,
+            agent_locations: Vec::new(),
+            session_location_refusals: Vec::new(),
         }
     }
 
@@ -2227,6 +2517,8 @@ mod tests {
         drop(app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 2,
             edit: ModelEdit::ReopenProject {
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: repository.clone(),
                 name: "repo".into(),
@@ -2257,6 +2549,8 @@ mod tests {
         app.project_ui.reopening.insert(project, repository.clone());
         let mut model = registry(Vec::new());
         model.projects.push(ModelProject {
+            checkout: None,
+            primary_checkout: None,
             kind: Default::default(),
             repository: repository.clone(),
             name: "repo".into(),
@@ -2347,6 +2641,8 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.workspace_model = WorkspaceModel {
             projects: vec![ModelProject {
+                checkout: None,
+                primary_checkout: None,
                 repository: repository.clone(),
                 name: "Folder".into(),
                 kind: ProjectKind::Folder,
@@ -2377,6 +2673,8 @@ mod tests {
             canonical_repository(&checkout.path().join(".git")).expect("an absolute key");
         app.workspace_model = WorkspaceModel {
             projects: vec![ModelProject {
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: repository.clone(),
                 name: "opened elsewhere".into(),
@@ -2598,6 +2896,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ModelEdit::OpenProject {
+                    checkout: None,
+                    primary_checkout: None,
                     kind: Default::default(),
                     repository: repository.clone(),
                     name: "repo".into(),
@@ -2758,5 +3058,317 @@ mod tests {
             "no registry has spoken, so nothing it did not say can be acted on"
         );
         assert!(drain(&published).is_empty());
+    }
+    fn removal_wire_fixture() -> (
+        WorkspaceModel,
+        crate::workspace_model::views::Scope,
+        crate::workspace_model::views::Pane,
+    ) {
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let scope = Scope::Worktree {
+            repository: "/repo".into(),
+            path: "/repo".into(),
+        };
+        let card = super::super::tests::context_inspector_test_app(false)
+            .workspace
+            .focused()
+            .unwrap();
+        let pane = Pane {
+            id: card,
+            title: "pane".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            scope: Some("/repo".into()),
+            kind: CardKind::Browser(crate::model::BrowserSession {
+                id: crate::model::BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        let mut model = WorkspaceModel::default();
+        model.identity = uuid::Uuid::new_v4();
+        model.sequence = 7;
+        model.projects = vec![ModelProject {
+            repository: "/repo".into(),
+            checkout: None,
+            primary_checkout: None,
+            name: "repo".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        let mut view = View::empty(scope.clone());
+        view.revision = 3;
+        view.panes = vec![pane.clone()];
+        model.views = vec![view];
+        (model, scope, pane)
+    }
+    #[test]
+    fn removal_worker_retries_only_original_source_and_refuses_before_any_unchecked_write() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+        };
+        for replace in [false, true] {
+            let (model, scope, pane) = removal_wire_fixture();
+            let operation = uuid::Uuid::new_v4();
+            let edit = ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 0,
+                operation,
+                change: crate::workspace_model::views::Change::RemoveSource {
+                    registry: model.identity,
+                    repository: "/repo".into(),
+                    before: pane.clone(),
+                    execution_instance: None,
+                },
+            };
+            let initial = model.clone();
+            let (reader, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let handle = std::thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let proof = HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("source-remove"),
+                    boot_id: crate::model::BootId::new("boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("daemon"),
+                };
+                let reply = |stream: &mut std::os::unix::net::UnixStream, id, message| {
+                    write_frame(
+                        stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap()
+                };
+                let connect: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                reply(
+                    &mut server,
+                    connect.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![],
+                        },
+                    },
+                );
+                let read: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert!(matches!(read.request, ClientRequest::ReadWorkspaceModel));
+                reply(
+                    &mut server,
+                    read.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: initial.clone(),
+                        },
+                    },
+                );
+                let first: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                let request_id = first.request_id;
+                let ClientRequest::EditWorkspaceModel { edit: first } = first.request else {
+                    panic!()
+                };
+                assert!(
+                    matches!(&first,ModelEdit::ChangeView {expected_revision:3,operation:id,change:crate::workspace_model::views::Change::RemoveSource {before,..},..} if *id==operation && before==&pane)
+                );
+                // A concurrent mutation wins after verified read, before write.
+                reply(
+                    &mut server,
+                    request_id,
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::ViewConflict,
+                        "concurrent source",
+                        true,
+                    )),
+                );
+                let mut current = initial.clone();
+                current.sequence += 1;
+                current.views[0].revision += 1;
+                if replace {
+                    if let CardKind::Browser(source) = &mut current.views[0].panes[0].kind {
+                        source.id = crate::model::BrowserId::new();
+                    }
+                } else {
+                    current.views[0].panes[0].title = "independent title".into();
+                }
+                let read: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert!(matches!(read.request, ClientRequest::ReadWorkspaceModel));
+                reply(
+                    &mut server,
+                    read.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: current.clone(),
+                        },
+                    },
+                );
+                if !replace {
+                    let retried: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                    assert!(
+                        matches!(&retried.request,ClientRequest::EditWorkspaceModel {edit:ModelEdit::ChangeView {expected_revision:4,operation:id,change:crate::workspace_model::views::Change::RemoveSource {before,..},..}} if *id==operation && before==&pane)
+                    );
+                    current.views[0].panes.clear();
+                    current.views[0].revision += 1;
+                    current.sequence += 1;
+                    reply(
+                        &mut server,
+                        retried.request_id,
+                        ServerMessage::Response {
+                            response: ServerResponse::WorkspaceModel { model: current },
+                        },
+                    );
+                }
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut server).unwrap().is_none(),
+                    "replacement must not receive a rebased Remove"
+                );
+            });
+            let mut client = ControlClient::from_stream(reader).unwrap();
+            let (updates, rx) = async_channel::unbounded();
+            send(&mut client, edit, &updates).unwrap();
+            drop(client);
+            handle.join().unwrap();
+            let update = rx.try_recv().unwrap();
+            if replace {
+                assert!(
+                    matches!(update,ModelUpdate::ViewRemovalRefused {operation:id,..} if id==operation)
+                );
+            } else {
+                assert!(
+                    matches!(update,ModelUpdate::ViewApplied {operation:Some(id),..} if id==operation)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lost_remove_ack_reconnect_probes_original_operation_and_reports_success() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        fn connection(
+            model: WorkspaceModel,
+            expected: ModelEdit,
+            lose_reply: bool,
+        ) -> (ControlClient, std::thread::JoinHandle<()>) {
+            let (reader, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let handle = std::thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let proof = HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("lost-remove-ack"),
+                    boot_id: crate::model::BootId::new("boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("daemon"),
+                };
+                let reply = |stream: &mut std::os::unix::net::UnixStream, id, response| {
+                    write_frame(
+                        stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response { response },
+                        },
+                    )
+                    .unwrap()
+                };
+                let connect: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                reply(
+                    &mut server,
+                    connect.request_id,
+                    ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                );
+                let read: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert!(matches!(read.request, ClientRequest::ReadWorkspaceModel));
+                reply(
+                    &mut server,
+                    read.request_id,
+                    ServerResponse::WorkspaceModel {
+                        model: model.clone(),
+                    },
+                );
+                let edit: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                let ClientRequest::EditWorkspaceModel { edit: actual } = edit.request else {
+                    panic!()
+                };
+                match (&expected, &actual) {
+                    (
+                        ModelEdit::ChangeView {
+                            operation: expected,
+                            change: expected_change,
+                            ..
+                        },
+                        ModelEdit::ChangeView {
+                            operation: actual,
+                            change: actual_change,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(expected, actual);
+                        assert_eq!(expected_change, actual_change);
+                    }
+                    _ => panic!(
+                        "a reconnect must retain the exact conditional operation and original source"
+                    ),
+                }
+                if lose_reply {
+                    return;
+                } // committed server-side, reply was lost
+                reply(
+                    &mut server,
+                    edit.request_id,
+                    ServerResponse::WorkspaceModel { model },
+                );
+                assert!(read_frame::<ClientEnvelope>(&mut server).unwrap().is_none());
+            });
+            (ControlClient::from_stream(reader).unwrap(), handle)
+        }
+        let (model, scope, before) = removal_wire_fixture();
+        let operation = uuid::Uuid::new_v4();
+        let edit = ModelEdit::ChangeView {
+            scope,
+            expected_revision: 0,
+            operation,
+            change: crate::workspace_model::views::Change::RemoveSource {
+                registry: model.identity,
+                repository: "/repo".into(),
+                before,
+                execution_instance: None,
+            },
+        };
+        let (updates, rx) = async_channel::unbounded();
+        let (mut first, server) = connection(model.clone(), edit.clone(), true);
+        assert!(send(&mut first, edit.clone(), &updates).is_err());
+        drop(first);
+        server.join().unwrap();
+        assert!(rx.is_empty());
+        let mut applied = model;
+        applied.sequence += 1;
+        applied.views[0].revision += 1;
+        applied.views[0].panes.clear();
+        let (mut reconnected, server) = connection(applied, edit.clone(), false);
+        send(&mut reconnected, edit, &updates).unwrap();
+        drop(reconnected);
+        server.join().unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(),ModelUpdate::ViewApplied {operation:Some(id),..} if id==operation)
+        );
+        assert!(rx.is_empty());
     }
 }

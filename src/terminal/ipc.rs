@@ -479,6 +479,22 @@ pub enum ClientRequest {
         log_id: String,
         offset: u64,
     },
+    /// Close only the exact inventory source and resident worker the user
+    /// selected. A successor with the same durable ID has no such authority.
+    CloseTerminalSourceChecked {
+        source: TerminalSession,
+        execution_instance: uuid::Uuid,
+        allow_active: bool,
+    },
+    /// Exact actor/worker identities for a guarded project removal census.
+    ProjectCloseInventory {
+        project: crate::project_recovery::ProjectInstance,
+    },
+    /// Explicit project removal, fenced before teardown and final deletion.
+    CloseProjectGuarded {
+        project: crate::project_recovery::ProjectInstance,
+        sessions: Vec<crate::project_recovery::SessionClose>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,6 +816,9 @@ pub enum ServerResponse {
         bytes: Vec<u8>,
         next_offset: Option<u64>,
         omitted: u64,
+    },
+    ProjectCloseInventory {
+        sessions: Vec<crate::project_recovery::SessionClose>,
     },
 }
 

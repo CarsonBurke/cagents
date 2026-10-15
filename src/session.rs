@@ -2893,6 +2893,7 @@ mod tests {
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
+            shared_project_bindings: Default::default(),
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
             cards: vec![CardState {

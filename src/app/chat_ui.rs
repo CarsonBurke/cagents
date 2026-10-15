@@ -5731,7 +5731,7 @@ impl Cagents {
     /// The conversation a chat card would return from, as current as the card
     /// knows it: the runtime's session carries the identity the provider has
     /// confirmed since the card was saved.
-    fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
+    pub(super) fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
         if let Some(runtime) = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(&**runtime),
             _ => self.chat_ui.parked.get(&card).map(|runtime| &**runtime),
@@ -6014,15 +6014,7 @@ impl Cagents {
     /// The workspace's reservation to remove `card`, taken now unless it is
     /// already held; a refusal is reported.
     fn reserve_chat_removal(&mut self, card: CardId) -> Option<crate::workspace::FocusHandoff> {
-        let handoff = match self.workspace.pending_close() {
-            Some(handoff) if handoff.unmounting == card => Ok(handoff),
-            _ => self.workspace.request_close(card),
-        };
-        handoff
-            .inspect_err(|error| {
-                self.status = Some(TransientNotice::error(error.to_string()));
-            })
-            .ok()
+        self.reserve_card_removal_for(card, None)
     }
     /// A panic while connecting is a failed start, not an unwind of the UI thread.
     fn started_chat(
@@ -13945,7 +13937,7 @@ mod tests {
             None,
             "chat removal commits in the same update"
         );
-        let _ = app.update(Message::CommitClose(card)); // A queued duplicate is harmless.
+        let _ = app.update(app.commit_close_message(card)); // A queued duplicate is harmless.
         assert!(
             !app.workspace.order().any(|id| id == card),
             "the card leaves the strip"
@@ -14299,7 +14291,7 @@ mod tests {
         request_end_chat(&mut app, card);
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
         assert_eq!(app.chat_ui.phases[&card].target(), closing);
-        let _ = app.update(Message::CommitClose(card));
+        let _ = app.update(app.commit_close_message(card));
         assert!(
             app.workspace.order().any(|id| id == card),
             "an unacknowledged owner keeps its card"
@@ -15176,7 +15168,7 @@ mod tests {
             _ => panic!("the chat card is never converted in place"),
         };
         assert_eq!(app.workspace.pending_close(), None);
-        let _ = app.update(Message::CommitClose(card)); // Duplicate must not create another terminal.
+        let _ = app.update(app.commit_close_message(card)); // Duplicate must not create another terminal.
         assert!(!app.card_state(card).unwrap().existence.is_open());
         assert!(!app.cards.contains_key(&card));
         assert!(!app.chat_ui.phases.contains_key(&card));
@@ -15342,7 +15334,7 @@ mod tests {
         app.notices.entries.clear();
         // The queued close retains ownership until the daemon proves cleanup.
         assert_eq!(app.workspace.pending_close(), None);
-        let _ = app.update(Message::CommitClose(card));
+        let _ = app.update(app.commit_close_message(card));
         assert!(app.workspace.order().any(|id| id == card));
         assert!(matches!(
             app.chat_ui.phases.get(&card),
@@ -15456,7 +15448,7 @@ mod tests {
                 None,
                 "the close commits with the return"
             );
-            let _ = app.update(Message::CommitClose(card));
+            let _ = app.update(app.commit_close_message(card));
             assert!(
                 terminal_cards(&app).is_empty(),
                 "no terminal only to stop it"
@@ -15694,7 +15686,7 @@ mod tests {
                     close_chat(&mut app, card);
                 } else {
                     let _ = app.update(Message::CloseCard(card));
-                    let _ = app.update(Message::CommitClose(card));
+                    let _ = app.update(app.commit_close_message(card));
                     assert!(!app.workspace.order().any(|id| id == card));
                 }
                 assert_eq!(
@@ -15727,6 +15719,137 @@ mod tests {
         app.notices.entries.clear();
         app.status = None;
         close_chat(&mut app, card);
+    }
+
+    #[test]
+    fn shared_close_basis_retains_issued_and_observed_thread_separately() {
+        use crate::workspace_model::{
+            ModelProject, WorkspaceModel,
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let mut observed = app.chat_return_session(card).unwrap();
+        observed.launch.session_id = Some(KNOWN_THREAD.into());
+        let runtime = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime,
+            _ => panic!(),
+        };
+        runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+            observed.clone(),
+            Snapshot {
+                session_id: observed.launch.session_id.clone(),
+                ready: true,
+                ..Snapshot::default()
+            },
+        )));
+        let CardKind::Chat(issued) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!()
+        };
+        issued.launch.session_id = None;
+        let directory = issued.launch.recipe.working_directory.clone();
+        let scope = Scope::Worktree {
+            repository: directory.clone(),
+            path: directory.clone(),
+        };
+        let pane = Pane::from_card(app.card_state(card).unwrap(), Some(directory.clone())).unwrap();
+        let mut model = WorkspaceModel::default();
+        model.identity = uuid::Uuid::new_v4();
+        model.projects = vec![ModelProject {
+            repository: directory,
+            checkout: None,
+            primary_checkout: None,
+            name: "fixture".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        let mut view = View::empty(scope);
+        view.panes = vec![pane];
+        model.views = vec![view];
+        app.workspace_model = model;
+        let original_model = app.workspace_model.clone();
+        let source = app.capture_shared_removal_source(card).unwrap().unwrap();
+        assert_eq!(
+            app.chat_return_session(card)
+                .unwrap()
+                .launch
+                .session_id
+                .as_deref(),
+            Some(KNOWN_THREAD)
+        );
+        assert!(
+            app.install_shared_removal_source(card, Some(source.clone())),
+            "unchanged observed thread must not be compared to an unlearned issued thread"
+        );
+        assert_eq!(
+            app.workspace_model, original_model,
+            "observed identity never rewrites authoritative wire before"
+        );
+        let mut replacement = observed;
+        replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let runtime = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime,
+            _ => panic!(),
+        };
+        runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+            replacement.clone(),
+            Snapshot {
+                session_id: replacement.launch.session_id.clone(),
+                ready: true,
+                ..Snapshot::default()
+            },
+        )));
+        assert!(!app.install_shared_removal_source(card, Some(source)));
+        assert_eq!(app.workspace_model, original_model);
+    }
+
+    #[test]
+    fn pending_removal_checks_runtime_source_before_descriptor_refresh() {
+        for same_conversation in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let descriptor = app.card_state(card).unwrap().kind.clone();
+            let observed = app.chat_return_session(card).unwrap();
+            assert!(app.reserve_card_removal_for(card, None).is_some());
+            let pending = app.pending_card_removal_target(card).unwrap();
+            let mut replacement = observed.clone();
+            if !same_conversation {
+                replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            }
+            replacement.native_continuity = chat::NativeContinuity::Durable {
+                provider_version: "fixture-restart".into(),
+            };
+            let handle = Arc::new(ClientHandle::fixture(
+                replacement.clone(),
+                Snapshot {
+                    session_id: replacement.launch.session_id.clone(),
+                    ready: true,
+                    ..Snapshot::default()
+                },
+            ));
+            let runtime = match app.cards.get_mut(&card) {
+                Some(CardRuntime::Chat(runtime)) => runtime,
+                _ => panic!(),
+            };
+            runtime.connection = Connection::Live(handle);
+            assert_eq!(app.card_state(card).unwrap().kind, descriptor);
+            assert_eq!(
+                app.card_removal_current(pending),
+                same_conversation,
+                "a native continuity/backend change preserves the logical source, a different thread does not"
+            );
+            if !same_conversation {
+                drop(app.update(Message::CommitCloseTarget(pending)));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert_eq!(app.card_state(card).unwrap().kind, descriptor);
+                assert_eq!(
+                    app.chat_return_session(card).unwrap().launch.session_id,
+                    replacement.launch.session_id
+                );
+                assert!(app.workspace.pending_close().is_none());
+                assert!(app.recently_closed.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -15780,7 +15903,7 @@ mod tests {
         assert!(app.card_state(terminal).unwrap().existence.is_open());
         app.workspace =
             crate::workspace::Workspace::new(crate::workspace::WorkspaceConfig::default()).unwrap();
-        let _ = app.update(Message::CommitClose(card));
+        let _ = app.update(app.commit_close_message(card));
         assert!(app.card_state(terminal).unwrap().existence.is_open());
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
     }
@@ -15897,7 +16020,7 @@ mod tests {
                 .pending_close()
                 .is_some_and(|handoff| handoff.unmounting == card)
             {
-                let _ = app.update(Message::CommitClose(card));
+                let _ = app.update(app.commit_close_message(card));
             } else if let Some(closing) =
                 app.chat_ui.phases.values().find_map(|phase| match phase {
                     Phase::Closing { target, .. } => Some(*target),

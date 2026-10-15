@@ -551,6 +551,34 @@ pub(super) fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
+    if let ClientRequest::CloseProjectGuarded { project, sessions } = &request {
+        let reservation = {
+            let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+            super::project_removal::reserve(host, project, sessions)?
+        };
+        let result = super::project_removal::remove(
+            host,
+            client_id,
+            project.clone(),
+            sessions.clone(),
+            &reservation,
+        );
+        drop(reservation);
+        return result;
+    }
+    if let ClientRequest::EditWorkspaceModel {
+        edit: crate::workspace_model::ModelEdit::RelocateProject { relocation },
+    } = &request
+    {
+        let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
+        ensure_control_open(host)?;
+        super::agent_execution::terminals::admit(host, client_id, &request)?;
+        super::project_removal::admit(host, &request)?;
+        let model = super::session_locations::relocate(host, client_id, relocation.clone())?;
+        return Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
@@ -560,12 +588,24 @@ pub(super) fn process_request(
         let prepared = {
             let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
             ensure_control_open(host)?;
+            super::project_removal::ensure_available(
+                host,
+                Some(&request.repository),
+                Some(&request.path),
+                None,
+            )?;
             crate::worktree_cleanup::PreparedRemoval::prepare(request.clone())
         };
         let removed = match prepared {
             Ok(prepared) => {
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
+                super::project_removal::ensure_available(
+                    host,
+                    Some(&request.repository),
+                    Some(&request.path),
+                    None,
+                )?;
                 prepared
                     .remove(|windows| {
                         host.lock()
@@ -605,8 +645,30 @@ pub(super) fn process_request(
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
+    super::project_removal::admit(host, &request)?;
+    process_admitted(host, client_id, request)
+}
+
+/// Caller owns control admission for this complete effect; never reacquires it.
+pub(super) fn process_admitted(
+    host: &SharedHost,
+    client_id: ClientId,
+    request: ClientRequest,
+) -> Result<RequestOutcome, ProtocolError> {
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::ProjectCloseInventory { project } => Ok((
+            ServerResponse::ProjectCloseInventory {
+                sessions: super::project_removal::inventory(host, client_id, &project)?,
+            },
+            Vec::new(),
+            false,
+        )),
+        ClientRequest::CloseProjectGuarded { .. } => Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Guarded project removal requires its scoped admission reservation",
+            false,
+        )),
         ClientRequest::DeviceOperation { operation } => {
             if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
                 let account =
@@ -1361,6 +1423,13 @@ pub(super) fn process_request(
                 false,
             ))
         }
+        ClientRequest::CloseTerminalSourceChecked {
+            source,
+            execution_instance,
+            allow_active,
+        } => {
+            close_terminal_source_checked(host, client_id, source, execution_instance, allow_active)
+        }
         ClientRequest::CloseTerminalChecked {
             terminal_id,
             allow_active,
@@ -1435,6 +1504,99 @@ pub(super) fn process_request(
             ))
         }
     }
+}
+
+/// process_request holds shared control admission. Retain both exact owners
+/// under HostState, perform teardown outside it, then retire only the
+/// retained worker. A concurrent successor with the same durable ID remains
+/// untouched, while unrelated input may proceed and upgrade writers wait.
+fn close_terminal_source_checked(
+    host: &SharedHost,
+    client_id: ClientId,
+    source: crate::model::TerminalSession,
+    execution_instance: uuid::Uuid,
+    allow_active: bool,
+) -> Result<RequestOutcome, ProtocolError> {
+    // One paired-teardown budget, independent of how long provider code might
+    // take to return. The retained source survives an unconfirmed timeout.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let changed = || {
+        ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "The selected terminal source changed; refresh its inventory before closing it",
+            false,
+        )
+    };
+    let (handle, paired) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let current = state.descriptor(client_id, source.id)?;
+        if execution_instance.is_nil()
+            || current.execution_instance != execution_instance
+            || current.session != source
+        {
+            return Err(changed());
+        }
+        let record = state.terminals.get(&source.id).ok_or_else(changed)?;
+        let handle = record.handle.clone();
+        // Completion publication can precede its event callback updating
+        // last_exit. The exact inventory UUID still binds that retained owner;
+        // an unconfirmed exit status must not manufacture a live proof or make
+        // the completed worker impossible to close.
+        if source.continuity.live_proof().is_none() && !handle.is_completed() {
+            return Err(changed());
+        }
+        let paired = state
+            .chats
+            .get(&source.id)
+            .map(|record| {
+                if !record
+                    .paired_terminal
+                    .as_ref()
+                    .is_some_and(|expected| expected.same_worker(&handle))
+                    || !record.session.terminal.as_ref().is_some_and(|terminal| {
+                        terminal.id == source.id && terminal.launch == source.launch
+                    })
+                    || !(record.session.launch.provider == crate::agent::Provider::Codex
+                        || record.owns_execution_console())
+                {
+                    return Err(changed());
+                }
+                Ok(record.handle.clone())
+            })
+            .transpose()?;
+        (handle, paired)
+    };
+    let outcome = if !allow_active && paired.as_ref().is_some_and(|actor| actor.owns_work()) {
+        crate::terminal_ipc::TerminalCloseResult::Active
+    } else {
+        handle.close_checked(allow_active)
+    };
+    if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
+        if let Some(paired) = paired {
+            super::chat::close_terminal_actor_until(host, source.id, &paired, deadline)?;
+        }
+        let retired = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state
+                .terminals
+                .get(&source.id)
+                .is_some_and(|record| record.handle.same_worker(&handle))
+            {
+                state.retire_terminal(source.id)
+            } else {
+                None
+            }
+        };
+        drop(retired);
+    }
+    Ok((
+        ServerResponse::TerminalCloseChecked {
+            terminal_id: source.id,
+            outcome,
+        },
+        Vec::new(),
+        false,
+    ))
 }
 
 fn prepare_resume(
@@ -1979,6 +2141,204 @@ mod tests {
     }
 
     #[test]
+    fn source_checked_close_refuses_same_id_successor_and_preserves_force_consent() {
+        use crate::model::{
+            BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalContinuity,
+            TerminalSession,
+        };
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("source-checked-close"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(super::super::state::HostLock::new(
+            super::super::state::HostState::new(proof),
+        ));
+        let mut recipe = LaunchRecipe::shell("/".into()).unwrap();
+        recipe.program = "/bin/cat".into();
+        recipe.arguments.clear();
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let old =
+            crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                .unwrap();
+        let observed = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(session.id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), old.clone(), true)
+                .unwrap()
+        };
+        old.shutdown().unwrap();
+        let replacement =
+            crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                .unwrap();
+        let current = {
+            let mut state = host.lock().unwrap();
+            state
+                .retire_terminal(session.id)
+                .expect("original terminal result");
+            state.reserve_spawn(session.id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), replacement.clone(), true)
+                .unwrap()
+        };
+        assert_eq!(
+            observed.session, current.session,
+            "the daemon proof and full launch recipe alone cannot distinguish this successor"
+        );
+        assert_ne!(observed.execution_instance, current.execution_instance);
+        let request =
+            |source, execution_instance, allow_active| ClientRequest::CloseTerminalSourceChecked {
+                source,
+                execution_instance,
+                allow_active,
+            };
+        assert!(
+            process_request(
+                &host,
+                1,
+                request(observed.session, observed.execution_instance, true)
+            )
+            .is_err()
+        );
+        assert!(!replacement.is_completed());
+        let mut changed = current.session.clone();
+        changed.launch.working_directory = "/another-project".into();
+        assert!(
+            process_request(&host, 1, request(changed, current.execution_instance, true)).is_err()
+        );
+        assert!(
+            process_request(
+                &host,
+                1,
+                request(current.session.clone(), uuid::Uuid::nil(), true)
+            )
+            .is_err()
+        );
+        assert!(!replacement.is_completed());
+        assert!(matches!(
+            process_request(
+                &host,
+                1,
+                request(current.session.clone(), current.execution_instance, false)
+            )
+            .unwrap()
+            .0,
+            ServerResponse::TerminalCloseChecked {
+                outcome: crate::terminal_ipc::TerminalCloseResult::Active,
+                ..
+            }
+        ));
+        assert!(
+            !replacement.is_completed(),
+            "active work needs explicit consent"
+        );
+        assert!(matches!(
+            process_request(
+                &host,
+                1,
+                request(current.session, current.execution_instance, true)
+            )
+            .unwrap()
+            .0,
+            ServerResponse::TerminalCloseChecked {
+                outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                ..
+            }
+        ));
+        assert!(replacement.is_completed());
+        assert!(!host.lock().unwrap().terminals.contains_key(&session.id));
+    }
+
+    #[test]
+    fn source_checked_close_retires_completed_worker_before_exit_callback() {
+        use crate::model::{
+            BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalContinuity,
+            TerminalSession,
+        };
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("source-close-unknown-exit"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(super::super::state::HostLock::new(
+            super::super::state::HostState::new(proof),
+        ));
+        let mut recipe = LaunchRecipe::shell("/".into()).unwrap();
+        recipe.program = "/bin/true".into();
+        recipe.arguments.clear();
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle =
+            crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        // No host event monitor is installed, reproducing the interval before
+        // it acquires HostLock to record the already-completed owner's status.
+        let descriptor = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(session.id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), handle, false)
+                .unwrap()
+        };
+        assert!(matches!(
+            descriptor.session.continuity,
+            TerminalContinuity::RelaunchAvailable {
+                last_exit: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::CloseTerminalSourceChecked {
+                    source: descriptor.session,
+                    execution_instance: descriptor.execution_instance,
+                    allow_active: false,
+                }
+            )
+            .unwrap()
+            .0,
+            ServerResponse::TerminalCloseChecked {
+                outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                ..
+            }
+        ));
+        assert!(!host.lock().unwrap().terminals.contains_key(&session.id));
+    }
+
+    #[test]
     fn completed_release_refuses_live_or_changed_sessions() {
         use crate::model::{
             BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalExit, TerminalSession,
@@ -2249,6 +2609,15 @@ mod tests {
 
     #[test]
     fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {
+        check_slow_close_admission(false);
+    }
+
+    #[test]
+    fn slow_source_checked_close_allows_reads_but_fences_upgrade_and_shutdown() {
+        check_slow_close_admission(true);
+    }
+
+    fn check_slow_close_admission(source_checked: bool) {
         use crate::{
             agent::Provider,
             chat::{
@@ -2314,28 +2683,69 @@ mod tests {
         )
         .unwrap();
         let chat_id = TerminalId::new();
+        let terminal = if source_checked {
+            let mut launch = recipe.clone();
+            launch.program = "/bin/true".into();
+            let session = crate::model::TerminalSession {
+                id: chat_id,
+                launch: launch.clone(),
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                transcript_path: None,
+                resume_hint: None,
+                continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                    recipe: launch,
+                    last_exit: None,
+                },
+            };
+            let worker =
+                crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                    .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_completed() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            Some((session, worker))
+        } else {
+            None
+        };
+        let mut close_source = None;
         let capability = {
             let mut state = host.lock().unwrap();
             state.register_client(1);
             state.register_client(2);
+            if let Some((session, worker)) = &terminal {
+                state.reserve_spawn(session.id).unwrap();
+                close_source = Some(
+                    state
+                        .finish_spawn(1, session.clone(), worker.clone(), false)
+                        .unwrap(),
+                );
+            }
             state.chats.insert(
                 chat_id,
                 super::super::chat::Record {
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
-                    paired_terminal: None,
+                    paired_terminal: terminal.as_ref().map(|(_, worker)| worker.clone()),
                     session: chat::Session {
                         archive_report: None,
                         native_continuity: Default::default(),
                         owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {
-                            provider: Provider::Claude,
+                            provider: if source_checked {
+                                Provider::Codex
+                            } else {
+                                Provider::Claude
+                            },
                             recipe,
                             session_id: None,
                         },
                         proof: Some(proof),
-                        terminal: None,
+                        terminal: terminal.as_ref().map(|(session, _)| session.clone()),
                     },
                     handle: handle.clone(),
                     source_process: None,
@@ -2352,7 +2762,15 @@ mod tests {
         pending.recv_timeout(Duration::from_secs(2)).unwrap();
         let close_host = Arc::clone(&host);
         let close = thread::spawn(move || {
-            process_request(&close_host, 1, ClientRequest::ChatClose { chat_id })
+            let request = match close_source {
+                Some(source) => ClientRequest::CloseTerminalSourceChecked {
+                    source: source.session,
+                    execution_instance: source.execution_instance,
+                    allow_active: true,
+                },
+                None => ClientRequest::ChatClose { chat_id },
+            };
+            process_request(&close_host, 1, request)
         });
         let gate = control_gate(&host);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2405,10 +2823,17 @@ mod tests {
         ));
         release.send(()).unwrap();
         let _ = command.join().unwrap();
-        assert!(matches!(
-            close.join().unwrap().unwrap().0,
-            ServerResponse::ChatClosed { chat_id: id, .. } if id == chat_id
-        ));
+        let closed = close.join().unwrap().unwrap().0;
+        if source_checked {
+            assert!(matches!(closed, ServerResponse::TerminalCloseChecked {
+                terminal_id, outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+            } if terminal_id == chat_id));
+            assert!(!host.lock().unwrap().terminals.contains_key(&chat_id));
+        } else {
+            assert!(
+                matches!(closed, ServerResponse::ChatClosed { chat_id: id, .. } if id == chat_id)
+            );
+        }
         let error = upgrading
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
@@ -3420,6 +3845,8 @@ mod tests {
             1,
             ClientRequest::EditWorkspaceModel {
                 edit: crate::workspace_model::ModelEdit::OpenProject {
+                    checkout: None,
+                    primary_checkout: None,
                     kind: Default::default(),
                     repository: repository.clone(),
                     name: "repo".into(),

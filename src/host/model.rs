@@ -26,6 +26,10 @@ use crate::{
 
 mod automation_archive_clock;
 mod automation_membership;
+mod agent_locations;
+mod session_locations;
+pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
+pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
 mod automation_proposals;
 mod automation_reports;
 mod automations;
@@ -34,6 +38,9 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod navigation;
+mod project_checkout;
+mod project_instances;
+mod relocation;
 mod terminal_owners;
 mod views;
 
@@ -112,6 +119,12 @@ impl Registry {
 
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
+        // Writers commit independently of HostState. One read transaction
+        // keeps metadata, views and agents on the same WAL snapshot.
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
         let (identity, sequence) = self
             .db
             .query_row(
@@ -125,11 +138,13 @@ impl Registry {
         })?;
         let mut projects = self
             .db
-            .prepare("SELECT repository, name, ordinal, kind FROM projects ORDER BY ordinal")
+            .prepare("SELECT repository, name, ordinal, kind, checkout, primary_checkout FROM projects ORDER BY ordinal")
             .map_err(|error| error.to_string())?;
         let projects = projects
             .query_map([], |row| {
                 Ok(ModelProject {
+                    checkout: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                    primary_checkout: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
                     repository: PathBuf::from(row.get::<_, String>(0)?),
                     name: row.get(1)?,
                     ordinal: row.get::<_, i64>(2)? as u32,
@@ -208,7 +223,10 @@ impl Registry {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(WorkspaceModel {
+        let views = views::all(&self.db)?;
+        let agents = self.agents(None)?;
+        let session_location_refusals = session_locations::refusals(&self.db, &views, &agents)?;
+        let model = WorkspaceModel {
             navigation_orders,
             headless_automation_agents: self.headless_automation_agents()?,
             archived_automation_agents: self.archived_automation_agents()?,
@@ -217,14 +235,18 @@ impl Registry {
             pending_automation_proposal_count: self.pending_automation_proposal_count()?,
             automation_proposal_sequence: self.automation_proposal_sequence()?,
             automation_archive_sequence: self.automation_archive_sequence()?,
-            views: views::all(&self.db)?,
-            agents: self.agents(None)?,
+            views,
+            agents,
+            agent_locations: agent_locations::all(&self.db)?,
+            session_location_refusals,
             identity,
             sequence: sequence as u64,
             projects,
             channels,
             closed_projects,
-        })
+        };
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(model)
     }
 
     /// Applies one edit as a single transaction, bumping `sequence` when it
@@ -233,24 +255,71 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
+        self.apply_with_session_moves(edit, &[])
+    }
+
+    pub(crate) fn apply_with_session_moves(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[SessionMove],
+    ) -> Result<Applied, String> {
+        // Direct registry users own no HostState lock. The live host route uses
+        // apply_with_location_moves with evidence prepared outside every lock.
+        let agent_moves = if let ModelEdit::RelocateProject { relocation } = edit {
+            self.agent_relocation_inputs(relocation)?
+                .into_iter()
+                .map(|input| input.verify())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.apply_with_location_moves(edit, moves, &agent_moves)
+    }
+
+    pub(crate) fn apply_with_location_moves(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[SessionMove],
+        agent_moves: &[AgentMove],
+    ) -> Result<Applied, String> {
+        if !moves.is_empty() && !matches!(edit, ModelEdit::RelocateProject { .. }) {
+            return Err(
+                "Session directory proofs may only accompany their project relocation".into(),
+            );
+        }
+        if let ModelEdit::RelocateProject { relocation } = edit
+            && moves
+                .iter()
+                .any(|movement| movement.repository != relocation.destination)
+        {
+            return Err("Session proofs do not belong to the requested destination project".into());
+        }
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        session_locations::pin_owned_agents(&transaction, moves)?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
+            ModelEdit::RelocateProject { relocation } => relocation::apply(&transaction, relocation, agent_moves)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
             ModelEdit::OpenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             }
             | ModelEdit::ReopenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             } => {
                 let key = repository_key(repository)?;
+                let checkout = checkout.as_deref().map(repository_key).transpose()?;
+                let primary_checkout = primary_checkout.as_deref().map(repository_key).transpose()?;
                 let explicit = matches!(edit, ModelEdit::ReopenProject { .. });
                 let tombstoned: bool = transaction
                     .query_row(
@@ -273,21 +342,23 @@ impl Registry {
                     } else {
                         false
                     };
-                    let existing: Option<String> = transaction
+                    let existing: Option<(String, Option<String>, Option<String>)> = transaction
                         .query_row(
-                            "SELECT name FROM projects WHERE repository = ?1",
+                            "SELECT name, checkout, primary_checkout FROM projects WHERE repository = ?1",
                             params![key],
-                            |row| row.get(0),
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
                         .optional()
                         .map_err(|error| error.to_string())?;
                     match existing {
-                        Some(current) if current == *name => reopened,
+                        Some((current, current_checkout, current_primary)) if current == *name
+                            && checkout.is_none_or(|checkout| Some(checkout) == current_checkout.as_deref())
+                            && primary_checkout.is_none_or(|primary| Some(primary) == current_primary.as_deref()) => reopened,
                         Some(_) => {
                             transaction
                                 .execute(
-                                    "UPDATE projects SET name = ?2 WHERE repository = ?1",
-                                    params![key, name],
+                                    "UPDATE projects SET name = ?2, checkout = COALESCE(?3, checkout), primary_checkout = COALESCE(?4, primary_checkout) WHERE repository = ?1",
+                                    params![key, name, checkout, primary_checkout],
                                 )
                                 .map_err(|error| error.to_string())?;
                             true
@@ -296,8 +367,8 @@ impl Registry {
                             let ordinal = take_ordinal(&transaction, "next_project_ordinal")?;
                             transaction
                                 .execute(
-                                    "INSERT INTO projects(repository, name, ordinal, kind) \
-                                 VALUES (?1, ?2, ?3, ?4)",
+                                    "INSERT INTO projects(repository, name, ordinal, kind, checkout, primary_checkout) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                                     params![
                                         key,
                                         name,
@@ -305,7 +376,9 @@ impl Registry {
                                         match kind {
                                             ProjectKind::Git => "git",
                                             ProjectKind::Folder => "folder",
-                                        }
+                                        },
+                                        checkout,
+                                        primary_checkout,
                                     ],
                                 )
                                 .map_err(|error| error.to_string())?;
@@ -317,7 +390,8 @@ impl Registry {
             // The channels go with it through the foreign key's cascade, which
             // `foreign_keys = ON` is verified to enforce: a channel in a project
             // nobody has open is reachable from no window's sidebar.
-            ModelEdit::CloseProject { repository } => {
+            ModelEdit::CloseProject { repository } | ModelEdit::CloseProjectInstance { project: crate::project_recovery::ProjectInstance { repository, .. } } => {
+                if let ModelEdit::CloseProjectInstance { project } = edit { project_instances::require(&transaction, project)?; }
                 let key = repository_key(repository)?;
                 let removed = transaction
                     .execute("DELETE FROM projects WHERE repository = ?1", params![key])
@@ -412,6 +486,27 @@ impl Registry {
                     > 0
             }
         };
+        if !moves.is_empty() {
+            if let ModelEdit::RelocateProject { relocation } = edit {
+                let open: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)",
+                        [repository_key(&relocation.destination)?],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !open {
+                    return Err(
+                        "The located project is no longer open; no session authority changed"
+                            .into(),
+                    );
+                }
+            }
+            session_locations::apply(&transaction, moves)?;
+        }
+        // Same-project verification is a meaningful state change when it
+        // clears or records a session refusal, even without rekeying a project.
+        let changed = changed || !moves.is_empty();
         if changed {
             transaction
                 .execute(
@@ -648,6 +743,11 @@ fn migrate(db: &Connection) -> Result<(), String> {
     if version < 12 {
         mailbox::migrate_attention(db)?;
     }
+    if version < 14 {
+        project_checkout::migrate(db)?;
+        agent_locations::migrate(db)?;
+        session_locations::migrate(db)?;
+    }
     if version < 13 {
         migrate_automation_extensions(db)?;
     }
@@ -718,6 +818,43 @@ fn migrate_automation_extensions(db: &Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_thirteen_checkout_only_registry_gains_all_location_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let mut registry = Registry::at(&path).unwrap();
+        registry.apply(&open("/metadata/project.git")).unwrap();
+        registry.db.execute("UPDATE projects SET checkout='/checkout/project',primary_checkout='/checkout/primary'", []).unwrap();
+        registry
+            .db
+            .execute_batch(
+                "DROP TABLE agent_locations; DROP TABLE session_locations; PRAGMA user_version=13;",
+            )
+            .unwrap();
+        drop(registry);
+        let registry = Registry::at(&path).unwrap();
+        for table in ["agent_locations", "session_locations"] {
+            let exists: bool = registry
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table}");
+        }
+        let model = registry.model().unwrap();
+        assert_eq!(
+            model.projects[0].checkout.as_deref(),
+            Some(Path::new("/checkout/project"))
+        );
+        assert_eq!(
+            model.projects[0].primary_checkout.as_deref(),
+            Some(Path::new("/checkout/primary"))
+        );
+    }
 
     #[test]
     fn navigation_rejects_cross_project_channels_and_relative_paths_without_writing() {
@@ -935,6 +1072,8 @@ mod tests {
 
     fn open(repository: &str) -> ModelEdit {
         ModelEdit::OpenProject {
+            checkout: None,
+            primary_checkout: None,
             kind: Default::default(),
             repository: PathBuf::from(repository),
             name: repository.rsplit('/').next().unwrap().to_owned(),
@@ -959,6 +1098,8 @@ mod tests {
         let path = directory.path().join("model.sqlite3");
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None,
+                primary_checkout: None,
                 repository: "/folder".into(),
                 name: "Folder".into(),
                 kind: ProjectKind::Folder,
@@ -969,6 +1110,8 @@ mod tests {
         let mut observed = registry.model().unwrap();
         assert_eq!(observed.projects[0].kind, ProjectKind::Folder);
         let repeat = ModelEdit::ReopenProject {
+            checkout: None,
+            primary_checkout: None,
             repository: "/folder".into(),
             name: "Renamed".into(),
             kind: ProjectKind::Git,
@@ -1059,6 +1202,8 @@ mod tests {
         assert_eq!(stale.model.closed_projects, [PathBuf::from("/tmp/one")]);
         let opened = registry
             .apply(&ModelEdit::ReopenProject {
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: PathBuf::from("/tmp/one"),
                 name: "one".into(),

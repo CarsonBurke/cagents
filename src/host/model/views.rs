@@ -237,6 +237,50 @@ pub(super) fn all(db: &Connection) -> Result<Vec<View>, String> {
         .collect()
 }
 
+/// Move shared scopes without losing pane/operation IDs. Revision fencing
+/// refuses queued edits built against the pre-relocation descriptors.
+pub(super) fn relocate(
+    db: &Connection,
+    relocation: &crate::project_recovery::Relocation,
+) -> Result<(), String> {
+    for mut view in all(db)? {
+        let belongs = match &view.scope {
+            Scope::Worktree { repository, .. } => *repository == relocation.repository,
+            Scope::Channel(channel) => db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM channels WHERE id=?1 AND repository=?2)",
+                    params![channel.to_string(), repository_key(&relocation.repository)?],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?,
+        };
+        if !belongs {
+            continue;
+        }
+        let previous = key(&view.scope)?;
+        relocation.view(&mut view);
+        view.revision = view
+            .revision
+            .checked_add(1)
+            .ok_or("view revision exhausted")?;
+        let next = key(&view.scope)?;
+        register(db, &view.scope)?;
+        write(db, &view)?;
+        if previous != next {
+            for table in ["shared_view_panes", "shared_view_edits"] {
+                db.execute(
+                    &format!("UPDATE {table} SET scope=?2 WHERE scope=?1"),
+                    params![previous, next],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            db.execute("DELETE FROM shared_view_scopes WHERE scope=?1", [previous])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn operation_seen(db: &Connection, operation: Uuid) -> Result<bool, String> {
     db.query_row(
         "SELECT EXISTS(SELECT 1 FROM shared_view_edits WHERE operation = ?1)",
@@ -362,6 +406,34 @@ pub(super) fn apply(
             change,
             ..
         } => {
+            if let Change::RemoveSource {
+                registry,
+                repository,
+                ..
+            } = change
+            {
+                let identity: String = transaction
+                    .query_row("SELECT identity FROM metadata WHERE key=0", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|error| error.to_string())?;
+                let current_repository: String = match scope {
+                    Scope::Channel(channel) => transaction
+                        .query_row(
+                            "SELECT repository FROM channels WHERE id=?1",
+                            [channel.to_string()],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| error.to_string())?,
+                    Scope::Worktree { repository, .. } => repository_key(repository)?.to_owned(),
+                };
+                if *registry == crate::workspace_model::NO_REGISTRY
+                    || identity != registry.to_string()
+                    || current_repository != repository_key(repository)?
+                {
+                    return Err("workspace view removal source conflict".into());
+                }
+            }
             if operation_seen(transaction, *operation)? {
                 return Ok(false);
             }
@@ -471,6 +543,29 @@ pub(super) fn apply(
                 }
                 Change::Update { pane, .. } if resource_owner(transaction, pane)?.is_some() => {
                     false
+                }
+                Change::RemoveSource { before, .. } => {
+                    if owner(transaction, before.id)?.as_ref() != Some(scope)
+                        || view
+                            .panes
+                            .iter()
+                            .filter(|pane| pane.id == before.id)
+                            .count()
+                            != 1
+                        || !view.panes.iter().any(|pane| {
+                            crate::workspace_model::views::same_pane_source(before, pane)
+                        })
+                    {
+                        return Err("workspace view removal source conflict".into());
+                    }
+                    let changed = view.apply(change)?;
+                    transaction
+                        .execute(
+                            "DELETE FROM shared_view_panes WHERE id=?1 AND scope=?2",
+                            params![before.id.to_string(), key(scope)?],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    changed
                 }
                 Change::RemoveArchivedAutomationSource { before, .. } => {
                     if owner(transaction, before.id)?.as_ref() != Some(scope)
@@ -609,6 +704,8 @@ mod tests {
         let mut registry = Registry::at(&dir.path().join("model.sqlite3")).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None,
+                primary_checkout: None,
                 repository: "/repo".into(),
                 name: "repo".into(),
                 kind: Default::default(),
@@ -1317,5 +1414,159 @@ mod tests {
             assert_eq!(replay.run.id, accepted.run.id);
             assert_eq!(replay.agent.placement, Scope::Channel(a));
         }
+    }
+
+    #[test]
+    fn source_checked_remove_refuses_replacement_registry_scope_and_startup_atomically() {
+        for change in 0..5 {
+            let (mut r, _, a, b) = setup();
+            let original = pane();
+            seed(&mut r, a, vec![original.clone()]);
+            let identity = r.model().unwrap().identity;
+            let mut conditional = edit(
+                &mut r,
+                a,
+                Change::RemoveSource {
+                    registry: identity,
+                    repository: "/repo".into(),
+                    before: original.clone(),
+                    execution_instance: None,
+                },
+            );
+            match change {
+                0 => {
+                    if let ModelEdit::ChangeView {
+                        change: Change::RemoveSource { registry, .. },
+                        ..
+                    } = &mut conditional
+                    {
+                        *registry = Uuid::new_v4();
+                    }
+                }
+                1 => {
+                    if let ModelEdit::ChangeView {
+                        change: Change::RemoveSource { repository, .. },
+                        ..
+                    } = &mut conditional
+                    {
+                        *repository = "/foreign".into();
+                    }
+                }
+                2 | 3 => {
+                    let mut replacement = original.clone();
+                    if change == 2 {
+                        replacement.kind = pane().kind;
+                    } else {
+                        replacement.pending_terminal_start = true;
+                    }
+                    let update = edit(
+                        &mut r,
+                        a,
+                        Change::Update {
+                            before: original.clone(),
+                            pane: replacement,
+                        },
+                    );
+                    r.apply(&update).unwrap();
+                }
+                _ => {
+                    let transfer = edit(
+                        &mut r,
+                        a,
+                        Change::Transfer {
+                            id: original.id,
+                            destination: Scope::Channel(b),
+                            before: None,
+                        },
+                    );
+                    r.apply(&transfer).unwrap();
+                }
+            }
+            // Rebase only the revision, reproducing the old unsafe worker.
+            if let ModelEdit::ChangeView {
+                expected_revision, ..
+            } = &mut conditional
+            {
+                *expected_revision = r.view_revision(&Scope::Channel(a)).unwrap();
+            }
+            let before = r.model().unwrap();
+            let operation = match &conditional {
+                ModelEdit::ChangeView { operation, .. } => *operation,
+                _ => unreachable!(),
+            };
+            assert!(r.apply(&conditional).is_err());
+            assert_eq!(r.model().unwrap(), before);
+            assert!(
+                !r.view_operation_seen(operation).unwrap(),
+                "refused source cannot consume operation receipt"
+            );
+            assert!(
+                r.model()
+                    .unwrap()
+                    .views
+                    .iter()
+                    .any(|view| view.panes.iter().any(|pane| pane.id == original.id))
+            );
+        }
+    }
+    #[test]
+    fn source_checked_remove_uses_transaction_revision_and_preserves_cli_remove_semantics() {
+        let (mut r, _, a, _) = setup();
+        let original = pane();
+        seed(&mut r, a, vec![original.clone()]);
+        let registry = r.model().unwrap().identity;
+        let mut conditional = edit(
+            &mut r,
+            a,
+            Change::RemoveSource {
+                registry,
+                repository: "/repo".into(),
+                before: original.clone(),
+                execution_instance: None,
+            },
+        );
+        let mut titled = original.clone();
+        titled.title = "independent display edit".into();
+        let update = edit(
+            &mut r,
+            a,
+            Change::Update {
+                before: original.clone(),
+                pane: titled,
+            },
+        );
+        r.apply(&update).unwrap();
+        let snapshot = r.model().unwrap();
+        assert!(r.apply(&conditional).is_err());
+        assert_eq!(r.model().unwrap(), snapshot);
+        if let ModelEdit::ChangeView {
+            expected_revision, ..
+        } = &mut conditional
+        {
+            *expected_revision = r.view_revision(&Scope::Channel(a)).unwrap();
+        }
+        r.apply(&conditional).unwrap();
+        let done = r.model().unwrap();
+        r.apply(&conditional).unwrap();
+        assert_eq!(r.model().unwrap(), done, "same operation is idempotent");
+        let second = pane();
+        seed(&mut r, a, vec![second.clone()]);
+        let mut replacement = second.clone();
+        replacement.kind = pane().kind;
+        let update = edit(
+            &mut r,
+            a,
+            Change::Update {
+                before: second.clone(),
+                pane: replacement,
+            },
+        );
+        r.apply(&update).unwrap();
+        let ordinary = edit(&mut r, a, Change::Remove { id: second.id });
+        r.apply(&ordinary).unwrap();
+        assert!(
+            read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty(),
+            "explicit CLI Remove retains its existing current-membership semantics"
+        );
     }
 }
