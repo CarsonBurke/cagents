@@ -17700,6 +17700,12 @@ mod tests {
         assert!(matches!(registered_editor_binding(card, &runtime, &press("k", Code::KeyK, iced::keyboard::Modifiers::CTRL|iced::keyboard::Modifiers::ALT)), Some(Some(text_editor::Binding::Custom(RepositoryAction::Undo { card: id }))) if id == card));
         assert!(registered_editor_binding(card, &runtime, &press("a", Code::KeyA, iced::keyboard::Modifiers::empty())).is_none());
         assert_eq!(crate::workspace_widget::shortcut_descriptor(Command::EditorCopy).category(), "Editor");
+        let mut shortcuts = runtime.keyboard_shortcuts.as_ref().clone();
+        shortcuts.find_in_pane = vec!["Ctrl+Alt+G".into()];
+        shortcuts.editor_redo = vec!["Ctrl+F".into()];
+        assert!(shortcuts.fault().is_none());
+        runtime.set_keyboard_shortcuts(Arc::new(shortcuts));
+        assert!(matches!(registered_editor_binding(card, &runtime, &press("f", Code::KeyF, iced::keyboard::Modifiers::CTRL)), Some(Some(text_editor::Binding::Custom(RepositoryAction::Redo { card: id }))) if id == card));
     }
 
     #[test]

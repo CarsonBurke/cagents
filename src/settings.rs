@@ -1072,13 +1072,18 @@ pub fn is_editor_command(action: &str) -> bool {
 }
 
 pub fn text_editing_shortcut_conflict_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
-    if is_editor_command(action) { None } else { text_editing_shortcut_conflict(binding) }
+    if is_editor_command(action)
+        || (action == "find_in_pane" && parse_shortcut("Ctrl+F").ok() == Some(binding))
+    { None } else { text_editing_shortcut_conflict(binding) }
 }
 
 pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBinding) -> bool {
     // Native editing chords already suppress ordinary workspace bindings in
     // an editable buffer; Reopen pane and Redo can therefore share CtrlShiftZ.
-    !(is_editor_command(left) != is_editor_command(right) && text_editing_shortcut_conflict(binding).is_some())
+    let editor_left = is_editor_command(left);
+    let editor_right = is_editor_command(right);
+    let outside = if editor_left { right } else { left };
+    !(editor_left != editor_right && text_editing_shortcut_conflict_for(outside, binding).is_some())
 }
 
 pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
@@ -3652,6 +3657,19 @@ mod tests {
         assert_eq!(decoded.editor_redo, shortcuts.editor_redo);
         assert_eq!(decoded.reopen_pane, shortcuts.reopen_pane);
         assert!(decoded.fault().is_none());
+    }
+
+    #[test]
+    fn editor_chords_conflict_with_find_when_find_owns_the_editor_binding() {
+        let binding = parse_shortcut("Ctrl+F").unwrap();
+        assert!(shortcut_binding_conflicts("editor_redo", "find_in_pane", binding));
+        assert!(shortcut_binding_conflicts("find_in_pane", "editor_redo", binding));
+        assert!(text_editing_shortcut_conflict_for("find_in_pane", binding).is_none());
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.editor_redo = vec!["Ctrl+F".into()];
+        assert!(shortcuts.fault().is_some_and(|fault| fault.conflicts_with.is_some()));
+        shortcuts.find_in_pane = vec!["Ctrl+Alt+G".into()];
+        assert!(shortcuts.fault().is_none());
     }
 
     #[test]
