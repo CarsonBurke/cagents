@@ -1627,10 +1627,20 @@ impl ClientHandle {
     /// Preserve the actual projected view, including admitted full sources,
     /// before the runtime drops its hydration/presentation owners on hide.
     pub(crate) fn remember_visible_view(&self, view: Arc<Snapshot>, clock: Option<SourceClock>) {
+        self.remember_visible_view_with_changes(view, clock, crate::chat::source_owners::ResidentChanges::default());
+    }
+
+    pub(crate) fn remember_visible_view_with_changes(&self, view: Arc<Snapshot>, clock: Option<SourceClock>, changes: crate::chat::source_owners::ResidentChanges) {
         let current = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         // A late UI view must not cross a reset/new native conversation.
         if current.session_id != view.session_id || self.inner.offline.revoked() { return; }
-        self.inner.offline.capture(view, clock, true);
+        self.inner.offline.capture_changes(view, clock, true, changes);
+    }
+
+    /// Transfer admitted full patches only after installing this handle's
+    /// current typed source projection. The Runtime validates it once more.
+    pub(crate) fn take_restored_changes(&self) -> Option<crate::chat::source_owners::ResidentChanges> {
+        self.inner.offline.take_restored_changes()
     }
 
     /// Account/history deletion must fence cached plaintext as well as the

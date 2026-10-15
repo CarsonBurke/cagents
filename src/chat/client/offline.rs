@@ -4,6 +4,8 @@
 //! capability. It only keeps an evicted reader usable after transport EOF.
 use super::*;
 mod sources;
+mod changes;
+use crate::chat::source_owners::ResidentChanges;
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -17,11 +19,18 @@ const BUFFER: usize = 64 * 1024;
 // Decoding also requires source-owner admission before allocation (union gate).
 const MAX_VIEW_BYTES: u64 = 512 * 1024 * 1024;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct View {
+    snapshot: Arc<Snapshot>,
+    changes: ResidentChanges,
+}
+
 struct Publication {
     snapshot: Arc<Snapshot>,
     clock: Option<SourceClock>,
     epoch: u64,
     sources: sources::Manifest,
+    changes: ResidentChanges,
 }
 struct Cached {
     file: File,
@@ -43,6 +52,7 @@ struct Data {
     error: Option<String>,
     rendered: bool,
     unavailable: bool,
+    restored_changes: Option<ResidentChanges>,
 }
 
 pub(super) struct State {
@@ -88,6 +98,17 @@ impl State {
     // Called under the owner's snapshot lock. This transfers an existing Arc;
     // it does not clone transcript bodies or perform disk I/O on the UI thread.
     pub(super) fn capture(self: &Arc<Self>, snapshot: Arc<Snapshot>, clock: Option<SourceClock>, rendered: bool) {
+        self.capture_changes(snapshot, clock, rendered, ResidentChanges::default());
+    }
+
+    pub(super) fn capture_changes(self: &Arc<Self>, snapshot: Arc<Snapshot>, clock: Option<SourceClock>, rendered: bool, changes: ResidentChanges) {
+        let sources = match sources::Manifest::capture_changes(&snapshot, &changes) {
+            Ok(sources) => sources,
+            Err(error) => {
+                tracing::warn!(target: "cagents::memory", %error, "Cannot capture an unqualified chat view");
+                return;
+            }
+        };
         {
             let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
             if data.revoked || (!rendered && data.rendered)
@@ -96,12 +117,17 @@ impl State {
             data.unavailable = false;
             data.epoch = data.epoch.wrapping_add(1);
             let epoch = data.epoch;
-            let sources = sources::Manifest::capture(&snapshot);
-            data.pending = Some(Publication { snapshot, clock, epoch, sources });
+            data.pending = Some(Publication { snapshot, clock, epoch, sources, changes });
             data.fallback = None;
         }
         self.schedule();
         self.trace();
+    }
+
+    pub(super) fn take_restored_changes(&self) -> Option<ResidentChanges> {
+        let restored = self.data.lock().unwrap_or_else(|p| p.into_inner()).restored_changes.take();
+        self.trace();
+        restored
     }
 
     pub(super) fn available(&self) -> bool {
@@ -118,6 +144,7 @@ impl State {
         {
             let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
             if data.requested_show == show { return; }
+            if !show { data.restored_changes = None; }
             data.requested_show = show;
             data.request = data.request.wrapping_add(1);
             data.restore = show && !data.revoked;
@@ -145,6 +172,7 @@ impl State {
         data.requested_show = false;
         data.rendered = false;
         data.unavailable = false;
+        data.restored_changes = None;
     }
 
     /// Content reset keeps the client usable but removes the previous view.
@@ -166,7 +194,8 @@ impl State {
     pub(super) fn metrics(&self) -> (usize, usize, usize, u64) {
         let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
         let queued = data.pending.iter().chain(data.fallback.iter())
-            .map(|record| record.snapshot.transcript_bytes()).sum();
+            .map(|record| record.snapshot.transcript_bytes() + patch_bytes(&record.changes)).sum::<usize>()
+            + data.restored_changes.as_ref().map_or(0, patch_bytes);
         (queued, self.in_flight_bytes.load(Ordering::Acquire) as usize,
          self.buffer_bytes.load(Ordering::Acquire) as usize,
          data.cached.as_ref().map_or(0, |cached| cached.bytes))
@@ -202,7 +231,7 @@ impl State {
         {
             let checked = CheckedWriter { state: self, epoch: record.epoch, file: &mut file, written: 0, limit: MAX_VIEW_BYTES };
             let mut writer = BufWriter::with_capacity(BUFFER, checked);
-            serde_json::to_writer(&mut writer, &record.snapshot).map_err(|e| e.to_string())?;
+            serde_json::to_writer(&mut writer, &View {snapshot: record.snapshot.clone(), changes: record.changes.clone()}).map_err(|e| e.to_string())?;
             writer.flush().map_err(|e| e.to_string())?;
         }
         let bytes = file.metadata().map_err(|e| e.to_string())?.len();
@@ -218,7 +247,7 @@ impl State {
             let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
             let record = data.pending.take();
             if let Some(record) = &record {
-                self.in_flight_bytes.store(record.snapshot.transcript_bytes() as u64, Ordering::Release);
+                self.in_flight_bytes.store((record.snapshot.transcript_bytes() + patch_bytes(&record.changes)) as u64, Ordering::Release);
                 self.buffer_bytes.store(BUFFER as u64, Ordering::Release);
             }
             record
@@ -283,31 +312,31 @@ impl State {
             data.restore = false;
             let file = data.cached.as_ref().and_then(|cached| cached.file.try_clone().ok().map(|file|
                 (file, cached.epoch, cached.clock, cached.sources.clone())));
-            let fallback = data.fallback.as_ref().map(|record| (record.snapshot.clone(), record.epoch, record.clock, record.sources.clone()));
+            let fallback = data.fallback.as_ref().map(|record| (record.snapshot.clone(), record.epoch, record.clock, record.sources.clone(), record.changes.clone()));
             (data.request, data.epoch, file, fallback)
         };
         if owner.alive.load(Ordering::Acquire) || !owner.body_requested.load(Ordering::Acquire) { return; }
         // A disk reader must not keep the client alive after its pane closes.
         drop(owner);
-        let restored = if let Some((mut snapshot, record_epoch, clock, sources)) = fallback {
+        let restored = if let Some((mut snapshot, record_epoch, clock, sources, changes)) = fallback {
             // These original Item owners already carry their shared leases.
-            sources.normalize(Arc::make_mut(&mut snapshot)).map(|()| (snapshot, record_epoch, clock))
+            sources.normalize_changes(Arc::make_mut(&mut snapshot), &changes).map(|()| (snapshot, changes, record_epoch, clock))
         } else if let Some((mut file, record_epoch, clock, sources)) = cached {
             self.buffer_bytes.store(BUFFER as u64, Ordering::Release);
             self.trace();
             let result = sources.reserve().and_then(|reservation| {
                 file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
                 let checked = CheckedReader { state: self, epoch, request, file: file.take(MAX_VIEW_BYTES + 1) };
-                serde_json::from_reader::<_, Snapshot>(BufReader::with_capacity(BUFFER, checked))
-                    .map_err(|e| e.to_string()).and_then(|mut snapshot| {
-                        sources.adopt(&mut snapshot, reservation)?;
-                        Ok((Arc::new(snapshot), record_epoch, clock))
+                serde_json::from_reader::<_, View>(BufReader::with_capacity(BUFFER, checked))
+                    .map_err(|e| e.to_string()).and_then(|mut view| {
+                        sources.adopt_changes(Arc::make_mut(&mut view.snapshot), &view.changes, reservation)?;
+                        Ok((view.snapshot, view.changes, record_epoch, clock))
                     })
             });
             self.buffer_bytes.store(0, Ordering::Release);
             result
         } else { return; };
-        let (mut restored, record_epoch, _cached_clock) = match restored {
+        let (mut restored, mut restored_changes, record_epoch, _cached_clock) = match restored {
             Ok(restored) => restored,
             Err(error) => {
                 // Preserve the private file for a later reveal. Capacity denial
@@ -316,7 +345,7 @@ impl State {
                 return;
             }
         };
-        self.in_flight_bytes.store(restored.transcript_bytes() as u64, Ordering::Release);
+        self.in_flight_bytes.store((restored.transcript_bytes() + patch_bytes(&restored_changes)) as u64, Ordering::Release);
         self.trace();
         #[cfg(test)]
         if let Some((ready, proceed)) = self.before_install.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -348,6 +377,14 @@ impl State {
         publication.source_parts = std::mem::take(&mut cached.source_parts);
         publication.source_parts.retain(|part| part.source.agent_id.as_ref().is_none_or(|id|
             publication.subagents.iter().any(|child| &child.id == id)));
+        publication.changes_revision = cached.changes_revision;
+        publication.changes_parts = std::mem::take(&mut cached.changes_parts);
+        publication.changes_parts.retain(|part| part.source.agent_id.as_ref().is_none_or(|id|
+            publication.subagents.iter().any(|child| &child.id == id)));
+        let retained_child = |source: &crate::chat::cache::SourceKey| source.agent_id.as_ref().is_none_or(|id|
+            publication.subagents.iter().any(|child| &child.id == id));
+        restored_changes.manifests.retain(|page| retained_child(&page.source));
+        restored_changes.patches.retain(|(_, record)| retained_child(&record.source));
         for child in &mut publication.subagents {
             if let Some(previous) = cached.subagents.iter_mut().find(|previous| previous.id == child.id) {
                 child.items = std::mem::take(&mut previous.items);
@@ -355,6 +392,7 @@ impl State {
         }
         publication.read_only_reason = Some("Connection lost; showing the last cached view. Reconnect to refresh history or send messages.".into());
         *snapshot = Arc::new(publication);
+        data.restored_changes = Some(restored_changes);
         data.unavailable = false;
         data.error = None;
         owner.transcript_resident.store(true, Ordering::Release);
@@ -363,6 +401,10 @@ impl State {
         drop(snapshot);
         (owner.wake)(Wake::Changed);
     }
+}
+
+fn patch_bytes(view: &ResidentChanges) -> usize {
+    view.patches.iter().map(|(text, _)| text.len()).sum()
 }
 
 impl Drop for State {
@@ -491,6 +533,32 @@ mod tests {
         handle.set_visible(false).unwrap();
         wait("disk spill did not finish", || handle.offline_view_metrics().3 > 0 && handle.offline_view_metrics().0 == 0);
         handle.disconnect_for_test();
+    }
+
+    #[test]
+    fn disconnected_full_patch_sidecar_spills_restores_once_and_revokes() {
+        let (mut snapshot, view) = changes::tests::fixture();
+        snapshot.generation = 12;
+        snapshot.ready = true;
+        snapshot.session_id = Some("private-offline-patch".into());
+        let handle = ClientHandle::fixture(super::super::tests::omp_card(None, None), snapshot);
+        let original = Arc::downgrade(&view.patches[0].0);
+        handle.remember_visible_view_with_changes(handle.snapshot(), None, view);
+        hidden_on_disk(&handle);
+        wait("patch body was retained after disk spill", || original.upgrade().is_none());
+        handle.set_visible(true).unwrap();
+        wait("cached patch projection was not restored", || handle.resident_snapshot().is_some());
+        let restored = handle.take_restored_changes().expect("decoded patch sidecar");
+        assert!(restored.patches[0].0.ends_with("+complete tail\n"));
+        assert_eq!(crate::chat::source_owners::resident_patch(&restored.patches[0].0), Some(restored.patches[0].1.clone()));
+        assert!(handle.take_restored_changes().is_none(), "the client transfers the body exactly once");
+        drop(restored);
+        handle.set_visible(false).unwrap();
+        handle.set_visible(true).unwrap();
+        wait("second patch restore did not finish", || handle.resident_snapshot().is_some());
+        handle.revoke_local_history();
+        assert!(handle.take_restored_changes().is_none(), "DeleteFiles must drop even an unconsumed sidecar");
+        assert_eq!(handle.offline_view_metrics().3, 0);
     }
 
     #[test]

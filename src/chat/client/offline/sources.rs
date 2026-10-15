@@ -6,7 +6,7 @@
 use crate::chat::{
     Item, Snapshot,
     cache::{SourceKey, SourceMetadata, SourcePart},
-    source_owners::{self, Reservation, ResidentSource},
+    source_owners::{self, Reservation, ResidentSource, ResidentChanges},
 };
 use std::{collections::HashSet, sync::Arc};
 
@@ -14,13 +14,21 @@ use std::{collections::HashSet, sync::Arc};
 pub(super) struct Manifest {
     sources: Vec<ResidentSource>,
     body_bytes: usize,
+    changes: super::changes::Manifest,
 }
 impl Manifest {
     pub(super) fn capture(snapshot: &Snapshot) -> Self {
         Self {
             sources: source_owners::resident_sources(snapshot),
             body_bytes: snapshot.transcript_bytes(),
+            changes: super::changes::Manifest::default(),
         }
+    }
+
+    pub(super) fn capture_changes(snapshot: &Snapshot, view: &ResidentChanges) -> Result<Self, String> {
+        let mut manifest = Self::capture(snapshot);
+        manifest.changes = super::changes::Manifest::capture(snapshot, view)?;
+        Ok(manifest)
     }
 
     pub(super) fn reserve(&self) -> Result<Reservation, String> {
@@ -29,7 +37,8 @@ impl Manifest {
         if total > self.body_bytes || self.body_bytes - total > crate::terminal_ipc::MAX_FRAME_BYTES {
             return Err("Cached inline bodies exceed the original IPC window".into());
         }
-        let largest = self.sources.iter().map(|record| record.bytes).max().unwrap_or(0);
+        let largest = self.sources.iter().map(|record| record.bytes).max().unwrap_or(0).max(self.changes.largest);
+        let total = total.checked_add(self.changes.bytes).ok_or("Cached mixed source size overflow")?;
         source_owners::reserve(total, largest)
             .map_err(|error| format!("Cached source admission unavailable: {error:?}"))
     }
@@ -65,15 +74,27 @@ impl Manifest {
         Ok(items)
     }
 
+    #[cfg(test)]
     pub(super) fn adopt(&self, snapshot: &mut Snapshot, reservation: Reservation) -> Result<(), String> {
+        self.adopt_changes(snapshot, &ResidentChanges::default(), reservation)
+    }
+
+    pub(super) fn adopt_changes(&self, snapshot: &mut Snapshot, changes: &ResidentChanges, reservation: Reservation) -> Result<(), String> {
+        self.changes.validate(snapshot, changes)?;
         let items = self.items(snapshot)?;
-        reservation.adopt(&items)
+        reservation.adopt_mixed(&items, &changes.patches)
             .map_err(|error| format!("Cached source ownership transfer failed: {error:?}"))?;
         self.normalize_parts(snapshot);
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn normalize(&self, snapshot: &mut Snapshot) -> Result<(), String> {
+        self.normalize_changes(snapshot, &ResidentChanges::default())
+    }
+
+    pub(super) fn normalize_changes(&self, snapshot: &mut Snapshot, changes: &ResidentChanges) -> Result<(), String> {
+        self.changes.validate_live(snapshot, changes)?;
         // The fallback consists of the original charged Arcs. Do not reserve
         // again or manufacture fresh leases just to retain those same owners.
         self.items(snapshot)?;
@@ -130,7 +151,7 @@ mod tests {
             start: 10, end: 12, source_len: 9999, replacement: true, epoch: source_epoch(2, 7),
             metadata: SourceMetadata { at: Some(999), ..record.metadata.clone() },
         }, untouched.clone()];
-        let manifest = Manifest { sources: vec![record.clone()], body_bytes: snapshot.transcript_bytes() };
+        let manifest = Manifest { sources: vec![record.clone()], body_bytes: snapshot.transcript_bytes(), changes: Default::default() };
         manifest.normalize(&mut snapshot).unwrap();
         assert_eq!(snapshot.source_parts.len(), 2);
         assert_eq!(snapshot.source_parts[0], untouched, "unloaded sources stay honest partial windows");
@@ -144,7 +165,7 @@ mod tests {
     #[test]
     fn malformed_manifest_never_relabels_an_unrelated_or_rewritten_item() {
         let (snapshot, record) = fixture();
-        let mut manifest = Manifest { sources: vec![record], body_bytes: snapshot.transcript_bytes() };
+        let mut manifest = Manifest { sources: vec![record], body_bytes: snapshot.transcript_bytes(), changes: Default::default() };
         manifest.sources[0].metadata.started_at = Some(900);
         assert!(manifest.items(&snapshot).is_err());
         let mut duplicate = snapshot.clone();
@@ -162,9 +183,9 @@ mod tests {
             source: SourceKey { source_id: format!("large-{index}"), agent_id: None },
             bytes: source_owners::SOURCE_BYTES, ..record.clone()
         }).collect();
-        let manifest = Manifest { sources, body_bytes: 3 * source_owners::SOURCE_BYTES };
+        let manifest = Manifest { sources, body_bytes: 3 * source_owners::SOURCE_BYTES, changes: Default::default() };
         assert!(manifest.reserve().is_err(), "96 MiB must not bypass the shared 72 MiB predecode pool");
-        let manifest = Manifest { sources: Vec::new(), body_bytes: crate::terminal_ipc::MAX_FRAME_BYTES + 1 };
+        let manifest = Manifest { sources: Vec::new(), body_bytes: crate::terminal_ipc::MAX_FRAME_BYTES + 1, changes: Default::default() };
         assert!(manifest.reserve().is_err(), "uncharged inline bodies retain their IPC bound");
     }
 
@@ -172,7 +193,7 @@ mod tests {
     fn decoded_source_lease_follows_the_actual_restored_item() {
         let (mut snapshot, record) = fixture();
         let weak = Arc::downgrade(&snapshot.items[0]);
-        let manifest = Manifest { sources: vec![record.clone()], body_bytes: snapshot.transcript_bytes() };
+        let manifest = Manifest { sources: vec![record.clone()], body_bytes: snapshot.transcript_bytes(), changes: Default::default() };
         manifest.adopt(&mut snapshot, manifest.reserve().unwrap()).unwrap();
         assert_eq!(source_owners::resident_sources(&snapshot), vec![record]);
         let retained = snapshot.items[0].clone();
