@@ -79,7 +79,7 @@ pub struct Setup {
 pub use crate::worktree_branch::{BranchDeleteFailure,BranchDeleteFailureKind};
 #[cfg(any(feature = "ui", feature = "host"))]
 pub use crate::worktree_branch::{delete_branch,delete_branch_checked,delete_branch_checked_at};
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(feature = "host")]
 pub(crate) use crate::worktree_branch::git_command;
 
 #[cfg(feature = "host")]
