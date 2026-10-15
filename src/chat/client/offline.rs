@@ -200,7 +200,7 @@ impl State {
         }
         let mut file = tempfile::tempfile_in(directory).map_err(|e| e.to_string())?;
         {
-            let checked = CheckedWriter { state: self, epoch: record.epoch, file: &mut file };
+            let checked = CheckedWriter { state: self, epoch: record.epoch, file: &mut file, written: 0, limit: MAX_VIEW_BYTES };
             let mut writer = BufWriter::with_capacity(BUFFER, checked);
             serde_json::to_writer(&mut writer, &record.snapshot).map_err(|e| e.to_string())?;
             writer.flush().map_err(|e| e.to_string())?;
@@ -400,6 +400,8 @@ struct CheckedWriter<'a> {
     state: &'a State,
     epoch: u64,
     file: &'a mut File,
+    written: u64,
+    limit: u64,
 }
 struct CheckedReader<'a> {
     state: &'a State,
@@ -424,7 +426,12 @@ impl Write for CheckedWriter<'_> {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Cached view was revoked or replaced"));
         }
         drop(data);
-        self.file.write(bytes)
+        if bytes.len() as u64 > self.limit.saturating_sub(self.written) {
+            return Err(io::Error::from_raw_os_error(libc::EFBIG));
+        }
+        let written = self.file.write(bytes)?;
+        self.written += written as u64;
+        Ok(written)
     }
     fn flush(&mut self) -> io::Result<()> { self.file.flush() }
 }
@@ -480,6 +487,19 @@ mod tests {
         handle.set_visible(false).unwrap();
         wait("disk spill did not finish", || handle.offline_view_metrics().3 > 0 && handle.offline_view_metrics().0 == 0);
         handle.disconnect_for_test();
+    }
+
+    #[test]
+    fn a_view_file_limit_is_enforced_before_oversized_output_hits_disk() {
+        let state = State::new();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = CheckedWriter { state: &state, epoch: 0, file: &mut file, written: 0, limit: 8 };
+        writer.write_all(b"1234").unwrap();
+        let error = writer.write_all(b"56789").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EFBIG));
+        writer.write_all(b"5678").unwrap();
+        drop(writer);
+        assert_eq!(file.metadata().unwrap().len(), 8);
     }
 
     #[test]
