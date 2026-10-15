@@ -15992,8 +15992,8 @@ impl Application for Cagents {
                 // The dialog is an overlay, so it has already seen the
                 // keystroke by the time this runs, and what it does with one
                 // is its own affair.
-                if !captured
-                    && is_escape_press(&event)
+                if is_escape_press(&event)
+                    && !self.workspace_inputs_blocked()
                     && let Some(card) = self.workspace.focused()
                     && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
                     && runtime.go_to_line_is_open()
@@ -26541,6 +26541,45 @@ mod tests {
         app.settings_reset_confirm = true;
         drop(app.update(next()));
         assert_eq!(app.workspace.focused(), Some(ids[2]));
+    }
+
+    #[test]
+    fn captured_go_to_line_escape_closes_the_field_and_preserves_top_modal_priority() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}};
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "code.rs", "fn main() {}\n");
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
+        let event = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape), modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape), location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+        };
+        let renderer = headless_renderer();
+        let captured = {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("editor"); };
+            let mut element = repository_widget::view(card, runtime);
+            let mut tree = Tree::new(&element);
+            let bounds = iced::Rectangle::with_size(iced::Size::new(1000.0, 700.0));
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO, bounds.size()));
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+                &mut operation::focusable::focus::<()>(widget::Id::new(format!("repository.{card}.go-to-line"))));
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(&mut tree, &iced::Event::Keyboard(event.clone()), Layout::new(&node), iced::mouse::Cursor::Unavailable,
+                &renderer, &mut clipboard::Null, &mut shell, &bounds);
+            shell.is_event_captured()
+        };
+        assert!(captured, "the actual mounted native input captures Escape to blur");
+        drop(app.update(Message::KeyEvent { event: event.clone(), captured }));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if !runtime.go_to_line_is_open()));
+        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
+        app.settings_reset_confirm = true;
+        drop(app.update(Message::KeyEvent { event, captured: true }));
+        assert!(!app.settings_reset_confirm);
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.go_to_line_is_open()));
     }
 
     #[test]

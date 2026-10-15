@@ -3194,6 +3194,13 @@ impl Application for Editor {
                 if self.find_open {
                     return self.update(Message::CloseFind);
                 }
+                if !self.modal_open()
+                    && let Some(card) = self.active
+                    && let Some(tab) = self.tab_mut(card)
+                    && tab.runtime.go_to_line_is_open()
+                {
+                    return repository_task(tab.runtime.update(RepositoryAction::CloseGoToLine { card }));
+                }
             }
             // Quick open counts as a modal, and the guard below drops every
             // key while a modal is up. A palette whose whole point is staying
@@ -6453,6 +6460,41 @@ mod tests {
                 .map(|pending| pending.path.clone()),
             Some(selected),
         );
+    }
+
+    #[test]
+    fn mounted_go_to_line_escape_closes_once_and_settings_keeps_priority() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, renderer::Headless, widget::{Tree, operation}};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("code.rs"), "fn main() {}\n").unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(Opened { root: directory.path().into(), file: Some("code.rs".into()), snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
+        let event = named_key(keyboard::key::Named::Escape, keyboard::Modifiers::empty());
+        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(cosmic::Renderer::new(cosmic::iced::Font::MONOSPACE, cosmic::iced::Pixels(14.0), Some("tiny-skia"))).unwrap();
+        {
+            let mut element = cagents::repository_widget::view(card, &app.tab(card).unwrap().runtime);
+            let mut tree = Tree::new(&element);
+            let bounds = iced::Rectangle::with_size(iced::Size::new(1000.0, 700.0));
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO, bounds.size()));
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+                &mut operation::focusable::focus::<()>(widget::Id::new(format!("repository.{card}.go-to-line"))));
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(&mut tree, &iced::Event::Keyboard(event.clone()), Layout::new(&node), iced::mouse::Cursor::Unavailable,
+                &renderer, &mut clipboard::Null, &mut shell, &bounds);
+            assert!(shell.is_event_captured(), "exercise the mounted native field's Escape capture");
+        }
+        drop(app.update(Message::Key(event.clone())));
+        assert!(!app.tab(card).unwrap().runtime.go_to_line_is_open());
+        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
+        app.settings_open = true;
+        drop(app.update(Message::Key(event)));
+        assert!(app.settings_open);
+        assert!(app.tab(card).unwrap().runtime.go_to_line_is_open());
     }
 
     #[test]
