@@ -8,7 +8,9 @@ mod claude_edits;
 mod claude_permissions;
 pub mod codex;
 pub mod omp;
-mod terminal_output;
+mod tool_cache;
+pub use tool_cache::{ItemKey as CanonicalItemKey,ItemReader as CanonicalItemReader};
+pub(crate) use super::terminal_output;
 
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
@@ -207,6 +209,11 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Optional exact canonical source for byte-budgeted adapter caches.
+    fn bind_item_reader(&mut self,_reader:std::sync::Arc<dyn CanonicalItemReader>) {}
+    /// The runtime has committed this Step into its canonical Store. Resident
+    /// caches may now retire bodies without losing same-frame correlation.
+    fn committed(&mut self) {}
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(
@@ -217,6 +224,26 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Providers with redundant partial snapshots can avoid allocating them.
+    fn decode(&self, bytes: &[u8]) -> Result<Value, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+
+    /// Housekeeping must run even when a provider stops sending frames.
+    fn tick(&mut self) -> Step {
+        Step::default()
+    }
+    fn deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    /// A command may await provider confirmation without blocking its actor.
+    fn command_ack(&mut self) -> Option<String> {
+        None
+    }
+    fn control_replies(&mut self) -> Vec<(String, Result<(), String>)> {
+        Vec::new()
+    }
+
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.
@@ -309,4 +336,22 @@ mod launch_tests {
             LaunchOutcome::TeardownProved
         );
     }
+}
+
+/// A byte-bounded, terminal-safe preview of untrusted protocol text.
+pub(crate) fn preview(bytes: &[u8], limit: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut result = String::new();
+    for ch in text.chars() {
+        let escaped: String = if ch.is_control() {
+            ch.escape_default().collect()
+        } else {
+            ch.to_string()
+        };
+        if result.len() + escaped.len() > limit {
+            break;
+        }
+        result.push_str(&escaped);
+    }
+    result
 }
