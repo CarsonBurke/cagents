@@ -1197,19 +1197,9 @@ pub(crate) const MAX_TERMINAL_HANDOFF_BYTES: usize = 64 * 1024 * 1024;
 /// Count encoded bytes without allocating another copy of a launch recipe.
 /// This is admission bookkeeping, never account or execution authority.
 pub(crate) fn terminal_handoff_bytes(receipt: &crate::terminal::ipc::TerminalHandoffReceipt) -> Result<usize, String> {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.checked_add(bytes.len()).filter(|total| *total <= crate::terminal::ipc::MAX_FRAME_BYTES)
-                .ok_or_else(|| std::io::Error::other("Terminal return receipt exceeds its source frame bound"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-    }
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, receipt).map_err(|error| error.to_string())?;
-    Ok(count.0)
+    crate::terminal::ipc::terminal_handoff_json_bytes(receipt).map_err(|error| error.to_string())
 }
+
 pub(crate) fn validate_terminal_handoffs(pending: &HashMap<uuid::Uuid, SavedTerminalHandoff>) -> Result<usize, String> {
     if pending.len() > MAX_TERMINAL_HANDOFFS { return Err("Too many saved terminal return receipts".into()); }
     let mut bytes = 0usize;

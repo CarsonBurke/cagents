@@ -7148,7 +7148,7 @@ impl Cagents {
         let Ok(bytes) = crate::model::validate_terminal_handoffs(&self.durable.terminal_handoff_receipts) else { return false; };
         let inflight = self.chat_ui.handoff_bindings.len();
         self.durable.terminal_handoff_receipts.len().saturating_add(inflight) < crate::model::MAX_TERMINAL_HANDOFFS
-            && bytes.saturating_add(inflight.saturating_add(1).saturating_mul(crate::terminal::ipc::MAX_FRAME_BYTES + 256)) <= crate::model::MAX_TERMINAL_HANDOFF_BYTES
+            && bytes.saturating_add(inflight.saturating_add(1).saturating_mul(crate::terminal::ipc::MAX_HANDOFF_RECEIPT_JSON_BYTES + 256)) <= crate::model::MAX_TERMINAL_HANDOFF_BYTES
     }
     fn retain_terminal_handoff_receipt(&mut self, card: CardId, receipt: &crate::terminal::ipc::TerminalHandoffReceipt) -> bool {
         if let Some(existing) = self.durable.terminal_handoff_receipts.get(&receipt.operation) {

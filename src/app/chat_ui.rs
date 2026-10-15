@@ -14,6 +14,8 @@ use std::sync::{
 };
 
 mod auth_recovery;
+#[cfg(test)]
+mod handoff_tests;
 mod changes;
 mod clipboard_image;
 mod completion;
@@ -8447,6 +8449,12 @@ impl Cagents {
                 }
                 // The ordinary installer releases this exact start slot LAST;
                 // its finish hook then resumes only a fully attached Close.
+                let result = if current && result.is_ok() && !exact {
+                    // Drop only this rejected attachment. Never adopt its
+                    // successor or leave the original pane loading forever.
+                    drop(result);
+                    Err("The returned terminal worker changed before attachment. Its current source was kept.".into())
+                } else { result };
                 let install = current && (result.is_err() || exact);
                 return self.terminal_started_for_operation(card, receipt.terminal.session.id, result, install);
             }
@@ -12797,7 +12805,7 @@ mod tests {
     }
 
     /// A conversation that started, optionally with a provider-confirmed id.
-    fn live_chat(app: &mut Cagents, session_id: Option<&str>) -> CardId {
+    pub(super) fn live_chat(app: &mut Cagents, session_id: Option<&str>) -> CardId {
         let (card, target) = starting_chat(app);
         let handle = fixture_handle(app, card, session_id);
         answer_start(app, target, Ok(handle));
@@ -12908,7 +12916,7 @@ mod tests {
     }
 
     /// Explicitly end a conversation through its confirmation flow.
-    fn request_end_chat(app: &mut Cagents, card: CardId) {
+    pub(super) fn request_end_chat(app: &mut Cagents, card: CardId) {
         drop(app.update(Message::ChatClose(closing::Action::End(card))));
         if let Some(target) = app
             .chat_ui
@@ -14812,81 +14820,7 @@ mod tests {
     /// CLI first reserved the card's removal twice and left it stuck.
     #[test]
     fn a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, Some(KNOWN_THREAD));
-        let _ = app.update(Message::ChatUi(Action::Switch(card)));
-        let target = app
-            .chat_ui
-            .phases
-            .values()
-            .find_map(|phase| match phase {
-                Phase::Returning { target, .. } => Some(*target),
-                _ => None,
-            })
-            .unwrap();
-        request_end_chat(&mut app, card);
-        assert!(matches!(
-            app.chat_ui.phases.get(&card),
-            Some(Phase::Returning {
-                close_requested: true,
-                ..
-            })
-        ));
-        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
-            unreachable!()
-        };
-        let mut session = runtime.session.clone();
-        session.launch.session_id = Some(KNOWN_THREAD.into());
-        let proof = runtime.handle().unwrap().proof().unwrap();
-        let mut cli = return_terminal(&session).unwrap();
-        cli.continuity = TerminalContinuity::Live {
-            host_session_id: proof.host_session_id.clone(),
-            boot_id: proof.boot_id.clone(),
-            host_incarnation: proof.host_incarnation.clone(),
-        };
-        let expected = app.chat_ui.handoff_bindings[&target].binding.clone();
-        let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(cli.id, cli.launch.clone(), cli.transcript_path.clone());
-        descriptor.session = cli;
-        descriptor.execution_instance = uuid::Uuid::new_v4();
-        let receipt = crate::terminal::ipc::TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(),
-            source: expected.source.clone(), source_execution_instance: expected.execution_instance,
-            source_binding: expected, retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor };
-        let _ = app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt))));
-        // Drive every daemon request to success until nothing is left to do.
-        for _ in 0..8 {
-            if let Some(intent) = app.terminal_close.clone() {
-                assert!(intent.detail.is_none(), "{:?}", intent.detail);
-                let _ = app.update(Message::TerminalCloseFinished {
-                    card: intent.card,
-                    terminal: intent.terminal,
-                    proof: intent.proof,
-                    generation: intent.generation,
-                    outcome: crate::app::terminal_close::CloseOutcome::Closed,
-                });
-            } else if app
-                .workspace
-                .pending_close()
-                .is_some_and(|handoff| handoff.unmounting == card)
-            {
-                let _ = app.update(Message::CommitClose(card));
-            } else if let Some(closing) =
-                app.chat_ui.phases.values().find_map(|phase| match phase {
-                    Phase::Closing { target, .. } => Some(*target),
-                    _ => None,
-                })
-            {
-                let _ = app.update(Message::ChatUi(Action::CloseFinished(closing, Ok(()))));
-            } else {
-                break;
-            }
-        }
-        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
-        assert!(!app.workspace.order().any(|id| id == card));
-        assert!(!app.card_state(card).unwrap().existence.is_open());
-        assert_eq!(app.workspace.pending_close(), None);
-        assert!(app.terminal_close.is_none());
-        assert!(!app.chat_has_parked_runtime(card));
-        assert!(!app.chat_ui.transition_pending());
+        super::handoff_tests::end_waits_for_original_attachment_then_closes_only_its_worker();
     }
 
     #[test]
