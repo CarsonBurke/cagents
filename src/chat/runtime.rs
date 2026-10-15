@@ -772,6 +772,11 @@ impl Handle {
     /// fencing further work. Call outside HostLock; joining may take time.
     pub(crate) fn close_if_revision(&self, revision:u64) -> Result<(),String> {
         if self.is_completed() {
+            let detached=self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner()).is_some();
+            let retained=self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner()).is_some();
+            if detached || retained {
+                return Err("Retained provider work is not observed by this actor; reattach the session before confirming close".into());
+            }
             if self.close_observation().close_revision!=revision {return Err("Provider work changed before conditional close".into());}
         } else {
             self.ownership_command(ActorCommand::CloseIfRevision {revision})?;
