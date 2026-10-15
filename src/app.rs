@@ -2196,11 +2196,12 @@ pub enum SettingsCategory {
     Links,
     Keyboard,
     Accounts,
+    Agents,
     About,
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
@@ -2210,6 +2211,7 @@ impl SettingsCategory {
         Self::Links,
         Self::Keyboard,
         Self::Accounts,
+        Self::Agents,
         Self::About,
     ];
 
@@ -2224,6 +2226,7 @@ impl SettingsCategory {
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
             Self::Accounts => "Accounts",
+            Self::Agents => "Agents",
             Self::About => "About",
         }
     }
@@ -2505,6 +2508,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         // keystroke aimed at the dialog must not edit a setting behind it.
         | Message::SelectSettingsCategory(_)
         | Message::SettingsSearchChanged(_)
+        | Message::DetectAgentExecutable(_)
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
         | Message::ResetSettings
@@ -2569,6 +2573,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::CancelDialog
                 | Message::SelectSettingsCategory(_)
                 | Message::SettingsSearchChanged(_)
+                | Message::DetectAgentExecutable(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
                 | Message::ResetSettings
@@ -2718,7 +2723,16 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentSetting { Model, Effort, PermissionMode, Executable, Arguments, Environment }
+
+impl AgentSetting {
+    const fn label(self) -> &'static str { match self { Self::Model => "Default model", Self::Effort => "Default effort", Self::PermissionMode => "Default permission mode", Self::Executable => "Executable", Self::Arguments => "Extra arguments", Self::Environment => "Environment" } }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingsField {
+    Agent(crate::agent::Provider, AgentSetting),
+    DefaultShell,
     Notifications(crate::notifications::Field),
     AppTheme,
     UiScale,
@@ -2848,6 +2862,8 @@ impl SettingsField {
     const fn label(self) -> &'static str {
         use crate::notifications::Field;
         match self {
+            Self::Agent(_, field) => field.label(),
+            Self::DefaultShell => "Default shell",
             Self::Notifications(Field::Enabled) => "System notifications",
             Self::Notifications(Field::Success) => "Successful completion",
             Self::Notifications(Field::Failure) => "Failure or cancellation",
@@ -2938,6 +2954,7 @@ impl SettingsField {
     /// The category whose page holds this setting.
     const fn category(self) -> SettingsCategory {
         match self {
+            Self::Agent(..) | Self::DefaultShell => SettingsCategory::Agents,
             Self::Notifications(_) => SettingsCategory::Notifications,
             Self::AppTheme
             | Self::UiScale
@@ -3123,8 +3140,16 @@ impl ShortcutDraft {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AgentDraft {
+    configuration: settings::AgentLaunchSettings,
+    environment: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
+    agents: std::collections::BTreeMap<crate::agent::Provider, AgentDraft>,
+    default_shell: String,
     notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
@@ -3173,6 +3198,12 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
+            agents: crate::agent::Provider::ALL.into_iter().map(|provider| {
+                let configuration = settings.agents.get(settings::agents::provider_key(provider)).cloned().unwrap_or_default();
+                let environment = configuration.environment.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+                (provider, AgentDraft { configuration, environment })
+            }).collect(),
+            default_shell: settings.default_shell.clone().unwrap_or_default(),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
@@ -3235,6 +3266,19 @@ impl SettingsDraft {
 
     fn set(&mut self, field: SettingsField, value: String) {
         match field {
+            SettingsField::DefaultShell => self.default_shell = value,
+            SettingsField::Agent(provider, field) => {
+                let draft = self.agents.entry(provider).or_default();
+                let optional = |value: String| (!value.is_empty()).then_some(value);
+                match field {
+                    AgentSetting::Model => draft.configuration.model = optional(value),
+                    AgentSetting::Effort => draft.configuration.effort = optional(value),
+                    AgentSetting::PermissionMode => draft.configuration.permission_mode = optional(value),
+                    AgentSetting::Executable => draft.configuration.executable = optional(value),
+                    AgentSetting::Arguments => if let Ok(arguments) = serde_json::from_str(&value) { draft.configuration.arguments = arguments; },
+                    AgentSetting::Environment => if let Ok(environment) = serde_json::from_str::<Vec<(String, String)>>(&value) { draft.configuration.environment = environment.iter().cloned().collect(); draft.environment = environment; },
+                }
+            }
             SettingsField::Notifications(field) => self.notifications.set(field, value == "true"),
             SettingsField::AppTheme => self.app_theme = value,
             SettingsField::UiScale => self.ui_scale = value,
@@ -3404,6 +3448,24 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+
+        SettingsField::DefaultShell => { next.default_shell = (!value.is_empty()).then(|| value.to_owned()); Ok(()) }
+        SettingsField::Agent(provider, field) => {
+            let configuration = next.agents.entry(settings::agents::provider_key(provider).into()).or_default();
+            let optional = || (!value.is_empty()).then(|| value.to_owned());
+            match field {
+                AgentSetting::Model => { configuration.model = optional(); Ok(()) }
+                AgentSetting::Effort => { configuration.effort = optional(); Ok(()) }
+                AgentSetting::PermissionMode => { configuration.permission_mode = optional(); Ok(()) }
+                AgentSetting::Executable => { configuration.executable = optional(); Ok(()) }
+                AgentSetting::Arguments => serde_json::from_str(value).map(|arguments| configuration.arguments = arguments).map_err(|_| "Enter each argument in its own row.".to_owned()),
+                AgentSetting::Environment => serde_json::from_str::<Vec<(String, String)>>(value).map_err(|_| "Enter each environment variable in its own row.".to_owned()).and_then(|entries| {
+                    let mut names = std::collections::HashSet::new();
+                    if entries.iter().any(|(name, _)| !names.insert(name)) { return Err("Environment variable names must be unique.".into()); }
+                    configuration.environment = entries.into_iter().collect(); Ok(())
+                }),
+            }
+        }
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -3819,6 +3881,9 @@ fn settings_update(
 fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
     let label = field.label();
     Some(match field {
+
+        SettingsField::DefaultShell => "Default shell must be an absolute path to an executable file.".into(),
+        SettingsField::Agent(provider, _) => attempted.agents.get(settings::agents::provider_key(provider))?.validate(provider).err()?,
         SettingsField::TerminalScrollSize => format!(
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
@@ -4296,6 +4361,8 @@ pub enum Message {
     ContextInspector(InspectorAction),
     SelectSettingsCategory(SettingsCategory),
     SettingsSearchChanged(String),
+    DetectAgentExecutable(crate::agent::Provider),
+    AgentExecutableDetected(crate::agent::Provider, Option<String>, Option<String>),
     SettingsChanged {
         field: SettingsField,
         value: String,
@@ -9262,6 +9329,7 @@ impl Cagents {
                 settings_ui::SettingsContext {
                     feedback: self.settings_feedback.as_ref(),
                     invalid: &self.settings_invalid,
+                    agent_models: crate::agent::Provider::ALL.into_iter().map(|provider| (provider, self.account_ui.catalog(provider).map(|catalog| catalog.models.as_slice()).unwrap_or(&[]))).collect(),
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
@@ -16066,6 +16134,21 @@ impl Application for Cagents {
                 self.settings_search.clear();
                 self.settings_category = category;
                 crate::settings_widgets::reveal_content_start()
+            }
+            Message::DetectAgentExecutable(provider) => {
+                let previous = self.settings_draft.agents.get(&provider).and_then(|draft| draft.configuration.executable.clone());
+                cosmic::task::future(async move {
+                let path = tokio::task::spawn_blocking(move || {
+                    let search = std::env::var_os("PATH");
+                    crate::account::probe::find_executable(provider.executable(), search.as_deref()).map(|path| path.to_string_lossy().into_owned())
+                }).await.ok().flatten();
+                Message::AgentExecutableDetected(provider, previous, path)
+            }) },
+            Message::AgentExecutableDetected(provider, previous, _) if self.settings_draft.agents.get(&provider).and_then(|draft| draft.configuration.executable.as_ref()) != previous.as_ref() => Task::none(),
+            Message::AgentExecutableDetected(provider, _, Some(path)) => self.apply_setting_input(SettingsField::Agent(provider, AgentSetting::Executable), path),
+            Message::AgentExecutableDetected(provider, _, None) => {
+                self.settings_invalid.insert(SettingsField::Agent(provider, AgentSetting::Executable), format!("{} was not found on PATH. Choose an executable path.", provider.label()));
+                self.refresh_settings_feedback(); Task::none()
             }
             Message::SettingsSearchChanged(query) => {
                 self.settings_search = query;

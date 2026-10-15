@@ -1,4 +1,5 @@
 use super::*;
+mod agents;
 use crate::settings_widgets::{Group, Setting, field as setting_field, group as settings_group};
 
 fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a, Message> {
@@ -191,6 +192,7 @@ pub(super) struct SettingsContext<'a> {
     pub feedback: Option<&'a SettingsFeedback>,
     /// Refused values, by the field that refused them.
     pub invalid: &'a HashMap<SettingsField, String>,
+    pub agent_models: Vec<(crate::agent::Provider, &'a [crate::chat::Model])>,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
@@ -204,6 +206,7 @@ fn settings_category_controls<'a>(
     let invalid = context.invalid;
     let testing_notification = context.testing_notification;
     match category {
+        SettingsCategory::Agents => agents::controls(draft, context),
         SettingsCategory::Notifications => {
             use crate::notifications::Field;
             let fields = [
@@ -1165,6 +1168,7 @@ fn category_icon(category: SettingsCategory) -> Icon {
         SettingsCategory::NativeChat => Icon::Chat,
         SettingsCategory::Editor => Icon::TextEditor,
         SettingsCategory::Accounts => Icon::Users,
+        SettingsCategory::Agents => Icon::Chat,
         SettingsCategory::About => Icon::Info,
     }
 }
