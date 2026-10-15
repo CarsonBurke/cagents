@@ -192,3 +192,28 @@ fn actual_nonselected_pane_header_keeps_native_focus_through_all_ready_update_op
     let _ = ui.update(&[key("q", Code::KeyQ, keyboard::Modifiers::empty(), None)], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
     assert!(messages.iter().any(|m| matches!(m, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &header && region.card == Some(owner))), "logical reconciliation and its actual widget operations must preserve the nondefault native owner");
 }
+
+
+#[test]
+fn actual_sidebar_buttons_reopen_a_pane_while_the_native_search_field_keeps_redo() {
+    use keyboard::key::Code;
+    for button in [widget::Id::new("sidebar.settings"), widget::Id::new("sidebar.automations"), sidebar::search_toggle_focus_id()] {
+        let (mut app, card) = super::tests::editing_repository_app();
+        app.sidebar_model.projects.push(sidebar::SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Keyboard fixture".into(), "/keyboard-fixture".into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder));
+        app.sidebar_state.apply(&SidebarAction::ToggleControls);
+        prepare(&mut app);
+        seed_reopen(&mut app, card);
+        let mut renderer = super::tests::headless_renderer();
+        let redo = key("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None);
+        let (cache, field_messages) = native(&app, &mut renderer, Cache::new(), Some(sidebar::search_focus_id()), &[redo.clone()]);
+        assert!(field_messages.iter().any(|message| matches!(message, Message::RoutedKeyEvent { region, widget: Some(id), .. } if region.pane == workspace_widget::FocusedPane::TextInput && region.card.is_none() && id == &sidebar::search_focus_id())));
+        dispatch(&mut app, field_messages);
+        assert_eq!(app.recently_closed.len(), 1, "sidebar text editing must keep redo");
+        let (_cache, messages) = native(&app, &mut renderer, cache, Some(button.clone()), &[redo]);
+        assert!(messages.iter().any(|message| matches!(message, Message::RoutedKeyEvent { event, region, widget: Some(id), .. } if region.pane == workspace_widget::FocusedPane::Other && region.card.is_none() && id == &button && workspace_widget::global_shortcut(event, &app.settings.keyboard_shortcuts, region.pane) == Some(workspace_widget::GlobalShortcut::ReopenPane))), "actual mounted button {button:?} must positively own nontext redo");
+        dispatch(&mut app, messages);
+        assert!(app.recently_closed.is_empty(), "the actual nontext route must consume the real reopen candidate");
+        assert_eq!(app.workspace.order().len(), 2);
+        assert_eq!(app.utility_card(&CardKind::Settings), app.workspace.focused());
+    }
+}

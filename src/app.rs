@@ -17143,6 +17143,11 @@ impl Application for Cagents {
             &self.settings.keyboard_shortcuts,
         )
         .map(Message::Sidebar);
+        // All mounted sidebar actions are outside the pane. Native editing
+        // markers still classify its search/commit fields as TextInput.
+        let sidebar: Element<'_, Message> = widget::container(sidebar)
+            .id(widget::Id::new("workspace.sidebar-controls"))
+            .into();
 
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
@@ -17503,7 +17508,7 @@ impl Application for Cagents {
             self.input_trace.clear_keyboard_focus();
             crate::input_trace::observe(surface, &self.input_trace)
         } else {
-            let mut regions = Vec::new();
+            let mut regions = vec![(widget::Id::new("workspace.sidebar-controls"), workspace_widget::FocusedPane::Other.into())];
             for mounted in &self.workspace.projection(self.workspace.viewport_width()).mounted {
                 let card = mounted.id;
                 let kind = self.pane_kind(card);
