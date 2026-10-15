@@ -1829,7 +1829,7 @@ impl Adapter for Claude {
                 | Command::SetPermissionMode { .. }
                 | Command::UpdatePermissionSettings { .. }
         ) {
-            self.originals.revision = self.originals.revision.wrapping_add(1);
+            self.original_settings_changed();
         }
         if self.history_only {
             match command {

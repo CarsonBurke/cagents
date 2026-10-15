@@ -36,6 +36,14 @@ pub(super) struct Originals {
     latest_started: Option<String>,
 }
 impl Claude {
+    pub(super) fn original_settings_changed(&mut self) {
+        self.originals.revision = self.originals.revision.wrapping_add(1);
+        // A setter ACK may only acknowledge the requested overlay. Until
+        // the provider reports its effective connection policy again, never
+        // combine an older init policy with a fresh model read.
+        self.originals.policy = None;
+        self.originals.init = None;
+    }
     pub(super) fn original_frame_budget(&self, frame: &Value) -> Result<(), String> {
         if let Some(waiting) = &self.originals.waiting
             && encoded_len(frame)? > MAX_PAYLOAD.saturating_sub(waiting.bytes)
@@ -511,6 +519,32 @@ mod tests {
                 ))
         );
     }
+    #[test]
+    fn setting_ack_never_reuses_prior_init_policy_for_the_next_original() {
+        for change in [
+            Command::SetPermissionMode { mode: "bypassPermissions".into() },
+            Command::SetFastMode { enabled: true },
+        ] {
+            let mut adapter = adapter();
+            adapter.fast_mode = Some(chat::FastMode { state: chat::FastModeState::Off, disabled_reason: None });
+            adapter.receive(init()).unwrap();
+            let control = adapter.command(change).unwrap();
+            adapter.receive(json!({"type":"control_response","response":{"request_id":control.writes[0]["request_id"],"subtype":"success","response":{"mode":"bypassPermissions"}}})).unwrap();
+            assert!(adapter.originals.policy.is_none());
+            assert!(adapter.originals.init.is_none());
+            adapter.original_command(Some("after-setting".into()));
+            let read = adapter.command(prompt("original", PromptMode::Send)).unwrap();
+            adapter.receive(settings_reply(&read.writes[0])).unwrap();
+            let mut changed = init();
+            changed["permissionMode"] = json!("bypassPermissions");
+            changed["fast_mode_state"] = json!("on");
+            adapter.receive(changed).unwrap();
+            adapter.receive(started("after-setting")).unwrap();
+            adapter.receive(user("after-setting")).unwrap();
+            assert!(adapter.take_original_updates().iter().all(|update| !matches!(update, OriginalUpdate::Settings { .. } | OriginalUpdate::Accepted { .. })));
+        }
+    }
+
     #[test]
     fn timeout_and_queued_input_preserve_wire_order_without_inventing_settings() {
         let mut adapter = adapter();
