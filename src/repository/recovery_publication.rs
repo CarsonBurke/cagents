@@ -149,7 +149,7 @@ impl Holding {
 
     fn release_blob_writers(
         &mut self,
-        writer: Arc<fs::File>,
+        mut writer: Arc<fs::File>,
         proof: &Proof,
         name: &Path,
         cancellation: &CancellationToken,
@@ -176,6 +176,9 @@ impl Holding {
                     return Err(io::Error::last_os_error().to_string());
                 }
                 if flags & libc::O_ACCMODE != libc::O_RDONLY {
+                    if !Arc::ptr_eq(file, &writer) {
+                        return Err("Recovery publication has an independent writer owner".into());
+                    }
                     let owned = self
                         .files
                         .iter()
@@ -201,6 +204,13 @@ impl Holding {
         // before the first public rename; try_clone cannot downgrade access.
         for index in release.into_iter().rev() {
             self.files.remove(index);
+        }
+        // A Weak can otherwise upgrade after a sampled strong count. Once
+        // our internal aliases are gone, require exclusive original ownership
+        // before closing it. Refusal puts that SAME writer back under the slot.
+        if Arc::get_mut(&mut writer).is_none() {
+            self.files.push(writer);
+            return Err("Recovery writer still has an outstanding executor owner".into());
         }
         drop(writer);
         Ok(())
@@ -262,7 +272,16 @@ impl Holding {
         }
         fs_safety::sync_directory(self.context.placement().directory())
             .map_err(|error| error.to_string())?;
-        fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())
+        fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())?;
+        // Removing names does not close an executor's original creator Arc.
+        // Keep the SAME charge until every exported strong/Weak capability has
+        // returned, including when only removed-H durability work remains.
+        for file in &mut self.files {
+            if Arc::get_mut(file).is_none() {
+                return Err("Undo recovery still has outstanding original file custody".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -767,6 +786,12 @@ mod tests {
     use super::*;
 
     fn fixture() -> (tempfile::TempDir, DiscardRecovery, Holding) {
+        fixture_with_guard(())
+    }
+
+    fn fixture_with_guard(
+        guard: impl Send + Sync + 'static,
+    ) -> (tempfile::TempDir, DiscardRecovery, Holding) {
         let directory = tempfile::tempdir().unwrap();
         let root = fs_safety::Root::open(directory.path()).unwrap();
         let metadata = root.metadata().unwrap();
@@ -782,7 +807,8 @@ mod tests {
             &root,
             &recovery,
             &CancellationToken::new(),
-            &crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap(),
+            &crate::filesystem_recovery_context::fixtures::fixture_context_with_guard(&root, guard)
+                .unwrap(),
         )
         .unwrap();
         (directory, recovery, holding)
@@ -879,56 +905,104 @@ mod tests {
 
     #[test]
     fn undo_read_only_handoff_refuses_outstanding_writer_without_publishing_or_losing_custody() {
-        let (directory, recovery, mut holding) = fixture();
-        let writer = holding.create_private_blob().unwrap();
-        let readable = holding.pin_readable_blob(&writer).unwrap();
-        writer.write_all_at(b"original bytes", 0).unwrap();
-        writer.sync_all().unwrap();
-        let before = writer.metadata().unwrap();
-        let access = SavedFileAccess::capture(&writer).unwrap();
-        let digest = digest_file(&writer, before.len(), &CancellationToken::new()).unwrap();
-        let proof = Proof::after_blob_access_change(
-            &holding,
-            Path::new("restored-blob"),
-            access,
-            readable,
-            before,
-            digest,
-            0o700,
-            &CancellationToken::new(),
-            |_| Ok(()),
-        )
-        .unwrap();
-        let outstanding = writer.clone();
-        let error = holding
-            .release_blob_writers(
-                writer,
-                &proof,
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ChargedGuard(Arc<AtomicBool>);
+        impl Drop for ChargedGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for weak_only in [false, true] {
+            let released = Arc::new(AtomicBool::new(false));
+            let (directory, recovery, mut holding) =
+                fixture_with_guard(ChargedGuard(released.clone()));
+            let writer = holding.create_private_blob().unwrap();
+            let readable = holding.pin_readable_blob(&writer).unwrap();
+            writer.write_all_at(b"original bytes", 0).unwrap();
+            writer.sync_all().unwrap();
+            let before = writer.metadata().unwrap();
+            let access = SavedFileAccess::capture(&writer).unwrap();
+            let digest = digest_file(&writer, before.len(), &CancellationToken::new()).unwrap();
+            let proof = Proof::after_blob_access_change(
+                &holding,
                 Path::new("restored-blob"),
+                access,
+                readable,
+                before,
+                digest,
+                0o700,
                 &CancellationToken::new(),
+                |_| Ok(()),
             )
-            .unwrap_err();
-        assert!(error.contains("outstanding executor owner"));
-        assert!(
-            fs::read_dir(directory.path()).unwrap().next().is_none(),
-            "no public entry was published"
-        );
-        let private = holding.root().path().to_owned();
-        let original = outstanding.metadata().unwrap();
-        drop(outstanding);
-        holding.retain(&recovery);
-        let authority = recovery.live_recovery.authority().unwrap();
-        assert!(authority.retry().is_err());
-        let retained = fs::metadata(private.join("restored-blob")).unwrap();
-        assert_eq!(
-            (retained.dev(), retained.ino()),
-            (original.dev(), original.ino())
-        );
-        assert!(!authority.is_resolved());
-        // Explicit fixture resolution of the known unpublished original.
-        fs::remove_file(private.join("restored-blob")).unwrap();
-        authority.retry().unwrap();
-        assert!(authority.is_resolved());
+            .unwrap();
+            let original = writer.metadata().unwrap();
+            let mut outstanding = Some(writer.clone());
+            let weak = weak_only.then(|| Arc::downgrade(&writer));
+            if weak_only {
+                drop(outstanding.take());
+            }
+            let error = holding
+                .release_blob_writers(
+                    writer,
+                    &proof,
+                    Path::new("restored-blob"),
+                    &CancellationToken::new(),
+                )
+                .unwrap_err();
+            assert!(error.contains("outstanding executor owner"));
+            assert!(
+                fs::read_dir(directory.path()).unwrap().next().is_none(),
+                "no public entry was published"
+            );
+            let private = holding.root().path().to_owned();
+            // Test-owned readonly proof aliases must return too; only the
+            // deliberate executor strong/Weak capability remains outstanding.
+            drop(proof);
+            holding.retain(&recovery);
+            let authority = recovery.live_recovery.authority().unwrap();
+            assert!(authority.retry().is_err());
+            let retained = fs::metadata(private.join("restored-blob")).unwrap();
+            assert_eq!(
+                (retained.dev(), retained.ino()),
+                (original.dev(), original.ino())
+            );
+            assert!(!authority.is_resolved());
+            assert!(!released.load(Ordering::SeqCst));
+            // Even positive removal of the original payload/H cannot release
+            // the charged owner while its same original FD can still be used.
+            fs::remove_file(private.join("restored-blob")).unwrap();
+            let error = authority.retry().unwrap_err();
+            assert!(error.contains("outstanding original file custody"));
+            assert!(!private.exists(), "known removed-H retry must stay live");
+            assert!(!authority.is_resolved());
+            assert!(!released.load(Ordering::SeqCst));
+            let held = outstanding
+                .as_ref()
+                .cloned()
+                .or_else(|| weak.as_ref().unwrap().upgrade())
+                .unwrap();
+            let held_metadata = held.metadata().unwrap();
+            assert_eq!(
+                (
+                    held_metadata.dev(),
+                    held_metadata.ino(),
+                    held_metadata.nlink()
+                ),
+                (original.dev(), original.ino(), 0)
+            );
+            drop(held);
+            assert!(
+                authority
+                    .retry()
+                    .unwrap_err()
+                    .contains("outstanding original file custody")
+            );
+            drop(outstanding);
+            drop(weak);
+            authority.retry().unwrap();
+            assert!(authority.is_resolved());
+            assert!(released.load(Ordering::SeqCst));
+        }
     }
 
     #[test]
