@@ -1450,7 +1450,7 @@ mod tests {
             let handle = BrowserHandle::fixture();
             let content = Id::unique();
             let mut shortcuts = crate::settings::KeyboardShortcuts::default();
-            shortcuts.new_thread = vec!["Ctrl+R".into()];
+            shortcuts.new_native_thread = vec!["Ctrl+R".into()];
             let browser = BrowserWidget::<()>::new(&handle).id(content.clone()).model_focused(true);
             let parent = crate::workspace_widget::browser_keyboard_reservation_fixture(browser.into(), &shortcuts);
             let mut ui = UserInterface::build(parent, Size::new(400.0, 240.0), Cache::new(), &mut renderer);
