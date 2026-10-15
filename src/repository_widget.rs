@@ -14,6 +14,7 @@ use std::{
 pub(crate) mod text_editor;
 
 mod diff_actions;
+pub use diff_actions::DiffPresentationCommand;
 mod diff_layout;
 mod diff_mutations;
 pub use diff_mutations::Request as DiffMutationRequest;
@@ -4322,6 +4323,15 @@ impl RepositoryRuntime {
             _ => return None,
         };
         (source != &selected.path).then_some(source.as_path())
+    }
+
+    // Status-only capabilities can borrow the indexed row rather than clone
+    // its paths each time the palette computes command availability. A followed
+    // target absent from the list has the same false status flags as the
+    // synthetic fallback used by subject_file().
+    fn subject_file_ref(&self) -> Option<&RepositoryFile> {
+        let selected = self.selected.as_ref()?;
+        self.followed_source().map_or(Some(selected), |source| self.file(source))
     }
 
     /// Git's facts for the open buffer.
@@ -10172,53 +10182,17 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         None => basis_choice(&runtime.diff_basis),
     };
     let mut controls = Vec::new();
-    for (label, tip, choice, enabled, action) in [
-        (
-            "Working",
-            "Compare index with working tree",
-            BasisChoice::Unstaged,
-            runtime.can_select_diff_basis(&DiffBasis::IndexToWorktree),
-            RepositoryAction::ApplyDiffBasis {
-                card,
-                basis: DiffBasis::IndexToWorktree,
-            },
-        ),
-        (
-            "Staged",
-            "Compare HEAD with index",
-            BasisChoice::Staged,
-            runtime.can_select_diff_basis(&DiffBasis::HeadToIndex),
-            RepositoryAction::ApplyDiffBasis {
-                card,
-                basis: DiffBasis::HeadToIndex,
-            },
-        ),
-        (
-            "Branch",
-            "Compare branch with base",
-            BasisChoice::Committed(CommittedChoice::Branch),
-            runtime.can_select_committed_basis(CommittedChoice::Branch),
-            RepositoryAction::SelectCommittedBasis {
-                card,
-                choice: CommittedChoice::Branch,
-            },
-        ),
-        (
-            "History",
-            "Compare last commit with its parent",
-            BasisChoice::Committed(CommittedChoice::LastCommit),
-            runtime.can_select_committed_basis(CommittedChoice::LastCommit),
-            RepositoryAction::SelectCommittedBasis {
-                card,
-                choice: CommittedChoice::LastCommit,
-            },
-        ),
+    for (label, tip, choice, command) in [
+        ("Working", "Compare index with working tree", BasisChoice::Unstaged, DiffPresentationCommand::Working),
+        ("Staged", "Compare HEAD with index", BasisChoice::Staged, DiffPresentationCommand::Staged),
+        ("Branch", "Compare branch with base", BasisChoice::Committed(CommittedChoice::Branch), DiffPresentationCommand::Branch),
+        ("History", "Compare last commit with its parent", BasisChoice::Committed(CommittedChoice::LastCommit), DiffPresentationCommand::History),
     ] {
         controls.push(labelled_diff_control(
             label,
             tip,
-            enabled && selected == Some(choice),
-            enabled.then_some(action),
+            runtime.diff_presentation_available(command) && selected == Some(choice),
+            runtime.diff_presentation_action(card, command),
         ));
     }
     crate::ui_controls::segmented_controls(controls)
@@ -10232,38 +10206,13 @@ fn diff_action_toolbar(
     let mut rows = Vec::new();
     let mut actions = Vec::new();
     if !runtime.reviews_pull_request() {
-        let subject = runtime.subject_file();
-        for (stage, label, enabled) in [
-            (
-                true,
-                "Stage",
-                subject.as_ref().is_some_and(|file| file.unstaged),
-            ),
-            (
-                false,
-                "Unstage",
-                subject.as_ref().is_some_and(|file| file.staged),
-            ),
+        for (command, label, tooltip) in [
+            (DiffPresentationCommand::StageFile, "Stage", "Stage file changes · Ctrl+Shift+S"),
+            (DiffPresentationCommand::UnstageFile, "Unstage", "Unstage file changes · Ctrl+Shift+S when no unstaged changes"),
         ] {
-            actions.push(labelled_diff_control(
-                label,
-                if stage {
-                    "Stage file changes · Ctrl+Shift+S"
-                } else {
-                    "Unstage file changes · Ctrl+Shift+S when no unstaged changes"
-                },
-                false,
-                (enabled && !runtime.mutation_refresh_pending && !runtime.blocks_navigation())
-                    .then_some(RepositoryAction::StageSelected { card, stage }),
-            ));
+            actions.push(labelled_diff_control(label, tooltip, false,
+                runtime.diff_presentation_action(card, command)));
         }
-        let revert = if runtime.can_discard_edits() {
-            Some(RepositoryAction::DiscardEdits { card })
-        } else {
-            runtime
-                .selected_discard_request()
-                .map(|_| RepositoryAction::RevertFile { card })
-        };
         actions.push(labelled_diff_control(
             "Revert",
             if runtime.can_discard_edits() {
@@ -10272,14 +10221,14 @@ fn diff_action_toolbar(
                 "Revert working tree file changes…"
             },
             false,
-            revert,
+            runtime.diff_presentation_action(card, DiffPresentationCommand::Revert),
         ));
     }
     actions.push(labelled_diff_control(
         "Ignore whitespace",
         "Ignore horizontal whitespace in every diff",
         runtime.diff_ignore_whitespace,
-        Some(RepositoryAction::ToggleDiffWhitespace { card }),
+        runtime.diff_presentation_action(card, DiffPresentationCommand::IgnoreWhitespace),
     ));
     let mut basis = Vec::new();
     if !runtime.directory_only && !runtime.reviews_pull_request() {
@@ -10372,17 +10321,13 @@ fn diff_review_controls(
                 "Unified",
                 "Unified diff",
                 runtime.diff_mode == DiffMode::Inline,
-                runtime
-                    .can_change_diff_layout()
-                    .then_some(RepositoryAction::ApplyDiffMode { card, split: false }),
+                runtime.diff_presentation_action(card, DiffPresentationCommand::Unified),
             ),
             labelled_diff_control(
                 "Split",
                 "Side-by-side diff",
                 runtime.diff_mode == DiffMode::Split,
-                runtime
-                    .can_change_diff_layout()
-                    .then_some(RepositoryAction::ApplyDiffMode { card, split: true }),
+                runtime.diff_presentation_action(card, DiffPresentationCommand::Split),
             ),
         ]),
         // Navigation commands are a plain cluster, distinct from mode choices.
@@ -10419,10 +10364,10 @@ fn diff_review_controls(
             ),
         ]),
     ];
-    if runtime.can_retry_diff() {
+    if let Some(action) = runtime.diff_presentation_action(card, DiffPresentationCommand::Retry) {
         controls.push(toolbar_group(vec![
             icon_button(Icon::Refresh, "Retry diff")
-                .on_press(RepositoryAction::RetryDiff { card })
+                .on_press(action)
                 .into(),
         ]));
     }

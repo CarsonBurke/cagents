@@ -5,6 +5,22 @@ use crate::diff_interaction::{
     self as interaction, Command as DiffCommand, CopyText, Selection, Side,
 };
 
+/// Actions exposed by the diff toolbar, shared with shortcuts and the palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffPresentationCommand {
+    Unified,
+    Split,
+    IgnoreWhitespace,
+    Working,
+    Staged,
+    Branch,
+    History,
+    StageFile,
+    UnstageFile,
+    Revert,
+    Retry,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct SourceKey {
     generation: u64,
@@ -42,6 +58,52 @@ pub(super) struct State {
 }
 
 impl RepositoryRuntime {
+    /// Uses the same capabilities as the mounted diff toolbar. Availability is
+    /// checked again at dispatch; the existing actions also retain their normal
+    /// save, mutation and asynchronous-result fences.
+    pub fn diff_presentation_available(&self, command: DiffPresentationCommand) -> bool {
+        use DiffPresentationCommand::*;
+        if !self.shows_diff() { return false; }
+        match command {
+            Unified | Split => self.can_change_diff_layout(),
+            IgnoreWhitespace => true,
+            Working | Staged | Branch | History if self.reviews_pull_request() => false,
+            Working => self.can_select_diff_basis(&DiffBasis::IndexToWorktree),
+            Staged => self.can_select_diff_basis(&DiffBasis::HeadToIndex),
+            Branch => self.can_select_committed_basis(CommittedChoice::Branch),
+            History => self.can_select_committed_basis(CommittedChoice::LastCommit),
+            StageFile | UnstageFile => !self.reviews_pull_request()
+                && !self.mutation_refresh_pending && !self.blocks_navigation()
+                && self.subject_file_ref().is_some_and(|file| {
+                    if command == StageFile { file.unstaged } else { file.staged }
+                }),
+            Revert => !self.reviews_pull_request() && (self.can_discard_edits()
+                || self.selected_discard_request().is_some()),
+            Retry => self.can_retry_diff(),
+        }
+    }
+
+    pub fn diff_presentation_action(
+        &self,
+        card: CardId,
+        command: DiffPresentationCommand,
+    ) -> Option<RepositoryAction> {
+        use DiffPresentationCommand::*;
+        if !self.diff_presentation_available(command) { return None; }
+        Some(match command {
+            Unified | Split => RepositoryAction::ApplyDiffMode { card, split: command == Split },
+            IgnoreWhitespace => RepositoryAction::ToggleDiffWhitespace { card },
+            Working => RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::IndexToWorktree },
+            Staged => RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::HeadToIndex },
+            Branch => RepositoryAction::SelectCommittedBasis { card, choice: CommittedChoice::Branch },
+            History => RepositoryAction::SelectCommittedBasis { card, choice: CommittedChoice::LastCommit },
+            StageFile | UnstageFile => RepositoryAction::StageSelected { card, stage: command == StageFile },
+            Revert if self.can_discard_edits() => RepositoryAction::DiscardEdits { card },
+            Revert => RepositoryAction::RevertFile { card },
+            Retry => RepositoryAction::RetryDiff { card },
+        })
+    }
+
     /// Availability for palette/shortcut commands acting on the selected rows.
     /// Context menus keep their own captured row and side rather than using this
     /// focus-based entry point when a previously opened menu is activated.
@@ -968,6 +1030,63 @@ mod tests {
         assert!(runtime.diff_command_available("diff_copy"));
         assert!(!runtime.diff_command_available("diff_copy_old"));
         assert!(!runtime.diff_command_available("diff_copy_new"));
+    }
+
+    #[test]
+    fn diff_presentation_commands_share_toolbar_actions_and_mutation_fences() {
+        use DiffPresentationCommand::*;
+        let (mut runtime, card, identity) = fixture(DiffMode::Inline);
+        let file = runtime.selected.as_mut().unwrap();
+        file.staged = true;
+        file.unstaged = true;
+        assert!(matches!(runtime.diff_presentation_action(card, Unified), Some(RepositoryAction::ApplyDiffMode { split: false, .. })));
+        assert!(matches!(runtime.diff_presentation_action(card, Split), Some(RepositoryAction::ApplyDiffMode { split: true, .. })));
+        assert!(matches!(runtime.diff_presentation_action(card, Working), Some(RepositoryAction::ApplyDiffBasis { basis: DiffBasis::IndexToWorktree, .. })));
+        assert!(matches!(runtime.diff_presentation_action(card, Staged), Some(RepositoryAction::ApplyDiffBasis { basis: DiffBasis::HeadToIndex, .. })));
+        assert!(matches!(runtime.diff_presentation_action(card, Branch), Some(RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::Branch, .. })));
+        assert!(matches!(runtime.diff_presentation_action(card, History), Some(RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::LastCommit, .. })));
+        assert!(matches!(runtime.diff_presentation_action(card, StageFile), Some(RepositoryAction::StageSelected { stage: true, .. })));
+        assert!(matches!(runtime.diff_presentation_action(card, UnstageFile), Some(RepositoryAction::StageSelected { stage: false, .. })));
+        assert!(matches!(runtime.diff_presentation_action(card, Revert), Some(RepositoryAction::RevertFile { .. })));
+        runtime.mutation_refresh_pending = true;
+        for command in [Working, Staged, StageFile, UnstageFile, Revert] {
+            assert!(runtime.diff_presentation_action(card, command).is_none());
+        }
+        assert!(runtime.diff_presentation_available(Branch));
+        runtime.mutation_refresh_pending = false;
+        let DocumentState::Editable(document) = &mut runtime.document else { panic!("editable fixture") };
+        document.dirty = true;
+        assert!(matches!(runtime.diff_presentation_action(card, Revert), Some(RepositoryAction::DiscardEdits { .. })));
+        assert!(!runtime.diff_presentation_available(StageFile));
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        document.active_save = Some(SaveTicket { id: 1, identity, revision: document.revision, snapshot: "saved snapshot".into() });
+        for command in [Unified, Split, Working, Staged, Branch, History, StageFile, UnstageFile, Revert] {
+            assert!(runtime.diff_presentation_action(card, command).is_none());
+        }
+        runtime.source_surface = SourceSurface::Editor;
+        for command in [Unified, Split, IgnoreWhitespace, Working, Staged, Branch, History, StageFile, UnstageFile, Revert, Retry] {
+            assert!(!runtime.diff_presentation_available(command));
+        }
+    }
+
+    #[test]
+    fn diff_presentation_commands_keep_pull_request_controls_read_only() {
+        use DiffPresentationCommand::*;
+        let (mut runtime, card, _) = fixture(DiffMode::Inline);
+        let state = runtime.diffs.remove(0).1;
+        runtime.diff_basis = DiffBasis::PullRequest {
+            number: 1,
+            base_ref: crate::repository::ValidatedRefName::parse("main").unwrap(),
+            head: crate::repository::Oid::parse("1".repeat(40)).unwrap(),
+            merge_base: crate::repository::Oid::parse("2".repeat(40)).unwrap(),
+        };
+        runtime.set_diff_state(runtime.diff_basis.clone(), state);
+        for command in [Unified, Split, IgnoreWhitespace] {
+            assert!(runtime.diff_presentation_action(card, command).is_some());
+        }
+        for command in [Working, Staged, Branch, History, StageFile, UnstageFile, Revert] {
+            assert!(runtime.diff_presentation_action(card, command).is_none());
+        }
     }
 
     #[test]
