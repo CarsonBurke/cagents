@@ -138,8 +138,18 @@ impl Store {
         if self.raw_sources.open.len()>=OPEN_KEYS{return self.raw_refused("Too many unfinished original tool calls".into());}
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;guard(&tx,self.raw_sources.nonce)?;
         if revoked(&tx,source)?{return Err("Original tool call was removed".into());}
-        let old:Option<String>=tx.query_row("SELECT name FROM raw_tool_sources WHERE agent=?1 AND id=?2",params![agent(source),source.source_id],|r|r.get(0)).optional().map_err(err)?;
-        if let Some(old)=old {if old!=name {return Err("Original tool identity changed".into());}return Ok(None);}
+        let old:Option<(String,i64)>=tx.query_row("SELECT name,state FROM raw_tool_sources WHERE agent=?1 AND id=?2",params![agent(source),source.source_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
+        if let Some((old,state))=old {
+            if state==SEALED||old!=name {
+                // A new stream cannot prove that it owns an already sealed
+                // native ID. Preserve old bodies while fencing every later
+                // placeholder/delta; never replace a patch with an empty call.
+                tx.execute("INSERT OR IGNORE INTO raw_tool_revoked VALUES(?1,?2)",params![agent(source),source.source_id]).map_err(err)?;
+                tx.commit().map_err(err)?;self.dirty=true;
+                return Ok(Some("Provider reused a completed original tool identity; its ambiguous stream was discarded".into()));
+            }
+            return Ok(None);
+        }
         let (bytes,keys):(usize,usize)=tx.query_row("SELECT bytes,keys FROM raw_source_schema WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         let cost=192+name.len()+source.source_id.len();
         if keys>=KEYS||bytes.saturating_add(cost).saturating_add(self.raw_sources.open_bytes)>DISK_BYTES{drop(tx);return self.raw_refused("Original tool history identity budget reached".into());}
@@ -391,6 +401,21 @@ mod tests {
         for index in 0..513{let step=adapter.receive(call(&format!("next-{index}"),json!({"file_path":"small","content":"x"}))).unwrap();commit(&store,adapter.as_mut(),step);}
         let step=adapter.receive(json!({"type":"user","uuid":"failure","message":{"content":[{"type":"tool_result","tool_use_id":"old","content":"permission denied","is_error":true}]}})).unwrap();commit(&store,adapter.as_mut(),step);
         let item=store.lock().unwrap().adapter_item(&crate::chat::protocol::CanonicalItemKey::new(None,"old")).unwrap().unwrap();let ItemContent::Tool{name,input:actual,status,..}=item.content else{panic!("actual failed Write must regain its original tool call, not a synthetic Edit or patch")};assert_eq!(name,"Write");assert_eq!(serde_json::from_str::<serde_json::Value>(&actual).unwrap(),input);assert_eq!(status,ToolStatus::Failed);
+    }
+}
+
+#[cfg(test)]
+mod identity_reuse_tests {
+    use super::*;
+    #[test]
+    fn a_new_stream_cannot_replace_an_already_completed_original_item(){
+        let mut store=Store::new().unwrap();store.apply(Event::RawToolCapture(RawToolCapture::Full{source:key("","old"),name:"Write".into(),input:"null".into(),command:None})).unwrap();
+        store.apply(Event::Item(Item{id:"old".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Changes{changes:Vec::new(),status:crate::chat::ToolStatus::Succeeded}})).unwrap();
+        let metadata:Vec<u8>=store.db.query_row("SELECT metadata FROM items WHERE id='old'",[],|r|r.get(0)).unwrap();
+        store.apply(Event::RawToolCapture(RawToolCapture::Start{source:key("","old"),name:"Write".into()})).unwrap();
+        let warnings=store.apply(Event::Item(Item{id:"old".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool{name:"Write".into(),input:String::new(),output:String::new(),status:crate::chat::ToolStatus::Running}})).unwrap();
+        assert!(warnings.iter().any(|event|matches!(event,Event::Error{fatal:false,..})));assert_eq!(store.db.query_row("SELECT metadata FROM items WHERE id='old'",[],|r|r.get::<_,Vec<u8>>(0)).unwrap(),metadata);
+        assert!(store.raw_original(&key("","old")).is_err(),"identity ambiguity must never grant an old call as a new original");
     }
 }
 
