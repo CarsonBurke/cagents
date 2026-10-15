@@ -57,55 +57,102 @@ fn argument_id(row: uuid::Uuid) -> widget::Id {
 }
 
 fn argument_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a, Message> {
-        let configuration = &entry.configuration;
-        let mut arguments: Vec<(uuid::Uuid, Element<'a, Message>)> = Vec::new();
-        let argument_owner = entry.argument_owner;
-        for (index, argument) in configuration.arguments.iter().enumerate() {
-            let row = entry.argument_rows[index];
-            arguments.push((row, widget::row::with_children(vec![
+    let configuration = &entry.configuration;
+    let mut arguments: Vec<(uuid::Uuid, Element<'a, Message>)> = Vec::new();
+    let argument_owner = entry.argument_owner;
+    for (index, argument) in configuration.arguments.iter().enumerate() {
+        let row = entry.argument_rows[index];
+        arguments.push((
+            row,
+            widget::row::with_children(vec![
                 crate::ui_controls::field::text("Argument", argument)
                     .id(argument_id(row))
                     .on_input(move |value| Message::AgentListEdited {
-                        provider, owner: argument_owner, edit: AgentListEdit::Argument { row, value },
-                    }).width(Length::Fill).into(),
+                        provider,
+                        owner: argument_owner,
+                        edit: AgentListEdit::Argument { row, value },
+                    })
+                    .width(Length::Fill)
+                    .into(),
                 crate::ui_controls::icon_button(Icon::Close, "Remove argument")
                     .on_press(Message::AgentListEdited {
-                        provider, owner: argument_owner, edit: AgentListEdit::RemoveArgument(row),
-                    }).into(),
-            ]).spacing(space::S).align_y(Alignment::Center).into()));
-        }
-        arguments.push((argument_owner, crate::ui_controls::button::quiet("Add argument")
+                        provider,
+                        owner: argument_owner,
+                        edit: AgentListEdit::RemoveArgument(row),
+                    })
+                    .into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into(),
+        ));
+    }
+    arguments.push((
+        argument_owner,
+        crate::ui_controls::button::quiet("Add argument")
             .on_press(Message::AgentListEdited {
-                provider, owner: argument_owner, edit: AgentListEdit::AddArgument,
-            }).into()));
-    iced::widget::keyed_column(arguments).spacing(space::XS).into()
+                provider,
+                owner: argument_owner,
+                edit: AgentListEdit::AddArgument,
+            })
+            .into(),
+    ));
+    iced::widget::keyed_column(arguments)
+        .spacing(space::XS)
+        .into()
 }
 
 fn environment_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a, Message> {
-        let mut environment: Vec<(uuid::Uuid, Element<'a, Message>)> = Vec::new();
-        let environment_owner = entry.environment_owner;
-        for (index, (name, value)) in entry.environment.iter().enumerate() {
-            let row = entry.environment_rows[index];
-            environment.push((row, widget::row::with_children(vec![
+    let mut environment: Vec<(uuid::Uuid, Element<'a, Message>)> = Vec::new();
+    let environment_owner = entry.environment_owner;
+    for (index, (name, value)) in entry.environment.iter().enumerate() {
+        let row = entry.environment_rows[index];
+        environment.push((
+            row,
+            widget::row::with_children(vec![
                 crate::ui_controls::field::text("NAME", name)
                     .on_input(move |value| Message::AgentListEdited {
-                        provider, owner: environment_owner, edit: AgentListEdit::EnvironmentName { row, value },
-                    }).width(Length::FillPortion(2)).into(),
-                crate::ui_controls::field::text("Value", value).secure(true)
+                        provider,
+                        owner: environment_owner,
+                        edit: AgentListEdit::EnvironmentName { row, value },
+                    })
+                    .width(Length::FillPortion(2))
+                    .into(),
+                crate::ui_controls::field::text("Value", value)
+                    .secure(true)
                     .on_input(move |value| Message::AgentListEdited {
-                        provider, owner: environment_owner, edit: AgentListEdit::EnvironmentValue { row, value },
-                    }).width(Length::FillPortion(3)).into(),
+                        provider,
+                        owner: environment_owner,
+                        edit: AgentListEdit::EnvironmentValue { row, value },
+                    })
+                    .width(Length::FillPortion(3))
+                    .into(),
                 crate::ui_controls::icon_button(Icon::Close, "Remove environment variable")
                     .on_press(Message::AgentListEdited {
-                        provider, owner: environment_owner, edit: AgentListEdit::RemoveEnvironment(row),
-                    }).into(),
-            ]).spacing(space::S).align_y(Alignment::Center).into()));
-        }
-        environment.push((environment_owner, crate::ui_controls::button::quiet("Add environment variable")
+                        provider,
+                        owner: environment_owner,
+                        edit: AgentListEdit::RemoveEnvironment(row),
+                    })
+                    .into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into(),
+        ));
+    }
+    environment.push((
+        environment_owner,
+        crate::ui_controls::button::quiet("Add environment variable")
             .on_press(Message::AgentListEdited {
-                provider, owner: environment_owner, edit: AgentListEdit::AddEnvironment,
-            }).into()));
-    iced::widget::keyed_column(environment).spacing(space::XS).into()
+                provider,
+                owner: environment_owner,
+                edit: AgentListEdit::AddEnvironment,
+            })
+            .into(),
+    ));
+    iced::widget::keyed_column(environment)
+        .spacing(space::XS)
+        .into()
 }
 
 pub(super) fn controls<'a>(
@@ -215,40 +262,93 @@ mod tests {
 
     #[test]
     fn settings_agent_keyed_rows_keep_focus_on_the_survivor_not_its_old_position() {
-        use cosmic::iced::advanced::{layout, renderer::Headless, widget::operation, widget::Tree, Layout};
+        use cosmic::iced::advanced::{
+            Layout, layout, renderer::Headless, widget::Tree, widget::operation,
+        };
         struct Focused(Vec<String>);
         impl operation::Operation for Focused {
-            fn traverse(&mut self, operation: &mut dyn FnMut(&mut dyn operation::Operation)) { operation(self); }
-            fn focusable(&mut self, id: Option<&widget::Id>, _: iced::Rectangle, state: &mut dyn operation::Focusable) {
-                if state.is_focused() && let Some(id) = id { self.0.push(id.to_string()); }
+            fn traverse(&mut self, operation: &mut dyn FnMut(&mut dyn operation::Operation)) {
+                operation(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused()
+                    && let Some(id) = id
+                {
+                    self.0.push(id.to_string());
+                }
             }
         }
-        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-            .block_on(cosmic::Renderer::new(Font::MONOSPACE, iced::Pixels(14.0), Some("tiny-skia"))).expect("headless renderer");
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                Font::MONOSPACE,
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("headless renderer");
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(700.0, 500.0));
         for remove_focused in [false, true] {
-            let draft = AgentDraft::new(settings::AgentLaunchSettings { arguments: vec!["first".into(), "second".into()], ..Default::default() }, None);
+            let draft = AgentDraft::new(
+                settings::AgentLaunchSettings {
+                    arguments: vec!["first".into(), "second".into()],
+                    ..Default::default()
+                },
+                None,
+            );
             let (removed, survivor) = (draft.argument_rows[0], draft.argument_rows[1]);
             let focused = if remove_focused { removed } else { survivor };
             let mut before = argument_rows(Provider::Claude, &draft);
             let mut tree = Tree::new(before.as_widget());
             let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            before.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
-                &mut operation::focusable::focus::<()>(argument_id(focused)));
+            before.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::focusable::focus::<()>(argument_id(focused)),
+            );
             let mut initial = Focused(Vec::new());
-            before.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut initial);
+            before
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut initial);
             assert_eq!(initial.0, [argument_id(focused).to_string()]);
             drop(before);
             let mut updated = draft.clone();
-            let (_, value) = updated.edit_list(updated.argument_owner, AgentListEdit::RemoveArgument(removed)).unwrap();
+            let (_, value) = updated
+                .edit_list(
+                    updated.argument_owner,
+                    AgentListEdit::RemoveArgument(removed),
+                )
+                .unwrap();
             updated.set_arguments(serde_json::from_str(&value).unwrap());
             let mut after = argument_rows(Provider::Claude, &updated);
             after.as_widget_mut().diff(&mut tree);
             let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
             let mut final_focus = Focused(Vec::new());
-            after.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut final_focus);
-            if remove_focused { assert!(final_focus.0.is_empty(), "removed field focus must not transfer to a different row"); }
-            else { assert_eq!(final_focus.0, [argument_id(survivor).to_string()], "survivor retains its own native state after moving"); }
+            after.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut final_focus,
+            );
+            if remove_focused {
+                assert!(
+                    final_focus.0.is_empty(),
+                    "removed field focus must not transfer to a different row"
+                );
+            } else {
+                assert_eq!(
+                    final_focus.0,
+                    [argument_id(survivor).to_string()],
+                    "survivor retains its own native state after moving"
+                );
+            }
         }
     }
 
