@@ -185,7 +185,10 @@ struct Resolution {
 #[derive(Debug, Clone)]
 enum LinearLookup {
     None,
-    Pending { id: OperationId, token: CancellationToken },
+    Pending {
+        id: OperationId,
+        token: CancellationToken,
+    },
     Ready(crate::linear::IssuePreview),
     Unavailable(String),
 }
@@ -237,7 +240,9 @@ impl WorktreeDialog {
         }
         self.submit_after_linear = false;
         if field == WorktreeField::Branch {
-            if let LinearLookup::Pending { token, .. } = &self.linear { token.cancel(); }
+            if let LinearLookup::Pending { token, .. } = &self.linear {
+                token.cancel();
+            }
             self.linear = LinearLookup::None;
             self.submit_after_linear = false;
         }
@@ -294,43 +299,65 @@ impl WorktreeDialog {
 
     fn linear_note(&self) -> Option<String> {
         match &self.linear {
-            LinearLookup::None => self.branch_preview().map(|branch| format!("Branch: {branch}")),
+            LinearLookup::None => self
+                .branch_preview()
+                .map(|branch| format!("Branch: {branch}")),
             LinearLookup::Pending { .. } => Some("Fetching Linear issue…".into()),
-            LinearLookup::Ready(issue) => Some(format!("{}: {} · {} → branch {}", issue.identifier, issue.title, issue.state, issue.branch_name)),
+            LinearLookup::Ready(issue) => Some(format!(
+                "{}: {} · {} → branch {}",
+                issue.identifier, issue.title, issue.state, issue.branch_name
+            )),
             LinearLookup::Unavailable(reason) => {
                 let branch = crate::repository::worktree_branch_input(&self.draft.branch)
                     .unwrap_or_else(|_| self.draft.branch.clone());
-                Some(format!("Issue not fetched from the default Linear workspace: {reason}. Branch: {branch}; the checkout will not be linked."))
-            },
+                Some(format!(
+                    "Issue not fetched from the default Linear workspace: {reason}. Branch: {branch}; the checkout will not be linked."
+                ))
+            }
         }
     }
 
     fn lookup(&mut self) -> Task<Message> {
-        let Ok(reference) = crate::linear::issue_reference(&self.draft.branch) else { return Task::none() };
+        let Ok(reference) = crate::linear::issue_reference(&self.draft.branch) else {
+            return Task::none();
+        };
         let id = OperationId::new();
         let token = CancellationToken::new();
-        self.linear = LinearLookup::Pending { id, token: token.clone() };
+        self.linear = LinearLookup::Pending {
+            id,
+            token: token.clone(),
+        };
         cosmic::task::future(async move {
             tokio::time::sleep(Duration::from_millis(350)).await;
             let result = if token.is_cancelled() {
                 Err("Lookup cancelled".into())
             } else {
                 tokio::task::spawn_blocking(move || {
-                    if token.is_cancelled() { return Err("Lookup cancelled".into()); }
-                    crate::linear::IssuePreview::fetch(&reference, None).map_err(|error| error.message)
-                }).await.map_err(|_| "Linear worker unavailable".to_owned()).and_then(|result| result)
+                    if token.is_cancelled() {
+                        return Err("Lookup cancelled".into());
+                    }
+                    crate::linear::IssuePreview::fetch(&reference, None)
+                        .map_err(|error| error.message)
+                })
+                .await
+                .map_err(|_| "Linear worker unavailable".to_owned())
+                .and_then(|result| result)
             };
             Message::WorktreeLinearResolved { id, result }
         })
     }
 
     fn can_submit(&self) -> bool {
-        self.resolving.is_none() && !matches!(self.linear, LinearLookup::Pending { .. }) && !self.draft.branch.trim().is_empty()
+        self.resolving.is_none()
+            && !matches!(self.linear, LinearLookup::Pending { .. })
+            && !self.draft.branch.trim().is_empty()
     }
 
     /// Stops a resolution the user no longer wants.
     pub fn cancel(&self) {
-        if let LinearLookup::Pending { token, .. } = &self.linear { token.cancel(); }
+        if let LinearLookup::Pending { token, .. } = &self.linear {
+            token.cancel();
+        }
         if let Some(resolution) = &self.resolving {
             resolution.token.cancel();
         }
@@ -361,19 +388,34 @@ impl Cagents {
     }
 
     pub(super) fn edit_worktree_branch(&mut self, value: String) -> Task<Message> {
-        let Some(dialog) = self.worktree_dialog.as_mut() else { return Task::none() };
-        if dialog.resolving.is_some() { return Task::none() }
+        let Some(dialog) = self.worktree_dialog.as_mut() else {
+            return Task::none();
+        };
+        if dialog.resolving.is_some() {
+            return Task::none();
+        }
         dialog.edit(WorktreeField::Branch, value);
         dialog.lookup()
     }
 
-    pub(super) fn finish_worktree_linear(&mut self, id: OperationId, result: Result<crate::linear::IssuePreview, String>) -> Task<Message> {
+    pub(super) fn finish_worktree_linear(
+        &mut self,
+        id: OperationId,
+        result: Result<crate::linear::IssuePreview, String>,
+    ) -> Task<Message> {
         if let Some(dialog) = self.worktree_dialog.as_mut()
             && matches!(&dialog.linear, LinearLookup::Pending { id: pending, .. } if *pending == id)
         {
             dialog.linear = match result {
-                Ok(issue) if crate::repository::ValidatedBranchName::parse(&issue.branch_name).is_ok() => LinearLookup::Ready(issue),
-                Ok(_) => LinearLookup::Unavailable("Linear suggested an invalid branch name".into()),
+                Ok(issue)
+                    if crate::repository::ValidatedBranchName::parse(&issue.branch_name)
+                        .is_ok() =>
+                {
+                    LinearLookup::Ready(issue)
+                }
+                Ok(_) => {
+                    LinearLookup::Unavailable("Linear suggested an invalid branch name".into())
+                }
                 Err(reason) => LinearLookup::Unavailable(reason),
             };
             if std::mem::take(&mut dialog.submit_after_linear)
@@ -419,7 +461,10 @@ impl Cagents {
         let project_id = dialog.project_id;
         let draft = dialog.draft.clone();
         let linear_issue = match &dialog.linear {
-            LinearLookup::Ready(issue) => Some(crate::linear::context::LinkedIssue { issue_id: issue.id.clone(), workspace: None }),
+            LinearLookup::Ready(issue) => Some(crate::linear::context::LinkedIssue {
+                issue_id: issue.id.clone(),
+                workspace: None,
+            }),
             _ => None,
         };
         let input = WorktreeInput {
@@ -434,7 +479,10 @@ impl Cagents {
             let result = tokio::task::spawn_blocking(move || {
                 RepositoryService::system("git")
                     .resolve_worktree_request(&input, &token)
-                    .map(|mut request| { request.linear_issue = linear_issue; request })
+                    .map(|mut request| {
+                        request.linear_issue = linear_issue;
+                        request
+                    })
                     .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
             })
             .await
@@ -768,19 +816,35 @@ mod tests {
     fn fetched_linear_issue_selects_its_branch_and_stale_results_are_ignored() {
         let Fixture { mut app, .. } = fixture();
         let id = OperationId::new();
-        app.worktree_dialog.as_mut().unwrap().linear = LinearLookup::Pending { id, token: CancellationToken::new() };
+        app.worktree_dialog.as_mut().unwrap().linear = LinearLookup::Pending {
+            id,
+            token: CancellationToken::new(),
+        };
         let issue = crate::linear::IssuePreview {
             id: "2b498c52-7dc7-4c76-ad59-dfc488c40111".into(),
-            identifier: "ENG-123".into(), title: "Fix login redirect".into(),
+            identifier: "ENG-123".into(),
+            title: "Fix login redirect".into(),
             branch_name: "user/eng-123-fix-login-redirect".into(),
-            url: "https://linear.app/team/issue/ENG-123".into(), state: "Todo".into(),
+            url: "https://linear.app/team/issue/ENG-123".into(),
+            state: "Todo".into(),
         };
         let _ = app.finish_worktree_linear(OperationId::new(), Ok(issue.clone()));
         assert!(matches!(dialog(&app).linear, LinearLookup::Pending { .. }));
         let _ = app.finish_worktree_linear(id, Ok(issue));
-        assert_eq!(dialog(&app).branch_input(), "user/eng-123-fix-login-redirect");
-        assert!(dialog(&app).linear_note().unwrap().contains("Fix login redirect"));
-        app.worktree_dialog.as_mut().unwrap().edit(WorktreeField::Branch, "feature/plain".into());
+        assert_eq!(
+            dialog(&app).branch_input(),
+            "user/eng-123-fix-login-redirect"
+        );
+        assert!(
+            dialog(&app)
+                .linear_note()
+                .unwrap()
+                .contains("Fix login redirect")
+        );
+        app.worktree_dialog
+            .as_mut()
+            .unwrap()
+            .edit(WorktreeField::Branch, "feature/plain".into());
         assert_eq!(dialog(&app).branch_input(), "feature/plain");
         let _ = app.finish_worktree_linear(id, Err("old failure".into()));
         assert!(matches!(dialog(&app).linear, LinearLookup::None));
@@ -788,7 +852,11 @@ mod tests {
 
     #[test]
     fn failed_linear_lookup_keeps_creation_available_with_an_explicit_note() {
-        let mut dialog = WorktreeDialog::new(ProjectId::new(), "/repo".into(), WorktreeDraft::branch("ENG-123"));
+        let mut dialog = WorktreeDialog::new(
+            ProjectId::new(),
+            "/repo".into(),
+            WorktreeDraft::branch("ENG-123"),
+        );
         dialog.linear = LinearLookup::Unavailable("No saved credential".into());
         assert!(dialog.can_submit());
         assert!(dialog.validate().is_ok());

@@ -318,7 +318,9 @@ impl Cagents {
                 // Git may have created the checkout while ticket linking still
                 // needs reconciliation. Keep the actionable operation row and
                 // defer setup/agent startup until the complete contract settles.
-                report.outcome.filter(|_| report.state == WorktreeOperationState::Created)
+                report
+                    .outcome
+                    .filter(|_| report.state == WorktreeOperationState::Created)
             }
             Err(error) => {
                 operation.state = Some(WorktreeOperationState::OutcomeUnknown);
@@ -481,39 +483,84 @@ mod tests {
 
     #[test]
     fn linear_link_reconciliation_defers_created_followup_until_fully_settled() {
-        for state in [WorktreeOperationState::ReconcileRequired, WorktreeOperationState::Created] {
+        for state in [
+            WorktreeOperationState::ReconcileRequired,
+            WorktreeOperationState::Created,
+        ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let id = OperationId::new();
             let project = ProjectId::new();
             let destination = PathBuf::from("/repo/worktrees/eng-123");
             let request = CreateWorktreeRequest {
-                linear_issue: Some(crate::linear::context::LinkedIssue { issue_id: "ENG-123".into(), workspace: None }),
-                repository: "/repo".into(), managed_root: "/repo/worktrees".into(), destination: destination.clone(),
+                linear_issue: Some(crate::linear::context::LinkedIssue {
+                    issue_id: "ENG-123".into(),
+                    workspace: None,
+                }),
+                repository: "/repo".into(),
+                managed_root: "/repo/worktrees".into(),
+                destination: destination.clone(),
                 branch: crate::repository::ValidatedBranchName::parse("eng-123").unwrap(),
                 base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),
-                track: false, operation_id: id,
+                track: false,
+                operation_id: id,
             };
-            app.worktree_operations.insert(id, ActiveWorktreeOperation {
-                project, generation: 1, request: Some(request.clone()), token: None, receiver: None,
-                stage: None, started: Instant::now(), completed_elapsed: None, restored: false,
-                termination_requested: false, finished: false, detail: "creating".into(),
-                created_worktree: None, label: "eng-123".into(), state: None, draft: None,
-            });
-            let task = app.finish_worktree_operation(id, 1, Ok(WorktreeOperationReport {
-                operation_id: id, generation: 1, request: Some(request), state,
-                outcome: Some(WorktreeCreationOutcome::Created {
-                    worktree: crate::repository::WorktreeRecord {
-                        id: crate::model::WorktreeId::new(), path: destination,
-                        created_at_unix_ms: Some(1), head_oid: Some("a".repeat(40)),
-                        branch: Some("refs/heads/eng-123".into()), detached: false, bare: false,
-                        lock: crate::repository::WorktreeLock::default(), prunable_reason: None,
-                    }, warnings: Vec::new(),
-                }), detail: "Linear linking requires reconciliation".into(), created_at_unix_ms: 1,
-            }));
-            assert_eq!(cosmic::iced::runtime::task::into_stream(task).is_some(), state == WorktreeOperationState::Created);
+            app.worktree_operations.insert(
+                id,
+                ActiveWorktreeOperation {
+                    project,
+                    generation: 1,
+                    request: Some(request.clone()),
+                    token: None,
+                    receiver: None,
+                    stage: None,
+                    started: Instant::now(),
+                    completed_elapsed: None,
+                    restored: false,
+                    termination_requested: false,
+                    finished: false,
+                    detail: "creating".into(),
+                    created_worktree: None,
+                    label: "eng-123".into(),
+                    state: None,
+                    draft: None,
+                },
+            );
+            let task = app.finish_worktree_operation(
+                id,
+                1,
+                Ok(WorktreeOperationReport {
+                    operation_id: id,
+                    generation: 1,
+                    request: Some(request),
+                    state,
+                    outcome: Some(WorktreeCreationOutcome::Created {
+                        worktree: crate::repository::WorktreeRecord {
+                            id: crate::model::WorktreeId::new(),
+                            path: destination,
+                            created_at_unix_ms: Some(1),
+                            head_oid: Some("a".repeat(40)),
+                            branch: Some("refs/heads/eng-123".into()),
+                            detached: false,
+                            bare: false,
+                            lock: crate::repository::WorktreeLock::default(),
+                            prunable_reason: None,
+                        },
+                        warnings: Vec::new(),
+                    }),
+                    detail: "Linear linking requires reconciliation".into(),
+                    created_at_unix_ms: 1,
+                }),
+            );
+            assert_eq!(
+                cosmic::iced::runtime::task::into_stream(task).is_some(),
+                state == WorktreeOperationState::Created
+            );
             assert_eq!(app.worktree_operations[&id].state, Some(state));
             if state == WorktreeOperationState::ReconcileRequired {
-                assert_eq!(app.worktree_operations[&id].row(&[]).unwrap().0, WorktreeOperationPhase::Failed);
+                assert_eq!(
+                    app.worktree_operations[&id].row(&[]).unwrap().0,
+                    WorktreeOperationPhase::Failed
+                );
             }
         }
     }

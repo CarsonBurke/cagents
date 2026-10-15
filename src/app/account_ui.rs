@@ -47,8 +47,8 @@ use crate::account::{
 };
 use crate::agent::Provider;
 
-mod table;
 mod linear;
+mod table;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
     operation: account::remote::Operation,
@@ -989,7 +989,9 @@ impl Action {
     /// Whether this is the reader acting on the account surfaces, which a
     /// dialog in front of them must stop. Closing a popup never is.
     pub(super) fn blocked_while_modal(&self) -> bool {
-        if let Self::Linear(action) = self { return action.blocked_while_modal(); }
+        if let Self::Linear(action) = self {
+            return action.blocked_while_modal();
+        }
         matches!(
             self,
             Self::Refresh(_)

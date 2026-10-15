@@ -89,16 +89,20 @@ impl Client {
             config_escape(&body)
         );
         for attempt in 0..3 {
-            let result = transport(&config).map_err(|error| {
-                if mutation {
-                    unconfirmed("The transport did not confirm the write")
-                } else {
-                    error
-                }
-            }).and_then(|output| parse_response(&output, mutation));
+            let result = transport(&config)
+                .map_err(|error| {
+                    if mutation {
+                        unconfirmed("The transport did not confirm the write")
+                    } else {
+                        error
+                    }
+                })
+                .and_then(|output| parse_response(&output, mutation));
             match result {
                 Err(error) if !mutation && attempt < 2 && error.kind == "linear_rate_limited" => {
-                    let delay = error.details.as_ref()
+                    let delay = error
+                        .details
+                        .as_ref()
                         .and_then(|details| details["retry_after_ms"].as_u64())
                         .unwrap_or(250 * (attempt + 1));
                     // Long windows belong to the caller. Never park an agent
@@ -108,12 +112,14 @@ impl Client {
                     }
                     wait(Duration::from_millis(delay));
                 }
-                result => return result.map_err(|mut error| {
-                    if let Some(details) = &mut error.details {
-                        redact_secret(details, &self.api_key);
-                    }
-                    error
-                }),
+                result => {
+                    return result.map_err(|mut error| {
+                        if let Some(details) = &mut error.details {
+                            redact_secret(details, &self.api_key);
+                        }
+                        error
+                    });
+                }
             }
         }
         unreachable!("bounded retry loop returns its last result")
@@ -217,7 +223,8 @@ fn curl_request(config: &str) -> Result<Vec<u8>, Error> {
     // Drain both pipes concurrently, even after reaching the memory bound.
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let output_reader = thread::spawn(move || read_bounded(stdout, MAX_RESPONSE_BYTES + 32 * 1024 + 4));
+    let output_reader =
+        thread::spawn(move || read_bounded(stdout, MAX_RESPONSE_BYTES + 32 * 1024 + 4));
     let error_reader = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
     let write_result = child
         .stdin
@@ -314,7 +321,8 @@ fn parse_response(output: &[u8], mutation: bool) -> Result<Value, Error> {
         return Err(Error::new(
             "linear_rate_limited",
             "Linear rate limit reached; wait before making another request",
-        ).details(rate_limit_details(&headers, epoch_ms())));
+        )
+        .details(rate_limit_details(&headers, epoch_ms())));
     }
     if status == 401 || status == 403 {
         return Err(Error::new(
@@ -366,8 +374,12 @@ fn parse_response(output: &[u8], mutation: bool) -> Result<Value, Error> {
 fn response_body(mut body: &[u8]) -> (&[u8], Vec<(String, String)>) {
     let mut headers = Vec::new();
     while body.starts_with(b"HTTP/") {
-        let Some(end) = body.windows(4).position(|part| part == b"\r\n\r\n") else { break };
-        headers = String::from_utf8_lossy(&body[..end]).lines().skip(1)
+        let Some(end) = body.windows(4).position(|part| part == b"\r\n\r\n") else {
+            break;
+        };
+        headers = String::from_utf8_lossy(&body[..end])
+            .lines()
+            .skip(1)
             .filter_map(|line| line.split_once(':'))
             .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
             .collect();
@@ -377,51 +389,107 @@ fn response_body(mut body: &[u8]) -> (&[u8], Vec<(String, String)>) {
 }
 
 fn epoch_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
-        .try_into().unwrap_or(u64::MAX)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn rate_limit_details(headers: &[(String, String)], now: u64) -> Value {
-    let header = |name: &str| headers.iter().rev().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
+    let header = |name: &str| {
+        headers
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
     let cost = header("x-complexity").and_then(|value| value.parse::<u64>().ok());
     let reset = [
-        ("x-ratelimit-requests-reset", "x-ratelimit-requests-remaining", false),
-        ("x-ratelimit-endpoint-requests-reset", "x-ratelimit-endpoint-requests-remaining", false),
-        ("x-ratelimit-complexity-reset", "x-ratelimit-complexity-remaining", true),
-    ].into_iter().filter_map(|(reset, remaining, complexity)| {
+        (
+            "x-ratelimit-requests-reset",
+            "x-ratelimit-requests-remaining",
+            false,
+        ),
+        (
+            "x-ratelimit-endpoint-requests-reset",
+            "x-ratelimit-endpoint-requests-remaining",
+            false,
+        ),
+        (
+            "x-ratelimit-complexity-reset",
+            "x-ratelimit-complexity-remaining",
+            true,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(reset, remaining, complexity)| {
         let reset = header(reset)?.parse::<u64>().ok()?;
         let remaining = header(remaining).and_then(|value| value.parse::<u64>().ok());
         // Global windows are included on every response, even when healthy.
         // Only a depleted applicable bucket should delay the next request.
         // A positive complexity balance can still be smaller than query cost.
-        let applicable = remaining.is_none_or(|remaining| remaining == 0
-            || (complexity && cost.is_none_or(|cost| remaining < cost)));
+        let applicable = remaining.is_none_or(|remaining| {
+            remaining == 0 || (complexity && cost.is_none_or(|cost| remaining < cost))
+        });
         applicable.then_some(reset)
-    }).max();
+    })
+    .max();
     let retry = header("retry-after").and_then(|value| {
-        value.parse::<u64>().ok().map(|seconds| seconds.saturating_mul(1_000))
+        value
+            .parse::<u64>()
+            .ok()
+            .map(|seconds| seconds.saturating_mul(1_000))
             .or_else(|| http_date_ms(value).map(|date| date.saturating_sub(now)))
     });
-    let delay = reset.map(|reset| reset.saturating_sub(now)).into_iter().chain(retry).max();
+    let delay = reset
+        .map(|reset| reset.saturating_sub(now))
+        .into_iter()
+        .chain(retry)
+        .max();
     json!({"retryable": true, "retry_after_ms": delay, "reset_at": delay.map(|delay| now.saturating_add(delay))})
 }
 
 fn http_date_ms(value: &str) -> Option<u64> {
     // IMF-fixdate is always English/GMT and independent of desktop locale.
     let fields: Vec<_> = value.split_whitespace().collect();
-    if fields.len() != 6 || fields[5] != "GMT" { return None; }
-    let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        .iter().position(|month| *month == fields[2])? as i64 + 1;
+    if fields.len() != 6 || fields[5] != "GMT" {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|month| *month == fields[2])? as i64
+        + 1;
     let year = fields[3].parse::<i64>().ok()?;
     let day = fields[1].parse::<i64>().ok()?;
-    let time = fields[4].split(':').map(str::parse::<i64>).collect::<Result<Vec<_>, _>>().ok()?;
-    if !(1970..=9999).contains(&year) || !(1..=31).contains(&day) || time.len() != 3 || time[0] > 23 || time[1] > 59 || time[2] > 59 || time.iter().any(|n| *n < 0) { return None; }
+    let time = fields[4]
+        .split(':')
+        .map(str::parse::<i64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if !(1970..=9999).contains(&year)
+        || !(1..=31).contains(&day)
+        || time.len() != 3
+        || time[0] > 23
+        || time[1] > 59
+        || time[2] > 59
+        || time.iter().any(|n| *n < 0)
+    {
+        return None;
+    }
     let year = year - i64::from(month <= 2);
     let era = year / 400;
     let yoe = year - era * 400;
     let shifted_month = month + if month > 2 { -3 } else { 9 };
-    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * shifted_month + 2) / 5 + day - 1 - 719468;
-    let seconds = days.checked_mul(86400)?.checked_add(time[0] * 3600 + time[1] * 60 + time[2])?;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * shifted_month + 2) / 5 + day
+        - 1
+        - 719468;
+    let seconds = days
+        .checked_mul(86400)?
+        .checked_add(time[0] * 3600 + time[1] * 60 + time[2])?;
     u64::try_from(seconds).ok()?.checked_mul(1000)
 }
 
@@ -431,26 +499,54 @@ mod tests {
 
     #[test]
     fn environment_overrides_keyring_and_keyring_works_without_environment() {
-        assert_eq!(resolve_key("LINEAR_API_KEY", || None, || Ok(Some("vault-key".into()))).unwrap(), "vault-key");
-        assert_eq!(resolve_key("LINEAR_API_KEY", || Some("env-key".into()), || panic!("keyring must not be touched when overridden")).unwrap(), "env-key");
-        assert_eq!(resolve_key("LINEAR_API_KEY", || None, || Ok(None)).unwrap_err().kind, "linear_auth_required");
+        assert_eq!(
+            resolve_key("LINEAR_API_KEY", || None, || Ok(Some("vault-key".into()))).unwrap(),
+            "vault-key"
+        );
+        assert_eq!(
+            resolve_key(
+                "LINEAR_API_KEY",
+                || Some("env-key".into()),
+                || panic!("keyring must not be touched when overridden")
+            )
+            .unwrap(),
+            "env-key"
+        );
+        assert_eq!(
+            resolve_key("LINEAR_API_KEY", || None, || Ok(None))
+                .unwrap_err()
+                .kind,
+            "linear_auth_required"
+        );
     }
 
     #[test]
     fn reset_headers_are_epoch_milliseconds_and_retry_after_is_seconds() {
-        let details = rate_limit_details(&[
-            ("retry-after".into(), "2".into()),
-            ("x-ratelimit-requests-reset".into(), "2500".into()),
-            ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
-        ], 1000);
-        assert_eq!(details, json!({"retryable":true,"retry_after_ms":2000,"reset_at":3000}));
-        let conflicting = rate_limit_details(&[
-            ("retry-after".into(), "10".into()),
-            ("x-ratelimit-requests-reset".into(), "2500".into()),
-        ], 1000);
+        let details = rate_limit_details(
+            &[
+                ("retry-after".into(), "2".into()),
+                ("x-ratelimit-requests-reset".into(), "2500".into()),
+                ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
+            ],
+            1000,
+        );
+        assert_eq!(
+            details,
+            json!({"retryable":true,"retry_after_ms":2000,"reset_at":3000})
+        );
+        let conflicting = rate_limit_details(
+            &[
+                ("retry-after".into(), "10".into()),
+                ("x-ratelimit-requests-reset".into(), "2500".into()),
+            ],
+            1000,
+        );
         assert_eq!(conflicting["retry_after_ms"], 10_000);
         assert_eq!(conflicting["reset_at"], 11_000);
-        assert_eq!(http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784111777000));
+        assert_eq!(
+            http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784111777000)
+        );
         let response = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nX-RateLimit-Requests-Reset: 3000\r\n\r\n{}\n429";
         let error = parse_response(response, false).unwrap_err();
         assert_eq!(error.kind, "linear_rate_limited");
@@ -460,35 +556,44 @@ mod tests {
 
     #[test]
     fn healthy_global_window_does_not_hide_an_exhausted_endpoint_window() {
-        let details = rate_limit_details(&[
-            ("x-ratelimit-requests-reset".into(), "3600000".into()),
-            ("x-ratelimit-requests-remaining".into(), "100".into()),
-            ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
-            ("x-ratelimit-endpoint-requests-remaining".into(), "0".into()),
-            ("x-ratelimit-complexity-reset".into(), "9000".into()),
-            ("x-ratelimit-complexity-remaining".into(), "1000".into()),
-            ("x-complexity".into(), "10".into()),
-        ], 1000);
+        let details = rate_limit_details(
+            &[
+                ("x-ratelimit-requests-reset".into(), "3600000".into()),
+                ("x-ratelimit-requests-remaining".into(), "100".into()),
+                ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
+                ("x-ratelimit-endpoint-requests-remaining".into(), "0".into()),
+                ("x-ratelimit-complexity-reset".into(), "9000".into()),
+                ("x-ratelimit-complexity-remaining".into(), "1000".into()),
+                ("x-complexity".into(), "10".into()),
+            ],
+            1000,
+        );
         assert_eq!(details["retry_after_ms"], 2000);
         assert_eq!(details["reset_at"], 3000);
-        let details = rate_limit_details(&[
-            ("x-ratelimit-requests-reset".into(), "4000".into()),
-            ("x-ratelimit-requests-remaining".into(), "0".into()),
-            ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
-            ("x-ratelimit-endpoint-requests-remaining".into(), "0".into()),
-            ("retry-after".into(), "10".into()),
-        ], 1000);
+        let details = rate_limit_details(
+            &[
+                ("x-ratelimit-requests-reset".into(), "4000".into()),
+                ("x-ratelimit-requests-remaining".into(), "0".into()),
+                ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
+                ("x-ratelimit-endpoint-requests-remaining".into(), "0".into()),
+                ("retry-after".into(), "10".into()),
+            ],
+            1000,
+        );
         assert_eq!(details["retry_after_ms"], 10000);
         assert_eq!(details["reset_at"], 11000);
     }
 
     #[test]
     fn positive_complexity_balance_can_still_be_too_small_for_the_query() {
-        let details = rate_limit_details(&[
-            ("x-ratelimit-complexity-reset".into(), "9000".into()),
-            ("x-ratelimit-complexity-remaining".into(), "5".into()),
-            ("x-complexity".into(), "10".into()),
-        ], 1000);
+        let details = rate_limit_details(
+            &[
+                ("x-ratelimit-complexity-reset".into(), "9000".into()),
+                ("x-ratelimit-complexity-remaining".into(), "5".into()),
+                ("x-complexity".into(), "10".into()),
+            ],
+            1000,
+        );
         assert_eq!(details["retry_after_ms"], 8000);
         assert_eq!(details["reset_at"], 9000);
     }
@@ -499,19 +604,42 @@ mod tests {
         for mutation in [false, true] {
             let mut calls = 0;
             let mut sleeps = Vec::new();
-            let error = client.request_with_wait("query { viewer { id } }", json!({}), mutation, |_| {
-                calls += 1;
-                Ok(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n\r\n{}\n429".to_vec())
-            }, |delay| sleeps.push(delay)).unwrap_err();
+            let error = client
+                .request_with_wait(
+                    "query { viewer { id } }",
+                    json!({}),
+                    mutation,
+                    |_| {
+                        calls += 1;
+                        Ok(
+                            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n\r\n{}\n429"
+                                .to_vec(),
+                        )
+                    },
+                    |delay| sleeps.push(delay),
+                )
+                .unwrap_err();
             assert_eq!(error.kind, "linear_rate_limited");
             assert_eq!(calls, if mutation { 1 } else { 3 });
             assert_eq!(sleeps.len(), if mutation { 0 } else { 2 });
         }
         let mut calls = 0;
-        client.request_with_wait("query { viewer { id } }", json!({}), false, |_| {
-            calls += 1;
-            Ok(if calls == 1 { b"{}\n429".to_vec() } else { b"{\"data\":{\"viewer\":{\"id\":\"ok\"}}}\n200".to_vec() })
-        }, |_| {}).unwrap();
+        client
+            .request_with_wait(
+                "query { viewer { id } }",
+                json!({}),
+                false,
+                |_| {
+                    calls += 1;
+                    Ok(if calls == 1 {
+                        b"{}\n429".to_vec()
+                    } else {
+                        b"{\"data\":{\"viewer\":{\"id\":\"ok\"}}}\n200".to_vec()
+                    })
+                },
+                |_| {},
+            )
+            .unwrap();
         assert_eq!(calls, 2);
     }
 
@@ -519,10 +647,21 @@ mod tests {
     fn long_reset_windows_are_returned_to_the_caller_without_early_retry() {
         let client = Client::from_key("key".into()).unwrap();
         let mut calls = 0;
-        let error = client.request_with_wait("query { viewer { id } }", json!({}), false, |_| {
-            calls += 1;
-            Ok(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\n\r\n{}\n429".to_vec())
-        }, |_| panic!("must not sleep past the bounded retry window")).unwrap_err();
+        let error = client
+            .request_with_wait(
+                "query { viewer { id } }",
+                json!({}),
+                false,
+                |_| {
+                    calls += 1;
+                    Ok(
+                        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\n\r\n{}\n429"
+                            .to_vec(),
+                    )
+                },
+                |_| panic!("must not sleep past the bounded retry window"),
+            )
+            .unwrap_err();
         assert_eq!(calls, 1);
         assert_eq!(error.details.unwrap()["retry_after_ms"], 3_600_000);
     }
