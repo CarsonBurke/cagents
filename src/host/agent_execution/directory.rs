@@ -115,9 +115,13 @@ pub(super) fn read(
     let mut me = None;
     let mut sessions = Vec::new();
     for live in live {
-        let (worktree, project) = place_cached(&live.directory);
         let (delegation, delegated_scope) = delegations.get(&live.id).cloned().unzip();
         let view_scope = scopes.get(&live.id).cloned().unwrap_or(delegated_scope);
+        // Logical ownership follows the exact shared pane/agent association.
+        // The directory field below remains the observed process directory;
+        // placing it by an obsolete launch spelling would lose moved projects.
+        let (worktree, project) = logical_membership(&model, view_scope.as_ref())
+            .unwrap_or_else(|| place_cached(&live.directory));
         let channel = match &view_scope {
             Some(crate::agent_execution::Placement::Channel(id)) => Some(*id),
             _ => None,
@@ -196,6 +200,20 @@ pub(super) fn read(
         scope,
         sessions,
     })
+}
+
+fn logical_membership(
+    model: &crate::workspace_model::WorkspaceModel,
+    scope: Option<&crate::agent_execution::Placement>,
+) -> Option<(Option<PathBuf>, Option<PathBuf>)> {
+    match scope? {
+        crate::agent_execution::Placement::Worktree { repository, path } => {
+            Some((Some(path.clone()), Some(repository.clone())))
+        }
+        crate::agent_execution::Placement::Channel(id) => model
+            .channel(*id)
+            .map(|channel| (None, Some(channel.repository.clone()))),
+    }
 }
 
 /// Live provider conversations and terminals; the caller decides which
@@ -293,6 +311,43 @@ fn session_scopes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn located_membership_uses_current_exact_scope_without_rewriting_launch_cwd() {
+        use crate::{
+            model::{ChannelId, ChannelTitleSource},
+            workspace_model::{ModelChannel, WorkspaceModel},
+        };
+        let id = ChannelId::new();
+        let model = WorkspaceModel {
+            channels: vec![ModelChannel {
+                id,
+                repository: "/moved/.git".into(),
+                title: "Moved".into(),
+                title_source: ChannelTitleSource::Manual,
+                ordinal: 0,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            logical_membership(
+                &model,
+                Some(&crate::agent_execution::Placement::Channel(id))
+            ),
+            Some((None, Some("/moved/.git".into())))
+        );
+        assert_eq!(
+            logical_membership(
+                &model,
+                Some(&crate::agent_execution::Placement::Worktree {
+                    repository: "/moved/.git".into(),
+                    path: "/moved".into()
+                })
+            ),
+            Some((Some("/moved".into()), Some("/moved/.git".into())))
+        );
+        assert_eq!(logical_membership(&model, None), None);
+    }
 
     #[test]
     fn terminal_membership_reports_worktree_views_and_refuses_ambiguous_placement() {

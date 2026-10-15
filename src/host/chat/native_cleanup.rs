@@ -314,6 +314,7 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
                         .into(),
                 );
             }
+            state.issued_chat_ids.insert(source.id);
             if !restart {
                 state.chats.remove(&source.id);
             }

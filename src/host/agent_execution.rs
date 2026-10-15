@@ -178,12 +178,35 @@ pub(super) fn submit(
     } else {
         None
     };
+    let pinned_directory = selected
+        .as_ref()
+        .map(|spec| {
+            chat::protocol::ExecutionContext::capture(&spec.target.directory)?
+                .directory_descriptor()
+                .ok_or_else(|| "The selected agent directory could not be pinned".to_owned())
+        })
+        .transpose()?;
+    let directory_identity = pinned_directory
+        .as_ref()
+        .map(|directory| {
+            directory
+                .metadata()
+                .map(|metadata| crate::agent_execution::DirectoryIdentity::from_metadata(&metadata))
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
     let accepted = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())?;
+        .submit_agent_with_directory(
+            &origin,
+            &request,
+            selected.as_ref(),
+            directory_identity,
+            now(),
+        )?;
     announce(host, &registry);
-    dispatch_accepted(host, accepted.clone())?;
+    dispatch_accepted_with_directory(host, accepted.clone(), pinned_directory)?;
     Ok(accepted)
 }
 
@@ -284,9 +307,14 @@ fn dispatch(
     let gate = agent_gate(host, accepted.agent.id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
+    let operational_directory = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_execution_directory(accepted.agent.id)
+        .map_err(before)?;
     let mut context = Arc::new(chat::protocol::ExecutionContext::new(directory));
     context
-        .verify_directory(&accepted.agent.spec.target.directory)
+        .verify_directory(&operational_directory)
         .map_err(before)?;
     registry
         .lock()
@@ -309,7 +337,7 @@ fn dispatch(
         let directory = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&accepted.agent.spec.target.directory)
+            .open(&operational_directory)
             .map_err(|error| before(error.to_string()))?;
         context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
             directory,
@@ -320,7 +348,7 @@ fn dispatch(
             ));
         }
         context
-            .verify_directory(&accepted.agent.spec.target.directory)
+            .verify_directory(&operational_directory)
             .map_err(before)?;
     }
     if matches!(accepted.agent.origin, Origin::Automation { .. })
@@ -369,7 +397,7 @@ fn dispatch(
         let mut session = chat::fresh_session(
             accepted.agent.spec.provider,
             TerminalId::new(),
-            accepted.agent.spec.target.directory.clone(),
+            operational_directory.clone(),
             &account,
         )
         .map_err(before)?;
@@ -529,8 +557,11 @@ fn dispatch(
         create_console(host, &registry, accepted.agent.id, &session, &handle)
             .map_err(ConsoleError::run_failure)?;
     }
+    handle
+        .relocate_execution_directory(&operational_directory)
+        .map_err(before)?;
     context
-        .verify_directory(&accepted.agent.spec.target.directory)
+        .verify_directory(&operational_directory)
         .map_err(before)?;
     if matches!(accepted.agent.origin, Origin::Automation { .. }) {
         // Live interactive work may survive removal; each scheduled prompt
@@ -1116,13 +1147,17 @@ fn create_console_with_restart(
     if !program.is_file() {
         return Err("The matched cagents CLI for the console is unavailable".into());
     }
+    let directory = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_execution_directory(agent)?;
     let recipe = crate::model::LaunchRecipe {
         program: program
             .into_os_string()
             .into_string()
             .map_err(|_| "Console executable path is not UTF-8")?,
         arguments: vec!["agent".into(), "console".into(), agent.to_string()],
-        working_directory: session.launch.recipe.working_directory.clone(),
+        working_directory: directory,
         environment: Default::default(),
         unset_environment: Default::default(),
     };

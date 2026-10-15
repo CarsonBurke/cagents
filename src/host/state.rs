@@ -291,6 +291,12 @@ pub(crate) struct HostState {
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_transition_gates: BTreeMap<TerminalId, std::sync::Weak<Mutex<()>>>,
     pub(super) chat_restarts: BTreeMap<TerminalId, super::chat::restart::Restart>,
+    /// A daemon proof plus native UUID must identify at most one fresh actor.
+    /// Retain successful/explicitly closed IDs after removing their records.
+    pub(super) issued_chat_ids: BTreeSet<TerminalId>,
+    /// Retry a failed private metadata write at most once per second, while
+    /// continuing to publish actor output. Directory authority stays unchanged.
+    pub(super) directory_thread_retry: Option<Instant>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
@@ -360,6 +366,8 @@ impl HostState {
             chats: BTreeMap::new(),
             chat_transition_gates: BTreeMap::new(),
             chat_restarts: BTreeMap::new(),
+            issued_chat_ids: BTreeSet::new(),
+            directory_thread_retry: None,
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
@@ -440,6 +448,50 @@ impl HostState {
             }
         };
         self.model = Some(registry);
+    }
+
+    /// Called under HostLock with the callback's private actor incarnation.
+    /// A late callback cannot enrich a successor that reused its numeric ID.
+    pub(super) fn observe_chat_directory_thread(
+        &mut self,
+        id: TerminalId,
+        instance: uuid::Uuid,
+    ) -> Result<(), String> {
+        let Some(record) = self
+            .chats
+            .get(&id)
+            .filter(|record| record.execution_instance == instance)
+        else {
+            return Ok(());
+        };
+        let Some(thread) = record.handle.confirmed_session_id() else {
+            return Ok(());
+        };
+        if record.session.launch.session_id.as_ref() == Some(&thread) {
+            return Ok(());
+        }
+        if self
+            .directory_thread_retry
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return Ok(());
+        }
+        let mut source = record.session.clone();
+        source.launch.session_id = Some(thread);
+        if let Some(registry) = self.model.as_mut() {
+            if let Err(error) = registry.observe_owned_session_thread(
+                &crate::agent_execution::HostedSession::Chat(source.clone()),
+            ) {
+                self.directory_thread_retry = Some(Instant::now() + Duration::from_secs(1));
+                return Err(error);
+            }
+        }
+        self.directory_thread_retry = None;
+        self.chats
+            .get_mut(&id)
+            .expect("actor held under HostLock")
+            .session = source;
+        Ok(())
     }
 
     /// How many hosted agents are working, and how many are waiting on the
@@ -631,6 +683,20 @@ impl HostState {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
         }
         Ok(applied.model)
+    }
+
+    /// Provider evidence was prepared without this mutex. The caller owns
+    /// exclusive control admission and publishes after actor-local completion.
+    pub(super) fn apply_session_relocation(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[super::model::SessionMove],
+        agent_moves: &[super::model::AgentMove],
+    ) -> Result<WorkspaceModel, ProtocolError> {
+        self.registry()?
+            .apply_with_location_moves(edit, moves, agent_moves)
+            .map(|applied| applied.model)
+            .map_err(model_unavailable)
     }
 
     fn registry(&mut self) -> Result<&mut super::model::Registry, ProtocolError> {
@@ -2568,9 +2634,6 @@ fn restore_terminal_execution_authority(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .retained_agent_authority_source(source.id)?;
-    if !matches!(authority, Some(HostedSession::Terminal(_))) {
-        return Ok(());
-    }
     let successor = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2595,10 +2658,12 @@ fn restore_terminal_execution_authority(
             retained.push(HostedSession::Terminal(attached));
         }
     }
-    registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .adopt_authenticated_agent_session(&retained, &HostedSession::Terminal(successor))?;
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let successor = HostedSession::Terminal(successor);
+    if matches!(authority, Some(HostedSession::Terminal(_))) {
+        registry.adopt_authenticated_agent_session(&retained, &successor)?;
+    }
+    registry.adopt_session_location(&retained, &successor)?;
     Ok(())
 }
 
@@ -3358,6 +3423,7 @@ pub(super) fn spawn_pending_terminal(
         None,
         None,
         Some(pane),
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3419,6 +3485,55 @@ pub(super) fn spawn_terminal_view_owned(
         None,
         None,
         None,
+        None,
+    )
+}
+
+/// Start a new terminal only in the independently verified operational
+/// directory captured before its native predecessor is stopped. The FD stays
+/// execution-only; it must never replace the original actor's issued recipe.
+pub(super) fn spawn_terminal_view_owned_at_directory(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    context: Arc<crate::chat::protocol::ExecutionContext>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    use std::os::unix::fs::MetadataExt;
+    let directory = context.directory_descriptor().ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "The native handoff has no verified working-directory descriptor",
+            false,
+        )
+    })?;
+    let metadata = directory.metadata().map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            format!("Inspect the native handoff directory: {error}"),
+            false,
+        )
+    })?;
+    if !metadata.is_dir() || metadata.nlink() == 0 {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "The native handoff directory is no longer available",
+            false,
+        ));
+    }
+    start_terminal_view_owned(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        None,
+        None,
+        None,
+        Some(directory),
     )
 }
 
@@ -3444,6 +3559,7 @@ fn start_terminal_view(
         adoption,
         previous,
         None,
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3460,6 +3576,7 @@ fn start_terminal_view_owned(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
+    execution_directory: Option<Arc<std::fs::File>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
@@ -3611,6 +3728,7 @@ fn start_terminal_view_owned(
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
+        execution_directory,
         adoption,
         holder_recovery,
         ..TerminalConfig::default()

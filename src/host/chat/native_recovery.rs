@@ -180,14 +180,50 @@ fn restore_authenticated(
         .map(crate::agent_execution::HostedSession::Chat)
         .collect();
     let execution_registry = super::super::agent_execution::registry(host)?;
-    let directory = execution_registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retained_agent_directory(&retained)?;
+    let (directory, operational_directory, session_location) = {
+        let registry = execution_registry.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            registry.retained_agent_directory(&retained)?,
+            registry.retained_agent_execution_directory(&retained)?,
+            registry.retained_session_location(&retained)?,
+        )
+    };
     let (mut spec, mut adapter) = chat::protocol::codex::create_restored(&recovery)?;
     spec.environment = recovery.execution_environment.0.clone();
-    spec.execution =
-        directory.map(|identity| Arc::new(chat::protocol::ExecutionContext::restored(identity)));
+    let operational_directory = session_location
+        .as_ref()
+        .map(|location| location.directory.clone())
+        .or(operational_directory)
+        .unwrap_or_else(|| spec.working_directory.clone());
+    let approved = session_location
+        .as_ref()
+        .and_then(|location| location.approved)
+        .or(directory);
+    if let (Some(agent), Some(session)) = (
+        directory,
+        session_location
+            .as_ref()
+            .and_then(|location| location.approved),
+    ) && agent != session
+    {
+        return Err(
+            "Agent and native session directory ownership disagree; provider was preserved".into(),
+        );
+    }
+    let process = recovery
+        .server_process
+        .as_ref()
+        .ok_or("The retained native provider has no authenticated process identity")?;
+    let pinned = chat::runtime::DirectoryProof::capture_owned_process(
+        process,
+        &operational_directory,
+        approved,
+    )?;
+    spec.execution = Some(Arc::new(chat::protocol::ExecutionContext::new(Some(
+        pinned.directory,
+    ))));
+    adapter.relocate_directory(&operational_directory)?;
+    spec.working_directory = operational_directory.clone();
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -236,7 +272,7 @@ fn restore_authenticated(
                     );
                 }
             } else {
-                changed(&weak, id, update);
+                changed_owned(&weak, id, execution_instance, update);
             }
         },
     )?;
@@ -342,6 +378,16 @@ fn restore_authenticated(
         let _ = handle.close();
         return Err(error);
     }
+    let location_result = (|| {
+        let mut registry = execution_registry.lock().unwrap_or_else(|p| p.into_inner());
+        let successor = crate::agent_execution::HostedSession::Chat(session.clone());
+        registry.adopt_session_location(&retained, &successor)?;
+        registry.bind_session_location(&successor, None, &operational_directory, pinned.identity)
+    })();
+    if let Err(error) = location_result {
+        let _ = handle.close();
+        return Err(error);
+    }
     handle.commit_native_installation()?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged = match (&session.terminal, &paired) {
@@ -386,6 +432,7 @@ fn restore_authenticated(
         returning_terminal: false,
     };
     let response = session_snapshot(&record);
+    state.issued_chat_ids.insert(id);
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();
