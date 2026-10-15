@@ -1454,6 +1454,81 @@ mod tests {
         assert!(matches!(&local, Message::SourceControlLoaded { result: Ok(read), .. } if read.head_repository.is_none()));
         drop(app.update(local));
         assert!(app.sidebar_model.projects[0].worktrees[0].head_repository.is_none());
+
+        git(&root, &["config", "--unset", "branch.main.pushremote"]);
+        git(&root, &["config", "--unset-all", "remote.fork.url"]);
+        git(&root, &["config", "include.path", "publication.inc"]);
+        let missing_include = load(&mut app, &key);
+        drop(app.update(missing_include));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+        let config_before = fs::read(root.join(".git/config")).unwrap();
+        let included = root.join(".git/publication.inc");
+        for owner in ["included-first", "included-second"] {
+            fs::write(&included, format!("[branch \"main\"]\n pushRemote = fork\n[remote \"fork\"]\n url = https://github.com/{owner}/repo.git\n")).unwrap();
+            let changed_include = load(&mut app, &key);
+            assert!(matches!(&changed_include, Message::SourceControlLoaded { result: Ok(read), .. }
+                if read.prepared.is_some() && read.head_repository.as_ref().is_some_and(|key| key.owner == owner)));
+            drop(app.update(changed_include));
+            assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, owner);
+            assert_eq!(fs::read(root.join(".git/config")).unwrap(), config_before,
+                "only the included file changed, not the main config or porcelain state");
+        }
+        fs::write(&included, "").unwrap();
+        let empty_include = load(&mut app, &key);
+        drop(app.update(empty_include));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+        fs::write(&included, "[branch \"main\"]\n pushRemote = retained-old\n").unwrap();
+        let filled_include = load(&mut app, &key);
+        assert!(matches!(&filled_include, Message::SourceControlLoaded { result: Ok(read), .. } if read.prepared.is_some()));
+        drop(app.update(filled_include));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+    }
+
+    #[test]
+    fn bound_worker_observes_new_and_changed_global_publication_config() {
+        const CHILD: &str = "CAGENTS_PUBLICATION_GLOBAL_TEST_CHILD";
+        const TEST: &str = "app::git_ui::tests::bound_worker_observes_new_and_changed_global_publication_config";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let global = directory.path().join("global-config");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
+                command.env_remove(name);
+            }
+            let output = command.args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, &global).env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
+                .output().unwrap();
+            assert!(output.status.success(), "global fixture failed: {}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "child must execute its exact contract: {}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let global = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        assert!(!global.exists());
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let baseline = fixture(&root);
+        git(&root, &["remote", "add", "origin", "https://github.com/global-old/repo.git"]);
+        git(&root, &["remote", "add", "fork", "https://github.com/global-new/repo.git"]);
+        let key = ActiveWorktreeKey { project_id: ProjectId::new(), worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let mut app = app_with_status_snapshot(baseline, &key);
+        fn load(app: &mut Cagents, key: &ActiveWorktreeKey) -> Message {
+            super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()))
+        }
+        let first = load(&mut app, &key);
+        drop(app.update(first));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, "global-old");
+        let local_before = fs::read(root.join(".git/config")).unwrap();
+        for (selected, owner) in [("fork", "global-new"), ("origin", "global-old")] {
+            fs::write(&global, format!("[branch \"main\"]\n pushRemote = {selected}\n")).unwrap();
+            let changed = load(&mut app, &key);
+            assert!(matches!(&changed, Message::SourceControlLoaded { result: Ok(read), .. }
+                if read.prepared.is_some() && read.head_repository.as_ref().is_some_and(|key| key.owner == owner)));
+            drop(app.update(changed));
+            assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, owner);
+            assert_eq!(fs::read(root.join(".git/config")).unwrap(), local_before);
+        }
     }
 
     #[test]
