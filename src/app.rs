@@ -14610,7 +14610,7 @@ impl Application for Cagents {
                     | SidebarAction::SetChangesTab { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::SetChangeListMode { .. }
-                    | SidebarAction::ChangePage { .. }
+                    | SidebarAction::ChangeViewport { .. }
                     | SidebarAction::ChangeGroup { .. }
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
