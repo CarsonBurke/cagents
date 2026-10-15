@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn bounded_preserve_case_counts_unicode_before_caching_or_appending() {
-        for (matched, text) in [("foo", "ΟΣ\u{301}"), ("FOO", "ßﬃ"), ("Foo", "ßΟΣ"), ("fOo", "λ🦀")] {
+        for (matched, text) in [("foo", "ΟΣ\u{301}"), ("foo", "Ⱥ"), ("FOO", "ΐ"), ("FOO", "ßﬃ"), ("Foo", "ßΟΣ"), ("fOo", "λ🦀")] {
             let replacement = Replacement::new(matched, text, Default::default(), true).unwrap();
             let expected = preserve_case(matched, text);
             assert!(replacement.expand_bounded(matched, 0, matched.len(), expected.len() - 1).is_err());
