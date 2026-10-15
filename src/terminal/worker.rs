@@ -1440,16 +1440,21 @@ impl TerminalHandle {
         self.release_completed_holder_until(std::time::Instant::now()+std::time::Duration::from_secs(3))
     }
 
-    fn release_completed_holder_until(&self,deadline:std::time::Instant)->Result<(),String> {
+    pub(crate) fn release_completed_holder_until(&self,deadline:std::time::Instant)->Result<(),String> {
         if std::time::Instant::now()>=deadline {return Err("Terminal cleanup deadline expired; its owner remains retained".into());}
         let mut retained = self.inner.published.retained_holder.try_lock()
             .map_err(|_| "Another close retains this terminal holder; retry after its deadline".to_owned())?;
         if let Some(holder) = retained.as_mut() {holder.close_until(deadline)?;}
         else if !self.is_completed() {return Err("Terminal worker has not retained a cleanup owner".into());}
+        // Preserve the exact holder and its positive cleanup proof if
+        // publication is contended; a retry need not rediscover ownership.
+        let mut archive=self.inner.published.archive.try_lock()
+            .map_err(|_|"Terminal cleanup is proved; archive metadata is busy, retry publication".to_string())?;
+        *archive=ArchivePhase::Released;
         let holder = retained.take();
+        drop(archive);
         drop(retained);
         drop(holder);
-        *self.inner.published.archive.try_lock().map_err(|_|"Terminal completion metadata is busy; retry exact cleanup".to_string())? = ArchivePhase::Released;
         self.inner.published.completed.store(true, Ordering::Release);
         self.inner.published.archive_ready.notify_all();
         Ok(())
