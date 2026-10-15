@@ -3658,18 +3658,18 @@ impl RepositoryRuntime {
         let cursor = document.content.cursor().position;
         let column = document.content.with_line(cursor.line, |line, _| {
             let prefix = &line[..char_boundary(line, cursor.column)];
-            // Code removes a document-start BOM from its model. A U+FEFF
+            // Code and Zed remove a document-start BOM from their models. A U+FEFF
             // elsewhere is ordinary content and must still contribute a unit.
             let prefix =
-                if cursor.line == 0 && crate::external_editor::uses_code_coordinates(editor) {
+                if cursor.line == 0 && crate::external_editor::normalizes_text_coordinates(editor) {
                     prefix.strip_prefix('\u{feff}').unwrap_or(prefix)
                 } else {
                     prefix
                 };
             crate::external_editor::column_for_prefix(editor, prefix)
         })?;
-        let line = if crate::external_editor::uses_code_coordinates(editor) {
-            // cosmic-text folds LFCR into one native terminator. Code splits
+        let line = if crate::external_editor::normalizes_text_coordinates(editor) {
+            // cosmic-text folds LFCR into one native terminator. Code and Zed split
             // CRLF, CR and LF, so LFCR contributes two model lines. Inspect
             // only ending metadata; do not serialize or clone source text.
             (0..cursor.line).try_fold(1usize, |row, index| {
@@ -16180,7 +16180,7 @@ mod tests {
     }
 
     #[test]
-    fn external_editor_caret_maps_actual_mixed_native_line_endings_for_code() {
+    fn external_editor_caret_maps_actual_mixed_native_line_endings_for_launchers() {
         let card = CardId::new();
         let (mut runtime, _) =
             RepositoryRuntime::open_fixture(card, "mixed.rs", "α\n\rβ\r\nγ\rδ\né😀X");
@@ -16216,15 +16216,15 @@ mod tests {
                     "{editor}"
                 );
             }
-            assert_eq!(
-                runtime.editor_caret_for("zed"),
-                Some((native_line + 1, scalar_column))
-            );
+            for editor in ["zed", "zeditor"] {
+                assert_eq!(runtime.editor_caret_for(editor), Some((code_line, scalar_column)));
+            }
+            assert_eq!(runtime.editor_caret(), Some((native_line + 1, scalar_column)));
         }
     }
 
     #[test]
-    fn external_editor_caret_excludes_only_the_document_bom_for_code() {
+    fn external_editor_caret_excludes_only_the_document_bom_for_launchers() {
         let card = CardId::new();
         let (mut runtime, _) =
             RepositoryRuntime::open_fixture(card, "bom.rs", "\u{feff}a😀b\n\u{feff}x");
@@ -16256,6 +16256,10 @@ mod tests {
             });
             for editor in ["code", "codium", "cursor"] {
                 assert_eq!(runtime.editor_caret_for(editor), Some(expected), "{editor}");
+            }
+            let scalar_expected = if line == 0 && bytes == 8 { (1, 3) } else { expected };
+            for editor in ["zed", "zeditor"] {
+                assert_eq!(runtime.editor_caret_for(editor), Some(scalar_expected), "{editor}");
             }
         }
     }

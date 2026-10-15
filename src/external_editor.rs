@@ -171,6 +171,10 @@ pub(crate) fn uses_code_coordinates(editor: &str) -> bool {
     matches!(editor, "code" | "codium" | "cursor")
 }
 
+pub(crate) fn normalizes_text_coordinates(editor: &str) -> bool {
+    uses_code_coordinates(editor) || matches!(editor, "zed" | "zeditor")
+}
+
 /// Positions use one-based lines and editor-specific columns. Convert a native
 /// caret's line prefix with [`column_for_prefix`] before constructing them.
 pub fn arguments(editor: &str, path: &Path, position: Option<(usize, usize)>) -> Vec<OsString> {
