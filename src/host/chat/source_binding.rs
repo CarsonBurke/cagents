@@ -863,6 +863,47 @@ pub(super) fn finish_closed_return(
     Ok(())
 }
 
+/// Private close context. The caller must already hold this chat's lifecycle
+/// transition and its own exact user/owner close admission. Capturing a pending
+/// handoff is not authorization to close an otherwise unrelated session.
+pub(in crate::host) struct PendingClose {
+    intent: ChatSourceBinding,
+    admitted: ChatSourceBinding,
+    continuation: Continuation,
+    closed: bool,
+}
+impl PendingClose {
+    pub(in crate::host) fn admitted(&self) -> &Session { &self.admitted.source }
+    pub(in crate::host) fn binding(&self) -> &ChatSourceBinding { &self.admitted }
+    pub(in crate::host) fn owner(&self) -> &Handle { &self.continuation.handle }
+    pub(in crate::host) fn witness(&self) -> &chat::runtime::BackendIdentity { &self.continuation.witness }
+    pub(in crate::host) fn close_original(&mut self, host: &SharedHost) -> Result<(), ProtocolError> {
+        claim_continuation(host, &self.intent, &self.admitted, &mut self.continuation)?;
+        close_continuation(host, self.admitted.source.id, &self.continuation)?;
+        self.closed = true;
+        Ok(())
+    }
+}
+pub(in crate::host) fn capture_pending_close(host: &SharedHost, source: &Session) -> Result<Option<PendingClose>, ProtocolError> {
+    let captured = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(source.proof.as_ref(), state.proof())?;
+        let Some(entry) = state.native_sources.entries.get(&source.id) else { return Ok(None); };
+        let Some(pending) = &entry.pending_handoff else { return Ok(None); };
+        if pending.original_pair.is_some() || pending.created_pair.is_some()
+            || pending.returned.as_ref().is_some_and(|target| target.attempted || target.published.is_some()) {
+            return Err(unavailable("This handoff retains attempted or paired terminal ownership; exact cleanup disposition is still required"));
+        }
+        if (source != &pending.intent.source && source != &pending.admitted.source)
+            || state.chats.get(&source.id).is_none_or(|record| record.execution_instance != entry.instance || !record.handle.same_actor(&pending.owner)) {
+            return Err(unavailable("The close does not name the exact retained handoff source"));
+        }
+        (pending.intent.clone(), pending.admitted.clone())
+    };
+    let continuation = continuation(host, &captured.1)?;
+    Ok(Some(PendingClose { intent: captured.0, admitted: captured.1, continuation, closed: false }))
+}
+
 /// The operation's own paired source may change, but its actual backend and
 /// confirmed conversation must remain exactly the one authenticated beforehand.
 pub(super) fn complete_pair(
