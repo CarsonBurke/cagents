@@ -1273,6 +1273,14 @@ mod tests {
         };
         drop(app.adopt_shared_project(&shared));
         let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project, RepositoryId::new(), "project".into(), repository.clone(), Vec::new(), Vec::new(),
+        ));
+        assert_eq!(
+            app.known_project_checkout(&linked, project),
+            Some((linked.clone(), repository.clone())),
+            "a linked-path reload still uses canonical project discovery metadata"
+        );
         assert_eq!(
             app.known_project_checkout(&repository, project),
             Some((linked.clone(), repository.clone()))

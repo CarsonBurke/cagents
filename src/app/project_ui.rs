@@ -223,6 +223,10 @@ impl Cagents {
         repository: &Path,
         project_id: ProjectId,
     ) -> Option<(PathBuf, PathBuf)> {
+        // Read requests can name a linked checkout while their stable ID names
+        // the canonical project. Discovery caches are keyed by that identity.
+        let project = self.sidebar_model.project(project_id);
+        let repository = project.map_or(repository, |project| project.repository.as_path());
         if let Some(checkout) = self
             .project_ui
             .checkout_roots
@@ -231,7 +235,7 @@ impl Cagents {
         {
             return Some((checkout.clone(), repository.to_owned()));
         }
-        let project = self.sidebar_model.project(project_id)?;
+        let project = project?;
         if project.kind == ProjectKind::Folder {
             return Some((project.repository.clone(), project.repository.clone()));
         }
