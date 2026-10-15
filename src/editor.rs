@@ -1278,7 +1278,7 @@ fn file_operation_root(
 /// exactly what makes everything below it fd-relative. It is canonicalized
 /// first because a worktree may legitimately live behind a symbolic link,
 /// which `Root::open` refuses for its final component.
-fn worktree_root(worktree: &Path) -> Result<Root, FileIoError> {
+pub(crate) fn worktree_root(worktree: &Path) -> Result<Root, FileIoError> {
     let root = fs::canonicalize(worktree)
         .map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))?;
     Root::open(&root).map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))

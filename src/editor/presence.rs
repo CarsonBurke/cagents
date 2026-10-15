@@ -393,6 +393,10 @@ fn replace_or_remove_document_file(
 /// Captures only metadata for a cross-presence Reload. Both the returned text
 /// and this template must name the same exact regular-file contents.
 pub(crate) fn capture_restoration_at(root: &Root, path: &Path, expected_hash: blake3::Hash) -> Result<Arc<FileRestoration>, FileIoError> {
+    capture_restoration_with_hook(root, path, expected_hash, |_, _| Ok(()))
+}
+
+fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3::Hash, before_unlink: impl FnOnce(&Root, &std::ffi::OsStr) -> io::Result<()>) -> Result<Arc<FileRestoration>, FileIoError> {
     validate_repo_path(path)?;
     let permit = RestorationPermit::acquire()?;
     let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
@@ -407,7 +411,31 @@ pub(crate) fn capture_restoration_at(root: &Root, path: &Path, expected_hash: bl
     if blake3::hash(&bytes) != expected_hash || version(&before) != version(&source.metadata().map_err(io_error)?) {
         return Err(FileIoError::Io("The reloaded file changed while retaining Undo metadata.".into()));
     }
-    let template = immutable_metadata_template(&parent, &source, &before, &attributes)?;
+    // The metadata can be world-readable/writable. Until its temporary name
+    // is removed, it must live behind a private directory, just as removal's
+    // metadata capture does. Never expose it in the ordinary worktree parent.
+    let holding_name = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
+    let (holding, created) = fs_safety::create_directory_beneath(&parent, Path::new(&holding_name), 0o700).map_err(resolve_error)?;
+    if !created { return Err(FileIoError::Io("The private Undo metadata directory already exists.".into())); }
+    let capture = (|| {
+        fs_safety::set_directory_permissions(&holding, 0o700).map_err(io_error)?;
+        if holding.metadata().map_err(io_error)?.mode() & 0o777 != 0o700 {
+            return Err(FileIoError::Io("The Undo metadata directory is not private.".into()));
+        }
+        immutable_metadata_template_with_hook(&holding, &source, &before, &attributes, before_unlink)
+    })();
+    let cleanup = (|| {
+        let named = fs_safety::metadata_beneath(&parent, Path::new(&holding_name)).map_err(resolve_error)?;
+        if !same_inode(&named, &holding.metadata().map_err(io_error)?) {
+            return Err(FileIoError::Io("The private Undo metadata directory was moved or replaced; no replacement directory was removed.".into()));
+        }
+        fs_safety::remove_directory_within(&parent, &holding_name).map_err(resolve_error)
+    })();
+    let template = match (capture, cleanup) {
+        (Ok(template), Ok(())) => template,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(cleanup)) => return Err(FileIoError::Io(format!("{error} Could not clean the private metadata directory: {cleanup}"))),
+    };
     // Re-read the same descriptor after capture: chmod/xattrs and text races
     // cannot produce metadata for another revision of these displayed bytes.
     source.rewind().map_err(io_error)?;
@@ -420,6 +448,10 @@ pub(crate) fn capture_restoration_at(root: &Root, path: &Path, expected_hash: bl
 }
 
 fn immutable_metadata_template(parent: &Root, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>) -> Result<File, FileIoError> {
+    immutable_metadata_template_with_hook(parent, source, before, attributes, |_, _| Ok(()))
+}
+
+fn immutable_metadata_template_with_hook(parent: &Root, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>, before_unlink: impl FnOnce(&Root, &std::ffi::OsStr) -> io::Result<()>) -> Result<File, FileIoError> {
     let (template, name) = fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
     let captured = (|| {
         fs_safety::copy_ownership(source, &template).map_err(io_error)?;
@@ -434,10 +466,14 @@ fn immutable_metadata_template(parent: &Root, source: &File, before: &fs::Metada
             || &fs_safety::content_attributes(&template).map_err(io_error)? != attributes {
             return Err(FileIoError::Io("The source metadata changed while retaining Undo metadata.".into()));
         }
+        before_unlink(parent, &name).map_err(io_error)?;
         Ok(())
     })();
     fs_safety::unlink_within(parent, &name).map_err(resolve_error)?;
     captured?;
+    if template.metadata().map_err(io_error)?.nlink() != 0 {
+        return Err(FileIoError::Io("The Undo metadata template acquired an outside hard link.".into()));
+    }
     Ok(template)
 }
 
@@ -445,6 +481,27 @@ fn immutable_metadata_template(parent: &Root, source: &File, before: &fs::Metada
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn reload_metadata_is_private_while_named_and_refuses_an_outside_hard_link() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        let path = Path::new("file"); fs::write(directory.path().join(path), "contents").unwrap();
+        fs::set_permissions(directory.path().join(path), Permissions::from_mode(0o666)).unwrap();
+        let restoration = capture_restoration_with_hook(&root, path, blake3::hash(b"contents"), |holding, name| {
+            assert_eq!(holding.metadata()?.mode() & 0o777, 0o700);
+            assert_ne!(holding.path(), directory.path());
+            assert!(fs::read_dir(directory.path())?.all(|entry| { let entry = entry.unwrap(); entry.file_name() == "file" || entry.file_type().unwrap().is_dir() }));
+            assert_eq!(fs::metadata(holding.path().join(name))?.mode() & 0o777, 0o666);
+            Ok(())
+        }).unwrap();
+        assert_eq!(restoration.source.metadata().unwrap().nlink(), 0);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        let alias = directory.path().join("outside-template");
+        assert!(capture_restoration_with_hook(&root, path, blake3::hash(b"contents"), |holding, name| fs::hard_link(holding.path().join(name), &alias)).is_err());
+        fs::remove_file(alias).unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_to_string(directory.path().join(path)).unwrap(), "contents");
+    }
 
     #[test]
     fn reload_restoration_capture_refuses_changed_bytes_and_keeps_immutable_metadata() {

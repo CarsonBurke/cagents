@@ -82,7 +82,7 @@ pub fn load(worktree: &Path, path: &Path, before: &str, tone: PdfTone) -> Result
 }
 
 pub fn load_with_restoration(worktree: &Path, path: &Path, before: &str, tone: PdfTone, capture: bool) -> Result<Version, String> {
-    let root = Root::open(worktree).map_err(|error| error.to_string())?;
+    let root = crate::editor::worktree_root(worktree).map_err(|error| error.to_string())?;
     match crate::editor::load_file_at(&root, path, tone) {
         Ok(LoadedFile { source, content: FileContent::Editable { text, content_hash, markdown } }) => {
             let mapping = LineMap::between(before, &text);
@@ -97,6 +97,16 @@ pub fn load_with_restoration(worktree: &Path, path: &Path, before: &str, tone: P
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_and_cross_presence_reload_preserve_symlink_worktree_roots() {
+        let directory = tempfile::tempdir().unwrap(); let actual = directory.path().join("actual"); let alias = directory.path().join("alias");
+        std::fs::create_dir(&actual).unwrap(); std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        std::fs::write(actual.join("file.rs"), "updated\n").unwrap();
+        for capture in [false, true] {
+            let version = load_with_restoration(&alias, Path::new("file.rs"), "old\n", PdfTone::Original, capture).unwrap();
+            assert_eq!(version.text, "updated\n"); assert_eq!(version.restoration.is_some(), capture);
+        }
+    }
     #[test]
     fn reload_policy_distinguishes_clean_dirty_own_saves_and_deletion() {
         let old = blake3::hash(b"old"); let new = blake3::hash(b"new");
