@@ -8827,6 +8827,7 @@ impl Cagents {
         } else {
             self.cards.insert(card_id, CardRuntime::Loading);
         }
+        let width_fraction = self.new_pane_fraction(self.settings.default_column_fraction);
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.push(CardState {
             id: card_id,
@@ -8835,7 +8836,7 @@ impl Cagents {
                 .host_str()
                 .and_then(normalize_card_name)
                 .unwrap_or_else(|| "Browser".into()),
-            width_fraction: self.new_pane_fraction(self.settings.default_column_fraction),
+            width_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hydrating {
