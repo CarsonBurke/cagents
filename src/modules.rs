@@ -120,6 +120,7 @@ pub mod tray;
 pub mod ui_controls;
 pub mod update;
 pub mod upgrade;
+pub mod worktree_control;
 pub mod worktree_cleanup;
 pub mod worktree_branch;
 pub use terminal::ipc as terminal_ipc;
