@@ -2131,6 +2131,7 @@ impl Adapter for Claude {
                 } else {
                     match string(&request, "subtype") {
                         "initialize" => {
+                            self.original_connection_policy(&response["response"]);
                             self.ready = true;
                             step.events.push(Event::Ready(true));
                             // The CLI names its session only on frames of a

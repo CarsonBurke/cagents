@@ -304,6 +304,7 @@ mod tests {
     fn first_claude_prompt_decoder_and_authority_preserve_operator_input_over_rewritten_echo(){
         let root=annotations::storage::test_directory();let home=root.path().join("claude-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Claude,root.path(),|key|(key=="CLAUDE_CONFIG_DIR").then(||home.as_os_str().to_owned())).unwrap();
         let mut authority=Authority::new(Ok(scope));authority.root=Some(root.path().join("annotations"));let mut adapter=protocol::claude::annotation_test_adapter();
+        let initialize=adapter.initialize().unwrap();adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":initialize.writes[0]["request_id"],"response":{"current_permission_mode":"default","fast_mode_state":"off"}}})).unwrap();
         let mut command=Command::Prompt{text:"original /slash-command".into(),attachments:vec![],mode:crate::chat::PromptMode::Send};assert!(adapter.supports_original_commands(&command));let id=authority.prepare(&mut command,root.path()).unwrap().unwrap();adapter.original_command(Some(id.clone()));let read=adapter.command(command).unwrap();
         let dispatched=adapter.receive(json!({"type":"control_response","response":{"request_id":read.writes[0]["request_id"],"subtype":"success","response":{"applied":{"model":"reported-model","effort":"low"}}}})).unwrap();assert_eq!(dispatched.writes[0]["uuid"],id);
         let session="00000000-0000-4000-8000-000000000001";

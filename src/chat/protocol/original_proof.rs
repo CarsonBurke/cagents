@@ -205,7 +205,9 @@ impl ClaudeProofs {
                 match frame["state"].as_str()? {
                     "started" | "completed" => self.joins.accepted(key, session, key),
                     "cancelled" | "discarded" | "refused" => {
-                        self.joins.retire(key);
+                        // A started command may later be cancelled because its
+                        // turn failed. Its delayed exact user echo still joins.
+                        if self.joins.pending.get(key).is_some_and(|pending|pending.accepted.is_none()){self.joins.retire(key);}
                         None
                     }
                     _ => None,
@@ -347,22 +349,17 @@ pub(crate) fn claude_reported_settings(payload: &Value, init: &Value, confirmed_
     if init.get("effort").is_some_and(|effort| effort.as_str() != Some(applied.effort.as_str())) {
         return Err(unavailable());
     }
-    let fast = match init["fast_mode_state"].as_str() {
-        Some("on") => true,
-        Some("off") => false,
-        _ => return Err(unavailable()),
-    };
-    let permission = match init["permissionMode"].as_str() {
-        Some("default") => "manual",
-        Some(mode @ ("acceptEdits" | "auto" | "plan" | "dontAsk" | "bypassPermissions")) => mode,
-        _ => return Err(unavailable()),
-    };
-    Ok(OriginalSettings {
-        model: Setting::Value(applied.model),
-        reasoning: Setting::Value(applied.effort),
-        fast: Setting::Value(fast),
-        permission: Setting::Value(permission.into()),
-    })
+    claude_applied_settings(payload,init["permissionMode"].as_str().ok_or_else(unavailable)?,init["fast_mode_state"].as_str().ok_or_else(unavailable)?)
+}
+
+/// Fresh applied model/effort plus provider-reported policy on this exact
+/// connection. Caller must retain ordering/revision proof through dispatch;
+/// requested flags and later initialization frames cannot fill missing values.
+pub(crate) fn claude_applied_settings(payload:&Value,permission:&str,fast_state:&str)->Result<OriginalSettings,OriginalError>{
+    let applied=claude_applied_model_effort(payload)?;
+    let fast=match fast_state {"on"=>true,"off"=>false,_=>return Err(unavailable())};
+    let permission=match permission {"default"=>"manual",mode@("manual"|"acceptEdits"|"auto"|"plan"|"dontAsk"|"bypassPermissions")=>mode,_=>return Err(unavailable())};
+    Ok(OriginalSettings {model:Setting::Value(applied.model),reasoning:Setting::Value(applied.effort),fast:Setting::Value(fast),permission:Setting::Value(permission.into())})
 }
 
 #[cfg(test)]
