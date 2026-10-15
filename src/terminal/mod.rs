@@ -24,7 +24,8 @@ pub(crate) const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration:
 pub use ipc::TerminalSpawnOptions;
 
 pub use hosted::{
-    HostedTerminalBinding, HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
+    HostedTerminalBinding, HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready,
+    ensure_daemon_ready_for,
 };
 pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
