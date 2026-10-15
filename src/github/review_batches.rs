@@ -84,10 +84,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             ),
             polling::now(),
         ) {
-            polling::failed(
-                &key.repository.authority(),
-                &GitHubError::RateLimited { limit },
-            );
+            polling::failed(&key.repository.host, &GitHubError::RateLimited { limit });
         }
         if output.success
             && response
@@ -175,6 +172,8 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 "--include",
                 "--hostname",
                 &repository.authority(),
+                "--method",
+                "POST",
                 "--input",
                 "-",
             ])
@@ -434,9 +433,9 @@ mod tests {
             stdout: format!("HTTP/2.0 403 Forbidden\r\nRetry-After: 120\r\nX-RateLimit-Remaining: 4000\r\n\r\n{{\"message\":\"secondary rate limit\"}}").into_bytes(),
             stderr: vec![],
         });
-        let service = GitHubService::new("gh", executor);
+        let service = GitHubService::new("gh", executor.clone());
         let key = PullRequestKey::new(
-            GitHubRepoKey::new("single-limit-test.invalid", None, "owner", "repo").unwrap(),
+            GitHubRepoKey::new("single-limit-test.invalid", Some(8443), "owner", "repo").unwrap(),
             9,
         )
         .unwrap();
@@ -457,7 +456,28 @@ mod tests {
         ));
         let limit = polling::rate_limit(&key.repository.host).unwrap();
         assert!(limit.retry_at >= reset && limit.retry_at <= reset + 1);
-        assert!(!polling::ready(&key.repository.authority(), true));
+        assert!(!polling::ready(&key.repository.host, true));
+        assert!(matches!(
+            service.graphql(
+                &key.repository,
+                "query{viewer{login}}",
+                vec![],
+                &CancellationToken::new()
+            ),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        let commands = executor.commands.lock().unwrap();
+        assert_eq!(
+            commands.len(),
+            1,
+            "the next review poll must not launch another process"
+        );
+        assert!(
+            commands[0]
+                .arguments
+                .iter()
+                .any(|arg| arg == "single-limit-test.invalid:8443")
+        );
     }
     #[test]
     fn single_comments_publish_directly_without_review_id() {
