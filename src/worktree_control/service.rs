@@ -194,12 +194,13 @@ fn inspect(
     })
 }
 
-fn journal_store() -> Result<crate::persistence::StateStore, String> {
+fn journal_store() -> Result<std::sync::Arc<crate::persistence::StateStore>, String> {
     let directories = crate::instance::project_dirs().ok_or("Data directory is unavailable")?;
     crate::persistence::StateStore::open(
         directories.data_dir().join("worktree-operations.sqlite3"),
         crate::daemon::read_boot_id().map_err(|error| error.to_string())?,
     )
+    .map(std::sync::Arc::new)
     .map_err(|error| error.to_string())
 }
 
@@ -229,7 +230,7 @@ fn remove_with_executor<E: ProcessExecutor + Clone + 'static>(
     operation: Operation,
     service: &RepositoryService<E>,
     executor: &E,
-    store: &crate::persistence::StateStore,
+    store: &std::sync::Arc<crate::persistence::StateStore>,
     live_sessions: &mut impl FnMut(&Path) -> Result<Vec<crate::model::TerminalId>, String>,
     before_effect: impl Fn(&Path) -> Result<(), String>,
     after_effect: impl Fn(),
@@ -332,6 +333,9 @@ fn remove_with_executor<E: ProcessExecutor + Clone + 'static>(
         path: record.path.clone(),
         branch: record.branch.clone(),
     };
+    // Metadata candidates are fixed before the effect. New creations that
+    // reuse these names before the reply can never enter this cleanup set.
+    let retirements = crate::repository::capture_worktree_creation_retirements(store.clone(), &removed);
     let command = super::git_command(&repository).args(["worktree", "remove"]);
     let command = if force && safety.files_to_discard() > 0 {
         command.arg("--force")
@@ -351,7 +355,7 @@ fn remove_with_executor<E: ProcessExecutor + Clone + 'static>(
     // this point, before receipt cleanup or response construction.
     after_effect();
     let mut warnings = Vec::new();
-    if let Err(failures) = crate::repository::release_deleted_worktree_creations(&store, &removed) {
+    if let Err(failures) = retirements.map_err(|error| vec![error]).and_then(|capture| capture.finish(&removed)) {
         warnings.push(format!(
             "Worktree was removed, but its creation receipt could not be retired: {}",
             failures

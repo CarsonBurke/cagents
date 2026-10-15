@@ -366,10 +366,15 @@ impl Cagents {
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
             let removed = tokio::task::spawn_blocking(move || {
+                let retirements = store.and_then(|store| {
+                    if crate::device::selected().is_some() { return None; }
+                    RepositoryService::system("git").creation_retirements_before_removal(
+                        store, &request.repository, &request.path, &CancellationToken::new()).ok()
+                });
                 let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request }).ok()?;
                 let crate::device_service::Reply::MergedWorktreeRemoved(Ok(removed)) = reply else { return None; };
-                if let Some(store) = store
-                    && let Err(errors) = crate::repository::release_deleted_worktree_creations(&store, &removed) {
+                if let Some(retirements) = retirements
+                    && let Err(errors) = retirements.finish(&removed) {
                     for error in errors { tracing::warn!(%error, "could not release removed worktree creation receipt"); }
                 }
                 Some(removed)
@@ -1502,11 +1507,15 @@ impl Cagents {
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
+                let retirements = store.and_then(|store| {
+                    if crate::device::selected().is_some() { return None; }
+                    RepositoryService::system("git").creation_retirements_before_removal(
+                        store, &request.repository, &request.path, &CancellationToken::new()).ok()
+                });
                 let removed = delete_worktree(&request)?;
-                if let Some(store) = store
+                if let Some(retirements) = retirements
                     && let Some(removed) = removed
-                    && let Err(errors) =
-                        crate::repository::release_deleted_worktree_creations(&store, &removed)
+                    && let Err(errors) = retirements.finish(&removed)
                 {
                     // The worktree is gone either way; what stays held is
                     // only the chance to create the same one again.
