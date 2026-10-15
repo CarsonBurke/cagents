@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     model::OperationId,
-    repository::{CancellationToken, CommandSpec, ProcessExecutor, RepositoryService, SystemProcessExecutor, TrackingState, WorktreeCreationOutcome, WorktreeInput, WorktreeRecord},
+    repository::{CancellationToken, ProcessExecutor, RepositoryService, SystemProcessExecutor, TrackingState, WorktreeCreationOutcome, WorktreeInput, WorktreeRecord},
 };
 use std::path::Path;
 
@@ -100,17 +100,17 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
             if expected_fingerprint.as_ref().is_some_and(|fingerprint|fingerprint!=&safety.fingerprint) {
                 return Err("The worktree changed after confirmation; review its safety again".into());
             }
-            if safety.requires_confirmation()&&!force {
+            if !force&&(safety.files_to_discard()>0||(expected_fingerprint.is_none()&&safety.requires_confirmation())) {
                 return Err(format!("Worktree contains {} modified, {} untracked, {} notable ignored file(s), {} unpushed and {} detached-only commit(s); pass --force to confirm discarding this work",safety.modified,safety.untracked,safety.notable_ignored.len(),safety.unpushed_commits,safety.detached_only_commits));
             }
-            if force&&safety.detached_only_commits>0 { service.rescue_detached_worktree(&record.path,&safety,&cancellation).map_err(|error|error.to_string())?; }
+            if safety.detached_only_commits>0&&(force||expected_fingerprint.is_some()) { service.rescue_detached_worktree(&record.path,&safety,&cancellation).map_err(|error|error.to_string())?; }
             let removed=crate::worktree_cleanup::RemovedWorktree {
                 common_dir:service.common_dir(&repository,&cancellation).map_err(|error|error.to_string())?,
                 admin_dir:service.git_dir(&record.path,&cancellation).map_err(|error|error.to_string())?,
                 path:record.path.clone(),branch:record.branch.clone(),
             };
-            let command=CommandSpec::new("git").cwd(&repository).args(["worktree","remove"]);
-            let command=if force { command.arg("--force") } else {command};
+            let command=super::git_command(&repository).args(["worktree","remove"]);
+            let command=if force&&safety.files_to_discard()>0 { command.arg("--force") } else {command};
             let command=command.arg("--").arg(&record.path).timeout(std::time::Duration::from_secs(30));
             SystemProcessExecutor.execute(&command,&cancellation).and_then(|output|output.require_success(&command.program)).map_err(|error|error.reported_detail())?;
             crate::repository::release_deleted_worktree_creations(&store,&removed)
@@ -122,6 +122,15 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
                 } else {None}
             } else {None};
             Ok(Reply::Removed {path:record.path.clone(),branch_deleted})
+        }
+        Operation::DeleteBranch {repository,branch,force,expected_oid} => {
+            if force&&expected_oid.is_none() {
+                return Ok(Reply::BranchDeleteRefused {failure:BranchDeleteFailure {kind:BranchDeleteFailureKind::Other,detail:"Force deletion requires the branch commit shown in confirmation".into()}});
+            }
+            Ok(match delete_branch_checked_at(&repository,&branch,force,expected_oid.as_deref(),&cancellation) {
+                Ok(())=>Reply::BranchDeleted {branch},
+                Err(failure)=>Reply::BranchDeleteRefused {failure},
+            })
         }
         Operation::Inspect {repository,path} => inspect(&service,&repository,&path,&cancellation),
         Operation::SetDisposableIgnoredDirectories {repository,path,directories} => {

@@ -107,6 +107,7 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
             let human=worktrees.iter().map(|entry|format!("{}\t{}\t{}\t{}\t{}\t{}",entry.path.display(),entry.branch.as_deref().unwrap_or("(detached)"),if entry.dirty {"dirty"}else{"clean"},entry.ahead.map(|count|format!("+{count}")).unwrap_or("-".into()),entry.behind.map(|count|format!("-{count}")).unwrap_or("-".into()),entry.live_sessions.len())).collect::<Vec<_>>().join("\n");
             ("worktree.list",json!({"schema_version":1,"worktrees":worktrees}),human)
         }
+        Reply::BranchDeleted {..}|Reply::BranchDeleteRefused {..}=>return Err(AppError::new("protocol","Unexpected branch-deletion response")),
         Reply::ResolvedProject {..}=>return Err(AppError::new("protocol","Unexpected project-ID response")),
         Reply::Inspected {..}=>return Err(AppError::new("protocol","Unexpected worktree inspection response")),
         Reply::Removed {path,branch_deleted}=>("worktree.remove",json!({"schema_version":1,"path":path,"branch_deleted":branch_deleted}),format!("Removed {}{}",path.display(),branch_deleted.map(|branch|format!(" and branch {branch}")).unwrap_or_default())),

@@ -145,3 +145,34 @@ fn project_ids_resolve_from_window_storage_without_migrating_it() {
     let data=fixture.cli(&["worktree","list","--project",&id.to_string()]);
     assert_eq!(data["worktrees"].as_array().unwrap().len(),1);
 }
+#[test]
+fn linear_context_is_committed_with_the_created_worktree() {
+    let fixture=Fixture::new();
+    let data=fixture.cli(&["worktree","create","linked","--linear","ENG-123","--no-setup"]);
+    let path=Path::new(data["worktree"]["path"].as_str().unwrap());
+    assert_eq!(cagents::linear::context::resolve_at(path).unwrap().issue_id,"ENG-123");
+}
+
+#[test]
+fn optional_agent_uses_new_worktree_and_waits_for_setup() {
+    let fixture=Fixture::new();let project=fixture.root.path().join("project");
+    fs::create_dir(project.join(".cagents")).unwrap();
+    fs::write(project.join(".cagents/worktree.toml"),"setup = \"sleep 0.05; printf ready > setup-ready\"\n").unwrap();
+    let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
+    cagents::worktree_setup::trust(&project,&plan,&cagents::repository::CancellationToken::new()).unwrap();
+    fs::create_dir(fixture.root.path().join("home/.claude")).unwrap();
+    let provider=fixture.root.path().join("bin/claude");
+    fs::write(&provider,format!("#!/bin/sh\nset -eu\n[ -f setup-ready ] || exit 18\nprintf '%s' \"$PWD\" > \"$HOME/../spawn-directory\"\n{}",include_str!("fixtures/automation-claude.sh"))).unwrap();
+    fs::set_permissions(provider,fs::Permissions::from_mode(0o700)).unwrap();
+    let data=fixture.cli(&["worktree","create","with-agent","--spawn-agent","claude","--model","haiku","--prompt","Reply ready"]);
+    let path=Path::new(data["worktree"]["path"].as_str().unwrap());
+    assert!(path.join("setup-ready").is_file());
+    assert_eq!(data["agent"]["agent"]["spec"]["target"]["directory"],path.to_str().unwrap());
+    let deadline=Instant::now()+Duration::from_secs(10);
+    let marker=fixture.root.path().join("spawn-directory");
+    while !marker.exists() {assert!(Instant::now()<deadline,"provider fixture did not start: {data}");thread::sleep(Duration::from_millis(20));}
+    assert_eq!(fs::read_to_string(marker).unwrap(),path.to_str().unwrap());
+    fixture.cli(&["agent","close",data["agent"]["agent"]["id"].as_str().unwrap()]);
+    fixture.cli(&["worktree","remove","with-agent","--force"]);
+    assert!(!path.exists());
+}

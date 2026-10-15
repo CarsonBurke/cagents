@@ -321,28 +321,34 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
 }
 
 fn start_worktree_setup(
-    host:&SharedHost,
-    repository:&std::path::Path,
-    path:&std::path::Path,
-    command:&str,
-)->Result<crate::model::TerminalSession,ProtocolError> {
-    use crate::{model::{CardId,CardKind,LaunchRecipe,TerminalContinuity,TerminalId,TerminalSession},workspace_model::{ModelEdit,views::{Scope,Pane,Change}}};
+    host: &SharedHost,
+    repository: &std::path::Path,
+    path: &std::path::Path,
+    command: &str,
+) -> Result<crate::model::TerminalSession, ProtocolError> {
+    use crate::{
+        model::{CardId,CardKind,LaunchRecipe,TerminalContinuity,TerminalId,TerminalSession},
+        workspace_model::{ModelEdit,views::{Scope,Pane,Change}},
+    };
     let recipe=LaunchRecipe {
         program:"/bin/sh".into(),arguments:vec!["-c".into(),command.into()],working_directory:path.to_path_buf(),
         environment:std::collections::BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),uuid::Uuid::new_v4().to_string())]),unset_environment:Default::default(),
     };
     let session=TerminalSession {id:TerminalId::new(),owned_codex_listener:None,recovery_origin:None,predecessor:None,launch:recipe.clone(),transcript_path:None,resume_hint:None,continuity:TerminalContinuity::RelaunchAvailable {recipe,last_exit:None}};
-    // An internal, immediately detached owner cannot interleave terminal frames
-    // with the CLI's unrelated device-operation response.
-    let terminal=spawn_terminal(host,0,session,crate::terminal::TerminalSpawnOptions::default())?;
-    let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
-    state.detach(0,terminal.session.id)?;
-    state.edit_model(0,ModelEdit::ReopenProject {repository:repository.to_path_buf(),name:crate::workspace_model::repository_display_name(repository),kind:crate::model::ProjectKind::Git})?;
-    let scope=Scope::Worktree {repository:repository.to_path_buf(),path:path.to_path_buf()};
-    let revision=state.read_model()?.views.iter().find(|view|view.scope==scope).map_or(0,|view|view.revision);
-    state.edit_model(0,ModelEdit::ChangeView {scope,expected_revision:revision,operation:uuid::Uuid::new_v4(),change:Change::Insert {
-        pane:Pane {id:CardId::new(),title:"Worktree setup".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,kind:CardKind::Terminal(terminal.session.clone()),scope:Some(path.to_path_buf())},before:None,
-    }})?;
+    let pane=CardId::new();
+    {
+        let mut state=host.lock().unwrap_or_else(|poison|poison.into_inner());
+        state.edit_model(0,ModelEdit::ReopenProject {repository:repository.to_path_buf(),name:crate::workspace_model::repository_display_name(repository),kind:crate::model::ProjectKind::Git})?;
+        let scope=Scope::Worktree {repository:repository.to_path_buf(),path:path.to_path_buf()};
+        let revision=state.read_model()?.views.iter().find(|view|view.scope==scope).map_or(0,|view|view.revision);
+        state.edit_model(0,ModelEdit::ChangeView {scope,expected_revision:revision,operation:uuid::Uuid::new_v4(),change:Change::Insert {
+            pane:Pane {id:pane,title:"Worktree setup".into(),user_title:None,pending_terminal_start:true,width_fraction:1.0,kind:CardKind::Terminal(session.clone()),scope:Some(path.to_path_buf())},before:None,
+        }})?;
+    }
+    // Publish ownership before starting the child, so completed-unattached
+    // retirement cannot race a short setup command's durable pane membership.
+    let terminal=super::state::spawn_pending_terminal(host,0,pane,session.id,crate::terminal::TerminalSpawnOptions::default())?;
+    host.lock().unwrap_or_else(|poison|poison.into_inner()).detach(0,terminal.session.id)?;
     Ok(terminal.session)
 }
 
@@ -425,7 +431,7 @@ pub(super) fn process_request(
                 operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
             | ClientRequest::DeviceOperation {
-                operation: crate::device_service::Operation::Worktree { operation: crate::worktree_control::Operation::Remove { .. } }
+                operation: crate::device_service::Operation::Worktree { operation: crate::worktree_control::Operation::Remove { .. } | crate::worktree_control::Operation::DeleteBranch { .. } }
             }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
