@@ -1511,6 +1511,7 @@ pub(super) struct Runtime {
     turns: Vec<turn::Turn>,
     selected_subagent: Option<String>,
     observed_scroll: scroll::Observations,
+    scroll_memory: scroll::Memory,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -2103,6 +2104,7 @@ impl Runtime {
             turns: Vec::new(),
             selected_subagent: None,
             observed_scroll: Default::default(),
+            scroll_memory: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -2161,6 +2163,7 @@ impl Runtime {
         self.deferred_page = None;
         self.scroll = view::Scroll::default();
         self.observed_scroll.borrow_mut().clear();
+        self.scroll_memory.clear();
         self.asked_after.clear();
         self.asked.clear();
         self.find_disclosure = find::Disclosure::default();
