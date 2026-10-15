@@ -862,6 +862,7 @@ impl SnapshotCache {
             .paths
             .iter()
             .chain(&files.ignored)
+            .chain(&files.directories)
             .chain(&files.ignored_directories)
         {
             for ancestor in path.as_path().ancestors() {

@@ -11131,6 +11131,7 @@ impl Cagents {
         let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
         let invalidated = self.refresh_ui.source_invalidated.clone();
         let model_key = key.clone();
+        let reveal_demand = self.sidebar_state.files_reveal_demand().cloned();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
@@ -11151,6 +11152,7 @@ impl Cagents {
                     cache.invalidate(false);
                     return Err("source-control read cancelled".to_owned());
                 }
+                let mut reveal_error = None;
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
@@ -11168,9 +11170,13 @@ impl Cagents {
                         &cancellation,
                     )
                     .inspect_err(|_| cache.invalidate(false))?;
+                    if let Some(path) = reveal_demand.as_ref() {
+                        reveal_error = crate::repository::include_revealed_path(&worktree, &mut snapshot.files, path).err();
+                    }
                     cache.observe_browse(&worktree, &snapshot.files);
                 }
-                let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
+                let mut model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
+                if let Some(error) = reveal_error { model.set_error(Some(format!("Could not reveal the requested path: {error}"))); }
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
                     return Err("source-control read cancelled".to_owned());
@@ -14744,6 +14750,7 @@ impl Application for Cagents {
                     SidebarAction::RevealChangeInFiles { key, path } => {
                         self.sidebar_state.reveal_in_files(path);
                         self.context_tab = ContextTab::Files;
+                        self.refresh_ui.source_invalidated.fetch_or(1, std::sync::atomic::Ordering::AcqRel);
                         let open = self.set_context_inspector_open(true);
                         Task::batch([open, self.reload_source_control(&key)])
                     }
