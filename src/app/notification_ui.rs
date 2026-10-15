@@ -1297,10 +1297,7 @@ mod tests {
             CardKind::Automations
         ));
     }
-    use crate::{
-        agent::Provider,
-        model::{ChannelId, ProjectChannel},
-    };
+    use crate::model::{ChannelId, ProjectChannel};
 
     #[test]
     fn review_notification_keeps_current_panes_and_acknowledges_only_that_review() {
@@ -1427,7 +1424,7 @@ mod tests {
         app.context_inspector_open = false;
         app.settings.notifications.while_focused = true;
         app.refresh_ui.focused = true;
-        drop(app.update(Message::ExpireNotices(Instant::now())));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
         let session = card_session(&app.durable.cards[0]).unwrap();
         let id = uuid::Uuid::new_v4();
         let snapshot = Snapshot {
@@ -1718,7 +1715,7 @@ mod tests {
         let window = window::Id::unique();
         app.core.set_main_window_id(Some(window));
         app.refresh_ui.focused = true;
-        drop(app.update(Message::ExpireNotices(Instant::now())));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
         assert_eq!(
             app.notification_ui.focused_session_for_test(),
             Some(session.id)
@@ -1773,7 +1770,7 @@ mod tests {
         app.core.set_main_window_id(Some(window));
         app.refresh_ui.focused = true;
         app.settings.notifications.while_focused = true;
-        drop(app.update(Message::ExpireNotices(Instant::now())));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
         assert_eq!(
             app.notification_ui.focused_session_for_test(),
             Some(terminal.id)

@@ -435,6 +435,11 @@ pub struct SidebarChannel {
 }
 
 impl SidebarChannel {
+    #[cfg(test)]
+    pub(crate) fn tooltip_for_test(&self) -> &str {
+        &self.tooltip
+    }
+
     pub fn with_notification_preview(mut self, preview: Option<String>) -> Self {
         if let Some(preview) = &preview {
             self.tooltip = format!("{}\n{preview}", self.tooltip).into_boxed_str();

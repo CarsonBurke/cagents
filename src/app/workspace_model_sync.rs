@@ -2188,8 +2188,12 @@ mod tests {
         else {
             panic!("terminal fixture");
         };
-        source.continuity = Default::default();
-        agent.console.as_mut().unwrap().continuity = Default::default();
+        source.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new(""),
+            boot_id: crate::model::BootId::new(""),
+            host_incarnation: crate::model::HostIncarnation::new(""),
+        };
+        agent.console.as_mut().unwrap().continuity = source.continuity.clone();
         app.workspace_model.agents = vec![agent.clone()];
         let original = app.durable.clone();
         let count = app.cards.len();
