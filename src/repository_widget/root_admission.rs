@@ -24,7 +24,21 @@ pub struct RootFileAdmission {
     root: Option<crate::editor::FileRootIdentity>,
 }
 
+impl RootFileAdmission {
+    /// All-state window ingress inspects typed error authority BEFORE routing
+    /// to a Runtime or rejecting this receipt's UUID/selection. Never project
+    /// a later recovery-capable FileIoError to its diagnostic string first.
+    pub fn error(&self) -> Option<&FileIoError> {
+        self.result.as_ref().err()
+    }
+}
+
 impl RootFilePreparation {
+    /// Same early typed-error custody seam as the final admission receipt.
+    pub fn error(&self) -> Option<&FileIoError> {
+        self.result.as_ref().err()
+    }
+
     fn refuse(self) {
         if let Some(prepared) = self.prepared {
             prepared.ticket().request_retirement();
