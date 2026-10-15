@@ -1939,8 +1939,9 @@ fn prepare_upgrade_with_carry_policy(
                 crate::chat::NativeContinuity::Durable { .. }
             ) {
                 source.launch.session_id = record.handle.confirmed_session_id();
-                crate::chat::protocol::align_resume_identity(&mut source.launch)
-                    .map_err(upgrade_error)?;
+                // This is an issued descriptor, including after a provider
+                // changed its thread. Only the separate effective launch below
+                // may normalize resume argv for that confirmed identity.
             }
             let mut launch = source.launch.clone();
             launch.session_id = record.handle.confirmed_session_id();
