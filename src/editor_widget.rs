@@ -60,7 +60,8 @@ mod snapshot;
 pub use snapshot::TextSnapshot;
 #[path = "editor_widget/match_index.rs"]
 mod match_index;
-pub(crate) use match_index::{MatchBuilder, MatchIndex};
+pub(crate) use match_index::MatchBuilder;
+pub use match_index::{MatchIndex, Matches};
 
 #[cfg(test)]
 thread_local! { static TEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }

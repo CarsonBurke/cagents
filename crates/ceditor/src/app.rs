@@ -7477,7 +7477,7 @@ mod tests {
             &RepositoryAction::FindLoaded {
                 card,
                 ticket: card.as_uuid(),
-                result: Ok(Some(Vec::new())),
+                result: Ok(Some(Default::default())),
             }
         ));
         assert!(!repository_action_allowed_while_modal(

@@ -1,5 +1,6 @@
 //! Shared bounded search rules for editor, diff and project search surfaces.
-use crate::repository_widget::text_editor::{self, MatchBuilder, MatchIndex, Position};
+use crate::repository_widget::text_editor::{self, MatchBuilder};
+pub use crate::repository_widget::text_editor::{MatchIndex, Matches, Position};
 pub use crate::settings::EditorFindOptions as FindOptions;
 
 const REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;

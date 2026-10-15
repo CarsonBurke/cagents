@@ -25,8 +25,12 @@ struct Data {
     checkpoints: Vec<Checkpoint>,
 }
 
+/// Complete, ordered, line-local UTF-8 match ranges backed by immutable storage.
+///
+/// Cloning and scoped views share their storage. Spans collected with
+/// `FromIterator` must be ordered and non-overlapping within each source line.
 #[derive(Clone, Default)]
-pub(crate) struct MatchIndex {
+pub struct MatchIndex {
     data: Arc<Data>,
     first: usize,
     len: usize,
@@ -153,13 +157,13 @@ impl MatchBuilder {
 }
 
 impl MatchIndex {
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         *self = Self::default();
     }
 
@@ -186,13 +190,13 @@ impl MatchIndex {
         iter
     }
 
-    pub(crate) fn get(&self, ordinal: usize) -> Option<Span> {
+    pub fn get(&self, ordinal: usize) -> Option<Span> {
         (ordinal < self.len)
             .then(|| self.iter_at(self.first + ordinal).next())
             .flatten()
     }
 
-    pub(crate) fn iter(&self) -> Matches<'_> {
+    pub fn iter(&self) -> Matches<'_> {
         if self.is_empty() {
             return Matches {
                 data: &self.data,
@@ -208,7 +212,7 @@ impl MatchIndex {
     }
 
     /// The predicate must be true for a prefix, as with slice::partition_point.
-    pub(crate) fn partition_point(&self, mut before: impl FnMut(Span) -> bool) -> usize {
+    pub fn partition_point(&self, mut before: impl FnMut(Span) -> bool) -> usize {
         let (mut first, mut last) = (0, self.len);
         while first < last {
             let middle = first + (last - first) / 2;
@@ -229,7 +233,7 @@ impl MatchIndex {
         }
     }
 
-    pub(crate) fn scoped(&self, scope: Option<Span>) -> Self {
+    pub fn scoped(&self, scope: Option<Span>) -> Self {
         let Some((start, end)) = scope else {
             return self.clone();
         };
@@ -241,7 +245,7 @@ impl MatchIndex {
 
     /// Only matches overlapping glyph bytes in this actual visible layout run.
     /// This avoids scanning every match on a long horizontally scrolled line.
-    pub(crate) fn visible(
+    pub fn visible(
         &self,
         line: usize,
         first_byte: usize,
@@ -274,7 +278,8 @@ impl MatchIndex {
     }
 }
 
-pub(crate) struct Matches<'a> {
+/// A lazy, exact-size iterator over UTF-8 source match ranges.
+pub struct Matches<'a> {
     data: &'a Data,
     offset: usize,
     previous: Position,
