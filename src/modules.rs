@@ -83,6 +83,7 @@ pub mod persistence;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod process;
 pub mod project_location;
+pub mod project_recovery;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
 #[cfg(feature = "ui")]
