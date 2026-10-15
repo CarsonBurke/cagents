@@ -52,20 +52,30 @@ impl Cagents {
                     }
                     Ok(Reply::InterruptedClosed(result)) => {
                         for failure in &result.failed {
-                            self.notices.record(TransientNotice::warning(format!("Could not close interrupted agent {}: {}", failure.id, failure.message)));
+                            self.notices.record(TransientNotice::warning(format!(
+                                "Could not close interrupted agent {}: {}",
+                                failure.id, failure.message
+                            )));
                         }
                         if let Some(report) = &mut self.agent_capacity.report {
                             for capacity in [&mut report.caller, &mut report.global] {
-                                capacity.holders.retain(|holder| !result.closed.contains(&holder.id));
+                                capacity
+                                    .holders
+                                    .retain(|holder| !result.closed.contains(&holder.id));
                                 capacity.running = capacity.holders.len();
                             }
                         }
                         if let Some(next) = result.next {
-                            if self.agent_capacity.cleanup_cursor.is_some_and(|previous| next <= previous) {
+                            if self
+                                .agent_capacity
+                                .cleanup_cursor
+                                .is_some_and(|previous| next <= previous)
+                            {
                                 self.notices.record(TransientNotice::warning("Interrupted cleanup did not advance; remaining agents were left open"));
                             } else {
                                 self.agent_capacity.cleanup_cursor = Some(next);
-                                return self.update_agent_capacity(CapacityAction::ContinueClosing(next));
+                                return self
+                                    .update_agent_capacity(CapacityAction::ContinueClosing(next));
                             }
                         }
                         return self.update_agent_capacity(CapacityAction::Refresh);
@@ -92,9 +102,15 @@ impl Cagents {
             CapacityAction::Refresh => Operation::Capacity,
             CapacityAction::CloseInterrupted => {
                 self.agent_capacity.cleanup_cursor = None;
-                Operation::CloseInterrupted { all: true, after: None }
+                Operation::CloseInterrupted {
+                    all: true,
+                    after: None,
+                }
             }
-            CapacityAction::ContinueClosing(after) => Operation::CloseInterrupted { all: true, after: Some(after) },
+            CapacityAction::ContinueClosing(after) => Operation::CloseInterrupted {
+                all: true,
+                after: Some(after),
+            },
         };
         self.agent_capacity.closing = matches!(operation, Operation::CloseInterrupted { .. });
         self.agent_capacity.pending = true;

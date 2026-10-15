@@ -1460,7 +1460,10 @@ fn accept_firing(
         Err(error) => {
             tx.execute_batch("ROLLBACK TO automation_accept; RELEASE automation_accept")
                 .map_err(|error| error.to_string())?;
-            firing.state = if matches!(&error, crate::agent_execution::AcceptanceError::LimitReached(_)) {
+            firing.state = if matches!(
+                &error,
+                crate::agent_execution::AcceptanceError::LimitReached(_)
+            ) {
                 firing.skip = Some(crate::automations::SkipReason::Capacity);
                 FiringState::Skipped
             } else {
@@ -2024,31 +2027,81 @@ mod tests {
     fn configured_agent_capacity_skips_automation_without_partial_acceptance() {
         use crate::agent_execution::{ConcurrencyLimits, Destination, Origin, Submit};
         let (mut registry, _directory, definition) = fixture();
-        let mut automation = registry.create_automation(definition.clone(), 100, test_identity()).unwrap();
-        let limits = ConcurrencyLimits { caller: 1, global: 1 };
-        let occupied = registry.submit_agent_with_limits(&Origin::User, &Submit {
-            name: None,
-            destination: Destination::New(definition.agent.clone()),
-            prompt: "Occupy one global slot".into(),
-            idempotency_key: "occupied-capacity".into(),
-        }, None, limits, 101).unwrap();
+        let mut automation = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let limits = ConcurrencyLimits {
+            caller: 1,
+            global: 1,
+        };
+        let occupied = registry
+            .submit_agent_with_limits(
+                &Origin::User,
+                &Submit {
+                    name: None,
+                    destination: Destination::New(definition.agent.clone()),
+                    prompt: "Occupy one global slot".into(),
+                    idempotency_key: "occupied-capacity".into(),
+                },
+                None,
+                limits,
+                101,
+            )
+            .unwrap();
         let mut firing = Firing {
-            id: Uuid::new_v4(), automation: automation.id,
-            name: definition.name.clone(), revision: automation.execution_revision,
-            trigger: crate::automations::Trigger::Manual { request: Uuid::new_v4() },
-            state: FiringState::Prechecking, release_pending: false, cancel_requested: false,
-            created_ms: 102, started_ms: None, finished_ms: None,
-            agent: None, run: None, skip: None, diagnostic: None,
+            id: Uuid::new_v4(),
+            automation: automation.id,
+            name: definition.name.clone(),
+            revision: automation.execution_revision,
+            trigger: crate::automations::Trigger::Manual {
+                request: Uuid::new_v4(),
+            },
+            state: FiringState::Prechecking,
+            release_pending: false,
+            cancel_requested: false,
+            created_ms: 102,
+            started_ms: None,
+            finished_ms: None,
+            agent: None,
+            run: None,
+            skip: None,
+            diagnostic: None,
         };
         automation.active_firing = Some(firing.id);
-        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
-        assert!(accept_firing(&tx, &mut automation, &mut firing, &definition, "limited-firing", limits, 103).unwrap().is_none());
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                "limited-firing",
+                limits,
+                103
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(firing.state, FiringState::Skipped);
         assert_eq!(firing.skip, Some(crate::automations::SkipReason::Capacity));
-        assert!(firing.diagnostic.as_ref().unwrap().contains(&occupied.agent.id.to_string()));
+        assert!(
+            firing
+                .diagnostic
+                .as_ref()
+                .unwrap()
+                .contains(&occupied.agent.id.to_string())
+        );
         assert!(automation.active_firing.is_none());
         assert!(firing.agent.is_none() && firing.run.is_none());
-        assert_eq!(tx.query_row("SELECT count(*) FROM agent_runs", [], |row| row.get::<_, usize>(0)).unwrap(), 1);
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM agent_runs", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
         tx.commit().unwrap();
     }
 

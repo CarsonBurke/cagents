@@ -94,7 +94,11 @@ impl std::fmt::Display for LimitReached {
             write!(f, "\n  {} {:?}", holder.id, holder.state)?;
         }
         if self.capacity.holders.len() > 12 {
-            write!(f, "\n  {} additional holders; --json includes the complete list", self.capacity.holders.len() - 12)?;
+            write!(
+                f,
+                "\n  {} additional holders; --json includes the complete list",
+                self.capacity.holders.len() - 12
+            )?;
         }
         f.write_str("\nWait for running work or close interrupted agents with `cagents agent close --interrupted`.")
     }

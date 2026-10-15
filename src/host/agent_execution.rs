@@ -884,7 +884,9 @@ fn close_interrupted(
             report.caller.holders
         }
     };
-    candidates.retain(|holder| holder.state == State::Interrupted && after.is_none_or(|previous| holder.id > previous));
+    candidates.retain(|holder| {
+        holder.state == State::Interrupted && after.is_none_or(|previous| holder.id > previous)
+    });
     candidates.sort_unstable_by_key(|holder| holder.id);
     let has_more = candidates.len() > crate::agent_execution::INTERRUPTED_CLEANUP_BATCH;
     candidates.truncate(crate::agent_execution::INTERRUPTED_CLEANUP_BATCH);

@@ -1502,15 +1502,22 @@ mod tests {
     #[test]
     fn configured_caller_budget_above_legacy_open_child_guard_is_reachable() {
         let (mut registry, _directory, mut request) = fixture();
-        let limits = ConcurrencyLimits { caller: 65, global: 80 };
+        let limits = ConcurrencyLimits {
+            caller: 65,
+            global: 80,
+        };
         for index in 0..65 {
             request.idempotency_key = format!("large-caller-{index}");
-            registry.submit_agent_with_limits(&Origin::User, &request, None, limits, index).unwrap();
+            registry
+                .submit_agent_with_limits(&Origin::User, &request, None, limits, index)
+                .unwrap();
         }
         let report = registry.agent_capacity(&Origin::User, limits).unwrap();
         assert_eq!(report.caller.running, 65);
         request.idempotency_key = "large-caller-rejected".into();
-        assert!(matches!(registry.submit_agent_with_limits(&Origin::User, &request, None, limits, 66), Err(AcceptanceError::LimitReached(details)) if details.capacity.scope == CapacityScope::Caller && details.capacity.limit == 65));
+        assert!(
+            matches!(registry.submit_agent_with_limits(&Origin::User, &request, None, limits, 66), Err(AcceptanceError::LimitReached(details)) if details.capacity.scope == CapacityScope::Caller && details.capacity.limit == 65)
+        );
     }
 
     #[test]

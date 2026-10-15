@@ -3607,13 +3607,32 @@ mod tests {
     }
     #[test]
     fn large_capacity_errors_keep_all_machine_holders_with_bounded_human_output() {
-        use crate::agent_execution::{Capacity, CapacityHolder, CapacityScope, LimitReached, State};
-        let holders: Vec<_> = (0..4096).map(|_| CapacityHolder { id: crate::model::AgentId::new(), run: crate::model::RunId::new(), state: State::Waiting }).collect();
+        use crate::agent_execution::{
+            Capacity, CapacityHolder, CapacityScope, LimitReached, State,
+        };
+        let holders: Vec<_> = (0..4096)
+            .map(|_| CapacityHolder {
+                id: crate::model::AgentId::new(),
+                run: crate::model::RunId::new(),
+                state: State::Waiting,
+            })
+            .collect();
         let last = holders.last().unwrap().id;
         let wire = terminal::ipc::ProtocolError::agent_limit_reached(LimitReached {
-            capacity: Capacity { running: holders.len(), limit: holders.len(), scope: CapacityScope::Global, holders }, retryable: true,
+            capacity: Capacity {
+                running: holders.len(),
+                limit: holders.len(),
+                scope: CapacityScope::Global,
+                holders,
+            },
+            retryable: true,
         });
-        let error = protocol_error(ControlError::Remote { code: wire.code, message: wire.message, retryable: wire.retryable, details: wire.details });
+        let error = protocol_error(ControlError::Remote {
+            code: wire.code,
+            message: wire.message,
+            retryable: wire.retryable,
+            details: wire.details,
+        });
         let details = error.details.unwrap();
         assert_eq!(details["holders"].as_array().unwrap().len(), 4096);
         assert_eq!(details["holders"][4095]["id"], last.to_string());

@@ -377,14 +377,23 @@ impl ControlClient {
             authority,
             operation,
         };
-        let interrupted_cleanup = matches!(&request, ClientRequest::Agent { operation: Operation::CloseInterrupted { .. }, .. });
+        let interrupted_cleanup = matches!(
+            &request,
+            ClientRequest::Agent {
+                operation: Operation::CloseInterrupted { .. },
+                ..
+            }
+        );
         let response = if interrupted_cleanup {
             let budget = RETAINED_CHAT_CLOSE_TIMEOUT
                 .saturating_add(CHAT_CLOSE_TIMEOUT)
                 .saturating_add(Duration::from_secs(35))
                 .saturating_mul(crate::agent_execution::INTERRUPTED_CLEANUP_BATCH as u32);
             let maximum = Instant::now() + budget;
-            self.request_with_deadline(request, deadline.map_or(maximum, |requested| requested.min(maximum)))?
+            self.request_with_deadline(
+                request,
+                deadline.map_or(maximum, |requested| requested.min(maximum)),
+            )?
         } else if closing {
             self.request_with_deadline(
                 request,
@@ -682,26 +691,56 @@ impl Session {
                     details.insert("failed".into(), json!(failed));
                     details.insert("attempts_complete".into(), json!(false));
                     error.details = Some(Value::Object(details));
-                    error.message = format!("Closed {} interrupted agents; remaining cleanup was not confirmed: {}", closed.len(), error.message);
+                    error.message = format!(
+                        "Closed {} interrupted agents; remaining cleanup was not confirmed: {}",
+                        closed.len(),
+                        error.message
+                    );
                     return Err(error);
                 }
             };
             let Reply::InterruptedClosed(result) = reply else {
-                return Err(AppError { kind: "agent.close", message: "Unexpected interrupted close response".into(), details: Some(json!({"closed":closed,"failed":failed,"attempts_complete":false})) });
+                return Err(AppError {
+                    kind: "agent.close",
+                    message: "Unexpected interrupted close response".into(),
+                    details: Some(
+                        json!({"closed":closed,"failed":failed,"attempts_complete":false}),
+                    ),
+                });
             };
             closed.extend(result.closed);
             failed.extend(result.failed);
-            let Some(next) = result.next else { break; };
+            let Some(next) = result.next else {
+                break;
+            };
             if after.is_some_and(|previous| next <= previous) {
-                return Err(AppError { kind: "protocol", message: "Interrupted cleanup did not advance its cursor".into(), details: Some(json!({"closed":closed,"failed":failed,"attempts_complete":false})) });
+                return Err(AppError {
+                    kind: "protocol",
+                    message: "Interrupted cleanup did not advance its cursor".into(),
+                    details: Some(
+                        json!({"closed":closed,"failed":failed,"attempts_complete":false}),
+                    ),
+                });
             }
             after = Some(next);
         }
         let mut human = format!("Closed {} interrupted agents", closed.len());
-        for failure in &failed { human.push_str(&format!("\n{}: {}", failure.id, failure.message)); }
+        for failure in &failed {
+            human.push_str(&format!("\n{}: {}", failure.id, failure.message));
+        }
         let data = json!({"closed":closed,"failed":failed,"attempts_complete":true});
-        if !failed.is_empty() { return Err(AppError { kind: "agent.close", message: human, details: Some(data) }); }
-        Ok(CommandOutput { command: "agent.close", human, data })
+        if !failed.is_empty() {
+            return Err(AppError {
+                kind: "agent.close",
+                message: human,
+                details: Some(data),
+            });
+        }
+        Ok(CommandOutput {
+            command: "agent.close",
+            human,
+            data,
+        })
     }
 
     /// Waits for `runs`; an agent's wait also ends when a message arrives
@@ -1420,16 +1459,59 @@ mod tests {
             let closed = AgentId::new();
             let server = thread::spawn(move || {
                 answer(&mut server_stream, |_| true, connected());
-                answer(&mut server_stream, |request| matches!(request, ClientRequest::Agent { operation: Operation::CloseInterrupted { all: false, after: None }, .. }),
-                    ServerResponse::Agent(Reply::InterruptedClosed(crate::agent_execution::CloseInterrupted { closed: vec![closed], failed: vec![], next: Some(closed) })));
+                answer(
+                    &mut server_stream,
+                    |request| {
+                        matches!(
+                            request,
+                            ClientRequest::Agent {
+                                operation: Operation::CloseInterrupted {
+                                    all: false,
+                                    after: None
+                                },
+                                ..
+                            }
+                        )
+                    },
+                    ServerResponse::Agent(Reply::InterruptedClosed(
+                        crate::agent_execution::CloseInterrupted {
+                            closed: vec![closed],
+                            failed: vec![],
+                            next: Some(closed),
+                        },
+                    )),
+                );
                 let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(request.request, ClientRequest::Agent { operation: Operation::CloseInterrupted { all: false, after: Some(cursor) }, .. } if cursor == closed));
+                assert!(
+                    matches!(request.request, ClientRequest::Agent { operation: Operation::CloseInterrupted { all: false, after: Some(cursor) }, .. } if cursor == closed)
+                );
                 if !lose_final_reply {
-                    write_frame(&mut server_stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: proof(), message: ServerMessage::Response { response: ServerResponse::Agent(Reply::InterruptedClosed(crate::agent_execution::CloseInterrupted { closed: vec![], failed: vec![], next: None })) } }).unwrap();
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Agent(Reply::InterruptedClosed(
+                                    crate::agent_execution::CloseInterrupted {
+                                        closed: vec![],
+                                        failed: vec![],
+                                        next: None,
+                                    },
+                                )),
+                            },
+                        },
+                    )
+                    .unwrap();
                 }
             });
             let client = ControlClient::from_stream(client_stream).unwrap();
-            let mut session = Session { authority: Authority::default(), connection: Some((client, PathBuf::from("/fixture"))), summaries: None };
+            let mut session = Session {
+                authority: Authority::default(),
+                connection: Some((client, PathBuf::from("/fixture"))),
+                summaries: None,
+            };
             let result = session.close_interrupted(false);
             if lose_final_reply {
                 let error = result.err().unwrap();
