@@ -40,7 +40,8 @@ pub struct State {
     cleanup_dialog: Option<CleanupPolicyDialog>,
     pending_delete: VecDeque<Target>,
     next_safety_request: u64,
-    deletion_authorizations: HashMap<WorktreeId, WorktreeSafetySnapshot>,
+    deletion_authorizations: HashMap<WorktreeId, Arc<WorktreeSafetySnapshot>>,
+    deletion_stop_authorizations: HashMap<WorktreeId, StopAuthorization>,
     deletion_busy_agents: HashMap<WorktreeId, AgentCensus>,
     branch_deletions: HashMap<WorktreeId, BranchDeletion>,
     released_delete_protections: HashSet<WorktreeId>,
@@ -195,7 +196,8 @@ struct Dialog {
     /// Why the last confirmed deletion of this worktree failed, when the
     /// dialog is opened again from its row. Confirming retries it.
     failure: Option<String>,
-    safety: Option<WorktreeSafetySnapshot>,
+    safety: Option<Arc<WorktreeSafetySnapshot>>,
+    stop_authorization: Option<StopAuthorization>,
     expected_head: Option<DeletionHead>,
     loading: bool,
     request: u64,
@@ -314,7 +316,7 @@ pub enum Action {
     SafetyRead {
         request: u64,
         confirming: bool,
-        result: Result<(WorktreeSafetySnapshot, AgentCensus), String>,
+        result: Result<SafetyInspection, String>,
     },
     OpenCleanupPolicy(ProjectId),
     CleanupPolicyRead {
@@ -746,6 +748,7 @@ impl Cagents {
             blocker,
             failure,
             safety: None,
+            stop_authorization: None,
             expected_head: None,
             loading,
             request,
@@ -763,7 +766,7 @@ impl Cagents {
                 delete_options_task(target.clone(), request, session.operation_store())
             });
         let read = if loading {
-            safety_read_task(target, request, false)
+            safety_read_task(target, request, false, None)
         } else {
             Task::none()
         };
@@ -1946,7 +1949,7 @@ impl Cagents {
                         {
                             row.locked = false;
                         }
-                        return safety_read_task(target, request, true);
+                        return safety_read_task(target, request, true, dialog.stop_authorization.clone());
                     }
                     Err(error) => {
                         dialog.loading = false;
@@ -1963,6 +1966,7 @@ impl Cagents {
                     || dialog.loading
                     || dialog.options_loading
                     || dialog.safety.is_none()
+                    || dialog.stop_authorization.is_none()
                     || !dialog.sessions_consented()
                 {
                     return Task::none();
@@ -1996,7 +2000,7 @@ impl Cagents {
                         Message::ProjectUi(Action::StaleUnlocked { request, result })
                     });
                 }
-                return safety_read_task(target, dialog.request, true);
+                return safety_read_task(target, dialog.request, true, dialog.stop_authorization.clone());
             }
             Action::SafetyRead {
                 request,
@@ -2010,7 +2014,8 @@ impl Cagents {
                     .as_ref()
                     .filter(|dialog| dialog.request == request)
                     .and_then(|dialog| {
-                        result.as_ref().ok().map(|(snapshot, _)| {
+                        result.as_ref().ok().map(|inspection| {
+                            let snapshot = &inspection.snapshot;
                             self.delete_branch_default(&dialog.target, snapshot)
                                 || dialog.expected_head.as_ref().is_some_and(|expected|
                                     expected.merged_receipt_matches(snapshot))
@@ -2033,11 +2038,24 @@ impl Cagents {
                 match result {
                     Err(error) => {
                         dialog.safety = None;
+                        dialog.stop_authorization = None;
                         dialog.failure = Some(format!(
                             "Could not verify worktree safety: {error}. Cancel and try again."
                         ));
                     }
-                    Ok((snapshot, agents)) => {
+                    Ok(inspection) => {
+                        let SafetyInspection { snapshot, agents, authorization } = inspection;
+                        if !confirming {
+                            dialog.stop_authorization = authorization;
+                            if !dialog.stop_authorization.as_ref().is_some_and(|authority|
+                                authority.matches(&dialog.target, &snapshot))
+                            {
+                                dialog.safety = None;
+                                dialog.blocker = Some("The original worktree inspection is unavailable. Cancel and review this worktree again.".into());
+                                return Task::none();
+                            }
+                        }
+
                         if !expected_source_matches || dialog.expected_head.as_ref().is_some_and(|expected|
                             snapshot.branch.as_deref() != Some(expected.branch.as_str())
                                 || snapshot.head_oid.as_deref() != Some(expected.head_oid.as_str())
@@ -2045,6 +2063,7 @@ impl Cagents {
                                     !source.same_repository(&expected.head_repository)))
                         {
                             dialog.safety = None;
+                            dialog.stop_authorization = None;
                             dialog.busy_confirmed = None;
                             dialog.blocker = Some("The merged pull request's exact branch, source or head changed. Cancel and refresh before offering cleanup.".into());
                             return Task::none();
@@ -2060,6 +2079,16 @@ impl Cagents {
                             return Task::none();
                         }
                         let unchanged = dialog.safety.as_ref() == Some(&snapshot);
+                        if confirming && (!unchanged || !dialog.stop_authorization.as_ref().is_some_and(|authority|
+                            authority.matches(&dialog.target, &snapshot)))
+                        {
+                            dialog.safety = Some(snapshot);
+                            dialog.stop_authorization = None;
+                            dialog.busy_confirmed = None;
+                            dialog.blocker = Some("The worktree changed after its original inspection. Cancel and reopen deletion to review it again.".into());
+                            return Task::none();
+                        }
+
                         if !dialog.branch_choice_edited && !dialog.branch_elsewhere {
                             dialog.delete_branch = default_branch;
                         }
@@ -2081,6 +2110,7 @@ impl Cagents {
                                 agents: dialog.busy_agents.clone(),
                                 census: dialog.session_census.clone(),
                             };
+                            let original_authority = dialog.stop_authorization.clone().expect("original inspection checked");
                             if let Some(blocker) = self.worktree_deletion_blocker(&target) {
                                 self.project_ui.dialog.as_mut().unwrap().blocker = Some(blocker);
                                 return Task::none();
@@ -2103,6 +2133,8 @@ impl Cagents {
                                 self.project_ui
                                     .deletion_busy_agents
                                     .insert(id, consented_agents);
+                                self.project_ui.deletion_stop_authorizations.insert(
+                                    id, original_authority);
                                 self.project_ui.deletion_authorizations.insert(id, snapshot);
                             }
                             self.project_ui.dialog = None;
@@ -2255,6 +2287,7 @@ impl Cagents {
                         if let Some(id) = target.worktree {
                             self.project_ui.branch_deletions.remove(&id);
                             self.project_ui.deletion_authorizations.remove(&id);
+                            self.project_ui.deletion_stop_authorizations.remove(&id);
                             self.project_ui.deletion_busy_agents.remove(&id);
                         }
                         // A blocker names what to resolve, so it outranks Git's
@@ -2283,6 +2316,7 @@ impl Cagents {
                             .and_then(|id| self.project_ui.deletion_authorizations.remove(&id));
                         if let Some(id) = target.worktree {
                             self.project_ui.deletions.remove(&id);
+                            self.project_ui.deletion_stop_authorizations.remove(&id);
                             self.project_ui.deletion_busy_agents.remove(&id);
                         }
                         // The daemon has already closed every terminal and chat in
@@ -2467,6 +2501,8 @@ impl Cagents {
             .worktree
             .and_then(|id| self.project_ui.deletion_authorizations.get(&id))
             .cloned();
+        let stop_authorization = target.worktree
+            .and_then(|id| self.project_ui.deletion_stop_authorizations.get(&id)).cloned();
         let consented_agents = target
             .worktree
             .and_then(|id| self.project_ui.deletion_busy_agents.get(&id))
@@ -2482,25 +2518,10 @@ impl Cagents {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let confirmed = authorization.ok_or("Deletion safety must be checked and confirmed again.")?;
-                let crate::worktree_control::Reply::Listed { worktrees } = worktree_control_request(crate::worktree_control::Operation::List { repository: request.repository.clone() })? else { return Err("Unexpected worktree listing response".into()); };
-                let record = worktrees.iter().find(|record| record.path == request.path).ok_or("Worktree changed before closing sessions")?;
-                if record.locked || record.primary { return Err("Worktree is locked or is the primary checkout".into()); }
-                let crate::worktree_control::Reply::Inspected { snapshot, .. } = worktree_control_request(crate::worktree_control::Operation::Inspect { repository: request.repository.clone(), path: request.path.clone() })? else { return Err("Unexpected worktree safety response".into()); };
-                let current: WorktreeSafetySnapshot = serde_json::from_str(&snapshot).map_err(|error| error.to_string())?;
-                if current != confirmed { return Err("The worktree changed after confirmation; review its current files and commits".into()); }
                 let observed = consented_agents.ok_or("Session stop consent must be checked again")?;
-                let consent = worktree_session_stop_consent(&observed)?;
-                // This is explicit consent to stop these exact actor lifetimes
-                // and ALL their ongoing work. The host fences new admission
-                // and refuses replacements/new actors before stopping them.
-                // The stronger conditional-close API remains live-refusing.
-                let reply = worktree_control_request(crate::worktree_control::Operation::StopSessions {
-                    repository: request.repository.clone(), path: request.path.clone(), consent,
-                })?;
-                match reply {
-                    crate::worktree_control::Reply::SessionsStopped { path } if path == request.path => Ok(()),
-                    _ => Err("Unexpected worktree session stop response".into()),
-                }
+                let authority = stop_authorization.ok_or("The original worktree inspection is unavailable. Cancel and review it again.")?;
+                stop_confirmed_worktree_sessions(&request, &confirmed, &observed, &authority)
+
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::ProjectUi(Action::DeletionSessionsClosed {
                 target,
@@ -2990,6 +3011,7 @@ impl Cagents {
             && !dialog.loading
             && !dialog.options_loading
             && dialog.safety.is_some()
+            && dialog.stop_authorization.is_some()
             && dialog.sessions_consented())
         .then_some(Message::ProjectUi(Action::ConfirmDelete(request)));
         let label = match dialog.safety.as_ref() {
@@ -3761,6 +3783,7 @@ fn inspected_worktree(
     let crate::device_service::Reply::Worktree(crate::worktree_control::Reply::Inspected {
         snapshot,
         disposable_ignored_directories,
+        ..
     }) = reply
     else {
         return Err("The selected device returned an unexpected worktree inspection reply.".into());
@@ -3769,6 +3792,141 @@ fn inspected_worktree(
         format!("The selected device returned invalid worktree safety data: {error}")
     })?;
     Ok((safety, disposable_ignored_directories))
+}
+
+/// The stream is part of the authority: a new connection cannot inherit this
+/// receipt. Network work and locking happen only in blocking workers.
+struct StopConnection {
+    client: std::sync::Mutex<crate::control::ControlClient>,
+    device: Option<(String, String, String)>,
+    #[cfg(test)]
+    fixture_peer: Option<std::os::unix::net::UnixStream>,
+}
+
+#[derive(Clone)]
+struct StopAuthorization {
+    connection: Arc<StopConnection>,
+    token: uuid::Uuid,
+    inspected: Arc<WorktreeSafetySnapshot>,
+    repository: PathBuf,
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for StopAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never lock a transport while rendering/logging UI state.
+        formatter.debug_struct("StopAuthorization").finish_non_exhaustive()
+    }
+}
+
+fn stop_device_key() -> Option<(String, String, String)> {
+    crate::device::selected().map(|device|
+        (device.name.clone(), device.host.clone(), device.executable.clone()))
+}
+
+fn request_on_stop_client(
+    client: &mut crate::control::ControlClient,
+    operation: crate::worktree_control::Operation,
+) -> Result<crate::worktree_control::Reply, String> {
+    match client.device_operation(crate::device_service::Operation::Worktree { operation })
+        .map_err(|error| error.to_string())?
+    {
+        crate::device_service::Reply::Worktree(reply) => Ok(reply),
+        _ => Err("Unexpected worktree control response".into()),
+    }
+}
+
+impl StopAuthorization {
+    fn matches(&self, target: &Target, snapshot: &WorktreeSafetySnapshot) -> bool {
+        self.repository == target.repository && self.path == target.path
+            && *self.inspected == *snapshot
+            && self.connection.device == stop_device_key()
+    }
+
+    fn request(&self, operation: crate::worktree_control::Operation)
+        -> Result<crate::worktree_control::Reply, String>
+    {
+        if self.connection.device != stop_device_key() {
+            return Err("The selected device changed. Cancel and review the worktree again.".into());
+        }
+        let mut client = self.connection.client.lock()
+            .map_err(|_| "The original inspection connection is unavailable. Cancel and review again.")?;
+        // No reconnect/retry: disconnect invalidates this connection's receipt.
+        request_on_stop_client(&mut client, operation)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SafetyInspection {
+    snapshot: Arc<WorktreeSafetySnapshot>,
+    agents: AgentCensus,
+    authorization: Option<StopAuthorization>,
+}
+
+impl SafetyInspection {
+    fn initial(mut client: crate::control::ControlClient, target: &Target) -> Result<Self, String> {
+        let reply = request_on_stop_client(&mut client,
+            crate::worktree_control::Operation::InspectForSessionStop {
+                repository: target.repository.clone(), path: target.path.clone(),
+            })?;
+        let token = match &reply {
+            crate::worktree_control::Reply::Inspected { stop_authority: Some(token), .. }
+                if !token.is_nil() => *token,
+            _ => return Err("The daemon did not retain an original worktree inspection. Cancel and review again.".into()),
+        };
+        let (snapshot, _) = inspected_worktree(crate::device_service::Reply::Worktree(reply))?;
+        let agents = checked_busy_worktree_agents(request_on_stop_client(&mut client,
+            crate::worktree_control::Operation::BusySessions {
+                repository: target.repository.clone(), path: target.path.clone(),
+            })?)?;
+        let snapshot = Arc::new(snapshot);
+        let authorization = StopAuthorization {
+            connection: Arc::new(StopConnection {
+                client: std::sync::Mutex::new(client), device: stop_device_key(),
+                #[cfg(test)]
+                fixture_peer: None,
+            }),
+            token, inspected: Arc::clone(&snapshot),
+            repository: target.repository.clone(), path: target.path.clone(),
+        };
+        Ok(Self { snapshot, agents, authorization: Some(authorization) })
+    }
+}
+
+fn stop_confirmed_worktree_sessions(
+    target: &Target,
+    confirmed: &WorktreeSafetySnapshot,
+    observed: &AgentCensus,
+    authority: &StopAuthorization,
+) -> Result<(), String> {
+    if !authority.matches(target, confirmed) {
+        return Err("The original worktree inspection changed. Cancel and review it again.".into());
+    }
+    let crate::worktree_control::Reply::Listed { worktrees } = authority.request(
+        crate::worktree_control::Operation::List { repository: target.repository.clone() })?
+    else { return Err("Unexpected worktree listing response".into()); };
+    let record = worktrees.iter().find(|record| record.path == target.path)
+        .ok_or("Worktree changed before closing sessions")?;
+    if record.locked || record.primary {
+        return Err("Worktree is locked or is the primary checkout".into());
+    }
+    let reply = authority.request(crate::worktree_control::Operation::Inspect {
+        repository: target.repository.clone(), path: target.path.clone(),
+    })?;
+    let (current, _) = inspected_worktree(crate::device_service::Reply::Worktree(reply))?;
+    if current != *confirmed {
+        return Err("The worktree changed after confirmation; cancel and review its current files and commits again".into());
+    }
+    let consent = worktree_session_stop_consent(observed)?;
+    // The host checks the ORIGINAL physical pins and fingerprint before first
+    // teardown, independently of this adjacent read and full session consent.
+    match authority.request(crate::worktree_control::Operation::StopSessions {
+        repository: target.repository.clone(), path: target.path.clone(), consent,
+        expected_fingerprint: authority.inspected.fingerprint.clone(), stop_authority: authority.token,
+    })? {
+        crate::worktree_control::Reply::SessionsStopped { path } if path == target.path => Ok(()),
+        _ => Err("Unexpected worktree session stop response".into()),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3850,21 +4008,31 @@ fn disposable_ignored_directories(
     }
 }
 
-fn safety_read_task(target: Target, request: u64, confirming: bool) -> Task<Message> {
+fn safety_read_task(
+    target: Target,
+    request: u64,
+    confirming: bool,
+    original: Option<StopAuthorization>,
+) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            let (safety, _) = inspect_worktree(&target.repository, &target.path)?;
-            let agents = busy_worktree_agents(&target.repository, &target.path)?;
-            Ok((safety, agents))
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result);
-        Message::ProjectUi(Action::SafetyRead {
-            request,
-            confirming,
-            result,
-        })
+            if confirming {
+                let authority = original.ok_or("The original worktree inspection is unavailable. Cancel and review it again.")?;
+                let reply = authority.request(crate::worktree_control::Operation::Inspect {
+                    repository: target.repository.clone(), path: target.path.clone(),
+                })?;
+                let (snapshot, _) = inspected_worktree(crate::device_service::Reply::Worktree(reply))?;
+                let agents = checked_busy_worktree_agents(authority.request(crate::worktree_control::Operation::BusySessions {
+                    repository: target.repository.clone(), path: target.path.clone(),
+                })?)?;
+                Ok(SafetyInspection { snapshot: Arc::new(snapshot), agents, authorization: None })
+            } else {
+                let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+                let client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+                SafetyInspection::initial(client, &target)
+            }
+        }).await.map_err(|error| error.to_string()).and_then(|result| result);
+        Message::ProjectUi(Action::SafetyRead { request, confirming, result })
     })
 }
 
@@ -3962,6 +4130,7 @@ mod tests {
             disposable_ignored_directories(crate::device_service::Reply::Worktree(
                 crate::worktree_control::Reply::Inspected {
                     snapshot: "{}".into(),
+                    stop_authority: None,
                     disposable_ignored_directories: vec![]
                 },
             ))
@@ -3983,6 +4152,7 @@ mod tests {
             inspected_worktree(crate::device_service::Reply::Worktree(
                 crate::worktree_control::Reply::Inspected {
                     snapshot: "{}".into(),
+                    stop_authority: None,
                     disposable_ignored_directories: vec![]
                 }
             ))
@@ -4009,6 +4179,7 @@ mod tests {
         let reply =
             crate::device_service::Reply::Worktree(crate::worktree_control::Reply::Inspected {
                 snapshot: serde_json::to_string(&safety).unwrap(),
+                stop_authority: None,
                 disposable_ignored_directories: directories.clone(),
             });
         let (decoded, policy) = inspected_worktree(reply).unwrap();
@@ -4018,6 +4189,135 @@ mod tests {
 
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    fn fixture_safety_result(
+        app: &Cagents,
+        result: Result<(WorktreeSafetySnapshot, AgentCensus), String>,
+        confirming: bool,
+    ) -> Result<SafetyInspection, String> {
+        let (snapshot, agents) = result?;
+        if confirming || app.project_ui.dialog.is_none() {
+            return Ok(SafetyInspection { snapshot: Arc::new(snapshot), agents, authorization: None });
+        }
+        let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
+        let (client_stream, mut server_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let response_snapshot = serde_json::to_string(&snapshot).unwrap();
+        let response_agents = agents.clone();
+        let token = uuid::Uuid::new_v4();
+        let peer = std::thread::spawn(move || {
+            use crate::terminal::ipc::{ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION, read_frame, write_frame};
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("stop-ui-fixture"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+            };
+            let hello: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(&mut server_stream, &ServerEnvelope {
+                version: PROTOCOL_VERSION, request_id: Some(hello.request_id), proof: proof.clone(),
+                message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: vec![] } },
+            }).unwrap();
+            for phase in 0..2 {
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Worktree { operation } } = request.request else {panic!("unexpected fixture request")};
+                let reply = if phase == 0 {
+                    assert!(matches!(operation, crate::worktree_control::Operation::InspectForSessionStop {..}));
+                    crate::worktree_control::Reply::Inspected { snapshot: response_snapshot.clone(), disposable_ignored_directories: vec![], stop_authority: Some(token) }
+                } else {
+                    assert!(matches!(operation, crate::worktree_control::Operation::BusySessions {..}));
+                    crate::worktree_control::Reply::BusySessions {agents: response_agents.agents.clone(), census: response_agents.census.clone()}
+                };
+                write_frame(&mut server_stream, &ServerEnvelope {
+                    version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: proof.clone(),
+                    message: ServerMessage::Response {response: ServerResponse::DeviceOperation {reply: crate::device_service::Reply::Worktree(reply)}},
+                }).unwrap();
+            }
+            server_stream
+        });
+        let client = crate::control::ControlClient::from_stream(client_stream).unwrap();
+        // This proves the real framed caller contract only. The separate host
+        // fixture must prove physical pins; a fixture UUID is not that proof.
+        let mut inspection = SafetyInspection::initial(client, &target).unwrap();
+        Arc::get_mut(&mut inspection.authorization.as_mut().unwrap().connection).unwrap()
+            .fixture_peer = Some(peer.join().unwrap());
+        Ok(inspection)
+    }
+
+    #[test]
+    fn stop_uses_the_original_inspection_connection_and_receipt_without_retrying_refusal() {
+        use crate::terminal::ipc::{ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse, ProtocolError, ProtocolErrorCode, PROTOCOL_VERSION, read_frame, write_frame};
+        for refuse in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            // Only the private paired fixture stream is used by this test.
+            let target = Target { project: ProjectId::new(), worktree: Some(WorktreeId::new()), repository: "/cagents-fixture-no-such-repository".into(), path: "/cagents-fixture-no-such-repository/linked".into(), label: "fixture".into() };
+            drop(app.open_worktree_delete_dialog(target.clone()));
+            let snapshot = clean_snapshot();
+            let observed = AgentCensus::default();
+            let mut inspection = fixture_safety_result(&app, Ok((snapshot.clone(), observed.clone())), false).unwrap();
+            let authority = inspection.authorization.as_mut().unwrap();
+            let connection = Arc::get_mut(&mut authority.connection).unwrap();
+            let mut peer = connection.fixture_peer.take().unwrap();
+            let proof = connection.client.get_mut().unwrap().proof().clone();
+            let token = authority.token;
+            let expected_fingerprint = snapshot.fingerprint.clone();
+            let expected_path = target.path.clone();
+            let server_snapshot = serde_json::to_string(&snapshot).unwrap();
+            let server = std::thread::spawn(move || {
+                for phase in 0..3 {
+                    let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                    let ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Worktree { operation } } = request.request else {panic!("caller reconnected or used a different protocol")};
+                    let reply = match phase {
+                        0 => {
+                            assert!(matches!(operation, crate::worktree_control::Operation::List {..}));
+                            crate::worktree_control::Reply::Listed {worktrees: vec![crate::worktree_control::Entry { path: expected_path.clone(), branch: Some("feature".into()), head_oid: None, primary: false, detached: false, locked: false, dirty: false, ahead: None, behind: None, live_sessions: vec![] }]}
+                        }
+                        1 => {
+                            assert!(matches!(operation, crate::worktree_control::Operation::Inspect {..}), "confirmation never renews physical authority");
+                            crate::worktree_control::Reply::Inspected {snapshot: server_snapshot.clone(), disposable_ignored_directories: vec![], stop_authority: None}
+                        }
+                        _ => {
+                            let crate::worktree_control::Operation::StopSessions {path, stop_authority, expected_fingerprint: original, consent, ..} = operation else {panic!("missing guarded Stop")};
+                            assert_eq!(path, expected_path); assert_eq!(stop_authority, token); assert_eq!(original, expected_fingerprint); assert!(consent.sessions.is_empty());
+                            if refuse {
+                                write_frame(&mut peer, &ServerEnvelope {version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: proof.clone(), message: ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::InvalidRequest, "Original inspection expired or was replaced; review again", false))}).unwrap();
+                                // The caller must not request another inspection,
+                                // stop, removal or transparent retry on refusal.
+                                let next: Option<ClientEnvelope> = read_frame(&mut peer).unwrap();
+                                assert!(next.is_none());
+                                return;
+                            }
+                            crate::worktree_control::Reply::SessionsStopped {path: expected_path.clone()}
+                        }
+                    };
+                    write_frame(&mut peer, &ServerEnvelope {version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: proof.clone(), message: ServerMessage::Response {response: ServerResponse::DeviceOperation {reply: crate::device_service::Reply::Worktree(reply)}}}).unwrap();
+                }
+            });
+            let result = stop_confirmed_worktree_sessions(&target, &snapshot, &observed, inspection.authorization.as_ref().unwrap());
+            assert_eq!(result.is_err(), refuse);
+            if refuse { assert!(result.unwrap_err().contains("Original inspection")); }
+            drop(inspection);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_or_disconnected_original_inspection_does_not_gain_stop_authority() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let target = Target { project: ProjectId::new(), worktree: Some(WorktreeId::new()), repository: "/cagents-fixture-no-such-repository".into(), path: "/cagents-fixture-no-such-repository/linked".into(), label: "fixture".into() };
+        drop(app.open_worktree_delete_dialog(target.clone()));
+        let snapshot = clean_snapshot();
+        let mut inspection = fixture_safety_result(&app, Ok((snapshot.clone(), AgentCensus::default())), false).unwrap();
+        // Real peer disconnect; the original client must fail without opening
+        // another connection or substituting a newly issued receipt.
+        Arc::get_mut(&mut inspection.authorization.as_mut().unwrap().connection).unwrap().fixture_peer.take();
+        assert!(stop_confirmed_worktree_sessions(&target, &snapshot, &AgentCensus::default(), inspection.authorization.as_ref().unwrap()).is_err());
+        let request = app.project_ui.dialog.as_ref().unwrap().request;
+        drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok(SafetyInspection {snapshot: Arc::new(snapshot), agents: AgentCensus::default(), authorization: None}) }));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert!(dialog.stop_authorization.is_none());
+        assert!(dialog.blocker.is_some());
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
+        assert!(!app.project_ui.is_deleting(target.worktree.unwrap()));
+    }
 
     fn clean_snapshot() -> WorktreeSafetySnapshot {
         WorktreeSafetySnapshot {
@@ -4056,13 +4356,13 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: false,
-            result: Ok((snapshot.clone(), agents.clone())),
+            result: fixture_safety_result(&app,  Ok((snapshot.clone(), agents.clone())), false),
         }));
         drop(app.handle_project_action(Action::ConfirmDelete(request)));
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
-            result: Ok((snapshot, agents)),
+            result: fixture_safety_result(&app,  Ok((snapshot, agents)), true),
         }));
     }
 
@@ -4280,7 +4580,8 @@ mod tests {
             if changed == 7 { snapshot.head_repository = None; }
             if changed == 8 { snapshot.head_repository = Some(GitHubRepoKey::new("github.com", None, "EXAMPLE", "REPO").unwrap()); }
             drop(app.handle_project_action(Action::SafetyRead {request, confirming: false,
-                result: Ok((snapshot, AgentCensus::default()))}));
+                result: fixture_safety_result(&app,  Ok((snapshot, AgentCensus::default())), false),
+        }));
             assert_eq!(app.project_ui.dialog.as_ref().unwrap().delete_branch, changed == 0 || changed == 8,
                 "only the actual merged receipt, current source/head and available branch allow the default");
         }
@@ -4371,14 +4672,14 @@ mod tests {
             drop(app.handle_project_action(Action::SafetyRead {
                 request,
                 confirming: true,
-                result: Ok((
+                result: fixture_safety_result(&app,  Ok((
                     clean_snapshot(),
                     AgentCensus {
                         agents: vec![changed.clone()],
                         census: vec![changed],
                     },
-                )),
-            }));
+                )), true),
+        }));
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(
                 app.project_ui
@@ -4427,13 +4728,13 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: false,
-            result: Ok((
+            result: fixture_safety_result(&app,  Ok((
                 clean_snapshot(),
                 AgentCensus {
                     agents: vec![],
                     census: vec![actor.clone()],
                 },
-            )),
+            )), false),
         }));
         drop(app.handle_project_action(Action::ConfirmDelete(request)));
         assert!(!app.project_ui.dialog.as_ref().unwrap().loading,
@@ -4447,13 +4748,13 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
-            result: Ok((
+            result: fixture_safety_result(&app,  Ok((
                 clean_snapshot(),
                 AgentCensus {
                     agents: vec![],
                     census: vec![actor],
                 },
-            )),
+            )), true),
         }));
         assert!(!app.project_ui.is_deleting(linked.id));
         assert!(
@@ -4488,7 +4789,8 @@ mod tests {
             })}));
             let mut snapshot = clean_snapshot(); snapshot.head_oid = Some(oid); snapshot.head_repository = Some(source);
             drop(app.handle_project_action(Action::SafetyRead {request, confirming: false,
-                result: Ok((snapshot.clone(), AgentCensus::default()))}));
+                result: fixture_safety_result(&app,  Ok((snapshot.clone(), AgentCensus::default())), false),
+        }));
             assert!(app.project_ui.dialog.as_ref().unwrap().safety.is_some());
             drop(app.handle_project_action(Action::ConfirmDelete(request)));
             match changed {
@@ -4500,7 +4802,8 @@ mod tests {
                 _ => snapshot.head_repository = None,
             }
             drop(app.handle_project_action(Action::SafetyRead {request, confirming: true,
-                result: Ok((snapshot, AgentCensus::default()))}));
+                result: fixture_safety_result(&app,  Ok((snapshot, AgentCensus::default())), true),
+        }));
             let dialog = app.project_ui.dialog.as_ref().unwrap();
             assert!(dialog.safety.is_none());
             assert!(dialog.blocker.as_deref().is_some_and(|message| message.contains("head changed")));
@@ -4594,8 +4897,8 @@ mod tests {
             drop(app.handle_project_action(Action::SafetyRead {
                 request,
                 confirming: false,
-                result: Ok((clean_snapshot(), AgentCensus::default())),
-            }));
+                result: fixture_safety_result(&app,  Ok((clean_snapshot(), AgentCensus::default())), false),
+        }));
             app.update_prepared = update;
             app.settings_reset_confirm = !update;
             drop(app.handle_project_action(Action::DeleteBranchChanged(request, true)));
@@ -4613,8 +4916,8 @@ mod tests {
             drop(app.handle_project_action(Action::SafetyRead {
                 request,
                 confirming: true,
-                result: Ok((clean_snapshot(), AgentCensus::default())),
-            }));
+                result: fixture_safety_result(&app,  Ok((clean_snapshot(), AgentCensus::default())), true),
+        }));
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(app.project_ui.dialog.is_some());
         }
@@ -4639,7 +4942,8 @@ mod tests {
         let current = app.project_ui.dialog.as_ref().unwrap().request;
         assert_ne!(stale, current);
         drop(app.handle_project_action(Action::DeleteOptionsRead { request: current, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
-        drop(app.handle_project_action(Action::SafetyRead { request: current, confirming: false, result: Ok((clean_snapshot(), AgentCensus::default())) }));
+        drop(app.handle_project_action(Action::SafetyRead { request: current, confirming: false, result: fixture_safety_result(&app,  Ok((clean_snapshot(), AgentCensus::default())), false),
+        }));
         drop(app.handle_project_action(Action::DeleteBranchChanged(stale, true)));
         assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
         let confirm = app.handle_project_action(Action::ConfirmDelete(stale));
@@ -4701,7 +5005,7 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: false,
-            result: Ok((clean_snapshot(), AgentCensus::default())),
+            result: fixture_safety_result(&app,  Ok((clean_snapshot(), AgentCensus::default())), false),
         }));
         let force = BranchDeletion {
             id: crate::model::OperationId::new(),
@@ -4719,7 +5023,7 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
-            result: Ok((clean_snapshot(), AgentCensus::default())),
+            result: fixture_safety_result(&app,  Ok((clean_snapshot(), AgentCensus::default())), true),
         }));
         assert!(!app.project_ui.is_deleting(linked.id));
         assert!(app.project_ui.dialog.is_some());
@@ -6013,7 +6317,7 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: false,
-            result: Ok((observed.clone(), AgentCensus::default())),
+            result: fixture_safety_result(&app,  Ok((observed.clone(), AgentCensus::default())), false),
         }));
         assert_eq!(
             app.project_ui.focus_target(),
@@ -6027,18 +6331,28 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
-            result: Ok((current.clone(), AgentCensus::default())),
+            result: fixture_safety_result(&app,  Ok((current.clone(), AgentCensus::default())), true),
         }));
         assert!(!app.project_ui.is_deleting(linked.id));
         let dialog = app.project_ui.dialog.as_ref().unwrap();
         assert_eq!(dialog.safety.as_ref().unwrap().untracked, 4);
-        assert!(dialog.failure.as_deref().unwrap().contains("changed"));
+        assert!(dialog.blocker.as_deref().unwrap().contains("changed"));
+        assert!(dialog.stop_authorization.is_none());
         drop(app.handle_project_action(Action::ConfirmDelete(request)));
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
-            result: Ok((current, AgentCensus::default())),
+            result: fixture_safety_result(&app, Ok((current.clone(), AgentCensus::default())), true),
         }));
+        assert!(!app.project_ui.is_deleting(linked.id), "changed inspection cannot be rebound within the same dialog");
+        drop(app.handle_project_action(Action::Dismiss));
+        drop(app.handle_project_action(Action::Command { project_id: project, worktree_id: Some(linked.id), command: ProjectCommand::Delete }));
+        let reopened = app.project_ui.dialog.as_ref().unwrap().request;
+        assert_ne!(reopened, request);
+        drop(app.handle_project_action(Action::DeleteOptionsRead {request: reopened, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None })}));
+        drop(app.handle_project_action(Action::SafetyRead {request: reopened, confirming: false, result: fixture_safety_result(&app, Ok((current.clone(), AgentCensus::default())), false)}));
+        drop(app.handle_project_action(Action::ConfirmDelete(reopened)));
+        drop(app.handle_project_action(Action::SafetyRead {request: reopened, confirming: true, result: fixture_safety_result(&app, Ok((current, AgentCensus::default())), true)}));
         assert!(app.project_ui.is_deleting(linked.id));
         assert!(app.project_ui.dialog.is_none());
     }
@@ -6069,7 +6383,7 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request: old_request,
             confirming: true,
-            result: Ok((clean_snapshot(), AgentCensus::default())),
+            result: fixture_safety_result(&app,  Ok((clean_snapshot(), AgentCensus::default())), true),
         }));
         assert!(app.project_ui.dialog.as_ref().unwrap().safety.is_none());
         assert!(app.project_ui.dialog.as_ref().unwrap().loading);
