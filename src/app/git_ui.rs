@@ -2,7 +2,7 @@
 //! replace local rows, and filesystem events never schedule a GitHub process.
 use super::*;
 use crate::{git_watch, model::WorktreeId, repository::HeadState};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn local_workers() -> usize {
     std::thread::available_parallelism().map_or(2, |count| count.get().clamp(2, 8))
@@ -160,9 +160,10 @@ fn defer_mutating_worktrees(
 ) -> git_watch::Change {
     let paths = change
         .worktrees
-        .intersection(blocked)
+        .iter()
+        .filter(|worktree| blocked.contains(worktree))
         .copied()
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     if !blocked.is_empty()
         && (change.topology || (!paths.is_empty() && paths.len() == change.worktrees.len()))
     {
@@ -176,6 +177,7 @@ fn defer_mutating_worktrees(
         worktrees: paths,
         metadata: change.metadata,
         membership: change.membership,
+        untracked: change.untracked,
         ..git_watch::Change::default()
     }
 }
@@ -1677,15 +1679,16 @@ mod tests {
         let active = WorktreeId(Uuid::from_u128(501));
         let sibling = WorktreeId(Uuid::from_u128(502));
         let mut change = git_watch::Change {
-            worktrees: HashSet::from([active, sibling]),
+            worktrees: BTreeSet::from([active, sibling]),
             metadata: true,
             membership: true,
+            untracked: true,
             ..Default::default()
         };
         let deferred = defer_mutating_worktrees(&mut change, &HashSet::from([active]));
-        assert_eq!(change.worktrees, HashSet::from([sibling]));
-        assert_eq!(deferred.worktrees, HashSet::from([active]));
-        assert!(deferred.metadata && deferred.membership);
+        assert_eq!(change.worktrees, BTreeSet::from([sibling]));
+        assert_eq!(deferred.worktrees, BTreeSet::from([active]));
+        assert!(deferred.metadata && deferred.membership && deferred.untracked);
         let mut pending = deferred;
         let again = defer_mutating_worktrees(&mut pending, &HashSet::from([active]));
         assert!(pending.worktrees.is_empty() && !pending.membership);
@@ -1695,7 +1698,7 @@ mod tests {
                 .worktrees
                 .is_empty()
         );
-        assert_eq!(pending.worktrees, HashSet::from([active]));
+        assert_eq!(pending.worktrees, BTreeSet::from([active]));
         let mut topology = git_watch::Change {
             topology: true,
             ..Default::default()
