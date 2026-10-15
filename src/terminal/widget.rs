@@ -2465,6 +2465,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         {
             shell.request_redraw_at(due);
         }
+        // refresh also runs while publishing the native tree through &self.
+        // Consume its retained exit, rather than sampling review only after it
+        // has already been cleared by that earlier publication.
+        if state.a11y.borrow_mut().take_review_exit() {
+            self.review_active = false;
+            self.publish_review(false, shell);
+            shell.request_redraw();
+        }
         if let Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)) = event {
             if state.review_control_pressed {
                 state.review_control_pressed = false;
