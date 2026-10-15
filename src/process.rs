@@ -972,6 +972,7 @@ mod tests {
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), format!("{}:{}", metadata.dev(), metadata.ino()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn inherited_file_keeps_parent_cloexec_and_distinct_descriptor_identity() {
         let temporary = tempfile::tempdir().unwrap();
