@@ -308,6 +308,8 @@ mod tests {
         let checkout = root.path().join("checkout with spaces");
         let metadata = root.path().join("metadata elsewhere");
         let output = Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["init", "--separate-git-dir"])
             .arg(&metadata)
             .arg(&checkout)
@@ -332,6 +334,8 @@ mod tests {
         let metadata = root.path().join("metadata");
         assert!(
             Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args(["init", "--separate-git-dir"])
                 .arg(&metadata)
                 .arg(&checkout)
@@ -342,6 +346,8 @@ mod tests {
         );
         assert!(
             Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .arg("-C")
                 .arg(&checkout)
                 .args([
@@ -374,6 +380,8 @@ mod tests {
         let linked = root.path().join("linked");
         assert!(
             Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .arg("-C")
                 .arg(&checkout)
                 .args(["worktree", "add", "-b", "linked"])
