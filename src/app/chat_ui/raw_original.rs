@@ -134,14 +134,22 @@ fn prefixes(text:&str)->Arc<Vec<[u8;32]>> {
     Arc::new(values)
 }
 struct Loaded {record:ResidentRaw,view:tool_text::ToolText,prefixes:Arc<Vec<[u8;32]>>}
-struct Entry {part:RawSourcePart,revision:u64,opened:bool,rehydrating:bool,attempt:Option<u64>,input:Option<Arc<ReadInput>>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
+struct Entry {part:RawSourcePart,revision:u64,opened:bool,rehydrating:bool,attempt:Option<u64>,input:Option<Arc<ReadInput>>,copies:Mutex<Vec<std::sync::Weak<CopyInput>>>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
 struct Disclosure {epoch:SourceEpoch,rehydrating:bool}
 impl Entry {
-    fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,rehydrating:false,attempt:None,input:None,loaded:None,restored:None,error:None}}
+    fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,rehydrating:false,attempt:None,input:None,copies:Mutex::new(Vec::new()),loaded:None,restored:None,error:None}}
     fn cancel_request(&mut self)->bool {
         let pending=self.attempt.take().is_some();if let Some(input)=self.input.take() {input.cancel();}pending
     }
     fn arm(&mut self,attempt:u64) {self.cancel_request();self.attempt=Some(attempt);self.input=Some(ReadInput::new(self.restored.clone()));}
+    fn register_copy(&self,input:&Arc<CopyInput>) {
+        let mut copies=self.copies.lock().unwrap_or_else(|error|error.into_inner());
+        copies.retain(|old|old.upgrade().is_some_and(|input|!input.0.is_cancelled()));copies.push(Arc::downgrade(input));
+    }
+    fn cancel_copies(&self)->bool {
+        let copies=std::mem::take(&mut *self.copies.lock().unwrap_or_else(|error|error.into_inner()));let mut changed=false;
+        for input in copies.into_iter().filter_map(|input|input.upgrade()) {input.0.cancel();changed=true;}changed
+    }
 }
 #[derive(Default)]
 pub(super) struct State {intents:disclosure_intent::Cache<Key,Disclosure>,entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,incarnation:Option<uuid::Uuid>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
@@ -156,7 +164,7 @@ impl State {
     pub(super) fn evict(&mut self) {
         let mut changed=false;
         for entry in self.entries.values_mut() {
-            let mut entry_changed=entry.cancel_request();
+            let mut entry_changed=entry.cancel_request() | entry.cancel_copies();
             if let Some(loaded)=entry.loaded.take() {entry.rehydrating=entry.opened;entry.error=None;retire_loaded(loaded);entry_changed=true;}
             if let Some(text)=entry.restored.take() {entry.rehydrating=entry.opened;retire(text);entry_changed=true;}
             if entry_changed {entry.revision=next_revision();}changed |=entry_changed;
@@ -226,7 +234,7 @@ impl State {
         entry.opened=!entry.opened;entry.error=None;
         if entry.opened {
             match eligible(&entry.part) {Ok(())=>{self.next=self.next.wrapping_add(1);entry.arm(self.next);},Err(error)=>entry.error=Some(error)}
-        } else {entry.rehydrating=false;entry.cancel_request();if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
+        } else {entry.rehydrating=false;entry.cancel_request();entry.cancel_copies();if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
         entry.revision=next_revision();self.revision=self.revision.wrapping_add(1);
     }
     pub(super) fn revision(&self)->u64 {self.revision}
@@ -410,7 +418,7 @@ fn retire_loaded(loaded:Loaded) {
     let text=loaded.view.text.clone();drop(loaded.view);retire((text,loaded.record,loaded.prefixes));
 }
 fn retire_entry(mut entry:Entry) {
-    entry.cancel_request();
+    entry.cancel_request();entry.cancel_copies();
     if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}
     if let Some(text)=entry.restored.take() {retire(text);}
 }
@@ -428,34 +436,37 @@ fn retire(value:impl Send+'static) {
 struct CopyOutput {text:String,_reader:tokio::sync::OwnedSemaphorePermit,_capacity:chat::source_owners::ReaderCapacity}
 #[derive(Clone)]
 pub(super) struct CopyReply(Arc<CopySlot>);
-struct CopySlot {value:Mutex<Option<Result<CopyOutput,String>>>,intent:clipboard_intent::Intent}
+struct CopySlot {value:Mutex<Option<Result<CopyOutput,String>>>,intent:clipboard_intent::Intent,input:Arc<CopyInput>}
 impl Drop for CopySlot {fn drop(&mut self) {if let Some(value)=self.value.get_mut().unwrap_or_else(|error|error.into_inner()).take() {retire(value);}}}
-struct CopyInput(Mutex<Option<Arc<str>>>);
-impl CopyInput {fn take(&self)->Option<Arc<str>> {self.0.lock().unwrap_or_else(|error|error.into_inner()).take()}}
-impl clipboard_intent::Pending for CopyInput {fn withdraw(&self) {if let Some(text)=self.take() {retire(text);}}}
-impl Drop for CopyInput {fn drop(&mut self) {if let Some(text)=self.0.get_mut().unwrap_or_else(|error|error.into_inner()).take() {retire(text);}}}
+struct CopyInput(Arc<ReadInput>);
+impl CopyInput {fn take(&self)->Option<Arc<str>> {self.0.take()}}
+impl clipboard_intent::Pending for CopyInput {fn withdraw(&self) {self.0.cancel();}}
 pub(super) fn copy(runtime:&Runtime,item:&str,field:RawSourceField,intent:clipboard_intent::Intent)->Task<Message> {
     if !intent.current() {return Task::none();}
     let Some(key)=runtime.raw_original.key(item,field) else {return Task::none();};
-    let Some(loaded)=runtime.raw_original.entries.get(&key).and_then(|entry|entry.loaded.as_ref()) else {return Task::none();};
-    let proof=loaded.record.clone();let input=Arc::new(CopyInput(Mutex::new(Some(loaded.view.text.clone()))));intent.register(&input);
+    let Some(entry)=runtime.raw_original.entries.get(&key) else {return Task::none();};
+    let Some(loaded)=entry.loaded.as_ref() else {return Task::none();};
+    let proof=loaded.record.clone();let input=Arc::new(CopyInput(ReadInput::new(Some(loaded.view.text.clone()))));intent.register(&input);entry.register_copy(&input);
     let target=runtime.target;let context=runtime.raw_original.context;
     Task::perform(async move {
-        let current=intent.clone();
+        let current=intent.clone();let cancelled=input.clone();
         let value=tokio::time::timeout(Duration::from_secs(40),async move {
-            let reader=chat::source_owners::readers().clone().acquire_owned().await.map_err(|_|"Original copy stopped.".to_owned())?;
+            let reader=interruptible(Some(input.0.as_ref()),chat::source_owners::readers().clone().acquire_owned()).await?
+                .map_err(|_|"Original copy stopped.".to_owned())?;
             tokio::task::spawn_blocking(move || {
                 let text=input.take().ok_or_else(||"A newer copy replaced this request.".to_owned())?;
-                if !current.current() {return Err("A newer copy replaced this request.".to_owned());}
+                #[cfg(test)] input.0.before_preparation();
+                if !current.current() || input.0.is_cancelled() {return Err("Original copy was cancelled.".to_owned());}
                 let capacity=chat::source_owners::ReaderCapacity::default();let text=text.to_string();capacity.set(text.capacity());
+                if !current.current() || input.0.is_cancelled() {return Err("Original copy was cancelled.".to_owned());}
                 Ok(CopyOutput {text,_reader:reader,_capacity:capacity})
             }).await.map_err(|_|"Original copy stopped.".to_owned())?
         }).await.unwrap_or_else(|_|Err("The original call could not be copied in time.".into()));
-        (proof,CopyReply(Arc::new(CopySlot {value:Mutex::new(Some(value)),intent})))
+        (proof,CopyReply(Arc::new(CopySlot {value:Mutex::new(Some(value)),intent,input:cancelled})))
     },move |(proof,reply)|cosmic::Action::App(action(Action::RawOriginalCopied(target,context,proof,reply))))
 }
 pub(super) fn copied(runtime:&mut Runtime,context:u64,proof:ResidentRaw,reply:CopyReply)->Task<Message> {
-    if !reply.0.intent.current() {return Task::none();}
+    if !reply.0.intent.current() || reply.0.input.0.is_cancelled() {return Task::none();}
     sync(runtime);let key=Key {source:proof.source.clone(),field:proof.field};
     if runtime.raw_original.context!=context || !runtime.visible.load(Ordering::Relaxed)
         || runtime.raw_original.entries.get(&key).is_none_or(|entry|!entry.opened || entry.loaded.as_ref().is_none_or(|loaded|loaded.record!=proof)) {return Task::none();}
@@ -533,6 +544,28 @@ mod tests {
         let(event,())=tokio::join!(tokio::time::timeout(Duration::from_secs(5),events.next()),control);
         accept_read_event(&mut runtime,event.unwrap().unwrap());flush();assert!(weak.upgrade().is_none());
         assert_eq!(runtime.raw_original.retained_bytes(),0);assert!(runtime.raw_original.entries.values().all(|entry|entry.error.is_none()));
+    }
+    #[tokio::test]
+    async fn actual_queued_copy_withdraws_body_on_hide_before_reader_permits_return() {
+        use iced::futures::{FutureExt,StreamExt};
+        let text="complete original copy queued behind readers".repeat(4096);let(mut runtime,part)=runtime_fixture(&text);
+        toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),&text).await);flush();
+        let weak=Arc::downgrade(&runtime.raw_original.loaded_leaves(&part.item_id)[0].text);
+        let held=tokio::time::timeout(Duration::from_secs(5),chat::source_owners::readers().clone().acquire_many_owned(2)).await.unwrap().unwrap();
+        let intent=clipboard_intent::Intents::default().next();let task=copy(&runtime,&part.item_id,part.field,intent.clone());
+        let mut events=iced::runtime::task::into_stream(task).unwrap();assert!(events.next().now_or_never().is_none());
+        let input=runtime.raw_original.entries[&Key::of(&part)].copies.lock().unwrap()[0].upgrade().unwrap();
+        assert_eq!(input.0.offline.lock().unwrap().as_ref().unwrap().as_ref(),text);assert!(intent.current());
+        runtime.visible.store(false,Ordering::Relaxed);runtime.raw_original.evict();flush();
+        assert!(input.0.is_cancelled());assert!(intent.current(),"source disposal is separate from newer clipboard intent");
+        assert!(weak.upgrade().is_none(),"queued copy cannot retain the body after model/slot withdrawal");
+        assert_eq!(chat::source_owners::readers().available_permits(),0);
+        let completed=tokio::time::timeout(Duration::from_secs(5),events.next()).await.unwrap().unwrap();
+        let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(Action::RawOriginalCopied(target,context,proof,ready))))=completed else {panic!("actual copied completion")};
+        assert!(ready.0.input.0.is_cancelled());let result=copied(&mut runtime,context,proof,ready);
+        assert_eq!(target,runtime.target);assert!(iced::runtime::task::into_stream(result).is_none());assert!(runtime.copied.is_none());
+        assert!(runtime.raw_original.entries.values().all(|entry|entry.error.is_none()));drop(held);
     }
     #[test]
     fn contradictory_raw_aliases_deny_the_exact_field_regardless_of_publication_order() {
@@ -694,7 +727,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::RawOriginalReady(target,part.source.clone(),part.field,context,attempt,ready)));
         let runtime=app.chat_runtime_mut(target).unwrap();assert!(runtime.raw_original.context!=context);assert_eq!(runtime.raw_original.retained_bytes(),0);
         let semaphore=Arc::new(tokio::sync::Semaphore::new(1));let permit=semaphore.clone().try_acquire_owned().unwrap();
-        let copy=CopyReply(Arc::new(CopySlot {value:Mutex::new(Some(Ok(CopyOutput {text:text.into(),_reader:permit,_capacity:Default::default()}))),intent:clipboard_intent::Intents::default().next()}));
+        let copy=CopyReply(Arc::new(CopySlot {value:Mutex::new(Some(Ok(CopyOutput {text:text.into(),_reader:permit,_capacity:Default::default()}))),intent:clipboard_intent::Intents::default().next(),input:Arc::new(CopyInput(ReadInput::new(None)))}));
         drop(app.handle_chat_ui(Action::RawOriginalCopied(target,context,record(&part),copy)));
         assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());flush();assert_eq!(semaphore.available_permits(),1);
         let runtime=app.chat_runtime_mut(target).unwrap();let prose=runtime.snapshot.source_revision;
