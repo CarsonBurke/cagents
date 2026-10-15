@@ -4,7 +4,7 @@
 //! a ticket before preparing a root; the actual authenticated client charges
 //! native ownership in its existing RecoveryContext. Custody is installed
 //! before any enrollment RPC, and sealed retirement custody before any release.
-use crate::{fs_safety::Root, process::CancellationToken, recovery_domain::{EditedRootLease, EditedRootRetirement}};
+use crate::{fs_safety::Root, process::CancellationToken, recovery_domain::{EditedRootLease, EditedRootRetirement, RecoveryPlacementCustody, RecoveryRetirement}};
 use std::{collections::HashMap, fmt, io, sync::{Arc, Mutex, MutexGuard}, time::Instant};
 use uuid::Uuid;
 
@@ -39,7 +39,10 @@ pub struct AdmissionTicket { id: AdmissionId, state: Arc<Mutex<State>> }
 /// Actual window-owned custody. Never clear it to implement pane/project close.
 /// Request retirement and keep the window/process alive until is_settled().
 #[derive(Debug, Default)]
-pub struct EditedRootAdmissions { entries: HashMap<AdmissionId, AdmissionTicket> }
+pub struct EditedRootAdmissions {
+    entries: HashMap<AdmissionId, AdmissionTicket>,
+    placements: HashMap<AdmissionId, PlacementTicket>,
+}
 /// App/Ceditor retain this original window owner. Each Runtime gets the SAME
 /// Arc so internal file loads can reserve before constructing their first task.
 pub type SharedEditedRootAdmissions = Arc<Mutex<EditedRootAdmissions>>;
@@ -85,7 +88,7 @@ impl EditedRootAdmissions {
     /// independently reserves its measured shared native context before RPC.
     pub fn reserve(&mut self) -> Result<AdmissionTicket, &'static str> {
         self.collect_settled();
-        if self.entries.len() >= MAX_ADMISSIONS {
+        if self.len() >= MAX_ADMISSIONS {
             return Err("Root admission custody is full. Retire an earlier root before opening another.");
         }
         let ticket = AdmissionTicket { id: AdmissionId(Uuid::new_v4()), state: Arc::new(Mutex::new(State {
@@ -94,6 +97,23 @@ impl EditedRootAdmissions {
         })) };
         self.entries.insert(ticket.id, ticket.clone());
         Ok(ticket)
+    }
+
+    /// A placement shares this SAME bounded pool. Its descriptor-free actual
+    /// client custody slot is retained BEFORE constructing the intake worker.
+    pub fn reserve_placement(&mut self) -> Result<PlacementTicket, &'static str> {
+        self.collect_settled();
+        if self.len() >= MAX_ADMISSIONS { return Err("Recovery admission custody is full. Settle an earlier original owner first."); }
+        let ticket = PlacementTicket { id: AdmissionId(Uuid::new_v4()), custody: RecoveryPlacementCustody::new(), state: Arc::new(Mutex::new(PlacementState {
+            phase: AdmissionPhase::Reserved, worker: false, retiring: false, armed: false, notice: None,
+        })) };
+        self.placements.insert(ticket.id, ticket.clone());
+        Ok(ticket)
+    }
+
+    pub fn placement_tickets(&self) -> impl Iterator<Item = &PlacementTicket> { self.placements.values() }
+    pub fn next_placement_retirement(&self) -> Option<PlacementRetirementWork> {
+        self.placements.values().find_map(PlacementTicket::begin_retirement)
     }
 
     /// Pure original-Arc lookup for already enrolled Sources. Ordinary file
@@ -141,15 +161,18 @@ impl EditedRootAdmissions {
 
     pub fn request_all_retirements(&self) {
         for ticket in self.entries.values() { ticket.request_retirement(); }
+        for ticket in self.placements.values() { ticket.request_retirement(); }
     }
     pub fn is_settled(&self) -> bool {
         self.entries.values().all(|ticket| ticket.phase() == AdmissionPhase::Settled)
+            && self.placements.values().all(|ticket| ticket.phase() == AdmissionPhase::Settled)
     }
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize { self.entries.len() + self.placements.len() }
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() && self.placements.is_empty() }
     pub fn tickets(&self) -> impl Iterator<Item = &AdmissionTicket> { self.entries.values() }
     pub fn collect_settled(&mut self) {
         self.entries.retain(|_, ticket| ticket.phase() != AdmissionPhase::Settled);
+        self.placements.retain(|_, ticket| ticket.phase() != AdmissionPhase::Settled);
     }
 }
 
@@ -167,7 +190,8 @@ impl AdmissionTicket {
     pub fn notice(&self) -> Option<String> { self.lock().notice.clone() }
     pub fn has_worker(&self) -> bool { self.lock().worker }
 
-    /// Phase one may do worker-only capture/read/client preparation, NO RPC.
+    /// Phase one may do worker-only capture/read and Connect/Catalog bootstrap,
+    /// but no negative registration effects. Client owner preparation is NO RPC.
     /// Its guard marks interrupted work; it never issues Drop cleanup.
     pub fn begin_preparation(&self) -> Result<PreparationWork, AdmissionFailure> {
         let mut state = self.lock();
@@ -246,7 +270,7 @@ impl AdmissionTicket {
                 }
             } else {
                 // No owner and no worker means no Prepare could have occurred:
-                // phase one is explicitly NO RPC; enrollment requires custody.
+                // phase one has no negative registration effects; enrollment requires custody.
                 state.phase = AdmissionPhase::Settled;
                 state.notice = None;
                 return Ok(None);
@@ -277,7 +301,7 @@ impl PreparationWork {
         payload
     }
     /// Normal read-only/binary/PDF completion, or reuse of an existing validated
-    /// AdmittedRoot pair. No new original owner and no RPC was prepared here.
+    /// AdmittedRoot pair. No new owner or negative registration effect exists.
     pub fn finish_read_only(mut self) -> AdmissionTicket {
         let mut state = self.ticket.lock();
         debug_assert!(state.owner.is_none() && state.retirement.is_none());
@@ -367,6 +391,114 @@ fn interrupted(ticket: &AdmissionTicket, finished: bool) {
 impl Drop for PreparationWork { fn drop(&mut self) { interrupted(&self.ticket, self.finished); } }
 impl Drop for EnrollmentWork { fn drop(&mut self) { interrupted(&self.ticket, self.finished); } }
 impl Drop for RetirementWork { fn drop(&mut self) { interrupted(&self.ticket, self.finished); } }
+
+// Placement custody remains concrete: the actual client owns the only
+// candidate/receipt transitions, with no validation callback or recreated Root.
+#[derive(Debug)]
+struct PlacementState {
+    phase: AdmissionPhase, worker: bool, retiring: bool, armed: bool, notice: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub struct PlacementTicket { id: AdmissionId, custody: RecoveryPlacementCustody, state: Arc<Mutex<PlacementState>> }
+#[derive(Debug, Clone)]
+pub struct PlacementFailure { message: String, ticket: PlacementTicket }
+impl fmt::Display for PlacementFailure { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.message) } }
+impl std::error::Error for PlacementFailure {}
+impl PlacementFailure { pub fn ticket(&self) -> &PlacementTicket { &self.ticket } }
+impl PlacementTicket {
+    fn lock(&self) -> MutexGuard<'_, PlacementState> { self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
+    pub fn id(&self) -> AdmissionId { self.id }
+    pub fn phase(&self) -> AdmissionPhase { self.lock().phase }
+    pub fn notice(&self) -> Option<String> { self.lock().notice.clone() }
+    pub fn begin_issue(&self) -> Result<PlacementWork, PlacementFailure> {
+        let mut state = self.lock();
+        if state.phase != AdmissionPhase::Reserved || state.worker || state.retiring {
+            return Err(PlacementFailure { message: "Original placement intake is unavailable; retain its custody.".into(), ticket: self.clone() });
+        }
+        state.worker = true;
+        state.phase = AdmissionPhase::Enrolling;
+        Ok(PlacementWork { ticket: self.clone(), finished: false })
+    }
+    pub fn request_retirement(&self) {
+        // Atomic client seal: a queued-but-not-started intake cannot issue later.
+        self.custody.seal();
+        let mut state = self.lock();
+        if state.phase == AdmissionPhase::Settled { return; }
+        if !state.retiring { state.armed = true; }
+        state.retiring = true;
+        if !state.worker { state.phase = AdmissionPhase::RetirementRequested; }
+    }
+    pub fn retry_retirement(&self) {
+        let mut state = self.lock();
+        if state.retiring && !state.worker && state.phase != AdmissionPhase::Settled { state.armed = true; }
+    }
+    pub fn begin_retirement(&self) -> Option<PlacementRetirementWork> {
+        let mut state = self.lock();
+        if !state.retiring || !state.armed || state.worker || state.phase == AdmissionPhase::Settled { return None; }
+        self.custody.seal();
+        state.worker = true; state.armed = false; state.phase = AdmissionPhase::Retiring;
+        Some(PlacementRetirementWork { ticket: self.clone(), finished: false })
+    }
+}
+#[derive(Debug)]
+pub struct PlacementWork { ticket: PlacementTicket, finished: bool }
+impl PlacementWork {
+    /// Pass this SAME preheld slot to the actual reserve_with_candidates_in_custody.
+    /// The client installs each original candidate before its first Prepare.
+    pub fn custody(&self) -> &RecoveryPlacementCustody { &self.ticket.custody }
+    /// Record quiescence BEFORE publishing any success/error message. The
+    /// caller's result still owns the actual issued context/typed error receipt;
+    /// this ticket independently retains the same custody on message loss.
+    pub fn finish(mut self) -> PlacementTicket {
+        self.ticket.custody.seal();
+        let mut state = self.ticket.lock();
+        state.worker = false;
+        state.phase = if state.retiring { AdmissionPhase::RetirementRequested } else { AdmissionPhase::Prepared };
+        self.finished = true;
+        drop(state); self.ticket.clone()
+    }
+}
+impl Drop for PlacementWork {
+    fn drop(&mut self) {
+        if self.finished { return; }
+        self.ticket.custody.seal();
+        let mut state = self.ticket.lock();
+        state.worker = false; state.retiring = true; state.armed = true;
+        state.phase = AdmissionPhase::Interrupted;
+        state.notice = Some("Original placement worker was interrupted; candidate custody is retained.".into());
+    }
+}
+#[derive(Debug)]
+pub struct PlacementRetirementWork { ticket: PlacementTicket, finished: bool }
+impl PlacementRetirementWork {
+    /// Blocking explicit cleanup. Receipt/candidate remains in the original
+    /// slot throughout RPC and unwind. Never infer settlement from UI lifetime.
+    pub fn run(mut self, deadline: Instant) -> Result<RecoveryRetirement, PlacementFailure> {
+        self.ticket.custody.seal();
+        let result = (|| -> io::Result<RecoveryRetirement> {
+            if self.ticket.custody.is_inflight() { return Ok(RecoveryRetirement::PendingCleanup); }
+            if let Some(receipt) = self.ticket.custody.receipt(deadline)? {
+                if receipt.retire(deadline)? == RecoveryRetirement::PendingCleanup { return Ok(RecoveryRetirement::PendingCleanup); }
+            }
+            if self.ticket.custody.forget_settled(deadline)? { Ok(RecoveryRetirement::Settled) }
+            else { Ok(RecoveryRetirement::PendingCleanup) }
+        })();
+        let mut state = self.ticket.lock(); state.worker = false; self.finished = true;
+        match result {
+            Ok(RecoveryRetirement::Settled) => { state.phase = AdmissionPhase::Settled; state.notice = None; Ok(RecoveryRetirement::Settled) }
+            Ok(RecoveryRetirement::PendingCleanup) => { state.phase = AdmissionPhase::RetirementRequested; state.notice = Some("Original placement still owns pending cleanup; retain its context and retry explicitly after cleanup.".into()); Ok(RecoveryRetirement::PendingCleanup) }
+            Err(error) => { let message = error.to_string().chars().take(MAX_NOTICE_CHARS).collect::<String>(); state.phase = AdmissionPhase::RetirementRequested; state.notice = Some(message.clone()); Err(PlacementFailure { message, ticket: self.ticket.clone() }) }
+        }
+    }
+}
+impl Drop for PlacementRetirementWork {
+    fn drop(&mut self) {
+        if self.finished { return; }
+        let mut state = self.ticket.lock(); state.worker = false; state.retiring = true; state.armed = false;
+        state.phase = AdmissionPhase::Interrupted;
+        state.notice = Some("Original placement retirement was interrupted; explicit retry retains the same receipt.".into());
+    }
+}
 
 #[cfg(test)]
 mod tests {

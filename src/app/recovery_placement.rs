@@ -209,6 +209,7 @@ impl WindowRecoveryRoots {
         source: Arc<Root>,
         protection: Arc<Option<Protection>>,
         payload_capacity: u8,
+        custody: &crate::recovery_domain::RecoveryPlacementCustody,
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<IssuedRecoveryPlacement, WindowRecoveryIssueError> {
@@ -236,8 +237,8 @@ impl WindowRecoveryRoots {
         // Connect, handshake, catalog and intake share this ONE absolute
         // deadline; connection setup cannot restart the operation timeout.
         let client = RecoveryPlacementClient::connect_local_until(resolved.endpoint, deadline)?;
-        client.reserve_with_candidates(inputs, source, protection, commons, payload_capacity,
-            cancellation, deadline).map_err(WindowRecoveryIssueError::Intake)
+        client.reserve_with_candidates_in_custody(inputs, source, protection, commons, payload_capacity,
+            custody, cancellation, deadline).map_err(WindowRecoveryIssueError::Intake)
     }
 
     /// Blocking worker only. Every source is the original cached actor; no
@@ -423,15 +424,15 @@ mod tests {
             endpoint: endpoint(Some(registry)), registry: Some(registry),
             required_projects: Vec::new(), projects: Vec::new(), edited: vec![source.clone()],
         };
-        let result = input().issue_context(source.clone(), Arc::new(None), 1,
+        let result = input().issue_context(source.clone(), Arc::new(None), 1, &crate::recovery_domain::RecoveryPlacementCustody::new(),
             &CancellationToken::new(), Instant::now() + Duration::from_secs(5));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::Unsupported
             && error.to_string().contains("strong source protection")));
         let cancelled = CancellationToken::new(); cancelled.cancel();
-        let result = input().issue_context(source.clone(), Arc::new(None), 1,
+        let result = input().issue_context(source.clone(), Arc::new(None), 1, &crate::recovery_domain::RecoveryPlacementCustody::new(),
             &cancelled, Instant::now() + Duration::from_secs(5));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::Interrupted));
-        let result = input().issue_context(source, Arc::new(None), 1,
+        let result = input().issue_context(source, Arc::new(None), 1, &crate::recovery_domain::RecoveryPlacementCustody::new(),
             &CancellationToken::new(), Instant::now() - Duration::from_millis(1));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error))
             if error.kind() == io::ErrorKind::Interrupted));
@@ -452,7 +453,7 @@ mod tests {
             endpoint: LocalRecoveryEndpoint::fixture(runtime.path().join("absent-daemon.sock"), Some(registry)).unwrap(),
             registry: Some(registry), required_projects: Vec::new(), projects: Vec::new(), edited: vec![source.clone()],
         };
-        let result = input.issue_context(source, protection, 1, &CancellationToken::new(),
+        let result = input.issue_context(source, protection, 1, &crate::recovery_domain::RecoveryPlacementCustody::new(), &CancellationToken::new(),
             Instant::now() + Duration::from_secs(5));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::NotFound));
         assert_eq!(std::fs::read(files.path().join("unchanged")).unwrap(), b"original");
