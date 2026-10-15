@@ -122,11 +122,17 @@ fn required_for_card(db: &Connection, card: CardId) -> Result<Option<CreatedStar
         [card.to_string()], record).optional().map_err(|error| error.to_string())
 }
 
-pub(super) fn active(db: &Connection) -> Result<Vec<CreatedStartRequirement>, String> {
-    let mut statement = db.prepare(&format!(
-        "SELECT {RECORD_COLUMNS} FROM created_start_requirements WHERE phase='required' ORDER BY session_id LIMIT {}",
+fn active_statement(db: &Connection) -> Result<rusqlite::Statement<'_>, String> {
+    // The permanent history can grow independently of the active quota. Scan
+    // only the existing Required-card partial index; sorting by the session
+    // primary key in SQL otherwise walks historical Started/Retired rows too.
+    db.prepare(&format!(
+        "SELECT {RECORD_COLUMNS} FROM created_start_requirements INDEXED BY created_start_requirements_required_card WHERE phase='required' LIMIT {}",
         MAX_REQUIRED_STARTS + 1,
-    )).map_err(|error| error.to_string())?;
+    )).map_err(|error| error.to_string())
+}
+
+fn active_from_statement(statement: &mut rusqlite::Statement<'_>) -> Result<Vec<CreatedStartRequirement>, String> {
     let records = statement
         .query_map([], record)
         .map_err(|error| error.to_string())?
@@ -138,10 +144,18 @@ pub(super) fn active(db: &Connection) -> Result<Vec<CreatedStartRequirement>, St
                 .into(),
         );
     }
-    Ok(records
+    let mut requirements: Vec<_> = records
         .into_iter()
         .map(|record| record.requirement)
-        .collect())
+        .collect();
+    // Stable publication order is bounded by the admitted active set, never
+    // by the permanent refusal history. Overflow is refused before sorting.
+    requirements.sort_unstable_by_key(|requirement| requirement.session);
+    Ok(requirements)
+}
+
+pub(super) fn active(db: &Connection) -> Result<Vec<CreatedStartRequirement>, String> {
+    active_from_statement(&mut active_statement(db)?)
 }
 
 /// Ordinary descriptor edits cannot substitute a different actor for a
@@ -493,6 +507,53 @@ mod tests {
             })
             .unwrap();
     }
+    #[test]
+    fn directory_start_active_discovery_cost_excludes_permanent_history() {
+        use rusqlite::StatementStatus;
+        let (mut registry, _directory, _, _) = setup();
+        let mut expected = Vec::new();
+        // The Required-card index visits these in the reverse session order.
+        // The actual public model must retain its stable session ordering.
+        for number in 1..=3u128 {
+            let required = CreatedStartRequirement {
+                card: CardId::from(Uuid::from_u128(10 - number)),
+                session: TerminalId::from(Uuid::from_u128(number)),
+                ..requirement()
+            };
+            registry.require_created_start(&required).unwrap();
+            expected.push(required);
+        }
+        fn observe(db: &Connection) -> (Vec<CreatedStartRequirement>, i32) {
+            let mut statement = active_statement(db).unwrap();
+            let active = active_from_statement(&mut statement).unwrap();
+            (active, statement.get_status(StatementStatus::VmStep))
+        }
+        let (before, steps_before) = observe(&registry.db);
+        assert_eq!(before, expected);
+        assert!(steps_before > 0, "observe actual SQLite execution");
+        let tx = registry.db.transaction().unwrap();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO created_start_requirements(session_id,card_id,intent_operation,generation,attempt,kind,phase,started_receipt) VALUES(?1,?2,?3,7,?4,'terminal','retired',NULL)"
+            ).unwrap();
+            // Metadata-only refusal history, not startup or retirement proof.
+            for number in 100..4196u128 {
+                insert.execute(params![
+                    Uuid::from_u128(number).to_string(),
+                    Uuid::from_u128(number + 10000).to_string(),
+                    OperationId::new().to_string(),
+                    Uuid::new_v4().to_string(),
+                ]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let (after, steps_after) = observe(&registry.db);
+        assert_eq!(after, expected);
+        assert_eq!(registry.model().unwrap().created_start_requirements, expected);
+        assert_eq!(steps_after, steps_before, "historical rows must not add query VM work");
+        assert_eq!(registry.db.query_row("SELECT COUNT(*) FROM created_start_requirements WHERE phase='retired'", [], |row| row.get::<_, i64>(0)).unwrap(), 4096);
+    }
+
     #[test]
     fn directory_start_registration_replay_and_restart_keep_the_negative_obligation() {
         let (mut registry, directory, a, _) = setup();
