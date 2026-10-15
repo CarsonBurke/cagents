@@ -53,3 +53,8 @@ the temporary copy; the created worktree is retained for inspection.
 `worktree_setup_creation` reads one settled creation through the same identity
 checks without reconciling or rewriting it. It returns no row when absent and
 an error for invalid evidence; resume callers verify the current checkout too.
+
+The copy restores the source group and replaces inherited ACL identities while
+its temporary file is still private, before applying source mode bits. This
+also avoids granting a setgid destination's different group access to secrets.
+If the source group cannot be preserved, setup stops and keeps the worktree.
