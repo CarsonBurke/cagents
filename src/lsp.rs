@@ -9011,10 +9011,12 @@ mod tests {
             assert_eq!(manager.live_servers().len(), 1);
             std::fs::remove_dir_all(&worktree).unwrap();
             next_matching(&events, |event| match event {
-                LspEvent::Resources { doc: at } if *at == doc => Some(()),
+                LspEvent::Resources { doc: at } if *at == doc && manager.live_servers().is_empty() => Some(()),
                 _ => None,
             })
             .await;
+            handle.wait_for("shutdown").await;
+            handle.wait_for("exit").await;
             assert!(manager.live_servers().is_empty());
             assert!(handle.methods().iter().any(|method| method == "shutdown"));
             assert!(handle.methods().iter().any(|method| method == "exit"));
@@ -9057,14 +9059,14 @@ mod tests {
             std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
             std::fs::write(&file, "fn replacement() {}\n").unwrap();
             next_matching(&events, |event| match event {
-                LspEvent::Resources { doc: at } if *at == doc => Some(()),
+                LspEvent::Resources { doc: at } if *at == doc && manager.live_servers().is_empty() => Some(()),
                 _ => None,
             }).await;
+            assert!(wait_until_gone(pid).await, "the old server must be reaped before replacement admission");
             assert!(manager.live_servers().is_empty());
             assert!(old.methods().iter().any(|method| method == "shutdown"));
             assert!(old.methods().iter().any(|method| method == "exit"));
             assert!(matches!(manager.status(doc), LspStatus::Disabled));
-            assert!(wait_until_gone(pid).await, "the old server must be reaped before replacement admission");
 
             manager.open_for_test(LspDocumentId(2), &file, &worktree, rust_language(), 1, "fn replacement() {}\n");
             await_ready(&events, LspDocumentId(2)).await;
