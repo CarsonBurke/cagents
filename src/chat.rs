@@ -924,6 +924,11 @@ pub struct Snapshot {
     pub skills: Vec<Skill>,
     pub usage: Usage,
     pub busy: bool,
+    /// Exact-original restoration is separate from provider activity and timing.
+    #[serde(default)]
+    pub original_retry_pending: bool,
+    #[serde(default)]
+    pub original_retry_diagnostic: Option<String>,
     pub detail: String,
     pub session_id: Option<String>,
     #[serde(default)]
