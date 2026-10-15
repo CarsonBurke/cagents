@@ -163,6 +163,7 @@ fn registered_index_lease(root:&Path,id:&crate::account::AccountId,operation:i32
     let path=directory.join(format!("{:x}",Sha256::digest(id.as_str().as_bytes())));
     crate::instance::owned_lock(&path,operation|libc::LOCK_NB).map_err(|error|format!("Annotation association is busy or unavailable: {error}"))
 }
+#[cfg(test)]
 fn purge_registered_at(root:&Path,id:&crate::account::AccountId)->Result<Option<usize>,String>{
     purge_registered_with(root,id,|_|Ok(()))
 }
