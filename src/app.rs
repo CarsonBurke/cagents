@@ -7343,9 +7343,8 @@ impl Cagents {
         // acknowledging it, but only after navigation has actually succeeded.
         let (transcript, read) = if self.workspace.focused() == Some(id) {
             let row = channel.map(sidebar::SelectionRow::Channel).or_else(|| {
-                self.agent_worktree(id).map(|key| {
-                    sidebar::SelectionRow::Worktree(key.project_id, key.worktree_id)
-                })
+                self.agent_worktree(id)
+                    .map(|key| sidebar::SelectionRow::Worktree(key.project_id, key.worktree_id))
             });
             if let Some(row) = row {
                 self.sidebar_state.navigate_attention(row);
@@ -7366,14 +7365,18 @@ impl Cagents {
 
     fn retain_attention_for_read(&mut self, card: CardId) {
         if !self.sidebar_state.has_card_update(card)
-            && self.sidebar_state.card_activity(card).is_none_or(|activity| {
-                activity.state != crate::agent::ActivityState::Waiting
-            })
+            && self
+                .sidebar_state
+                .card_activity(card)
+                .is_none_or(|activity| activity.state != crate::agent::ActivityState::Waiting)
         {
             return;
         }
         self.sidebar_state.retain_card_attention(card);
-        if let Some(channel) = self.durable.channels.iter()
+        if let Some(channel) = self
+            .durable
+            .channels
+            .iter()
             .find(|channel| channel.cards.contains(&card))
         {
             self.sidebar_state.retain_attention_channel(channel.id);

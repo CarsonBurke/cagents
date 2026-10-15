@@ -2912,13 +2912,18 @@ impl SidebarState {
     /// Capture the row before a user read removes its unread owner. Closing
     /// or retiring a card deliberately does not call this method.
     pub fn retain_card_attention(&mut self, card: CardId) {
-        let owner = self.agent_updates.get(&card).copied().flatten().or_else(|| {
-            self.agent_activity.get(&card).and_then(|entry| {
-                (entry.activity.state == crate::agent::ActivityState::Waiting)
-                    .then_some(entry.owner)
-                    .flatten()
-            })
-        });
+        let owner = self
+            .agent_updates
+            .get(&card)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                self.agent_activity.get(&card).and_then(|entry| {
+                    (entry.activity.state == crate::agent::ActivityState::Waiting)
+                        .then_some(entry.owner)
+                        .flatten()
+                })
+            });
         if self.filter == SidebarFilter::Attention
             && let Some((project, worktree)) = owner
         {
@@ -2934,7 +2939,8 @@ impl SidebarState {
 
     pub fn retain_attention_channel(&mut self, channel: ChannelId) {
         if self.filter == SidebarFilter::Attention {
-            self.retained_attention.insert(SelectionRow::Channel(channel));
+            self.retained_attention
+                .insert(SelectionRow::Channel(channel));
         }
     }
 
@@ -5256,7 +5262,9 @@ fn project_view<'a>(
                             .group_size(SelectionRow::Channel(channel.id)),
                         &project.state.query,
                         project.state.attention_read(
-                            SelectionRow::Channel(channel.id), channel.unread, channel.activity,
+                            SelectionRow::Channel(channel.id),
+                            channel.unread,
+                            channel.activity,
                         ),
                     ),
                     SelectionRow::Channel(channel.id),
@@ -5398,7 +5406,9 @@ fn compact_project<'a>(
     for channel in project.channels.iter().filter(|channel| {
         expanded
             && ((!project.state.query.trim().is_empty() && project.state.controls_expanded)
-                || project.state.attention_retained(SelectionRow::Channel(channel.id))
+                || project
+                    .state
+                    .attention_retained(SelectionRow::Channel(channel.id))
                 || channel.selected
                 || channel.unread
                 || channel.activity.is_some()
@@ -5415,7 +5425,9 @@ fn compact_project<'a>(
                     .group_size(SelectionRow::Channel(channel.id)),
                 &project.state.query,
                 project.state.attention_read(
-                    SelectionRow::Channel(channel.id), channel.unread, channel.activity,
+                    SelectionRow::Channel(channel.id),
+                    channel.unread,
+                    channel.activity,
                 ),
             ),
             SelectionRow::Channel(channel.id),
@@ -5431,7 +5443,9 @@ fn compact_project<'a>(
                         project_id: entity.id,
                         worktree_id: worktree.id,
                     })
-                || project.state.attention_retained(SelectionRow::Worktree(entity.id, worktree.id))
+                || project
+                    .state
+                    .attention_retained(SelectionRow::Worktree(entity.id, worktree.id))
                 || project.state.has_agent_update(entity.id, worktree.id)
                 || project.state.worktree_has_panes(entity.id, worktree.id)
                 || worktree.deletion.is_some()
@@ -5546,11 +5560,7 @@ impl GlyphTone {
 }
 
 fn read_row_ink(ink: RowInk, retained_read: bool) -> RowInk {
-    if retained_read {
-        RowInk::Muted
-    } else {
-        ink
-    }
+    if retained_read { RowInk::Muted } else { ink }
 }
 
 fn channel_ink(channel: &SidebarChannel) -> RowInk {
@@ -5999,7 +6009,11 @@ fn worktree_view<'a>(
             &chrome.label,
             query,
             CHILD_ROW_TEXT_SIZE,
-            deletion_ink(read_row_ink(RowInk::of(has_panes, agent_update), retained_read), deletion).text_class(),
+            deletion_ink(
+                read_row_ink(RowInk::of(has_panes, agent_update), retained_read),
+                deletion,
+            )
+            .text_class(),
             false,
         )
     });
@@ -6024,7 +6038,11 @@ fn worktree_view<'a>(
             }))
             .into()
     } else {
-        worktree_status_icon(worktree, false, !retained_read && (has_panes || agent_update))
+        worktree_status_icon(
+            worktree,
+            false,
+            !retained_read && (has_panes || agent_update),
+        )
     };
     let mut content = grid.content(glyph, label, indicator);
     if !compact {
@@ -9584,7 +9602,10 @@ pub fn visible_selection_rows(
                                     project_id: project.project.id,
                                     worktree_id: worktree.id,
                                 })
-                            || state.attention_retained(SelectionRow::Worktree(project.project.id, worktree.id))
+                            || state.attention_retained(SelectionRow::Worktree(
+                                project.project.id,
+                                worktree.id,
+                            ))
                             || state.has_agent_update(project.project.id, worktree.id)
                             || state.worktree_has_panes(project.project.id, worktree.id)
                             || state
@@ -9665,7 +9686,8 @@ fn filtered_projects<'a>(
                         SidebarFilter::All => true,
                         SidebarFilter::PullRequests => worktree.pull_request().is_some(),
                         SidebarFilter::Attention => {
-                            state.attention_retained(SelectionRow::Worktree(project.id, worktree.id))
+                            state
+                                .attention_retained(SelectionRow::Worktree(project.id, worktree.id))
                                 || state.has_agent_update(project.id, worktree.id)
                                 || state.agent_activity(project.id, worktree.id)
                                     == Some(crate::agent::ActivityState::Waiting)
@@ -12109,7 +12131,10 @@ pub(crate) mod tests {
         assert!(state.attention_retained(row));
         assert_eq!(visible_selection_rows(&model, &state, false), before);
         assert!(visible_selection_rows(&model, &state, true).contains(&row));
-        assert_eq!(read_row_ink(RowInk::Full, state.attention_retained(row)), RowInk::Muted);
+        assert_eq!(
+            read_row_ink(RowInk::Full, state.attention_retained(row)),
+            RowInk::Muted
+        );
         state.navigate_attention(row);
         assert!(visible_selection_rows(&model, &state, false).contains(&row));
         state.navigate_attention(SelectionRow::Project(project));
@@ -12132,12 +12157,25 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let mut state = SidebarState::default();
         let card = CardId::new();
-        let activity = |state| crate::agent::Activity { provider: crate::agent::Provider::Claude, state };
+        let activity = |state| crate::agent::Activity {
+            provider: crate::agent::Provider::Claude,
+            state,
+        };
         state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
-        state.set_agent_activity(card, project, worktree, activity(crate::agent::ActivityState::Waiting));
+        state.set_agent_activity(
+            card,
+            project,
+            worktree,
+            activity(crate::agent::ActivityState::Waiting),
+        );
         state.retain_card_attention(card);
         state.acknowledge_agent_update(card);
-        state.set_agent_activity(card, project, worktree, activity(crate::agent::ActivityState::Idle));
+        state.set_agent_activity(
+            card,
+            project,
+            worktree,
+            activity(crate::agent::ActivityState::Idle),
+        );
         assert!(visible_selection_rows(&model, &state, false).contains(&row));
         assert!(!state.has_card_update(card));
 
