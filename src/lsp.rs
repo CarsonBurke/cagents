@@ -1592,7 +1592,10 @@ struct RootIdentity {
 
 impl RootIdentity {
     fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        Self { device: metadata.dev(), inode: metadata.ino() }
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
     }
 }
 
@@ -4621,13 +4624,17 @@ impl LspManager {
                 let (directory_pin, identity) = match pin_session_root(&context.launch.root).await {
                     Ok(pin) => pin,
                     Err(error) => {
-                        context.set_status(LspStatus::Unavailable {
-                            reason: format!("cannot retain language server root: {error}"),
-                        }).await;
+                        context
+                            .set_status(LspStatus::Unavailable {
+                                reason: format!("cannot retain language server root: {error}"),
+                            })
+                            .await;
                         return;
                     }
                 };
-                *launched_root_identity.lock().unwrap_or_else(|error| error.into_inner()) = Some(identity);
+                *launched_root_identity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(identity);
                 run_session(context, rx).await;
                 // Prevent inode reuse until protocol teardown has reaped the
                 // process; the watchdog's identity comparison stays exact.
@@ -4672,9 +4679,12 @@ impl LspManager {
                 // at the same spelling before this poll. The original inode
                 // remains pinned until the server finishes teardown.
                 let root_metadata = tokio::fs::metadata(&watched_root).await;
-                let original = *root_identity.lock().unwrap_or_else(|error| error.into_inner());
+                let original = *root_identity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 let root_changed = match root_metadata {
-                    Ok(metadata) => original.is_some_and(|identity| identity != RootIdentity::from_metadata(&metadata)),
+                    Ok(metadata) => original
+                        .is_some_and(|identity| identity != RootIdentity::from_metadata(&metadata)),
                     Err(error) => error.kind() == io::ErrorKind::NotFound,
                 };
                 if root_changed {
@@ -9011,7 +9021,11 @@ mod tests {
             assert_eq!(manager.live_servers().len(), 1);
             std::fs::remove_dir_all(&worktree).unwrap();
             next_matching(&events, |event| match event {
-                LspEvent::Resources { doc: at } if *at == doc && manager.live_servers().is_empty() => Some(()),
+                LspEvent::Resources { doc: at }
+                    if *at == doc && manager.live_servers().is_empty() =>
+                {
+                    Some(())
+                }
                 _ => None,
             })
             .await;
@@ -9059,16 +9073,31 @@ mod tests {
             std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
             std::fs::write(&file, "fn replacement() {}\n").unwrap();
             next_matching(&events, |event| match event {
-                LspEvent::Resources { doc: at } if *at == doc && manager.live_servers().is_empty() => Some(()),
+                LspEvent::Resources { doc: at }
+                    if *at == doc && manager.live_servers().is_empty() =>
+                {
+                    Some(())
+                }
                 _ => None,
-            }).await;
-            assert!(wait_until_gone(pid).await, "the old server must be reaped before replacement admission");
+            })
+            .await;
+            assert!(
+                wait_until_gone(pid).await,
+                "the old server must be reaped before replacement admission"
+            );
             assert!(manager.live_servers().is_empty());
             assert!(old.methods().iter().any(|method| method == "shutdown"));
             assert!(old.methods().iter().any(|method| method == "exit"));
             assert!(matches!(manager.status(doc), LspStatus::Disabled));
 
-            manager.open_for_test(LspDocumentId(2), &file, &worktree, rust_language(), 1, "fn replacement() {}\n");
+            manager.open_for_test(
+                LspDocumentId(2),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "fn replacement() {}\n",
+            );
             await_ready(&events, LspDocumentId(2)).await;
             let replacement = handle_of(&slot).await;
             assert_eq!(replacement.entries("initialize").len(), 1);
