@@ -203,7 +203,7 @@ impl Runtime {
             .filter(|request| request.kind == chat::RequestKind::Approval)
             .collect();
         for request in approvals {
-            content.push(view::request_view_with_redirect(
+            content.push(view::request_view_with_restore(
                 target,
                 request,
                 &self.answers,
@@ -211,6 +211,7 @@ impl Runtime {
                 view::RequestSurface::Permissions,
                 (self.session.launch.provider == Provider::Claude)
                     .then(|| !self.composer.text().trim().is_empty()),
+                snapshot.original_retry_pending,
             ));
         }
         for denial in snapshot.permission_denials.iter().rev() {

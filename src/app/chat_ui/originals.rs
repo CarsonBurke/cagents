@@ -141,6 +141,8 @@ fn stream(job:&Job)->Pin<Box<dyn iced::futures::Stream<Item=Message>+Send>> {
     }))
 }
 
+pub(super) fn cleanup_answer(answer:&str)->bool {matches!(answer,"deny"|"decline"|"reject"|"cancel"|"abort")}
+
 impl Runtime {
     /// Restoration holds provider input until the actor has verified readback.
     /// Navigation and cancellation remain available even when native busy is false.
@@ -148,7 +150,7 @@ impl Runtime {
         !self.snapshot.original_retry_pending
             || matches!(command, Command::Interrupt | Command::Refresh | Command::LoadEarlier | Command::LoadLater
                 | Command::StopSubagent {..} | Command::RemoveQueued {..} | Command::DismissPermissionDenial {..})
-            || matches!(command, Command::Answer {action,..} if matches!(action.as_str(),"deny"|"decline"|"reject"|"cancel"|"abort"))
+            || matches!(command, Command::Answer {action,..} if cleanup_answer(action))
     }
     fn revoke_originals(&mut self) {
         self.recovery.originals.clear();

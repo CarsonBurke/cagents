@@ -1572,7 +1572,7 @@ impl Runtime {
                                 .requests
                                 .iter()
                                 .map(|request| {
-                                    request_view_with_redirect(
+                                    request_view_with_restore(
                                         self.target,
                                         request,
                                         &self.answers,
@@ -1580,6 +1580,7 @@ impl Runtime {
                                         RequestSurface::Transcript,
                                         (self.session.launch.provider == Provider::Claude)
                                             .then(|| !self.composer.text().trim().is_empty()),
+                                        snapshot.original_retry_pending,
                                     )
                                 })
                                 .collect::<Vec<_>>(),
@@ -2011,7 +2012,7 @@ impl Runtime {
         };
         let mut actions = Vec::new();
         if snapshot.capabilities.branch || snapshot.capabilities.compact {
-            actions.push(self.composer_actions(available));
+            actions.push(self.composer_actions(input_available));
         }
         if !snapshot.capabilities.interrupt_modes.is_empty() {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
@@ -2025,7 +2026,7 @@ impl Runtime {
                         "Steering: after tools"
                     },
                 )
-                .on_press_maybe(available.then(|| {
+                .on_press_maybe(input_available.then(|| {
                     action(Action::Command(
                         target,
                         Command::SetInterruptMode { mode: next.into() },
@@ -4147,6 +4148,13 @@ pub(super) fn request_view_with_redirect<'a>(
     surface: RequestSurface,
     redirect: Option<bool>,
 ) -> Element<'a, Message> {
+    request_view_with_restore(target,request,answers,available,surface,redirect,false)
+}
+
+pub(super) fn request_view_with_restore<'a>(
+    target:Target,request:&'a chat::Request,answers:&'a Answers,available:bool,
+    surface:RequestSurface,redirect:Option<bool>,restoring:bool,
+)->Element<'a,Message> {
     let (question, context) = question_and_context(&request.description);
     let mut rows: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(vec![
@@ -4182,9 +4190,9 @@ pub(super) fn request_view_with_redirect<'a>(
         ));
     }
     for field in &request.fields {
-        rows.push(field_view(target, request, field, answers, available));
+        rows.push(field_view(target, request, field, answers, available && !restoring));
     }
-    rows.push(answers_view(target, request, available, surface));
+    rows.push(answers_view(target, request, available, surface, restoring));
     if let Some(has_text) = redirect.filter(|_| {
         request.kind == chat::RequestKind::Approval
             && request.actions.iter().any(|choice| choice.id == "deny")
@@ -4218,7 +4226,7 @@ pub(super) fn request_view_with_redirect<'a>(
     .padding(step::GAP_M)
     .width(Length::Fill)
     .into();
-    if available && request.kind == chat::RequestKind::Approval {
+    if available && !restoring && request.kind == chat::RequestKind::Approval {
         let once = request
             .actions
             .iter()
@@ -4439,6 +4447,7 @@ fn answers_view<'a>(
     request: &'a chat::Request,
     available: bool,
     surface: RequestSurface,
+    restoring: bool,
 ) -> Element<'a, Message> {
     if request.actions.is_empty() {
         // A provider can ask something this surface has no answer for -
@@ -4457,15 +4466,17 @@ fn answers_view<'a>(
         answers
             .into_iter()
             .map(|choice| {
-                let message = available.then_some(action(Action::Answer(
+                let message = (available && (!restoring || originals::cleanup_answer(&choice.id))).then_some(action(Action::Answer(
                     target,
                     request.id.clone(),
                     choice.id.clone(),
                 )));
                 let label = if request.kind == chat::RequestKind::Approval {
                     match stake(choice) {
-                        Stake::Once => format!("{} (Enter)", choice.label),
-                        Stake::Refuse => format!("{} (Esc)", choice.label),
+                        Stake::Once if !restoring => format!("{} (Enter)", choice.label),
+                        Stake::Once => choice.label.clone(),
+                        Stake::Refuse if !restoring => format!("{} (Esc)", choice.label),
+                        Stake::Refuse => choice.label.clone(),
                         Stake::Session => choice.label.clone(),
                     }
                 } else {
@@ -6397,6 +6408,30 @@ mod tests {
             let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
             assert_eq!(accessible.root().iter().chain(accessible.children()).any(|node|
                 node.node().label()==Some("Edit and resend in a new branch")),expected);
+        }
+    }
+
+    #[test]
+    fn held_restoration_disables_grants_but_preserves_negative_controls_in_both_request_surfaces() {
+        use iced::advanced::{Layout,layout,widget::Tree};
+        let target=Target {card:CardId::new(),generation:1};
+        let request=chat::Request {id:"held-approval".into(),kind:chat::RequestKind::Approval,title:"Allow Bash?".into(),description:String::new(),fields:vec![],
+            actions:["allow","allow_session","deny"].into_iter().map(|id|chat::Choice {id:id.into(),label:id.into(),description:String::new()}).collect()};
+        let answers=Answers::default();let renderer=crate::ui_controls::accessibility_probe::headless_renderer();
+        for surface in [RequestSurface::Transcript,RequestSurface::Permissions] {
+            let mut tree=Tree::empty();
+            for restoring in [false,true,false] {
+                let mut element=request_view_with_restore(target,&request,&answers,true,surface,Some(false),restoring);
+                tree.diff(element.as_widget_mut());
+                let node=element.as_widget_mut().layout(&mut tree,&renderer,
+                    &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
+                let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
+                for (label,disabled) in [("allow",restoring),("allow_session",restoring),("deny",false)] {
+                    let control=accessible.root().iter().chain(accessible.children()).find(|node|
+                        node.node().label().is_some_and(|name|name==label || name.strip_suffix(" (Enter)")==Some(label) || name.strip_suffix(" (Esc)")==Some(label))).expect("mounted decision");
+                    assert_eq!(control.node().is_disabled(),disabled,"{label} while restoring={restoring}");
+                }
+            }
         }
     }
 
