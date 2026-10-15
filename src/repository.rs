@@ -5,6 +5,9 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod worktree_setup_intent;
+pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
+
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -3789,6 +3792,9 @@ pub struct CreateWorktreeRequest {
     pub base: BaseRevision,
     pub track: bool,
     pub operation_id: OperationId,
+    /// Exact setup choice retained through uncertain creation and restart.
+    #[serde(default)]
+    pub setup_intent: Option<WorktreeSetupIntent>,
 }
 
 /// User intent, resolved without creating directories or changing Git refs.
@@ -7196,6 +7202,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::DestinationOccupied.into());
         }
         Ok(CreateWorktreeRequest {
+            setup_intent: None,
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
             repository: input.repository.clone(),
@@ -7738,6 +7745,18 @@ impl GitFileLock {
             return Err("Git lock name must be one ordinary component".into());
         }
         Self::acquire_in(parent.try_clone().map_err(|error| error.to_string())?, name)
+    }
+
+    /// Acquire through the same retained admin directory as the Git reader.
+    /// Share the canonical one-component guard and retained-root writer.
+    pub(crate) fn acquire_at(
+        parent: &fs_safety::Root,
+        index: &std::ffi::OsStr,
+    ) -> Result<Self, String> {
+        if Path::new(index).components().count() != 1 || index == "." || index == ".." {
+            return Err("Git reported an invalid index name".into());
+        }
+        Self::acquire_beneath(parent, index)
     }
 
     fn acquire_in(parent: fs_safety::Root, name: &OsStr) -> Result<Self, String> {
@@ -10814,6 +10833,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("feature; echo nope");
         let request = CreateWorktreeRequest {
+            setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: destination.clone(),
@@ -10844,6 +10864,7 @@ mod tests {
     fn tracking_is_configured_after_creation_from_the_validated_ref() {
         let root = tempfile::tempdir().unwrap();
         let request = CreateWorktreeRequest {
+            setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: root.path().join("feature"),
@@ -12604,6 +12625,7 @@ mod tests {
         let managed = tempfile::tempdir().unwrap();
         let plan = service
             .plan_worktree_creation(&CreateWorktreeRequest {
+                setup_intent: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
                 destination: managed.path().join("feature"),
@@ -15218,6 +15240,7 @@ mod worktree_journal_tests {
             .unwrap();
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
+                setup_intent: None,
                 repository,
                 managed_root: root.clone(),
                 destination: root.join("feature"),
