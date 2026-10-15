@@ -5051,11 +5051,13 @@ pub struct Cagents {
 
 impl Cagents {
     fn set_terminal_review_owner(&mut self, owner: Option<CardId>) {
+        let previous=self.terminal_review_identity;
         self.terminal_review_card = owner;
         self.terminal_review_identity = owner.and_then(|card| match self.cards.get(&card) {
             Some(CardRuntime::Terminal(handle)) => Some(handle.terminal_id()),
             _ => None,
         });
+        self.terminal_review_input.confirm_review(previous,self.terminal_review_identity);
         self.terminal_review_revision = self.terminal_review_revision.wrapping_add(1);
     }
 
@@ -9256,7 +9258,9 @@ impl Cagents {
                             self.window_scale_factor,
                             self.settings.ui_scale,
                         ))
-                        .model_focused(card_focused && !find.is_some_and(|find| find.focused))
+                        // Selection/native focus survives an inactive-window rebuild.
+                        .model_focused(focused && !self.workspace_inputs_blocked() && !find.is_some_and(|find| find.focused))
+                        .window_focused(self.refresh_ui.focused)
                         .on_shortcut(move |event| {
                             let keyboard::Event::KeyPressed {
                                 key,
@@ -13207,6 +13211,7 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         self.reconcile_terminal_review_owner();
+        self.terminal_review_input.flush_orphans(self.terminal_review_card.is_some());
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }
@@ -14690,6 +14695,7 @@ impl Application for Cagents {
                 // successor mounted in the same card while the task was pending.
                 if !matches!(self.cards.get(&card), Some(CardRuntime::Terminal(handle)) if handle.terminal_id() == terminal)
                 {
+                    self.terminal_review_input.note_review(terminal,false);
                     return Task::none();
                 }
                 if active {
@@ -17445,6 +17451,7 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
+        self.input_trace.bind_terminal_keys(self.terminal_review_input.clone());
         let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
