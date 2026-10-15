@@ -45,7 +45,7 @@ use crossbeam_channel::{Receiver, Sender};
 use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-mod release;
+pub(super) mod release;
 
 use super::{ChildExit, close_processes::signal};
 use crate::terminal::{
