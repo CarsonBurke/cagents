@@ -13609,7 +13609,7 @@ mod tests {
                 &saved,
                 SnapshotBase {
                     workspace: 0,
-                    cards: &BTreeMap::new(),
+                    cards: &std::collections::BTreeMap::new(),
                 },
             )
             .unwrap();
