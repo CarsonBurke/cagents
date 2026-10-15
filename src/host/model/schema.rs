@@ -52,19 +52,35 @@ fn prepare_file(path: &Path) -> Result<(), String> {
     // a new private file descriptor closes before another Registry constructor
     // in this process can open that newly created inode through SQLite.
     static CREATION: Mutex<()> = Mutex::new(());
-    let _creation = CREATION.lock().map_err(|_| "registry file creation lock was poisoned")?;
+    let _creation = CREATION
+        .lock()
+        .map_err(|_| "registry file creation lock was poisoned")?;
     if let Some(parent) = path.parent() {
         super::create_private_directory(parent).map_err(|e| e.to_string())?;
     }
     loop {
         match std::fs::symlink_metadata(path) {
-            Ok(metadata) => return if metadata.is_file() { Ok(()) } else { Err("workspace registry is not a regular file".into()) },
+            Ok(metadata) => {
+                return if metadata.is_file() {
+                    Ok(())
+                } else {
+                    Err("workspace registry is not a regular file".into())
+                };
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),
         }
-        match OpenOptions::new().write(true).create_new(true).mode(FILE_MODE)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path) {
-            Ok(created) => { drop(created); return Ok(()); }
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(created) => {
+                drop(created);
+                return Ok(());
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.to_string()),
         }
@@ -143,9 +159,7 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
         db.pragma_update(None, "locking_mode", "NORMAL")
             .map_err(|e| e.to_string())?;
         let locking: String = db
-            .pragma_query_value(Some("main"), "locking_mode", |r| {
-                r.get(0)
-            })
+            .pragma_query_value(Some("main"), "locking_mode", |r| r.get(0))
             .map_err(|e| e.to_string())?;
         if !locking.eq_ignore_ascii_case("normal") {
             return Err("SQLite could not release exclusive registry admission".into());
@@ -498,7 +512,11 @@ mod tests {
         FAIL_STEP.with(|s| s.set(Some(8)));
         assert!(Registry::at(&path).err().unwrap().contains("failure at 8"));
         FAIL_STEP.with(|s| s.set(None));
-        assert_eq!(bytes(&path), original, "converted legacy rows must roll back with the failed migration");
+        assert_eq!(
+            bytes(&path),
+            original,
+            "converted legacy rows must roll back with the failed migration"
+        );
         let registry = Registry::at(&path).unwrap();
         let scope = serde_json::json!({"Channel":channel}).to_string();
         let view: (i64, String, String) = registry
@@ -886,25 +904,67 @@ mod tests {
 
     #[test]
     fn failed_opener_cannot_release_another_connections_actual_writer_lock() {
-        use crate::process::{ProcessExecutor,CommandSpec,CancellationToken,SystemProcessExecutor};
-        let _clear=Clear;
-        let dir=tempfile::Builder::new().prefix("registry12-lock-").tempdir().unwrap();let root=dir.path().canonicalize().unwrap();
-        std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
-        let path=root.join("writer.sqlite3");let mut registry=Registry::at(&path).unwrap();
-        assert_eq!(registry.db.query_row("PRAGMA journal_mode=DELETE",[],|r|r.get::<_,String>(0)).unwrap(),"delete");
-        let tx=registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
-        tx.execute("INSERT INTO projects VALUES('/owner','Writer',1,'git')",[]).unwrap();
-        let prove=|busy:bool| {
-            let spec=CommandSpec::new(std::env::current_exe().unwrap()).args(["--exact","host::model::schema::tests::writer_lock_child","--nocapture"])
-                .env("CAGENTS_REGISTRY12_LOCK_CHILD",&root).env("CAGENTS_REGISTRY12_LOCK_BUSY",if busy {"1"}else{"0"})
-                .timeout(Duration::from_secs(20)).output_limits(8192,8192);
-            let out=SystemProcessExecutor.execute(&spec,&CancellationToken::new()).and_then(|out|out.require_success(&spec.program)).unwrap();
-            assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed; 0 failed"),"{}",String::from_utf8_lossy(&out.stdout));
+        use crate::process::{
+            CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+        };
+        let _clear = Clear;
+        let dir = tempfile::Builder::new()
+            .prefix("registry12-lock-")
+            .tempdir()
+            .unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("writer.sqlite3");
+        let mut registry = Registry::at(&path).unwrap();
+        assert_eq!(
+            registry
+                .db
+                .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute("INSERT INTO projects VALUES('/owner','Writer',1,'git')", [])
+            .unwrap();
+        let prove = |busy: bool| {
+            let spec = CommandSpec::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host::model::schema::tests::writer_lock_child",
+                    "--nocapture",
+                ])
+                .env("CAGENTS_REGISTRY12_LOCK_CHILD", &root)
+                .env("CAGENTS_REGISTRY12_LOCK_BUSY", if busy { "1" } else { "0" })
+                .timeout(Duration::from_secs(20))
+                .output_limits(8192, 8192);
+            let out = SystemProcessExecutor
+                .execute(&spec, &CancellationToken::new())
+                .and_then(|out| out.require_success(&spec.program))
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("1 passed; 0 failed"),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
         };
         prove(true);
-        hook(|stage|if stage=="inspected" {Err("forced second-opener refusal".into())}else{Ok(())});
-        assert!(Registry::at(&path).err().unwrap().contains("forced second-opener refusal"));
-        HOOK.with(|h|*h.borrow_mut()=None);
+        hook(|stage| {
+            if stage == "inspected" {
+                Err("forced second-opener refusal".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            Registry::at(&path)
+                .err()
+                .unwrap()
+                .contains("forced second-opener refusal")
+        );
+        HOOK.with(|h| *h.borrow_mut() = None);
         assert!(!tx.is_autocommit());
         prove(true);
         tx.rollback().unwrap();
@@ -913,18 +973,45 @@ mod tests {
 
     #[test]
     fn writer_lock_child() {
-        let Some(root)=std::env::var_os("CAGENTS_REGISTRY12_LOCK_CHILD") else { return; };
-        let root=std::path::PathBuf::from(root);assert!(root.is_absolute());assert_eq!(root.canonicalize().unwrap(),root);
-        assert!(root.file_name().unwrap().to_str().unwrap().starts_with("registry12-lock-"));
-        assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode()&0o777,0o700);
-        let mut db=connect(&root.join("writer.sqlite3"),false).unwrap();db.busy_timeout(Duration::ZERO).unwrap();
-        match std::env::var("CAGENTS_REGISTRY12_LOCK_BUSY").unwrap().as_str() {
-            "1"=> {
-                let error=db.transaction_with_behavior(TransactionBehavior::Immediate).err().expect("the original writer must remain excluded");
-                assert!(matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)),"{error}");
+        let Some(root) = std::env::var_os("CAGENTS_REGISTRY12_LOCK_CHILD") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        assert!(root.is_absolute());
+        assert_eq!(root.canonicalize().unwrap(), root);
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("registry12-lock-")
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let mut db = connect(&root.join("writer.sqlite3"), false).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        match std::env::var("CAGENTS_REGISTRY12_LOCK_BUSY")
+            .unwrap()
+            .as_str()
+        {
+            "1" => {
+                let error = db
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .err()
+                    .expect("the original writer must remain excluded");
+                assert!(
+                    matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)),
+                    "{error}"
+                );
             }
-            "0"=>db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap().rollback().unwrap(),
-            _=>panic!("invalid child expectation"),
+            "0" => db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap()
+                .rollback()
+                .unwrap(),
+            _ => panic!("invalid child expectation"),
         }
     }
 
