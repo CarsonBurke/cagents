@@ -355,3 +355,25 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
     assert_eq!(skipped["run_id"],skipped_run.to_string());
     assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewed");
 }
+
+#[test]
+fn daemon_setup_recovery_refuses_a_direct_same_path_and_branch_replacement() {
+    use cagents::{device_service,repository::WorktreeSetupIntent,worktree_control::{Operation,Reply}};
+    let fixture=Fixture::new();let project=fixture.root.path().join("project");
+    let path=fixture.create("replaced-setup");
+    let retained=fixture.setup_intent(&path);
+    let intent:WorktreeSetupIntent=serde_json::from_value(retained.clone()).unwrap();
+    let admin=fixture.git(&path,&["rev-parse","--absolute-git-dir"]);
+    fixture.git(&project,&["worktree","remove",path.to_str().unwrap()]);
+    fixture.git(&project,&["worktree","add",path.to_str().unwrap(),"replaced-setup"]);
+    assert_eq!(fixture.git(&path,&["rev-parse","--absolute-git-dir"]),admin,"the fixture must actually reuse the administrative pathname");
+    let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client=cagents::control::ControlClient::connect(&socket).unwrap();
+    let repository=project.join(".git");
+    assert!(client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).is_err());
+    assert!(client.device_operation(device_service::Operation::Worktree {operation:Operation::ResumeSetup {repository:repository.clone(),path:path.clone(),expected_run_id:intent.run_id,expected_plan_fingerprint:None,trust:false,skip:true}}).is_err());
+    let device_service::Reply::Worktree(Reply::SetupIntents {intents,warnings})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntents {repository}}).unwrap() else {panic!("wrong setup inventory")};
+    assert!(intents.is_empty());assert!(!warnings.is_empty(),"an unverifiable retained receipt must be reported");
+    assert_eq!(fixture.setup_intent(&path),retained,"replacement must not adopt or rewrite the original intent");
+    assert!(path.join("tracked").is_file());assert!(client.list().unwrap().is_empty());
+}

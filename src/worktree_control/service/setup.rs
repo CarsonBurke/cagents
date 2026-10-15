@@ -29,6 +29,9 @@ fn verified_report(service:&Service,row:&crate::persistence::PendingOperation,co
     if saved_common.as_path()!=common||saved_admin!=admin||record.branch.as_deref()!=Some(request.branch.full_ref().as_str()) {
         return Err("The worktree's creation ownership changed; no setup was resumed".into());
     }
+    if !crate::repository::worktree_setup_marker_matches(&admin,report.operation_id).map_err(|error|format!("Could not verify this checkout's creation generation: {error}"))? {
+        return Err("The checkout no longer has the original creation generation; legacy or replaced worktrees cannot inherit its setup intent".into());
+    }
     Ok(report)
 }
 
