@@ -99,12 +99,10 @@ impl Prepared {
                 .git_read_receipt()
                 .ok_or("Reload the Git source before applying this change")?;
             if !receipt.is_current()
-                || !runtime
-                    .git_read_source()
-                    .is_some_and(|source| {
-                        source.authority().path() == runtime.descriptor.worktree.as_path()
-                            && receipt.matches_source(source)
-                    })
+                || !runtime.git_read_source().is_some_and(|source| {
+                    source.authority().path() == runtime.descriptor.worktree.as_path()
+                        && receipt.matches_source(source)
+                })
             {
                 return Err(
                     "The original Git reader changed; reload this source before applying changes"
@@ -346,11 +344,10 @@ impl RepositoryRuntime {
         };
         (buffer_revert
             || model.git_read_receipt().is_some_and(|receipt| {
-                self.git_read_source()
-                    .is_some_and(|source| {
-                        source.authority().path() == self.descriptor.worktree.as_path()
-                            && receipt.matches_source(source)
-                    })
+                self.git_read_source().is_some_and(|source| {
+                    source.authority().path() == self.descriptor.worktree.as_path()
+                        && receipt.matches_source(source)
+                })
             }))
             && !model.is_empty()
             && (kind == git_patch::Kind::Unstage) == model.source_head.is_some()
@@ -1163,16 +1160,24 @@ mod tests {
             ..RepositoryFile::default()
         });
         let content = crate::diff_view::load_repository_diff_with_read_source(
-            root, Path::new("target.sh"), &DiffBasis::IndexToWorktree, None,
-            crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE,
-            &CancellationToken::default(), Some(&source),
+            root,
+            Path::new("target.sh"),
+            &DiffBasis::IndexToWorktree,
+            None,
+            crate::settings::EditorSyntaxTheme::default(),
+            false,
+            Font::MONOSPACE,
+            &CancellationToken::default(),
+            Some(&source),
         );
         runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content));
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
         let identity = runtime.current_identity(card, "new.sh".into());
         let request = runtime.diff_mutation_request(card, 0..1).unwrap();
-        let capture = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap();
+        let capture = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request))
+            .unwrap();
         assert!(capture.git_read_receipt().unwrap().matches_source(&source));
         assert_eq!(capture.identity, identity);
         assert_eq!(capture.new_path.as_path(), Path::new("target.sh"));
@@ -1293,11 +1298,19 @@ mod tests {
         runtime.git_read_source = Some(source);
         runtime.source_surface = SourceSurface::Diff;
         let content = crate::diff_view::load_repository_diff_with_read_source(
-            &runtime.descriptor.worktree, Path::new("file.txt"), &DiffBasis::IndexToWorktree, None,
-            crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE,
-            &CancellationToken::default(), runtime.git_read_source(),
+            &runtime.descriptor.worktree,
+            Path::new("file.txt"),
+            &DiffBasis::IndexToWorktree,
+            None,
+            crate::settings::EditorSyntaxTheme::default(),
+            false,
+            Font::MONOSPACE,
+            &CancellationToken::default(),
+            runtime.git_read_source(),
         );
-        assert!(matches!(&content, RenderedDiff::Text { model, .. } if model.git_read_receipt().is_some()));
+        assert!(
+            matches!(&content, RenderedDiff::Text { model, .. } if model.git_read_receipt().is_some())
+        );
         runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content));
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
@@ -1482,7 +1495,11 @@ mod tests {
             .unwrap();
         runtime.descriptor.worktree = runtime.descriptor.worktree.with_extension("different");
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
-        assert!(runtime.capture_diff_mutation(card, git_patch::Kind::Stage, None).is_none());
+        assert!(
+            runtime
+                .capture_diff_mutation(card, git_patch::Kind::Stage, None)
+                .is_none()
+        );
         assert!(prepared.apply(&mut runtime).is_err());
     }
 
