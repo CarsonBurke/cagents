@@ -184,7 +184,9 @@ impl Homes {
                 _ => Ok(()),
             };
             if let Err(error) = seeded {
-                let _ = self.remove(provider, key);
+                // The initializer may already have durably registered export
+                // ownership. Failed creation keeps that forensic namespace;
+                // cleanup needs the same complete lifecycle census as removal.
                 return Err(error);
             }
             link_shared(provider, system_home, &path);

@@ -41,9 +41,18 @@ impl Directory {
         }
         Ok(Self { identity: identity(&m), file })
     }
+    pub(super) fn verify(&self) -> Result<()> {
+        let m = self.file.metadata()?;
+        if !m.is_dir() || m.uid() != uid() || m.mode() & 0o777 != 0o700
+            || m.nlink() == 0 || identity(&m) != self.identity {
+            return Err(Error::Incomplete("Export directory changed owner, mode, identity, or lifetime"));
+        }
+        Ok(())
+    }
     pub(super) fn identity(&self) -> FileIdentity { self.identity }
     pub(super) fn fd(&self) -> &File { &self.file }
     pub(super) fn current_path(&self) -> Result<PathBuf> {
+        self.verify()?;
         let path = std::fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))?;
         if !path.is_absolute() || std::fs::canonicalize(&path)? != path
             || identity(&std::fs::metadata(&path)?) != self.identity {
@@ -52,6 +61,7 @@ impl Directory {
         Ok(path)
     }
     pub(super) fn create_dir(&self, child: &OsStr) -> Result<Self> {
+        self.verify()?;
         let child = name(child)?;
         if unsafe { libc::mkdirat(self.file.as_raw_fd(), child.as_ptr(), 0o700) } != 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -62,12 +72,14 @@ impl Directory {
         Ok(directory)
     }
     pub(super) fn open_dir(&self, child: &OsStr) -> Result<Self> {
+        self.verify()?;
         let child = name(child)?;
         let fd = unsafe { libc::openat(self.file.as_raw_fd(), child.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
         if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
         Self::from_file(unsafe { File::from_raw_fd(fd) })
     }
     pub(super) fn open_file(&self, child: &OsStr, write: bool) -> Result<File> {
+        self.verify()?;
         let child = name(child)?;
         let access = if write { libc::O_RDWR } else { libc::O_RDONLY };
         let fd = unsafe { libc::openat(self.file.as_raw_fd(), child.as_ptr(), access | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
@@ -77,6 +89,7 @@ impl Directory {
         Ok(file)
     }
     fn create_file(&self, child: &OsStr) -> Result<File> {
+        self.verify()?;
         let child = name(child)?;
         let fd = unsafe { libc::openat(self.file.as_raw_fd(), child.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
         if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
@@ -102,6 +115,7 @@ impl Directory {
             if Instant::now() >= deadline { return Err(Error::Deadline); }
             std::thread::sleep(Duration::from_millis(2));
         }
+        if Instant::now() >= deadline { return Err(Error::Deadline); }
         let named = self.open_file(child, false)?;
         if identity(&named.metadata()?) != original {
             return Err(Error::Incomplete("Export lock was replaced during admission"));
@@ -119,6 +133,7 @@ impl Directory {
         Ok((serde_json::from_slice(&data)?, data.len()))
     }
     pub(super) fn names(&self) -> Result<Vec<OsString>> {
+        self.verify()?;
         let mut names = Vec::new();
         // Enumeration uses procfs only as a descriptor locator; each entry is
         // subsequently opened NOFOLLOW relative to this actual directory FD.
@@ -131,6 +146,7 @@ impl Directory {
         Ok(names)
     }
     pub(super) fn atomic<T: Serialize>(&self, child: &OsStr, value: &T, replace: bool) -> Result<()> {
+        self.verify()?;
         let destination = name(child)?;
         let temp_name = OsString::from_vec(format!(".prepared-{}", uuid::Uuid::new_v4()).into_bytes());
         let temp = name(&temp_name)?;
@@ -146,6 +162,7 @@ impl Directory {
                 return Err(std::io::Error::last_os_error().into());
             }
             self.file.sync_all()?;
+            self.verify()?;
             Ok(())
         })();
         if result.is_err()
@@ -164,4 +181,10 @@ impl Write for Limited {
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+pub(super) fn encoded_size(value: &impl Serialize) -> Result<usize> {
+    let mut encoded = Limited { data: Vec::new() };
+    serde_json::to_writer(&mut encoded, value)?;
+    Ok(encoded.data.len())
 }
