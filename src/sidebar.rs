@@ -41,6 +41,9 @@ use crate::{
 };
 use row_interaction::RowInteraction;
 
+pub mod conversation;
+pub use conversation::ConversationEndTarget;
+
 mod selection;
 pub use selection::{Intent as SelectionIntent, Row as SelectionRow};
 

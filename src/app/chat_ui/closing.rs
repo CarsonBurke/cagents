@@ -113,6 +113,44 @@ pub(in crate::app) fn draft_key(session: &chat::Session) -> Option<String> {
 }
 
 impl Cagents {
+    fn conversation_end_placement(&self, card: CardId) -> Option<(Option<crate::model::ChannelId>, Option<PathBuf>, Option<crate::workspace_model::views::Scope>)> {
+        let mut channels = self.durable.channels.iter().filter(|channel| channel.cards.contains(&card));
+        let channel = channels.next().map(|channel| channel.id);
+        if channels.next().is_some() { return None; }
+        let mut views = self.workspace_model.views.iter().filter(|view| view.panes.iter().any(|pane| pane.id == card));
+        let shared_scope = views.next().map(|view| view.scope.clone());
+        if views.next().is_some() { return None; }
+        Some((channel, self.durable.card_scopes.get(&card).cloned(), shared_scope))
+    }
+    /// Capture when constructing a lazy, scoped sidebar menu, not in response
+    /// to its later click. The original issued and observed identity are kept
+    /// separately, including the legitimate unlearned/learned thread pair.
+    pub(in crate::app) fn capture_conversation_end_target(&self, card: CardId) -> Option<Arc<sidebar::ConversationEndTarget>> {
+        let source = self.chat_close_source(card)?;
+        let (channel, worktree, shared_scope) = self.conversation_end_placement(card)?;
+        Some(Arc::new(sidebar::ConversationEndTarget {
+            card, registry: source.registry, issued: Arc::new(source.descriptor), observed: Arc::new(source.session),
+            channel, worktree, shared_scope,
+        }))
+    }
+    pub(in crate::app) fn conversation_end_target_current(&self, target: &sidebar::ConversationEndTarget) -> bool {
+        target.registry == self.workspace_model.identity
+            && self.card_state(target.card).is_some_and(|card| card.existence.is_open()
+                && matches!(&card.kind, CardKind::Chat(issued) if terminal_close::same_chat_removal_source(&target.issued, issued)))
+            && self.chat_return_session(target.card).as_ref().is_some_and(|observed| terminal_close::same_chat_removal_source(&target.observed, observed))
+            && self.conversation_end_placement(target.card).is_some_and(|(channel, worktree, scope)| channel == target.channel && worktree == target.worktree && scope == target.shared_scope)
+    }
+    /// Existing command-template dispatch supplies its captured parameters;
+    /// never reconstruct authority from the current row/CardId on delivery.
+    pub(in crate::app) fn request_conversation_end(&mut self, target: Arc<sidebar::ConversationEndTarget>) -> Task<Message> {
+        if self.update_prepared || self.modal_is_open() { return Task::none(); }
+        if !self.conversation_end_target_current(&target) {
+            self.status = Some(TransientNotice::warning("The original conversation or its sidebar scope changed. Its current source was kept."));
+            return Task::none();
+        }
+        self.update_chat_close(Action::End(target.card))
+    }
+
     fn chat_close_source(&self, card: CardId) -> Option<CloseSource> {
         let state = self.card_state(card)?;
         let CardKind::Chat(descriptor) = &state.kind else {
@@ -869,6 +907,34 @@ mod tests {
         model.channels = vec![ModelChannel { id: channel, repository: directory.into(), title: "Retained conversation".into(), title_source: Default::default(), ordinal: 1 }];
         model.views = vec![view];
         app.workspace_model = model;
+    }
+
+    #[test]
+    fn sidebar_end_parameters_cannot_follow_replaced_identity_or_moved_scope() {
+        for change in 0..6 {
+            let (mut app, card, directory) = fixture();
+            write(&mut app, card, "keep sidebar conversation", true);
+            retain_in_channel(&mut app, directory.path(), vec![card]);
+            let target = app.capture_conversation_end_target(card).unwrap();
+            match change {
+                0 => app.workspace_model.identity = uuid::Uuid::new_v4(),
+                1 => {
+                    let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else { panic!("issued chat"); };
+                    session.launch.session_id = Some("replacement-issued-thread".into());
+                }
+                2 => {
+                    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("observed chat"); };
+                    runtime.session.launch.session_id = Some("replacement-observed-thread".into());
+                }
+                3 => Arc::make_mut(&mut app.durable).channels[0].cards.clear(),
+                4 => { Arc::make_mut(&mut app.durable).card_scopes.insert(card, directory.path().join("another-scope")); },
+                _ => {}
+            }
+            drop(app.request_conversation_end(target));
+            assert_eq!(app.chat_ui.close_dialog.is_some(), change == 5);
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.chat_ui.phases.is_empty());
+        }
     }
 
     #[test]
