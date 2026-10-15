@@ -268,7 +268,7 @@ impl State {
             self.buffer_bytes.store(0, Ordering::Release);
             result
         } else { return; };
-        let Ok((mut restored, record_epoch, clock)) = restored else { return; };
+        let Ok((mut restored, record_epoch, _cached_clock)) = restored else { return; };
         self.in_flight_bytes.store(restored.transcript_bytes() as u64, Ordering::Release);
         self.trace();
         #[cfg(test)]
@@ -288,9 +288,20 @@ impl State {
             self.in_flight_bytes.store(0, Ordering::Release);
             return;
         }
-        Arc::make_mut(&mut restored).read_only_reason = Some("Connection lost; showing the last cached view. Reconnect to refresh history or send messages.".into());
-        *snapshot = restored;
-        *owner.source_clock.lock().unwrap_or_else(|p| p.into_inner()) = clock;
+        // The file owns a last-viewed BODY, not authority to roll back newer
+        // control metadata received while hidden. Keep the current generation,
+        // outcome, requests, diagnostics and source clock. Only matching child
+        // identities receive cached body ownership; removed children stay gone.
+        let cached = Arc::make_mut(&mut restored);
+        let mut publication = (**snapshot).clone();
+        publication.items = std::mem::take(&mut cached.items);
+        for child in &mut publication.subagents {
+            if let Some(previous) = cached.subagents.iter_mut().find(|previous| previous.id == child.id) {
+                child.items = std::mem::take(&mut previous.items);
+            }
+        }
+        publication.read_only_reason = Some("Connection lost; showing the last cached view. Reconnect to refresh history or send messages.".into());
+        *snapshot = Arc::new(publication);
         owner.transcript_resident.store(true, Ordering::Release);
         self.in_flight_bytes.store(0, Ordering::Release);
         drop(data);
