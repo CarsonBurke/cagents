@@ -455,6 +455,12 @@ fn settings_category_controls<'a>(
                 SettingsField::MaxHotCards,
                 invalid,
             );
+            let git_status_limit = setting_input(
+                "Changed paths shown per worktree (1–100000). Larger repositories keep a capped list; bulk group actions still include every path.",
+                &draft.git_status_limit,
+                SettingsField::GitStatusLimit,
+                invalid,
+            );
             let hibernation = setting_input(
                 "Milliseconds before an inactive pane hibernates; 0 suspends immediately.",
                 &draft.hibernation_delay_ms,
@@ -475,7 +481,7 @@ fn settings_category_controls<'a>(
                 settings_group(
                     "Performance",
                     "Balance active panes and background resource use.",
-                    vec![hot_panes, hibernation],
+                    vec![hot_panes, hibernation, git_status_limit],
                 ),
                 settings_group(
                     "Reset",

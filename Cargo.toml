@@ -68,6 +68,7 @@ ui = [
     "dep:mermaid-rs-renderer",
     "dep:notify",
     "dep:resvg",
+    "dep:regex",
     "dep:roxmltree",
     "dep:rusqlite",
     "dep:tempfile",
@@ -137,6 +138,7 @@ cookie = { version = "0.18", optional = true }
 net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
 yaml-rust = { version = "0.4.5", optional = true }
 unicode-width = { version = "0.2.2", optional = true }
+regex = { version = "1.13", optional = true }
 unicode-casefold = { version = "0.2", optional = true }
 unicode-linebreak = { version = "0.1", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
