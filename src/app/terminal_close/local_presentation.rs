@@ -56,6 +56,9 @@ impl Cagents {
     pub(in crate::app) fn locally_dismissed_terminal(&self,card:CardId)->bool {
         self.terminal_close_bindings.local.hidden.get(&card).is_some_and(|target|self.local_terminal_dismissal_current(target))
     }
+    pub(in crate::app) fn locally_dismissed_terminal_ids(&self)->HashSet<CardId> {
+        self.terminal_close_bindings.local.hidden.keys().copied().filter(|card|self.locally_dismissed_terminal(*card)).collect()
+    }
     pub(in crate::app) fn prune_local_terminal_dismissals(&mut self) {
         let valid=self.terminal_close_bindings.local.hidden.iter().chain(self.terminal_close_bindings.local.unavailable.iter()).filter(|(_,target)|self.local_terminal_dismissal_current(target)).map(|(_,target)|target.token).collect::<HashSet<_>>();
         let state=&mut self.terminal_close_bindings.local;

@@ -1227,11 +1227,14 @@ impl Cagents {
     }
 
     fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
-        let panes=panes.iter().filter(|pane|!self.locally_dismissed_terminal(pane.id)).cloned().collect::<Vec<_>>();
+        // Validate the sparse local overlay once. Keep borrowed panes so a
+        // presentation-only filter never clones every launch/history payload.
+        let hidden=self.locally_dismissed_terminal_ids();
+        let panes=panes.iter().filter(|pane|!hidden.contains(&pane.id)).collect::<Vec<_>>();
         let camera = self.workspace.camera().offset();
         let focus = self.workspace.focused();
         let mut updates = Vec::new();
-        let visible = visible.iter().copied().filter(|card|!self.locally_dismissed_terminal(*card)).collect::<HashSet<_>>();
+        let visible = visible.iter().copied().filter(|card|!hidden.contains(card)).collect::<HashSet<_>>();
         let removed = self
             .workspace
             .order()
@@ -1240,7 +1243,7 @@ impl Cagents {
         for id in removed {
             // A transfer removes only this surface, leaving the actor and its
             // local runtime available in the destination view.
-            if !self.locally_dismissed_terminal(id) { match self.cards.get_mut(&id) {
+            if !hidden.contains(&id) { match self.cards.get_mut(&id) {
                 Some(CardRuntime::Terminal(surface)) => {
                     let _ = surface.focus(false);
                     let _ = surface.hide();
