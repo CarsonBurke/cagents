@@ -12349,6 +12349,97 @@ mod tests {
     }
 
     #[test]
+    fn hidden_account_switch_keeps_a_real_activity_frame_before_the_old_busy_reply() {
+        use crate::agent::ActivityState;
+        use crate::terminal_ipc::{ClientEnvelope, ClientRequest, FrameCodec, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION};
+        use std::{os::unix::net::UnixStream, sync::mpsc, thread, time::Duration};
+        for parked in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 450);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let source = chat_runtime(&app, card).session.clone();
+            let proof = source.proof.clone().unwrap();
+            let mut initial = chat_runtime(&app, card).snapshot.as_ref().clone();
+            initial.generation = 1;
+            initial.busy = true;
+            initial.ready = true;
+            initial.items = vec![Arc::new(chat::Item {
+                id: "hidden-account-history".into(), role: chat::Role::Assistant,
+                content: text("Original hidden history"), started_at: None, at: None,
+            })];
+            assert!(initial.transcript_bytes() > 0);
+            let attached_snapshot = initial.clone();
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let (emit_tx, emit_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut codec = FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES);
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION,
+                    request_id: Some(connect.request_id), proof: proof.clone(),
+                    message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: Vec::new() } } }).unwrap();
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { mut session, .. } = start.request else { panic!("native start") };
+                session.proof = Some(proof.clone());
+                let chat_id = session.id;
+                codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION,
+                    request_id: Some(start.request_id), proof: proof.clone(),
+                    message: ServerMessage::Response { response: ServerResponse::ChatAttached {
+                        session, snapshot: attached_snapshot, account_home: None } } }).unwrap();
+                emit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof,
+                    message: ServerMessage::ChatActivity { chat_id, state: ActivityState::Idle, generation: 2 } }).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let handle = Arc::new(ClientHandle::fixture_stream(client, source.clone(), move |wake| {
+                let _ = wake_tx.send(wake);
+            }).unwrap());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.connection = Connection::Live(handle.clone());
+            runtime.snapshot = Arc::new(initial);
+            runtime.replace_draft(text_editor::Content::with_text("Preserve hidden request"));
+            runtime.set_visible(false).unwrap();
+            drop(app.choose_chat_account(target, alternate.clone()));
+            drop(app.probe_queued_account_switch(target));
+            assert!(chat_runtime(&app, card).account_switch_checking);
+            if parked {
+                let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat") };
+                app.chat_ui.parked.insert(card, runtime);
+            }
+            emit_tx.send(()).unwrap();
+            let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(wake, Wake::Activity));
+            assert!(handle.snapshot().busy, "hidden activity never refreshed the old body snapshot");
+            assert_eq!(handle.snapshot().generation, 1);
+            assert_eq!(handle.snapshot().transcript_bytes(), 0);
+            assert_eq!(handle.account_switch_idle_observation(), Some(2));
+            drop(app.handle_chat_ui(Action::Wake(target, wake)));
+            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(runtime.account_switch_checking, "one newer hidden idle edge schedules one new read");
+            assert!(!runtime.account_switch_recheck);
+            assert_eq!(runtime.account_switch_checked_idle, Some(2));
+            assert_eq!(runtime.session, source);
+            assert_eq!(runtime.composer.text(), "Preserve hidden request");
+            assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+            assert!(!app.chat_start_pending(card));
+            assert!(app.chat_ui.retiring.is_empty());
+            // Without another activity edge, a second None must not spin.
+            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate, Ok(None))));
+            assert!(!app.chat_runtime_mut(target).unwrap().account_switch_checking);
+            assert!(handle.snapshot().busy);
+            assert_eq!(handle.snapshot().generation, 1);
+            done_tx.send(()).unwrap();
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
     fn queued_account_switch_uses_daemon_generation_for_hidden_and_parked_panes() {
         for parked in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
