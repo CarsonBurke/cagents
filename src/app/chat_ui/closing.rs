@@ -1070,6 +1070,65 @@ mod tests {
     }
 
     #[test]
+    fn a_qualified_saved_report_end_removes_only_its_original_membership() {
+        let (mut app, card, owner, report) = super::super::qualified_closed_console_archive_for_test();
+        let before = app.canonical_automation_archive_pane(card).expect("original canonical console");
+        let scope = app.workspace_model.views[0].scope.clone();
+        let original_report = serde_json::to_value(&*report).unwrap();
+        let original_owner = serde_json::to_value(&app.workspace_model.archived_automation_agents).unwrap();
+        let request = EndRequest::capture(&mut app, card, None).expect("qualified original archive source");
+        assert!(request.archived_metadata_only());
+        assert!(app.pending_shared_view_changes_for_test().is_empty());
+
+        drop(app.begin_chat_close_request(card, request));
+
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert_eq!(app.durable.automation_archives.get(&card), Some(&owner));
+        assert_eq!(serde_json::to_value(&*report).unwrap(), original_report);
+        assert_eq!(serde_json::to_value(&app.workspace_model.archived_automation_agents).unwrap(), original_owner);
+        assert!(app.chat_ui.phases.is_empty());
+        assert!(app.chat_ui.retiring.is_empty());
+        assert!(app.chat_ui.end_requests.is_empty());
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        let changes = app.pending_shared_view_changes_for_test();
+        assert!(changes.iter().any(|(current_scope, change)| current_scope == &scope && matches!(change,
+            crate::workspace_model::views::Change::RemoveArchivedAutomationSource { registry, before: captured, .. }
+                if *registry == app.workspace_model.identity && captured == &before)));
+        assert!(!changes.iter().any(|(_, change)| matches!(change,
+            crate::workspace_model::views::Change::Remove { .. }
+                | crate::workspace_model::views::Change::RemoveSource { .. })));
+    }
+
+    #[test]
+    fn a_saved_report_end_keeps_its_pane_when_original_scope_or_readiness_expires() {
+        for revoke_readiness in [false, true] {
+            let (mut app, card, owner, report) = super::super::qualified_closed_console_archive_for_test();
+            let request = EndRequest::capture(&mut app, card, None).unwrap();
+            assert!(request.archived_metadata_only());
+            let original_report = serde_json::to_value(&*report).unwrap();
+            if revoke_readiness {
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("ready report runtime"); };
+                runtime.archive_readiness = None;
+                assert!(!matches!(app.archived_pane_readiness(card), Ok(Some(true))));
+            } else {
+                let crate::workspace_model::views::Scope::Worktree { path, .. } = &mut app.workspace_model.views[0].scope else { panic!("original worktree"); };
+                *path = path.join("another-scope");
+            }
+            drop(app.begin_chat_close_request(card, request));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.workspace.order().any(|id| id == card));
+            assert_eq!(app.durable.automation_archives.get(&card), Some(&owner));
+            assert_eq!(serde_json::to_value(&*report).unwrap(), original_report);
+            assert!(app.pending_shared_view_changes_for_test().is_empty());
+            assert!(app.chat_ui.phases.is_empty());
+            assert!(app.chat_ui.retiring.is_empty());
+            assert!(app.chat_ui.end_requests.is_empty());
+            assert!(app.terminal_starts.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn an_unqualified_unpublished_archive_never_falls_through_to_provider_retirement() {
         let (mut app, card, _directory) = fixture();
         let source = attach_durable_owner(&mut app, card);

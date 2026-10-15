@@ -8640,6 +8640,14 @@ pub(super) fn show_chat_snapshot_for_test(
 }
 
 #[cfg(test)]
+pub(in crate::app) fn qualified_closed_console_archive_for_test() -> (
+    Cagents, CardId, crate::model::AgentId, Arc<crate::automations::ArchivedConversation>,
+) {
+    tests::qualified_closed_console_archive()
+}
+
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
@@ -17058,4 +17066,138 @@ mod tests {
             assert_eq!(chat_runtime(&app, card).failures, recorded);
         }
     }
+    /// Source-only shared fixture: all asynchronous tasks are dropped. The private
+    /// completion passes through the actual archive qualifier; no daemon/provider runs.
+    pub(super) fn qualified_closed_console_archive() -> (
+        Cagents, CardId, crate::model::AgentId, Arc<crate::automations::ArchivedConversation>,
+    ) {
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.workspace.resize_viewport(1600.0);
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Terminal(mut console) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("fixture terminal")
+        };
+        let id = crate::model::AgentId::from_uuid(card.as_uuid());
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("console-archive"),
+            boot_id: crate::model::BootId::new("console-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("console-incarnation"),
+        };
+        console.launch.program = "cagents".into();
+        console.launch.arguments = vec!["agent".into(), "console".into(), id.to_string()];
+        console.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(console.clone());
+        let mut saved = chat::fresh_session(
+            Provider::Claude,
+            console.id,
+            console.launch.working_directory.clone(),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        saved.proof = Some(proof);
+        saved.launch.session_id = Some("confirmed-console-archive".into());
+        let agent = Agent {
+            name: None,
+            id,
+            origin: Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+            spec: Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: console.launch.working_directory.clone(),
+                    directory: console.launch.working_directory.clone(),
+                    placement: None,
+                },
+                surface: Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Placement::Worktree {
+                repository: console.launch.working_directory.clone(),
+                path: console.launch.working_directory.clone(),
+            },
+            session: Some(HostedSession::Chat(saved.clone())),
+            console: Some(console.clone()),
+            created_ms: 1,
+            closed: true,
+        };
+        Arc::make_mut(&mut app.durable)
+            .automation_archives
+            .insert(card, id);
+        if let CardKind::Terminal(current) = &mut app.card_state_mut(card).unwrap().kind {
+            current.continuity = crate::model::TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0), signal: None, occurred_at_unix_ms: 2,
+                },
+            };
+        }
+        let directory = console.launch.working_directory.clone();
+        app.active_workspace = Some(directory.clone());
+        app.known_worktree_roots.insert(directory.clone());
+        Arc::make_mut(&mut app.durable).card_scopes.insert(card, directory.clone());
+        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(
+            crate::model::ProjectId::new(), crate::repository::RepositoryId::new(),
+            "Archive project".into(), directory.clone(), vec![], vec![],
+        ));
+        let scope = crate::workspace_model::views::Scope::Worktree {
+            repository: directory.clone(), path: directory.clone(),
+        };
+        let canonical = crate::workspace_model::views::Pane::from_card(
+            app.card_state(card).unwrap(), Some(directory.clone()),
+        ).unwrap();
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: directory.clone(), name: "Archive project".into(),
+            kind: Default::default(), ordinal: 1,
+        }];
+        app.workspace_model.views = vec![crate::workspace_model::views::View {
+            scope, revision: 1, panes: vec![canonical.clone()], retired: vec![],
+        }];
+        app.workspace_model.archived_automation_agents = vec![agent.clone()];
+        assert!(app.prepare_automation_archive(card, &agent));
+        assert_eq!(app.archived_pane_readiness(card), Ok(Some(false)));
+        let CardKind::Chat(requested) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("archive presentation is a native conversation");
+        };
+        let target = app.chat_ui.next_target(card);
+        app.chat_ui.phases.insert(card, Phase::ReadingArchive {
+            target, session: requested,
+        });
+        let archive = Arc::new(crate::automations::ArchivedConversation {
+            agent,
+            snapshot: Snapshot {
+                generation: 7, session_id: Some("confirmed-console-archive".into()),
+                exited: true,
+                read_only_reason: Some("Completed scheduled conversation".into()),
+                items: vec![Arc::new(chat::Item {
+                    id: "closed-automation-report".into(), role: chat::Role::Assistant,
+                    content: text("The saved automation result remains unchanged."),
+                    at: None, started_at: None,
+                })],
+                ..Default::default()
+            },
+        });
+        // Exercise the production completion/qualifier, not a fabricated Ready flag.
+        drop(app.handle_chat_ui(Action::Archived(target, Arc::new(Ok((*archive).clone())))));
+        assert_eq!(app.archived_pane_readiness(card), Ok(Some(true)));
+        assert_eq!(app.canonical_automation_archive_pane(card), Some(canonical));
+        let runtime = chat_runtime(&app, card);
+        assert!(matches!(runtime.connection, Connection::Archived));
+        assert!(runtime.handle().is_none());
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        (app, card, id, archive)
+    }
+
+
 }
