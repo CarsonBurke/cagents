@@ -21,6 +21,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod complete_inventory;
+mod pr_checkout;
+pub use pr_checkout::{
+    ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, PrCheckoutDisposition, PrCheckoutFailure,
+    PrCheckoutFailureKind, PrCheckoutTracking, VerifiedPrCheckout,
+};
+
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
 use crate::persistence::{PendingOperation, PendingOperationStatus, StateStore, StoreError};
