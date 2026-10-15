@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Repeatable, offline native-chat memory workload; Linux and Python stdlib only.
+
+Run prepare, then run inside an owned native compositor. In a second terminal,
+seed while that runner holds the shared build lock. Supply the runner's matched
+cagents executable explicitly. sample refuses a PID outside the private fixture.
+
+Record these stages on BOTH revisions, with the same viewport and renderer:
+small (one normal chat), restore100, visit20 (scroll each), hidden20 (focus the
+small chat), closed100, then repeat the same seed/visit/hide/close cycle twice.
+After seeding, restart only the private UI to measure fresh restore. Record raw
+screenshots, input sequences, source SHA/dirty diff, build profile and compositor
+alongside samples. Actor counts alone do not verify actual UI attachment.
+
+Samples are process-local. Daemon/provider RSS and RAM-backed cache storage are
+separate measurements. Exposed owner instrumentation counts Arc body references,
+not unique heap bytes; renderer/parser allocations require additional attribution.
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import time
+
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+MARKER = ".chat-memory-fixture-v1"
+STAGES = ("small", "restore100", "visit20", "hidden20", "closed100")
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def fixture_environment(root):
+    if not (root / MARKER).is_file():
+        raise SystemExit("prepare this private fixture first")
+    env = dict(os.environ)
+    for key in ("CAGENTS_AGENT_AUTHORITY", "CODEX_SESSION_ID", "CODEX_THREAD_ID"):
+        env.pop(key, None)
+    # A nested compositor's relative socket lives in the caller's runtime.
+    display = env.get("WAYLAND_DISPLAY")
+    if display and not display.startswith("/"):
+        env["WAYLAND_DISPLAY"] = str(Path(env["XDG_RUNTIME_DIR"]) / display)
+    original_home = Path.home()
+    runtime = Path("/run/user") / str(os.getuid()) / (
+        "chat-memory-" + hashlib.sha256(os.fsencode(root)).hexdigest()[:12]
+    )
+    runtime.mkdir(mode=0o700, exist_ok=True)
+    if runtime.stat().st_uid != os.getuid():
+        raise SystemExit("private runtime has another owner")
+    runtime.chmod(0o700)
+    env.setdefault("CARGO_HOME", str(original_home / ".cargo"))
+    env.setdefault("RUSTUP_HOME", str(original_home / ".rustup"))
+    env.update(
+        HOME=str(root / "home"), XDG_RUNTIME_DIR=str(runtime),
+        XDG_DATA_HOME=str(root / "data"), XDG_CONFIG_HOME=str(root / "config"),
+        XDG_CACHE_HOME=str(root / "cache"), XDG_STATE_HOME=str(root / "state"),
+        CODEX_HOME=str(root / "home/.codex"),
+        PATH=str(root / "bin") + ":" + env["PATH"],
+    )
+    return env
+
+
+def cli_call(cli, env, arguments, root):
+    cli = cli.resolve(strict=True)
+    for sibling in ("cagents-ui", "cagentsd"):
+        if not (cli.parent / sibling).is_file():
+            raise SystemExit("supply a matched CLI/UI/daemon directory")
+    result = subprocess.run([str(cli), "--json", *arguments], env=env,
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+    with (root / "cli.jsonl").open("a") as output:
+        output.write(json.dumps({"arguments": arguments, "exit": result.returncode,
+                                 "stdout": result.stdout, "stderr": result.stderr}) + "\n")
+    result.check_returncode()
+    value = json.loads(result.stdout)
+    return value.get("data", value)
+
+
+def proc_fields(path):
+    values = {}
+    for line in path.read_text().splitlines():
+        key, _, value = line.partition(":")
+        words = value.split()
+        if words and words[0].isdigit():
+            values[key] = int(words[0])
+    return values
+
+
+def sample(root, pid, stage, seconds):
+    process = Path("/proc") / str(pid)
+    environment = dict(part.split(b"=", 1) for part in
+                       (process / "environ").read_bytes().split(b"\0") if b"=" in part)
+    if environment.get(b"XDG_DATA_HOME") != os.fsencode(root / "data"):
+        raise SystemExit("refusing to sample a process outside this private fixture")
+    if (process / "exe").resolve().name != "cagents-ui":
+        raise SystemExit("sample requires the explicit native UI PID")
+    start_identity = (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    started = time.monotonic()
+    samples = []
+    while time.monotonic() - started < seconds:
+        stat = (process / "stat").read_text().rsplit(")", 1)[1].split()
+        if stat[19] != start_identity:
+            raise SystemExit("sample PID was recycled")
+        status = proc_fields(process / "status")
+        memory = proc_fields(process / "smaps_rollup")
+        samples.append({
+            "elapsed_seconds": time.monotonic() - started, "rss_kib": memory["Rss"],
+            "anonymous_pss_kib": memory["Pss_Anon"], "file_pss_kib": memory["Pss_File"],
+            "swap_kib": memory["Swap"], "peak_rss_kib": status["VmHWM"],
+            "threads": status["Threads"], "cpu_ticks": int(stat[11]) + int(stat[12]),
+        })
+        time.sleep(0.25)
+    ticks = os.sysconf("SC_CLK_TCK")
+    duration = max(0.0001, samples[-1]["elapsed_seconds"] - samples[0]["elapsed_seconds"])
+    summary = {key: max(row[key] for row in samples) for key in (
+        "rss_kib", "anonymous_pss_kib", "file_pss_kib", "swap_kib", "peak_rss_kib", "threads")}
+    summary["cpu_percent"] = (samples[-1]["cpu_ticks"] - samples[0]["cpu_ticks"]) / ticks / duration * 100
+    report = {"stage": stage, "pid": pid, "start_identity": start_identity,
+              "clock_ticks_per_second": ticks, "samples": samples, "summary": summary}
+    path = root / (stage + ".json")
+    if path.exists():
+        raise SystemExit("refusing to overwrite a stage; use a new cycle suffix")
+    write_json(path, report)
+    print(json.dumps(summary))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("action", choices=("prepare", "run", "seed", "close", "sample", "environment"))
+    parser.add_argument("--root", type=Path, required=True, help="new disk-backed private fixture directory")
+    parser.add_argument("--cli", type=Path, help="absolute matched development cagents executable")
+    parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--cycle", type=int, default=1)
+    parser.add_argument("--pid", type=int)
+    parser.add_argument("--stage", help="stage name, e.g. restore100-cycle1")
+    parser.add_argument("--seconds", type=float, default=10)
+    parser.add_argument("--fresh-daemon", action="store_true", help="stop ONLY this fixture's hosted jobs after builds")
+    parser.add_argument("--build-lock", type=Path, default=Path.home() / ".cache/cagents-issue-build.lock")
+    args = parser.parse_args()
+    root = args.root.resolve()
+    if (root in (Path("/"), Path.home(), REPOSITORY)
+            or root.is_relative_to("/run") or root.is_relative_to("/dev/shm")):
+        parser.error("choose a dedicated disk-backed fixture directory")
+    if args.action == "prepare":
+        root.mkdir(parents=True, exist_ok=False, mode=0o700)
+        (root / MARKER).touch(mode=0o600)
+        for name in ("home", "data", "config", "cache", "state", "bin", "project"):
+            (root / name).mkdir(mode=0o700)
+        provider = REPOSITORY / "tests/fixtures/chat-memory-claude.py"
+        shutil.copy2(provider, root / "bin/claude")
+        for name in ("codex", "omp"):
+            path = root / "bin" / name
+            path.write_text("#!/bin/sh\n# Real providers are disabled in this fixture.\nexit 127\n")
+            path.chmod(0o700)
+        subprocess.run(["git", "init", "--quiet", str(root / "project")], check=True,
+                       env=fixture_environment(root))
+        write_json(root / "manifest.json", {
+            "fixture": MARKER, "provider_sha256": hashlib.sha256(provider.read_bytes()).hexdigest(),
+            "workload": {"parent_kib": 512, "children": 32, "child_kib": 64, "tool_rows": 30},
+            "stages": STAGES, "seeded_actors_are_not_proof_of_ui_attachment": True,
+        })
+        return
+    env = fixture_environment(root)
+    if args.action == "environment":
+        # Only allowlisted non-secret paths; do not dump the inherited environment.
+        print(json.dumps({key: env[key] for key in ("HOME", "XDG_RUNTIME_DIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME")}, indent=2))
+    elif args.action == "run":
+        env["CARGO_BUILD_JOBS"] = "2"
+        env.setdefault("RUST_LOG", "cagents::memory=trace,cagents=debug,cagentsd=debug,warn")
+        native_lock = args.build_lock.parent / "cagents-native-ui.lock"
+        args.build_lock.parent.mkdir(parents=True, exist_ok=True)
+        with native_lock.open("a") as native, args.build_lock.open("a") as build:
+            fcntl.flock(native, fcntl.LOCK_EX)
+            fcntl.flock(build, fcntl.LOCK_EX)
+            command = [str(REPOSITORY / "scripts/run-development"), "--browserless", "--debug",
+                       "--log-file", str(root / "ui.log")]
+            if args.fresh_daemon:
+                command.append("--fresh-daemon")
+            raise SystemExit(subprocess.call(command, cwd=REPOSITORY, env=env))
+    elif args.action in ("seed", "close"):
+        if args.cli is None or not args.cli.is_absolute() or not 1 <= args.count <= 120:
+            parser.error("seed/close need an absolute matched --cli and count1..120")
+        manifest = root / ("actors-cycle" + str(args.cycle) + ".json")
+        if args.action == "seed":
+            cli_call(args.cli, env, ["project", "open", str(root / "project")], root)
+            actors = []
+            for index in range(args.count):
+                name = "memory-" + str(args.cycle) + "-" + str(index).zfill(3)
+                actors.append(cli_call(args.cli, env, [
+                    "agent", "spawn", "--provider", "claude", "--model", "haiku", "--name", name,
+                    "--directory", str(root / "project"), "--idempotency-key", name,
+                    "memory 512 32 " + name], root))
+                write_json(manifest, actors)
+                print(index + 1, flush=True)
+            for actor in actors:
+                settled = cli_call(args.cli, env, ["agent", "wait", actor["run"]["id"], "--timeout", "60"], root)
+                if settled["run"]["state"] != "Succeeded":
+                    raise SystemExit("fixture actor did not settle; inspect private cli.jsonl")
+        else:
+            # Close only IDs minted by this fixture; never global inventory.
+            for actor in json.loads(manifest.read_text()):
+                cli_call(args.cli, env, ["agent", "close", actor["agent"]["id"]], root)
+    elif args.action == "sample":
+        if not args.pid or not args.stage or not 0.5 <= args.seconds <= 60:
+            parser.error("sample needs --pid, --stage and seconds0.5..60")
+        if not args.stage.replace("-", "").replace("_", "").isalnum():
+            parser.error("stage must be a plain filename component")
+        sample(root, args.pid, args.stage, args.seconds)
+
+
+if __name__ == "__main__":
+    main()
