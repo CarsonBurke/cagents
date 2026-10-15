@@ -1652,7 +1652,8 @@ impl Cagents {
             | Action::BusyAgentsConfirmed(..) => !self.worktree_delete_dialog_on_top(),
             Action::DismissDelete(request) => {
                 !self.worktree_delete_dialog_on_top()
-                    || self.project_ui.dialog.as_ref().map(|dialog| dialog.request) != Some(*request)
+                    || self.project_ui.dialog.as_ref().map(|dialog| dialog.request)
+                        != Some(*request)
             }
             Action::ConfirmRemove(request) | Action::DismissRemove(request) => {
                 self.project_ui.removal_request() != Some(*request)
@@ -1662,7 +1663,8 @@ impl Cagents {
             }
             Action::Dismiss => {
                 !self.project_ui.force_branches.is_empty()
-                    || ((self.project_ui.remove_dialog.is_some() || self.project_ui.dialog.is_some())
+                    || ((self.project_ui.remove_dialog.is_some()
+                        || self.project_ui.dialog.is_some())
                         && self.project_ui.cleanup_dialog.is_none())
             }
             _ => false,
@@ -2188,7 +2190,7 @@ impl Cagents {
                             .force_branches
                             .push_back((request, failure.detail));
                         return iced::widget::operation::focus(self.project_ui.focus_target())
-                        .map(cosmic::Action::App);
+                            .map(cosmic::Action::App);
                     }
                     Err(failure)
                         if failure.kind
@@ -3063,7 +3065,10 @@ impl Cagents {
         // Declining to run a failed deletion again is the answer to it,
         // so its row stops asking.
         if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
-            && self.project_ui.deletions.get(&id)
+            && self
+                .project_ui
+                .deletions
+                .get(&id)
                 .is_some_and(|deletion| deletion.failure.is_some())
         {
             self.project_ui.deletions.remove(&id);
@@ -3298,11 +3303,8 @@ impl Cagents {
     pub(super) fn project_dialog_overlay(&self) -> Option<Element<'_, Message>> {
         let surface = self.project_dialog_view()?;
         let dismiss = self.project_dialog_dismiss_action();
-        let overlay = super::dialog_ui::overlay(
-            surface,
-            Some(Message::ProjectUi(dismiss.clone())),
-            1.0,
-        );
+        let overlay =
+            super::dialog_ui::overlay(surface, Some(Message::ProjectUi(dismiss.clone())), 1.0);
         Some(match dismiss {
             Action::DismissRemove(request) => {
                 // Replace unnamed native press state too. Named controls also
@@ -6074,16 +6076,25 @@ mod tests {
     fn deletion_review_fixture() -> (Cagents, tempfile::TempDir, WorktreeId) {
         let repository = PathBuf::from("/delete-native-owner");
         let primary = SidebarWorktree::from_durable(
-            WorktreeId::new(), repository.clone(), Some("main".into()),
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
         );
         let linked = SidebarWorktree::from_durable(
-            WorktreeId::new(), repository.join("linked"), Some("feature".into()),
+            WorktreeId::new(),
+            repository.join("linked"),
+            Some("feature".into()),
         );
         let (mut app, directory, project) = deletable_app(&repository, &linked, &primary);
         let target = app.project_target(project, Some(linked.id)).unwrap();
-        app.project_ui.deletions.insert(linked.id, Deletion {
-            target, started_at: Instant::now(), failure: Some("owned earlier attempt failed".into()),
-        });
+        app.project_ui.deletions.insert(
+            linked.id,
+            Deletion {
+                target,
+                started_at: Instant::now(),
+                failure: Some("owned earlier attempt failed".into()),
+            },
+        );
         ready_deletion_retry(&mut app, linked.id);
         (app, directory, linked.id)
     }
@@ -6096,11 +6107,18 @@ mod tests {
         drop(app.handle_project_action(Action::DeleteOptionsRead {
             request,
             result: Ok(DeleteOptions {
-                branch_elsewhere: false, stale_lock: false, lock_error: None,
+                branch_elsewhere: false,
+                stale_lock: false,
+                lock_error: None,
             }),
         }));
-        let result = fixture_safety_result(app, Ok((clean_snapshot(), AgentCensus::default())), false);
-        drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result }));
+        let result =
+            fixture_safety_result(app, Ok((clean_snapshot(), AgentCensus::default())), false);
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: false,
+            result,
+        }));
         let review = app.project_ui.dialog.as_ref().unwrap();
         assert!(review.safety.is_some() && review.stop_authorization.is_some());
         assert!(!review.loading && !review.options_loading && review.blocker.is_none());
@@ -6117,21 +6135,34 @@ mod tests {
             let mut element = app.dialog().unwrap();
             let mut tree = Tree::new(element.as_widget());
             let (node, bounds) = removal_native_frame(&mut element, &mut tree, &renderer);
-            let point = role.map(|role| bounds[&deletion_control_id(old, role).to_string()].center())
+            let point = role
+                .map(|role| bounds[&deletion_control_id(old, role).to_string()].center())
                 .unwrap_or(Point::new(4.0, 4.0));
             let mut messages = removal_pointer_event(
-                &mut element, &mut tree, &renderer, &node, point,
+                &mut element,
+                &mut tree,
+                &renderer,
+                &node,
+                point,
                 mouse::Event::ButtonPressed(mouse::Button::Left),
             );
             messages.extend(removal_pointer_event(
-                &mut element, &mut tree, &renderer, &node, point,
+                &mut element,
+                &mut tree,
+                &renderer,
+                &node,
+                point,
                 mouse::Event::ButtonReleased(mouse::Button::Left),
             ));
-            assert!(matches!(messages.as_slice(), [Message::ProjectUi(Action::DismissDelete(request))] if *request == old));
+            assert!(
+                matches!(messages.as_slice(), [Message::ProjectUi(Action::DismissDelete(request))] if *request == old)
+            );
             drop(element);
             let current = ready_deletion_retry(&mut app, worktree);
             assert_ne!(old, current);
-            for message in messages { drop(app.update(message)); }
+            for message in messages {
+                drop(app.update(message));
+            }
             drop(app.handle_project_action(Action::Dismiss));
             assert_eq!(app.project_ui.dialog.as_ref().unwrap().request, current);
             assert!(!app.project_ui.is_deleting(worktree));
@@ -6143,7 +6174,10 @@ mod tests {
 
     #[test]
     fn deletion_native_press_does_not_transfer_to_a_replacement_review() {
-        use cosmic::iced::{advanced::widget::{Tree, tree}, mouse};
+        use cosmic::iced::{
+            advanced::widget::{Tree, tree},
+            mouse,
+        };
         for role in ["cancel", "confirm"] {
             let (mut app, _directory, worktree) = deletion_review_fixture();
             let old = app.project_ui.dialog.as_ref().unwrap().request;
@@ -6152,10 +6186,17 @@ mod tests {
             let mut state = Tree::new(element.as_widget());
             let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
             let point = bounds[&deletion_control_id(old, role).to_string()].center();
-            assert!(removal_pointer_event(
-                &mut element, &mut state, &renderer, &node, point,
-                mouse::Event::ButtonPressed(mouse::Button::Left),
-            ).is_empty());
+            assert!(
+                removal_pointer_event(
+                    &mut element,
+                    &mut state,
+                    &renderer,
+                    &node,
+                    point,
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                )
+                .is_empty()
+            );
             drop(element);
             let current = ready_deletion_retry(&mut app, worktree);
             let mut element = app.dialog().unwrap();
@@ -6169,44 +6210,79 @@ mod tests {
             let current_point = bounds[&deletion_control_id(current, role).to_string()].center();
             assert_ne!(old, current);
             assert_eq!(point, current_point);
-            assert!(removal_pointer_event(
-                &mut element, &mut state, &renderer, &node, current_point,
-                mouse::Event::ButtonReleased(mouse::Button::Left),
-            ).is_empty());
-            assert!(removal_pointer_event(
-                &mut element, &mut state, &renderer, &node, current_point,
-                mouse::Event::ButtonPressed(mouse::Button::Left),
-            ).is_empty());
+            assert!(
+                removal_pointer_event(
+                    &mut element,
+                    &mut state,
+                    &renderer,
+                    &node,
+                    current_point,
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                )
+                .is_empty()
+            );
+            assert!(
+                removal_pointer_event(
+                    &mut element,
+                    &mut state,
+                    &renderer,
+                    &node,
+                    current_point,
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                )
+                .is_empty()
+            );
             let messages = removal_pointer_event(
-                &mut element, &mut state, &renderer, &node, current_point,
+                &mut element,
+                &mut state,
+                &renderer,
+                &node,
+                current_point,
                 mouse::Event::ButtonReleased(mouse::Button::Left),
             );
             assert_eq!(messages.len(), 1, "the current review remains usable");
             assert!(match &messages[0] {
-                Message::ProjectUi(Action::DismissDelete(request)) if role == "cancel" => *request == current,
-                Message::ProjectUi(Action::ConfirmDelete(request)) if role == "confirm" => *request == current,
+                Message::ProjectUi(Action::DismissDelete(request)) if role == "cancel" =>
+                    *request == current,
+                Message::ProjectUi(Action::ConfirmDelete(request)) if role == "confirm" =>
+                    *request == current,
                 _ => false,
             });
             drop(element);
-            for message in messages { drop(app.update(message)); }
+            for message in messages {
+                drop(app.update(message));
+            }
             if role == "cancel" {
                 assert!(app.project_ui.dialog.is_none());
             } else {
                 let review = app.project_ui.dialog.as_ref().unwrap();
                 assert_eq!(review.request, current);
-                assert!(review.loading, "only a fresh current press starts its recheck");
+                assert!(
+                    review.loading,
+                    "only a fresh current press starts its recheck"
+                );
             }
-            assert!(!app.project_ui.is_deleting(worktree), "no worker was polled");
+            assert!(
+                !app.project_ui.is_deleting(worktree),
+                "no worker was polled"
+            );
         }
     }
 
-    fn queued_force_reviews() -> (Cagents, crate::model::OperationId, crate::model::OperationId) {
+    fn queued_force_reviews() -> (
+        Cagents,
+        crate::model::OperationId,
+        crate::model::OperationId,
+    ) {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let mut ids = Vec::new();
         for branch in ["branch-a", "branch-b"] {
             let request = BranchDeletion {
-                id: crate::model::OperationId::new(), repository: "/repo".into(),
-                branch: branch.into(), expected_oid: "a".repeat(40), warnings: Vec::new(),
+                id: crate::model::OperationId::new(),
+                repository: "/repo".into(),
+                branch: branch.into(),
+                expected_oid: "a".repeat(40),
+                warnings: Vec::new(),
                 continuation: Some(fixture_branch_continuation()),
             };
             ids.push(request.id);
@@ -6224,14 +6300,19 @@ mod tests {
     }
 
     fn escape_project_review(app: &mut Cagents) {
-        use cosmic::iced::keyboard::{self, key::{Code, Named}};
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Named},
+        };
         drop(app.update(Message::KeyEvent {
             event: keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(Named::Escape),
                 modified_key: keyboard::Key::Named(Named::Escape),
                 physical_key: keyboard::key::Physical::Code(Code::Escape),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
             },
             captured: false,
         }));
@@ -6246,21 +6327,34 @@ mod tests {
             let mut element = app.dialog().unwrap();
             let mut tree = Tree::new(element.as_widget());
             let (node, bounds) = removal_native_frame(&mut element, &mut tree, &renderer);
-            let point = role.map(|role| bounds[&force_branch_control_id(old, role).to_string()].center())
+            let point = role
+                .map(|role| bounds[&force_branch_control_id(old, role).to_string()].center())
                 .unwrap_or(Point::new(4.0, 4.0));
             let mut messages = removal_pointer_event(
-                &mut element, &mut tree, &renderer, &node, point,
+                &mut element,
+                &mut tree,
+                &renderer,
+                &node,
+                point,
                 mouse::Event::ButtonPressed(mouse::Button::Left),
             );
             messages.extend(removal_pointer_event(
-                &mut element, &mut tree, &renderer, &node, point,
+                &mut element,
+                &mut tree,
+                &renderer,
+                &node,
+                point,
                 mouse::Event::ButtonReleased(mouse::Button::Left),
             ));
-            assert!(matches!(messages.as_slice(), [Message::ProjectUi(Action::KeepBranch(id))] if *id == old));
+            assert!(
+                matches!(messages.as_slice(), [Message::ProjectUi(Action::KeepBranch(id))] if *id == old)
+            );
             drop(element);
             escape_project_review(&mut app);
             assert_eq!(app.project_ui.force_branches.front().unwrap().0.id, current);
-            for message in messages { drop(app.update(message)); }
+            for message in messages {
+                drop(app.update(message));
+            }
             drop(app.handle_project_action(Action::Dismiss));
             assert_eq!(app.project_ui.force_branches.front().unwrap().0.id, current);
             assert!(app.project_ui.branch_requests.is_empty());
@@ -6271,7 +6365,10 @@ mod tests {
 
     #[test]
     fn queued_force_native_press_does_not_transfer_after_escape() {
-        use cosmic::iced::{advanced::widget::{Tree, tree}, mouse};
+        use cosmic::iced::{
+            advanced::widget::{Tree, tree},
+            mouse,
+        };
         for role in ["keep", "force"] {
             let (mut app, old, current) = queued_force_reviews();
             let renderer = super::super::tests::headless_renderer();
@@ -6279,10 +6376,17 @@ mod tests {
             let mut state = Tree::new(element.as_widget());
             let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
             let point = bounds[&force_branch_control_id(old, role).to_string()].center();
-            assert!(removal_pointer_event(
-                &mut element, &mut state, &renderer, &node, point,
-                mouse::Event::ButtonPressed(mouse::Button::Left),
-            ).is_empty());
+            assert!(
+                removal_pointer_event(
+                    &mut element,
+                    &mut state,
+                    &renderer,
+                    &node,
+                    point,
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                )
+                .is_empty()
+            );
             drop(element);
             escape_project_review(&mut app);
             assert_eq!(app.project_ui.force_branches.front().unwrap().0.id, current);
@@ -6292,30 +6396,55 @@ mod tests {
             iced::runtime::user_interface::restore_cached_named_states(&mut state);
             tree::NAMED.with(|named| named.borrow_mut().clear());
             let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
-            let current_point = bounds[&force_branch_control_id(current, role).to_string()].center();
+            let current_point =
+                bounds[&force_branch_control_id(current, role).to_string()].center();
             assert_eq!(point, current_point);
-            assert!(removal_pointer_event(
-                &mut element, &mut state, &renderer, &node, current_point,
-                mouse::Event::ButtonReleased(mouse::Button::Left),
-            ).is_empty());
-            assert!(removal_pointer_event(
-                &mut element, &mut state, &renderer, &node, current_point,
-                mouse::Event::ButtonPressed(mouse::Button::Left),
-            ).is_empty());
+            assert!(
+                removal_pointer_event(
+                    &mut element,
+                    &mut state,
+                    &renderer,
+                    &node,
+                    current_point,
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                )
+                .is_empty()
+            );
+            assert!(
+                removal_pointer_event(
+                    &mut element,
+                    &mut state,
+                    &renderer,
+                    &node,
+                    current_point,
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                )
+                .is_empty()
+            );
             let messages = removal_pointer_event(
-                &mut element, &mut state, &renderer, &node, current_point,
+                &mut element,
+                &mut state,
+                &renderer,
+                &node,
+                current_point,
                 mouse::Event::ButtonReleased(mouse::Button::Left),
             );
             assert_eq!(messages.len(), 1);
             assert!(match &messages[0] {
                 Message::ProjectUi(Action::KeepBranch(id)) if role == "keep" => *id == current,
-                Message::ProjectUi(Action::ForceDeleteBranch(id)) if role == "force" => *id == current,
+                Message::ProjectUi(Action::ForceDeleteBranch(id)) if role == "force" =>
+                    *id == current,
                 _ => false,
             });
             drop(element);
-            for message in messages { drop(app.update(message)); }
+            for message in messages {
+                drop(app.update(message));
+            }
             assert!(app.project_ui.force_branches.is_empty());
-            assert_eq!(app.project_ui.branch_requests.contains(&current), role == "force");
+            assert_eq!(
+                app.project_ui.branch_requests.contains(&current),
+                role == "force"
+            );
             assert!(!app.project_ui.branch_requests.contains(&old));
             // The returned force-delete task is deliberately never polled.
         }
@@ -6360,7 +6489,10 @@ mod tests {
         assert!(app.project_ui.dialog.as_ref().unwrap().blocker.is_some());
         assert_eq!(
             super::super::tests::focused_element(app.project_dialog_view().unwrap(), task),
-            Some(deletion_control_id(app.project_ui.dialog.as_ref().unwrap().request, "cancel")),
+            Some(deletion_control_id(
+                app.project_ui.dialog.as_ref().unwrap().request,
+                "cancel"
+            )),
         );
     }
 
