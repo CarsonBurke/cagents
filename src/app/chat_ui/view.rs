@@ -1211,12 +1211,7 @@ impl Runtime {
 
     /// The logical copy/selection catalog is rebuilt only when exposed text
     /// or disclosure changes, never for mouse motion, copying, find or timers.
-    fn selection_document(
-        &self,
-    ) -> (
-        Arc<selection::Catalog>,
-        std::rc::Rc<std::cell::RefCell<selection::Bookmark>>,
-    ) {
+    pub(super) fn selection_document(&self) -> (Arc<selection::Catalog>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>) {
         use std::hash::{Hash, Hasher};
         let mut fingerprint = std::hash::DefaultHasher::new();
         self.selected_subagent.hash(&mut fingerprint);
@@ -1341,9 +1336,8 @@ impl Runtime {
             builder.plain(&item.id, &[2], text.into());
             return;
         }
-        let Some(cached) = self.cache.get(&item.id) else {
-            return;
-        };
+        let Some(cached) = self.cache.get(&item.id) else { return; };
+        if cached.placeholder { return; }
         if slot == turn::Slot::Thinking && !self.expanded.contains(&item.id) {
             let selected = self
                 .selected_subagent

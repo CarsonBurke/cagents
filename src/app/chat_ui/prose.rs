@@ -260,6 +260,9 @@ pub(super) fn view(
     target: Target,
     find: Option<&str>,
 ) -> Element<'static, Message> {
+    if cached.placeholder {
+        return widget::text::caption("Loading message…").into();
+    }
     Renderer {
         target,
         blocks: cached
