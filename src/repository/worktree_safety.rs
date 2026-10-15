@@ -64,13 +64,34 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     pub fn notable_ignored_files(&self, worktree: &Path, cancellation: &CancellationToken) -> Result<Vec<RepoPath>, RepositoryError> {
         let directories = self.disposable_ignored_directories(worktree, cancellation)?;
         let names: HashSet<_> = directories.iter().map(OsStr::new).collect();
-        let command = self.git_read(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]);
+        let disposable = |path: &RepoPath, directory: bool| {
+            let path = Path::new(path.as_os_str());
+            let directory = if directory { Some(path) } else { path.parent() };
+            directory.into_iter().flat_map(Path::components)
+                .any(|component| names.contains(component.as_os_str()))
+        };
+        // Collapse wholly ignored directories first, so target/node_modules
+        // need not enumerate hundreds of thousands of disposable artifacts.
+        let command = self.git_read(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z"]);
         let output = self.run_checked(&command, cancellation)?;
         let paths = parse_path_list(&output.stdout, "ignored worktree files")?;
-        Ok(paths.into_iter().filter(|path| {
-            let path = Path::new(path.as_os_str());
-            !path.parent().into_iter().flat_map(Path::components).any(|component| names.contains(component.as_os_str()))
-        }).collect())
+        let mut notable = std::collections::BTreeSet::new();
+        let mut directories = Vec::new();
+        for (path, raw) in paths.into_iter().zip(output.stdout.split(|byte| *byte == 0).filter(|raw| !raw.is_empty())) {
+            let directory = raw.ends_with(b"/");
+            if disposable(&path, directory) { continue; }
+            if directory { directories.push(path); } else { notable.insert(path); }
+        }
+        // Expand only non-disposable directories, keeping exact file counts
+        // and fingerprints rather than treating a whole folder as one file.
+        // Small batches also keep ignored-prefix queries below argv limits.
+        for batch in directories.chunks(64) {
+            let mut arguments: Vec<OsString> = ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--"].into_iter().map(OsString::from).collect();
+            arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
+            let output = self.run_checked(&self.git_literal_read(worktree, arguments), cancellation)?;
+            notable.extend(parse_path_list(&output.stdout, "ignored worktree files")?.into_iter().filter(|path| !disposable(path, false)));
+        }
+        Ok(notable.into_iter().collect())
     }
 
     /// Call on a worker at dialog open and again immediately before removal.
@@ -166,7 +187,9 @@ mod tests {
         fs::write(root.join("node_modules"), "user data").unwrap();
         assert_eq!(service.notable_ignored_files(root, &cancellation).unwrap(), vec![RepoPath::from_bytes(b"node_modules").unwrap()]);
         fs::remove_file(root.join("node_modules")).unwrap();
-        fs::create_dir(root.join("cache")).unwrap();
+        fs::create_dir_all(root.join("cache/target/nested")).unwrap();
+        fs::write(root.join("cache/target/nested/generated"), "disposable").unwrap();
+        assert!(service.notable_ignored_files(root, &cancellation).unwrap().is_empty());
         fs::write(root.join("cache/data"), "custom").unwrap();
         assert!(!service.notable_ignored_files(root, &cancellation).unwrap().is_empty());
         let mut names = default_disposable_ignored_directories();
