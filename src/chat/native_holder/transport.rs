@@ -205,6 +205,12 @@ impl Holder {
     }
 
     #[cfg(test)]
+    pub(in crate::chat) fn replace_control_for_test(&mut self,stream:UnixStream)->super::Detached {
+        self.control=Some(stream);
+        self.identity.clone()
+    }
+
+    #[cfg(test)]
     pub(in crate::chat) fn disconnect_control_for_test(&self) {
         self.control.as_ref().unwrap().shutdown(std::net::Shutdown::Both).unwrap();
     }
