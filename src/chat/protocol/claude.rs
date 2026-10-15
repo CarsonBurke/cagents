@@ -2112,7 +2112,12 @@ impl Adapter for Claude {
                 self.retire(required(&frame, "request_id")?.into(), &mut step);
             }
             "conversation_reset" => {
+                // Pending control receipts still name their original native
+                // generation. A reset begins a different current conversation,
+                // even before another prompt emits TurnStarted.
+                self.attention_generation = self.attention_generation.wrapping_add(1);
                 self.started_generation = None;
+                self.interruption = None;
                 self.session_id = None;
                 self.history = None;
                 self.pending.clear();
@@ -5614,6 +5619,21 @@ mod tests {
         assert!(advisory.writes.is_empty());
         assert!(!advisory.events.iter().any(|event| matches!(event, Event::Error { .. })));
         assert_eq!(adapter.controls.len(), MAX_PENDING + 1);
+    }
+
+    #[test]
+    fn reset_before_old_interrupt_ack_keeps_old_outcome_out_of_the_new_idle_conversation() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let id = interrupt.writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.receive(json!({"type":"result","uuid":"old-before-reset","subtype":"success","is_error":false})).unwrap();
+        let reset = adapter.receive(json!({"type":"conversation_reset"})).unwrap();
+        assert!(reset.events.iter().any(|event| matches!(event, Event::Reset { .. })));
+        let acknowledged = adapter.receive(reply(&id, json!({}))).unwrap();
+        assert!(acknowledged.events.iter().any(|event| matches!(event,
+            Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Cancelled } if key=="claude:old-before-reset")));
+        assert!(!acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
+        assert!(adapter.deferred_attention.is_empty());
     }
 
     #[test]
