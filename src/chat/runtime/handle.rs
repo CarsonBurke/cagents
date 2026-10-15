@@ -317,10 +317,10 @@ impl Handle {
         }
     }
     pub(crate) fn account_switch_generation(&self)->Result<Option<u64>,String> {
-        match &self.0 {Owner::Local(local)=>local.account_switch_generation(),Owner::Remote(remote)=>remote.call("account_switch_generation",serde_json::Value::Null)}
+        match &self.0 {Owner::Local(local)=>local.account_switch_generation(),Owner::Remote(remote)=>remote.account_switch_generation()}
     }
     pub(crate) fn completed_account_options(&self)->Result<Option<super::AccountSwitchOptions>,String> {
-        match &self.0 {Owner::Local(local)=>local.completed_account_options(),Owner::Remote(remote)=>remote.call("completed_account_options",serde_json::Value::Null)}
+        match &self.0 {Owner::Local(local)=>local.completed_account_options(),Owner::Remote(remote)=>remote.completed_account_options()}
     }
     pub(crate) fn close_for_account_switch(&self,generation:u64)->Result<Option<super::AccountSwitchOptions>,String> {
         match &self.0 {Owner::Local(local)=>local.close_for_account_switch(generation),Owner::Remote(remote)=>remote.close_for_account_switch(generation)}
