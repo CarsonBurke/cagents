@@ -9265,6 +9265,7 @@ impl Cagents {
                 settings_ui::SettingsContext {
                     feedback: self.settings_feedback.as_ref(),
                     invalid: &self.settings_invalid,
+                    pressed_key: self.palette.pressed_key_filter(),
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
@@ -16123,11 +16124,13 @@ impl Application for Cagents {
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
             Message::SelectSettingsCategory(category) => {
+                self.palette.clear_pressed_key_filter();
                 self.settings_search.clear();
                 self.settings_category = category;
                 crate::settings_widgets::reveal_content_start()
             }
             Message::SettingsSearchChanged(query) => {
+                self.palette.clear_pressed_key_filter();
                 self.settings_search = query;
                 crate::settings_widgets::reveal_content_start()
             }

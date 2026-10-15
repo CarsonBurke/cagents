@@ -191,6 +191,7 @@ pub(super) struct SettingsContext<'a> {
     pub feedback: Option<&'a SettingsFeedback>,
     /// Refused values, by the field that refused them.
     pub invalid: &'a HashMap<SettingsField, String>,
+    pub pressed_key: Option<&'a keyboard::Event>,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
@@ -868,7 +869,7 @@ fn settings_category_controls<'a>(
                 ),
             ],
         )],
-        SettingsCategory::Keyboard => keyboard_groups(draft, invalid),
+        SettingsCategory::Keyboard => keyboard_groups(draft, invalid, context.pressed_key),
     }
 }
 
@@ -1086,14 +1087,18 @@ fn settings_layout<'a>(
         .into()
     };
 
-    let categories: Vec<_> = if searching {
+    let categories: Vec<_> = if context.pressed_key.is_some() {
+        vec![SettingsCategory::Keyboard]
+    } else if searching {
         SettingsCategory::ALL.to_vec()
     } else {
         vec![category]
     };
     let mut results = Vec::new();
     for category in categories {
-        let filter = if crate::settings_widgets::matches(category.label(), query) {
+        let filter = if context.pressed_key.is_some()
+            || crate::settings_widgets::matches(category.label(), query)
+        {
             ""
         } else {
             query
@@ -1104,7 +1109,10 @@ fn settings_layout<'a>(
                 .filter_map(|group| group.view(category.label(), filter)),
         );
     }
-    if results.is_empty() {
+    if context.pressed_key.is_some() && results.len() == 1 {
+        // The filter controls remain available even when no binding matches.
+        results.push(design::body("No matching shortcuts").into());
+    } else if results.is_empty() {
         results.push(design::body("No matching settings").into());
     }
     if let Some(SettingsFeedback::Error(message)) = feedback {
@@ -1234,9 +1242,19 @@ fn shortcut_group(field: SettingsField) -> &'static str {
     }
 }
 
+fn shortcut_matches_pressed_key(chords: &str, event: Option<&keyboard::Event>) -> bool {
+    event.is_none_or(|event| {
+        settings::parse_chords(chords).iter().any(|chord| {
+            settings::parse_shortcut(chord)
+                .is_ok_and(|binding| workspace_widget::shortcut_event_matches(binding, event))
+        })
+    })
+}
+
 fn keyboard_groups<'a>(
     draft: &'a SettingsDraft,
     invalid: &'a HashMap<SettingsField, String>,
+    pressed_key: Option<&keyboard::Event>,
 ) -> Vec<Group<'a, Message>> {
     let mut groups = vec![settings_group("Keyboard shortcuts", "Leave blank to unbind optional actions. Required actions need at least one chord. Fixed chords belong to native surfaces.", vec![setting_field("Filter shortcuts", "", widget::row::with_children(vec![
         widget::button::text("Filter by pressed key").on_press(Message::Palette(palette_ui::Action::FilterKey)).into(),
@@ -1246,7 +1264,7 @@ fn keyboard_groups<'a>(
         let mut rows: Vec<_> = SettingsField::SHORTCUTS
             .into_iter()
             .filter(|field| shortcut_group(*field) == group)
-            .map(|field| {
+            .filter_map(|field| {
                 let action = field.shortcut_action().expect("shortcut field");
                 let value = draft
                     .keyboard_shortcuts
@@ -1255,13 +1273,15 @@ fn keyboard_groups<'a>(
                     .find(|(candidate, _)| *candidate == action)
                     .expect("registered draft")
                     .1;
-                shortcut_input(
-                    field.label(),
-                    value,
-                    field,
-                    &draft.keyboard_shortcuts,
-                    invalid,
-                )
+                shortcut_matches_pressed_key(value, pressed_key).then(|| {
+                    shortcut_input(
+                        field.label(),
+                        value,
+                        field,
+                        &draft.keyboard_shortcuts,
+                        invalid,
+                    )
+                })
             })
             .collect();
         for fixed in settings::FIXED_SHORTCUTS
@@ -1269,6 +1289,9 @@ fn keyboard_groups<'a>(
             .filter(|fixed| fixed.scope == group)
         {
             let keys = fixed.chords.join(", ");
+            if !shortcut_matches_pressed_key(&keys, pressed_key) {
+                continue;
+            }
             let row = widget::row::with_children(vec![
                 design::body(fixed.label)
                     .width(Length::FillPortion(3))
@@ -1470,7 +1493,7 @@ mod keyboard_table_tests {
         draft.keyboard_shortcuts.rename_pane = "Ctrl+Tab".into();
         draft.keyboard_shortcuts.chat_model = "Ctrl+Tab".into();
         let invalid = HashMap::new();
-        let groups = keyboard_groups(&draft, &invalid);
+        let groups = keyboard_groups(&draft, &invalid, None);
         let matches = groups
             .into_iter()
             .filter_map(|group| group.view("Keyboard", "Ctrl+Tab"))
@@ -1480,7 +1503,7 @@ mod keyboard_table_tests {
             "the pane action, chat action and fixed navigation row all match"
         );
         assert_eq!(
-            keyboard_groups(&draft, &invalid)
+            keyboard_groups(&draft, &invalid, None)
                 .into_iter()
                 .filter_map(|group| group.view("Keyboard", "Ctrl+="))
                 .count(),
@@ -1489,12 +1512,59 @@ mod keyboard_table_tests {
         draft.keyboard_shortcuts.rename_pane = "Control + F8".into();
         draft.keyboard_shortcuts.chat_model = "F8 + Control".into();
         assert_eq!(
-            keyboard_groups(&draft, &invalid)
+            keyboard_groups(&draft, &invalid, None)
                 .into_iter()
                 .filter_map(|group| group.view("Keyboard", "Ctrl+F8"))
                 .count(),
             2,
             "pressed keys find accepted aliases and modifier order"
         );
+
+        // A real pressed-key filter must retain the event: the same shifted
+        // number key can match both numeric and symbol bindings.
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings_draft.keyboard_shortcuts.rename_pane = "Ctrl+Shift+1".into();
+        app.settings_draft.keyboard_shortcuts.chat_model = "Ctrl+Shift+!".into();
+        let press = |value: &str, code, modifiers| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(value.into()),
+            modified_key: keyboard::Key::Character(value.into()),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        let shifted = press("!", keyboard::key::Code::Digit1,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT);
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&shifted));
+        assert_eq!(app.settings_search, "Ctrl+Shift+1");
+        assert_eq!(keyboard_groups(&app.settings_draft, &app.settings_invalid,
+            app.palette.pressed_key_filter()).into_iter()
+            .filter_map(|group| group.view("Keyboard", "")).count(), 3,
+            "filter controls and both numeric/symbol action groups are visible");
+        for chord in ["Ctrl+Shift+1", "Ctrl+Shift+!"] {
+            assert!(shortcut_matches_pressed_key(chord, app.palette.pressed_key_filter()));
+        }
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&press("1", keyboard::key::Code::Numpad1,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT)));
+        assert_eq!(keyboard_groups(&app.settings_draft, &app.settings_invalid,
+            app.palette.pressed_key_filter()).len(), 1,
+            "a numpad digit matches neither the number-row nor symbol binding");
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&press("à", keyboard::key::Code::Digit0,
+            keyboard::Modifiers::CTRL)));
+        assert_eq!(app.settings_search, "Ctrl+0");
+        assert!(shortcut_matches_pressed_key("Ctrl+0", app.palette.pressed_key_filter()));
+        assert_eq!(keyboard_groups(&app.settings_draft, &app.settings_invalid,
+            app.palette.pressed_key_filter()).len(), 2,
+            "filter controls and fixed Reset font size remain visible");
+        drop(app.update(Message::SettingsSearchChanged("typed query".into())));
+        assert!(app.palette.pressed_key_filter().is_none());
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&shifted));
+        drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard)));
+        assert!(app.palette.pressed_key_filter().is_none());
     }
 }

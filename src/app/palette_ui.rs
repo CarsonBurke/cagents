@@ -7,10 +7,19 @@ pub(super) struct State {
     recording_error: Option<String>,
     reassign: Option<(SettingsField, String, usize)>,
     filtering_key: bool,
+    pressed_key_filter: Option<keyboard::Event>,
     query: Option<String>,
     selected: usize,
 }
 impl State {
+    pub(super) fn pressed_key_filter(&self) -> Option<&keyboard::Event> {
+        self.pressed_key_filter.as_ref()
+    }
+
+    pub(super) fn clear_pressed_key_filter(&mut self) {
+        self.pressed_key_filter = None;
+    }
+
     pub(super) fn is_open(&self) -> bool {
         self.query.is_some() || self.recording.is_some() || self.filtering_key
     }
@@ -45,6 +54,7 @@ impl Cagents {
                 Task::none()
             }
             Action::FilterKey => {
+                self.palette.pressed_key_filter = None;
                 self.palette.filtering_key = true;
                 self.palette.recording = None;
                 self.palette.query = None;
@@ -202,8 +212,9 @@ impl Cagents {
             {
                 let name = match key {
                     keyboard::Key::Character(value) if value.chars().count() == 1 => {
-                        workspace_widget::latin_key(key, *physical_key)
+                        workspace_widget::recordable_shortcut_character(key, *physical_key)
                             .map(|character| character.to_ascii_uppercase().to_string())
+                            .or_else(|| self.palette.filtering_key.then(|| value.to_uppercase()))
                     }
                     keyboard::Key::Named(name) => match name {
                         keyboard::key::Named::ArrowLeft => Some("Left".into()),
@@ -250,13 +261,23 @@ impl Cagents {
                     });
                     if self.palette.filtering_key {
                         self.palette.filtering_key = false;
-                        return Some(self.update(Message::SettingsSearchChanged(chord)));
+                        let task = self.update(Message::SettingsSearchChanged(chord));
+                        // Match the event, rather than one spelling: a shifted
+                        // number key can trigger both digit and symbol chords.
+                        self.palette.pressed_key_filter = Some(event.clone());
+                        return Some(task);
                     }
                     return Some(
                         self.record_shortcut(
                             self.palette.recording.expect("recording field"),
                             chord,
                         ),
+                    );
+                }
+                if matches!(key, keyboard::Key::Character(_)) {
+                    self.palette.recording_error = Some(
+                        "This key cannot trigger a shortcut. Use the number row for digit bindings."
+                            .into(),
                     );
                 }
             }
@@ -1335,6 +1356,7 @@ mod settings_recorder_tests {
             keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
         for (value, physical, chord) in [
             ("л", keyboard::key::Code::KeyK, "Ctrl+Alt+Shift+K"),
+            ("!", keyboard::key::Code::Digit1, "Ctrl+Alt+Shift+1"),
             (",", keyboard::key::Code::Comma, "Ctrl+Alt+Shift+Comma"),
             ("+", keyboard::key::Code::Equal, "Ctrl+Alt+Shift+Plus"),
         ] {
@@ -1368,6 +1390,11 @@ mod settings_recorder_tests {
         let field = SettingsField::ShortcutToggleProjects;
         let before = app.settings.keyboard_shortcuts.clone();
         drop(app.update_palette(Action::Record(field)));
+        let numpad = event("1", keyboard::key::Code::Numpad1, modifiers);
+        drop(app.palette_key_event(&numpad));
+        assert!(app.palette.recording_error.as_ref().is_some_and(|reason| reason.contains("number row")));
+        assert_eq!(app.settings.keyboard_shortcuts, before);
+        assert_eq!(app.palette.recording, Some(field));
         let interrupt = event("с", keyboard::key::Code::KeyC, keyboard::Modifiers::CTRL);
         drop(
             app.palette_key_event(&interrupt)

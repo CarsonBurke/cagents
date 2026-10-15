@@ -790,11 +790,19 @@ fn shortcut_matches(
         }
 }
 
-/// Character normalization shared by shortcut dispatch and the settings recorder.
-pub(crate) fn latin_key(
+/// A character chord that this physical event can actually dispatch. Number
+/// bindings use the number row even when Shift changes the logical character.
+pub(crate) fn recordable_shortcut_character(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
 ) -> Option<char> {
+    physical_digit(physical_key).or_else(|| {
+        // A logical numpad digit cannot trigger a number-row binding.
+        latin_key(key, physical_key).filter(|character| !character.is_ascii_digit())
+    })
+}
+
+fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
     if let keyboard::Key::Character(value) = key.as_ref() {
         let mut characters = value.chars();
         if let (Some(character), None) = (characters.next(), characters.next())
