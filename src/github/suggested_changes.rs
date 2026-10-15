@@ -46,6 +46,17 @@ pub fn suggestion_block(lines: &str) -> String {
     format!("{fence}suggestion\n{lines}\n{fence}")
 }
 
+pub fn suggestion_range(thread: &PullRequestReviewThread, suggestion: &Suggestion) -> Option<(u64,u64)> {
+    if thread.outdated || thread.side != ReviewDiffSide::Right { return None; }
+    let line=thread.line?;
+    let (start,end)=if suggestion.explicit_range {(line.checked_sub(suggestion.before)?,line.checked_add(suggestion.after)?)}else{(thread.start_line.unwrap_or(line),line)};
+    (start>0 && start<=end).then_some((start,end))
+}
+
+pub fn suggestion_diff(original: &str, replacement: &str) -> String {
+    original.lines().map(|line|format!("- {line}")).chain(replacement.lines().map(|line|format!("+ {line}"))).collect::<Vec<_>>().join("\n")
+}
+
 pub fn replace_lines(source:&str,start:u64,end:u64,replacement:&str)->Result<String,GitHubError>{
     if source.len()>MAX_SOURCE_BYTES || source.contains('\0'){return Err(GitHubError::Inspection("Suggestions require a text file smaller than 2 MiB.".into()));}
     let lines:Vec<&str>=source.split_inclusive('\n').collect();
@@ -90,9 +101,7 @@ impl<E:ProcessExecutor> GitHubService<E>{
         if comment.body != request.expected_body { return Err(GitHubError::Inspection("The comment changed. Refresh before applying its suggestion.".into())); }
         if thread.outdated||thread.side!=ReviewDiffSide::Right||comment.is_pending(){return Err(GitHubError::Inspection("Only published suggestions on the current right side can be applied.".into()));}
         let suggestion=suggestions(&comment.body).into_iter().nth(request.index).ok_or_else(||GitHubError::Inspection("The suggestion changed. Refresh the discussion.".into()))?;
-        let line=thread.line.ok_or_else(||GitHubError::Inspection("The suggestion has no current line anchor.".into()))?;
-        let (start,end)=if suggestion.explicit_range{(line.checked_sub(suggestion.before),line.checked_add(suggestion.after))}else{(Some(thread.start_line.unwrap_or(line)),Some(line))};
-        let (Some(start),Some(end))=(start,end)else{return Err(GitHubError::Inspection("Invalid suggestion range.".into()));};
+        let (start,end)=suggestion_range(thread,&suggestion).ok_or_else(||GitHubError::Inspection("Invalid or outdated suggestion range.".into()))?;
         let (source,repository,branch)=self.suggestion_source(key,&thread.path,&request.expected_head,true,cancellation)?;
         let replacement=replace_lines(&source,start,end,&suggestion.replacement)?;
         if source==replacement{return Err(GitHubError::Inspection("This suggestion is already present in the PR head.".into()));}
@@ -108,4 +117,41 @@ use crate::repository::Oid;
 #[test]fn suggestion_fences_and_offsets_are_explicit(){assert_eq!(suggestions("```rust\nx\n```\n```suggestion:-1+2\nnew\n```"),vec![Suggestion{replacement:"new".into(),before:1,after:2,explicit_range:true}]);assert!(suggestions("```suggestion\nunfinished").is_empty());assert!(suggestions("```suggestion:-99999+2\nx\n```").is_empty());}
 #[test]fn inserted_suggestions_preserve_embedded_fences(){let source="before\n```rust\nx\n```\nafter";let block=suggestion_block(source);assert!(block.starts_with("````suggestion"));assert_eq!(suggestions(&block)[0].replacement,source);assert!(suggestions("````text\n```suggestion\nnot a suggestion\n```\n````").is_empty());}
 #[test]fn replacements_preserve_context_line_endings_and_eof(){assert_eq!(replace_lines("a\nb\nc\n",2,2,"x\ny").unwrap(),"a\nx\ny\nc\n");assert_eq!(replace_lines("a\r\nb\r\n",2,2,"x").unwrap(),"a\r\nx\r\n");assert_eq!(replace_lines("a\nb",2,2,"x").unwrap(),"a\nx");assert_eq!(replace_lines("a\nb\nc\n",2,2,"").unwrap(),"a\nc\n");assert!(replace_lines("a\n",0,1,"x").is_err());}
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    struct Fixture { calls:Mutex<Vec<CommandSpec>> }
+    impl ProcessExecutor for Fixture {
+        fn execute(&self,command:&CommandSpec,_:&CancellationToken)->Result<ProcessOutput,ProcessFailure>{
+            self.calls.lock().unwrap().push(command.clone());
+            let query=command.arguments.iter().find_map(|argument|argument.to_str().filter(|argument|argument.starts_with("query="))).unwrap_or("");
+            let value=if command.stdin.is_some(){serde_json::json!({"data":{"createCommitOnBranch":{"commit":{"oid":"new-head"}}}})}
+            else if query.contains("reviewThreads(first:"){serde_json::json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread","path":"src/file.rs","line":2,"diffSide":"RIGHT","isOutdated":false,"isResolved":false,"isCollapsed":false,"viewerCanResolve":true,"viewerCanUnresolve":false,"comments":{"nodes":[{"id":"comment","author":{"login":"reviewer"},"body":"```suggestion\nfixed\n```","createdAt":"now","url":"https://github.com/owner/repo/pull/1#discussion_r1","commentState":"SUBMITTED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})}
+            else if query.contains("comments(first:"){serde_json::json!({"data":{"repository":{"pullRequest":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})}
+            else if query.contains("reviews(first:"){serde_json::json!({"data":{"repository":{"pullRequest":{"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})}
+            else if query.contains("viewerDidAuthor"){serde_json::json!({"data":{"repository":{"pullRequest":{"headRefOid":"a".repeat(40),"headRefName":"feature","state":"OPEN","viewerDidAuthor":true,"headRepository":{"name":"fork","owner":{"login":"author"},"viewerPermission":"WRITE"}}}}})}
+            else{serde_json::json!({"data":{"repository":{"object":{"file":{"mode":33188,"object":{"text":"before\nold\nafter\n","isTruncated":false,"byteSize":17}}}}}})};
+            Ok(ProcessOutput{success:true,exit_code:Some(0),signal:None,stdout:value.to_string().into_bytes(),stderr:Vec::new()})
+        }
+    }
+    #[test]
+    fn author_apply_uses_fork_branch_expected_head_and_stdin_file_changes(){
+        let executor=Arc::new(Fixture{calls:Mutex::new(Vec::new())});let service=GitHubService::new("gh",executor.clone());let api:&dyn GitHubReviewApi=&service;
+        let key=PullRequestKey::new(GitHubRepoKey::new("suggestions.invalid",None,"owner","repo").unwrap(),1).unwrap();
+        let request=SuggestionRequest{comment:"comment".into(),expected_body:"```suggestion\nfixed\n```".into(),index:0,expected_head:"a".repeat(40)};
+        assert!(matches!(api.apply_suggestion(&key,&request,&CancellationToken::new()).unwrap(),ReviewMutationOutcome::Applied(())));
+        let calls=executor.calls.lock().unwrap();let command=calls.last().unwrap();assert!(command.arguments.iter().any(|argument|argument=="--input"));
+        let input:serde_json::Value=serde_json::from_slice(command.stdin.as_ref().unwrap()).unwrap();let input=&input["variables"]["input"];
+        assert_eq!(input["branch"]["repositoryNameWithOwner"],"author/fork");assert_eq!(input["branch"]["branchName"],"feature");assert_eq!(input["expectedHeadOid"],"a".repeat(40));
+        let content=base64::engine::general_purpose::STANDARD.decode(input["fileChanges"]["additions"][0]["contents"].as_str().unwrap()).unwrap();assert_eq!(content,b"before\nfixed\nafter\n");
+    }
+    #[test]
+    fn changed_suggestion_body_is_refused_before_any_commit(){
+        let executor=Arc::new(Fixture{calls:Mutex::new(Vec::new())});let service=GitHubService::new("gh",executor.clone());
+        let key=PullRequestKey::new(GitHubRepoKey::new("suggestions.invalid",None,"owner","repo").unwrap(),1).unwrap();
+        let request=SuggestionRequest{comment:"comment".into(),expected_body:"old body".into(),index:0,expected_head:"a".repeat(40)};
+        assert!(service.apply_suggestion(&key,&request,&CancellationToken::new()).is_err());assert!(executor.calls.lock().unwrap().iter().all(|command|command.stdin.is_none()));
+    }
 }
