@@ -202,6 +202,8 @@ impl State {
         self.entries.values().filter_map(|entry|entry.loaded.as_ref())
             .map(|loaded|loaded.prefixes.capacity().saturating_mul(std::mem::size_of::<[u8;32]>())).sum()
     }
+    /// (records, logical metadata bytes); excludes allocator/container RSS.
+    pub(super) fn paged_intent_metadata(&self)->(usize,usize) {self.intents.usage()}
     pub(super) fn retained_bytes(&self)->usize {self.entries.values().map(|entry|entry.loaded.as_ref().map_or(0,|loaded|loaded.view.text.len())+entry.restored.as_ref().map_or(0,|text|text.len())).sum()}
     pub(super) fn capture(&self)->ResidentRawCalls {
         ResidentRawCalls {calls:self.entries.values().filter_map(|entry|entry.loaded.as_ref().map(|loaded|(loaded.view.text.clone(),loaded.record.clone()))
