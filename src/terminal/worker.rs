@@ -6243,29 +6243,62 @@ mod tests {
             environment: BTreeMap::from([
                 ("HOME".into(), home.path().to_string_lossy().into_owned()),
                 ("HISTFILE".into(), "/dev/null".into()),
-                ("PS1".into(), "CENSUS_READY> ".into()),
+                (
+                    "PS1".into(),
+                    r"\[\e]133;A\a\]CENSUS_READY> \[\e]133;B\a\]".into(),
+                ),
             ]),
         };
         let (mut worker, _) = capture_worker_for(launch);
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut prompt_bytes = Vec::new();
         loop {
-            let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
-            let ready = matches!(&message, PtyMessage::Bytes(bytes) if bytes.windows(12).any(|word| word == b"CENSUS_READY"));
+            let message = worker
+                .pty_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            if let PtyMessage::Bytes(bytes) = &message {
+                prompt_bytes.extend_from_slice(bytes);
+            }
+            let ready = prompt_bytes
+                .windows(b"\x1b]133;B\x07".len())
+                .any(|word| word == b"\x1b]133;B\x07");
             worker.handle_pty_message(Some(message));
-            if ready { break; }
+            if ready {
+                break;
+            }
         }
-        let active = |worker: &Worker| worker.inspect_close(std::time::Instant::now() + Duration::from_secs(3)).unwrap().0;
-        assert!(!active(&worker), "fixture must start as a proven idle shell");
+        let active = |worker: &Worker| {
+            worker
+                .inspect_close(std::time::Instant::now() + Duration::from_secs(3))
+                .unwrap()
+                .0
+        };
+        assert!(
+            !active(&worker),
+            "fixture must start as a proven idle shell"
+        );
         let (commands, receiver) = command_channel(1);
         worker.commands = receiver;
         commands.send(Command::Input(b"unsent".to_vec())).unwrap();
-        assert!(active(&worker), "priority close must see accepted input still in its inbox");
+        assert!(
+            active(&worker),
+            "priority close must see accepted input still in its inbox"
+        );
         let _ = worker.commands.try_recv();
         worker.pending_input.extend(b"pending");
-        assert!(active(&worker), "accepted bytes cannot be silently closed before delivery");
+        assert!(
+            active(&worker),
+            "accepted bytes cannot be silently closed before delivery"
+        );
         worker.pending_input.clear();
-        worker.retained_commands.push_back(Command::Input(b"carried".to_vec()));
-        assert!(active(&worker), "coalesced/cancellation carry must also be inspected");
+        worker
+            .retained_commands
+            .push_back(Command::Input(b"carried".to_vec()));
+        assert!(
+            active(&worker),
+            "coalesced/cancellation carry must also be inspected"
+        );
         worker.retained_commands.clear();
         assert!(!active(&worker));
         drop(commands);
