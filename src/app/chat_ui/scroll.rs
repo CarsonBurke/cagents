@@ -2327,26 +2327,35 @@ mod tests {
                 "estimate navigation converges to actual mounted glyph geometry"
             );
             struct Visible {
+                scroll: Id,
                 identity: u64,
                 byte: usize,
                 translation: Vector,
+                pending: Option<Vector>,
                 viewport: Option<Rectangle>,
                 glyph: Option<Rectangle>,
             }
             impl Operation for Visible {
                 fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    let before = self.translation;
+                    if let Some(translation) = self.pending.take() {
+                        self.translation += translation;
+                    }
                     visit(self);
+                    self.translation = before;
                 }
                 fn scrollable(
                     &mut self,
-                    _: Option<&Id>,
+                    id: Option<&Id>,
                     viewport: Rectangle,
                     _: Rectangle,
                     translation: Vector,
                     _: &mut dyn operation::Scrollable,
                 ) {
-                    self.translation = translation;
-                    self.viewport = Some(viewport);
+                    if id == Some(&self.scroll) {
+                        self.viewport = Some(viewport);
+                    }
+                    self.pending = Some(translation);
                 }
                 fn custom(
                     &mut self,
@@ -2366,9 +2375,11 @@ mod tests {
                 }
             }
             let mut visible = Visible {
+                scroll: card_control_id(target.card, "chat-transcript"),
                 identity,
                 byte,
                 translation: Vector::ZERO,
+                pending: None,
                 viewport: None,
                 glyph: None,
             };
