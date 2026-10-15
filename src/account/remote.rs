@@ -242,8 +242,8 @@ pub(crate) fn execute_reserved<'a>(
 /// The callback is invoked only for Create, against its genuine unpublished
 /// home receipt. Existing callers intentionally use a no-op initializer; this
 /// plumbing alone does not bootstrap or enable exported history. It currently
-/// runs under Commits' writer and the home/registry locks: do not reenter
-/// admission or take an earlier-ranked namespace/federation lock here. Such
+/// runs under Commits' writer and the home/registry locks: do not call registry
+/// load/update APIs, reenter admission or take an earlier-ranked namespace/federation lock here. Such
 /// bootstrap needs a separate lock-order-qualified integration first.
 #[cfg(feature = "host")]
 pub(crate) fn execute_reserved_initialized<'a>(
@@ -825,6 +825,23 @@ mod tests {
             return;
         }
         let store = super::super::registry::Store::installation().unwrap();
+        let registry_path = crate::instance::project_dirs().unwrap().config_dir().join("accounts.toml");
+        // The production initializer holds the registry flock. Observe only
+        // our private fixture bytes, never reenter Store::load from it.
+        let read_fixture_registry = || -> std::io::Result<Option<Vec<u8>>> {
+            use std::{io::Read, os::unix::fs::OpenOptionsExt};
+            let file = match std::fs::OpenOptions::new().read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&registry_path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let mut bytes = Vec::new();
+            file.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+            assert!(bytes.len() <= 256 * 1024);
+            Ok(Some(bytes))
+        };
+        let expected_registry = std::cell::RefCell::new(read_fixture_registry().unwrap());
         let calls = std::cell::Cell::new(0usize);
         let failed_home = std::cell::RefCell::new(None);
         let initialize = |receipt: &super::super::home::NewHomeCreationReceipt| {
@@ -832,9 +849,8 @@ mod tests {
             calls.set(calls.get() + 1);
             assert_eq!(receipt.provider(), Provider::Codex);
             assert!(std::fs::read_dir(receipt.home())?.next().is_none());
-            let current_registry = store.load()?;
-            let pending = current_registry.pending();
-            assert!(!pending.iter().any(|row| row.key == receipt.key()), "the new pending row must follow initialization");
+            assert_eq!(read_fixture_registry()?, *expected_registry.borrow(),
+                "registry publication must follow the initializer");
             std::fs::write(receipt.home().join("namespace-pointer-fixture"), "bootstrap metadata only")?;
             if calls.get() == 2 {
                 *failed_home.borrow_mut() = Some(receipt.home().to_owned());
@@ -852,6 +868,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(std::fs::read_to_string(created.home.join("namespace-pointer-fixture")).unwrap(), "bootstrap metadata only");
         let before = store.load().unwrap();
+        *expected_registry.borrow_mut() = read_fixture_registry().unwrap();
         assert!(before.pending().iter().any(|row| row.key == created.key));
         let error = execute_with_commits(
             Operation::Create { provider: Provider::Codex, copy_codex_config: false }, &commits,

@@ -938,7 +938,7 @@ impl Store {
     /// same lifecycle/registry admission as pending publication. The borrowed
     /// receipt comes only from the actual fresh mkdir, before seeding/links.
     /// The initializer runs while lifecycle/registry locks remain held; it
-    /// must not reenter registry writes or invert any caller's admission order.
+    /// must not call registry load/update APIs or invert caller admission order.
     pub(crate) fn create_pending_initialized(
         &self,
         homes: &Homes,
