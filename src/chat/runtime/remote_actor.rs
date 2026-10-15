@@ -273,7 +273,7 @@ impl RemoteActor {
                     let ready=state.ready&&!old.ready;
                     let outcomes=(state.outbox_latest>state.outbox_ack && state.outbox_latest!=old.outbox_latest)||(state.continuity_loss!=old.continuity_loss && state.continuity_loss.as_ref().is_some_and(|loss|!loss.acknowledged));
                     let usage:Vec<_>=state.account_reports.iter().filter(|report|!old.account_reports.contains(report)).cloned().collect();
-                    *actor.0.state.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(state);
+                    if !actor.publish_resident(state) {break;}
                     if changed {(actor.0.notify)(Update::Observed {generation});(actor.0.notify)(Update::Presentation);}
                     if activity_changed {(actor.0.notify)(Update::Activity {state:activity,generation,outcome});}
                     if ready {(actor.0.notify)(Update::Ready);}
@@ -291,6 +291,17 @@ impl RemoteActor {
         *remote.0.worker.lock().unwrap_or_else(|p|p.into_inner())=Some(worker);
         Ok(remote)
     }
+    fn publish_resident(&self,resident:Resident)->bool {
+        let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
+        if self.0.stop.load(Ordering::Acquire) {return false;}
+        *state=Arc::new(resident);true
+    }
+    fn publish_closed(&self,snapshot:Snapshot) {
+        *self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner())=Some(Arc::new(snapshot));
+        self.0.stop.store(true,Ordering::Release);
+        let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());let state=Arc::make_mut(&mut state);
+        state.completed=true;state.owns_work=false;state.idle=false;state.ready=false;state.failure=None;state.close.completed=true;state.close.owns_work=false;state.close.closing=true;
+    }
     fn endpoint_failed(&self,error:&str)->bool {
         terminal_endpoint_error(error,self.0.identity.record.holder.is_current())
     }
@@ -301,6 +312,7 @@ impl RemoteActor {
         let outcome;
         {
             let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
+            if self.0.stop.load(Ordering::Acquire) {return;}
             let state=Arc::make_mut(&mut state);
             if dead && state.working {state.outcome=Some(crate::agent::ActivityOutcome::Interrupted {reason:reason.clone()});}
             state.failure=Some(reason.clone());state.ready=false;state.idle=false;state.busy=false;state.waiting=false;state.working=false;state.activity=crate::agent::ActivityState::Unknown;state.owns_work=true;
@@ -410,9 +422,7 @@ impl RemoteActor {
                 final_snapshot::read(&self.0.identity,&self.0.proof).map_err(|detail|format!("Provider cleanup is proved, but the exact final publication is unavailable: {detail}"))?
             }
         };
-        *self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner())=Some(Arc::new(snapshot));
-        self.0.stop.store(true,Ordering::Release);
-        {let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());let state=Arc::make_mut(&mut state);state.completed=true;state.owns_work=false;state.idle=false;state.ready=false;state.failure=None;state.close.completed=true;state.close.owns_work=false;state.close.closing=true;}
+        self.publish_closed(snapshot);
         Ok(())
     }
     pub fn close(&self)->Result<(),String> {self.close_method("close",Value::Null)}
@@ -844,6 +854,16 @@ done"#;
         assert!(!first.ready);assert_ne!(first.changed,fixture.server.revision());
         let response=fixture.server.invoke(Invocation {proof:fixture.server.proof.clone(),epoch:Some(fixture.server.epoch),method:"state".into(),args:json!([first.changed])}).unwrap();
         let next:Option<Resident>=serde_json::from_value(response).unwrap();assert!(next.unwrap().ready,"the next real state RPC must fetch the raced Ready transition");
+    }
+    #[test]
+    fn proved_close_wins_over_delayed_live_metadata_and_disconnection_publications() {
+        let actor=RemoteActor::fixture();let delayed=actor.state().as_ref().clone();
+        let snapshot=Snapshot {generation:42,exited:true,..Default::default()};
+        actor.publish_closed(snapshot.clone());
+        assert!(!actor.publish_resident(delayed),"the actual worker publication rechecks the stop fence under the state lock");
+        actor.publish_unavailable("late socket failure");
+        let state=actor.state();assert!(state.completed);assert!(!state.owns_work);assert!(state.failure.is_none());
+        assert_eq!(actor.snapshot(None),Some(snapshot));
     }
     #[test]
     fn proved_close_keeps_exact_final_publication_without_a_live_socket() {
