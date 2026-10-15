@@ -213,11 +213,11 @@ fn schema17_upgrade_preserves_issued_end_and_all_stored_authority_before_locate(
     // Populate the non-presentation selected rows too: upgrading their schema
     // must neither rotate an owner/cursor nor fabricate new runtime authority.
     registry.db.execute("INSERT INTO session_locations(session,source,directory,previous_sources) VALUES(?1,?2,?3,'[]')",
-        params![pane.id.to_string(), source, relocation.old_root.to_str().unwrap()]).unwrap();
+        params![agent.session.as_ref().unwrap().id().to_string(), source, relocation.old_root.to_str().unwrap()]).unwrap();
     registry.db.execute("INSERT INTO native_actor_cursors(actor,owner,sequence,digest) VALUES(?1,?2,7,?3)",
         params!["preserved-actor", "preserved-owner", vec![23u8; 32]]).unwrap();
     registry.db.execute("INSERT INTO session_observer_owners(session,instance,stamp,source) VALUES(?1,?2,?3,?4)",
-        params![pane.id.to_string(), uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), source]).unwrap();
+        params![agent.session.as_ref().unwrap().id().to_string(), uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), source]).unwrap();
     for table in ["agent_locations", "session_locations", "native_actor_cursors", "shared_view_terminal_sources", "session_observer_owners"] {
         let count: u64 = registry.db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap();
         assert!(count > 0, "preservation fixture must populate {table}");
