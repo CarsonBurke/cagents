@@ -83,7 +83,7 @@ pub mod notifications;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
 pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
