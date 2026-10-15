@@ -67,7 +67,7 @@ pub(super) fn normalize(value: &mut Value) {
                 }
             },
             Value::String(text) if matches!(field, "provider" | "surface" | "state" | "run_state" | "role" | "relation" | "phase" | "status" | "origin" | "action" | "kind" | "scope" | "owner" | "source") => {
-                if matches!(text.as_str(), "Omp" | "Claude" | "Codex" | "Chat" | "Terminal" | "Unknown" | "Idle" | "Working" | "Accepted" | "Running" | "Waiting" | "Succeeded" | "Failed" | "Cancelled" | "Interrupted" | "User" | "Assistant" | "System" | "Myself" | "Parent" | "Child" | "Peer" | "Final" | "Commentary" | "Denied" | "Stopped" | "Run" | "Read" | "Search" | "List" | "Added" | "Deleted" | "Updated" | "All" | "Ok" | "Warning" | "Limited" | "NeedsLogin" | "Unavailable" | "Live" | "Probe" | "Cache" | "Recorded") { *text = snake(text); }
+                if matches!(text.as_str(), "Omp" | "Claude" | "Codex" | "Chat" | "Terminal" | "Unknown" | "Idle" | "Working" | "Accepted" | "Running" | "Waiting" | "Succeeded" | "Failed" | "Cancelled" | "Interrupted" | "User" | "Assistant" | "System" | "Myself" | "Parent" | "Child" | "Peer" | "Final" | "Commentary" | "Denied" | "Stopped" | "Run" | "Read" | "Search" | "List" | "Added" | "Deleted" | "Updated" | "Report" | "Message" | "Notice" | "All" | "Ok" | "Warning" | "Limited" | "NeedsLogin" | "Unavailable" | "Live" | "Probe" | "Cache" | "Recorded") { *text = snake(text); }
             }
             _ => {}
         }
@@ -98,6 +98,14 @@ mod tests {
         assert_eq!(transcript["role"], "assistant");
         let content: crate::chat::ItemContent = serde_json::from_value(transcript["content"].clone()).unwrap();
         assert!(matches!(content, crate::chat::ItemContent::Text { phase: crate::chat::Phase::Final, .. }));
+        for kind in [crate::chat::DeliveryKind::Report, crate::chat::DeliveryKind::Message, crate::chat::DeliveryKind::Notice] {
+            let content = crate::chat::ItemContent::Delivery { kind, from: "reviewer".into(), sender: "fixture".into(), summary: "Report".into(), body: "Report".into() };
+            let mut page = serde_json::json!({"content": content});
+            normalize(&mut page);
+            assert_eq!(page["content"]["delivery"]["kind"], label(kind));
+            assert_eq!(page["content"]["delivery"]["body"], "Report");
+            assert_eq!(serde_json::from_value::<crate::chat::ItemContent>(page["content"].clone()).unwrap(), content);
+        }
         for provider in ["Claude", "claude"] {
             assert_eq!(serde_json::from_value::<crate::agent::Provider>(serde_json::json!(provider)).unwrap(), crate::agent::Provider::Claude);
         }

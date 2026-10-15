@@ -1536,11 +1536,14 @@ pub enum ItemContent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryKind {
     /// A delegated agent's final report to the conversation that started it.
+    #[serde(alias = "report")]
     Report,
     /// A message from a teammate or another session.
+    #[serde(alias = "message")]
     Message,
     /// The harness reporting that background work - a command, a monitor or
     /// an agent - finished or produced an event.
+    #[serde(alias = "notice")]
     Notice,
 }
 
