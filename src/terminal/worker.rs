@@ -732,6 +732,7 @@ impl TerminalHandle {
     ) -> Result<Self, TerminalStartError> {
         // Acquire the shared monitor before starting any holder/provider.
         event_notifier().map_err(TerminalStartError::Worker)?;
+        super::reactor::runtime().map_err(TerminalStartError::Worker)?;
         let (command_tx, command_rx) = command_channel(config.command_capacity);
         // Semantic events are lossless and independent from visual wakes. They
         // are low-volume metadata; an unbounded queue avoids either dropping a
