@@ -18256,7 +18256,7 @@ mod tests {
             assert_eq!(output.len(), count);
             assert!(output.bytes().all(|byte| byte == b'b'));
             settle_find_tasks(&mut runtime, refresh);
-            assert_eq!(runtime.find_total, 0);
+            assert_eq!(runtime.find_total, if irregular { count } else { 0 });
             let started = Instant::now();
             let refresh = runtime.update(RepositoryAction::Undo { card });
             let undo_update = started.elapsed();
