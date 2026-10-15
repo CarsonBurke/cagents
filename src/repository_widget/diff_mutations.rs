@@ -84,6 +84,17 @@ impl RepositoryRuntime {
         })
     }
 
+    fn diff_mutation_control_action(&self, card: CardId, kind: git_patch::Kind) -> Option<RepositoryAction> {
+        if self.has_diff_selection() {
+            return self.diff_selection_mutation_action(card, kind);
+        }
+        // The toolbar names its rendered hunk, just like the gutter. Preparing
+        // the worker capture is O(1); no source text or row vectors are copied.
+        let capture = self.capture_diff_mutation(card, kind, None)?;
+        let request = self.diff_mutation_request(card, capture.rows)?;
+        Some(RepositoryAction::ApplyDiffHunk { card, kind, request })
+    }
+
     fn selected_mutation_rows(&self, kind: git_patch::Kind) -> Option<Range<usize>> {
         if !self.can_mutate_diff(kind) {
             return None;
@@ -371,12 +382,7 @@ pub(super) fn selection_controls<'a>(
     };
     let mut controls = vec![
         crate::ui_controls::button::secondary(label)
-            .on_press_maybe(runtime.can_mutate_diff(primary).then_some(
-                RepositoryAction::ApplyDiffSelection {
-                    card,
-                    kind: primary,
-                },
-            ))
+            .on_press_maybe(runtime.diff_mutation_control_action(card, primary))
             .into(),
     ];
     if !staged {
@@ -386,12 +392,7 @@ pub(super) fn selection_controls<'a>(
             } else {
                 "Revert current hunk"
             })
-            .on_press_maybe(runtime.can_mutate_diff(git_patch::Kind::Revert).then_some(
-                RepositoryAction::ApplyDiffSelection {
-                    card,
-                    kind: git_patch::Kind::Revert,
-                },
-            ))
+            .on_press_maybe(runtime.diff_mutation_control_action(card, git_patch::Kind::Revert))
             .into(),
         );
     }
@@ -901,6 +902,22 @@ mod tests {
         runtime.diff_interaction.selection.as_mut().unwrap().anchor = 0;
         assert!(runtime.can_apply_diff_selection(git_patch::Kind::Stage));
         assert!(runtime.can_apply_diff_selection(git_patch::Kind::Revert));
+    }
+
+    #[test]
+    fn diff_mutation_controls_capture_the_rendered_hunk_and_disable_context_only_selections() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        let RepositoryAction::ApplyDiffHunk { request, .. } = runtime.diff_mutation_control_action(card, git_patch::Kind::Stage).unwrap()
+            else { panic!("toolbar must capture its rendered hunk"); };
+        let rows = request.rows.clone();
+        runtime.diff_change = usize::MAX;
+        assert_eq!(request.rows, rows);
+        runtime.diff_change = 0;
+        let context_row = runtime.current_diff_model_snapshot().unwrap().row_count(runtime.diff_mode) - 1;
+        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(runtime.diff_mode, crate::diff_interaction::Side::New, context_row));
+        assert!(runtime.diff_mutation_control_action(card, git_patch::Kind::Stage).is_none());
+        assert!(runtime.diff_mutation_control_action(card, git_patch::Kind::Revert).is_none());
     }
 
     #[test]
