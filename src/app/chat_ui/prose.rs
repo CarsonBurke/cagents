@@ -347,6 +347,7 @@ impl Renderer {
             };
             let item = item.clone();
             let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+                let renderer = renderer.clone(); let item = item.clone();
                 retained::kept(revision, move || widget::container(renderer.item(&item, index, settings))
                     .padding(iced::Padding::ZERO.top(if index == 0 { 0.0 } else { settings.spacing.0 })).into())
             });
@@ -634,6 +635,8 @@ pub(super) fn code_text(
             identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: true });
         let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
         let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+            let text = text.clone(); let spans = spans.clone(); let starts = starts.clone();
+            let find = find.clone(); let logical = logical.clone(); let range = range.clone();
             retained::kept(revision, move || {
                 let spans = if spans.is_empty() { vec![Span::new(text[range.clone()].to_owned())].into() }
                     else { sliced_spans(&spans, &starts, range.clone()) };
@@ -707,6 +710,8 @@ fn paragraph(
             identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: true });
         let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
         let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+            let text = text.clone(); let find = find.clone();
+            let logical = logical.clone(); let range = range.clone();
             retained::kept(revision, move || {
                 leaf_text(text.spans_range(settings.style, range.clone()), settings.text_size, settings.style.font,
                     target, find.as_deref(), logical.clone())
