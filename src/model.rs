@@ -281,11 +281,25 @@ pub(crate) fn terminal_shell() -> Result<String, LoginShellError> {
 fn terminal_shell_for_device(remote_shell: Option<&str>) -> Result<String, LoginShellError> {
     // Device preparation obtains this from the filesystem-owning daemon.
     // Local preferences and filesystem checks cannot validate a remote path.
-    if let Some(shell) = remote_shell { return Ok(shell.to_owned()); }
-    if let Some(shell) = crate::settings::default_path().ok().and_then(|path| crate::settings::load(path).ok()).and_then(|settings| settings.default_shell) {
+    if let Some(shell) = remote_shell {
+        return if Path::new(shell).is_absolute() && !shell.contains('\0') { Ok(shell.to_owned()) } else { Err(LoginShellError::ConfiguredUnavailable) };
+    }
+    if let Some(shell) = configured_terminal_shell() {
         return if crate::settings::agents::executable_available(&shell) { Ok(shell) } else { Err(LoginShellError::ConfiguredUnavailable) };
     }
     login_shell()
+}
+
+fn configured_terminal_shell() -> Option<String> {
+    crate::settings::default_path().ok().and_then(|path| crate::settings::load(path).ok()).and_then(|settings| settings.default_shell)
+}
+
+/// Device identity remains readable when a terminal-only pin becomes stale.
+/// The requested path is kept; the owning daemon refuses an unavailable
+/// executable at terminal spawn rather than silently choosing another shell.
+#[cfg(feature = "host")]
+pub(crate) fn terminal_shell_descriptor() -> Result<String, LoginShellError> {
+    configured_terminal_shell().map(Ok).unwrap_or_else(login_shell)
 }
 
 /// Login environment discovery uses the account's login shell, independently
@@ -1507,6 +1521,8 @@ mod tests {
         let shell = "/cagents-fixture-remote-only/configured-shell";
         assert!(!std::path::Path::new(shell).exists());
         assert_eq!(terminal_shell_for_device(Some(shell)).unwrap(), shell);
+        assert_eq!(terminal_shell_for_device(Some("relative-shell")), Err(LoginShellError::ConfiguredUnavailable));
+        assert_eq!(terminal_shell_for_device(Some("/remote/bad\0shell")), Err(LoginShellError::ConfiguredUnavailable));
     }
 
     #[test]

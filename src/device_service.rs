@@ -227,7 +227,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             let path = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or("remote HOME is unavailable")?;
-            let shell = crate::model::terminal_shell().map_err(|error| error.to_string())?;
+            let shell = crate::model::terminal_shell_descriptor().map_err(|error| error.to_string())?;
             Ok(Reply::Home {
                 path,
                 shell,

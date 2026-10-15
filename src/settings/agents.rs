@@ -326,6 +326,11 @@ mod tests {
         assert!(provider_executable(Provider::Claude, Some(std::ffi::OsStr::new("/usr/bin:/bin"))).is_err());
         assert_eq!(crate::model::terminal_shell(), Err(crate::model::LoginShellError::ConfiguredUnavailable));
         assert!(crate::model::login_shell().is_ok(), "a terminal-only stale pin cannot disable login-environment discovery");
+        #[cfg(feature = "host")]
+        {
+            let crate::device_service::Reply::Home { shell: reported, .. } = crate::device_service::execute(crate::device_service::Operation::Home).unwrap() else { panic!("device identity reply"); };
+            assert_eq!(reported, shell.to_string_lossy(), "remote identity must preserve unavailable pin without blocking unrelated operations");
+        }
         assert!(crate::control::terminal_spawn_recipe(root, vec![]).is_err(), "a missing pinned shell cannot silently switch to the login shell");
     }
 
