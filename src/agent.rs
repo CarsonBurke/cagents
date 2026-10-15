@@ -46,6 +46,15 @@ pub enum ActivityOutcome {
     Interrupted { reason: String },
 }
 
+impl ActivityOutcome {
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed { reason } | Self::Interrupted { reason } => Some(reason),
+            Self::Succeeded | Self::Cancelled => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Activity {
     pub provider: Provider,
