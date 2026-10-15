@@ -61,9 +61,20 @@ lease prevents a newly started daemon from sweeping a live helper's cache.
 Clean Stop or explicit End closes the provider tree and releases that cache;
 an upgrade preserves the helper until its successor reattaches.
 
-The journal has a bounded byte and entry budget. Execution and attention
+The journal holds at most 4096 unacknowledged semantic events within a default
+64 MiB payload budget; each event is at most 1 MiB. Execution and attention
 outcomes remain there until the daemon confirms its durable registry and
-notification transactions. Input receipts bind a sequence, request UUID and
+notification transactions. Acknowledgement deletes those replay rows using a
+FULL-synchronous SQLite transaction. A stopped provider's helper and cache stay
+owned until the final outcomes are acknowledged and helper retirement is proved.
+
+An attention event can carry its original bounded conversation label (80
+characters) and response/request excerpt (240 characters). These copies are
+ordinary private semantic replay history, removed after durable host
+acknowledgement. The notification preview preference governs desktop/app
+notification presentation and the notification journal, including revocation
+of its excerpts; it does not erase ordinary conversation or replay history.
+A later snapshot never replaces the event's captured context. Input receipts bind a sequence, request UUID and
 payload hash; an accepted or ambiguous input is never permission to send the
 prompt again. An overflow or storage failure produces a retained continuity-loss
 record. Its affected runs become Interrupted with that reason before recovery
@@ -398,8 +409,8 @@ its running commands and its pending approvals are lost, and the conversation
 returns by resuming from disk. With explicit local debug capture enabled, the
 daemon emits a foreground warning naming the thread and reported version when
 a conversation starts without durable continuity for this reason, once per
-conversation. Other providers
-retain their existing reconnect/resume behavior.
+conversation. Claude uses the resident protocol actor described above; OMP
+retains its reconnect/resume behavior.
 
 To qualify a version, add it to the allowlist locally and run the
 qualification against the native Codex executable:
