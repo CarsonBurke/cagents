@@ -3591,6 +3591,15 @@ impl Application for Editor {
                     Task::batch(tasks)
                 }
                 Message::Sidebar(action) => {
+                    if let SidebarAction::RunCommand { command, action } = action {
+                        if cagents::sidebar::commands::command_id(&action) != Some(command) {
+                            return Task::none();
+                        }
+                        // Shared menus carry registry IDs, while this host owns
+                        // file mutation availability and its native save/modal
+                        // and exact worktree-binding guards.
+                        return self.update(Message::Sidebar(*action));
+                    }
                     if matches!(action, SidebarAction::OpenSettings) {
                         return self.update(Message::Settings);
                     }
@@ -7969,4 +7978,34 @@ mod tests {
             "the previous file is no longer considered the one this tab has open"
         );
     }
+    #[test]
+    fn registered_file_commands_keep_native_rename_duplicate_and_binding_guards() {
+        let directory = git_fixture();
+        let mut app = editor();
+        let id = open_real_git(&mut app, directory.path(), None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        for (command, duplicate) in [(FileCommand::Rename, false), (FileCommand::CopyFile, true)] {
+            let action = cagents::sidebar::commands::registered(SidebarAction::FileCommand {
+                key: key.clone(), path: cagents::repository::RepoPath::parse("file.txt").unwrap(), command,
+            });
+            drop(app.update(Message::Sidebar(action)));
+            let dialog = app.file_dialog.as_ref().expect("shared menu reaches native mutation dialog");
+            assert_eq!(dialog.duplicate, duplicate);
+            app.file_dialog = None;
+        }
+        let mut stale = key.clone();
+        stale.canonical_path = directory.path().join("different-worktree");
+        drop(app.update(Message::Sidebar(cagents::sidebar::commands::registered(SidebarAction::FileCommand {
+            key: stale, path: cagents::repository::RepoPath::parse("file.txt").unwrap(), command: FileCommand::Rename,
+        }))));
+        assert!(app.file_dialog.is_none());
+        drop(app.update(Message::Sidebar(SidebarAction::RunCommand {
+            command: cagents::workspace_widget::GlobalShortcut::CopyPath,
+            action: Box::new(SidebarAction::FileCommand {
+                key, path: cagents::repository::RepoPath::parse("file.txt").unwrap(), command: FileCommand::Rename,
+            }),
+        })));
+        assert!(app.file_dialog.is_none());
+    }
+
 }
