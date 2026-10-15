@@ -1121,6 +1121,22 @@ impl Registry {
             if !pending.same_process(&session) {
                 return Err("The provider does not match the committed launch intent".into());
             }
+            if let (HostedSession::Chat(saved), HostedSession::Chat(captured)) = (&pending, &session)
+                && saved.launch.session_id.is_some()
+                && captured.launch.session_id.is_some()
+                && saved.launch.session_id != captured.launch.session_id
+            {
+                // A different known UUID is never inferred from same_process.
+                // Require the current issuing capability's exact source as
+                // corroboration of the trusted pending advancement.
+                let authority: Option<String> = tx.query_row(
+                    "SELECT source FROM agent_authorities WHERE session_id=?1",
+                    [pending.id().to_string()], |row| row.get(0),
+                ).optional().map_err(|error| error.to_string())?;
+                if authority.as_deref().map(decode::<HostedSession>).transpose()?.as_ref() != Some(&pending) {
+                    return Err("The private confirmed thread lacks matching current actor authority".into());
+                }
+            }
             // The exact owned observer may have advanced the private launch
             // after ChatAttached was captured. Publish that authenticated row
             // verbatim; deleting it must not roll thread/pair metadata back to
@@ -2680,6 +2696,26 @@ mod tests {
         assert!(observe_owned_thread_in(&tx, &confirmed, &next).unwrap());
         tx.commit().unwrap();
         assert_eq!(registry.agent(accepted.agent.id).unwrap().session, Some(next.clone()));
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(next));
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+    }
+
+    #[test]
+    fn agent_bind_requires_current_authority_to_accept_conflicting_known_threads() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let captured = source();
+        registry.reserve_agent_launch(accepted.agent.id, &captured).unwrap();
+        let next = confirmed_thread(&captured);
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(!observe_owned_thread_in(&tx, &captured, &next).unwrap());
+        tx.commit().unwrap();
+        assert!(registry.bind_agent(accepted.agent.id, None, captured.clone()).is_err());
+        assert!(registry.agent(accepted.agent.id).unwrap().session.is_none());
+        assert_eq!(registry.pending_agent_launch(accepted.agent.id).unwrap(), Some(next.clone()));
+        let token = registry.register_agent_authority(&next).unwrap();
+        let bound = registry.bind_agent(accepted.agent.id, None, captured).unwrap();
+        assert_eq!(bound.session, Some(next.clone()));
         assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(next));
         assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
     }
