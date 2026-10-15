@@ -190,12 +190,16 @@ impl Record {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            children.extend(raw.split_whitespace().filter_map(|pid| pid.parse::<i32>().ok()));
+            children.extend(
+                raw.split_whitespace()
+                    .filter_map(|pid| pid.parse::<i32>().ok()),
+            );
         }
         let zombies = children
             .into_iter()
             .filter(|pid| {
-                fs::read_to_string(format!("/proc/{pid}/stat")).ok()
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
                     .and_then(|stat| {
                         stat.rsplit_once(')').map(|(_, fields)| {
                             let mut fields = fields.split_whitespace();
