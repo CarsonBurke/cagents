@@ -45,10 +45,30 @@ fn definition(db: &Connection, table: &str) -> Result<Option<String>, String> {
         .optional().map_err(|error| error.to_string())
 }
 
-// These are fixed internal identifiers and literals, never arbitrary user SQL.
+// Only whitespace/case outside quoted tokens is insignificant. Identifiers
+// and default literals must never lose substrings while validating authority.
 fn normalized(sql: &str) -> String {
-    sql.chars().filter(|c| !c.is_ascii_whitespace() && *c != ';')
-        .flat_map(char::to_lowercase).collect::<String>().replace("ifnotexists", "")
+    let mut result = String::new();
+    let mut quoted = None;
+    let mut chars = sql.chars().peekable();
+    while let Some(character) = chars.next() {
+        if let Some(end) = quoted {
+            result.push(character);
+            if character == end {
+                if chars.peek() == Some(&end) {
+                    result.push(chars.next().expect("peeked quoted escape"));
+                } else {
+                    quoted = None;
+                }
+            }
+        } else if matches!(character, '\'' | '"' | '`' | '[') {
+            quoted = Some(if character == '[' { ']' } else { character });
+            result.push(character);
+        } else if !character.is_ascii_whitespace() && character != ';' {
+            result.push(character.to_ascii_lowercase());
+        }
+    }
+    result
 }
 
 fn validate_selected(db: &Connection, current: u32) -> Result<(), String> {
@@ -193,6 +213,25 @@ mod tests {
         let before = image(&path);
         assert!(Registry::at(&path).is_err());
         assert_eq!(image(&path), before);
+    }
+
+    #[test]
+    fn malformed_identifiers_and_default_literals_are_refused_unchanged() {
+        let cases = [
+            ("session_observer_owners", TABLES[4].1.replace("instance TEXT", "instanceifnotexists TEXT")),
+            ("session_locations", TABLES[1].1.replace("DEFAULT '[]'", "DEFAULT '[ ]'")),
+            ("agent_locations", TABLES[0].1.replace("blocked_directory", "blocKed_directory")),
+        ];
+        for (table, ddl) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("registry.sqlite3");
+            let registry = Registry::at(&path).unwrap();
+            registry.db.execute_batch(&format!("DROP TABLE {table}; {ddl}")).unwrap();
+            drop(registry);
+            let before = image(&path);
+            assert!(Registry::at(&path).is_err(), "malformed {table}");
+            assert_eq!(image(&path), before);
+        }
     }
 
     #[test]
