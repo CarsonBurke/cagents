@@ -1142,3 +1142,87 @@ fn captured_raw_fetch_endpoint_applies_git_url_rewrites_exactly_once() {
     assert_eq!(verified.upstream(), Some("refs/remotes/origin/feature"));
     assert!(!missing.exists());
 }
+
+#[test]
+fn explicit_tracking_repair_preserves_local_ahead_dirty_work_and_all_refs() {
+    let fixture = Fixture::new(false);
+    fs::write(fixture.root.join("file"), "local commit\n").unwrap();
+    run_git(&fixture.root, &["commit", "-qam", "local work"]);
+    let local = git_text(&fixture.root, &["rev-parse", "HEAD"]);
+    fs::write(fixture.root.join("file"), "staged local\n").unwrap();
+    run_git(&fixture.root, &["add", "file"]);
+    fs::write(fixture.root.join("other"), "unstaged local\n").unwrap();
+    fs::write(fixture.root.join("untracked"), "untracked local\n").unwrap();
+    run_git(&fixture.root, &["config", "fixture.unrelated", "preserved"]);
+    let index = fs::read(fixture.root.join(".git/index")).unwrap();
+    let refs = run_git(&fixture.root, &["show-ref"]).stdout;
+    let original_config = fs::read(fixture.root.join(".git/config")).unwrap();
+    let request = fixture.request(fixture.original.clone());
+    assert!(fixture.service.prepare_existing_pr_checkout(&request, &CancellationToken::default()).is_err());
+    assert!(fixture.service.prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default()).is_err());
+    let plan = fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).unwrap();
+    assert_eq!(plan.disposition(), PrCheckoutDisposition::RepairTrackingPreservingLocal);
+    assert_eq!(plan.local_head().as_str(), local);
+    assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), original_config, "preparing the explicit choice must not configure tracking");
+    fixture.intercept(|command| {
+        assert!(!command.arguments.iter().any(|argument| argument == "fetch" || argument == "read-tree"));
+        if command.arguments.iter().any(|argument| argument == "update-ref") {
+            assert_eq!(command.environment.get(OsStr::new("CAGENTS_PR_MODE")), Some(&OsString::from("probe")));
+            assert_eq!(command.environment.get(OsStr::new("CAGENTS_PR_UPDATE_REMOTE")), Some(&OsString::from("0")));
+        }
+    });
+    let verified = fixture.apply(&plan).unwrap();
+    assert_eq!(verified.disposition(), PrCheckoutDisposition::RepairTrackingPreservingLocal);
+    assert_eq!(verified.head().as_str(), local);
+    assert_eq!(verified.upstream(), Some("refs/remotes/origin/feature"));
+    assert_eq!(run_git(&fixture.root, &["show-ref"]).stdout, refs);
+    assert_eq!(fs::read(fixture.root.join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"staged local\n");
+    assert_eq!(fs::read(fixture.root.join("other")).unwrap(), b"unstaged local\n");
+    assert_eq!(fs::read(fixture.root.join("untracked")).unwrap(), b"untracked local\n");
+    assert_eq!(git_text(&fixture.root, &["config", "fixture.unrelated"]), "preserved");
+    assert_eq!(git_text(&fixture.root, &["config", "branch.feature.remote"]), "origin");
+    assert_eq!(git_text(&fixture.root, &["config", "branch.feature.merge"]), "refs/heads/feature");
+    run_git(&fixture.root, &["push"]);
+    assert_eq!(git_text(&fixture.bare, &["rev-parse", "refs/heads/feature"]), local);
+}
+
+#[test]
+fn tracking_repair_preserves_diverged_head_and_refuses_missing_or_stale_tracking_refs() {
+    let fixture = Fixture::new(false);
+    fs::write(fixture.root.join("file"), "local divergent\n").unwrap();
+    run_git(&fixture.root, &["commit", "-qam", "local divergence"]);
+    let local = git_text(&fixture.root, &["rev-parse", "HEAD"]);
+    let reviewed = fixture.advance(|root| fs::write(root.join("file"), "PR divergent\n").unwrap());
+    let request = fixture.request(reviewed.clone());
+    let configuration = fs::read(fixture.root.join(".git/config")).unwrap();
+    assert!(fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).unwrap_err().detail.contains("Fetch and review"));
+    assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), configuration);
+    run_git(&fixture.root, &["fetch", "origin"]);
+    let plan = fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).unwrap();
+    let refs = run_git(&fixture.root, &["show-ref"]).stdout;
+    let verified = fixture.apply(&plan).unwrap();
+    assert_eq!(verified.head().as_str(), local);
+    assert_eq!(run_git(&fixture.root, &["show-ref"]).stdout, refs);
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"local divergent\n");
+
+    let missing = Fixture::new(false);
+    run_git(&missing.root, &["update-ref", "-d", "refs/remotes/origin/feature"]);
+    let config = fs::read(missing.root.join(".git/config")).unwrap();
+    assert!(missing.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&missing.request(missing.original.clone()), &CancellationToken::default()).unwrap_err().detail.contains("Fetch and review"));
+    assert_eq!(fs::read(missing.root.join(".git/config")).unwrap(), config);
+}
+
+#[test]
+fn tracking_only_preserve_requires_absent_pair_and_fresh_confirmation() {
+    let fixture = Fixture::new(false);
+    let request = fixture.request(fixture.original.clone());
+    let plan = fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).unwrap();
+    run_git(&fixture.root, &["config", "branch.feature.merge", "refs/heads/different"]);
+    let config = fs::read(fixture.root.join(".git/config")).unwrap();
+    assert!(fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).is_err());
+    assert_eq!(fixture.apply(&plan).unwrap_err().kind, PrCheckoutFailureKind::Refused);
+    assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), config);
+    let configured = Fixture::new(true);
+    assert!(configured.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&configured.request(configured.original.clone()), &CancellationToken::default()).unwrap_err().detail.contains("wholly absent"));
+}

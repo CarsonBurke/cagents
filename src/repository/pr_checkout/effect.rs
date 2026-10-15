@@ -559,7 +559,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         disposition: plan.disposition,
         path: plan.path().to_owned(),
         branch: plan.request.branch.clone(),
-        head: if plan.disposition == PrCheckoutDisposition::OpenPreservingLocal { plan.current_head.clone() } else { plan.request.expected_head.clone() },
+        head: if matches!(plan.disposition, PrCheckoutDisposition::OpenPreservingLocal | PrCheckoutDisposition::RepairTrackingPreservingLocal) { plan.current_head.clone() } else { plan.request.expected_head.clone() },
         upstream: (plan.request.tracking == PrCheckoutTracking::RemoteBranch).then(|| {
             format!(
                 "refs/remotes/{}/{}",
@@ -613,6 +613,25 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             cancellation,
         )?;
         if matches!(plan.disposition, PrCheckoutDisposition::AlreadyCurrent | PrCheckoutDisposition::OpenPreservingLocal) {
+            return Ok(());
+        }
+        if plan.disposition == PrCheckoutDisposition::RepairTrackingPreservingLocal {
+            repair_tracking(service, plan, &pinned, private.path(), cancellation, &mut changed)?;
+            let current = service.recheck_existing_pr_checkout(plan, cancellation)
+                .map_err(|error| error.to_string())?;
+            if current.disposition != PrCheckoutDisposition::OpenPreservingLocal
+                || current.worktree != plan.worktree
+                || current.git_dir != plan.git_dir
+                || current.common_dir != plan.common_dir
+                || current.current_head != plan.current_head
+                || current.remote != plan.remote
+                || current.remote_tracking != plan.remote_tracking
+                || current.dirty != plan.dirty
+            {
+                return Err("The local checkout changed during tracking-only repair; inspect the retained operation before opening".into());
+            }
+            transaction(service, &current, &pinned, private.path(), &lease, true, cancellation)?;
+            expected_final = current;
             return Ok(());
         }
         fetch_captured_head(service, plan, &pinned, private.path(), &private_ref, &lease, cancellation)?;

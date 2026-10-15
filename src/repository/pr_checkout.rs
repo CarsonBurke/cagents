@@ -38,6 +38,8 @@ pub enum PrCheckoutDisposition {
     /// Explicitly open the captured local HEAD without changing its contents.
     /// This does not claim that it equals the reviewed PR head.
     OpenPreservingLocal,
+    /// Repair only the wholly absent upstream pair, preserving local work.
+    RepairTrackingPreservingLocal,
     AlreadyCurrent,
     FastForward,
     RepairTracking,
@@ -223,18 +225,35 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         request: &ExistingPrCheckoutRequest,
         cancellation: &CancellationToken,
     ) -> Result<ExistingPrCheckoutPlan, PrCheckoutFailure> {
-        self.prepare_existing_pr_checkout_inner(request, false, cancellation)
+        self.prepare_existing_pr_checkout_inner(request, false, false, cancellation)
     }
 
     /// Prepare an explicitly acknowledged opening of the existing local HEAD.
-    /// It must already track the reviewed source correctly; no fetch, upstream
-    /// repair, index replacement or branch movement is authorized by this plan.
+    /// It must already track the reviewed source correctly, or be an explicitly
+    /// read-only branch without tracking. No fetch, upstream repair, index
+    /// replacement or branch movement is authorized by this plan.
     pub fn prepare_existing_pr_checkout_preserving_local(
         &self,
         request: &ExistingPrCheckoutRequest,
         cancellation: &CancellationToken,
     ) -> Result<ExistingPrCheckoutPlan, PrCheckoutFailure> {
-        self.prepare_existing_pr_checkout_inner(request, true, cancellation)
+        self.prepare_existing_pr_checkout_inner(request, true, false, cancellation)
+    }
+
+    /// Confirm only missing upstream configuration while opening captured local
+    /// work. The existing direct tracking ref must already equal the reviewed
+    /// head; this action never fetches, moves refs or replaces checkout bytes.
+    pub fn prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(
+        &self,
+        request: &ExistingPrCheckoutRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ExistingPrCheckoutPlan, PrCheckoutFailure> {
+        let plan = self.prepare_existing_pr_checkout_inner(request, true, true, cancellation)?;
+        if plan.disposition != PrCheckoutDisposition::RepairTrackingPreservingLocal {
+            return Err(PrCheckoutFailure::refused(&request.worktree,
+                "This action requires a wholly absent writable PR upstream; review the existing checkout without changing its tracking"));
+        }
+        Ok(plan)
     }
 
     fn recheck_existing_pr_checkout(
@@ -242,13 +261,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         plan: &ExistingPrCheckoutPlan,
         cancellation: &CancellationToken,
     ) -> Result<ExistingPrCheckoutPlan, PrCheckoutFailure> {
-        self.prepare_existing_pr_checkout_inner(&plan.request, plan.disposition == PrCheckoutDisposition::OpenPreservingLocal, cancellation)
+        let preserve = matches!(plan.disposition, PrCheckoutDisposition::OpenPreservingLocal | PrCheckoutDisposition::RepairTrackingPreservingLocal);
+        self.prepare_existing_pr_checkout_inner(&plan.request, preserve,
+            plan.disposition == PrCheckoutDisposition::RepairTrackingPreservingLocal, cancellation)
     }
 
     fn prepare_existing_pr_checkout_inner(
         &self,
         request: &ExistingPrCheckoutRequest,
         preserve_local: bool,
+        repair_preserving_local: bool,
         cancellation: &CancellationToken,
     ) -> Result<ExistingPrCheckoutPlan, PrCheckoutFailure> {
         let refuse = |detail: String| PrCheckoutFailure::refused(&request.worktree, detail);
@@ -363,7 +385,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 PrCheckoutTracking::RemoteBranch if absent => true,
                 PrCheckoutTracking::RemoteBranch => return Err("The branch has partial or different upstream configuration; preserve it and reconcile manually".into()),
             };
-            if preserve_local && repair {
+            if preserve_local && repair && !repair_preserving_local {
                 return Err("This branch has no PR upstream. Configure its tracking explicitly before opening preserved local work; no commits or files were changed".into());
             }
             if request.tracking == PrCheckoutTracking::RemoteBranch {
@@ -453,6 +475,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let remote_tracking = self
                 .resolve_optional_revision(&worktree.path, &remote_ref, cancellation)
                 .map_err(|error| error.to_string())?;
+            if repair_preserving_local && remote_tracking.as_ref() != Some(&request.expected_head) {
+                return Err("Fetch and review the PR first: this config-only action requires an existing direct tracking ref at the reviewed head; no local work or configuration was changed".into());
+            }
             let command = self.git_read(
                 &worktree.path,
                 ["config", "--null", "--list", "--show-scope"],
@@ -496,13 +521,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     return Err("The local PR branch is ahead or has diverged. Its commits were preserved; reconcile it manually".into());
                 }
             }
-            let disposition = if preserve_local { PrCheckoutDisposition::OpenPreservingLocal } else { match (advance, repair) {
+            let disposition = if preserve_local && repair { PrCheckoutDisposition::RepairTrackingPreservingLocal } else if preserve_local { PrCheckoutDisposition::OpenPreservingLocal } else { match (advance, repair) {
                 (false, false) => PrCheckoutDisposition::AlreadyCurrent,
                 (true, false) => PrCheckoutDisposition::FastForward,
                 (false, true) => PrCheckoutDisposition::RepairTracking,
                 (true, true) => PrCheckoutDisposition::FastForwardAndRepair,
             }};
             let notice = match disposition {
+                PrCheckoutDisposition::RepairTrackingPreservingLocal => format!("Configure only branch.{}.remote={} and branch.{}.merge={}, then open local commit {} while the reviewed PR is at {}. Preserve local commits, index and files without fetching or updating any ref.", request.branch.as_str(), request.remote, request.branch.as_str(), request.head_branch.full_ref(), current_head, request.expected_head),
                 PrCheckoutDisposition::OpenPreservingLocal => format!("Open existing local commit {} while the reviewed PR is at {}. Preserve local commits and uncommitted work without fetching or updating this checkout.", current_head, request.expected_head),
                 PrCheckoutDisposition::AlreadyCurrent => "Open the existing worktree at the reviewed PR head.".to_owned(),
                 PrCheckoutDisposition::FastForward => "Verify the fetched PR head, then fast-forward and open the existing clean worktree.".to_owned(),
