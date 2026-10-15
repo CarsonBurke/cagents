@@ -635,7 +635,15 @@ fn migrate(db: &Connection) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS automation_snapshots (
             firing TEXT PRIMARY KEY REFERENCES automation_firings(id) ON DELETE CASCADE,
             agent TEXT NOT NULL UNIQUE, snapshot TEXT NOT NULL
-        ) STRICT;")
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS automation_precheck_retirements (
+            firing TEXT PRIMARY KEY REFERENCES automation_firings(id) ON DELETE RESTRICT,
+            revision INTEGER NOT NULL, retired INTEGER NOT NULL CHECK(retired IN (0,1))
+        ) STRICT;
+        INSERT OR IGNORE INTO automation_precheck_retirements(firing,revision,retired)
+            SELECT f.id,f.revision,0 FROM automation_firings f
+            JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
+            WHERE json_type(r.definition,'$.precheck')='object';")
         .map_err(|error| error.to_string())?;
     Ok(())
 }

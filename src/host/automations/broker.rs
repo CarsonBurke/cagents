@@ -65,6 +65,7 @@ struct Inner {
     // newer unrelated events evict its durable replay identity.
     attention: Mutex<BTreeMap<crate::model::RunId, crate::notifications::Evidence>>,
     history_pruned_ms: std::sync::atomic::AtomicU64,
+    retirement_after: Mutex<Option<Uuid>>,
 }
 
 #[derive(Clone)]
@@ -89,6 +90,7 @@ impl Broker {
             cleanup: Mutex::new(Some(cleanup)),
             attention: Mutex::new(attention),
             history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
+            retirement_after:Mutex::new(None),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -366,7 +368,11 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .retain(|run, _| runs.contains(run));
         let mut checking = false;
-        let candidates = self
+        let after=*self.0.retirement_after.lock().unwrap_or_else(|p|p.into_inner());
+        let retirement_page=self.0.registry.lock().unwrap_or_else(|p|p.into_inner()).pending_automation_precheck_retirements(after)?;
+        *self.0.retirement_after.lock().unwrap_or_else(|p|p.into_inner())=if retirement_page.len()==32 {retirement_page.last().map(|(id,_)|*id)} else {None};
+        checking|=retirement_page.len()==32;
+        let mut candidates = self
             .0
             .workers
             .lock()
@@ -375,14 +381,14 @@ impl Handle {
             .filter(|id| !owners.contains(id))
             .copied()
             .collect::<Vec<_>>();
+        candidates.extend(retirement_page.into_iter().map(|(id,_)|id));
+        candidates.sort_unstable();candidates.dedup();
         for id in candidates {
             // A manual request can add a worker after the active census. The
             // absent snapshot entry alone never authorizes deleting its proof.
             let Some(revision)=self.0.registry.lock().unwrap_or_else(|p|p.into_inner()).retired_automation_precheck(id)? else {continue;};
             let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(worker) = workers.get_mut(&id) else {
-                continue;
-            };
+            let worker = workers.entry(id).or_insert_with(||Worker::recover(&self.0.root,id,revision));
             match worker.retire() {
                 Ok(true) => {
                     // Files are gone, but keep this worker entry retryable if
@@ -392,7 +398,7 @@ impl Handle {
                     self.0.registry.lock().unwrap_or_else(|p|p.into_inner()).coalesce_retired_automation_precheck(id,revision)?;
                     self.0.workers.lock().unwrap_or_else(|p|p.into_inner()).remove(&id);
                 }
-                Ok(false) => {} // Reap/reclaim again on the next bounded tick.
+                Ok(false) => {checking=true;} // Reap/reclaim again on the next bounded tick.
                 Err(error) => {
                     tracing::warn!(%id, %error, "retired precheck files could not be reclaimed");
                     // A reaped owner may leave inaccessible files for the next
@@ -805,6 +811,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
+            retirement_after:Mutex::new(None),
         }));
         let (reported, received) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -889,6 +896,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
+            retirement_after:Mutex::new(None),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.write().unwrap();

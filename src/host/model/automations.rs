@@ -402,6 +402,12 @@ impl Registry {
         Ok((!firing.state.is_active() && !firing.release_pending).then_some(firing.revision))
     }
 
+    pub(crate) fn pending_automation_precheck_retirements(&self,after:Option<Uuid>)->Result<Vec<(Uuid,u64)>,String> {
+        let mut query=self.db.prepare("SELECT f.id,p.revision FROM automation_precheck_retirements p JOIN automation_firings f ON f.id=p.firing JOIN automations a ON a.id=f.automation WHERE p.retired=0 AND f.id>?1 AND (a.active_firing IS NULL OR a.active_firing<>f.id) AND json_extract(f.record,'$.state') NOT IN ('prechecking','accepted','running','waiting') AND coalesce(json_extract(f.record,'$.release_pending'),0)=0 ORDER BY f.id LIMIT 32").map_err(|error|error.to_string())?;
+        query.query_map([after.map(|id|id.to_string()).unwrap_or_default()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,u64>(1)?))).map_err(|error|error.to_string())?
+            .map(|row|{let (id,revision)=row.map_err(|error|error.to_string())?;Ok((id.parse::<Uuid>().map_err(|error|error.to_string())?,revision))}).collect()
+    }
+
     /// The broker calls this only after the exact helper's files are retired.
     /// Until then its original firing ID remains the cleanup authority.
     pub(crate) fn coalesce_retired_automation_precheck(&mut self,id:Uuid,revision:u64)->Result<(),String> {
@@ -410,10 +416,14 @@ impl Registry {
         let Some(record)=record else {return Ok(());};
         let mut firing:Firing=decode(&record)?;
         if firing.revision!=revision {return Err("The retired precheck revision changed".into());}
-        if firing.state!=FiringState::Skipped || firing.agent.is_some() || firing.run.is_some() || firing.release_pending {return Ok(());}
         let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM automations WHERE active_firing=?1)",[id.to_string()],|row|row.get(0)).map_err(|error|error.to_string())?;
-        if active {return Err("The precheck still owns its automation slot".into());}
+        if active || firing.state.is_active() || firing.release_pending {return Err("The precheck still owns its automation slot".into());}
+        tx.execute("UPDATE automation_precheck_retirements SET retired=1 WHERE firing=?1 AND revision=?2",params![id.to_string(),revision]).map_err(|error|error.to_string())?;
+        if firing.state!=FiringState::Skipped || firing.agent.is_some() || firing.run.is_some() {
+            tx.commit().map_err(|error|error.to_string())?;return Ok(());
+        }
         coalesce_existing_skipped_firing(&tx,&mut firing)?;
+        tx.execute("INSERT INTO automation_precheck_retirements(firing,revision,retired) VALUES(?1,?2,1) ON CONFLICT(firing) DO UPDATE SET retired=1",params![firing.id.to_string(),firing.revision]).map_err(|error|error.to_string())?;
         let automation=read_automation(&tx,firing.automation).ok();
         if let Some(automation)=automation {
             // The surviving group ID is the durable notification evidence key.
@@ -615,6 +625,9 @@ impl Registry {
                     automation.reuse_agent = None;
                 }
             }
+        }
+        if firing.run.is_none() && firing.state==FiringState::Prechecking {
+            tx.execute("UPDATE automation_precheck_retirements SET retired=1 WHERE firing=?1",[firing.id.to_string()]).map_err(|error|error.to_string())?;
         }
         firing.state = FiringState::Failed;
         firing.finished_ms = Some(now_ms);
@@ -1686,6 +1699,9 @@ impl Registry {
             automation.active_firing = Some(firing.id);
         }
         insert_or_coalesce_firing(&tx, &mut firing, &key)?;
+        if definition.precheck.is_some() {
+            tx.execute("INSERT OR IGNORE INTO automation_precheck_retirements(firing,revision,retired) VALUES(?1,?2,?3)",params![firing.id.to_string(),firing.revision,firing.state!=FiringState::Prechecking]).map_err(|error|error.to_string())?;
+        }
         let accepted = if firing.state == FiringState::Prechecking && definition.precheck.is_none()
         {
             accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
@@ -2021,6 +2037,7 @@ fn coalesce_existing_skipped_firing(tx:&Transaction<'_>,firing:&mut Firing)->Res
     // and reason boundary instead of reinserting an older occurrence last.
     if latest.as_deref()!=Some(firing.id.to_string().as_str()) {return Ok(());}
     let key:String=tx.query_row("SELECT occurrence_key FROM automation_firings WHERE id=?1",[firing.id.to_string()],|row|row.get(0)).map_err(|error|error.to_string())?;
+    tx.execute("DELETE FROM automation_precheck_retirements WHERE firing=?1 AND retired=1",[firing.id.to_string()]).map_err(|error|error.to_string())?;
     tx.execute("DELETE FROM automation_firings WHERE id=?1",[firing.id.to_string()]).map_err(|error|error.to_string())?;
     insert_or_coalesce_firing(tx,firing,&key)
 }
@@ -2118,6 +2135,7 @@ fn prune_history(
         ) WHERE (active_firing IS NULL OR active_firing<>id)
           AND json_extract(record,'$.state') NOT IN ('prechecking','accepted','running','waiting')
           AND coalesce(json_extract(record,'$.release_pending'),0)=0
+          AND NOT EXISTS(SELECT 1 FROM automation_precheck_retirements p WHERE p.firing=id AND p.retired=0)
           AND ((deleted_ms IS NOT NULL AND deleted_ms<?1) OR coalesce(json_extract(record,'$.finished_ms'),created_ms)<?1 OR rank>?2)
     ", if automation.is_some() { "WHERE f.automation=?3" } else { "WHERE ?3 IS NULL" });
     tx.execute(
@@ -2132,6 +2150,7 @@ fn prune_history(
         [],
     )
     .map_err(|error| error.to_string())?;
+    tx.execute("DELETE FROM automation_precheck_retirements WHERE retired=1 AND firing IN (SELECT id FROM automation_history_prune)",[]).map_err(|error|error.to_string())?;
     tx.execute(
         "DELETE FROM automation_firings WHERE id IN (SELECT id FROM automation_history_prune)",
         [],
@@ -4387,7 +4406,7 @@ mod tests {
             let due=registry.automation(created.id).unwrap().next.unwrap();
             let next=Occurrence {due_ms:due.due_ms+60_000,local:format!("minute-{}",index+1)};
             let claim=registry.claim_automation(created.id,enabled.execution_revision,Some(&due),Trigger::Scheduled {occurrence:due.clone()},Some(next),false,due.due_ms).unwrap();
-            registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).unwrap();
+            assert!(registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).is_err());
             assert_eq!(registry.automation(created.id).unwrap().active_firing,Some(claim.firing.id),"an unresolved helper's original owner row cannot be merged");
             registry.finish_automation_precheck(claim.firing.id,Outcome::Stopped {state:FiringState::Skipped,skip:Some(SkipReason::PrecheckExit),diagnostic:"predicate declined".into()},due.due_ms+1).unwrap();
             assert!(registry.automation_firing(claim.firing.id).is_ok(),"durable completion alone does not erase the helper's cleanup key");
@@ -4401,13 +4420,43 @@ mod tests {
         let next=Occurrence {due_ms:due.due_ms+60_000,local:"after interruption".into()};
         let claim=registry.claim_automation(created.id,enabled.execution_revision,Some(&due),Trigger::Scheduled {occurrence:due.clone()},Some(next),false,due.due_ms).unwrap();
         registry.interrupt_automation_precheck(claim.firing.id,"cleanup receipt unavailable".into(),due.due_ms+1).unwrap();
-        registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).unwrap();
+        assert!(registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).is_err());
         assert_eq!(registry.automation(created.id).unwrap().active_firing,Some(claim.firing.id));
         assert_eq!(registry.automation_firing(claim.firing.id).unwrap().state,FiringState::Interrupted);
         assert!(registry.finish_automation_precheck(claim.firing.id,Outcome::Stopped {state:FiringState::Skipped,skip:Some(SkipReason::PrecheckExit),diagnostic:"late proved cleanup".into()},due.due_ms+2).unwrap().is_none());
         registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).unwrap();
         assert_eq!(registry.automation_firing(claim.firing.id).unwrap().state,FiringState::Interrupted,"late cleanup never turns uncertain work into a fresh skip or new provider dispatch");
         assert_eq!(registry.automation_history(Some(created.id),None,100).unwrap().firings.len(),2);
+    }
+
+    #[test]
+    fn retention_keeps_settled_precheck_proof_until_helper_retirement_survives_restart() {
+        use crate::automations::{Precheck,SkipReason,Trigger};
+        use crate::host::automations::precheck::Outcome;
+        let (mut registry,directory,mut definition)=fixture();
+        definition.precheck=Some(Precheck {command:"exit 3".into(),timeout_seconds:1});
+        let created=registry.create_automation(definition,100,test_identity()).unwrap();
+        let claim=registry.claim_automation(created.id,1,None,Trigger::Manual {request:Uuid::new_v4()},None,true,200).unwrap();
+        registry.finish_automation_precheck(claim.firing.id,Outcome::Stopped {state:FiringState::Skipped,skip:Some(SkipReason::PrecheckExit),diagnostic:"declined".into()},210).unwrap();
+        let late=HISTORY_TTL_MS+1000;
+        registry.prune_automation_history(late).unwrap();
+        assert!(registry.automation_firing(claim.firing.id).is_ok(),"durable outcome alone does not prove the helper process and inherited lease retired");
+        // Simulate an older store lacking the new cleanup authority table.
+        registry.db.execute("DROP TABLE automation_precheck_retirements",[]).unwrap();
+        drop(registry);
+        let mut registry=Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry.prune_automation_history(late).unwrap();
+        assert!(registry.automation_firing(claim.firing.id).is_ok());
+        assert_eq!(registry.pending_automation_precheck_retirements(None).unwrap(),vec![(claim.firing.id,claim.firing.revision)]);
+        registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).unwrap();
+        assert!(registry.pending_automation_precheck_retirements(None).unwrap().is_empty());
+        drop(registry);
+        let mut registry=Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert!(registry.pending_automation_precheck_retirements(None).unwrap().is_empty(),"backfill never forgets a committed retirement receipt");
+        registry.prune_automation_history(late).unwrap();
+        assert!(registry.automation_firing(claim.firing.id).is_err());
+        let markers:u64=registry.db.query_row("SELECT count(*) FROM automation_precheck_retirements",[],|row|row.get(0)).unwrap();
+        assert_eq!(markers,0,"retired marker metadata expires atomically with its history");
     }
 
 }
