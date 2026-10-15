@@ -23,6 +23,11 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+// The mechanism is exercised on Unix in unit tests, but production Darwin
+// ownership is not enabled until retained identity + complete census compose.
+#[cfg(any(target_os = "macos", test))]
+mod darwin_owner;
+
 mod daemon_admission;
 pub(crate) use daemon_admission::{
     DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, has_inherited_daemon_fence,
