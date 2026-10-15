@@ -2357,7 +2357,7 @@ impl Cagents {
             (Command::EditorComplete, capabilities.completion),
             (Command::GoToDefinition, capabilities.definition),
             (Command::FindReferences, capabilities.references),
-            (Command::HoverDocumentation, capabilities.hover),
+            (Command::ShowHover, capabilities.hover),
             // Diagnostics is the local panel for server-pushed diagnostics;
             // pull-diagnosticProvider does not describe that capability.
             (Command::ShowDiagnostics, true),
