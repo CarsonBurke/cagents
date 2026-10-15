@@ -633,7 +633,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
 mod tests {
     use super::*;
     #[test]
-    fn current_match_has_a_distinct_background_without_losing_span_text() {
+    fn find_current_match_has_a_distinct_background_without_losing_span_text() {
         let selectable = Selectable { logical:None,plain:"cat cat".into(),
             spans:vec![Span::new("cat cat")].into(),matches:vec![0..3,4..7],current:Some(4..7),
             size:design::TEXT_PROSE.into(),font:iced::Font::default(),
