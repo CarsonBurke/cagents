@@ -663,7 +663,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             size: self.size,
             font: self.font,
         };
-        if let Some(flow) = &state.flow {
+        if let Some(flow) = state.flow.clone() {
             state.paragraph.take();
             state.spans = Some(self.spans.clone());
             state.shape = Some(shape);
