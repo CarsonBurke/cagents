@@ -324,19 +324,28 @@ impl HostedPublishedState {
         ticket: u64,
         result: Result<HostedTerminalBinding, String>,
         proof: &HostSessionProof,
-    ) {
-        if result.is_ok() {
+    ) -> bool {
+        let mut accepted = result.is_ok();
+        if accepted {
             let deliveries = self
                 .key_deliveries
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(delivery) = deliveries.pending.get(&ticket) {
+                accepted = delivery.deadline > Instant::now();
                 // Publish the exact matching frame's proof before its Ok
                 // outcome, so delayed UI reaping needs no current attachment.
-                let _ = delivery.completed.admission_proof.set(proof.clone());
+                if accepted {
+                    let _ = delivery.completed.admission_proof.set(proof.clone());
+                }
+            } else {
+                accepted = false;
             }
         }
-        self.complete_key(ticket, result);
+        self.complete_key(ticket, if accepted { result } else {
+            Err("terminal key admission was not confirmed before its deadline".into())
+        });
+        accepted
     }
 
     fn complete_key(&self, ticket: u64, result: Result<HostedTerminalBinding, String>) {
@@ -2126,8 +2135,22 @@ async fn serve_connection(
     let mut unconfirmed = std::collections::VecDeque::new();
     let mut unconfirmed_bytes = 0usize;
     let mut unconfirmed_codec = None;
+    let mut ready_turns = 0usize;
 
     loop {
+        if published.key_deadline().is_some_and(|deadline| deadline <= Instant::now()) {
+            stop.request();
+            published.fail_keys("terminal key admission was not confirmed before its five-second deadline");
+            return ConnectionEnd::Stop;
+        }
+        // A busy decoded inbox can be immediately ready indefinitely. Bound
+        // its executor turn as well as its memory so other attachments and the
+        // deadline supervisor can run without an idle polling timer.
+        ready_turns += 1;
+        if ready_turns == 32 {
+            ready_turns = 0;
+            tokio::task::yield_now().await;
+        }
         published.expire_retained(Instant::now());
         if stop.is_requested() {
             connection.close();
@@ -2372,7 +2395,10 @@ async fn serve_connection(
                         let result = published.worker_binding.get().cloned().ok_or_else(|| {
                             "key accepted without authenticated worker identity".to_owned()
                         });
-                        published.admit_key(ticket, result, &proof);
+                        if !published.admit_key(ticket, result, &proof) {
+                            stop.request();
+                            return ConnectionEnd::Stop;
+                        }
                     }
                     (PendingRequest::KeyDelivery(ticket), unexpected) => {
                         published.complete_key(
@@ -3878,6 +3904,29 @@ mod tests {
         assert_eq!(receipt.admission_host_proof(), Some(proof.clone()));
         assert_eq!(observer.admission_host_proof(), Some(proof.clone()));
         assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+    }
+
+    #[test]
+    fn late_key_ack_cannot_publish_success_or_historical_authority() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("late-key.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let proof = proof("late-key");
+        let source = session();
+        let handle = HostedTerminalHandle::connect_at(socket, source.id, Some(proof.clone()), |_| {}).unwrap();
+        let mut stream = accept_connection(&listener);
+        receipt_connect(&mut stream, &proof, source);
+        let receipt = handle.key_with_receipt(receipt_key(super::super::KeyAction::Press)).unwrap();
+        let key: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(key.request, ClientRequest::Key { .. }));
+        // Expire the exact in-flight ticket without waking the outer timer.
+        // The already-ready response path must independently enforce its bound.
+        handle.inner.published.key_deliveries.lock().unwrap().pending.values_mut().next().unwrap().deadline = Instant::now();
+        receipt_response(&mut stream, &proof, key.request_id, ServerResponse::Accepted);
+        assert!(receipt.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err().contains("deadline"));
+        assert_eq!(receipt.admission_host_proof(), None);
+        assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+        assert_eq!(handle.key(receipt_key(super::super::KeyAction::Release)), Err(TerminalSendError::Closed));
     }
 
     #[test]
