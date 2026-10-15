@@ -6562,7 +6562,9 @@ impl RepositoryRuntime {
             .diff_model()
             .and_then(|model| model.source_head.clone());
         let modes = self.diff_model().map_or([None; 2], |model| model.modes);
-        let git_read_receipt = self.diff_model().and_then(|model| model.git_read_receipt.clone());
+        let git_read_receipt = self
+            .diff_model()
+            .and_then(|model| model.git_read_receipt.clone());
         self.working_diff.active = Some(WorkingDiffJob {
             identity: identity.clone(),
             revision,

@@ -14,16 +14,35 @@ pub struct GitReadSource {
 impl GitReadSource {
     /// The host supplies its already initialized original actor and authority.
     /// This constructor does not discover a worktree through its current path.
-    pub fn new(binding: OperationId, authority: WorktreeAuthority, mutation_revision: Arc<AtomicU64>) -> Self {
-        Self { binding, authority, mutation_revision, available: Arc::new(AtomicBool::new(true)) }
+    pub fn new(
+        binding: OperationId,
+        authority: WorktreeAuthority,
+        mutation_revision: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            binding,
+            authority,
+            mutation_revision,
+            available: Arc::new(AtomicBool::new(true)),
+        }
     }
 
-    pub fn id(&self) -> OperationId { self.binding }
-    pub fn authority(&self) -> &WorktreeAuthority { &self.authority }
-    pub fn mutation_revision(&self) -> Arc<AtomicU64> { self.mutation_revision.clone() }
-    pub fn is_available(&self) -> bool { self.available.load(Ordering::Acquire) }
+    pub fn id(&self) -> OperationId {
+        self.binding
+    }
+    pub fn authority(&self) -> &WorktreeAuthority {
+        &self.authority
+    }
+    pub fn mutation_revision(&self) -> Arc<AtomicU64> {
+        self.mutation_revision.clone()
+    }
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
+    }
     /// Project removal/replacement permanently retires all clones of this source.
-    pub fn invalidate(&self) { self.available.store(false, Ordering::Release); }
+    pub fn invalidate(&self) {
+        self.available.store(false, Ordering::Release);
+    }
 
     /// Pure comparison for native event handlers; no filesystem operations.
     pub fn same_source(&self, other: &Self) -> bool {
@@ -41,13 +60,24 @@ impl GitReadSource {
     }
 
     /// Only the actual scoped read issues a receipt. Call on a blocking worker.
-    pub fn diff(&self, request: &DiffRequest, cancellation: &CancellationToken) -> Result<(DiffContent, GitReadReceipt), RepositoryError> {
+    pub fn diff(
+        &self,
+        request: &DiffRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<(DiffContent, GitReadReceipt), RepositoryError> {
         let revision = self.mutation_revision.load(Ordering::Acquire);
         self.validate(revision)?;
-        let service = RepositoryService::system("git").with_worktree_authority(self.authority.clone())?;
+        let service =
+            RepositoryService::system("git").with_worktree_authority(self.authority.clone())?;
         let content = service.diff(request, cancellation)?;
         self.validate(revision)?;
-        Ok((content, GitReadReceipt { source: self.clone(), revision }))
+        Ok((
+            content,
+            GitReadReceipt {
+                source: self.clone(),
+                revision,
+            },
+        ))
     }
 }
 
@@ -59,16 +89,23 @@ pub struct GitReadReceipt {
 }
 
 impl GitReadReceipt {
-    pub fn source(&self) -> &GitReadSource { &self.source }
-    pub fn revision(&self) -> u64 { self.revision }
+    pub fn source(&self) -> &GitReadSource {
+        &self.source
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     pub fn is_current(&self) -> bool {
-        self.source.is_available() && self.source.mutation_revision.load(Ordering::Acquire) == self.revision
+        self.source.is_available()
+            && self.source.mutation_revision.load(Ordering::Acquire) == self.revision
     }
     pub fn matches_source(&self, source: &GitReadSource) -> bool {
         self.is_current() && self.source.same_source(source)
     }
     /// Worker-side physical validation, in addition to pure native comparisons.
-    pub fn validate(&self) -> Result<(), RepositoryError> { self.source.validate(self.revision) }
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        self.source.validate(self.revision)
+    }
 }
 
 impl PartialEq for GitReadReceipt {
@@ -84,23 +121,52 @@ pub(crate) mod tests {
 
     pub(crate) fn git(root: &Path, args: &[&str]) {
         let mut command = CommandSpec::new("git")
-            .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
-            .arg("-C").arg(root).args(args)
-            .timeout(Duration::from_secs(5)).output_limits(16 * 1024, 16 * 1024);
-        for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.templateDir=",
+            ])
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .timeout(Duration::from_secs(5))
+            .output_limits(16 * 1024, 16 * 1024);
+        for (name, _) in
+            std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_"))
+        {
             command = command.env_remove(name);
         }
-        command = command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null");
-        let output = SystemProcessExecutor.execute(&command, &CancellationToken::default()).unwrap();
-        assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
+        command = command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::default())
+            .unwrap();
+        assert!(
+            output.success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn read(root: &Path, source: &GitReadSource) -> GitReadReceipt {
-        let (content, receipt) = source.diff(&DiffRequest {
-            worktree: root.to_owned(), basis: DiffBasis::IndexToWorktree,
-            path: RepoPath::parse("file").unwrap(), old_path: None,
-        }, &CancellationToken::default()).unwrap();
-        assert!(matches!(content, DiffContent::Comparison { new: DiffSide::Text { text, .. }, .. } if text == "original work\n"));
+        let (content, receipt) = source
+            .diff(
+                &DiffRequest {
+                    worktree: root.to_owned(),
+                    basis: DiffBasis::IndexToWorktree,
+                    path: RepoPath::parse("file").unwrap(),
+                    old_path: None,
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(
+            matches!(content, DiffContent::Comparison { new: DiffSide::Text { text, .. }, .. } if text == "original work\n")
+        );
         receipt
     }
 
@@ -125,8 +191,19 @@ pub(crate) mod tests {
         source.invalidate();
         assert!(!current.is_current());
         assert!(current.validate().is_err());
-        assert!(source.diff(&DiffRequest { worktree: root.to_owned(), basis: DiffBasis::IndexToWorktree,
-            path: RepoPath::parse("file").unwrap(), old_path: None }, &CancellationToken::default()).is_err());
+        assert!(
+            source
+                .diff(
+                    &DiffRequest {
+                        worktree: root.to_owned(),
+                        basis: DiffBasis::IndexToWorktree,
+                        path: RepoPath::parse("file").unwrap(),
+                        old_path: None
+                    },
+                    &CancellationToken::default()
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -137,15 +214,24 @@ pub(crate) mod tests {
             fs::create_dir(&root).unwrap();
             git(&root, &["init", "-b", "main"]);
             fs::write(root.join("file"), "original work\n").unwrap();
-            let source = GitReadSource::new(OperationId::new(), WorktreeAuthority::capture(&root).unwrap(), Arc::new(AtomicU64::new(0)));
+            let source = GitReadSource::new(
+                OperationId::new(),
+                WorktreeAuthority::capture(&root).unwrap(),
+                Arc::new(AtomicU64::new(0)),
+            );
             let receipt = read(&root, &source);
-            let moved = if replace_git { root.join(".git") } else { root.clone() };
+            let moved = if replace_git {
+                root.join(".git")
+            } else {
+                root.clone()
+            };
             fs::rename(&moved, directory.path().join("original")).unwrap();
             fs::create_dir(&moved).unwrap();
             git(&root, &["init", "-b", "main"]);
             let replacement = WorktreeAuthority::capture(&root).unwrap();
             assert!(!source.authority().same_scope(&replacement));
-            let newer = GitReadSource::new(OperationId::new(), replacement, Arc::new(AtomicU64::new(0)));
+            let newer =
+                GitReadSource::new(OperationId::new(), replacement, Arc::new(AtomicU64::new(0)));
             assert!(!receipt.matches_source(&newer));
             assert!(receipt.validate().is_err());
         }
@@ -159,10 +245,28 @@ pub(crate) mod tests {
         git(&primary, &["init", "-b", "main"]);
         fs::write(primary.join("file"), "base\n").unwrap();
         git(&primary, &["add", "file"]);
-        git(&primary, &["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"]);
-        git(&primary, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+        git(
+            &primary,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
+        git(
+            &primary,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
         fs::write(linked.join("file"), "original work\n").unwrap();
-        let source = GitReadSource::new(OperationId::new(), WorktreeAuthority::capture(&linked).unwrap(), Arc::new(AtomicU64::new(0)));
+        let source = GitReadSource::new(
+            OperationId::new(),
+            WorktreeAuthority::capture(&linked).unwrap(),
+            Arc::new(AtomicU64::new(0)),
+        );
         let receipt = read(&linked, &source);
         let original_common = primary.join(".git");
         let parked = directory.path().join("original-common");
@@ -175,5 +279,4 @@ pub(crate) mod tests {
         let replacement = WorktreeAuthority::capture(&linked).unwrap();
         assert!(!source.authority().same_scope(&replacement));
     }
-
 }
