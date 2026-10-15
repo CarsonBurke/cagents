@@ -268,6 +268,7 @@ fn send(
         &request,
         ModelEdit::ChangeView {
             change: crate::workspace_model::views::Change::RemoveSource { .. }
+                | crate::workspace_model::views::Change::RemoveArchivedAutomationSource { .. }
                 | crate::workspace_model::views::Change::Remove { .. },
             ..
         }
@@ -366,12 +367,12 @@ fn prepare_removal_request(edit: &mut ModelEdit, model: &WorkspaceModel) -> bool
         // A lost ACK can leave our original operation durably applied. Probe
         // only that same typed operation; the server's atomic source check
         // refuses an unrecorded absent removal without consuming its receipt.
-        let crate::workspace_model::views::Change::RemoveSource {
+        let (crate::workspace_model::views::Change::RemoveSource {
             registry,
             repository,
             before,
             ..
-        } = change
+        } | crate::workspace_model::views::Change::RemoveArchivedAutomationSource {registry,repository,before}) = change
         else {
             return false;
         };

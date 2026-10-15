@@ -618,7 +618,7 @@ impl Cagents {
 
     pub(super) fn acknowledge_view_edit(&mut self, scope: Scope, operation: Option<uuid::Uuid>) {
         if let Some(operation) = operation {
-            if let Some((_, _, Change::RemoveSource { before, .. })) = self
+            if let Some((_, _, Change::RemoveSource { before, .. } | Change::RemoveArchivedAutomationSource { before, .. })) = self
                 .shared_views
                 .pending
                 .iter()
