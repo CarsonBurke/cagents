@@ -28,7 +28,7 @@ mod worker_join;
 use store::Store;
 pub(crate) use store::StoreExportSeed;
 mod account_source;
-pub(crate) use account_source::CapturedAccountSource;
+pub(crate) use account_source::{CapturedAccountSource, PendingAccountSource};
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;

@@ -1,9 +1,9 @@
 //! Pair account provenance and transcript source inside their actual owner.
 //! No public metadata, two-object factory, or requested resume UUID can mint it.
-use super::{Handle, Store};
+use super::{Handle, Inner, Store};
 use crate::{account::scope::LaunchAccountScope, model::TerminalId,
     transcript_cache::export::{SessionNamespace, StoreSourceReceipt}};
-use std::{sync::{Arc, TryLockError}, time::{Duration, Instant}};
+use std::{sync::{Arc, Mutex, TryLockError, Weak}, time::{Duration, Instant}};
 
 #[derive(Default)]
 pub(super) enum StoreAccountBinding {
@@ -54,17 +54,70 @@ impl CapturedAccountSource {
         (self.scope, self.source_session, SessionNamespace::Unconfirmed, self.receipt)
     }
 }
+/// Queueable source issuance capability. The Store may outlive its provider;
+/// this owns no Handle/Inner/actor, only its exact weak identity and the Store.
+/// No public account metadata or path can construct one.
+/// Deliberately non-Clone and non-serializable.
+pub(crate) struct PendingAccountSource {
+    scope: LaunchAccountScope,
+    source_session: TerminalId,
+    owner: Weak<Inner>,
+    store: Arc<Mutex<Store>>,
+}
 impl Handle {
+    /// Cheap owner capture: no filesystem, SQLite or Store lock. Queue this
+    /// instead of a Handle. Release HostState/control locks before submission,
+    /// resolution or dropping the queued capability (last Store cleanup may run).
+    pub(crate) fn pending_account_source(&self) -> Result<PendingAccountSource, String> {
+        let scope = self.0.launch_account_scope.as_ref().map_err(Clone::clone)?;
+        let source_session = self.0.account_source_session
+            .ok_or("The actual backend has no original source session")?;
+        Ok(PendingAccountSource {
+            scope: scope.clone(), source_session,
+            owner: Arc::downgrade(&self.0), store: self.0.store.clone(),
+        })
+    }
+
     /// Filesystem/SQLite capture: callers must release HostState before entry.
     pub(crate) fn capture_account_source(&self, expires: Instant) -> Result<CapturedAccountSource, String> {
         if Instant::now() >= expires { return Err("Account source capture deadline expired".into()); }
-        let scope = self.0.launch_account_scope.as_ref().map_err(Clone::clone)?;
-        let session = self.0.account_source_session.ok_or("The actual backend has no original source session")?;
+        self.pending_account_source()?.resolve(expires)
+    }
+}
+impl PendingAccountSource {
+    /// Detached receipt only: no promise of reachable source paths after the
+    /// final Store owner drops. A later factory must revalidate or refuse.
+    pub(crate) fn resolve(self, expires: Instant) -> Result<CapturedAccountSource, String> {
+        self.resolve_with(expires, Ok)
+    }
+
+    /// Keep only the Store alive through post-snapshot namespace/reader
+    /// admission. No Store mutex or SQL read lease crosses the callback; it
+    /// must retain the original deadline for all admission waits. The factory
+    /// still needs actual fresh reader SH/current-source checks and canonical
+    /// Drop/sweep interlocks before exports can be enabled.
+    pub(crate) fn resolve_with<T>(
+        self,
+        expires: Instant,
+        finish: impl FnOnce(CapturedAccountSource) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let proof = self.capture(expires)?;
+        let result = finish(proof)?;
+        if Instant::now() >= expires { return Err("Account source admission deadline expired".into()); }
+        Ok(result)
+    }
+
+    /// Dead Weak identity is still exact: never upgrade it to keep a provider
+    /// alive. Rebinding, unavailable epochs, replaced homes and expiry refuse.
+    fn capture(&self, expires: Instant) -> Result<CapturedAccountSource, String> {
+        if Instant::now() >= expires { return Err("Account source capture deadline expired".into()); }
+        let scope = &self.scope;
+        let session = self.source_session;
         scope.revalidate()?;
         // Store -> state is the runtime lock order. Avoid an unbounded lock
         // wait, and acquire no namespace/reader flock while this guard exists.
         let store = loop {
-            match self.0.store.try_lock() {
+            match self.store.try_lock() {
                 Ok(store) => break store,
                 Err(TryLockError::Poisoned(_)) => return Err("The actual transcript Store owner is unavailable".into()),
                 Err(TryLockError::WouldBlock) => {
@@ -75,9 +128,9 @@ impl Handle {
             }
         };
         if Instant::now() >= expires { return Err("Account source capture deadline expired".into()); }
-        let expected = Arc::downgrade(&self.0);
+        let expected = &self.owner;
         let check_owner = |store: &Store| -> Result<(), String> {
-            if !store.source_authority_observer().ptr_eq(&expected) {
+            if !store.source_authority_observer().ptr_eq(expected) {
                 return Err("The transcript Store is now owned by a different backend".into());
             }
             match &store.account_source_binding {
@@ -134,6 +187,80 @@ mod tests {
         std::mem::replace(&mut *handle.0.store.lock().unwrap(), Store::new().unwrap())
     }
     fn expires() -> Instant { Instant::now() + Duration::from_secs(2) }
+
+    #[test]
+    fn queued_pairing_does_not_keep_its_provider_alive_or_need_a_store_lock_to_mint() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (spec, source) = launch(root.path(), &root.path().join("a"), Provider::Claude);
+        let id = source.id;
+        let handle = start(spec, source, None).unwrap();
+        let inner = Arc::downgrade(&handle.0);
+        let store = Arc::downgrade(&handle.0.store);
+        let held = handle.0.store.lock().unwrap();
+        let pending = handle.pending_account_source().unwrap();
+        drop(held);
+        handle.close().unwrap();
+        drop(handle);
+        assert!(inner.upgrade().is_none(), "a queued request must not retain the provider owner");
+        assert!(store.upgrade().is_some(), "only the actual Store stays available for queued issuance");
+        let captured = pending.resolve_with(expires(), |proof| {
+            assert!(inner.upgrade().is_none());
+            let actual = store.upgrade().expect("Store remains alive through admission");
+            assert!(actual.try_lock().is_ok(), "no Store mutex may span namespace admission");
+            Ok(proof)
+        }).unwrap();
+        assert_eq!(captured.source_session(), id);
+        assert_eq!(captured.native_namespace(), SessionNamespace::Unconfirmed);
+        assert!(store.upgrade().is_none(), "the resolved proof must release the original Store owner lease");
+    }
+
+    #[test]
+    fn queued_admission_preserves_callback_error_and_drops_late_success() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (spec, source) = launch(root.path(), &root.path().join("a"), Provider::Claude);
+        let handle = start(spec, source, None).unwrap();
+        let deadline = expires();
+        let result = handle.pending_account_source().unwrap().resolve_with(deadline, |_proof| {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Err::<(), _>("actual namespace admission refused".into())
+        });
+        assert_eq!(result.unwrap_err(), "actual namespace admission refused");
+        #[derive(Debug)]
+        struct Granted(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Granted {
+            fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deadline = expires();
+        let result = handle.pending_account_source().unwrap().resolve_with(deadline, |_proof| {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Ok(Granted(released.clone()))
+        });
+        assert!(result.unwrap_err().contains("admission deadline"));
+        assert!(released.load(std::sync::atomic::Ordering::Acquire));
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn queued_pairing_rechecks_actual_owner_and_home_instead_of_trusting_mint_time() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let home = root.path().join("a");
+        let (spec, source) = launch(root.path(), &home, Provider::Claude);
+        let handle = start(spec, source, None).unwrap();
+        let pending = handle.pending_account_source().unwrap();
+        let (spec, source) = launch(root.path(), &root.path().join("b"), Provider::Claude);
+        let other = start(spec, source, None).unwrap();
+        handle.0.store.lock().unwrap().register_source_authority_observer(Arc::downgrade(&other.0));
+        assert!(pending.resolve(expires()).err().unwrap().contains("different backend"));
+        handle.0.store.lock().unwrap().register_source_authority_observer(Arc::downgrade(&handle.0));
+        let pending = handle.pending_account_source().unwrap();
+        std::fs::rename(&home, root.path().join("original-a")).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        assert!(pending.resolve(expires()).is_err());
+        let pending = handle.pending_account_source().unwrap();
+        assert!(pending.resolve(Instant::now()).err().unwrap().contains("deadline"));
+        handle.close().unwrap();other.close().unwrap();
+    }
 
     #[test]
     fn paired_capture_uses_actual_backend_scope_and_never_requested_native_uuid() {
