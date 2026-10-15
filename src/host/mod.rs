@@ -8,6 +8,8 @@ mod delivery;
 pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
+/// Upper bound for read-only registry source inspection; opening is not required.
+pub(crate) const WORKSPACE_REGISTRY_SCHEMA_VERSION: u32 = model::SCHEMA_VERSION;
 mod notifications;
 #[cfg(test)]
 mod provider_shutdown_tests;
