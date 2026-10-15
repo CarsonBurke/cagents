@@ -20,6 +20,7 @@ use super::{
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 128;
 const CRITICAL_EVENT_RESERVE: usize = 8;
+const ADMITTED_KEY_LIMIT: usize = 512;
 static EVENT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default)]
@@ -135,6 +136,9 @@ impl CommandMailbox {
     pub(crate) fn press_key(&self, physical: cosmic::iced::keyboard::key::Physical,
         press: BrowserInput, release: BrowserInput) -> Result<(), BrowserError> {
         let mut keyboard = self.keyboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if keyboard.held.len() >= ADMITTED_KEY_LIMIT && !keyboard.held.iter().any(|(key, _)| *key == physical) {
+            return Err(BrowserError::CommandQueueFull);
+        }
         self.send(Command::Input(press))?;
         keyboard.released.retain(|key| *key != physical);
         if !keyboard.held.iter().any(|(key, _)| *key == physical) {
@@ -162,7 +166,10 @@ impl CommandMailbox {
         let mut pending = self.deferred_releases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         while let Some((physical, release)) = keyboard.held.pop() {
             pending.push_back(release);
-            if !keyboard.released.contains(&physical) { keyboard.released.push(physical); }
+            if !keyboard.released.contains(&physical) {
+                if keyboard.released.len() == ADMITTED_KEY_LIMIT { keyboard.released.remove(0); }
+                keyboard.released.push(physical);
+            }
         }
         self.refill_releases(&mut pending);
     }
