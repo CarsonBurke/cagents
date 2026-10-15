@@ -160,11 +160,18 @@ pub(super) fn steps_id(id: &str) -> Id {
 /// its current query/document/navigation generations, applies `offset`, waits
 /// for the resulting layout, and retries until `exact` or its bounded limit.
 /// Wheel/drag navigation must cancel that pending correction in the caller.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct LogicalLocation {
     pub offset: f32,
     pub exact: bool,
     pub stage: u8,
+    pub horizontal: Option<HorizontalLocation>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct HorizontalLocation {
+    id: Id,
+    offset: f32,
 }
 
 struct LocateLogical {
@@ -175,6 +182,7 @@ struct LocateLogical {
     content: Option<Rectangle>,
     viewport: Option<Rectangle>,
     found: Option<(Rectangle, u8)>,
+    horizontal: Vec<(Id, Rectangle, Rectangle)>,
 }
 impl LocateLogical {
     fn candidate(&mut self, bounds: Rectangle, stage: u8) {
@@ -202,6 +210,10 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         if id == Some(&self.scroll) {
             self.content = Some(content);
             self.viewport = Some(viewport);
+        } else if content.width > viewport.width + 1.0 {
+            if let Some(id) = id {
+                self.horizontal.push((id.clone(), viewport, content));
+            }
         }
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
@@ -238,6 +250,15 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
                     offset: travel - from_top,
                     exact: stage == 3,
                     stage,
+                    horizontal: self.horizontal.iter().rev().find_map(|(id, viewport, content)| {
+                        if stage < 2 { return None; }
+                        let center = Point::new(found.x + found.width / 2.0, found.y + found.height / 2.0);
+                        content.contains(center).then(|| HorizontalLocation {
+                            id: id.clone(),
+                            offset: (found.x - content.x - (viewport.width - found.width) / 2.0)
+                                .clamp(0.0, (content.width - viewport.width).max(0.0)),
+                        })
+                    }),
                 }
             },
         ))
@@ -258,7 +279,16 @@ pub(super) fn locate_logical(
         content: None,
         viewport: None,
         found: None,
+        horizontal: Vec::new(),
     })
+}
+
+/// Reveal a far-right code glyph without moving its vertical code/transcript offset.
+pub(super) fn find_scroll_horizontal<T: Send + 'static>(location: HorizontalLocation) -> iced::Task<T> {
+    iced::advanced::widget::operate(operation::scrollable::scroll_to(
+        location.id,
+        operation::scrollable::AbsoluteOffset { x: Some(location.offset), y: None },
+    ))
 }
 
 struct FindScrollMarker(bool);
@@ -918,7 +948,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 child,
                 Layout::new(&node),
                 renderer,
-                &mut SetBottom(offset),
+                &mut measured,
             );
             rows.extend(measured.rows);
             rows.extend(
@@ -1410,6 +1440,75 @@ mod tests {
     }
 
     #[test]
+    fn logical_find_reveals_a_far_right_code_glyph_without_changing_vertical_scroll() {
+        let renderer = crate::app::tests::headless_renderer();
+        for byte in [400, 4000] {
+        let target = Target { card: CardId::new(), generation: 0 };
+        let identity = 9357;
+        let horizontal_id = Id::new("find-horizontal-code");
+        let source: Arc<str> = format!("{}needle", "w".repeat(byte)).into();
+        let text = prose::code_text(source, Arc::from([]), design::TEXT_BODY.into(),
+            iced::Font::MONOSPACE, target, None,
+            Some(selectable_prose::Logical {identity,start:0,paint:None}));
+        let code = widget::scrollable(widget::container(text).width(50000))
+            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .id(horizontal_id.clone());
+        let mut element = transcript(widget::column::with_children(vec![
+            item("code", code), widget::Space::new().height(1000).into(),
+        ]), target, None, vec![], false, vec![]);
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+        let mut node = element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+        let mut realized = false;
+        for _ in 0..6 {
+        let found = Arc::new(std::sync::Mutex::new(None));
+        let sink = found.clone();
+        let mut locate = operation::map(LocateLogical {
+            scroll:card_control_id(target.card,"chat-transcript"),item:item_id("code"),identity,byte,
+            content:None,viewport:None,found:None,horizontal:Vec::new(),
+        },move |location|{*sink.lock().unwrap()=location;});
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut locate);
+        let _ = locate.finish();
+        let location = found.lock().unwrap().take().expect("mounted code glyph exists");
+        let horizontal = location.horizontal.expect("glyph belongs to a horizontal code viewport");
+        assert_eq!(horizontal.id,horizontal_id);
+        assert!(horizontal.offset>600.0,"far-right glyph needs horizontal realization");
+        struct Position {
+            horizontal: Id, transcript: Id, identity: u64, byte: usize,
+            x: f32, y: f32, viewport: Option<Rectangle>, glyph: Option<Rectangle>,
+        }
+        impl Operation for Position {
+            fn traverse(&mut self, visit:&mut dyn FnMut(&mut dyn Operation)){visit(self);}
+            fn scrollable(&mut self,id:Option<&Id>,viewport:Rectangle,_:Rectangle,translation:Vector,_:&mut dyn operation::Scrollable){
+                if id==Some(&self.transcript){self.y=translation.y;}
+                if id==Some(&self.horizontal){self.x=translation.x;self.viewport=Some(viewport);}
+            }
+            fn custom(&mut self,_:Option<&Id>,bounds:Rectangle,state:&mut dyn std::any::Any){
+                if let Some(prose)=state.downcast_ref::<selectable_prose::State>()
+                    && let Some(local)=prose.logical_byte_bounds(self.identity,self.byte){
+                    self.glyph=Some(Rectangle{x:bounds.x+local.x-self.x,y:bounds.y+local.y,..local});
+                }
+            }
+        }
+        let mut before=Position{horizontal:horizontal_id.clone(),transcript:card_control_id(target.card,"chat-transcript"),identity,byte,x:0.0,y:0.0,viewport:None,glyph:None};
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut before);
+        let mut correction=operation::scrollable::scroll_to::<()>(horizontal.id,operation::scrollable::AbsoluteOffset{x:Some(horizontal.offset),y:None});
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut correction);
+        node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+        let mut after=Position{glyph:None,viewport:None,..before};
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut after);
+        assert_eq!(after.y,before.y,"horizontal correction preserves the transcript offset");
+        let Some(glyph)=after.glyph else { continue; };let viewport=after.viewport.unwrap();
+        assert!(glyph.x>=viewport.x && glyph.x+glyph.width<=viewport.x+viewport.width,
+            "highlighted glyph is visible after horizontal realization: {glyph:?}, {viewport:?}");
+        realized = true;
+        break;
+        }
+        assert!(realized, "far-right match at byte {byte} must become an actual visible glyph");
+        }
+    }
+
+    #[test]
     fn logical_find_realizes_a_distant_chunk_and_centers_its_mounted_glyph() {
         let renderer = crate::app::tests::headless_renderer();
         let target = Target {
@@ -1457,6 +1556,7 @@ mod tests {
                     content: None,
                     viewport: None,
                     found: None,
+                    horizontal: Vec::new(),
                 },
                 move |location| {
                     *sink.lock().unwrap() = location;

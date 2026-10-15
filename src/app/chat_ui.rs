@@ -7618,11 +7618,14 @@ impl Cagents {
                     return Task::none();
                 }
                 runtime.find_locating = location
+                    .as_ref()
                     .filter(|location| !location.exact && attempt < 5)
                     .map(|_| (generation, navigation, attempt + 1));
                 if let Some(location) = location {
-                    return scroll::find_scroll_to(target, location.offset)
-                        .map(cosmic::Action::App);
+                    let vertical = scroll::find_scroll_to::<Message>(target, location.offset);
+                    let horizontal = location.horizontal.map(scroll::find_scroll_horizontal::<Message>)
+                        .unwrap_or_else(iced::Task::none);
+                    return iced::Task::batch([vertical, horizontal]).map(cosmic::Action::App);
                 }
             }
             Action::FindNavigationInput(target) => {

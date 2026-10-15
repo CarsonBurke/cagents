@@ -9,12 +9,14 @@ use iced::advanced::{
 };
 use iced::{Event, Point, Rectangle, Size, Vector};
 use std::any::Any;
+use std::{cell::RefCell, rc::Rc};
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use unicode_segmentation::UnicodeSegmentation;
 
 mod boundary;
 mod document;
+pub(super) use document::{Bookmark, Catalog, Builder as DocumentBuilder, identity as logical_identity};
 pub(super) use boundary::{Kind, wrap};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
