@@ -553,14 +553,13 @@ pub(in crate::host) fn finish_close(
             None => requested.clone(),
         }
     };
-    if !chat::native_holder::closed_source(&source, &proof)?
-        .is_some_and(|(owner, _)| owner == identity.record)
-    {
-        return Err(
-            "The final actor publication does not prove this exact execution descriptor closed"
-                .into(),
-        );
-    }
+    // This phase proves only that this exact actor closed its provider. Its
+    // live helper still owns the final journal/Store, so requiring discovery
+    // retirement here would prevent the ACK/retire sequence below from ever
+    // reaching that separate positive retirement proof.
+    let _provider_closed: chat::native_holder::ActorProviderClosed =
+        chat::native_holder::actor_provider_closed(&identity.record, &source, &proof)?
+            .ok_or("The exact retained actor has not published provider closure for this execution descriptor")?;
     handle.refresh_retained_state()?;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
