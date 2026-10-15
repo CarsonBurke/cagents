@@ -47,7 +47,6 @@ mod tests {
     use crate::{model::{BootId, CardId, CardKind, HostIncarnation, HostSessionId, LaunchRecipe},
         upgrade::handoff::{Carried, Checkpoint, Phase, Store, Terminal},
         workspace_model::views::{Pane, Scope}};
-    use std::path::Path;
 
     fn isolated_fixture(name: &str) -> bool {
         use crate::process::ProcessExecutor;
@@ -93,8 +92,10 @@ mod tests {
     // Only exact processes created by this private fixture enter this guard.
     // Keep kernel handles before detaching so assertion cleanup never signals
     // a PID re-created from a stale registry or leaves its original status.
+    #[cfg(target_os = "linux")]
     #[derive(Default)]
     struct FixtureProcesses(Vec<std::os::fd::OwnedFd>);
+    #[cfg(target_os = "linux")]
     impl FixtureProcesses {
         fn retain(&mut self, process: &crate::daemon::holder_registry::Process) {
             use std::os::fd::FromRawFd;
@@ -104,6 +105,7 @@ mod tests {
             self.0.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) });
         }
     }
+    #[cfg(target_os = "linux")]
     impl Drop for FixtureProcesses {
         fn drop(&mut self) {
             use std::os::fd::AsRawFd;
@@ -251,6 +253,7 @@ mod tests {
         println!("SETUP_GENERIC_REPLAY_REFUSED");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn authenticated_carried_setup_reattaches_the_original_holder_without_replaying_its_recipe() {
         if isolated_fixture(concat!(module_path!(), "::authenticated_carried_setup_reattaches_the_original_holder_without_replaying_its_recipe")) { return; }
@@ -299,7 +302,7 @@ mod tests {
         state.enable_holder_recovery();
         let host = Arc::new(HostLock::new(state));
         let _cleanup = CloseFixtureTerminals(host.clone());
-        restore_upgrade_from(&host, store, Path::new("/proc"), Some(&holders)).unwrap();
+        restore_upgrade_from(&host, store, std::path::Path::new("/proc"), Some(&holders)).unwrap();
         let adopted = host.lock().unwrap().terminals[&source.id].handle.clone();
         assert_eq!(adopted.holder_identity(), Some(&owner));
         assert!(!adopted.is_completed());
