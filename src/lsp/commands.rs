@@ -96,7 +96,8 @@ pub(super) fn channel() -> (Sender, Receiver) {
 impl SessionCommand {
     fn queued_bytes(&self) -> usize {
         match self {
-            Self::Open { text, .. } | Self::Save { text, .. } => text.len(),
+            Self::Open { text, .. } => text.byte_len(),
+            Self::Save { text, .. } => text.len(),
             Self::Change {
                 full, incremental, ..
             } => {
@@ -323,7 +324,7 @@ mod tests {
                 uri: Arc::clone(&uri),
                 language_id: "rust".into(),
                 version: 1,
-                text: Arc::from("opened"),
+                text: Arc::new(Snapshot::new(1,Arc::from("opened"))),
             },
         ] {
             let (sender, _receiver) = channel();

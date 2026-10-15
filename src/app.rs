@@ -10330,7 +10330,7 @@ impl Cagents {
         path: &Path,
         worktree: &Path,
         version: i32,
-        text: &str,
+        text: &repository_widget::LspChangeText,
     ) -> Task<Message> {
         // A previous buffer's document is closed first even without a `Close`
         // intent, because the two are one transition for the user: opening a
@@ -10351,7 +10351,10 @@ impl Cagents {
         };
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
-        let status = self.lsp.open(doc, path, worktree, language, version, text);
+        let status = match text {
+            repository_widget::LspChangeText::Text(text) => self.lsp.open(doc,path,worktree,language,version,text),
+            repository_widget::LspChangeText::Snapshot(source) => self.lsp.open_snapshot(doc,path,worktree,language,version,source.clone()),
+        };
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));
         }
@@ -25044,7 +25047,7 @@ mod tests {
             Path::new("/repo/notes.unknownext"),
             Path::new("/repo"),
             1,
-            "text\n",
+            &"text\n".into(),
         );
 
         let state = &app.lsp_contexts[&card];

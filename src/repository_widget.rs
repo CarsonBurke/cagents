@@ -312,7 +312,7 @@ pub enum LspIntent {
         absolute_path: PathBuf,
         worktree: PathBuf,
         version: i32,
-        text: String,
+        text: LspChangeText,
     },
     /// The buffer changed. Exact ranges accompany an immutable text root;
     /// only full/inexact synchronization materializes that root on a worker.
@@ -3645,7 +3645,7 @@ impl RepositoryRuntime {
             absolute_path: worktree.join(&document.source),
             worktree: worktree.to_path_buf(),
             version: document.lsp_version,
-            text: document.content.text(),
+            text: LspChangeText::Snapshot(document.content.text_snapshot()),
         });
     }
 

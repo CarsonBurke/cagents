@@ -1949,9 +1949,10 @@ impl Editor {
                     if let Some(language) = self.lsp.language_for(&absolute_path) {
                         let doc = LspDocumentId(self.next_document);
                         self.next_document += 1;
-                        let status =
-                            self.lsp
-                                .open(doc, &absolute_path, &worktree, language, version, &text);
+                        let status = match text {
+                            repository_widget::LspChangeText::Text(text) => self.lsp.open(doc,&absolute_path,&worktree,language,version,&text),
+                            repository_widget::LspChangeText::Snapshot(source) => self.lsp.open_snapshot(doc,&absolute_path,&worktree,language,version,source),
+                        };
                         if let Some(tab) = self.tab_mut(id) {
                             tab.runtime.set_lsp_document(Some(doc));
                             if let Some(error) = language_server_failure(status) {
