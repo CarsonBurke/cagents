@@ -1003,3 +1003,73 @@ fn missing_ref_namespace_never_follows_a_foreign_symlink_parent() {
     assert!(effect::lock_at(&root, Path::new("refs/heads/foreign/nested/feature")).is_err());
     assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
 }
+
+#[test]
+fn explicit_preserve_local_keeps_ahead_commits_and_all_dirty_bytes_without_fetch_or_repair() {
+    let fixture = Fixture::new(true);
+    fs::write(fixture.root.join("file"), "local commit\n").unwrap();
+    run_git(&fixture.root, &["commit", "-qam", "local work"]);
+    let local = git_text(&fixture.root, &["rev-parse", "HEAD"]);
+    fs::write(fixture.root.join("file"), "staged local\n").unwrap();
+    run_git(&fixture.root, &["add", "file"]);
+    fs::write(fixture.root.join("other"), "unstaged local\n").unwrap();
+    fs::write(fixture.root.join("untracked"), "untracked local\n").unwrap();
+    let index = fs::read(fixture.root.join(".git/index")).unwrap();
+    let config = fs::read(fixture.root.join(".git/config")).unwrap();
+    let request = fixture.request(fixture.original.clone());
+    assert!(fixture.service.prepare_existing_pr_checkout(&request, &CancellationToken::default()).is_err());
+    let plan = fixture.service.prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default()).unwrap();
+    assert_eq!(plan.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+    assert_eq!(plan.local_head().as_str(), local);
+    assert_eq!(plan.request().expected_head, fixture.original);
+    assert!(plan.notice().contains(&local));
+    assert!(plan.notice().contains(fixture.original.as_str()));
+    fixture.intercept(|command| {
+        assert!(!command.arguments.iter().any(|arg| arg == "fetch" || arg == "--add" || arg == "read-tree"));
+        if command.arguments.iter().any(|arg| arg == "update-ref") {
+            assert_eq!(command.environment.get(OsStr::new("CAGENTS_PR_MODE")), Some(&OsString::from("probe")));
+        }
+    });
+    let verified = fixture.apply(&plan).unwrap();
+    assert_eq!(verified.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+    assert_eq!(verified.head(), plan.local_head());
+    assert_eq!(verified.upstream(), Some("refs/remotes/origin/feature"));
+    assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), local);
+    assert_eq!(fs::read(fixture.root.join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), config);
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"staged local\n");
+    assert_eq!(fs::read(fixture.root.join("other")).unwrap(), b"unstaged local\n");
+    assert_eq!(fs::read(fixture.root.join("untracked")).unwrap(), b"untracked local\n");
+}
+
+#[test]
+fn explicit_preserve_local_admits_diverged_commits_while_strict_writer_still_refuses() {
+    let fixture = Fixture::new(true);
+    fs::write(fixture.root.join("file"), "local divergent commit\n").unwrap();
+    run_git(&fixture.root, &["commit", "-qam", "local divergence"]);
+    let local = git_text(&fixture.root, &["rev-parse", "HEAD"]);
+    let reviewed = fixture.advance(|root| fs::write(root.join("file"), "PR divergent commit\n").unwrap());
+    run_git(&fixture.root, &["fetch", "origin"]);
+    let request = fixture.request(reviewed.clone());
+    assert!(fixture.service.prepare_existing_pr_checkout(&request, &CancellationToken::default()).unwrap_err().detail.contains("diverged"));
+    let plan = fixture.service.prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default()).unwrap();
+    let verified = fixture.apply(&plan).unwrap();
+    assert_eq!(verified.head().as_str(), local);
+    assert_ne!(verified.head(), &reviewed);
+    assert_eq!(verified.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"local divergent commit\n");
+}
+
+#[test]
+fn preserve_local_never_repairs_missing_tracking_or_accepts_changed_confirmation() {
+    let missing = Fixture::new(false);
+    let request = missing.request(missing.original.clone());
+    let config = fs::read(missing.root.join(".git/config")).unwrap();
+    assert!(missing.service.prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default()).unwrap_err().detail.contains("no PR upstream"));
+    assert_eq!(fs::read(missing.root.join(".git/config")).unwrap(), config);
+    let fixture = Fixture::new(true);
+    let plan = fixture.service.prepare_existing_pr_checkout_preserving_local(&fixture.request(fixture.original.clone()), &CancellationToken::default()).unwrap();
+    run_git(&fixture.root, &["config", "branch.feature.merge", "refs/heads/different"]);
+    assert_eq!(fixture.apply(&plan).unwrap_err().kind, PrCheckoutFailureKind::Refused);
+    assert_eq!(git_text(&fixture.root, &["config", "branch.feature.merge"]), "refs/heads/different");
+}

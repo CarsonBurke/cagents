@@ -197,7 +197,7 @@ fn repair_tracking<E: ProcessExecutor>(
     let mut config = lock_at(&pinned.roots[2], Path::new("config"))?;
     pinned.check(plan)?;
     if service
-        .prepare_existing_pr_checkout(&plan.request, cancellation)
+        .recheck_existing_pr_checkout(plan, cancellation)
         .map_err(|error| error.to_string())?
         != *plan
     {
@@ -301,7 +301,7 @@ fn repair_tracking<E: ProcessExecutor>(
     pinned.check(plan)?;
     unchanged_source(&source, &original, &pinned.roots[2])?;
     if service
-        .prepare_existing_pr_checkout(&plan.request, cancellation)
+        .recheck_existing_pr_checkout(plan, cancellation)
         .map_err(|error| error.to_string())?
         != *plan
     {
@@ -506,7 +506,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     cancellation: &CancellationToken,
 ) -> Result<VerifiedPrCheckout, PrCheckoutFailure> {
     let refuse = |detail: String| PrCheckoutFailure::refused(plan.path(), detail);
-    let fresh = service.prepare_existing_pr_checkout(&plan.request, cancellation)?;
+    let fresh = service.recheck_existing_pr_checkout(plan, cancellation)?;
     if fresh != *plan {
         return Err(refuse(
             "The checkout changed after confirmation; refresh and review its new state".into(),
@@ -515,9 +515,10 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     let mut pinned = PinnedDirectories::open(plan).map_err(refuse)?;
     pinned.check(plan).map_err(refuse)?;
     let verified = || VerifiedPrCheckout {
+        disposition: plan.disposition,
         path: plan.path().to_owned(),
         branch: plan.request.branch.clone(),
-        head: plan.request.expected_head.clone(),
+        head: if plan.disposition == PrCheckoutDisposition::OpenPreservingLocal { plan.current_head.clone() } else { plan.request.expected_head.clone() },
         upstream: (plan.request.tracking == PrCheckoutTracking::RemoteBranch).then(|| {
             format!(
                 "refs/remotes/{}/{}",
@@ -570,7 +571,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             true,
             cancellation,
         )?;
-        if plan.disposition == PrCheckoutDisposition::AlreadyCurrent {
+        if matches!(plan.disposition, PrCheckoutDisposition::AlreadyCurrent | PrCheckoutDisposition::OpenPreservingLocal) {
             return Ok(());
         }
         let fetch = pinned
@@ -616,7 +617,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         }
         pinned.check(plan)?;
         if service
-            .prepare_existing_pr_checkout(&plan.request, cancellation)
+            .recheck_existing_pr_checkout(plan, cancellation)
             .map_err(|error| error.to_string())?
             != *plan
         {
@@ -653,7 +654,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             )?;
         }
         let settled = service
-            .prepare_existing_pr_checkout(&plan.request, cancellation)
+            .recheck_existing_pr_checkout(plan, cancellation)
             .map_err(|error| error.to_string())?;
         // Repair intentionally changes only tracking configuration. Every
         // physical identity and the exact original commit must still match.
@@ -697,7 +698,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             })?;
         drop(cleanup);
         let current = service
-            .prepare_existing_pr_checkout(&plan.request, cancellation)
+            .recheck_existing_pr_checkout(plan, cancellation)
             .map_err(|error| error.to_string())?;
         pinned.check(plan)?;
         if current.disposition != PrCheckoutDisposition::AlreadyCurrent
@@ -734,7 +735,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         Ok(())
     };
     let state = || -> String {
-        match service.prepare_existing_pr_checkout(&plan.request, &CancellationToken::default()) {
+        match service.recheck_existing_pr_checkout(plan, &CancellationToken::default()) {
             Ok(current) => format!(
                 "Current branch {} at {}; upstream state {:?}",
                 current.request.branch.as_str(),
@@ -769,7 +770,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     // effects. Re-read only after all inherited leases have truly retired,
     // including children that exited before the first observer flock.
     let final_state =
-        service.prepare_existing_pr_checkout(&plan.request, &CancellationToken::default());
+        service.recheck_existing_pr_checkout(plan, &CancellationToken::default());
     if !matches!(&final_state, Ok(current) if current == &expected_final) {
         let detail = match final_state {
             Ok(_) => "The checkout changed after its last policy hook; refresh it before opening"
