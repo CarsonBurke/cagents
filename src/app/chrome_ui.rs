@@ -312,6 +312,21 @@ mod tests {
         let initial_revision = app.card_chrome[&id].typography_revision;
         let initial_width = app.card_chrome[&id].title_width;
         let initial_tab_width = app.tab_strip_geometry().1;
+        // Lay out the actual body widget independently of the measurement
+        // helper, so a stale/default font in that helper cannot validate itself.
+        let body_size = |font| {
+            let mut body: Element<'_, Message> = design::body(TITLE)
+                .font(font)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into();
+            let mut tree = Tree::new(body.as_widget());
+            body.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO,
+                    iced::Size::new(f32::INFINITY, f32::INFINITY)),
+            ).size()
+        };
         let assert_mounted = |app: &Cagents| {
             let width = app.tab_strip_geometry().1;
             let mut header = app.column_header(id, true, width);
@@ -330,9 +345,10 @@ mod tests {
                 &mut title,
             );
             let bounds = title.0.expect("the actual mounted tab title");
-            assert!(bounds.width + 0.1 >= measure_tab_title(TITLE));
-            assert!(bounds.height + 0.1 >= design::interface_size() + 5.0);
-            assert!((app.card_chrome[&id].title_width - measure_tab_title(TITLE)).abs() < 0.1);
+            let intrinsic = body_size(design::interface_font());
+            assert!(bounds.width + 0.1 >= intrinsic.width);
+            assert!(bounds.height + 0.1 >= intrinsic.height);
+            assert!((app.card_chrome[&id].title_width - intrinsic.width).abs() < 0.1);
         };
         assert_mounted(&app);
 
@@ -347,10 +363,18 @@ mod tests {
         assert_mounted(&app);
 
         let sized_revision = app.card_chrome[&id].typography_revision;
+        let sized_width = app.card_chrome[&id].title_width;
         let family = design::installed_font_families(false)
             .iter()
-            .find(|family| iced::font::Family::Name(family.as_str()) != initial_font.family)
-            .expect("a renderer-installed family differs from the initial font");
+            .find(|family| {
+                let font = iced::Font {
+                    family: iced::font::Family::Name(family.as_str()),
+                    ..initial_font
+                };
+                font.family != initial_font.family
+                    && (body_size(font).width - sized_width).abs() > 0.1
+            })
+            .expect("an installed family has different actual metrics for the fixture title");
         app.settings.interface_font_family = family.clone();
         drop(app.sync_chrome());
         assert_eq!(
@@ -358,6 +382,7 @@ mod tests {
             iced::font::Family::Name(family.as_str())
         );
         assert!(app.card_chrome[&id].typography_revision > sized_revision);
+        assert!((app.card_chrome[&id].title_width - sized_width).abs() > 0.1);
         assert_mounted(&app);
         let stable_revision = app.card_chrome[&id].typography_revision;
         drop(app.sync_chrome());
