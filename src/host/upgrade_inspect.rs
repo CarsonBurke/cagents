@@ -114,6 +114,7 @@ fn inspect(request: Request) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let paths = crate::instance::window_database_paths()
         .map_err(|_| "Cannot enumerate saved source windows")?;
+    let mut budget = crate::persistence::MigrationInspectionBudget::new(deadline);
     let mut saved = Vec::new();
     for path in paths {
         check_deadline(deadline)?;
@@ -124,7 +125,7 @@ fn inspect(request: Request) -> Result<(), String> {
             continue;
         }
         saved.extend(
-            crate::persistence::read_open_migration_sessions(&path)
+            crate::persistence::read_open_migration_sessions_with_budget(&path, &mut budget)
                 .map_err(|_| "A saved source pane is unreadable; source windows remain usable")?
                 .into_iter()
                 .map(|(card, kind)| (path.clone(), card, kind)),

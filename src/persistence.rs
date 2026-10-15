@@ -9,6 +9,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(any(feature = "host", test))]
+use std::time::Instant;
+
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
@@ -2277,50 +2280,106 @@ pub enum SavedSessionOwner {
     Directory(PathBuf),
 }
 
-/// Read exact open session descriptors without migrating or updating a source
-/// window's database. Upgrade preflight must fail on an unreadable session,
-/// rather than quietly omit the pane that needs recovery.
-pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, CardKind)>> {
+/// One budget spans all source windows. Per-row bounds alone would allow
+/// thousands of individually valid descriptors to exhaust updater memory.
+#[cfg(any(feature = "host", test))]
+pub(crate) struct MigrationInspectionBudget {
+    remaining_rows: usize,
+    remaining_bytes: u64,
+    deadline: Instant,
+}
+
+#[cfg(any(feature = "host", test))]
+impl MigrationInspectionBudget {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            remaining_rows: 4096,
+            remaining_bytes: 64 * 1024 * 1024,
+            deadline,
+        }
+    }
+
+    fn check_deadline(&self) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(StoreError::InvalidState(
+                "Saved pane inspection exceeded its bounded budget".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self, bytes: u64) -> Result<()> {
+        self.check_deadline()?;
+        if self.remaining_rows == 0 || bytes > self.remaining_bytes {
+            return Err(StoreError::InvalidState(
+                "Saved pane inventory exceeds the migration inspection limit".into(),
+            ));
+        }
+        self.remaining_rows -= 1;
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, CardKind)>> {
+    read_open_migration_sessions_with_budget(
+        path,
+        &mut MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30)),
+    )
+}
+
+/// Read exact open descriptors without migrating or writing a source database.
+/// Refuse unreadable or over-budget rows instead of omitting recovery work.
+#[cfg(any(feature = "host", test))]
+pub(crate) fn read_open_migration_sessions_with_budget(
+    path: &Path,
+    budget: &mut MigrationInspectionBudget,
+) -> Result<Vec<(CardId, CardKind)>> {
+    budget.check_deadline()?;
     let mut connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    connection.busy_timeout(Duration::from_millis(100))?;
     let transaction = connection.transaction()?;
     let mut statement = transaction.prepare(
-        "SELECT c.card_id, c.kind_tag,
+        "SELECT CASE WHEN length(CAST(c.card_id AS BLOB)) <= 128 THEN c.card_id ELSE NULL END, c.kind_tag,
          CASE WHEN length(CAST(c.content_json AS BLOB)) <= 4194304 THEN c.content_json ELSE NULL END,
          CASE WHEN length(CAST(c.existence_json AS BLOB)) <= 4096 THEN c.existence_json ELSE 'null' END,
-         CASE WHEN length(CAST(w.existence_json AS BLOB)) <= 4096 THEN w.existence_json ELSE 'null' END
+         CASE WHEN length(CAST(w.existence_json AS BLOB)) <= 4096 THEN w.existence_json ELSE 'null' END,
+         CASE WHEN c.kind_tag = 'chat' THEN length(CAST(c.content_json AS BLOB))
+         ELSE (SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
+                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
+                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
+               FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
+         END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
          WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id",
     )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
+    let mut rows = statement.query([])?;
     let mut sessions = Vec::new();
-    for row in rows {
-        let (card, kind, content, existence, workspace) = row?;
+    while let Some(row) = rows.next()? {
+        budget.check_deadline()?;
+        let existence: String = row.get(3)?;
+        let workspace: String = row.get(4)?;
         if !from_json::<Existence>("migration card existence", &existence)?.is_open()
             || !from_json::<Existence>("migration workspace existence", &workspace)?.is_open()
         {
             continue;
         }
+        let bytes: u64 = row.get(5)?;
+        // Reserve before allocating the descriptor's JSON or normalized fields.
+        budget.reserve(bytes)?;
+        let card: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let content: Option<String> = row.get(2)?;
         let card = parse_id("migration card", &card)?;
         let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
         sessions.push((card, session));
-        if sessions.len() > 4096 {
-            return Err(StoreError::InvalidState(
-                "Saved pane inventory exceeds the migration inspection limit".into(),
-            ));
-        }
     }
+    budget.check_deadline()?;
     Ok(sessions)
 }
 
@@ -6390,6 +6449,55 @@ mod tests {
             lane.save(&store, &workspace).unwrap();
             assert!(read_open_migration_sessions(&path).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn migration_session_inventory_budget_spans_windows_and_precedes_json_decode() {
+        let directory = tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..2 {
+            let path = directory.path().join(format!("source-{index}.sqlite3"));
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            workspace.cards[0].kind = CardKind::Chat(source);
+            SaveLane::default().save(&store, &workspace).unwrap();
+            drop(store);
+            paths.push(path);
+        }
+        let before = paths.iter().map(std::fs::read).collect::<std::io::Result<Vec<_>>>().unwrap();
+        let connection = Connection::open_with_flags(&paths[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let descriptor_bytes: u64 = connection.query_row(
+            "SELECT length(CAST(content_json AS BLOB)) FROM cards WHERE kind_tag='chat'",
+            [], |row| row.get(0),
+        ).unwrap();
+        drop(connection);
+        for row_limited in [false, true] {
+            let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+            if row_limited {
+                budget.remaining_rows = 1;
+            } else {
+                budget.remaining_bytes = descriptor_bytes;
+            }
+            assert_eq!(read_open_migration_sessions_with_budget(&paths[0], &mut budget).unwrap().len(), 1);
+            assert!(read_open_migration_sessions_with_budget(&paths[1], &mut budget)
+                .unwrap_err().to_string().contains("inventory exceeds"));
+        }
+        for (path, original) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+
+        let connection = Connection::open(&paths[1]).unwrap();
+        connection.execute("UPDATE cards SET content_json='not valid JSON' WHERE kind_tag='chat'", []).unwrap();
+        drop(connection);
+        let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        budget.remaining_bytes = 0;
+        assert!(read_open_migration_sessions_with_budget(&paths[1], &mut budget)
+            .unwrap_err().to_string().contains("inventory exceeds"), "budget must refuse before decoding the oversized inventory");
+        let missing = directory.path().join("must-not-open.sqlite3");
+        let mut expired = MigrationInspectionBudget::new(Instant::now());
+        assert!(read_open_migration_sessions_with_budget(&missing, &mut expired)
+            .unwrap_err().to_string().contains("bounded budget"));
+        assert!(!missing.exists());
     }
 
     #[test]
