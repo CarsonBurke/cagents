@@ -9,7 +9,7 @@ fn wait(mut condition:impl FnMut()->bool) {
 }
 #[test]
 fn actual_actor_held_retry_preserves_idle_turn_root_error_and_reconciles_cancellation() {
-    for mode in ["dispatch","interrupt","refusal","timeout","native","close"] {
+    for mode in ["dispatch","interrupt","refusal","timeout","native","close","eof","crash","deny"] {
         let root=annotations::storage::test_directory();
         let home=root.path().join("claude-home");std::fs::create_dir(&home).unwrap();
         let scope=LaunchAccountScope::resolve(crate::agent::Provider::Claude,root.path(),|key|(key=="CLAUDE_CONFIG_DIR").then(||home.as_os_str().to_owned())).unwrap();
@@ -21,6 +21,9 @@ def emit(frame): print(json.dumps(frame),flush=True)
 def reply(request,payload,success=True): emit({'type':'control_response','response':{'subtype':'success' if success else 'error','request_id':request['request_id'],'response':payload}})
 while True:
  if pending and (root/'release').exists():
+  if mode in ('eof','crash'):
+   if mode=='crash': print('original-provider-crash',file=sys.stderr,flush=True)
+   sys.exit(7 if mode=='crash' else 0)
   if mode=='native': emit({'type':'system','subtype':'session_state_changed','session_id':session,'state':'working'})
   reply(pending,{},mode!='refusal');pending=None;(root/'late-setter-sent').touch()
  if not select.select([0],[],[],0.01)[0]: continue
@@ -38,11 +41,15 @@ while True:
    elif subtype=='get_settings': reply(frame,{'applied':{'model':model,'effort':effort}})
    elif subtype=='set_model':
     model=request['model'];pending=frame
-    emit({'type':'system','subtype':'session_state_changed','session_id':session,'state':'idle'});(root/'setter-seen').touch()
+    emit({'type':'system','subtype':'session_state_changed','session_id':session,'state':'idle'})
+    if mode=='deny': emit({'type':'control_request','request_id':'native-approval','session_id':session,'request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'late-tool','input':{'command':'must be denied'}}})
+    (root/'setter-seen').touch()
    elif subtype=='apply_flag_settings':
     settings=request['settings'];effort=settings.get('effortLevel',effort);fast=settings.get('fastMode',fast);reply(frame,{})
    elif subtype=='set_permission_mode': permission=request['mode'];reply(frame,{})
    else: reply(frame,{})
+  elif frame.get('type')=='control_response':
+   (root/'denial-response.json').write_text(json.dumps(frame))
   elif frame.get('type')=='user':
    users+=1
    with (root/'users.jsonl').open('a') as out: out.write(json.dumps(frame)+'\n')
@@ -73,20 +80,40 @@ while True:
         let held=handle.snapshot(None).unwrap();
         assert!(!held.busy,"holding settings is not a native provider turn");
         assert_eq!(held.error,before.error);assert_eq!(held.turn_generation,before.turn_generation);
-        assert_eq!(held.turn_started_at,before.turn_started_at);assert_eq!(held.finished_at,before.finished_at);
+        assert_eq!(held.turn_started_at,before.turn_started_at);
+        if mode!="deny" {assert_eq!(held.finished_at,before.finished_at);}
         assert_eq!(std::fs::read_to_string(root.path().join("users.jsonl")).unwrap().lines().count(),1);
         if mode=="close" {
             handle.close().unwrap();assert_eq!(handle.snapshot(None).unwrap().error,before.error);continue;
         }
         if mode=="interrupt" {handle.command(Command::Interrupt).unwrap();}
+        if mode=="deny" {
+            wait(||handle.snapshot(None).unwrap().requests.iter().any(|request|request.id=="native-approval"));
+            handle.command(Command::Answer {request_id:"native-approval".into(),action:"deny".into(),answers:vec![]}).unwrap();
+            wait(||root.path().join("denial-response.json").exists());
+            let denial:Value=serde_json::from_slice(&std::fs::read(root.path().join("denial-response.json")).unwrap()).unwrap();
+            assert_eq!(denial["response"]["request_id"],"native-approval");
+            assert_eq!(denial["response"]["response"]["behavior"],"deny");
+            assert!(!root.path().join("release").exists(),"Deny must reach provider before any settings setter receipt");
+        }
         if mode=="timeout" {
             wait(||handle.snapshot(None).unwrap().original_retry_diagnostic.as_deref().is_some_and(|detail|detail.contains("timed out")));
             assert!(handle.command(Command::Refresh).is_err(),"unsettled setter cannot be read back prematurely");
         }
-        if mode!="dispatch" {
+        if !matches!(mode,"dispatch"|"eof"|"crash") {
             assert!(handle.command(Command::Prompt {text:"must not run under partial settings".into(),attachments:vec![],mode:crate::chat::PromptMode::Queue}).is_err());
         }
         std::fs::write(root.path().join("release"),b"go").unwrap();
+        if matches!(mode,"eof"|"crash") {
+            wait(||handle.snapshot(None).unwrap().exited);
+            let exited=handle.snapshot(None).unwrap();
+            assert!(!exited.original_retry_pending);assert!(exited.original_retry_diagnostic.is_none());
+            assert_eq!(std::fs::read_to_string(root.path().join("users.jsonl")).unwrap().lines().count(),1);
+            let authority=handle.0.annotations.lock().unwrap();
+            let pending=authority.pending_store().unwrap();
+            assert_eq!(pending.pending_count_for_test().unwrap(),0,"exact never-written Retry intent must retire on unexpected actor termination");
+            drop(pending);drop(authority);handle.close().unwrap();continue;
+        }
         wait(||root.path().join("late-setter-sent").exists());
         if mode=="timeout" {
             wait(||handle.snapshot(None).unwrap().original_retry_diagnostic.as_deref().is_some_and(|detail|detail.contains("setter settled")));
@@ -102,7 +129,8 @@ while True:
             if mode=="native" {assert!(after.busy);assert!(after.turn_generation>before.turn_generation);}
             else {
                 assert_eq!(after.error,before.error);assert_eq!(after.turn_generation,before.turn_generation);
-                assert_eq!(after.turn_started_at,before.turn_started_at);assert_eq!(after.finished_at,before.finished_at);
+                assert_eq!(after.turn_started_at,before.turn_started_at);
+                if mode!="deny" {assert_eq!(after.finished_at,before.finished_at);}
                 assert_eq!(after.selected_model.as_deref(),Some("reported-model"));
                 assert_eq!(after.reasoning.as_deref(),Some("high"));
                 assert_eq!(after.permission_mode.as_deref(),Some("bypassPermissions"));

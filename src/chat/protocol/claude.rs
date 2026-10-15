@@ -1833,9 +1833,9 @@ impl Adapter for Claude {
         }
         let retry_aborted = self.cancel_original_retry("Retry was cancelled by a newer operator action");
         if retry_aborted.is_some() {
-            if matches!(&command, Command::Interrupt) {
-                if !self.busy { return Ok(retry_aborted.unwrap()); }
-            } else {
+            if matches!(&command, Command::Interrupt) && !self.busy {
+                return Ok(retry_aborted.unwrap());
+            } else if !Self::retry_safe_cleanup(&command) {
                 return self.merge_retry_abort(Err("Wait for effective settings reconciliation before sending new work".into()),retry_aborted);
             }
         }

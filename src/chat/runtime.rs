@@ -452,6 +452,22 @@ impl Handle {
                 // take seconds. Reject commands now so a caller is told the provider
                 // exited instead of waiting out an acknowledgement nobody will send.
                 draining.store(true, Ordering::Release);
+                // EOF, parse failure and panic bypass the normal stop branch.
+                // Retire only inputs the adapter proves were held locally; a
+                // written prompt's missing reply is never non-execution proof.
+                match actor.adapter.discard_undispatched() {
+                    Ok(Some(mut discarded)) => {
+                        if !discarded.writes.is_empty() {
+                            tracing::warn!("ignored provider writes during local held-input retirement");
+                            discarded.writes.clear();
+                        }
+                        if let Err(error)=actor.step(discarded) {
+                            tracing::warn!(%error,"held original retirement could not fully publish during teardown");
+                        }
+                    }
+                    Ok(None)=>{},
+                    Err(error)=>tracing::warn!(%error,"held original retirement unavailable during teardown"),
+                }
                 let unexpected_loss = result.is_err() && !actor.stop.load(Ordering::Acquire);
                 let preserve_holder = actor
                     .native_holder
@@ -2135,7 +2151,9 @@ impl Actor {
                 _ => false,
             };
             let restoring_original=self.state.lock().unwrap_or_else(|p|p.into_inner()).original_retry_pending;
-            if restoring_original && !matches!(&command,Command::Interrupt|Command::Refresh|Command::LoadEarlier|Command::LoadLater) {
+            let restoration_cleanup=matches!(&command,Command::Interrupt|Command::Refresh|Command::LoadEarlier|Command::LoadLater|Command::StopSubagent{..}|Command::RemoveQueued{..}|Command::DismissPermissionDenial{..})
+                || matches!(&command,Command::Answer{action,..} if matches!(action.as_str(),"deny"|"decline"|"reject"|"cancel"|"abort"));
+            if restoring_original && !restoration_cleanup {
                 if let Some(cancelled) = self.adapter.cancel_original_restoration() {
                     self.step(cancelled)?;
                 }
@@ -3197,6 +3215,8 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             }
         }
         Event::Exited { .. } => {
+            state.original_retry_pending=false;
+            state.original_retry_diagnostic=None;
             state.prompt_suggestion = None;
             state.exited = true;
             state.waiting = false;

@@ -12,6 +12,10 @@ pub(crate) struct PreparedCommand {
     pub settings: Option<OriginalSettings>,
 }
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn pending_count_for_test(&self) -> Result<usize,String> {
+        self.db.query_row("SELECT count(*) FROM pending_commands",[],|row|row.get(0)).map_err(|error|error.to_string())
+    }
     /// Publish before dispatch. Until acceptance, only an explicit proven
     /// rejection/abandonment or history deletion can retire this durable intent.
     pub(crate) fn prepare_command(

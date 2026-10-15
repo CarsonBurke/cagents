@@ -79,6 +79,10 @@ impl Claude {
         #[cfg(test)] if let Some(timeout)=self.retry.timeout { return timeout; }
         Duration::from_secs(20)
     }
+    pub(super) fn retry_safe_cleanup(command:&Command) -> bool {
+        matches!(command,Command::Interrupt|Command::StopSubagent{..}|Command::RemoveQueued{..}|Command::DismissPermissionDenial{..})
+            || matches!(command,Command::Answer{action,..} if matches!(action.as_str(),"deny"|"decline"|"reject"|"cancel"|"abort"))
+    }
     pub(super) fn retry_is_pending(&self) -> bool { self.retry.pending.is_some() }
     pub(super) fn cancel_original_retry(&mut self, reason: &str) -> Option<Step> {
         let pending=self.retry.pending.as_mut()?;
@@ -188,7 +192,13 @@ impl Claude {
             return Ok(Some(Step {events:vec![Event::OriginalRetryState {pending:true,diagnostic:Some("The prior native setter settled; refresh to reconcile effective settings before sending input".into())}],..Step::default()}));
         }
         if Instant::now() >= pending.deadline {
-            return Ok(Some(self.block_retry_reconciliation("Exact Retry timed out before dispatch; no prompt was sent")));
+            // This exact receipt is already here, even if the budget expired
+            // inside this frame batch. Do not wait for an ACK consumed below.
+            let request=pending.request.clone();
+            let blocked=self.block_retry_reconciliation("Exact Retry timed out before dispatch; no prompt was sent");
+            self.controls.remove(&request);
+            self.retry.pending.as_mut().unwrap().request.clear();
+            return Ok(Some(blocked));
         }
         if self.session_id.as_deref()!=Some(pending.session.as_str()) || self.original_retry_session()!=Some(pending.session.as_str()) {
             return Ok(self.drop_original_retry("The confirmed native session changed before Retry dispatch"));
@@ -405,6 +415,15 @@ mod tests {
         assert_eq!(adapter.selected.as_deref(),Some("partially-restored"));
         assert_eq!(adapter.reasoning.as_deref(),Some("high"));
         assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Rejected{..})));
+    }
+    #[test]
+    fn retry_deadline_expiring_inside_matching_setter_reply_consumes_that_exact_receipt() {
+        let mut adapter=ready_adapter();let first=begin(&mut adapter);
+        adapter.retry.pending.as_mut().unwrap().deadline=Instant::now();
+        let blocked=adapter.receive(response(&first,json!({}))).unwrap();
+        assert!(blocked.writes.is_empty());
+        let refresh=adapter.command(Command::Refresh).unwrap();
+        assert_eq!(refresh.writes[0]["request"]["subtype"],"get_settings");
     }
     #[test]
     fn retry_setter_refusal_reconciles_partial_native_settings_without_provider_error() {
