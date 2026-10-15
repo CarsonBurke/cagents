@@ -3,7 +3,7 @@
 //! Every range is resolved before any file or buffer is changed. UI previews
 //! retain the exact before/after snapshots; publication uses the editor's
 //! descriptor-relative compare-and-swap writer rather than unconditional saves.
-use std::{collections::HashMap, io::Read, ops::Range, path::{Path, PathBuf}, sync::Arc};
+use std::{collections::HashMap, io::Read, ops::Range, os::unix::fs::MetadataExt, path::{Path, PathBuf}, sync::Arc};
 
 use crate::{editor::{self, SaveOutcome, SaveDurability}, fs_safety, lsp::{LspCoordinates, LspPosition, LspTextEdit}};
 
@@ -45,11 +45,13 @@ pub struct DocumentPlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct Plan { pub worktree: PathBuf, pub documents: Vec<DocumentPlan> }
+pub struct Plan { pub worktree: PathBuf, pub root: Arc<fs_safety::Root>, pub documents: Vec<DocumentPlan>, _protection: Arc<Option<crate::worktree_cleanup::Protection>> }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedTargets {
     pub worktree: PathBuf,
+    pub root: Arc<fs_safety::Root>,
+    protection: Arc<Option<crate::worktree_cleanup::Protection>>,
     pub documents: Vec<DocumentEdits>,
     pub open_paths: Vec<PathBuf>,
 }
@@ -59,6 +61,9 @@ pub struct ResolvedTargets {
 pub fn resolve_targets(worktree: PathBuf, documents: Vec<DocumentEdits>, open_paths: Vec<PathBuf>) -> Result<ResolvedTargets, String> {
     if documents.len() > 512 { return Err("This workspace edit exceeds the 512-file preview limit".into()); }
     let worktree = std::fs::canonicalize(worktree).map_err(|error| error.to_string())?;
+    let root = Arc::new(fs_safety::Root::open(&worktree).map_err(|error| error.to_string())?);
+    let protection = Arc::new(crate::worktree_cleanup::protect(&worktree).map_err(|error| error.to_string())?);
+    verify_root(&root)?;
     let mut targets = std::collections::HashSet::new();
     for document in &documents {
         let path = if document.path.is_absolute() { document.path.clone() } else { worktree.join(&document.path) };
@@ -67,7 +72,8 @@ pub fn resolve_targets(worktree: PathBuf, documents: Vec<DocumentEdits>, open_pa
         targets.insert(path);
     }
     let open_paths = open_paths.into_iter().filter(|path| std::fs::canonicalize(path).is_ok_and(|path| targets.contains(&path))).collect();
-    Ok(ResolvedTargets { worktree, documents, open_paths })
+    verify_root(&root)?;
+    Ok(ResolvedTargets { worktree, root, protection, documents, open_paths })
 }
 
 fn offset(text: &str, position: LspPosition, coordinates: LspCoordinates) -> Result<usize, String> {
@@ -84,8 +90,27 @@ fn offset(text: &str, position: LspPosition, coordinates: LspCoordinates) -> Res
     if units == position.character { Ok(end) } else { Err("The server edit names a missing column".into()) }
 }
 
+fn verify_root(root: &fs_safety::Root) -> Result<(), String> {
+    let pinned = root.metadata().map_err(|error| error.to_string())?;
+    let named = fs_safety::Root::open(root.path()).and_then(|root| root.metadata()).map_err(|error| format!("The previewed worktree is no longer available: {error}"))?;
+    if (pinned.dev(), pinned.ino()) != (named.dev(), named.ino()) { return Err("The previewed worktree was replaced; prepare the edit again".into()); }
+    Ok(())
+}
+
 pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
     let worktree = std::fs::canonicalize(worktree).map_err(|error| error.to_string())?;
+    let root = Arc::new(fs_safety::Root::open(&worktree).map_err(|error| error.to_string())?);
+    let protection = Arc::new(crate::worktree_cleanup::protect(&worktree).map_err(|error| error.to_string())?);
+    prepare_at(root, protection, documents, open)
+}
+
+pub fn prepare_resolved(resolved: ResolvedTargets, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
+    prepare_at(resolved.root, resolved.protection, resolved.documents, open)
+}
+
+fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree_cleanup::Protection>>, documents: Vec<DocumentEdits>, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
+    verify_root(&root)?;
+    let worktree = root.path().to_path_buf();
     let mut canonical_open = HashMap::new();
     let mut aliases: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     for (path, snapshot) in open {
@@ -97,7 +122,6 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
             }
         }
     }
-    let root = fs_safety::Root::open(&worktree).map_err(|error| error.to_string())?;
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::with_capacity(documents.len());
     let mut total = 0usize;
@@ -142,7 +166,8 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
             before, after: after.into(), version: snapshot.map(|snapshot| snapshot.version), protocol_version: snapshot.and_then(|snapshot| snapshot.protocol_version), open: snapshot.is_some(), open_paths, edits });
     }
     result.sort_by(|left, right| left.relative.cmp(&right.relative));
-    Ok(Plan { worktree, documents: result })
+    verify_root(&root)?;
+    Ok(Plan { worktree, root, documents: result, _protection: protection })
 }
 
 /// Atomically publishes each unopened file. A later refusal rolls back earlier
@@ -152,10 +177,11 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
 pub struct PublicationReport { pub durability_warnings: Vec<String> }
 
 pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, String> {
+    verify_root(&plan.root)?;
     let mut report = PublicationReport::default();
     let mut published: Vec<&DocumentPlan> = Vec::new();
     for document in plan.documents.iter().filter(|document| !document.open && document.before != document.after) {
-        let saved = editor::save_file(&plan.worktree, &document.relative, &document.after, document.before_hash, false);
+        let saved = verify_root(&plan.root).and_then(|()| editor::save_file_at(&plan.root, &document.relative, &document.after, document.before_hash, false).map_err(|error| error.to_string()));
         let failure = match saved {
             Ok(SaveOutcome::Saved { durability, .. }) => {
                 if let SaveDurability::Unconfirmed { error } = durability { report.durability_warnings.push(format!("{} was replaced, but durability is unconfirmed: {error}", document.relative.display())); }
@@ -166,7 +192,7 @@ pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, String> {
         };
         let mut unrestored = Vec::new();
         for previous in published.into_iter().rev() {
-            if !matches!(editor::save_file(&plan.worktree, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false), Ok(SaveOutcome::Saved { .. })) {
+            if !matches!(editor::save_file_at(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false), Ok(SaveOutcome::Saved { .. })) {
                 unrestored.push(previous.relative.display().to_string());
             }
         }
@@ -261,6 +287,42 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().unwrap();
         assert!(prepare(directory.path(), vec![DocumentEdits { path: outside.path().into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![] }], &HashMap::new()).is_err());
     }
+    #[test]
+    fn replacing_previewed_root_with_identical_files_refuses_every_write() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("worktree");
+        let moved = parent.path().join("original-worktree");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "old").unwrap();
+        let documents = vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }];
+        let resolved = resolve_targets(root.clone(), documents, Vec::new()).unwrap();
+        let plan = prepare_resolved(resolved, &HashMap::new()).unwrap();
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "old").unwrap();
+        assert!(publish_unopened(&plan).unwrap_err().contains("replaced"));
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(moved.join("a.rs")).unwrap(), "old");
+        // A rollback still has authority over the original root after rename,
+        // independently of the name now identifying the replacement tree.
+        assert!(matches!(editor::save_file_at(&plan.root, Path::new("a.rs"), "original only", blake3::hash(b"old"), false), Ok(SaveOutcome::Saved { .. })));
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(moved.join("a.rs")).unwrap(), "original only");
+    }
+
+    #[test]
+    fn root_replacement_between_resolution_and_preparation_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("worktree");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "old").unwrap();
+        let resolved = resolve_targets(root.clone(), vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], Vec::new()).unwrap();
+        std::fs::rename(&root, parent.path().join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "old").unwrap();
+        assert!(prepare_resolved(resolved, &HashMap::new()).unwrap_err().contains("replaced"));
+    }
+
     #[test]
     fn outside_change_cancels_batch_and_restores_preceding_atomic_writes() {
         let directory = tempfile::tempdir().unwrap();

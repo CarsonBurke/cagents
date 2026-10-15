@@ -865,6 +865,21 @@ pub fn save_file(
     )
 }
 
+/// Uses the caller's pinned worktree authority for a multi-file transaction.
+/// Reopening the path for each file would allow a previewed tree to be replaced
+/// between publications and redirect later writes into a different checkout.
+pub(crate) fn save_file_at(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+) -> Result<SaveOutcome, FileIoError> {
+    // The workspace planner retains its cleanup protection with this Root
+    // from preparation through rollback, even if the directory is renamed.
+    save_file_at_with_hooks(root, relative_path, text, expected_disk_hash, overwrite, || Ok(()), fs_safety::sync_directory)
+}
+
 fn save_file_with_hooks(
     worktree: &Path,
     relative_path: &Path,
@@ -876,8 +891,21 @@ fn save_file_with_hooks(
 ) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(relative_path)?;
     let root = worktree_root(worktree)?;
+    save_file_at_with_hooks(&root, relative_path, text, expected_disk_hash, overwrite, before_publish, sync_parent)
+}
+
+fn save_file_at_with_hooks(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+) -> Result<SaveOutcome, FileIoError> {
+    validate_repo_path(relative_path)?;
     let (parent, name) =
-        fs_safety::open_parent_beneath(&root, relative_path).map_err(resolve_error)?;
+        fs_safety::open_parent_beneath(root, relative_path).map_err(resolve_error)?;
     let name = Path::new(&name);
     // The destination is classified by name once, only to refuse a symlink
     // without opening it, and then opened; every decision that follows — its

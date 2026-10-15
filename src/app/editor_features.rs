@@ -108,6 +108,32 @@ mod tests {
         assert_eq!(text(&app, b), original);
     }
 
+    #[tokio::test]
+    async fn replacing_preview_root_preserves_open_buffers_and_releases_their_freeze() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("worktree");
+        let moved = parent.path().join("original");
+        std::fs::create_dir(&root).unwrap();
+        let original = "fn old() {}\n";
+        for name in ["a.rs", "b.rs"] { std::fs::write(root.join(name), original).unwrap(); }
+        let mut app = app();
+        let card = buffer(&mut app, &root, "a.rs", original);
+        let plan = plan(&app, &root, &["a.rs", "b.rs"]);
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        for name in ["a.rs", "b.rs"] { std::fs::write(root.join(name), original).unwrap(); }
+        let operation = operation(&app, card);
+        let task = app.publish_editor_workspace_edit(20, operation, plan);
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending()));
+        finish(&mut app, task).await;
+        assert_eq!(text(&app, card), original);
+        for tree in [&root, &moved] {
+            for name in ["a.rs", "b.rs"] { assert_eq!(std::fs::read_to_string(tree.join(name)).unwrap(), original); }
+        }
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+        assert!(!app.editor_features.publishing());
+    }
+
     #[test]
     fn changed_protocol_version_refuses_publication_before_buffer_or_disk_mutation() {
         let root = tempfile::tempdir().unwrap();
@@ -690,7 +716,7 @@ impl Cagents {
                     Err(error) => return self.update_editor_features(Action::Prepared { ticket, result: Err(error) }),
                 };
                 cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || workspace::prepare(&resolved.worktree, resolved.documents, &open).map(Arc::new)).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    let result = tokio::task::spawn_blocking(move || workspace::prepare_resolved(resolved, &open).map(Arc::new)).await.map_err(|error| error.to_string()).and_then(|result| result);
                     Message::EditorFeatures(Action::Prepared { ticket, result })
                 })
             }
