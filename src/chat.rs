@@ -954,6 +954,9 @@ pub struct Snapshot {
     /// Original prose mutation boundary, independent of status/presentation updates.
     #[serde(default)]
     pub source_revision: u64,
+    /// Exact source cache lifetime, including Reset followed by the same session.
+    #[serde(default)]
+    pub source_incarnation: Option<uuid::Uuid>,
     #[serde(default)]
     pub source_parts: Vec<cache::SourcePart>,
 }

@@ -102,6 +102,7 @@ impl State {
         let Some(active)=active else {result.known=false;return result;};
         let mut by_item:HashMap<&str,&chat::cache::SourcePart>=HashMap::new();
         for part in raw.source_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected) {
+            if raw.source_incarnation.is_some_and(|incarnation|part.epoch.incarnation!=incarnation) {result.known=false;continue;}
             if by_item.insert(&part.item_id,part).is_some() {result.known=false;}
         }
         let mut groups:BTreeMap<&Key,Vec<(&chat::cache::SourcePart,&Arc<chat::Item>)>>=BTreeMap::new();
@@ -148,14 +149,15 @@ impl State {
                 .map(move |part|(scroll::item_id(&key.source_id),part.item.id.as_str())))
     }
     fn sync(&mut self,raw:&Arc<Snapshot>,selected:Option<&str>) {
-        if self.raw.as_ref().is_some_and(|previous|previous.session_id!=raw.session_id) {self.clear();}
+        if self.raw.as_ref().is_some_and(|previous|previous.session_id!=raw.session_id || previous.source_incarnation!=raw.source_incarnation) {self.clear();}
         let mut groups:BTreeMap<Key,Vec<Part>>=BTreeMap::new();
         let active=match selected {
             Some(id)=>raw.subagents.iter().find(|agent|agent.id==id).map(|agent|(Some(agent.id.clone()),&agent.items)),
             None=>Some((None,&raw.items)),
         };
         let source_parts:HashMap<_,_>=raw.source_parts.iter()
-            .filter(|part|part.source.agent_id.as_deref()==selected)
+            .filter(|part|part.source.agent_id.as_deref()==selected
+                && raw.source_incarnation.is_none_or(|incarnation|part.epoch.incarnation==incarnation))
             .map(|part|(part.item_id.as_str(),part)).collect();
         for (_agent_id,items) in active {
             for item in items.iter() {
@@ -510,6 +512,18 @@ mod tests {
         assert!(!state.append_proven(&rewritten,&changed),"rendering kind changes require a parse reset");
         state.clear();assert!(!state.append_proven(&current,&rewritten));
     }
+    #[test]
+    fn same_session_reset_drops_loaded_prose_aliases_and_rejects_old_completion() {
+        let raw=source_snapshot(Snapshot {generation:1,source_revision:7,items:vec![text("root","part")],..Default::default()});
+        let key=Key {agent_id:None,source_id:"root".into()};let mut state=State::default();state.project(raw.clone(),None);
+        let request=state.requests().remove(0);
+        let mut reset=(*raw).clone();reset.source_incarnation=Some(uuid::Uuid::from_u128(999));
+        state.project(Arc::new(reset),None);
+        assert!(state.entries.is_empty());assert!(state.logical_item_id(None,"root").is_none());
+        assert!(!state.complete(&key,request.1,Ok(Loaded {item:text("root","old body"),epoch:source_epoch(7)})));
+        assert_eq!(state.retained_bytes(),0);assert!(!state.presentation_coverage(None).known);
+    }
+
     #[test]
     fn a_new_store_incarnation_cannot_reuse_same_revision_body_or_append_proof() {
         let raw=source_snapshot(Snapshot {generation:1,source_revision:7,items:vec![text("root","part")],..Default::default()});
