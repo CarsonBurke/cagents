@@ -12996,7 +12996,10 @@ mod tests {
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
         assert_eq!(app.durable.channels[0].title, "First conversation");
         assert_eq!(
-            app.chat_ui.channel_names[&target].title.as_ref().map(|(title, _)| title.as_str()),
+            app.chat_ui.channel_names[&target]
+                .title
+                .as_ref()
+                .map(|(title, _)| title.as_str()),
             Some("Secondary encryption review"),
             "the secondary pane caches its own title without renaming the primary channel"
         );
