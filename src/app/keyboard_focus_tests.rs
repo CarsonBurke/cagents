@@ -210,13 +210,14 @@ fn actual_nonselected_pane_header_keeps_native_focus_through_all_ready_update_op
 
 
 #[test]
-fn actual_sidebar_buttons_reopen_a_pane_while_the_native_search_field_keeps_redo() {
+fn actual_workspace_buttons_reopen_a_pane_while_the_native_search_field_keeps_redo() {
     use keyboard::key::Code;
-    for button in [widget::Id::new("sidebar.settings"), widget::Id::new("sidebar.automations"), sidebar::search_toggle_focus_id()] {
+    for (button, inspector_open) in [(widget::Id::new("sidebar.settings"), false), (widget::Id::new("sidebar.automations"), false), (sidebar::search_toggle_focus_id(), false), (context_inspector_toggle_id(), false), (context_inspector_toggle_id(), true)] {
         let (mut app, card) = super::tests::editing_repository_app();
         app.sidebar_model.projects.push(sidebar::SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Keyboard fixture".into(), "/keyboard-fixture".into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder));
         app.sidebar_state.apply(&SidebarAction::ToggleControls);
         prepare(&mut app);
+        app.context_inspector_open = inspector_open;
         seed_reopen(&mut app, card);
         let mut renderer = super::tests::headless_renderer();
         let redo = key("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None);

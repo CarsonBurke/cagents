@@ -17510,7 +17510,7 @@ impl Application for Cagents {
             self.input_trace.clear_keyboard_focus();
             crate::input_trace::observe(surface, &self.input_trace)
         } else {
-            let mut regions = vec![(widget::Id::new("workspace.sidebar-controls"), workspace_widget::FocusedPane::Other.into())];
+            let mut regions: Vec<_> = ["workspace.sidebar-controls", "workspace.header-controls", "workspace.inspector-controls", "workspace.inspector-header-controls"].into_iter().map(|id| (widget::Id::new(id), workspace_widget::FocusedPane::Other.into())).collect();
             for mounted in &self.workspace.projection(self.workspace.viewport_width()).mounted {
                 let card = mounted.id;
                 let kind = self.pane_kind(card);
