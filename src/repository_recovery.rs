@@ -686,6 +686,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .retry()
                 .map_err(|message| ValidationError::Io(message))?;
         }
+        // A pending native source rename is completed only after retry has
+        // reverified its SAME original inode/content/access at that endpoint.
+        // No callback captures the live authority itself (avoids an Arc cycle).
+        for entry in &recovery.entries {
+            if entry
+                .trash
+                .as_ref()
+                .is_some_and(native_trash::confirmed_restore)
+            {
+                recovery.live_recovery.mark_completed(&entry.path);
+            }
+        }
         recovery.live_recovery.acknowledge_resolution();
         Ok(DiscardRecoveryResolution {
             remaining_paths: recovery.remaining_paths(),
