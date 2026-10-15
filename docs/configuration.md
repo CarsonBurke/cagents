@@ -167,6 +167,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
+| `editor_find_options` | table | all options `false` | Persisted Find matching options; see the three fields below |
 | `editor_find_options.case_sensitive` | boolean | `false` | Match case in the native editor Find strip |
 | `editor_find_options.regex` | boolean | `false` | Interpret Find queries as bounded regular expressions |
 | `editor_find_options.whole_word` | boolean | `false` | Require word boundaries outside each Find match |

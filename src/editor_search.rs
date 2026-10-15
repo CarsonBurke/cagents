@@ -224,6 +224,25 @@ mod tests {
         assert!(find_in_lines(["a"].into_iter(), "[", options, || false).is_err());
     }
     #[test]
+    fn find_matches_all_case_regex_and_word_option_combinations() {
+        for case_sensitive in [false, true] {
+            for regex in [false, true] {
+                for whole_word in [false, true] {
+                    let options = FindOptions { case_sensitive, regex, whole_word };
+                    let query = if regex { "f[o]{2}" } else { "foo" };
+                    let expected = match (case_sensitive, whole_word) {
+                        (false, false) => 4,
+                        (false, true) => 3,
+                        (true, false) => 2,
+                        (true, true) => 1,
+                    };
+                    assert_eq!(count("foo Foo food FOO", query, options), expected, "{options:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn replacements_expand_captures_and_preserve_case() {
         let options = FindOptions {
             regex: true,

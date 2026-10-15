@@ -620,7 +620,9 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
 - Find offers **Aa** (match case), **Word** (whole words), and `.*` (regular
   expressions). Invalid expressions show an inline error. **Selection** searches
   only the selection captured when enabled. Matching preferences persist for
-  the user; the selection scope lasts only for this open strip.
+  the user; the selection scope lasts only for this open strip. Editing or
+  undoing pauses a scoped search so it cannot replace text in a different
+  region. Select the new range and turn **Selection** off and on to resume.
 - Replace or Replace all uses the same matching options. Regular expressions
   expand captures such as `$1`; plain replacements can **Preserve case** for
   upper, lower and title case matches. Replace all is one undo step.
