@@ -238,7 +238,9 @@ impl Editor {
         let basis = DiffBasis::CommitToParent { oid, parent: changes.commit.parent.clone() };
         let old_path = entry.old_path.clone();
         tab.title = path.as_path().file_name().unwrap_or(path.as_path().as_os_str()).to_string_lossy().into_owned();
-        tab.owned_file = Some(tab.runtime.descriptor.worktree.join(path.as_path()));
+        // An immutable commit view does not own the live working file. Live
+        // open/dedup must still mount its current editable document.
+        tab.owned_file = None;
         tab.pending_file = None; tab.pending_fragment = None;
         repository_task(tab.runtime.update(RepositoryAction::OpenCommittedFile { card: origin.card, path, old_path, basis }))
     }
@@ -446,8 +448,16 @@ mod tests {
         sidebar_action(&mut app, SidebarAction::OpenCommitFile { key: origin.key, oid, path });
         assert!(app.selection_epoch > epoch);
         assert!(app.tab(card).unwrap().runtime.shows_diff());
-        assert_eq!(app.tab(card).unwrap().owned_file.as_deref(), Some(root.join("tracked.txt").as_path()));
+        assert!(app.tab(card).unwrap().owned_file.is_none());
         assert_eq!(app.tab(card).unwrap().title, "tracked.txt");
+        std::fs::write(root.join("tracked.txt"), "newer working document\n").unwrap();
+        let task = app.update(Message::Chosen(app.selection_epoch, Ok(Some(root.join("tracked.txt")))));
+        run_tasks(&mut app, task);
+        let working = app.active.unwrap();
+        assert_ne!(working, card, "historical tab cannot deduplicate a live working-file open");
+        assert_eq!(app.tab(working).unwrap().runtime.editor_text().as_deref(), Some("newer working document\n"));
+        assert_eq!(app.tab(working).unwrap().owned_file.as_deref(), Some(root.join("tracked.txt").as_path()));
+        assert!(app.tab(card).unwrap().runtime.shows_diff());
     }
 
     #[test]
