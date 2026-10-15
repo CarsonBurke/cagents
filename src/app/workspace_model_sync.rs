@@ -1230,7 +1230,8 @@ mod tests {
             primary_checkout: Some(primary.clone()), name: "project".into(), kind: ProjectKind::Git, ordinal: 1 };
         drop(app.adopt_shared_project(&shared));
         let project = ProjectId::new();
-        assert_eq!(app.known_project_checkout(&repository, project), Some((primary, repository.clone())));
+        assert_eq!(app.known_project_checkout(&repository, project), Some((linked.clone(), repository.clone())));
+        assert_eq!(app.project_ui.primary_checkout_roots.get(&repository), Some(&primary));
         assert_eq!(app.project_ui.checkout_roots.get(&repository), Some(&linked));
     }
 
