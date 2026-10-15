@@ -553,3 +553,73 @@ fn combined_close_local_admission_avoids_held_presentation_store_and_host_census
     assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
     assert!(store.lock().unwrap().inspect_presentation_repair(&Origin::User, fixture.agent.id).unwrap().is_none());
 }
+
+
+#[test]
+fn combined_close_retained_local_owner_refuses_degraded_managed_registry_before_adoption() {
+    if owning_close_isolated("combined_close_retained_local_owner_refuses_degraded_managed_registry_before_adoption").is_some() { return; }
+    let fixture = LocalCodexPresentationFixture::start();
+    let store = registry(&fixture.host).unwrap();
+    let before_model = fixture.host.lock().unwrap().read_model().unwrap();
+    let before_run = store.lock().unwrap().agent_run(fixture.run.id).unwrap();
+    let counts = fixture.rpc_counts();
+    let HostedSession::Chat(source) = fixture.agent.session.as_ref().unwrap() else { unreachable!() };
+    let before_holder = chat::native_holder::inspect(&fixture.owner, &fixture.proof).unwrap().0;
+    struct Restore {
+        host: SharedHost,
+        id: TerminalId,
+        registry: Option<SharedRegistry>,
+        record: Option<crate::host::chat::Record>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let mut state = self.host.lock().unwrap();
+            if state.execution_registry.is_none() { state.execution_registry = self.registry.take(); }
+            if !state.chats.contains_key(&self.id)
+                && let Some(record) = self.record.take() { state.chats.insert(self.id, record); }
+            // Any unexpected replacement stays intact; retired handles owned
+            // by this guard are dropped only after the HostState lock.
+            drop(state);
+        }
+    }
+    let restore = {
+        let mut state = fixture.host.lock().unwrap();
+        let registry = state.execution_registry.take().expect("actual managed connection");
+        let record = state.chats.remove(&source.id).expect("actual Local actor record");
+        Restore {host: fixture.host.clone(), id: source.id, registry: Some(registry), record: Some(record)}
+    };
+    // The durable sidebar model is still real and installed. Only its second
+    // execution connection has become unavailable; this is not registry-less
+    // ordinary interactive mode. Keep the exact Local handle alive separately.
+    let installed = fixture.host.lock().unwrap().read_model();
+    let started = Instant::now();
+    let preflight = preflight_retirement(&fixture.host, source);
+    let retired = retired(&fixture.host, source);
+    let close = crate::host::chat::close_retained_native(&fixture.host, source);
+    let elapsed = started.elapsed();
+    let pending = fixture.host.lock().unwrap().native_closing.contains_key(&source.id);
+    let after_holder = chat::native_holder::inspect(&fixture.owner, &fixture.proof);
+    let after_model = fixture.host.lock().unwrap().read_model();
+    drop(restore); // Restore the original connection/record before cleanup/assertions.
+    assert!(installed.is_ok());
+    for result in [preflight, retired, close] {
+        let error = result.unwrap_err();
+        assert!(error.contains("managed execution registry is unavailable"), "{error}");
+    }
+    assert!(elapsed < Duration::from_secs(2), "unavailable execution store must refuse before provider cleanup waits");
+    assert!(!pending, "refusal must precede installing/adopting any cleanup owner");
+    assert!(fixture.owner.root.is_current()); assert!(fixture.owner.holder.is_current());
+    assert!(!fixture.pair.is_completed());
+    assert!(fixture.handle.provider_process().is_none());
+    let (after_holder, exited) = after_holder.unwrap();
+    assert!(!exited);
+    assert_eq!(after_holder.source, before_holder.source);
+    assert_eq!(after_holder.previous_sources, before_holder.previous_sources);
+    assert_eq!(after_holder.server_process, before_holder.server_process);
+    assert_eq!(after_holder.paired_holder, before_holder.paired_holder);
+    assert_eq!(after_model.unwrap(), before_model);
+    assert_eq!(store.lock().unwrap().agent(fixture.agent.id).unwrap(), fixture.agent);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), before_run);
+    assert!(Arc::ptr_eq(&registry(&fixture.host).unwrap(), &store));
+    assert_eq!(fixture.rpc_counts(), counts);
+}
