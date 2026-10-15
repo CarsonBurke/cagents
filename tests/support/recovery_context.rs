@@ -1,5 +1,5 @@
 //! Test-only real domain fixture; no production registration policy.
-use std::{io, os::unix::fs::MetadataExt, path::Path, process::{Command, Stdio}, sync::{Arc, Mutex}, time::{Duration, Instant}};
+use std::{io::{self, Read}, os::unix::fs::{MetadataExt, PermissionsExt}, path::Path, process::{Command, Stdio}, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use cagents::{filesystem_recovery_context::FilesystemRecoveryContext, fs_safety::{RecoveryPlacement, RecoveryRegistrationLease, RecoveryRegistryCheck, Root, recovery_directory_stamp}};
 
 /// The process environment is isolated by the owning test process BEFORE any
@@ -14,23 +14,36 @@ pub(super) fn run_isolated_case(case: &str) -> bool {
         assert_eq!(metadata.mode() & 0o777, 0o700);
         return false;
     }
-    let runtime = tempfile::Builder::new().prefix("cagents-recovery-runtime-").tempdir().unwrap();
-    let data = tempfile::Builder::new().prefix("cagents-recovery-data-").tempdir().unwrap();
+    let runtime = tempfile::Builder::new().prefix("cagents-recovery-runtime-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+    let data = tempfile::Builder::new().prefix("cagents-recovery-data-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+    let stdout_path = runtime.path().join("case.stdout");
+    let stderr_path = runtime.path().join("case.stderr");
     let mut command = Command::new(std::env::current_exe().unwrap());
     for (key, _) in std::env::vars_os() { if key.as_encoded_bytes().starts_with(b"GIT_") { command.env_remove(key); } }
     command.args([case, "--exact", "--nocapture", "--test-threads=1"])
         .env("CAGENTS_RECOVERY_CASE", case).env("CAGENTS_RECOVERY_RUNTIME", runtime.path())
         .env("XDG_RUNTIME_DIR", runtime.path()).env("XDG_DATA_HOME", data.path())
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        .stdin(Stdio::null()).stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap())).stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
     struct Child(std::process::Child);
     impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
     let mut child = Child(command.spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success(), "isolated recovery case {case} failed: {status}"); break; }
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() { break status; }
         assert!(Instant::now() < deadline, "isolated recovery case {case} timed out");
         std::thread::sleep(Duration::from_millis(10));
+    };
+    fn bounded_output(path: &Path) -> String {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path).unwrap().take(1024 * 1024 + 1).read_to_end(&mut bytes).unwrap();
+        assert!(bytes.len() <= 1024 * 1024, "isolated recovery output exceeded its fixed fixture bound");
+        String::from_utf8_lossy(&bytes).into_owned()
     }
+    let stdout = bounded_output(&stdout_path);
+    let stderr = bounded_output(&stderr_path);
+    assert!(status.success(), "isolated recovery case {case} failed: {status}\n{stdout}\n{stderr}");
+    assert!(stdout.lines().any(|line| line.contains(&format!("test {case} ... ok"))), "owning contract did not report success: {stdout}\n{stderr}");
+    assert!(stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")), "selector must execute exactly one owning contract, not zero tests: {stdout}\n{stderr}");
     true
 }
 
