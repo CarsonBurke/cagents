@@ -194,7 +194,7 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
-    crate::terminal::transport::runtime().map_err(io::Error::other)?;
+    crate::terminal::transport::initialize_host().map_err(io::Error::other)?;
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id()?,

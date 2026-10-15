@@ -1,8 +1,9 @@
 //! Fixed transport resources, independent from PTY parsing and UI drawing.
 //!
-//! Socket tasks never block on I/O or host requests. CPU/blocking work has a
-//! bounded admission queue and four workers; adding a connection adds no OS
-//! thread. Each connection submits at most one request and one encode at once.
+//! Socket tasks never block on I/O or host requests. CPU/blocking work uses
+//! bounded admission queues and fixed pools. Input, snapshots, serialization
+//! and slow domain work have independent capacity; adding a connection adds no
+//! OS thread. Each connection submits at most one request and one encode at once.
 use std::{
     io::{self, Read},
     os::{fd::AsRawFd, unix::net::UnixStream},
@@ -16,13 +17,18 @@ use super::ipc::{FrameCodec, FrameError};
 
 type Job = Box<dyn FnOnce() + Send>;
 const QUEUED_WORK: usize = 64;
-const WORKERS: usize = 4;
+#[derive(Clone, Copy)]
+pub(crate) enum WorkClass { Input, Snapshot, Encode, Domain }
 
+struct Pool { work: crossbeam_channel::Sender<Job>, admission: Arc<Semaphore> }
 struct Resources {
     runtime: tokio::runtime::Runtime,
-    work: crossbeam_channel::Sender<Job>,
+    input: OnceLock<Result<Pool, String>>,
+    snapshot: OnceLock<Result<Pool, String>>,
+    encode: OnceLock<Result<Pool, String>>,
+    domain: OnceLock<Result<Pool, String>>,
     retire: crossbeam_channel::Sender<Job>,
-    admission: Arc<Semaphore>,
+    retirement: crossbeam_channel::Receiver<Job>,
     retiring: AtomicUsize,
     retired: Notify,
 }
@@ -33,36 +39,54 @@ fn resources() -> Result<&'static Resources, String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2).thread_name("terminal-transport")
             .enable_io().enable_time().build().map_err(|error| error.to_string())?;
-        let (work, jobs) = crossbeam_channel::unbounded::<Job>();
         let (retire, retirement) = crossbeam_channel::unbounded::<Job>();
-        for index in 0..WORKERS {
+        Ok(Resources { runtime, input: OnceLock::new(), snapshot: OnceLock::new(), encode: OnceLock::new(), domain: OnceLock::new(),
+            retire, retirement, retiring: AtomicUsize::new(0), retired: Notify::new() })
+    }).as_ref().map_err(Clone::clone)
+}
+
+fn pool(resources: &'static Resources, class: WorkClass) -> Result<&'static Pool, String> {
+    let (slot, name, workers) = match class {
+        WorkClass::Input => (&resources.input, "input", 2),
+        WorkClass::Snapshot => (&resources.snapshot, "snapshot", 2),
+        WorkClass::Encode => (&resources.encode, "encode", 2),
+        WorkClass::Domain => (&resources.domain, "domain", 4),
+    };
+    slot.get_or_init(|| {
+        let (work, jobs) = crossbeam_channel::unbounded::<Job>();
+        let retirement = if matches!(class, WorkClass::Domain) { resources.retirement.clone() } else { crossbeam_channel::never() };
+        for index in 0..workers {
             let jobs = jobs.clone();
             let retirement = retirement.clone();
-            std::thread::Builder::new().name(format!("terminal-dispatch-{index}"))
+            std::thread::Builder::new().name(format!("terminal-{name}-{index}"))
                 .spawn(move || loop {
                     let job = crossbeam_channel::select_biased! {
                         recv(retirement) -> job => job,
                         recv(jobs) -> job => job,
                     };
                     let Ok(job) = job else { return; };
-                    // One subscriber/request panic must not remove pool capacity.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                 }).map_err(|error| error.to_string())?;
         }
-        Ok(Resources { runtime, work, retire, admission: Arc::new(Semaphore::new(QUEUED_WORK)),
-            retiring: AtomicUsize::new(0), retired: Notify::new() })
+        Ok(Pool { work, admission: Arc::new(Semaphore::new(QUEUED_WORK)) })
     }).as_ref().map_err(Clone::clone)
 }
 
-pub(crate) fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
-    resources().map(|resources| &resources.runtime)
+pub(crate) fn runtime() -> Result<&'static tokio::runtime::Runtime, String> { resources().map(|resources| &resources.runtime) }
+
+/// Warm host resources before publishing daemon readiness or sampling its idle
+/// thread count. The UI initializes only its two I/O threads.
+pub(crate) fn initialize_host() -> Result<(), String> {
+    let resources = resources()?;
+    for class in [WorkClass::Input, WorkClass::Snapshot, WorkClass::Encode, WorkClass::Domain] { pool(resources, class)?; }
+    Ok(())
 }
 
-pub(crate) async fn dispatch<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
-    let resources = resources()?;
-    let permit = resources.admission.clone().acquire_owned().await.map_err(|error| error.to_string())?;
+pub(crate) async fn dispatch<T: Send + 'static>(class: WorkClass, operation: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    let pool = pool(resources()?, class)?;
+    let permit = pool.admission.clone().acquire_owned().await.map_err(|error| error.to_string())?;
     let (reply, result) = oneshot::channel();
-    resources.work.send(Box::new(move || {
+    pool.work.send(Box::new(move || {
         let _permit = permit;
         let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
         let _ = reply.send(value.map_err(|_| "transport dispatcher request panicked".to_owned()));
@@ -75,6 +99,7 @@ pub(crate) async fn dispatch<T: Send + 'static>(operation: impl FnOnce() -> T + 
 /// number of admitted clients, including clients whose cleanup is pending.
 pub(crate) fn retire(operation: impl FnOnce() + Send + 'static) {
     let resources = resources().expect("transport initialized before client registration");
+    pool(resources, WorkClass::Domain).expect("initialized retirement pool");
     resources.retiring.fetch_add(1, Ordering::AcqRel);
     let _ = resources.retire.send(Box::new(move || {
         struct Finished(&'static Resources);

@@ -147,6 +147,20 @@ pub(crate) fn spawn(
     Ok(crate::terminal::transport::runtime()?.spawn(serve_async(stream, client_id, host, process_request, Some(Box::new(retired)))))
 }
 
+fn request_class(request: &ClientRequest) -> crate::terminal::transport::WorkClass {
+    use crate::terminal::transport::WorkClass;
+    match request {
+        ClientRequest::Input { .. } | ClientRequest::Paste { .. } | ClientRequest::Key { .. }
+        | ClientRequest::Mouse { .. } | ClientRequest::Focus { .. } | ClientRequest::Scroll { .. }
+        | ClientRequest::Resize { .. } | ClientRequest::SetTheme { .. } | ClientRequest::SetVisibility { .. }
+        | ClientRequest::Hibernate { .. } | ClientRequest::Resume { .. }
+        | ClientRequest::TerminalAcknowledge { .. } | ClientRequest::AcknowledgeRedraw { .. }
+        | ClientRequest::Authenticate { .. } | ClientRequest::BuildInfo => WorkClass::Input,
+        ClientRequest::Connect { .. } | ClientRequest::Attach { .. } | ClientRequest::Snapshot { .. } => WorkClass::Snapshot,
+        _ => WorkClass::Domain,
+    }
+}
+
 struct Session {
     registration: Registration,
     connected: bool,
@@ -306,7 +320,7 @@ async fn serve_async(
     use crate::terminal::transport;
     let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let pid = peer_pid(&stream);
-    let registration = transport::dispatch(move || {
+    let registration = transport::dispatch(transport::WorkClass::Input, move || {
         let registration = Registration::new(Arc::clone(&host), client_id, retired);
         if let Some(pid) = pid { host.lock().unwrap_or_else(|p| p.into_inner()).record_client_pid(client_id, pid); }
         Session { registration, connected: false, handle }
@@ -334,7 +348,8 @@ async fn serve_async(
             }
         };
         let Ok(Some(envelope)) = frame else { break; };
-        let result = transport::dispatch(move || {
+        let class = request_class(&envelope.request);
+        let result = transport::dispatch(class, move || {
             let connected = session.process(envelope);
             (session, connected)
         }).await;
@@ -359,7 +374,7 @@ async fn writer_loop_async(socket: Arc<tokio::io::unix::AsyncFd<UnixStream>>, de
     let _close = Close(Arc::clone(&socket));
     let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
     while let Some(message) = delivery.pop_async().await {
-        let encoded = transport::dispatch(move || {
+        let encoded = transport::dispatch(transport::WorkClass::Encode, move || {
             let result = codec.encode(&message.wire());
             (codec, result)
         }).await;
@@ -376,7 +391,7 @@ async fn writer_loop_async(socket: Arc<tokio::io::unix::AsyncFd<UnixStream>>, de
     }
 }
 
-fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
+pub(super) fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     // Never wait for admission while holding HostState: admitted operations
     // need to reacquire it after synchronous provider/PTY work.
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
@@ -1462,6 +1477,64 @@ mod tests {
     use crate::model::TerminalId;
 
     #[test]
+    fn slow_domain_requests_cannot_occupy_input_or_response_encoding() {
+        static GATE: std::sync::OnceLock<(crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>)> = std::sync::OnceLock::new();
+        fn handler(host: &SharedHost, client: ClientId, request: ClientRequest) -> Result<RequestOutcome, ProtocolError> {
+            match request {
+                ClientRequest::SendTestNotification => {
+                    let (entered, release) = GATE.get().unwrap();
+                    entered.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(3)).unwrap();
+                    Ok((ServerResponse::Accepted, Vec::new(), false))
+                },
+                ClientRequest::Input { bytes, .. } => {
+                    assert_eq!(bytes, b"ping");
+                    Ok((ServerResponse::Accepted, Vec::new(), false))
+                },
+                request => process_request(host, client, request),
+            }
+        }
+        crate::terminal::transport::initialize_host().unwrap();
+        let runtime = crate::terminal::transport::runtime().unwrap();
+        let (entered, observed) = crossbeam_channel::bounded(4);
+        let (release, waiting) = crossbeam_channel::bounded(4);
+        GATE.set((entered, waiting)).unwrap();
+        let (proof, host) = panic_test_host("slow-domain-transport");
+        let mut peers = Vec::new();
+        let mut tasks = Vec::new();
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        for client in 1..=5 {
+            let (mut peer, server) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            tasks.push(runtime.spawn(serve_async(server, client, Arc::clone(&host), handler, None)));
+            codec.write(&mut peer, &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 1, proof: None,
+                request: ClientRequest::Connect { expected_host: Some(proof.clone()), resume: Vec::new() } }).unwrap();
+            let response: ServerEnvelope = codec.read(&mut peer).unwrap().unwrap();
+            assert!(matches!(response.message, ServerMessage::Response { response: ServerResponse::Connected { .. } }));
+            peers.push(peer);
+        }
+        for peer in &mut peers[..4] {
+            codec.write(peer, &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 2, proof: Some(proof.clone()), request: ClientRequest::SendTestNotification }).unwrap();
+        }
+        for _ in 0..4 { observed.recv_timeout(Duration::from_secs(1)).unwrap(); }
+        let started = Instant::now();
+        codec.write(&mut peers[4], &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 2, proof: Some(proof),
+            request: ClientRequest::Input { terminal_id: TerminalId::new(), bytes: b"ping".to_vec() } }).unwrap();
+        let response: ServerEnvelope = codec.read(&mut peers[4]).unwrap().unwrap();
+        assert!(matches!(response.message, ServerMessage::Response { response: ServerResponse::Accepted }));
+        assert!(started.elapsed() < Duration::from_millis(500), "input/encoding waited for a slow domain request");
+        for _ in 0..4 { release.send(()).unwrap(); }
+        for peer in &mut peers[..4] { let _: ServerEnvelope = codec.read(peer).unwrap().unwrap(); }
+        drop(peers);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for task in tasks { task.await.unwrap(); }
+                crate::terminal::transport::flush_retired().await;
+            }).await.unwrap();
+        });
+    }
+
+    #[test]
     fn thirty_client_connections_add_no_os_threads() {
         const FIXTURE: &str = "CAGENTS_TRANSPORT_THREAD_CENSUS";
         if std::env::var_os(FIXTURE).is_none() {
@@ -1471,6 +1544,7 @@ mod tests {
             assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
             return;
         }
+        crate::terminal::transport::initialize_host().unwrap();
         let runtime = crate::terminal::transport::runtime().unwrap();
         let count = || std::fs::read_dir("/proc/self/task").unwrap().count();
         let idle = count();

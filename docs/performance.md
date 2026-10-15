@@ -216,10 +216,10 @@ measurable UI CPU ticks in a three-second observation.
 ## Connection transport resources
 
 Terminal attachments and daemon connections share a transport runtime with two
-I/O threads and four dispatcher workers. Requests on one connection remain
-serial, including the handshake and resume replay. Blocking host operations
-and outbound serialization use the fixed dispatcher, whose admission limit is
-64 jobs. Socket reads and writes use nonblocking readiness rather than one
+I/O threads and fixed dispatcher pools: two for terminal input, two for
+snapshots, two for outbound encoding, and four for blocking domain requests. Requests on one connection remain
+serial, including the handshake and resume replay. Each pool admits at most 64 jobs. Slow provider, Git, account, and notification
+requests cannot occupy terminal input, snapshot or encoding capacity. Socket reads and writes use nonblocking readiness rather than one
 reader and writer thread per connection. The transport runtime is separate
 from the PTY reactor so host requests cannot park PTY output reads.
 
