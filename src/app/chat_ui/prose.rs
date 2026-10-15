@@ -340,7 +340,7 @@ impl Renderer<'_> {
                     rows.push(selectable_prose::text(
                         alt,
                         settings.text_size,
-                        iced::Font::default(),
+                        settings.style.font,
                         self.target,
                         self.find,
                     ));
@@ -348,8 +348,8 @@ impl Renderer<'_> {
                 if !title.is_empty() {
                     rows.push(selectable_prose::text(
                         vec![Span::new(title.clone())].into(),
-                        design::TEXT_CAPTION.into(),
-                        iced::Font::default(),
+                        settings.text_size * (design::TEXT_CAPTION / design::TEXT_PROSE),
+                        settings.style.font,
                         self.target,
                         self.find,
                     ));
@@ -663,6 +663,47 @@ mod tests {
                 assert_eq!(actual_font, font, "rendered list marker {marker} must follow chat prose family");
                 assert_eq!(actual_size, size, "rendered list marker {marker} must follow chat prose size");
             }
+        }
+    }
+
+    #[test]
+    fn settings_chat_image_text_follows_prose_and_caption_scale_on_the_retained_tree() {
+        use iced::advanced::{layout, widget::{Tree, tree::Tag}};
+        fn image_text(tree: &Tree, out: &mut Vec<(String, iced::Font, f32)>) {
+            if tree.tag == Tag::of::<selectable_prose::State>() {
+                let state = tree.state.downcast_ref::<selectable_prose::State>();
+                let (font, size) = state.typography_for_test();
+                out.push((state.plain.to_string(), font, size.0));
+            }
+            for child in &tree.children { image_text(child, out); }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let families = design::installed_font_families(false);
+        assert!(families.len() >= 2, "two installed families required");
+        let fonts = [iced::Font::with_name(families[0].as_str()), iced::Font::with_name(families[1].as_str())];
+        assert_ne!(fonts[0].family, fonts[1].family);
+        let cached = CachedItem::new(&ItemContent::Text {
+            text: r#"![Diagram alt](docs/diagram.png "Image caption")"#.into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        }, crate::settings::EditorSyntaxTheme::Auto);
+        assert!(matches!(cached.markdown.items(), [markdown::Item::Image { .. }]));
+        let target = Target { card: CardId::new(), generation: 17 };
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0));
+        let mut tree = None;
+        for (font, size) in fonts.into_iter().zip([13.0, 24.0]) {
+            let mut settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            settings.style.font = font;
+            settings.text_size = size.into();
+            let mut element = view(&cached, settings, target, None);
+            let tree = tree.get_or_insert_with(|| Tree::new(element.as_widget()));
+            element.as_widget_mut().diff(tree);
+            let _ = element.as_widget_mut().layout(tree, &renderer, &limits);
+            let mut actual = Vec::new();
+            image_text(tree, &mut actual);
+            assert_eq!(actual.len(), 2, "actual selectable alternative and caption text");
+            assert_eq!(actual[0], ("Diagram alt".to_owned(), font, size));
+            assert_eq!(actual[1], ("Image caption".to_owned(), font, size * (design::TEXT_CAPTION / design::TEXT_PROSE)));
         }
     }
 
