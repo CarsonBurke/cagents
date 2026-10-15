@@ -4988,6 +4988,7 @@ mod tests {
                 attach.request_id,
                 ServerResponse::ChatAttached {
                     session,
+                    account_home: None,
                     snapshot: crate::chat::Snapshot::default(),
                 },
             );
@@ -5030,6 +5031,7 @@ mod tests {
                 attach.request_id,
                 ServerResponse::ChatAttached {
                     session,
+                    account_home: None,
                     snapshot: crate::chat::Snapshot::default(),
                 },
             );

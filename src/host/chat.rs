@@ -553,7 +553,8 @@ fn session_snapshot(record: &Record) -> ServerResponse {
     let mut session = record.session.clone();
     session.launch.session_id = snapshot.session_id.clone();
     session.native_continuity = snapshot.native_continuity.clone();
-    ServerResponse::ChatAttached { session, snapshot }
+    let account_home = record.handle.launch_account_scope().ok().map(crate::account::HomeIdentity::from);
+    ServerResponse::ChatAttached { session, snapshot, account_home }
 }
 fn same_conversation(a: &chat::Launch, b: &chat::Launch) -> bool {
     a.provider == b.provider && a.session_id.is_some() && a.session_id == b.session_id
@@ -2511,6 +2512,7 @@ fn process_inner(
                 return Ok(ServerResponse::ChatAttached {
                     session: receipt.source.clone(),
                     snapshot: receipt.snapshot(),
+                    account_home: None, // The receipt no longer has an attached actor.
                 });
             }
             let record = state.chats.get_mut(&session.id).ok_or_else(|| {
@@ -4803,7 +4805,7 @@ done
             Default::default(),
         )
         .unwrap();
-        let ServerResponse::ChatAttached { session, snapshot } = response else {
+        let ServerResponse::ChatAttached { session, snapshot, .. } = response else {
             panic!("Expected confirmed account attachment")
         };
         assert_eq!(session.launch.session_id.as_deref(), Some(conversation));
@@ -5613,4 +5615,46 @@ done
         drop(release);
         handle.close().unwrap();
     }
+
+    #[test]
+    fn account_cache_attachment_uses_actual_scope_not_issued_recipe() {
+        use crate::chat::protocol::{Adapter, ProcessSpec, Step};
+        struct Quiet;
+        impl Adapter for Quiet {
+            fn initialize(&mut self) -> Result<Step,String> { Ok(Step::default()) }
+            fn command(&mut self,_:chat::Command) -> Result<Step,String> { Ok(Step::default()) }
+            fn receive(&mut self,_:serde_json::Value) -> Result<Step,String> { Ok(Step::default()) }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let actual = root.path().join("actual-b");
+        std::fs::create_dir(&actual).unwrap();
+        let source = Session { id:TerminalId::new(),proof:None,terminal:None,
+            native_continuity:Default::default(),owned_codex_listener:None,
+            launch:chat::Launch { provider:Provider::Claude,session_id:None,
+                recipe:crate::model::LaunchRecipe { program:"/bin/cat".into(),arguments:Vec::new(),
+                    working_directory:root.path().into(),environment:BTreeMap::new(),unset_environment:Default::default() } } };
+        let mut spec = ProcessSpec::from(&source.launch.recipe);
+        spec.environment.insert("CLAUDE_CONFIG_DIR".into(),actual.display().to_string());
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec,&mut initial).unwrap();
+        let handle = Handle::start_owned(spec,Box::new(Quiet),initial,store,source.clone(),Default::default(),|_|{}).unwrap();
+        let record = Record { execution_instance:uuid::Uuid::nil(),console_recipe:None,paired_terminal:None,
+            session:source.clone(),handle:handle.clone(),source_process:None,subscribers:BTreeMap::new(),
+            observations:BTreeMap::new(),completion_observed:false,returning_terminal:false };
+        let ServerResponse::ChatAttached {session,account_home,..} = session_snapshot(&record) else { panic!("attachment expected"); };
+        let captured = account_home.unwrap();
+        assert!(session.launch.recipe.environment.is_empty(),"issued provenance remains unchanged");
+        assert_eq!(captured.canonical_home,actual.canonicalize().unwrap());
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&actual).unwrap();
+        assert_eq!((captured.device,captured.inode),(metadata.dev(),metadata.ino()));
+        // Replacing the path cannot rewrite an existing attachment's identity.
+        std::fs::rename(&actual,root.path().join("retained-b")).unwrap();
+        std::fs::create_dir(&actual).unwrap();
+        let ServerResponse::ChatAttached {account_home:Some(repeated),..}=session_snapshot(&record) else { panic!("captured association expected"); };
+        assert_eq!(captured,repeated);
+        assert_ne!(captured.inode,std::fs::metadata(&actual).unwrap().ino());
+        handle.close().unwrap();
+    }
+
 }

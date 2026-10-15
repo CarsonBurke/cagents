@@ -716,6 +716,10 @@ pub enum ServerResponse {
     ChatAttached {
         session: crate::chat::Session,
         snapshot: crate::chat::Snapshot,
+        /// Deletion association, never read authority or recipe inference.
+        /// Missing for history-only or legacy actors without captured proof.
+        #[serde(default)]
+        account_home: Option<crate::account::HomeIdentity>,
     },
     ChatSnapshot {
         chat_id: TerminalId,

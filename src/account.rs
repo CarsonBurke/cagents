@@ -48,6 +48,32 @@ pub mod schedule;
 #[cfg(feature = "host")]
 pub(crate) mod scope;
 
+/// Immutable, nonsecret association metadata for a local transcript cache.
+/// Supplied only by the exact attached backend actor's captured startup scope.
+/// This is not a capability and never authorizes provider or annotation reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeIdentity {
+    pub provider: Provider,
+    pub canonical_home: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    /// Validated aliases at attachment, used only for deletion association.
+    #[serde(default)]
+    pub purge_ids: Vec<AccountId>,
+}
+
+#[cfg(feature = "host")]
+impl From<&scope::LaunchAccountScope> for HomeIdentity {
+    fn from(scope: &scope::LaunchAccountScope) -> Self {
+        let mut purge_ids = scope.purge_ids.clone();
+        purge_ids.extend(scope.registered_id.iter().cloned());
+        purge_ids.sort();
+        purge_ids.dedup();
+        Self { provider: scope.provider, canonical_home: scope.canonical_home.clone(),
+            device: scope.device, inode: scope.inode, purge_ids }
+    }
+}
+
 /// A used fraction past which an account is reported as approaching its
 /// limit. It is the same point past which the shell draws a budget in its
 /// warning tone, so a status and a ring cannot disagree.
