@@ -1685,6 +1685,51 @@ mod tests {
             crate::chat::presentation::ItemChange::Append { suffix, .. } if suffix.is_empty())).count(), 1);
     }
 
+    #[test]
+    fn completed_parts_keep_payloads_and_publish_current_root_metadata_when_root_is_paged_out() {
+        use crate::chat::cache::{SourceKey, SourceQuery};
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let source = "x".repeat(PART_BYTES * 32 + 17);
+        let item = Item { id: "clocked".into(), role: Role::Assistant,
+            at: Some(10), started_at: Some(3), content: ItemContent::Text {
+                text: source.clone(), thinking: true, phase: Phase::Commentary } };
+        store.put(item, true).unwrap();
+        let mut previous = store.window().unwrap();
+        assert!(previous.has_earlier);
+        assert!(!previous.items.iter().any(|item| item.id == "clocked"),
+            "fixture must omit original root display part");
+        let epoch = previous.source_parts[0].epoch;
+        let completed: Vec<_> = previous.items.iter().filter(|item| matches!(&item.content,
+            ItemContent::Text { text, .. } if text.len() == PART_BYTES)).cloned().collect();
+        assert!(!completed.is_empty());
+        store.apply(Event::TextDelta { id: "clocked".into(), role: Role::Assistant,
+            thinking: true, delta: " tail".into() }).unwrap();
+        let next = store.window_reusing(&mut previous.items).unwrap();
+        assert!(!next.items.iter().any(|item| item.id == "clocked"));
+        for old in completed {
+            let current = next.items.iter().find(|item| item.id == old.id).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&old, current));
+            assert_eq!(current.at, Some(10), "retained display fragment keeps its own stamp");
+        }
+        let expected = &next.source_parts[0].metadata;
+        assert!(expected.at.is_some_and(|at| at > 10));
+        assert_eq!(expected.started_at, Some(3));
+        assert_eq!(expected.role, Role::Assistant);
+        assert!(expected.thinking);
+        assert_eq!(expected.phase, Phase::Commentary);
+        for part in &next.source_parts {
+            assert_eq!(part.epoch, epoch, "append does not replace the original source");
+            assert_eq!(part.source_len, source.len() + " tail".len());
+            assert_eq!(&part.metadata, expected);
+        }
+        let page = store.source_page(SourceQuery { source: SourceKey {
+            agent_id: None, source_id: "clocked".into() }, offset: 0, limit: 1024,
+            expected_epoch: Some(epoch), until: Some(source.len() + " tail".len()) }).unwrap();
+        assert_eq!(&page.metadata, expected,
+            "hydration/timers use authoritative root metadata independently of display Arcs");
+        assert_eq!(page.text, "x".repeat(1024));
+    }
+
     /// Isolated producer microbenchmark. The reference disables only local
     /// append reuse; it is not a historical-native UI/RSS comparison.
     #[test]
