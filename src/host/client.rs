@@ -503,7 +503,7 @@ pub(super) fn process_request(
             let _setup_reservation=execution.setup_reservation;
             let prepared=match &mut reply {
                 crate::worktree_control::Reply::Created {worktree,setup:Some(setup),warnings}=>Some((&worktree.path,setup,warnings)),
-                crate::worktree_control::Reply::SetupPrepared {path,setup:Some(setup),warnings}=>Some((&*path,setup,warnings)),
+                crate::worktree_control::Reply::SetupPrepared {path,setup:Some(setup),warnings,..}=>Some((&*path,setup,warnings)),
                 _=>None,
             };
             if let Some((path,setup,warnings))=prepared {

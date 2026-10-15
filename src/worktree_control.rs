@@ -78,7 +78,7 @@ pub enum Reply {
     BranchDeleted {branch:String},
     BranchDeleteRefused {failure:BranchDeleteFailure},
     SetupIntent {creation_id:crate::model::OperationId,primary:PathBuf,intent:String,current_plan:Option<String>,plan_error:Option<String>,trusted:bool,active:bool},
-    SetupPrepared {path:PathBuf,setup:Option<Setup>,warnings:Vec<String>},
+    SetupPrepared {path:PathBuf,setup:Option<Setup>,warnings:Vec<String>,run_id:crate::model::OperationId},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

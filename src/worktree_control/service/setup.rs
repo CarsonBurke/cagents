@@ -87,7 +87,7 @@ pub(super) fn resume(service:&Service,store:&crate::persistence::StateStore,repo
     let request=retained.request.ok_or("The resumed setup receipt has no request")?;
     let mut warnings=Vec::new();
     let setup=plan.as_ref().and_then(|plan|prepare(service,store,&request,primary,&request.destination,plan,&mut warnings,cancel));
-    Ok(Reply::SetupPrepared {path:request.destination,setup,warnings})
+    Ok(Reply::SetupPrepared {path:request.destination,setup,warnings,run_id:request.setup_intent.as_ref().and_then(|intent|intent.run_id).ok_or("The resumed setup receipt has no run identity")?})
 }
 
 pub(super) fn prepare(service:&Service,store:&crate::persistence::StateStore,request:&CreateWorktreeRequest,primary:&Path,destination:&Path,
