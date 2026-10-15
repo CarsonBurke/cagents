@@ -975,6 +975,7 @@ impl HostState {
             }
         };
         Ok(TerminalDescriptor {
+            execution_instance: record.handle.execution_instance(),
             screen_lost_after_crash: record.screen_lost_after_crash,
             session,
             activity: record.handle.activity(),

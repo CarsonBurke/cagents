@@ -374,6 +374,7 @@ struct InputOrder {
 }
 
 struct PublishedState {
+    execution_instance: uuid::Uuid,
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
     acknowledged_generation: AtomicU64,
@@ -422,6 +423,7 @@ impl PublishedState {
     fn new(visible: bool, wake: Arc<WakeCallback>) -> Self {
         let (capture_tx, capture_rx) = crossbeam_channel::bounded(1);
         Self {
+            execution_instance: uuid::Uuid::new_v4(),
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             published_generation: AtomicU64::new(0),
             acknowledged_generation: AtomicU64::new(0),
@@ -985,6 +987,11 @@ impl TerminalHandle {
     /// A stopped parser or foreground-process exit alone releases no ownership.
     pub fn is_completed(&self) -> bool {
         self.inner.published.completed.load(Ordering::Acquire)
+    }
+    /// Ephemeral identity of this exact resident worker, never a durable
+    /// terminal ID or a daemon-wide ownership proof.
+    pub(crate) fn execution_instance(&self) -> uuid::Uuid {
+        self.inner.published.execution_instance
     }
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
