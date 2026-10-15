@@ -5337,7 +5337,7 @@ impl RepositoryRuntime {
         self.source_surface = SourceSurface::Diff;
         self.diff_basis = DiffBasis::IndexToWorktree;
         self.set_diff_state(self.diff_basis.clone(), DiffState::ready(RenderedDiff::Text {
-            model, old_label: "Before".into(), new_label: "After applying".into(),
+            model: Arc::new(model), old_label: "Before".into(), new_label: "After applying".into(),
         }));
     }
 
