@@ -106,7 +106,7 @@ mod tests {
 
     fn row(index: usize) -> Entry {
         let session = crate::chat::Session {
-            id: crate::model::TerminalId::new(), proof: None, terminal: None, owned_codex_listener: None,
+            archive_report: None, id: crate::model::TerminalId::new(), proof: None, terminal: None, owned_codex_listener: None,
             native_continuity: Default::default(), launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Codex, session_id: Some(format!("conversation-{index}")),
                 recipe: crate::model::LaunchRecipe { program: "codex".into(), arguments: Vec::new(),

@@ -488,7 +488,7 @@ mod archive_candidate_tests {
                 working_directory: "/original".into(), environment: Default::default(), unset_environment: Default::default() },
             transcript_path: None, resume_hint: None, continuity: crate::model::TerminalContinuity::Live {
                 host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() } };
-        let mut saved = crate::chat::Session { id, launch: crate::chat::Launch { provider: crate::agent::Provider::Codex,
+        let mut saved = crate::chat::Session { archive_report: None, id, launch: crate::chat::Launch { provider: crate::agent::Provider::Codex,
             recipe: console.launch.clone(), session_id: Some("exact-archived-thread".into()) }, proof: Some(proof), terminal: Some(console.clone()),
             owned_codex_listener: None, native_continuity: Default::default() };
         assert!(archive_console_matches_binding(agent, card, &saved, &console));
