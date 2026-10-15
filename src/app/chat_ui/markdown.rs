@@ -940,7 +940,7 @@ fn parse_with<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super as native;
+    use crate::app::chat_ui::markdown as native;
     use cosmic::widget::markdown as original;
 
     macro_rules! outline {
