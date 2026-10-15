@@ -1208,8 +1208,12 @@ mod tests {
             let original = r.bind_agent(accepted.agent.id, None, live.clone()).unwrap();
             let console = if let HostedSession::Chat(session) = &live {
                 let terminal = session.terminal.clone().unwrap();
-                r.bind_agent_console(original.id, &live, terminal.clone()).unwrap();
-                Some(Pane { kind: CardKind::Terminal(terminal), ..pane() })
+                r.bind_agent_console(original.id, &live, terminal.clone())
+                    .unwrap();
+                Some(Pane {
+                    kind: CardKind::Terminal(terminal),
+                    ..pane()
+                })
             } else {
                 None
             };
@@ -1249,20 +1253,31 @@ mod tests {
                 HostedSession::Chat(session) => CardKind::Chat(session.clone()),
                 HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
             };
-            let p = Pane { id: CardId::from_uuid(original.id.as_uuid()), kind, ..pane() };
+            let p = Pane {
+                id: CardId::from_uuid(original.id.as_uuid()),
+                kind,
+                ..pane()
+            };
             let mut panes = vec![p.clone()];
             panes.extend(console.clone());
             seed(&mut r, a, panes);
             if let Some(console) = &console {
                 let before = r.agent(original.id).unwrap();
-                let transfer = edit(&mut r, a, Change::Transfer {
-                    id: console.id,
-                    destination: Scope::Channel(b),
-                    before: None,
-                });
+                let transfer = edit(
+                    &mut r,
+                    a,
+                    Change::Transfer {
+                        id: console.id,
+                        destination: Scope::Channel(b),
+                        before: None,
+                    },
+                );
                 assert!(r.apply(&transfer).unwrap().changed);
-                assert_eq!(r.agent(original.id).unwrap(), before,
-                    "moving a separate proved console must preserve the canonical agent placement and execution");
+                assert_eq!(
+                    r.agent(original.id).unwrap(),
+                    before,
+                    "moving a separate proved console must preserve the canonical agent placement and execution"
+                );
                 assert_eq!(owner(&r.db, p.id).unwrap(), Some(Scope::Channel(a)));
                 assert_eq!(owner(&r.db, console.id).unwrap(), Some(Scope::Channel(b)));
             }
@@ -1306,7 +1321,10 @@ mod tests {
             assert_eq!(owner(&r.db, p.id).unwrap(), Some(Scope::Channel(b)));
             assert_eq!(
                 read(&r.db, &Scope::Channel(b)).unwrap().panes,
-                console.into_iter().chain(std::iter::once(p.clone())).collect::<Vec<_>>()
+                console
+                    .into_iter()
+                    .chain(std::iter::once(p.clone()))
+                    .collect::<Vec<_>>()
             );
             assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
             assert!(!r.apply(&transfer).unwrap().changed);
