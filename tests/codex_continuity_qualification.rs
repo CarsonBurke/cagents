@@ -459,7 +459,8 @@ impl Fixture {
         let directory = evidence.as_deref().and_then(Path::parent)
             .filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("/var/tmp"));
         fs::create_dir_all(directory).unwrap();
-        let root = tempfile::Builder::new().prefix("codex-continuity-").tempdir_in(directory).unwrap();
+        let directory = fs::canonicalize(directory).unwrap();
+        let root = tempfile::Builder::new().prefix("codex-continuity-").tempdir_in(&directory).unwrap();
         for directory in [
             "home/.codex",
             "run",
@@ -699,7 +700,11 @@ impl Drop for Fixture {
 /// a second identity/ownership check; a numeric PID from the census alone is
 /// never signal authority.
 fn stop_fixture_process(identity: Identity, root: &Path) -> std::io::Result<()> {
-    if identity.0 == std::process::id() || !fixture_process_matches(identity, root) {
+    // /proc cwd links are absolute and resolve symlinks. An aliased evidence
+    // directory must still identify the same private root; failure preserves
+    // its evidence and never broadens signal authority.
+    let root = fs::canonicalize(root)?;
+    if identity.0 == std::process::id() || !fixture_process_matches(identity, &root) {
         return Ok(());
     }
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.0, 0) as i32 };
@@ -708,7 +713,7 @@ fn stop_fixture_process(identity: Identity, root: &Path) -> std::io::Result<()> 
         return if error.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(error) };
     }
     let pidfd = unsafe { fs::File::from_raw_fd(fd) };
-    if !fixture_process_matches(identity, root) { return Ok(()); }
+    if !fixture_process_matches(identity, &root) { return Ok(()); }
     let result = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL,
         std::ptr::null::<libc::siginfo_t>(), 0) };
     if result == 0 { return Ok(()); }
@@ -750,7 +755,9 @@ fn fixture_cleanup_requires_private_cwd_and_the_same_process_incarnation() {
     assert!(owned.0.try_wait().unwrap().is_none(), "a stale start time must not authorize a signal");
     stop_fixture_process(identity(unrelated.0.id()), private.path()).unwrap();
     assert!(unrelated.0.try_wait().unwrap().is_none(), "an exact pidfd alone must not admit an outside process");
-    stop_fixture_process(owned_identity, private.path()).unwrap();
+    let alias = outside.path().join("private-alias");
+    symlink(private.path(), &alias).unwrap();
+    stop_fixture_process(owned_identity, &alias).unwrap();
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(owned.0.wait().unwrap().signal(), Some(libc::SIGKILL));
 }
