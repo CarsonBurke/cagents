@@ -58,13 +58,13 @@ fn repair_config_with(relocation:&Relocation,before_write:impl FnOnce())->Result
     repair_config_pinned(relocation,&root,&common,before_write)
 }
 
-fn config_edit_pinned(relocation:&Relocation,root:&Directory,common:&Directory)->Result<Option<Edit>,String> {
+fn config_edit_pinned(relocation:&Relocation,root:&Directory,common:&Directory)->Result<(Option<Edit>,bool),String> {
     use crate::repository::{CommandSpec,ProcessExecutor,SystemProcessExecutor};
     root.require_current()?;common.require_current()?;
     let (admin,discovered)=crate::project_location::checkout_identity(&root.anchor()).ok_or("The selected checkout no longer has readable Git metadata")?;
     if discovered!=relocation.destination {return Err("The selected checkout changed repositories while locating it".into());}
     root.require_current()?;common.require_current()?;
-    if admin!=common.path() {return Ok(None);}
+    if admin!=common.path() {return Ok((None,false));}
     let original=common.read("config",8*1024*1024)?;
     // Let Git parse and preserve its config syntax in a private working copy.
     // It never receives a mutable repository pathname. The final replace is
@@ -77,24 +77,24 @@ fn config_edit_pinned(relocation:&Relocation,root:&Directory,common:&Directory)-
         .timeout(std::time::Duration::from_secs(15)).output_limits(64*1024,64*1024);
     let read=command().args(["--null","--get","core.worktree"]);
     let output=SystemProcessExecutor.execute(&read,&crate::repository::CancellationToken::default()).map_err(|error|error.to_string())?;
-    if output.exit_code==Some(1) {return Ok(None);}
+    if output.exit_code==Some(1) {return Ok((None,true));}
     let output=output.require_success(&read.program).map_err(|error|error.to_string())?;
     let bytes=output.stdout.strip_suffix(&[0]).ok_or("Git returned an invalid checkout setting")?;
     let configured=PathBuf::from(String::from_utf8(bytes.to_vec()).map_err(|_|"Git checkout setting is not valid UTF-8")?);
     let absolute=if configured.is_absolute(){configured}else{relocation.destination.join(configured)};
     let mut normalized=PathBuf::new();
     for component in absolute.components(){match component {std::path::Component::CurDir=>{},std::path::Component::ParentDir=>{normalized.pop();},component=>normalized.push(component.as_os_str())}}
-    if normalized==relocation.new_root {return Ok(None);}
+    if normalized==relocation.new_root {return Ok((None,true));}
     if normalized!=relocation.old_root {return Err(format!("This Git directory names another checkout: {}. Its setting was preserved.",normalized.display()));}
     let write=command().arg("core.worktree").arg(&relocation.new_root);
     SystemProcessExecutor.execute(&write,&crate::repository::CancellationToken::default()).and_then(|output|output.require_success(&write.program)).map_err(|error|error.to_string())?;
     let after=std::fs::read(&config).map_err(|error|error.to_string())?;
     root.require_current()?;common.require_current()?;
-    Ok(Some(Edit::new(common.clone(),"config",original,after)))
+    Ok((Some(Edit::new(common.clone(),"config",original,after)),true))
 }
 
 fn repair_config_pinned(relocation:&Relocation,root:&Directory,common:&Directory,before_write:impl FnOnce())->Result<(),String> {
-    let edit=config_edit_pinned(relocation,root,common)?;
+    let (edit,_primary)=config_edit_pinned(relocation,root,common)?;
     if let Some(edit)=edit {before_write();root.require_current()?;common.require_current()?;edit.apply()?;}
     root.require_current()?;common.require_current()
 }
@@ -105,6 +105,7 @@ fn repair_config_pinned(relocation:&Relocation,root:&Directory,common:&Directory
 /// Original directory pins prepared before Git repair. Paths are immutable
 /// diagnostic/record-role hints only; the SAME File Arc is the physical object.
 /// This observer does not authorize repair, adoption, start or a current path.
+#[derive(Clone)]
 pub(crate) struct OriginalRepairDirectory {
     pub(crate) path:PathBuf,
     pub(crate) directory:std::sync::Arc<std::fs::File>,
@@ -115,6 +116,9 @@ impl From<(PathBuf,std::sync::Arc<std::fs::File>)> for OriginalRepairDirectory {
 pub(crate) struct RepairPlan {
     root: Directory,
     common: Directory,
+    // Set only by the held checkout's actual private-admin == common proof,
+    // never by a hint/basename/caller bool. Pin-only plans remain unknown.
+    primary:Option<OriginalRepairDirectory>,
     edits: Vec<Edit>,
     next: usize,
     bytes: usize,
@@ -123,14 +127,16 @@ impl RepairPlan {
     pub(crate) fn pin(relocation:&Relocation)->Result<Self,String> {
         let root=Directory::open(&relocation.new_root)?;
         let common=Directory::open(&relocation.destination)?;
-        Ok(Self{root,common,edits:Vec::new(),next:0,bytes:0})
+        Ok(Self{root,common,primary:None,edits:Vec::new(),next:0,bytes:0})
     }
     pub(crate) fn prepare(relocation:&Relocation,worktrees:&[PathBuf])->Result<Self,String> {
         if worktrees.len()>256 {return Err("Locate exceeds its retained worktree repair capacity".into());}
         let root=Directory::open(&relocation.new_root)?;
         let common=Directory::open(&relocation.destination)?;
         let mut edits=Vec::new();
-        if let Some(edit)=config_edit_pinned(relocation,&root,&common)? {edits.push(edit);}
+        let (config,primary)=config_edit_pinned(relocation,&root,&common)?;
+        let primary=primary.then(||root.original().into());
+        if let Some(edit)=config {edits.push(edit);}
         let mut known=worktrees.to_vec();known.push(relocation.new_root.clone());
         if let Ok(entries)=std::fs::read_dir(common.anchor().join("worktrees")) {
             for (index,entry) in entries.enumerate() {
@@ -160,7 +166,7 @@ impl RepairPlan {
         }
         let bytes=edits.iter().try_fold(0usize,|sum,edit|sum.checked_add(edit.retained_bytes())).ok_or("Git repair size overflow")?;
         if bytes>16*1024*1024 {return Err("Locate exceeds its retained Git metadata budget".into());}
-        let plan=Self{root,common,edits,next:0,bytes};plan.require_current()?;Ok(plan)
+        let plan=Self{root,common,primary,edits,next:0,bytes};plan.require_current()?;Ok(plan)
     }
     pub(crate) fn require_current(&self)->Result<(),String> {
         self.root.require_current()?;self.common.require_current()?;
@@ -170,6 +176,10 @@ impl RepairPlan {
     /// These only clone already-owned Arc handles: no FD duplication, locking,
     /// filesystem work, opening a pathname, or fresh discovery on retry.
     pub(crate) fn original_selected_directory(&self)->OriginalRepairDirectory {self.root.original().into()}
+    /// Original primary ROLE proof, prepared through the actual held checkout
+    /// marker/admin/common relationship. None for linked or uninspected plans.
+    /// A retry only clones the original receipt; it never reruns discovery.
+    pub(crate) fn original_primary_checkout_directory(&self)->Result<Option<OriginalRepairDirectory>,String> {Ok(self.primary.clone())}
     pub(crate) fn original_common_directory(&self)->OriginalRepairDirectory {self.common.original().into()}
     /// Exact parents of prepared metadata edits, which may be linked checkout
     /// roots OR private admin dirs. Do not infer an admin role from a basename.
