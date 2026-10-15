@@ -458,6 +458,83 @@ pub fn directory_entries_beneath(
     Ok(names)
 }
 
+/// Creates an unnamed regular file on this retained directory's filesystem.
+///
+/// No directory entry can be substituted or require cleanup. Unsupported
+/// filesystems are an explicit refusal; there is no named temporary fallback.
+pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<File, ResolveError> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: the Root owns its descriptor, the literal is NUL-terminated,
+    // and a successful openat returns a fresh owned descriptor.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.descriptor(),
+            c".".as_ptr(),
+            libc::O_RDWR | libc::O_TMPFILE | libc::O_CLOEXEC,
+            libc::mode_t::from(mode),
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return Err(ResolveError::message(
+            directory.path(),
+            format!("Cannot create an anonymous copy file; this filesystem must support O_TMPFILE: {error}"),
+        ));
+    }
+    // SAFETY: this is the fresh descriptor returned by openat above.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| ResolveError::io(directory.path(), &error))?;
+    if !metadata.is_file() || metadata.nlink() != 0 {
+        return Err(ResolveError::message(
+            directory.path(),
+            "The copy file is not an unnamed regular inode",
+        ));
+    }
+    Ok(file)
+}
+
+/// Publishes the exact unnamed file without replacing a destination entry.
+///
+/// `/proc/self/fd` denotes the retained descriptor, never a mutable worktree
+/// name. AT_SYMLINK_FOLLOW follows only that kernel-owned descriptor link.
+/// The caller keeps the File alive across linkat. Failure leaves the output
+/// unnamed and never unlinks or overwrites anything in the destination.
+pub fn link_anonymous_new(directory: &Root, file: &File, to: &OsStr) -> Result<(), ResolveError> {
+    use std::os::unix::fs::MetadataExt;
+    let destination = c_component(to, directory.path())?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ResolveError::io(directory.path(), &error))?;
+    if !metadata.is_file() || metadata.nlink() != 0 {
+        return Err(ResolveError::message(
+            directory.path(),
+            "Only an unnamed regular copy file may be published",
+        ));
+    }
+    let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .expect("a decimal descriptor contains no NUL");
+    // SAFETY: both strings and the owning File/Root remain alive across
+    // linkat. linkat does not replace an existing destination, including links.
+    let status = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            directory.descriptor(),
+            destination.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if status < 0 {
+        return Err(ResolveError::io(
+            &directory.path.join(to),
+            &io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
 /// Creates a file inside `directory` with `mode`, for the atomic
 /// write-then-rename sequence. The name is generated and unpredictable.
 ///

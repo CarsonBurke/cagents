@@ -30,6 +30,14 @@ Directory traversal and copies refuse symbolic links and do not cross into neste
 Git checkouts, including other managed worktrees or the destination itself. Glob patterns support
 `*`, `?`, character classes and recursive `**` directory components.
 
+Copy output stays in an unnamed Linux file until publication from its retained
+descriptor. Filesystems must support `O_TMPFILE` and linking that inode through
+`/proc/self/fd`; unsupported operations fail explicitly, without a named temporary
+fallback. The anonymous inode is created in the retained checkout before any
+missing copy directories are created. A copy cannot cross to a different
+filesystem mounted beneath that checkout. Failures can leave newly created
+directories or earlier completed copies; preparation is not one atomic operation.
+
 The preparation API accepts a per-creation Skip choice, which bypasses both
 copies and commands. The planned **Skip setup** UI and
 `cagents worktree create --no-setup` CLI flag are not available in this core PR.
@@ -61,7 +69,7 @@ checks without reconciling or rewriting it. It returns no row when absent and
 an error for invalid evidence; resume callers verify the current checkout too.
 
 The copy restores the source group and replaces inherited ACL identities while
-its temporary file is still private, before applying source mode bits. This
+its file is still unnamed, before applying source mode bits. This
 also avoids granting a setgid destination's different group access to secrets.
 If the source group cannot be preserved, setup stops and keeps the worktree.
 

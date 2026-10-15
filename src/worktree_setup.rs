@@ -602,6 +602,18 @@ fn prepare_with_checkpoint(
     cancel: &CancellationToken,
     after_checkout_capture: impl FnOnce(),
 ) -> Result<SetupPreparation, SetupError> {
+    prepare_with_checkpoints(primary, destination, plan, skip, cancel, after_checkout_capture, |_, _, _| {})
+}
+
+fn prepare_with_checkpoints(
+    primary: &Path,
+    destination: &Path,
+    plan: &SetupPlan,
+    skip: bool,
+    cancel: &CancellationToken,
+    after_checkout_capture: impl FnOnce(),
+    mut before_copy_publication: impl FnMut(&fs_safety::Root, &fs::File, &Path),
+) -> Result<SetupPreparation, SetupError> {
     if skip {
         return Ok(SetupPreparation {
             skipped: true,
@@ -712,14 +724,19 @@ fn prepare_with_checkpoint(
                 path.display()
             )));
         }
+        // Establish anonymous-file support before creating copy directories.
+        // Its inode stays unnamed until exact-FD no-replace publication; a
+        // shared parent cannot replace a temporary source or cleanup target.
+        let mut output = fs_safety::create_anonymous_in(&target, 0o600).map_err(error)?;
         let parent = fs_safety::create_directories_beneath(
             &target,
             path.parent().unwrap_or(Path::new("")),
             0o700,
         )
         .map_err(error)?;
-        let (mut output, temporary) =
-            fs_safety::create_temporary_in(&parent, 0o600).map_err(error)?;
+        if output.metadata().map_err(error)?.dev() != parent.metadata().map_err(error)?.dev() {
+            return Err(error("Setup copies cannot cross filesystems from their retained checkout"));
+        }
         let copied = (|| {
             let mut total = 0u64;
             let mut buffer = [0u8; 64 * 1024];
@@ -746,9 +763,10 @@ fn prepare_with_checkpoint(
             index_lock.check().map_err(error)?;
             index.check(&checkout.admin)?;
             permissions.check(&input)?;
-            fs_safety::rename_new_within(
+            before_copy_publication(&parent, &output, &path);
+            fs_safety::link_anonymous_new(
                 &parent,
-                &temporary,
+                &output,
                 path.file_name().expect("matched file has a name"),
             )
             .map_err(SetupError::Filesystem)
@@ -759,17 +777,14 @@ fn prepare_with_checkpoint(
                 result.copied.push(path);
             }
             Err(err) => {
-                let cleanup = fs_safety::unlink_within(&parent, &temporary);
                 // Existing destination is always kept, including dangling symlinks.
                 if matches!(&err, SetupError::Filesystem(cause) if cause.is_already_exists())
-                    && cleanup.is_ok()
                 {
                     result.skipped_paths.push(SkippedCopy {
                         path,
                         reason: "destination already exists".into(),
                     });
                 } else {
-                    cleanup.map_err(error)?;
                     return Err(err);
                 }
             }
@@ -841,15 +856,21 @@ mod tests {
             fixture
         }
         fn git(&self, args: &[&str]) {
-            let output = Command::new("git")
-                .current_dir(&self.primary)
+            let mut command = Command::new("git");
+            for (key, _) in std::env::vars_os().filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_")) {
+                command.env_remove(key);
+            }
+            let output = command.current_dir(&self.primary)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args([
                     "-c",
                     "core.hooksPath=/dev/null",
                     "-c",
                     "core.fsmonitor=false",
+                    "-c",
+                    "init.templateDir=",
                 ])
                 .args(args)
                 .output()
@@ -1043,6 +1064,84 @@ mod tests {
             fs::read(fixture.destination.join(".env")).unwrap(),
             b"secret"
         );
+    }
+
+    #[test]
+    fn anonymous_copy_publishes_the_owned_inode_and_never_cleans_foreign_names() {
+        use std::os::unix::fs::FileExt;
+        for collision in [false, true] {
+            let fixture = Fixture::new();
+            fs::write(fixture.primary.join(".env"), "original private copy").unwrap();
+            let plan = fixture.config("copy = ['.env']");
+            fs::set_permissions(&fixture.destination, fs::Permissions::from_mode(0o2770)).unwrap();
+            let outside = fixture.primary.parent().unwrap().join("outside");
+            fs::write(&outside, "foreign destination").unwrap();
+            let foreign = fixture.destination.join(".cagents-tmp-foreign");
+            let mut retained = None;
+            let result = prepare_with_checkpoints(
+                &fixture.primary, &fixture.destination, &plan, false, &CancellationToken::new(), || {},
+                |parent, output, path| {
+                    assert_eq!(path, Path::new(".env"));
+                    assert_eq!(output.metadata().unwrap().nlink(), 0);
+                    assert!(!fs::read_dir(parent.path()).unwrap().any(|entry| {
+                        entry.unwrap().file_name().as_encoded_bytes().starts_with(b".cagents-tmp-")
+                    }), "the copied output must have no replaceable source entry");
+                    retained = Some(output.try_clone().unwrap());
+                    fs::write(&foreign, "foreign temporary lookalike").unwrap();
+                    if collision { symlink(&outside, fixture.destination.join(".env")).unwrap(); }
+                },
+            ).unwrap();
+            let output = retained.unwrap();
+            let mut bytes = vec![0; "original private copy".len()];
+            assert_eq!(output.read_at(&mut bytes, 0).unwrap(), bytes.len());
+            assert_eq!(bytes.as_slice(), b"original private copy");
+            if collision {
+                assert!(result.copied.is_empty());
+                assert_eq!(result.skipped_paths[0].path, Path::new(".env"));
+                assert_eq!(fs::read_link(fixture.destination.join(".env")).unwrap(), outside);
+                assert_eq!(output.metadata().unwrap().nlink(), 0);
+            } else {
+                assert_eq!(result.copied, [PathBuf::from(".env")]);
+                let named = fs::symlink_metadata(fixture.destination.join(".env")).unwrap();
+                let held = output.metadata().unwrap();
+                assert!(named.is_file());
+                assert_eq!((named.dev(), named.ino()), (held.dev(), held.ino()));
+                // A later replacement is not cleanup authority for the File.
+                fs::remove_file(fixture.destination.join(".env")).unwrap();
+                symlink(&outside, fixture.destination.join(".env")).unwrap();
+            }
+            drop(output);
+            assert_eq!(fs::read_to_string(&foreign).unwrap(), "foreign temporary lookalike");
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "foreign destination");
+            assert_eq!(fs::read_link(fixture.destination.join(".env")).unwrap(), outside);
+        }
+        eprintln!("SETUP_ANONYMOUS_COPY_VERIFIED");
+    }
+
+    #[test]
+    fn anonymous_copy_preserves_mode_under_restrictive_umask() {
+        const CHILD: &str = "CAGENTS_SETUP_ANONYMOUS_UMASK_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "worktree_setup::tests::anonymous_copy_preserves_mode_under_restrictive_umask", "--nocapture"])
+                .env(CHILD, "1").env("RUST_TEST_THREADS", "1").output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("SETUP_ANONYMOUS_UMASK_VERIFIED"));
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        // This is the sole selected test in a disposable subprocess; changing
+        // its umask cannot affect the parent harness or another test thread.
+        unsafe { libc::umask(0o077); }
+        let fixture = Fixture::new();
+        fs::write(fixture.primary.join(".env"), "private bytes").unwrap();
+        fs::set_permissions(fixture.primary.join(".env"), fs::Permissions::from_mode(0o640)).unwrap();
+        let plan = fixture.config("copy = ['.env']");
+        let result = fixture.prepare(&plan).unwrap();
+        assert_eq!(result.copied, [PathBuf::from(".env")]);
+        assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"private bytes");
+        assert_eq!(fs::metadata(fixture.destination.join(".env")).unwrap().mode() & 0o777, 0o640);
+        eprintln!("SETUP_ANONYMOUS_UMASK_VERIFIED");
     }
 
     #[test]
