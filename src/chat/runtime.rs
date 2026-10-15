@@ -1025,6 +1025,18 @@ impl Handle {
             .title
             .clone()
     }
+    /// A bounded tray label; never clones a provider's full title under the host lock.
+    #[cfg(feature = "host")]
+    pub(crate) fn title_excerpt(&self) -> Option<String> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .title
+            .as_ref()
+            .map(|title| title.chars().take(256).collect())
+    }
+
     #[cfg(test)]
     pub(crate) fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
         let inner = Arc::downgrade(&self.0);

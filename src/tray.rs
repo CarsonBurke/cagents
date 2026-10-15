@@ -30,6 +30,49 @@ mod service {
         pub waiting: usize,
     }
 
+    /// The exact hosted session a waiting menu item activates.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct WaitingAgent {
+        pub session: crate::model::TerminalId,
+        pub label: String,
+    }
+
+    impl WaitingAgent {
+        pub(crate) fn new(
+            session: crate::model::TerminalId,
+            provider: crate::agent::Provider,
+            title: Option<&str>,
+            directory: &std::path::Path,
+        ) -> Self {
+            let bounded = |text: &str| -> String {
+                text.chars()
+                    .take(256)
+                    .filter(|ch| !ch.is_control())
+                    .take(100)
+                    .collect()
+            };
+            let title = title.map(bounded).filter(|title| !title.trim().is_empty());
+            let text = title.unwrap_or_else(|| {
+                bounded(
+                    &directory
+                        .file_name()
+                        .unwrap_or(directory.as_os_str())
+                        .to_string_lossy(),
+                )
+            });
+            Self {
+                session,
+                label: format!("{} · {text}", provider.label()),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct TraySnapshot {
+        pub tally: AgentTally,
+        pub waiting_agents: Vec<WaitingAgent>,
+    }
+
     impl AgentTally {
         /// "2 agents working · 1 waiting for you", or `None` when idle.
         fn summary(self) -> Option<String> {
@@ -94,11 +137,37 @@ mod service {
         }
     });
 
+    static ATTENTION_ICON: LazyLock<ksni::Icon> = LazyLock::new(|| {
+        let mut icon = ICON.clone();
+        let radius = (icon.width.min(icon.height) / 8).max(1);
+        let center = (icon.width - radius - 4, radius + 4);
+        for y in 0..icon.height {
+            for x in 0..icon.width {
+                let distance = (x - center.0).pow(2) + (y - center.1).pow(2);
+                if distance <= radius.pow(2) {
+                    let index = ((y * icon.width + x) * 4) as usize;
+                    icon.data[index..index + 4].copy_from_slice(
+                        if distance > (radius - 3).max(0).pow(2) {
+                            &[255, 255, 255, 255]
+                        } else {
+                            &[255, 245, 166, 35]
+                        },
+                    );
+                }
+            }
+        }
+        icon
+    });
+
+    type FocusAgent = Arc<dyn Fn(crate::model::TerminalId) -> ActionResult + Send + Sync>;
+
     struct DaemonTray {
         /// The action in flight, described; actions are refused meanwhile.
         pending: Option<String>,
         outcome: Option<Outcome>,
         tally: AgentTally,
+        waiting_agents: Vec<WaitingAgent>,
+        focus_agent: FocusAgent,
         updates: mpsc::UnboundedSender<ActionResult>,
     }
 
@@ -108,30 +177,47 @@ mod service {
                 pending: None,
                 outcome: None,
                 tally: AgentTally::default(),
+                waiting_agents: Vec::new(),
+                focus_agent: Arc::new(|_| Err("The hosted agent is unavailable".into())),
                 updates,
             }
         }
 
         fn run_action(&mut self, stop: bool) {
+            let label = if stop {
+                "Checking for open terminals…".into()
+            } else {
+                format!("Opening {}…", instance::APPLICATION_NAME)
+            };
+            self.begin_action(label, move || {
+                if stop {
+                    stop_from_tray()
+                } else {
+                    open_from_tray()
+                }
+            });
+        }
+
+        fn run_agent(&mut self, session: crate::model::TerminalId) {
+            let focus = Arc::clone(&self.focus_agent);
+            self.begin_action("Opening waiting agent…".into(), move || focus(session));
+        }
+
+        fn begin_action(
+            &mut self,
+            label: String,
+            action: impl FnOnce() -> ActionResult + Send + 'static,
+        ) {
             if self.pending.is_some() {
                 return;
             }
             self.outcome = None;
-            self.pending = Some(if stop {
-                "Checking for open terminals…".into()
-            } else {
-                format!("Opening {}…", instance::APPLICATION_NAME)
-            });
+            self.pending = Some(label);
             let updates = self.updates.clone();
             if let Err(error) = thread::Builder::new()
                 .name("cagents-tray-action".into())
                 .spawn(move || {
-                    let result = if stop {
-                        stop_from_tray()
-                    } else {
-                        open_from_tray()
-                    };
-                    let _ = updates.send(result);
+                    let _ = updates.send(action());
                 })
             {
                 self.pending = None;
@@ -435,6 +521,62 @@ mod service {
         }
 
         #[test]
+        fn waiting_menu_activates_the_exact_session_and_restores_the_icon() {
+            let (updates, _results) = mpsc::unbounded_channel();
+            let (selected, received) = std::sync::mpsc::channel();
+            let mut tray = DaemonTray::new(updates);
+            let idle_icon = ksni::Tray::icon_pixmap(&tray);
+            let session = crate::model::TerminalId::new();
+            tray.tally.waiting = 1;
+            tray.waiting_agents.push(WaitingAgent {
+                session,
+                label: "Claude · feature_one".into(),
+            });
+            tray.focus_agent = Arc::new(move |id| {
+                selected.send(id).unwrap();
+                Ok("Opened".into())
+            });
+            assert_eq!(ksni::Tray::icon_name(&tray), "");
+            assert_ne!(ksni::Tray::icon_pixmap(&tray)[0].data, idle_icon[0].data);
+            let mut menu = ksni::Tray::menu(&tray);
+            let ksni::MenuItem::Standard(item) = &mut menu[2] else {
+                panic!("waiting agent item");
+            };
+            assert_eq!(item.label, "Claude · feature__one");
+            (item.activate)(&mut tray);
+            assert_eq!(
+                received.recv_timeout(Duration::from_secs(2)).unwrap(),
+                session
+            );
+            // Pending actions are guarded even if a stale menu is activated again.
+            (item.activate)(&mut tray);
+            assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+            assert_eq!(tray.status(), "Opening waiting agent…");
+            tray.tally.waiting = 0;
+            tray.waiting_agents.clear();
+            assert_eq!(ksni::Tray::icon_pixmap(&tray)[0].data, idle_icon[0].data);
+        }
+
+        #[test]
+        fn waiting_labels_are_bounded_and_do_not_contain_control_rows() {
+            let label = WaitingAgent::new(
+                crate::model::TerminalId::new(),
+                crate::agent::Provider::Claude,
+                Some(&format!("hello\n\t{}", "x".repeat(2000))),
+                std::path::Path::new("/project"),
+            );
+            assert!(!label.label.chars().any(char::is_control));
+            assert!(label.label.chars().count() <= 120);
+            let fallback = WaitingAgent::new(
+                label.session,
+                crate::agent::Provider::Claude,
+                Some(" "),
+                std::path::Path::new("/repo/feature"),
+            );
+            assert_eq!(fallback.label, "Claude Code · feature");
+        }
+
+        #[test]
         fn agent_counts_read_as_one_line() {
             let tally = |working, waiting| AgentTally { working, waiting }.summary();
             assert_eq!(tally(0, 0), None);
@@ -457,7 +599,8 @@ mod service {
         }
 
         fn icon_name(&self) -> String {
-            if instance::IS_DEVELOPMENT {
+            if instance::IS_DEVELOPMENT || self.tally.waiting > 0 {
+                // The attention variant must not be replaced by a theme icon.
                 // No icon-theme entry is installed for source-tree builds.
                 String::new()
             } else {
@@ -466,7 +609,11 @@ mod service {
         }
 
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-            vec![ICON.clone()]
+            vec![if self.tally.waiting > 0 {
+                ATTENTION_ICON.clone()
+            } else {
+                ICON.clone()
+            }]
         }
 
         fn activate(&mut self, _x: i32, _y: i32) {
@@ -497,6 +644,19 @@ mod service {
                     StandardItem {
                         label: agents,
                         enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
+            for agent in &self.waiting_agents {
+                let session = agent.session;
+                menu.push(
+                    StandardItem {
+                        // DBusMenu treats a single underscore as a mnemonic marker.
+                        label: agent.label.replace('_', "__"),
+                        enabled: idle,
+                        activate: Box::new(move |tray: &mut DaemonTray| tray.run_agent(session)),
                         ..Default::default()
                     }
                     .into(),
@@ -553,8 +713,12 @@ mod service {
 
     /// Starts the tray; `tally` reads the daemon's agent counts, or `None`
     /// once the daemon is gone.
-    pub fn start(tally: impl Fn() -> Option<AgentTally> + Send + Sync + 'static) -> TrayGuard {
+    pub fn start(
+        tally: impl Fn() -> Option<TraySnapshot> + Send + Sync + 'static,
+        focus_agent: impl Fn(crate::model::TerminalId) -> ActionResult + Send + Sync + 'static,
+    ) -> TrayGuard {
         let tally = Arc::new(tally);
+        let focus_agent: FocusAgent = Arc::new(focus_agent);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker = thread::Builder::new()
             .name("cagents-tray".into())
@@ -572,7 +736,10 @@ mod service {
                 runtime.block_on(async move {
                     let (updates, mut results) = mpsc::unbounded_channel();
                     let mut tray = DaemonTray::new(updates);
-                    tray.tally = tally().unwrap_or_default();
+                    let initial = tally().unwrap_or_default();
+                    tray.tally = initial.tally;
+                    tray.waiting_agents = initial.waiting_agents;
+                    tray.focus_agent = focus_agent;
                     let handle = match tray.assume_sni_available(true).spawn().await {
                         Ok(handle) => handle,
                         Err(error) => {
@@ -613,9 +780,14 @@ mod service {
                             };
                             // Only a change is worth a menu update on the bus.
                             if current.is_some() && current != last {
-                                last = current;
+                                last = current.clone();
                                 let current = current.unwrap_or_default();
-                                tally_handle.update(move |tray| tray.tally = current).await;
+                                tally_handle
+                                    .update(move |tray| {
+                                        tray.tally = current.tally;
+                                        tray.waiting_agents = current.waiting_agents;
+                                    })
+                                    .await;
                             }
                         }
                     });
@@ -634,4 +806,4 @@ mod service {
     }
 }
 
-pub use service::{AgentTally, TrayGuard, start};
+pub use service::{AgentTally, TrayGuard, TraySnapshot, WaitingAgent, start};

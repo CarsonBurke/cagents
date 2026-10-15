@@ -431,27 +431,76 @@ impl HostState {
         self.model = Some(registry);
     }
 
-    /// How many hosted agents are working, and how many are waiting on the
-    /// user, across running terminals and native conversations.
-    pub(super) fn agent_tally(&self) -> crate::tray::AgentTally {
+    /// Counts each hosted conversation once and retains exact activation targets.
+    pub(super) fn tray_snapshot(&self) -> crate::tray::TraySnapshot {
         use crate::agent::ActivityState;
-        let terminals = self
-            .terminals
-            .values()
-            .filter(|record| record.running)
-            .filter_map(|record| record.handle.agent_activity())
-            .map(|activity| activity.state);
-        let chats = self.chats.values().map(|record| record.handle.activity());
-        terminals
-            .chain(chats)
-            .fold(crate::tray::AgentTally::default(), |mut tally, state| {
-                match state {
-                    ActivityState::Working => tally.working += 1,
-                    ActivityState::Waiting => tally.waiting += 1,
-                    ActivityState::Idle | ActivityState::Unknown => {}
+        let mut agents = BTreeMap::new();
+        for (id, record) in self.terminals.iter().filter(|(_, record)| record.running) {
+            if let Some(activity) = record.handle.agent_activity() {
+                let waiting = (activity.state == ActivityState::Waiting).then(|| {
+                    crate::tray::WaitingAgent::new(
+                        *id,
+                        activity.provider,
+                        record.conversation_title(),
+                        record.current_directory(),
+                    )
+                });
+                agents.insert(*id, (activity.state, waiting));
+            }
+        }
+        // A native actor and its paired CLI terminal describe one conversation;
+        // the actor has the current activity when both descriptors are present.
+        for (id, record) in &self.chats {
+            let state = record.handle.activity();
+            // An exited/connecting observer has no authoritative activity. A
+            // still-live paired CLI can continue waiting after that observer ends.
+            if state == ActivityState::Unknown && agents.contains_key(id) {
+                continue;
+            }
+            let waiting = (state == ActivityState::Waiting).then(|| {
+                crate::tray::WaitingAgent::new(
+                    *id,
+                    record.session.launch.provider,
+                    record.handle.title_excerpt().as_deref(),
+                    &record.session.launch.recipe.working_directory,
+                )
+            });
+            agents.insert(*id, (state, waiting));
+        }
+        let mut snapshot = crate::tray::TraySnapshot::default();
+        for (state, waiting) in agents.into_values() {
+            match state {
+                ActivityState::Working => snapshot.tally.working += 1,
+                ActivityState::Waiting => {
+                    snapshot.tally.waiting += 1;
+                    if let Some(waiting) = waiting {
+                        snapshot.waiting_agents.push(waiting);
+                    }
                 }
-                tally
-            })
+                ActivityState::Idle | ActivityState::Unknown => {}
+            }
+        }
+        snapshot.waiting_agents.sort_by(|left, right| {
+            left.label
+                .cmp(&right.label)
+                .then_with(|| left.session.cmp(&right.session))
+        });
+        snapshot
+    }
+
+    pub(super) fn activate_tray_agent(
+        &mut self,
+        session: TerminalId,
+    ) -> Result<crate::notifications::Destination, String> {
+        if !self.terminals.contains_key(&session) && !self.chats.contains_key(&session) {
+            return Err("This agent is no longer hosted; refresh the tray menu".into());
+        }
+        Ok(self.activate_notification_destination(
+            crate::notifications::Target::Session(session),
+            Some(session),
+            None,
+            None,
+        ))
     }
 
     pub(super) fn notification_snapshot(&self) -> crate::notifications::Snapshot {
@@ -4351,6 +4400,14 @@ mod tests {
             crate::account::login::callback_failed(&text),
             "a hibernated login must retain its callback failure"
         );
+    }
+
+    #[test]
+    fn tray_refuses_stale_sessions_without_creating_a_window_route() {
+        let mut host = test_host();
+        assert_eq!(host.tray_snapshot(), crate::tray::TraySnapshot::default());
+        assert!(host.activate_tray_agent(TerminalId::new()).is_err());
+        assert!(host.notification_activation.is_empty());
     }
 
     #[test]

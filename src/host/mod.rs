@@ -257,11 +257,32 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
-    let _tray = crate::tray::start(move || {
-        let host = tally_host.upgrade()?;
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        Some(state.agent_tally())
-    });
+    let focus_host = Arc::downgrade(&host);
+    let _tray = crate::tray::start(
+        move || {
+            let host = tally_host.upgrade()?;
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            Some(state.tray_snapshot())
+        },
+        move |session| {
+            let host = focus_host
+                .upgrade()
+                .ok_or("The daemon is no longer running")?;
+            let destination = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .activate_tray_agent(session)?;
+            // Window activation and the matched executable handshake can wait;
+            // they must never run under the global host lock.
+            if !crate::instance::activate_destination(&destination, None)
+                .map_err(|error| error.to_string())?
+            {
+                crate::instance::launch_notification_destination(&destination, None)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok("Opened waiting agent".into())
+        },
+    );
 
     let automation_broker = match automations::start(&host) {
         Ok(broker) => Some(broker),
