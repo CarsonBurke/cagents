@@ -151,7 +151,6 @@ fn receipt_native_descriptor_matches(archive: &ArchivedConversation, current: &S
     reported.native_continuity = archive.snapshot.native_continuity.clone();
     if !supported(canonical) || !supported(current) || !supported(&reported)
         || !matches!(canonical.native_continuity, crate::chat::NativeContinuity::ReconnectOnly)
-            && !matches!(reported.native_continuity, crate::chat::NativeContinuity::ReconnectOnly)
             && canonical.native_continuity != reported.native_continuity
     {
         return false;
@@ -497,6 +496,11 @@ mod tests {
         let mut canonical = archive.clone();
         canonical.agent.session = Some(HostedSession::Chat(promoted.clone()));
         assert!(ArchivedPaneReadiness::qualify(id,&source,&canonical).is_ok(), "an issued default source can learn the same snapshot-proved marker");
+        let mut missing_known = canonical.clone();
+        missing_known.snapshot.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+        for saved in [&source,&promoted] {
+            assert!(ArchivedPaneReadiness::qualify(id,saved,&missing_known).is_err(), "a known canonical marker requires the same private snapshot marker, including strict-descriptor matches");
+        }
         assert!(!native_archive_candidate_matches(&canonical.agent,&different), "different known markers never match");
         canonical.snapshot.native_continuity = different.native_continuity;
         assert!(ArchivedPaneReadiness::qualify(id,&source,&canonical).is_err());
