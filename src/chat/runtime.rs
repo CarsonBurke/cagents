@@ -53,6 +53,7 @@ enum ActorCommand {
     CloseIfRevision {
         revision: u64,
     },
+    StopSession { actor_id: uuid::Uuid },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     Interrupt {
         run: Option<crate::model::RunId>,
@@ -696,6 +697,41 @@ impl Handle {
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
     }
 
+    /// Fence one actor lifetime after explicit consent to stop all its work.
+    /// This phase never joins cleanup and may run under control admission.
+    pub(crate) fn fence_session_stop_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
+        let observed = self.close_observation();
+        if observed.actor_id != actor_id {
+            return Err("The provider actor was replaced; its replacement was preserved".into());
+        }
+        if observed.completed || self.0.stop.load(Ordering::Acquire) {
+            return if observed.owns_work && self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native {
+                Err("Retained provider ownership must be reattached before session stop".into())
+            } else { Ok(()) };
+        }
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err("Provider ownership is changing; refresh before stopping it".into());
+        }
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.0.commands.try_send((ActorCommand::StopSession {actor_id}, reply))
+            .map_err(|error| format!("Session stop could not be admitted: {error}"))?;
+        match self.0.wake.try_lock() {
+            Ok(mut wake) => { let _ = wake.write(&[1]); },
+            Err(std::sync::TryLockError::Poisoned(p)) => { let _ = p.into_inner().write(&[1]); },
+            Err(std::sync::TryLockError::WouldBlock) => {},
+        }
+        response.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| "Session stop acknowledgement is unconfirmed; its exact owner is retained for retry".to_string())?
+    }
+
+    /// Explicitly stop all ongoing work in this exact actor lifetime.
+    /// Cleanup uses one caller-owned budget and must run outside HostLock and
+    /// the global control gate. Timeout preserves the original cleanup owner.
+    pub(crate) fn stop_session_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
+        self.fence_session_stop_until(actor_id, deadline)?;
+        self.close_until(deadline)
+    }
+
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
         self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
         self.close()
@@ -1270,6 +1306,7 @@ impl Handle {
                 }
             } else {Some(false)};
             if retained==Some(false) && detached==Some(false) && !self.0.native_reconciling.load(Ordering::Acquire) {
+                self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native=false;
                 return self.close_result();
             }
             if retained==Some(true) || detached==Some(true) {
@@ -2197,6 +2234,20 @@ impl Actor {
                     } else {
                         "Provider work changed before conditional close".into()
                     }));
+                    continue;
+                }
+                ActorCommand::StopSession {actor_id} => {
+                    let close = self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+                    let result = if close.actor_id != actor_id {
+                        Err("The provider actor was replaced; its replacement was preserved".into())
+                    } else {
+                        // Consent covers this actor's entire lifetime of work,
+                        // including autonomous starts. Publish before ACK so
+                        // no later queued provider command can execute.
+                        self.stop.store(true, Ordering::Release);
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
                     continue;
                 }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
