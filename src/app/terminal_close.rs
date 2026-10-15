@@ -625,13 +625,27 @@ impl Cagents {
         }
     }
 
+    pub(super) fn set_terminal_close_dont_ask(&mut self, value: bool) -> Task<Message> {
+        let Some(intent) = self.terminal_close.as_mut()
+            .filter(|intent| !intent.pending && intent.active && intent.detail.is_none())
+        else { return Task::none(); };
+        intent.dont_ask_again = value;
+        intent.focus = 2;
+        // The nested checkbox can consume a pointer toggle before the outer
+        // focusable button sees it. Keep its native and logical focus aligned.
+        self.modal_focus(close_focus_id(2))
+    }
+
     pub(super) fn cycle_terminal_close_focus(&mut self, backwards: bool) -> Task<Message> {
+        let observed = self.modal_stack.focus_snapshot(modal_ui::Modal::TerminalClose).get()
+            .and_then(|id| (0..3).find(|index| close_focus_id(*index) == id));
         let Some(intent) = self.terminal_close.as_mut() else {
             return Task::none();
         };
         if intent.pending {
             return Task::none();
         }
+        if let Some(index) = observed { intent.focus = index; }
         intent.focus = if intent.detail.is_some() || !intent.active {
             0
         } else {
@@ -724,6 +738,79 @@ fn close_focus_id(index: usize) -> widget::Id {
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    #[test]
+    fn tab_starts_from_the_actual_checkbox_control_after_focus_or_pointer_toggle() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::{Operation, Tree, operation}};
+        let renderer = super::super::tests::headless_renderer();
+        for clicked in [false, true] {
+            for backwards in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(true);
+                let card = app.workspace.focused().unwrap();
+                app.terminal_close = Some(CloseIntent {
+                    card, terminal: TerminalId::new(), proof: HostSessionProof {
+                        host_session_id: HostSessionId::new("focus-fixture"), boot_id: BootId::new("boot"),
+                        host_incarnation: HostIncarnation::new("incarnation"),
+                    }, completed_source: None, generation: 1, restore_card: Some(card),
+                    pending: false, active: true, dont_ask_again: false, detail: None,
+                    focus: 0, restore_keyboard_nav: true,
+                });
+                drop(app.finish_modal_update(Task::none()));
+                if clicked {
+                    let messages = {
+                        let mut element = app.dialog().unwrap();
+                        let mut tree = Tree::new(&element);
+                        let viewport = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
+                        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+                            &layout::Limits::new(iced::Size::ZERO, viewport.size()));
+                        struct Bounds(Option<iced::Rectangle>);
+                        impl Operation for Bounds {
+                            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+                            fn focusable(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle, _: &mut dyn operation::Focusable) {
+                                if id == Some(&close_focus_id(2)) { self.0 = Some(bounds); }
+                            }
+                        }
+                        let mut initial = operation::focusable::focus::<()>(close_focus_id(0));
+                        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut initial);
+                        let mut bounds = Bounds(None);
+                        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+                        let bounds = bounds.0.expect("actual don't-ask control");
+                        let cursor = mouse::Cursor::Available(iced::Point::new(bounds.x + bounds.width / 2.0, bounds.y + bounds.height / 2.0));
+                        let mut messages = Vec::new();
+                        for event in [mouse::Event::ButtonPressed(mouse::Button::Left), mouse::Event::ButtonReleased(mouse::Button::Left)] {
+                            element.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node), cursor,
+                                &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+                        }
+                        messages
+                    };
+                    assert!(messages.iter().any(|message| matches!(message, Message::TerminalCloseDontAskChanged(true))));
+                    for message in messages {
+                        let toggled = matches!(message, Message::TerminalCloseDontAskChanged(_));
+                        let task = app.update(message);
+                        if toggled {
+                            assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task), Some(close_focus_id(2)));
+                        }
+                    }
+                    assert!(app.terminal_close.as_ref().unwrap().dont_ask_again);
+                } else {
+                    let focus = app.modal_focus(close_focus_id(2));
+                    assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), focus), Some(close_focus_id(2)));
+                    assert_eq!(app.terminal_close.as_ref().unwrap().focus, 0,
+                        "the next cycle must read actual native focus, not this stale logical index");
+                }
+                let mut event = keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab), modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab), location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+                };
+                if backwards && let keyboard::Event::KeyPressed { modifiers, .. } = &mut event { *modifiers = keyboard::Modifiers::SHIFT; }
+                let task = app.update(Message::KeyEvent { event, captured: true });
+                let expected = if backwards { 1 } else { 0 };
+                assert_eq!(app.terminal_close.as_ref().unwrap().focus, expected);
+                assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task), Some(close_focus_id(expected)));
+            }
+        }
+    }
 
     #[test]
     fn completed_close_waits_for_receipt_and_ignores_a_replaced_card() {

@@ -14919,16 +14919,7 @@ impl Application for Cagents {
             Message::CloseCardUnasked(id) => self.close_card_unasked(id),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
             Message::CancelTerminalClose => self.cancel_terminal_close(),
-            Message::TerminalCloseDontAskChanged(value) => {
-                if let Some(intent) = self.terminal_close.as_mut()
-                    && !intent.pending
-                    && intent.active
-                    && intent.detail.is_none()
-                {
-                    intent.dont_ask_again = value;
-                }
-                Task::none()
-            }
+            Message::TerminalCloseDontAskChanged(value) => self.set_terminal_close_dont_ask(value),
             Message::TerminalCloseFinished {
                 card,
                 terminal,
