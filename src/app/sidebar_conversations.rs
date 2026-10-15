@@ -1,9 +1,8 @@
 //! Cached sidebar targets for retained conversations, including hidden tabs.
 //!
-//! This is the menu adapter for the source-bound End API from modals
-//! 0cd1028c2/e10816e7b/21a916a98. The final application must also compose
-//! 12da0cb31's captured End pipeline and generic removal source65cce, plus
-//! 66e77b52b/bdcfc5987 preconfirmation shared-source and filing fences.
+//! Rows retain the original source and filing captured during a semantic
+//! sidebar refresh. Menu delivery and confirmation revalidate that same target
+//! through the conversation End pipeline before beginning cleanup.
 use super::*;
 use crate::sidebar::conversation::{ConversationEndTarget, Entry};
 use crate::workspace_model::views::Scope;
