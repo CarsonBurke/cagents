@@ -14,8 +14,8 @@ const STORE_ITEMS: usize = 8192;
 const STORE_CHUNKS: usize = 65536;
 const PENDING_BYTES: usize = 64 * 1024;
 const KEY_BYTES: usize = 4096;
-const SOURCE_ERROR: &str = "Exact delegated tool source could not be updated; its recorded source was preserved and no replacement tool was invented";
-const BUDGET_ERROR: &str = "Delegated tool source exceeds its bounded canonical cache; its recorded source was preserved, but exact late updates are unavailable";
+const SOURCE_ERROR: &str = "The subagent's complete original tool record is unavailable. Existing history was kept; no replacement result was inferred";
+const BUDGET_ERROR: &str = "This conversation reached its complete subagent tool history limit. Existing history was kept; exact late updates are unavailable";
 
 pub(super) struct Pending {
     agent: String,
