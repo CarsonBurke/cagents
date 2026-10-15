@@ -7262,9 +7262,16 @@ impl Cagents {
     /// Reconcile only when repository roots change, not on runtime/frame wakes.
     /// Existing scalar activity and restored unread must acquire late roots too.
     fn reconcile_agent_attention_owners(&mut self) -> bool {
-        let roots: HashMap<_, _> = self.sidebar_model.projects.iter().flat_map(|project|
-            project.worktrees.iter().map(move |worktree| (worktree.path.as_path(), (project.id, worktree.id)))
-        ).collect();
+        let mut roots = HashMap::new();
+        for project in &self.sidebar_model.projects {
+            if let Some(key) = project.folder_key() {
+                roots.entry(project.repository.as_path()).or_insert((key.project_id, key.worktree_id));
+            }
+            for worktree in &project.worktrees {
+                // Match SidebarModel::worktree_at's first-known exact owner.
+                roots.entry(worktree.path.as_path()).or_insert((project.id, worktree.id));
+            }
+        }
         let resolve = |directory: &Path| directory.ancestors().find_map(|ancestor| roots.get(ancestor).copied());
         let owners: Vec<_> = self.durable.cards.iter()
             .filter(|card| card.existence.is_open() && (self.sidebar_state.card_activity(card.id).is_some() || self.sidebar_state.has_card_update(card.id)))
