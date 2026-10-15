@@ -42,6 +42,46 @@ pub(super) struct State {
 }
 
 impl RepositoryRuntime {
+    /// Availability for palette/shortcut commands acting on the selected rows.
+    /// Context menus keep their own captured row and side rather than using this
+    /// focus-based entry point when a previously opened menu is activated.
+    pub fn diff_command_available(&self, id: &str) -> bool {
+        if self.selected_diff_range().is_none() { return false; }
+        let Some(selection) = self.diff_interaction.selection else { return false; };
+        let Some(model) = self.diff_model() else { return false; };
+        if selection.head >= model.row_count(self.diff_mode) { return false; }
+        match id {
+            "diff_copy" => true,
+            "diff_copy_old" | "diff_copy_new" => self.diff_mode == DiffMode::Inline,
+            "diff_copy_patch" => selection.has_changes(model),
+            "diff_copy_line_reference" => selection.line_reference(model).is_some(),
+            "diff_open_in_editor" => !self.is_saving()
+                && (matches!(self.document,DocumentState::Editable(_)) || !self.blocks_navigation())
+                && (model.new_line_at_row(self.diff_mode,selection.head).is_some()
+                    || selection.line_reference(model).is_some()),
+            _ => false,
+        }
+    }
+
+    /// Capture the same source/layout fence as a row menu at dispatch time.
+    pub fn diff_command_action(&self, card: CardId, id: &str) -> Option<RepositoryAction> {
+        if !self.diff_command_available(id) { return None; }
+        let selection = self.diff_interaction.selection?;
+        let row = selection.head;
+        let side = selection.side;
+        let command = match id {
+            "diff_copy" => DiffCommand::Copy,
+            "diff_copy_old" => DiffCommand::CopyOld,
+            "diff_copy_new" => DiffCommand::CopyNew,
+            "diff_copy_patch" => DiffCommand::CopyPatch,
+            "diff_copy_line_reference" => DiffCommand::CopyLineReference { row,side },
+            "diff_open_in_editor" => DiffCommand::OpenInEditor { row,side },
+            _ => return None,
+        };
+        let source = self.diff_source_key()?;
+        Some(widget::menu::Action::message(&MenuCommand(card,source.generation,self.diff_layout_revision,source.mode,source.sources,command)))
+    }
+
     pub fn selected_diff_range(&self) -> Option<Range<usize>> {
         self.shows_diff()
             .then_some(self.diff_interaction.selection)
@@ -814,6 +854,31 @@ mod tests {
         assert!(runtime.diff_model().is_some());
         assert!(runtime.current_diff_model_snapshot().is_none());
         assert!(first.inline_rows.len() > 1);
+    }
+
+    #[test]
+    fn registered_diff_commands_capture_selected_row_and_source_fences() {
+        let (mut runtime,card,_) = fixture(DiffMode::Inline);
+        assert!(!runtime.diff_command_available("diff_copy"));
+        let row = runtime.diff_model().unwrap().change_starts(DiffMode::Inline)[0];
+        runtime.diff_interaction.selection = Some(Selection::new(DiffMode::Inline,Side::Old,row));
+        for id in ["diff_copy","diff_copy_old","diff_copy_new","diff_copy_patch","diff_copy_line_reference","diff_open_in_editor"] {
+            assert!(runtime.diff_command_available(id),"{id}");
+            let Some(RepositoryAction::DiffCommand { card: actual,generation,revision,mode,sources,command }) = runtime.diff_command_action(card,id) else { panic!("registered command {id}") };
+            assert_eq!(actual,card);
+            assert_eq!(generation,runtime.generation);
+            assert_eq!(revision,runtime.diff_layout_revision);
+            assert_eq!(mode,DiffMode::Inline);
+            assert_eq!(sources,runtime.diff_source_key().unwrap().sources);
+            assert_eq!(command.command_id(),id);
+            if let DiffCommand::CopyLineReference { row: captured,side } | DiffCommand::OpenInEditor { row: captured,side } = command { assert_eq!(captured,row); assert_eq!(side,Side::Old); }
+        }
+        assert!(!runtime.diff_command_available("unknown"));
+        runtime.diff_mode = DiffMode::Split;
+        runtime.diff_interaction.selection = Some(Selection::new(DiffMode::Split,Side::New,row));
+        assert!(runtime.diff_command_available("diff_copy"));
+        assert!(!runtime.diff_command_available("diff_copy_old"));
+        assert!(!runtime.diff_command_available("diff_copy_new"));
     }
 
     #[test]

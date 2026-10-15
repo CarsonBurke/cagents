@@ -338,6 +338,20 @@ pub enum Command {
     OpenInEditor { row: usize, side: Side },
 }
 
+impl Command {
+    /// Stable command-registry identity, independent of captured row context.
+    pub const fn command_id(self) -> &'static str {
+        match self {
+            Self::Copy => "diff_copy",
+            Self::CopyOld => "diff_copy_old",
+            Self::CopyNew => "diff_copy_new",
+            Self::CopyPatch => "diff_copy_patch",
+            Self::CopyLineReference { .. } => "diff_copy_line_reference",
+            Self::OpenInEditor { .. } => "diff_open_in_editor",
+        }
+    }
+}
+
 /// Whole-file contextual patch for just the selected changed rows. Git's
 /// contextual patch generator restores untouched lines around the selection,
 /// so a whole-hunk selection can be applied with ordinary `git apply`.
