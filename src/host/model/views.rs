@@ -613,29 +613,26 @@ pub(super) fn apply(
                     if resource_owner(transaction, pane)?.is_some() {
                         false
                     } else {
-                        view.apply(change)?
+                        let previous = view
+                            .panes
+                            .iter()
+                            .find(|current| current.id == pane.id)
+                            .map(|current| current.kind.clone());
+                        let changed = view.apply(change)?;
+                        let current = view
+                            .panes
+                            .iter()
+                            .find(|current| current.id == pane.id)
+                            .map(|current| &current.kind);
+                        update_terminal_source(
+                            transaction,
+                            pane.id,
+                            &before.kind,
+                            previous.as_ref(),
+                            current,
+                        )?;
+                        changed
                     }
-                }
-                Change::Update { before, pane } => {
-                    let previous = view
-                        .panes
-                        .iter()
-                        .find(|current| current.id == pane.id)
-                        .map(|current| current.kind.clone());
-                    let changed = view.apply(change)?;
-                    let current = view
-                        .panes
-                        .iter()
-                        .find(|current| current.id == pane.id)
-                        .map(|current| &current.kind);
-                    update_terminal_source(
-                        transaction,
-                        pane.id,
-                        &before.kind,
-                        previous.as_ref(),
-                        current,
-                    )?;
-                    changed
                 }
                 Change::Remove { id } => {
                     transaction
