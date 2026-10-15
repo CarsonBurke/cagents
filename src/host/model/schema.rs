@@ -467,6 +467,7 @@ mod tests {
 
     #[test]
     fn legacy_view_conversion_preserves_consumed_rows_and_rejects_unknown_shapes() {
+        let _clear = Clear;
         // Synthesized compatibility fixture for the actual version-eight
         // reader; the old version-seven CREATE writer is not in Git history.
         let dir = tempfile::tempdir().unwrap();
@@ -493,6 +494,11 @@ mod tests {
         )
         .unwrap();
         drop(db);
+        let original = bytes(&path);
+        FAIL_STEP.with(|s| s.set(Some(8)));
+        assert!(Registry::at(&path).err().unwrap().contains("failure at 8"));
+        FAIL_STEP.with(|s| s.set(None));
+        assert_eq!(bytes(&path), original, "converted legacy rows must roll back with the failed migration");
         let registry = Registry::at(&path).unwrap();
         let scope = serde_json::json!({"Channel":channel}).to_string();
         let view: (i64, String, String) = registry
