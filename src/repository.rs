@@ -25,6 +25,8 @@ mod creation_retention;
 pub(crate) mod creation_journal;
 mod creation_receiver;
 pub(crate) use creation_receiver::{ReceivedCreationScopes, ValidatedCreationOperation};
+#[cfg(all(target_os = "linux", feature = "host"))]
+pub(crate) use creation_receiver::AuthenticatedCreationScopes;
 pub use creation_retention::{RetainedWorktreeCreation, CreationRetention, SettledCreatedWorktree};
 pub(crate) use creation_retention::SettledCreationRoots;
 mod branch_transaction;

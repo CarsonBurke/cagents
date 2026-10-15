@@ -29,6 +29,18 @@ impl ReceivedCreationScopes {
     ) -> Result<Self, RepositoryError> {
         let saved = store.journaled_worktree_operation(operation).map_err(|error| invalid(&error.to_string()))?
             .ok_or_else(|| invalid("The exact settled creation journal is unavailable"))?;
+        Self::validate_description(saved, operation, generation, roots)
+    }
+    // The only callers are the original held StateStore path above and the
+    // consumed authenticated original-peer response below. A decoded plain row
+    // or serialized report cannot call this private physical validator.
+    fn validate_description(
+        saved: PendingOperation, operation: OperationId, generation: u64,
+        roots: [fs_safety::Root; 6],
+    ) -> Result<Self, RepositoryError> {
+        if saved.id != operation {
+            return Err(invalid("The creation row does not name the authenticated operation"));
+        }
         let journal: WorktreeJournal = serde_json::from_value(saved.payload.clone())
             .map_err(|_| invalid("The settled creation journal is malformed"))?;
         if saved.entity_kind != "worktree_creation" || saved.action != "create"
@@ -113,4 +125,69 @@ fn read_regular(root: &fs_safety::Root, name: &str) -> Result<Vec<u8>, Repositor
     (&mut file).take(8193).read_to_end(&mut bytes).map_err(|e| invalid(&e.to_string()))?;
     if bytes.len()>8192 || bytes.contains(&0) { return Err(invalid("The original creation metadata is oversized or invalid")); }
     Ok(bytes)
+}
+
+
+/// One authenticated recipient and its original six physical roles. There is
+/// no Clone, Deserialize, arbitrary-row constructor or conversion that drops
+/// the audience fence. The actual host must move this object into exactly one
+/// retained grant only after committing that recipient's required obligation.
+/// This object alone does not authorize publication, provider preparation,
+/// process creation or a Started receipt.
+#[cfg(all(target_os = "linux", feature = "host"))]
+pub(crate) struct AuthenticatedCreationScopes {
+    origin: crate::control::created_journal::AuthenticatedCreationOperation,
+    requirement: crate::model::DirectoryStartRequirement,
+    scopes: ReceivedCreationScopes,
+}
+#[cfg(all(target_os = "linux", feature = "host"))]
+impl AuthenticatedCreationScopes {
+    pub(crate) fn receive(
+        origin: crate::control::created_journal::AuthenticatedCreationOperation,
+        roots: [fs_safety::Root; 6],
+        current_request: u64,
+        current_proof: &crate::model::HostSessionProof,
+        current_requirement: &crate::model::DirectoryStartRequirement,
+    ) -> Result<Self, RepositoryError> {
+        // Authenticate the one-use response and actual held descriptor roles
+        // BEFORE parsing a row. The decoder produces description only.
+        origin.validate_current(current_request, current_proof, current_requirement, &roots)
+            .map_err(|error| invalid(&error.to_string()))?;
+        let row = super::creation_journal::decode_creation_operation_description(origin.encoded_operation())?;
+        let scopes = ReceivedCreationScopes::validate_description(row, origin.operation(), origin.generation(), roots)?;
+        let received = Self { origin, requirement: current_requirement.clone(), scopes };
+        // Repeat peer/request/recipient and all physical predicates after the
+        // potentially fallible row and backlink work, using only held roles.
+        received.revalidate(current_request, current_proof, current_requirement)?;
+        Ok(received)
+    }
+    pub(crate) fn requirement(&self) -> &crate::model::DirectoryStartRequirement { &self.requirement }
+    pub(crate) fn source(&self) -> &WorktreeAuthority { self.scopes.source() }
+    pub(crate) fn destination(&self) -> &WorktreeAuthority { self.scopes.destination() }
+    pub(crate) fn record(&self) -> &WorktreeRecord { self.scopes.record() }
+    pub(crate) fn revalidate(
+        &self,
+        current_request: u64,
+        current_proof: &crate::model::HostSessionProof,
+        current_requirement: &crate::model::DirectoryStartRequirement,
+    ) -> Result<(), RepositoryError> {
+        let source = self.scopes.source.retained_roots()?;
+        let destination = self.scopes.destination.retained_roots()?;
+        let roots = [source.0, source.1, source.2, destination.0, destination.1, destination.2];
+        self.origin.validate_current(current_request, current_proof, current_requirement, &roots)
+            .map_err(|error| invalid(&error.to_string()))?;
+        let fresh = ReceivedCreationScopes::validate_description(
+            self.scopes.operation.clone(), self.origin.operation(), self.origin.generation(), roots)?;
+        if fresh.operation != self.scopes.operation || fresh.record != self.scopes.record {
+            return Err(invalid("The authenticated creation description changed"));
+        }
+        // Do not re-open a UI database or pretend this is another journal
+        // observation: row provenance is the exact original owned-connection
+        // response, while this repeat checks original physical scope liveness.
+        let source = fresh.source.retained_roots()?;
+        let destination = fresh.destination.retained_roots()?;
+        self.origin.validate_current(current_request, current_proof, current_requirement,
+            &[source.0, source.1, source.2, destination.0, destination.1, destination.2])
+            .map_err(|error| invalid(&error.to_string()))
+    }
 }
