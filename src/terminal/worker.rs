@@ -1510,16 +1510,18 @@ impl TerminalHandle {
             }
             order.handoff=true;
         }
-        let (reply, result) = crossbeam_channel::bounded(1);
-        if let Err(error)=self.send_command(Command::PreserveForRestart(reply)) {
-            // No command was accepted, so original ownership is known. Wake
-            // any deadline parked behind this provisional handoff fence.
-            self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner()).handoff=false;
-            joins::ownership_changed();
-            return Err(error.to_string());
+        if !self.is_completed() {
+            let (reply, result) = crossbeam_channel::bounded(1);
+            if let Err(error)=self.send_command(Command::PreserveForRestart(reply)) {
+                // No command was accepted, so original ownership is known. Wake
+                // any deadline parked behind this provisional handoff fence.
+                self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner()).handoff=false;
+                joins::ownership_changed();
+                return Err(error.to_string());
+            }
+            result.recv_timeout(WORKER_JOIN_TIMEOUT * 2)
+                .map_err(|_|"Terminal preservation outcome is unknown; ownership remains fenced".to_string())??;
         }
-        result.recv_timeout(WORKER_JOIN_TIMEOUT * 2)
-            .map_err(|_|"Terminal preservation outcome is unknown; ownership remains fenced".to_string())??;
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
         if !self.join_worker_until(deadline, false) {
             return Err("terminal preservation join is pending or exceeded its deadline".into());
@@ -7013,6 +7015,21 @@ mod tests {
         let deadline=Instant::now()+Duration::from_secs(2);
         while published.worker_join.load(Ordering::Acquire)==1 {assert!(Instant::now()<deadline);thread::yield_now();}
         assert_eq!(published.worker_join.load(Ordering::Acquire),2);
+    }
+
+    #[test]
+    fn preservation_of_completed_worker_does_not_require_a_live_command_inbox() {
+        let published=Arc::new(PublishedState::new(true,Arc::new(|_|{})));
+        published.join_reservation.set(joins::reserve().unwrap()).unwrap();
+        published.completed.store(true,Ordering::Release);
+        let (commands,receiver)=command_channel(1);drop(receiver);
+        let handle=TerminalHandle {inner:Arc::new(HandleInner {
+            commands,events:crossbeam_channel::unbounded().1,published:Arc::clone(&published),
+            worker:Arc::new(Mutex::new(Some(thread::spawn(||{})))),
+        })};
+        handle.preserve_for_restart().unwrap();
+        assert_eq!(published.worker_join.load(Ordering::Acquire),2);
+        assert!(published.input_order.lock().unwrap().handoff);
     }
 
     #[test]
