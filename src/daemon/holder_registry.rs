@@ -53,7 +53,7 @@ impl BuildIdentity {
             commit: crate::VERSION.split("+local.").nth(1)
                 .and_then(|metadata| metadata.split('.').next()).map(str::to_owned),
             capabilities: match kind {
-                Kind::Native => vec!["event-driven-orphan-reaping".into()],
+                Kind::Native => vec!["event-driven-orphan-reaping".into(), "provider-exit-diagnostics".into()],
                 Kind::Terminal => Vec::new(),
             },
         }
@@ -165,6 +165,8 @@ impl Record {
             build.version != crate::VERSION
                 || (self.kind == Kind::Native && !build.capabilities.iter()
                     .any(|capability| capability == "event-driven-orphan-reaping"))
+                || (self.kind == Kind::Native && !build.capabilities.iter()
+                    .any(|capability| capability == "provider-exit-diagnostics"))
         })
     }
 
