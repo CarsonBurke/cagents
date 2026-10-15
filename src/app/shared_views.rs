@@ -1759,6 +1759,16 @@ mod tests {
                 "shared terminal reconciliation closed_owner={closed_owner} blocked native input for {elapsed:?}"
             );
             if closed_owner {
+                // A cache miss is pending rather than a synchronous database
+                // probe. Retry the same current shared model after the real
+                // worker has published its requested-identity answer.
+                assert!(app.session.as_ref().unwrap().take_closure_updates());
+                drop(app.reconcile_shared_views());
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .flush(Duration::from_secs(5))
+                    .unwrap();
                 let restored = store
                     .load_card(card.id, None)
                     .unwrap()

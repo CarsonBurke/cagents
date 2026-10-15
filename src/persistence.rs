@@ -33,7 +33,7 @@ use crate::{
 mod review_cache;
 
 mod closed_claims;
-pub(crate) use closed_claims::ClosedTerminalClaim;
+pub(crate) use closed_claims::{ClosedTerminalClaim, ClosureKey, ClosureQuery};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -752,8 +752,7 @@ impl StateStore {
         enforce_private_database(path)?;
         enforce_sqlite_sidecars(path)?;
 
-        let mut closed_authority = closed_claims::ClosedAuthority::default();
-        closed_authority.sync(&connection)?;
+        let closed_authority = closed_claims::ClosedAuthority::open(&connection)?;
         Ok(Self {
             closed_authority: RwLock::new(closed_authority),
             inner: Mutex::new(StoreInner {
@@ -807,11 +806,13 @@ impl StateStore {
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
+        let closure_stamp = (commit.generation != base.workspace)
+            .then(|| self.prepare_closure_commit(&transaction))
+            .transpose()?;
         transaction.commit()?;
-        self.closed_authority
-            .write()
-            .map_err(|_| StoreError::MutexPoisoned)?
-            .sync(connection)?;
+        if let Some(stamp) = closure_stamp {
+            self.finish_closure_commit(stamp)?;
+        }
         Ok(commit)
     }
 
@@ -821,6 +822,7 @@ impl StateStore {
     pub fn compact_closed_cards(&self, older_than_unix_ms: i64) -> Result<usize> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
+        let previous_changes = inner.connection.total_changes();
         let transaction = inner
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -889,11 +891,13 @@ impl StateStore {
             compacted += transaction
                 .execute("DELETE FROM cards WHERE card_id = ?1 AND retired = 1", [id])?;
         }
+        let closure_stamp = (transaction.total_changes() != previous_changes)
+            .then(|| self.prepare_closure_commit(&transaction))
+            .transpose()?;
         transaction.commit()?;
-        self.closed_authority
-            .write()
-            .map_err(|_| StoreError::MutexPoisoned)?
-            .sync(&inner.connection)?;
+        if let Some(stamp) = closure_stamp {
+            self.finish_closure_commit(stamp)?;
+        }
         Ok(compacted)
     }
 
@@ -1346,11 +1350,13 @@ impl StateStore {
             },
             refused_closures,
         )?;
+        let closure_stamp = (commit.generation != base.workspace)
+            .then(|| self.prepare_closure_commit(&transaction))
+            .transpose()?;
         transaction.commit()?;
-        self.closed_authority
-            .write()
-            .map_err(|_| StoreError::MutexPoisoned)?
-            .sync(connection)?;
+        if let Some(stamp) = closure_stamp {
+            self.finish_closure_commit(stamp)?;
+        }
         Ok(commit)
     }
 
@@ -3128,6 +3134,16 @@ fn migrate_reserved(connection: &mut Connection) -> Result<()> {
                     unknown INTEGER NOT NULL DEFAULT 0 CHECK(unknown IN (0, 1))
                  ) STRICT;
                  CREATE INDEX closed_terminal_claims_unknown_idx ON closed_terminal_claims(card_id) WHERE unknown = 1;
+                 CREATE TABLE closed_terminal_claim_keys (
+                    card_id TEXT NOT NULL REFERENCES closed_cards(card_id),
+                    ordinal INTEGER NOT NULL CHECK(ordinal IN (0, 1)),
+                    terminal_id TEXT NOT NULL,
+                    lineage_root TEXT,
+                    claim_json TEXT NOT NULL,
+                    PRIMARY KEY(card_id, ordinal)
+                 ) STRICT;
+                 CREATE INDEX closed_terminal_claim_keys_id ON closed_terminal_claim_keys(terminal_id);
+                 CREATE INDEX closed_terminal_claim_keys_root ON closed_terminal_claim_keys(lineage_root) WHERE lineage_root IS NOT NULL;
                  CREATE TABLE closed_card_archives (
                     card_id TEXT PRIMARY KEY NOT NULL,
                     workspace_id TEXT NOT NULL,
@@ -5684,7 +5700,7 @@ mod tests {
             .execute_batch(
                 "DROP INDEX cards_active_workspace_order_idx;
             DROP INDEX cards_retired_age_idx; DROP TABLE closed_card_archives;
-            DROP TABLE closed_terminal_claims; DROP TABLE closed_cards;
+            DROP TABLE closed_terminal_claim_keys; DROP TABLE closed_terminal_claims; DROP TABLE closed_cards;
             ALTER TABLE cards DROP COLUMN retired;",
             )
             .unwrap();
@@ -8685,7 +8701,7 @@ mod tests {
                 "DROP INDEX cards_active_workspace_order_idx;
             DROP INDEX cards_retired_age_idx;
             DROP TABLE closed_card_archives;
-            DROP TABLE closed_terminal_claims;
+            DROP TABLE closed_terminal_claim_keys; DROP TABLE closed_terminal_claims;
             DROP TABLE closed_cards;
             ALTER TABLE cards DROP COLUMN retired;
             PRAGMA user_version = 11;",
@@ -8742,7 +8758,7 @@ mod tests {
             .execute_batch(
                 "DROP INDEX cards_active_workspace_order_idx;
             DROP INDEX cards_retired_age_idx; DROP TABLE closed_card_archives;
-            DROP TABLE closed_terminal_claims; DROP TABLE closed_cards;
+            DROP TABLE closed_terminal_claim_keys; DROP TABLE closed_terminal_claims; DROP TABLE closed_cards;
             ALTER TABLE cards DROP COLUMN retired; PRAGMA user_version = 11;",
             )
             .unwrap();
@@ -9845,6 +9861,144 @@ mod tests {
             "the snapshot must not be skipped over the downgraded continuity \
              the recovery pass left behind"
         );
+    }
+
+    #[test]
+    fn closed_identity_lookup_uses_only_its_indexed_lineage_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("indexed-closure");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut state = workspace_with_terminal(&boot_id);
+        let CardKind::Terminal(first) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        let mut second = state.cards[0].clone();
+        second.id = CardId::new();
+        let CardKind::Terminal(second_terminal) = &mut second.kind else {
+            unreachable!()
+        };
+        second_terminal.id = TerminalId::new();
+        let second_root = second_terminal.id;
+        state.cards.push(second);
+        for card in &mut state.cards {
+            card.existence = closed_by_user();
+        }
+        state.focused = None;
+        SaveLane::default().save(&store, &state).unwrap();
+        // An unrelated damaged historical payload cannot be a reason to scan
+        // and decode all history while opening or checking another identity.
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE closed_terminal_claim_keys SET claim_json='{invalid' WHERE terminal_id=?1",
+                [second_root.to_string()],
+            )
+            .unwrap();
+        store.shutdown().unwrap();
+        drop(store);
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut hosted = first.clone();
+        hosted.id = TerminalId::new();
+        hosted.recovery_origin = Some(first.id);
+        hosted.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("new"),
+            boot_id,
+            host_incarnation: HostIncarnation::new("new"),
+        };
+        assert_eq!(store.cached_closure(&ClosureQuery::terminal(&hosted)), None);
+        assert!(store.terminal_was_closed(&hosted));
+        assert!(!store.has_unknown_closed_claims());
+        hosted.launch.arguments.push("different-content".into());
+        assert_eq!(
+            store.cached_closure(&ClosureQuery::terminal(&hosted)),
+            None,
+            "an answer cannot be relabelled with another recovery recipe"
+        );
+        assert!(!store.terminal_was_closed(&hosted));
+        let inner = store.lock_inner().unwrap();
+        for (sql, index) in [
+            (
+                "EXPLAIN QUERY PLAN SELECT 1 FROM closed_terminal_claim_keys WHERE terminal_id=?1",
+                "closed_terminal_claim_keys_id",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT claim_json FROM closed_terminal_claim_keys WHERE lineage_root=?1",
+                "closed_terminal_claim_keys_root",
+            ),
+        ] {
+            let plans = inner
+                .connection
+                .prepare(sql)
+                .unwrap()
+                .query_map([first.id.to_string()], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(plans.iter().any(|plan| plan.contains(index)), "{plans:?}");
+        }
+        drop(inner);
+        hosted.recovery_origin = Some(second_root);
+        assert!(
+            store.terminal_was_closed(&hosted),
+            "the actually requested damaged lineage refuses"
+        );
+        assert!(store.has_unknown_closed_claims());
+        hosted.recovery_origin = Some(TerminalId::new());
+        assert!(
+            store.terminal_was_closed(&hosted),
+            "a failed canonical read cannot heal through another request"
+        );
+    }
+
+    #[test]
+    fn closed_identity_negative_is_withdrawn_before_commit_and_never_replayed() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            boot("closure-cache"),
+        )
+        .unwrap();
+        let mut state = workspace_with_terminal(&boot("closure-cache"));
+        let id = state.cards[0].id;
+        let query = ClosureQuery::Card(id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        assert!(!store.resolve_closure(query.clone()).unwrap());
+        assert_eq!(store.cached_closure(&query), Some(false));
+        {
+            let mut inner = store.lock_inner().unwrap();
+            let transaction = inner
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction.execute("INSERT INTO closed_cards(card_id,workspace_id,closed_at_unix_ms) VALUES (?1,?2,1)", params![id.to_string(), state.id.to_string()]).unwrap();
+            store.prepare_closure_commit(&transaction).unwrap();
+            assert_eq!(
+                store.cached_closure(&query),
+                None,
+                "withdraw before SQLite COMMIT/fsync"
+            );
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            store.cached_closure(&query),
+            None,
+            "rollback is not a positive admission"
+        );
+        assert!(!store.resolve_closure(query.clone()).unwrap());
+        state.cards[0].existence = closed_by_user();
+        state.focused = None;
+        lane.save(&store, &state).unwrap();
+        assert_eq!(
+            store.cached_closure(&query),
+            None,
+            "actual close invalidates the prior worker answer"
+        );
+        assert!(store.resolve_closure(query.clone()).unwrap());
+        assert_eq!(store.cached_closure(&query), Some(true));
     }
 
     /// Run alone on a quiet host; normal CI must not enforce scheduler timing.

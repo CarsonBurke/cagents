@@ -218,7 +218,9 @@ impl Cagents {
         // does not hold the identity the daemon already published. Deciding now
         // would race it, so the observation waits for a quiet moment instead.
         if self.terminal_starts_in_flight() > 0 {
-            self.pending_adoptions.extend(terminals);
+            for session in terminals {
+                self.defer_terminal_adoption(session);
+            }
             return Task::none();
         }
         let mut tasks = Vec::new();
@@ -248,10 +250,19 @@ impl Cagents {
             if !waiting.is_empty() {
                 tasks.push(self.lifecycle_sweep());
             }
-            if !self.adoptable(&session) {
+            if !self.adoptable_without_history(&session) {
                 continue;
             }
-            tasks.push(self.adopt_hosted_terminal(session));
+            match self
+                .session
+                .as_ref()
+                .map(|runtime| runtime.terminal_closure_observation(&session))
+                .unwrap_or(Some(false))
+            {
+                Some(false) => tasks.push(self.adopt_hosted_terminal(session)),
+                Some(true) => {}
+                None => self.defer_terminal_adoption(session),
+            }
         }
         if tasks.is_empty() {
             return Task::none();
@@ -280,13 +291,28 @@ impl Cagents {
         if remaining > 0 {
             return Task::none();
         }
-        let adopted = if self.pending_adoptions.is_empty() {
-            Task::none()
-        } else {
-            let pending = std::mem::take(&mut self.pending_adoptions);
-            self.observe_hosted_terminals(pending)
-        };
+        let adopted = self.retry_pending_terminal_adoptions();
         Task::batch([adopted, self.attach_next_restored_agent()])
+    }
+
+    fn defer_terminal_adoption(&mut self, session: TerminalSession) {
+        if let Some(previous) = self
+            .pending_adoptions
+            .iter_mut()
+            .find(|previous| previous.id == session.id)
+        {
+            *previous = session;
+        } else {
+            self.pending_adoptions.push(session);
+        }
+    }
+
+    pub(super) fn retry_pending_terminal_adoptions(&mut self) -> Task<Message> {
+        if self.terminal_starts_in_flight() > 0 || self.pending_adoptions.is_empty() {
+            return Task::none();
+        }
+        let pending = std::mem::take(&mut self.pending_adoptions);
+        self.observe_hosted_terminals(pending)
     }
 
     pub(super) fn terminal_starts_in_flight(&self) -> usize {
@@ -314,7 +340,15 @@ impl Cagents {
             .or_insert(1);
     }
 
+    #[cfg(test)]
     fn adoptable(&self, session: &TerminalSession) -> bool {
+        self.adoptable_without_history(session)
+            && !self
+                .session
+                .as_ref()
+                .is_some_and(|runtime| runtime.terminal_was_closed(session))
+    }
+    fn adoptable_without_history(&self, session: &TerminalSession) -> bool {
         // Only a terminal the daemon still hosts can be attached. An exited one
         // would have to be relaunched, and relaunching is a user's decision.
         session.continuity.live_proof().is_some()
@@ -322,7 +356,6 @@ impl Cagents {
             // A terminal in the middle of a native-chat handoff is already this
             // window's, even before the card that will hold it is written.
             && !self.pending_terminal_handoffs.contains_key(&session.id)
-            && !self.session.as_ref().is_some_and(|runtime| runtime.terminal_was_closed(session))
             && !self
                 .durable
                 .cards
@@ -624,6 +657,111 @@ mod tests {
         assert!(!app.adoptable(hosted));
         drop(app.observe_hosted_terminals(vec![hosted.clone()]));
         assert_eq!(app.durable.cards.len(), count);
+    }
+
+    #[test]
+    fn closed_inventory_lookup_never_blocks_ui_and_retries_only_current_requested_sessions() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo"]);
+        let old = hosted("/repo");
+        drop(app.observe_hosted_terminals(vec![old.clone()]));
+        let card = cards_for(&app, old.id)[0].id;
+        drop(app.finish_terminal_start(card));
+        app.card_state_mut(card).unwrap().existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let (runtime, _) =
+            crate::session::SessionRuntime::open(&path, BootId::new("closed-lookup")).unwrap();
+        app.session = Some(runtime);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let committed = app
+            .session
+            .as_ref()
+            .unwrap()
+            .take_committed_closures(app.durable.id);
+        assert_eq!(
+            Arc::make_mut(&mut app.durable).retire_committed_cards(&committed),
+            1
+        );
+        let store = app.session.as_ref().unwrap().operation_store();
+        // Hold the actual writer connection at SQLite BEGIN. Calling the
+        // native inventory callback must still return while that writer waits.
+        let mut blocker = rusqlite::Connection::open(&path).unwrap();
+        let transaction = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        app.session
+            .as_ref()
+            .unwrap()
+            .snapshot(Arc::clone(&app.durable));
+        let barrier = app.session.as_ref().unwrap().request_flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !store.audit_writer_holds_connection() {
+            assert!(
+                Instant::now() < deadline,
+                "writer did not acquire the real connection"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut new = hosted("/repo");
+        let started = Instant::now();
+        drop(app.observe_hosted_terminals(vec![old.clone(), new.clone()]));
+        new.launch.arguments.push("latest-observation".into());
+        drop(app.observe_hosted_terminals(vec![new.clone()]));
+        let elapsed = started.elapsed();
+        assert!(cards_for(&app, new.id).is_empty());
+        assert_eq!(
+            app.pending_adoptions.len(),
+            2,
+            "coalesce repeated observations by actual identity"
+        );
+        transaction.rollback().unwrap();
+        barrier
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "native inventory waited on SQLite: {elapsed:?}"
+        );
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let event = app
+            .session
+            .as_ref()
+            .unwrap()
+            .health_receiver()
+            .try_recv()
+            .unwrap();
+        drop(app.update(Message::SessionSaveHealthChanged(event)));
+        assert!(app.pending_adoptions.is_empty());
+        assert!(
+            cards_for(&app, old.id).is_empty(),
+            "the closed identity is never resurrected"
+        );
+        let adopted = cards_for(&app, new.id);
+        assert_eq!(adopted.len(), 1);
+        let CardKind::Terminal(current) = &adopted[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            current, &new,
+            "retry the latest received descriptor, not an old queued clone"
+        );
     }
 
     #[test]

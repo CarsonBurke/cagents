@@ -15,8 +15,8 @@ use crate::{
         WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
     },
     persistence::{
-        SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptPruneReport,
-        TranscriptRetention,
+        ClosureKey, ClosureQuery, SnapshotBase, StateStore, StoreError, StoredGenerations,
+        TranscriptPruneReport, TranscriptRetention,
     },
 };
 
@@ -419,6 +419,7 @@ struct QueueState {
     /// of every card, title, and browser history.
     latest: Option<Arc<WorkspaceState>>,
     committed_closures: BTreeMap<WorkspaceId, BTreeSet<CardId>>,
+    closure_queries: HashMap<ClosureKey, ClosureQuery>,
     conversions: VecDeque<ConversionCheckpoint>,
     ordered_identities: bool,
     projects: HashMap<ProjectId, ProjectState>,
@@ -926,12 +927,33 @@ impl SessionRuntime {
         self.last_error.lock().ok().and_then(|error| error.clone())
     }
 
-    /// Read narrow committed closure authority without querying SQLite.
+    /// Pending metadata is refused until the existing persistence worker has
+    /// checked the requested identity. No SQLite call runs on the UI thread.
+    fn closure_observation(&self, query: ClosureQuery) -> Option<bool> {
+        let answer = self.operation_store.cached_closure(&query);
+        if answer.is_none() {
+            let (lock, changed) = &*self.queue;
+            if let Ok(mut state) = lock.lock() {
+                if !state.shutdown {
+                    state.closure_queries.insert(query.key(), query);
+                    changed.notify_one();
+                }
+            }
+        }
+        answer
+    }
     pub fn card_was_closed(&self, id: CardId) -> bool {
-        self.operation_store.card_was_closed(id)
+        self.closure_observation(ClosureQuery::Card(id))
+            .unwrap_or(true)
     }
     pub fn terminal_was_closed(&self, session: &TerminalSession) -> bool {
-        self.operation_store.terminal_was_closed(session)
+        self.terminal_closure_observation(session).unwrap_or(true)
+    }
+    pub(crate) fn terminal_closure_observation(&self, session: &TerminalSession) -> Option<bool> {
+        self.closure_observation(ClosureQuery::terminal(session))
+    }
+    pub(crate) fn take_closure_updates(&self) -> bool {
+        self.operation_store.take_closure_updates()
     }
 
     /// Drain only closures whose exact snapshot transaction committed. The UI
@@ -1351,6 +1373,11 @@ impl Quarantine {
 }
 
 trait SessionStore {
+    fn resolve_closure(&self, _query: ClosureQuery) -> Result<bool, StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support closed identity checks".into(),
+        ))
+    }
     fn recover_terminal_ownership(
         &self,
         _state: &WorkspaceState,
@@ -1443,6 +1470,9 @@ trait SessionStore {
 }
 
 impl SessionStore for StateStore {
+    fn resolve_closure(&self, query: ClosureQuery) -> Result<bool, StoreError> {
+        StateStore::resolve_closure(self, query)
+    }
     fn compact_closed_cards(&self) {
         const HISTORY_GUARD_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
         if let Err(error) = StateStore::compact_closed_cards(
@@ -1550,6 +1580,9 @@ impl SessionStore for StateStore {
 }
 
 impl SessionStore for Arc<StateStore> {
+    fn resolve_closure(&self, query: ClosureQuery) -> Result<bool, StoreError> {
+        StateStore::resolve_closure(self, query)
+    }
     fn recover_terminal_ownership(
         &self,
         state: &WorkspaceState,
@@ -2328,6 +2361,7 @@ fn persistence_loop(
             && state.projects.is_empty()
             && state.worktrees.is_empty()
             && state.identity_replacements.is_empty()
+            && state.closure_queries.is_empty()
             && !state.retry_requested
             && state.checkpoints.is_empty()
             && !state.shutdown
@@ -2398,6 +2432,7 @@ fn persistence_loop(
                 config.debounce,
             );
         }
+        let closure_queries = std::mem::take(&mut state.closure_queries);
         let shutdown = state.shutdown;
         let checkpoints = std::mem::take(&mut state.checkpoints);
         let should_persist = shutdown
@@ -2468,6 +2503,19 @@ fn persistence_loop(
                 due = (!retry_exhausted).then(|| Instant::now() + retry_delay);
                 retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
             }
+        }
+        if !closure_queries.is_empty() {
+            for query in closure_queries.into_values() {
+                if let Err(error) = store.resolve_closure(query) {
+                    tracing::warn!(
+                        category = save_failure_category(&error).label(),
+                        "closed identity lookup refused"
+                    );
+                }
+            }
+            // Reuse the existing health wake. Only actual requested answers
+            // trigger a model/adoption retry; no history reconstruction runs.
+            health.publish(health.health.clone());
         }
         if let Some(revision) = retry_answered_after {
             health.answer_retry(revision);
@@ -3340,6 +3388,60 @@ mod tests {
         let replacement = &replacements[&card_id];
         assert_eq!(replacement.expected_terminal_id, original_id);
         assert_eq!(replacement.replacement.id(), final_id);
+    }
+
+    #[test]
+    fn closed_identity_requests_use_the_existing_worker_and_exact_current_receipt() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot = BootId::new("closure-worker");
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let mut state = workspace();
+        let workspace_id = state.id;
+        let closed = state.cards[0].id;
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        };
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        runtime.shutdown();
+        let (mut runtime, _) = SessionRuntime::open(&path, boot).unwrap();
+        let open = CardId::new();
+        assert!(
+            runtime.card_was_closed(open),
+            "unknown answer refuses while requested"
+        );
+        assert!(runtime.card_was_closed(closed));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        assert!(!runtime.card_was_closed(open));
+        assert!(runtime.card_was_closed(closed));
+        assert!(runtime.take_closure_updates());
+        assert!(!runtime.take_closure_updates());
+        let mut state = workspace();
+        state.id = workspace_id;
+        state.cards[0].id = open;
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        };
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        assert!(
+            runtime.card_was_closed(open),
+            "committed closure withdraws the earlier negative answer"
+        );
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        assert!(runtime.card_was_closed(open));
+        runtime.shutdown();
     }
 
     #[test]

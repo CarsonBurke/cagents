@@ -16229,6 +16229,10 @@ impl Application for Cagents {
                 }
             }),
             Message::SessionSaveHealthChanged(event) => {
+                let closure_updates = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.take_closure_updates());
                 if let Some(session) = &self.session {
                     let committed = session.take_committed_closures(self.durable.id);
                     if !committed.is_empty()
@@ -16240,7 +16244,14 @@ impl Application for Cagents {
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
                 }
-                Task::none()
+                if closure_updates {
+                    Task::batch([
+                        self.reconcile_workspace_model(),
+                        self.retry_pending_terminal_adoptions(),
+                    ])
+                } else {
+                    Task::none()
+                }
             }
             Message::RetrySessionSave => {
                 if let (Some(session), Some(health)) = (&self.session, &mut self.save_health) {
