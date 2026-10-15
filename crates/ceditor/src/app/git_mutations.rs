@@ -100,6 +100,7 @@ impl Editor {
         }) else { return Task::none(); };
         // Resolve selected paths only on activation. Ordinary whole-area
         // availability and its captured button contain no path vector.
+        if !source.mutations_available() { return self.refuse_git_mutation(tab.id); }
         let selected = if let Some(row) = sidebar::selected_change_group_anchor(source, &tab.navigation, area) {
             let Some(action) = sidebar::resolve_change_command(source, &tab.navigation, &key, &row, command) else {
                 return Task::none();
@@ -115,7 +116,7 @@ impl Editor {
             };
             Some(Arc::new(selection))
         } else { None };
-        let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
+        let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(tab.id); };
         let origin = GroupOrigin {
             card: tab.id,
             key: key.clone(),
@@ -272,7 +273,8 @@ impl Editor {
         let Some(tab) = self.tab(card).filter(|tab| tab.git && !tab.snapshot_loading) else { return Task::none(); };
         let Some(key) = tab.navigation.active_worktree().cloned() else { return Task::none(); };
         if !tab.sidebar.source_control.as_ref().is_some_and(|source| source.key == key && !source.is_reloading()) { return Task::none(); }
-        let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
+        if !tab.sidebar.source_control.as_ref().is_some_and(SourceControlModel::mutations_available) { return self.refuse_git_mutation(card); }
+        let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(card); };
         let origin = GroupOrigin { card, key: key.clone(), source_revision: tab.change_source_revision,
             selection_revision: tab.navigation.change_selection_revision(), authority,
             operation: self.next_group_operation, mutation_revision: tab.git_mutation_revision, cancellation: CancellationToken::default() };
@@ -332,7 +334,8 @@ impl Editor {
         if self.modal_open() || self.exiting { return Task::none(); }
         let Some(tab) = self.tab(card) else { return Task::none(); };
         let Some(key) = tab.navigation.active_worktree().cloned() else { return Task::none(); };
-        let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
+        let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(tab.id); };
+        if !tab.sidebar.source_control.as_ref().is_some_and(SourceControlModel::mutations_available) { return self.refuse_git_mutation(card); }
         let Some(capture) = tab.runtime.capture_diff_mutation(card, kind, Some(&request)) else { return Task::none(); };
         let origin = GroupOrigin {
             card, key: key.clone(), source_revision: tab.change_source_revision,

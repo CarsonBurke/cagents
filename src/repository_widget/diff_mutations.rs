@@ -218,7 +218,8 @@ impl RepositoryRuntime {
         // A hunk edit keeps the current document open. Unsaved working
         // text is a valid source while its annotations match that revision;
         // saving and unresolved durability still fence the operation.
-        if !self.shows_diff()
+        if self.git_mutation_unavailable_reason.is_some()
+            || !self.shows_diff()
             || self.directory_only
             || self.mutation_refresh_pending
             || self.is_saving()
@@ -1107,6 +1108,24 @@ mod tests {
         runtime.working_diff.applied_rich = true;
         runtime.working_diff.desired_rich = true;
         runtime
+    }
+
+    #[test]
+    fn read_only_git_runtime_disables_hunk_and_staging_but_keeps_native_edit_and_undo() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        runtime.set_git_mutation_unavailable_reason(Some(Arc::from("Git writes unsupported")));
+        assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
+        assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Revert));
+        assert!(runtime.selected_staging_selection(true).is_none());
+        let request = runtime.diff_mutation_request(card, 0..2).unwrap();
+        assert!(runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).is_none());
+        runtime.source_surface = SourceSurface::Editor;
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("editable ".into()))) }));
+        assert!(runtime.editor_text().unwrap().contains("editable"));
+        assert!(runtime.can_step_editor_history(false));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
     }
 
     #[test]
