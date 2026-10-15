@@ -2069,6 +2069,39 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn terminal_provider_outcomes_and_diagnostics_round_trip_without_losing_reason() {
+        use crate::agent::ActivityOutcome;
+        for outcome in [
+            ActivityOutcome::Succeeded,
+            ActivityOutcome::Cancelled,
+            ActivityOutcome::Failed { reason: "Provider exited with status 3: authentication failed".into() },
+        ] {
+            let snapshot = super::Snapshot {
+                outcome: Some(outcome),
+                provider_exit: Some(super::ProviderExitDiagnostic {
+                    summary: "Provider exited with status 3. Restart session to continue.".into(),
+                    output: "First diagnostic\nAuthentication failed\n".into(),
+                }),
+                ..Default::default()
+            };
+            let binary = postcard::to_stdvec(&snapshot).unwrap();
+            assert_eq!(postcard::from_bytes::<super::Snapshot>(&binary).unwrap(), snapshot);
+            let json = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(serde_json::from_value::<super::Snapshot>(json).unwrap(), snapshot);
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_json_defaults_absent_provider_outcome_and_diagnostic() {
+        let mut legacy = serde_json::to_value(super::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("outcome");
+        legacy.as_object_mut().unwrap().remove("provider_exit");
+        let restored: super::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(restored.outcome.is_none());
+        assert!(restored.provider_exit.is_none());
+    }
+
+    #[test]
     fn request_kind_roundtrips_and_legacy_json_requires_explicit_approval() {
         let legacy = serde_json::json!({"id":"request","title":"Prompt","description":"","fields":[],"actions":[]});
         let mut request: super::Request = serde_json::from_value(legacy).unwrap();
