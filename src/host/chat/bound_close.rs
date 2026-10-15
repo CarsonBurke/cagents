@@ -41,16 +41,31 @@ pub(super) fn close_unattempted(host: &SharedHost, source: &Session)
     let expected = if let Some(identity) = &actor {
         identity.record.clone()
     } else {
-        let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
-        let record = registry::evidence(&socket, Kind::Native)?
-            .ok_or("This pending handoff has no authenticated native cleanup owner; its phase was retained")?;
+        // A post-close finalizer failure must retry from the retained exact
+        // cleanup owner or its authenticated receipt, not a dead helper RPC.
+        let retained = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.native_closing.get(&source.id)
+                .filter(|close| close.owns(close.owner_record(), pending.admitted()))
+                .map(|close| close.owner_record().clone())
+        };
+        let record = if let Some(record) = retained {
+            record
+        } else if let Some((record, _)) = chat::native_holder::closed_source(pending.admitted(), &proof)? {
+            record
+        } else {
+            let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
+            let record = registry::evidence(&socket, Kind::Native)?
+                .ok_or("This pending handoff has no authenticated native cleanup owner; its phase was retained")?;
+            let (recovery, _) = chat::native_holder::inspect(&record, &proof)?;
+            if recovery.source != *pending.admitted()
+                && !recovery.previous_sources.iter().any(|issued| issued == pending.admitted()) {
+                return Err("The native owner does not cover this exact pending source; no provider was stopped".into());
+            }
+            record
+        };
         if Handle::is_remote_record(&record) {
             return Err("The pending Local owner changed to a retained actor; no provider was stopped".into());
-        }
-        let (recovery, _) = chat::native_holder::inspect(&record, &proof)?;
-        if recovery.source != *pending.admitted()
-            && !recovery.previous_sources.iter().any(|issued| issued == pending.admitted()) {
-            return Err("The native owner does not cover this exact pending source; no provider was stopped".into());
         }
         record
     };
@@ -58,7 +73,7 @@ pub(super) fn close_unattempted(host: &SharedHost, source: &Session)
     // This invokes the actual expected UUID/process/thread/revision + token
     // predicate. Generic close_for_resume would lose this original-owner scope.
     pending.close_original(host).map_err(|error| error.message)?;
-    native_cleanup::close_retained_inner(host, pending.admitted(), false, None)?;
+    native_cleanup::close_retained_inner_then(host, pending.admitted(), false, None, || {
     let receipt = chat::native_holder::closed_source(pending.admitted(), &proof)?
         .filter(|(record, paired_closed)| record == &expected && *paired_closed)
         .ok_or("The original owner lacks its exact complete native cleanup receipt; the pending phase was retained")?;
@@ -76,6 +91,7 @@ pub(super) fn close_unattempted(host: &SharedHost, source: &Session)
             .ok_or("The original backend close has no confirmed claim token")?,
     };
     source_binding::release_pending_close(host, &pending, &seal)
-        .map_err(|error| error.message)?;
+        .map_err(|error| error.message)
+    })?;
     Ok(Some(()))
 }
