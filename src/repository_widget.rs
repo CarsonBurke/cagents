@@ -6124,7 +6124,9 @@ impl RepositoryRuntime {
                 self.pending_diff_anchor = Some(anchor);
             }
         }
-        if restores_current && self.shows_diff() { self.apply_pending_diff_source(); }
+        if restores_current && self.shows_diff() && self.apply_pending_diff_source() {
+            self.pending_diff_source = None;
+        }
     }
 
     /// Drops the committed comparisons added longest ago, beyond the cap.
@@ -6498,8 +6500,8 @@ impl RepositoryRuntime {
         let position = self.viewports.editor;
         let fraction = (position.vertical / (self.editor_font_size * self.line_height)).clamp(0.0,1.0) as f64;
         self.pending_diff_source = Some((self.diff_source_for_editor_line(position.line),fraction,position.horizontal));
-        self.apply_pending_diff_source();
-        if self.diff_basis != DiffBasis::IndexToWorktree || (self.working_diff.applied_rich && self.working_annotations_current()) {
+        let applied = self.apply_pending_diff_source();
+        if applied && (self.diff_basis != DiffBasis::IndexToWorktree || (self.working_diff.applied_rich && self.working_annotations_current())) {
             self.pending_diff_source = None;
         }
     }
@@ -6507,9 +6509,9 @@ impl RepositoryRuntime {
     /// Gutter-only refreshes intentionally leave rich rows stale. Keep the
     /// editor's source line until the replacement arrives; an old model row
     /// cannot name that line correctly after insertions above the viewport.
-    fn apply_pending_diff_source(&mut self) {
-        let Some((line,fraction,horizontal)) = self.pending_diff_source else { return; };
-        let Some(row) = self.diff_model().and_then(|model| model.row_at_new_line(self.diff_mode,line)) else { return; };
+    fn apply_pending_diff_source(&mut self) -> bool {
+        let Some((line,fraction,horizontal)) = self.pending_diff_source else { return false; };
+        let Some(row) = self.diff_model().and_then(|model| model.row_at_new_line(self.diff_mode,line)) else { return false; };
         let hidden = self.diff_layout().and_then(|layout| {
             let folded = layout.folded(self.diff_mode);
             match folded.row(folded.display(row)) { DisplayRow::Fold { fold,.. } => Some(fold),_ => None }
@@ -6519,6 +6521,7 @@ impl RepositoryRuntime {
             row:Some(diff_layout::Anchor::Row { row,fraction }),horizontal,first_change:false,
             ..self.current_diff_viewport()
         });
+        true
     }
 
     fn retain_viewports(&mut self) {
@@ -15149,6 +15152,27 @@ mod tests {
             assert!((runtime.viewports.editor.vertical-2.0).abs()<0.01);
             assert_eq!(runtime.viewports.editor.horizontal,9.0);
         }
+    }
+
+    #[test]
+    fn initial_staged_diff_applies_source_anchor_when_rows_arrive() {
+        let card = CardId::new();
+        let text = (0..100).map(|line| format!("line {line}\n")).collect::<String>();
+        let (mut runtime,_) = working_diff_runtime(card,&text,&text);
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.diff_basis = DiffBasis::HeadToIndex;
+        runtime.viewports.editor = text_editor::ScrollPosition { line:70,vertical:3.0,horizontal:8.0 };
+        runtime.align_diff_to_editor();
+        assert!(runtime.pending_diff_source.is_some());
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.set_diff_state(DiffBasis::HeadToIndex,DiffState::ready(staged_text_diff(crate::diff_view::build_diff(&text,&text))));
+        assert!(runtime.pending_diff_source.is_none());
+        let Some(diff_layout::Anchor::Row { row,.. }) = runtime.current_diff_viewport().row else { panic!("source row") };
+        assert_eq!(runtime.diff_model().unwrap().new_line_at_row(DiffMode::Inline,row),Some(71));
+        runtime.align_editor_to_diff();
+        assert_eq!(runtime.viewports.editor.line,70);
+        assert!((runtime.viewports.editor.vertical-3.0).abs()<0.01);
+        assert_eq!(runtime.viewports.editor.horizontal,8.0);
     }
 
     #[test]
