@@ -11362,6 +11362,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             } else {
                 format!("Created with warning: {}", journal.detail)
             };
+            // Complete ticket context while the operation-id lock still proves
+            // ownership, before ANY transition can persist Created as Applied.
+            // A crash leaves the prior unresolved row and the marker intact;
+            // recovery repeats this idempotent write instead of losing the link.
+            if let Some(issue) = &journal.request.linear_issue
+                && let Err(error) = crate::linear::context::link_at(
+                    &journal.request.destination,
+                    &issue.issue_id,
+                    issue.workspace.as_deref(),
+                )
+            {
+                journal.state = WorktreeOperationState::ReconcileRequired;
+                journal.detail = format!("Worktree created; Linear linking requires reconciliation: {error}");
+            }
         } else if (!residual.branch_exists
             || journal.existing_branch_oid.as_ref().is_some_and(|before| {
                 self.resolve_optional_revision(
@@ -11603,20 +11617,6 @@ fn finish_worktree_journal(
     created: i64,
     emit: &impl Fn(WorktreeProgressStage),
 ) -> WorktreeOperationReport {
-    let mut journal = journal.clone();
-    // Linking precedes the Applied journal transition: recovery repeats this
-    // idempotent write if the process exits between the two durable writes.
-    if journal.state == WorktreeOperationState::Created
-        && let Some(issue) = &journal.request.linear_issue
-        && let Err(error) = crate::linear::context::link_at(
-            &journal.request.destination,
-            &issue.issue_id,
-            issue.workspace.as_deref(),
-        )
-    {
-        journal.state = WorktreeOperationState::ReconcileRequired;
-        journal.detail = format!("Worktree created; Linear linking requires reconciliation: {error}");
-    }
     let mut report = journal.report(created);
     if let Err(error) = journal.persist(store, prior) {
         report.state = WorktreeOperationState::JournalWriteFailed;
@@ -11827,6 +11827,66 @@ mod worktree_journal_tests {
                 &sender,
             )
         }
+    }
+
+    /// Simulate process loss after Git completed but before reconciliation
+    /// can write the link or settle Applied. The original operation lock stays.
+    fn interrupted_linear_checkout(fixture: &Fixture) {
+        let (mut journal, payload) = fixture.prepare();
+        let lease = worktree_lease(&journal.lease_path, true).unwrap();
+        journal.lease_identity = Some(lease_file_identity(&lease).unwrap());
+        journal.state = WorktreeOperationState::Running;
+        journal.effects_started = true;
+        let oid = fixture.git(&["rev-parse", "HEAD"]);
+        journal.base_oid = Some(oid.clone());
+        let payload = journal.persist(&fixture.store, &payload).unwrap();
+        fs::create_dir(&fixture.request.managed_root).unwrap();
+        let mut command = fixture.service.create_worktree_command(&fixture.request, &oid).unwrap();
+        command.inherited_lease = Some(lease.as_raw_fd());
+        assert!(SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap().success);
+        journal.checkout_completed = true;
+        journal.persist(&fixture.store, &payload).unwrap();
+        drop(lease);
+    }
+
+    #[test]
+    fn interrupted_creation_recovers_linear_link_before_first_applied_transition() {
+        for already_linked in [false, true] {
+            let mut fixture = Fixture::new();
+            fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
+                issue_id: "ENG-123".into(), workspace: None,
+            });
+            interrupted_linear_checkout(&fixture);
+            if already_linked {
+                crate::linear::context::link_at(&fixture.request.destination, "ENG-123", None).unwrap();
+            }
+            let report = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            assert_eq!(crate::linear::context::resolve_at(&fixture.request.destination).unwrap().issue_id, "ENG-123");
+            assert_eq!(fixture.journal(fixture.request.operation_id).state, WorktreeOperationState::Created);
+        }
+    }
+
+    #[test]
+    fn failed_linear_link_retains_ownership_for_recovery_retry() {
+        let mut fixture = Fixture::new();
+        fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
+            issue_id: "ENG-123".into(), workspace: None,
+        });
+        interrupted_linear_checkout(&fixture);
+        let admin = fixture.service.git_dir(&fixture.request.destination, &CancellationToken::new()).unwrap();
+        let obstruction = admin.join("cagents-linear.json");
+        fs::create_dir(&obstruction).unwrap();
+        let report = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
+        assert_eq!(report.state, WorktreeOperationState::ReconcileRequired, "{report:?}");
+        assert!(report.detail.contains("Linear linking requires reconciliation"));
+        assert_eq!(fixture.journal(fixture.request.operation_id).state, WorktreeOperationState::ReconcileRequired);
+        let worktree = fixture.service.list_worktrees(&fixture.request.repository, &CancellationToken::new()).unwrap().into_iter().find(|worktree| worktree.path == fixture.request.destination).unwrap();
+        assert_eq!(worktree.lock.reason, Some(format!("cagents:{}", fixture.request.operation_id)));
+        fs::remove_dir(obstruction).unwrap();
+        let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
+        assert_eq!(recovered.state, WorktreeOperationState::Created, "{recovered:?}");
+        assert_eq!(crate::linear::context::resolve_at(&fixture.request.destination).unwrap().issue_id, "ENG-123");
     }
 
     #[test]
