@@ -1024,6 +1024,8 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
     });
     let holder = record["holder"]["pid"].as_u64().unwrap();
     let holder_start = record["holder"]["start"].as_u64().unwrap();
+    let provider_processes = fixture.servers();
+    assert_eq!(provider_processes.len(), 1, "the fixture must begin with one actual provider incarnation");
     // Every exit has a finite SIGCHLD delivery/reap window. Record raw Z
     // observations honestly, and separately detect accumulation persisting
     // across a 250ms grace period; a product polling timer is not involved.
@@ -1091,6 +1093,13 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
         thread::sleep(Duration::from_millis(10));
     };
     drop(census);
+    // Read physical identity and provider state after the entire final census,
+    // so shutdown during its grace window cannot masquerade as reaping.
+    let final_provider = window.read(chat.id);
+    assert!(final_provider.ready && !final_provider.exited,
+        "the original provider must remain ready after the final census");
+    assert_eq!(fixture.servers(), provider_processes,
+        "the original provider incarnation must survive the complete census");
     let tool_records = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap();
     let tool_identities = tool_records.lines().map(|line| {
         let (pid, stat) = line.split_once(' ').expect("a tool launch records PID and its proc stat");
@@ -1104,6 +1113,7 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
     let witnessed_adoptions = witnessed_children.intersection(&tool_identities).count();
     let report = json!({"provider":fixture.version, "seconds":started.elapsed().as_secs_f64(),
         "holder":holder, "holder_start":holder_start, "provider_exited":final_provider.exited,
+        "provider_processes":provider_processes,
         "provider_ready":final_provider.ready, "samples":samples, "background_children":tools,
         "witnessed_background_adoptions":witnessed_adoptions,
         "raw_zombie_observations":observed, "persistent_zombies_250ms":persistent, "final_zombies":final_zombies});
