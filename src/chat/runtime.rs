@@ -2640,14 +2640,17 @@ fn provider_exit_diagnostic(
     } else {
         " Restart session to continue."
     };
-    let reason = if status.is_some() {
-        execution::exit_reason(status, None)
-    } else if error.to_lowercase().contains("tungstenite")
+    let detail = if error.to_lowercase().contains("tungstenite")
         || error.to_lowercase().contains("inspect")
     {
         "Provider connection closed".into()
     } else {
         super::protocol::preview(error.as_bytes(), 240)
+    };
+    let reason = if status.is_some() {
+        execution::exit_reason(status, Some(&detail))
+    } else {
+        detail
     };
     let lines: Vec<_> = output
         .lines()
@@ -3583,6 +3586,9 @@ mod tests {
         assert!(diagnostic.output.len() > diagnostic.summary.len());
         let missing=provider_exit_diagnostic(None,"Provider executable not found","");assert!(missing.summary.contains("Install or configure"));
         let killed=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(9)),"socket closed","");assert!(killed.summary.contains("signal 9") && killed.summary.contains("Free memory"));
+        let invalid=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(0)),"Provider printed 8 consecutive invalid protocol lines. Last output: garbage","");
+        assert!(invalid.summary.contains("status 0"));
+        assert!(invalid.summary.contains("8 consecutive invalid protocol lines. Last output: garbage"),"a status must not erase the bounded framing diagnosis");
     }
 
     #[test]
