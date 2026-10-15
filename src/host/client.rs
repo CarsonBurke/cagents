@@ -341,9 +341,21 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     }
 }
 
-fn forget_retention_pin(host: &SharedHost, terminal: crate::model::TerminalId) {
+fn retention_pin_generation(host: &SharedHost, terminal: crate::model::TerminalId) -> Option<String> {
+    match super::agent_execution::registry(host).and_then(|registry|
+        registry.lock().unwrap_or_else(|p| p.into_inner()).retention_pin_generation(terminal)) {
+        Ok(generation) => generation,
+        Err(error) => {
+            tracing::warn!(%error, %terminal, "Retaining terminal ownership because its pin could not be read");
+            None
+        }
+    }
+}
+
+fn forget_retention_pin(host: &SharedHost, terminal: crate::model::TerminalId, generation: Option<String>) {
+    let Some(generation) = generation else { return; };
     let result = super::agent_execution::registry(host).and_then(|registry|
-        registry.lock().unwrap_or_else(|p| p.into_inner()).forget_retention_pin(terminal));
+        registry.lock().unwrap_or_else(|p| p.into_inner()).forget_retention_pin(terminal, &generation));
     if let Err(error) = result { tracing::warn!(%error, %terminal, "Could not compact a closed terminal retention pin"); }
 }
 
@@ -1089,12 +1101,14 @@ pub(super) fn process_request(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .history_handle(client_id, terminal_id)?;
+            let pin = retention_pin_generation(host, terminal_id);
             handle.shutdown().map_err(send_error)?;
             super::chat::close_for_terminal(host, terminal_id)?;
             let retired = host.lock().unwrap_or_else(|p| p.into_inner())
                 .retire_terminal_if_current(terminal_id, &handle);
+            let retired_current = retired.is_some();
             drop(retired);
-            forget_retention_pin(host, terminal_id);
+            if retired_current { forget_retention_pin(host, terminal_id, pin); }
             crate::daemon::wake();
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -1150,6 +1164,7 @@ pub(super) fn process_request(
                 }).transpose()?;
                 (handle, paired)
             };
+            let pin = handle.as_ref().and_then(|_| retention_pin_generation(host, session.id));
             if paired.as_ref().is_some_and(|handle| handle.owns_work()) && !allow_active {
                 return Ok((
                     ServerResponse::TerminalCloseChecked {
@@ -1170,8 +1185,9 @@ pub(super) fn process_request(
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 handle.as_ref().and_then(|handle| state.retire_terminal_if_current(session.id, handle))
             };
+            let retired_current = retired.is_some();
             drop(retired); // Drop holder ownership outside the global host lock.
-            forget_retention_pin(host, session.id);
+            if retired_current { forget_retention_pin(host, session.id, pin); }
             crate::daemon::wake();
             Ok((
                 ServerResponse::TerminalCloseChecked {
@@ -1190,13 +1206,15 @@ pub(super) fn process_request(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .history_handle(client_id, terminal_id)?;
+            let pin = retention_pin_generation(host, terminal_id);
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 super::chat::close_for_terminal(host, terminal_id)?;
                 let retired = host.lock().unwrap_or_else(|p| p.into_inner())
                     .retire_terminal_if_current(terminal_id, &handle);
+                let retired_current = retired.is_some();
                 drop(retired);
-                forget_retention_pin(host, terminal_id);
+                if retired_current { forget_retention_pin(host, terminal_id, pin); }
                 crate::daemon::wake();
             }
             Ok((
