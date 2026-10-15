@@ -33,6 +33,8 @@ impl Handle {
     pub(crate) fn retained_outcomes(&self,after:u64)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("outbox",serde_json::json!([after])),_=>Err("This actor has no remote outbox".into())}}
     pub(crate) fn commit_retained_outcomes(&self,through:u64)->Result<(),String> {match &self.0 {Owner::Remote(remote)=>remote.call("ack_outbox",serde_json::json!([through])),_=>Err("This actor has no remote outbox".into())}}
     pub(crate) fn retained_input(&self,identity:InputIdentity)->Result<Option<InputReceipt>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("input_receipt",serde_json::json!([identity])),_=>Err("This actor has no remote input journal".into())}}
+    pub(crate) fn pending_retained_inputs(&self)->Vec<InputIdentity> {match &self.0 {Owner::Remote(remote)=>remote.pending_inputs(),_=>Vec::new()}}
+    pub(crate) fn retry_retained_input(&self,identity:&InputIdentity)->Result<InputReceipt,String> {match &self.0 {Owner::Remote(remote)=>remote.retry_input(identity),_=>Err("This actor has no retained input envelope".into())}}
     pub(crate) fn commit_retained_inputs(&self,through:u64)->Result<(),String> {match &self.0 {Owner::Remote(remote)=>remote.call("ack_inputs",serde_json::json!([through])),_=>Err("This actor has no remote input journal".into())}}
     pub(crate) fn same_actor(&self,other:&Self)->bool {match (&self.0,&other.0) {(Owner::Local(a),Owner::Local(b))=>a.same_actor(b),(Owner::Remote(a),Owner::Remote(b))=>a.identity()==b.identity(),_=>false}}
     pub(crate) fn enqueue_command(&self,command:Command)->Result<crossbeam_channel::Receiver<Result<(),String>>,String> {match &self.0 {Owner::Local(local)=>local.enqueue_command(command),Owner::Remote(remote)=>remote.enqueue(None,command)}}
@@ -58,7 +60,7 @@ impl Handle {
     pub(crate) fn recovery_environment_matches(&self,environment:&BTreeMap<String,String>)->bool {match &self.0 {Owner::Local(local)=>local.recovery_environment_matches(environment),Owner::Remote(remote)=>remote.recovery_environment_matches(environment)}}
     pub fn is_completed(&self)->bool {match &self.0 {Owner::Local(local)=>local.is_completed(),Owner::Remote(remote)=>remote.state().completed}}
     pub fn failure(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.failure(),Owner::Remote(remote)=>remote.state().failure.clone()}}
-    pub fn owns_work(&self)->bool {match &self.0 {Owner::Local(local)=>local.owns_work(),Owner::Remote(remote)=>!remote.state().completed}}
+    pub fn owns_work(&self)->bool {match &self.0 {Owner::Local(local)=>local.owns_work(),Owner::Remote(remote)=>remote.state().owns_work}}
     pub(crate) fn activity(&self)->crate::agent::ActivityState {match &self.0 {Owner::Local(local)=>local.activity(),Owner::Remote(remote)=>remote.state().activity}}
     pub(crate) fn update_activity(&self)->(bool,bool) {match &self.0 {Owner::Local(local)=>local.update_activity(),Owner::Remote(remote)=>{let state=remote.state();(state.working||state.waiting||!state.requests.is_empty(),state.ready)}}}
     pub(crate) fn is_idle(&self)->bool {match &self.0 {Owner::Local(local)=>local.is_idle(),Owner::Remote(remote)=>remote.state().idle}}
@@ -73,4 +75,17 @@ impl Handle {
     pub(crate) fn preserve_for_restart(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.preserve_for_restart(),Owner::Remote(remote)=>remote.preserve()}}
     pub(crate) fn close_for_resume(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close_for_resume(),Owner::Remote(remote)=>remote.close()}}
     pub fn close(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close(),Owner::Remote(remote)=>remote.close()}}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn remote_ownership_is_authoritative_even_when_completion_is_cached() {
+        let remote=RemoteActor::completed_failure_fixture();
+        let handle=Handle(Owner::Remote(remote));
+        assert!(handle.is_completed());
+        assert!(handle.failure().is_some());
+        assert!(handle.owns_work());
+    }
 }
