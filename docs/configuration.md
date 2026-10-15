@@ -537,3 +537,12 @@ Ctrl+Enter follows `enter_sends`, Ctrl+Shift+Enter selects the alternate deliver
 mode while busy, and Escape cancels through the existing confirmation flow.
 A pending-first-message cancellation retains that exact starting session;
 newly submitted messages do not inherit an older palette result's cancellation.
+
+Whole-area Git commands (`git_stage_all_unstaged`, `git_stage_all_untracked`,
+`git_stage_all_conflicts`, `git_unstage_all_staged`, `git_discard_all_unstaged`,
+`git_discard_all_untracked`) start unbound and appear in Keyboard → Git. They
+require an active nonempty area without an explicit selection in that area.
+Group header controls use the selected-changes commands when rows are selected.
+Captured whole-area commands refuse a changed selection, and the backend reads
+the complete current area when the queued operation runs. Discard retains its
+confirmation.

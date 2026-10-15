@@ -2951,11 +2951,17 @@ pub enum SettingsField {
     ShortcutChatCancelQueued,
     ShortcutChatToggleSteering,
     ShortcutChatToggleFastMode,
+    ShortcutGitStageAllUnstaged,
+    ShortcutGitStageAllUntracked,
+    ShortcutGitStageAllConflicts,
+    ShortcutGitUnstageAllStaged,
+    ShortcutGitDiscardAllUnstaged,
+    ShortcutGitDiscardAllUntracked,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 193] = [
+    const SHORTCUTS: [Self; 199] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3149,6 +3155,12 @@ impl SettingsField {
         Self::ShortcutChatCancelQueued,
         Self::ShortcutChatToggleSteering,
         Self::ShortcutChatToggleFastMode,
+        Self::ShortcutGitStageAllUnstaged,
+        Self::ShortcutGitStageAllUntracked,
+        Self::ShortcutGitStageAllConflicts,
+        Self::ShortcutGitUnstageAllStaged,
+        Self::ShortcutGitDiscardAllUnstaged,
+        Self::ShortcutGitDiscardAllUntracked,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3351,6 +3363,12 @@ impl SettingsField {
             Self::ShortcutChatCancelQueued => "Take back pending first message",
             Self::ShortcutChatToggleSteering => "Toggle chat steering timing",
             Self::ShortcutChatToggleFastMode => "Toggle chat fast mode",
+            Self::ShortcutGitStageAllUnstaged => "Stage all unstaged changes",
+            Self::ShortcutGitStageAllUntracked => "Stage all untracked files",
+            Self::ShortcutGitStageAllConflicts => "Stage all conflicts",
+            Self::ShortcutGitUnstageAllStaged => "Unstage all staged changes",
+            Self::ShortcutGitDiscardAllUnstaged => "Discard all unstaged changes…",
+            Self::ShortcutGitDiscardAllUntracked => "Delete all untracked files…",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3607,6 +3625,12 @@ impl SettingsField {
             | Self::ShortcutChatCancelQueued
             | Self::ShortcutChatToggleSteering
             | Self::ShortcutChatToggleFastMode
+            | Self::ShortcutGitStageAllUnstaged
+            | Self::ShortcutGitStageAllUntracked
+            | Self::ShortcutGitStageAllConflicts
+            | Self::ShortcutGitUnstageAllStaged
+            | Self::ShortcutGitDiscardAllUnstaged
+            | Self::ShortcutGitDiscardAllUntracked
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3827,6 +3851,12 @@ struct ShortcutDraft {
     chat_cancel_queued: String,
     chat_toggle_steering: String,
     chat_toggle_fast_mode: String,
+    git_stage_all_unstaged: String,
+    git_stage_all_untracked: String,
+    git_stage_all_conflicts: String,
+    git_unstage_all_staged: String,
+    git_discard_all_unstaged: String,
+    git_discard_all_untracked: String,
 
     command_palette: String,
     new_native_thread: String,
@@ -4036,6 +4066,12 @@ impl ShortcutDraft {
             chat_cancel_queued: settings::format_chords(&shortcuts.chat_cancel_queued),
             chat_toggle_steering: settings::format_chords(&shortcuts.chat_toggle_steering),
             chat_toggle_fast_mode: settings::format_chords(&shortcuts.chat_toggle_fast_mode),
+            git_stage_all_unstaged: settings::format_chords(&shortcuts.git_stage_all_unstaged),
+            git_stage_all_untracked: settings::format_chords(&shortcuts.git_stage_all_untracked),
+            git_stage_all_conflicts: settings::format_chords(&shortcuts.git_stage_all_conflicts),
+            git_unstage_all_staged: settings::format_chords(&shortcuts.git_unstage_all_staged),
+            git_discard_all_unstaged: settings::format_chords(&shortcuts.git_discard_all_unstaged),
+            git_discard_all_untracked: settings::format_chords(&shortcuts.git_discard_all_untracked),
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -4556,6 +4592,12 @@ impl SettingsDraft {
             SettingsField::ShortcutChatToggleFastMode => {
                 self.keyboard_shortcuts.chat_toggle_fast_mode = value
             }
+            SettingsField::ShortcutGitStageAllUnstaged => { self.keyboard_shortcuts.git_stage_all_unstaged = value }
+            SettingsField::ShortcutGitStageAllUntracked => { self.keyboard_shortcuts.git_stage_all_untracked = value }
+            SettingsField::ShortcutGitStageAllConflicts => { self.keyboard_shortcuts.git_stage_all_conflicts = value }
+            SettingsField::ShortcutGitUnstageAllStaged => { self.keyboard_shortcuts.git_unstage_all_staged = value }
+            SettingsField::ShortcutGitDiscardAllUnstaged => { self.keyboard_shortcuts.git_discard_all_unstaged = value }
+            SettingsField::ShortcutGitDiscardAllUntracked => { self.keyboard_shortcuts.git_discard_all_untracked = value }
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5268,6 +5310,12 @@ fn settings_update(
             next.keyboard_shortcuts.chat_toggle_fast_mode = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutGitStageAllUnstaged => { next.keyboard_shortcuts.git_stage_all_unstaged = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitStageAllUntracked => { next.keyboard_shortcuts.git_stage_all_untracked = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitStageAllConflicts => { next.keyboard_shortcuts.git_stage_all_conflicts = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitUnstageAllStaged => { next.keyboard_shortcuts.git_unstage_all_staged = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitDiscardAllUnstaged => { next.keyboard_shortcuts.git_discard_all_unstaged = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitDiscardAllUntracked => { next.keyboard_shortcuts.git_discard_all_untracked = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
