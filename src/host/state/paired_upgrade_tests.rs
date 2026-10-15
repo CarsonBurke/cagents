@@ -320,6 +320,10 @@ fn run_pair(mode: &str) {
         initial.terminal.as_ref().unwrap().launch,
         original.lock().unwrap().terminals[&id].session.launch
     );
+    assert_eq!(
+        initial.terminal.as_ref().unwrap().continuity.live_proof(),
+        Some(original.lock().unwrap().proof().clone())
+    );
     let actor = original.lock().unwrap().chats[&id].handle.clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     while actor.confirmed_session_id().as_deref() != Some(ID) {

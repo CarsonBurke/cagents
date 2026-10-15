@@ -1136,7 +1136,9 @@ fn start_with_execution(
                 ));
             }
             let handle = record.handle.clone();
-            session.terminal = Some(record.session.clone());
+            // Capture this worker's current daemon proof, not the raw launch
+            // continuity retained before it was first attached.
+            session.terminal = Some(state.descriptor(client, session.id)?.session);
             Some(handle)
         } else {
             if state.terminals.contains_key(&session.id) && !recovering {
