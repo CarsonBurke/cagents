@@ -305,6 +305,7 @@ struct Claude {
     cwd: PathBuf,
     ready: bool,
     busy: bool,
+    retrying: bool,
     /// Only advertised for a CLI whose async input contract we have verified.
     async_input: bool,
     submissions: HashMap<String, Submission>,
@@ -475,6 +476,7 @@ impl Claude {
     fn status(&mut self, busy: bool, detail: impl Into<String>, step: &mut Step) {
         self.busy = busy;
         if !busy {
+            self.retrying = false;
             step.events.push(Event::Waiting(false));
         }
         step.events.push(Event::Status {
@@ -1894,6 +1896,15 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        // Backoff is a provider status, not assistant output. Keep it visible
+        // until actual assistant content resumes, including streamed deltas.
+        if self.retrying && frame["parent_tool_use_id"].is_null()
+            && (string(&frame, "type") == "assistant"
+                || (string(&frame, "type") == "stream_event"
+                    && string(&frame["event"], "type") == "content_block_delta")) {
+            self.retrying = false;
+            self.status(true, "Claude is working", &mut step);
+        }
         if frame["parent_tool_use_id"].is_null() {
             self.fast_mode_metadata(&frame, &mut step);
         }
@@ -3560,7 +3571,7 @@ impl Claude {
                 if parent.is_empty() {
                     self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
-                    self.status(true, "Claude is working", step);
+                    if !self.retrying { self.status(true, "Claude is working", step); }
                 }
             }
             "content_block_start" => {
@@ -4034,12 +4045,27 @@ impl Claude {
             // chat's subtitle. A failure still reaches the reader through the
             // error surface, and what the session is doing is the status
             // line's job.
+            "api_retry" => {
+                let attempt = frame["attempt"].as_u64().or_else(|| frame["retry_attempt"].as_u64()).unwrap_or(1);
+                let delay = frame["retry_delay_ms"].as_u64()
+                    .or_else(|| frame["retry_after_ms"].as_u64())
+                    .or_else(|| frame["delay_ms"].as_u64());
+                let error = frame["error"].as_str()
+                    .or_else(|| frame["error_message"].as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| frame.get("error_status").or_else(||frame.get("status_code"))
+                        .filter(|value|!value.is_null()).map(ToString::to_string)
+                        .unwrap_or_else(||"Transient provider error".into()));
+                let error: String = error.chars().take(512).collect();
+                let delay = delay.map(|ms| format!(", in {} s", ms.div_ceil(1000))).unwrap_or_default();
+                self.retrying = true;
+                self.status(true, format!("Retrying (attempt {attempt}{delay}): {error}"), step);
+            }
             "informational"
             | "notification"
             | "hook_started"
             | "hook_progress"
             | "hook_response"
-            | "api_retry"
             | "thinking_tokens"
             | "background_tasks_changed"
             | "vcs_state_changed"
@@ -5497,6 +5523,23 @@ mod tests {
         align_resume_identity(&mut untouched, "new").unwrap();
         assert_eq!(untouched, vec!["--print", "--model"]);
         assert!(align_resume_identity(&mut vec!["--resume".to_string()], "new").is_err());
+    }
+
+    #[test]
+    fn provider_backoff_status_is_cleared_by_assistant_content() {
+        let mut adapter = Claude::default();
+        let retry = adapter.receive(json!({"type":"system","subtype":"api_retry",
+            "attempt":2,"retry_delay_ms":8000,"error":"529 Overloaded"})).unwrap();
+        assert!(retry.events.iter().any(|event| matches!(event,
+            Event::Status { busy:true, detail } if detail.contains("attempt 2") && detail.contains("8 s") && detail.contains("529 Overloaded"))));
+        adapter.receive(stream(json!({"type":"message_start","message":{"id":"answer","usage":{}}}))).unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"text","text":""}}))).unwrap();
+        let resumed = adapter.receive(stream(json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"Answer"}}))).unwrap();
+        assert!(!adapter.retrying);
+        assert!(resumed.events.iter().any(|event| matches!(event,
+            Event::Status { busy:true, detail } if detail == "Claude is working")));
     }
 
     fn approval(id: &str, tool: &str, input: Value) -> Value {

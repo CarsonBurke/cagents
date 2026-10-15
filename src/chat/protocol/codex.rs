@@ -373,6 +373,9 @@ fn create_inner(
             turn_pricing: Default::default(),
             turn: None,
             busy: false,
+            retrying: false,
+            retry_turn: None,
+            retry_detail: None,
             lifecycle_revision: 0,
             suggestion_turn: None,
             prediction_turn: None,
@@ -515,6 +518,9 @@ struct Codex {
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
     busy: bool,
+    retrying: bool,
+    retry_turn: Option<String>,
+    retry_detail: Option<String>,
     lifecycle_revision: u64,
     suggestion_turn: Option<String>,
     prediction_turn: Option<String>,
@@ -1800,6 +1806,7 @@ impl Adapter for Codex {
                     && *revision == self.lifecycle_revision
                 {
                     self.busy = false;
+                    self.retrying = false;self.retry_turn=None;self.retry_detail=None;
                     self.turn = None;
                     step.events.push(Event::Waiting(false));
                     step.events.push(Event::Status {
@@ -1930,6 +1937,7 @@ impl Adapter for Codex {
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
                     self.busy = thread["status"]["type"] == "active";
+                    if !self.busy {self.retrying=false;self.retry_turn=None;self.retry_detail=None;}
                     step.events.push(Event::PermissionMode(
                         permission_mode(&result["approvalPolicy"], &result["sandbox"])
                             .map(str::to_owned),
@@ -2209,6 +2217,7 @@ impl Adapter for Codex {
                             self.finish_execution(&completed, &mut step)?;
                             if !self.busy || self.turn.as_deref() == Some(turn.as_str()) {
                                 self.busy = false;
+                    self.retrying = false;self.retry_turn=None;self.retry_detail=None;
                                 self.turn = None;
                                 step.events.push(Event::Status {
                                     busy: false,
@@ -2459,7 +2468,9 @@ impl Adapter for Codex {
                 }
                 step.events.push(Event::Status {
                     busy: self.busy,
-                    detail: status_detail(&params["status"]),
+                    detail: if self.busy && self.retrying {
+                        self.retry_detail.clone().unwrap_or_else(||status_detail(&params["status"]))
+                    } else {status_detail(&params["status"])},
                 });
             }
             "thread/prediction/updated" => {
@@ -2562,6 +2573,7 @@ impl Adapter for Codex {
                 let current =
                     method == "turn/started" || self.turn.as_deref().is_none_or(|id| id == turn_id);
                 if current {
+                    self.retrying=false;self.retry_turn=None;self.retry_detail=None;
                     if method == "turn/completed" {
                         step.events.push(Event::TurnSettled);
                     }
@@ -2658,6 +2670,10 @@ impl Adapter for Codex {
             | "item/plan/delta"
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/textDelta" => {
+                if self.retrying && self.retry_turn.as_deref().is_none_or(|turn|params["turnId"].as_str() == Some(turn)) {
+                    self.retrying=false;self.retry_turn=None;self.retry_detail=None;
+                    step.events.push(Event::Status {busy:true,detail:"Working".into()});
+                }
                 let base = item_key(string(params, "turnId")?, string(params, "itemId")?);
                 let thinking = method.contains("reasoning");
                 let id = if thinking {
@@ -2790,6 +2806,7 @@ impl Adapter for Codex {
                 self.subagent_detail = "Agent disconnected".into();
                 step.events.push(Event::Ready(false));
                 self.busy = false;
+                    self.retrying = false;self.retry_turn=None;self.retry_detail=None;
                 self.subagent_status = Some(
                     self.subagent_status
                         .filter(|status| *status != ToolStatus::Running)
@@ -2809,9 +2826,26 @@ impl Adapter for Codex {
                     .unwrap_or_else(|| params["error"].to_string());
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
-                if params["willRetry"] == true {
+                let current = self.busy && match params["turnId"].as_str() {
+                    Some(turn) => self.turn.as_deref() == Some(turn),
+                    // A session-wide retry can describe its currently active
+                    // turn, but cannot restart an idle/closed lifecycle.
+                    None => self.turn.is_some(),
+                };
+                let stale_turn = params["turnId"].as_str().is_some() && !current;
+                if stale_turn || (params["willRetry"] == true && !current) {
+                    step.events.push(session_notice(message));
+                } else if params["willRetry"] == true {
+                    self.retrying=true;
+                    self.retry_turn=params["turnId"].as_str().map(str::to_owned).or_else(||self.turn.clone());
+                    self.retry_detail=Some(format!("Retrying: {message}"));
+                    self.busy=true;
+                    step.events.push(Event::Status {busy:true,detail:self.retry_detail.clone().unwrap()});
                     step.events.push(session_notice(message));
                 } else {
+                    if current || self.turn.is_none() {
+                        self.retrying=false;self.retry_turn=None;self.retry_detail=None;
+                    }
                     step.events.push(Event::Error {
                         message,
                         fatal: false,
@@ -2897,6 +2931,7 @@ impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
         self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
         self.busy = status["type"] == "active";
+        if !self.busy {self.retrying=false;self.retry_turn=None;self.retry_detail=None;}
         self.subagent_waiting = waiting_on_user(status);
         self.subagent_detail = status_detail(status);
         match status["type"].as_str() {
@@ -4274,6 +4309,9 @@ mod tests {
             turn_pricing: Default::default(),
             turn: None,
             busy: false,
+            retrying: false,
+            retry_turn: None,
+            retry_detail: None,
             lifecycle_revision: 0,
             suggestion_turn: None,
             prediction_turn: None,
@@ -4305,21 +4343,26 @@ mod tests {
 
     #[test]
     fn retry_notices_are_timeline_items_and_exhausted_retries_are_errors() {
-        let mut adapter = adapter();
+        let mut adapter = adapter();adapter.turn=Some("turn".into());adapter.busy=true;
         let frame = json!({"method":"error","params":{"threadId":"thread-exact","turnId":"turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}});
         let first = adapter.receive(frame.clone()).unwrap();
         let second = adapter.receive(frame.clone()).unwrap();
-        let [Event::Item(item)] = first.events.as_slice() else {
+        let [Event::Status {busy:true,detail},Event::Item(item)] = first.events.as_slice() else {
             panic!("{:?}", first.events)
         };
+        assert!(detail.starts_with("Retrying:"));
         assert_eq!(item.role, Role::System);
         assert!(
             matches!(&item.content, ItemContent::Text { text, thinking: false, phase: Phase::Commentary } if text == "Reconnecting... 1/2")
         );
-        let [Event::Item(next)] = second.events.as_slice() else {
+        let [Event::Status {..},Event::Item(next)] = second.events.as_slice() else {
             panic!("{:?}", second.events)
         };
         assert_ne!(item.id, next.id);
+        let resumed=adapter.receive(json!({"method":"item/agentMessage/delta","params":{
+            "threadId":"thread-exact","turnId":"turn","itemId":"answer","delta":"resumed"}})).unwrap();
+        assert!(resumed.events.iter().any(|event|matches!(event,Event::Status {busy:true,detail} if detail == "Working")));
+        assert!(!adapter.retrying);
         for will_retry in [json!(false), Value::Null] {
             let mut failed = frame.clone();
             failed["params"]["willRetry"] = will_retry;
@@ -4338,13 +4381,13 @@ mod tests {
         let mut parent = adapter();
         let mut child = adapter();
         child.thread = Some("child-thread".into());
-        child.is_child = true;
+        child.is_child = true;child.turn=Some("child-turn".into());child.busy=true;
         parent
             .children
             .insert("child-thread".into(), Box::new(child));
         let step = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}})).unwrap();
         assert!(
-            matches!(step.events.as_slice(), [Event::SubagentItem { id, item: Item { role: Role::System, .. } }] if id == "child-thread")
+            step.events.iter().any(|event|matches!(event, Event::SubagentItem { id, item: Item { role: Role::System, .. } } if id == "child-thread"))
         );
     }
 
@@ -6445,4 +6488,58 @@ mod tests {
         let late = adapter.receive(json!({"id":request.writes[0]["id"],"error":{"code":-32000,"message":"old refresh failed"}})).unwrap();
         assert!(late.events.is_empty());
     }
+    #[test]
+    fn retry_status_cannot_revive_a_completed_or_closed_turn() {
+        for boundary in [
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"failed","items":[]}}}),
+            json!({"method":"thread/closed","params":{"threadId":"thread-exact"}}),
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}}),
+        ] {
+            let mut adapter=adapter();
+            adapter.turn=Some("turn".into());adapter.busy=true;
+            adapter.receive(json!({"method":"error","params":{"threadId":"thread-exact","turnId":"turn","willRetry":true,"error":{"message":"Overloaded"}}})).unwrap();
+            adapter.receive(boundary).unwrap();assert!(!adapter.retrying);
+            let late=adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"turn","itemId":"answer","delta":"late"}})).unwrap();
+            assert!(!late.events.iter().any(|event|matches!(event,Event::Status {busy:true,..})));
+        }
+        let mut adapter=adapter();adapter.turn=Some("new".into());adapter.busy=true;adapter.retrying=true;
+        adapter.retry_turn=Some("new".into());adapter.retry_detail=Some("Retrying: 529".into());
+        let old_delta=adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"old","itemId":"answer","delta":"late"}})).unwrap();
+        assert!(adapter.retrying);
+        assert!(!old_delta.events.iter().any(|event|matches!(event,Event::Status {detail,..} if detail == "Working")));
+        let active=adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+        assert!(active.events.iter().any(|event|matches!(event,Event::Status {detail,..} if detail == "Retrying: 529")));
+        adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"old","status":"completed","items":[]}}})).unwrap();
+        assert!(adapter.retrying,"an old completion must not clear a newer turn's backoff");
+    }
+
+    #[test]
+    fn stale_retry_errors_cannot_revive_idle_or_replace_a_new_turn_backoff() {
+        let frame=|retry|json!({"method":"error","params":{"threadId":"thread-exact","turnId":"old",
+            "willRetry":retry,"error":{"message":"old failure"}}});
+        let mut idle=adapter();idle.turn=Some("old".into());idle.busy=false;
+        let late=idle.receive(frame(true)).unwrap();
+        assert!(!idle.busy && !idle.retrying);
+        assert!(!late.events.iter().any(|event|matches!(event,Event::Status {busy:true,..})));
+        let mut active=adapter();active.turn=Some("new".into());active.busy=true;
+        active.retrying=true;active.retry_turn=Some("new".into());active.retry_detail=Some("Retrying: new failure".into());
+        for retry in [true,false] {
+            let late=active.receive(frame(retry)).unwrap();
+            assert_eq!(active.retry_turn.as_deref(),Some("new"));
+            assert_eq!(active.retry_detail.as_deref(),Some("Retrying: new failure"));
+            assert!(!late.events.iter().any(|event|matches!(event,Event::Status {..}|Event::Error {..})));
+        }
+    }
+
+    #[test]
+    fn matching_active_final_error_clears_backoff_and_remains_a_failure() {
+        let mut adapter=adapter();adapter.turn=Some("current".into());adapter.busy=true;
+        let frame=|retry|json!({"method":"error","params":{"threadId":"thread-exact","turnId":"current",
+            "willRetry":retry,"error":{"message":"current overload"}}});
+        adapter.receive(frame(true)).unwrap();assert!(adapter.retrying);
+        let failed=adapter.receive(frame(false)).unwrap();
+        assert!(!adapter.retrying);assert!(adapter.retry_turn.is_none());assert!(adapter.retry_detail.is_none());
+        assert!(failed.events.iter().any(|event|matches!(event,Event::Error {fatal:false,message} if message=="current overload")));
+    }
+
 }
