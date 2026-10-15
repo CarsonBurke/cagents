@@ -47,9 +47,17 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
     fn view(self, query: &str) -> Element<'a, Message> {
         let mut children = Vec::new();
         if !self.label_in_control {
-            children.push(highlighted(self.label.to_owned(), query, design::heading_font()).into());
+            children.push(highlighted(self.label.to_owned(), query, design::heading_font()));
         }
         children.push(self.control);
+        if !query.trim().is_empty() {
+            let terms: Vec<_> = self.keywords.split_whitespace().filter(|term| {
+                query.split_whitespace().any(|word| term.to_lowercase().contains(&word.to_lowercase()))
+            }).collect();
+            if !terms.is_empty() {
+                children.push(highlighted(format!("Matches: {}", terms.join(" · ")), query, cosmic::font::default()));
+            }
+        }
         if let Some(error) = self.error {
             children.push(
                 design::caption(error)
@@ -60,10 +68,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
             );
         }
         if !self.detail.is_empty() { children.push(
-            design::caption(self.detail)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
+            highlighted(self.detail.into_owned(), query, cosmic::font::default()),
         );
         }
         widget::column::with_children(children)
@@ -76,23 +81,27 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
 /// Build spans at original UTF-8 boundaries, including non-ASCII text.
 fn highlighted<'a, Message: 'a>(text: String, query: &str, font: iced::Font) -> Element<'a, Message> {
     let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+    let max_chars = words.iter().map(|word| word.chars().count()).max().unwrap_or(0);
     let mut spans = Vec::new();
     let boundaries: Vec<_> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
     let mut highlighted = vec![false; text.len()];
     for (offset, &start) in boundaries.iter().enumerate() {
-        for &end in &boundaries[offset + 1..] {
+        for &end in boundaries[offset + 1..].iter().take(max_chars) {
             if words.iter().any(|word| text[start..end].to_lowercase() == *word) {
                 highlighted[start..end].fill(true);
             }
         }
     }
     for range in boundaries.windows(2) {
-        let span = iced::widget::text::Span::new(text[range[0]..range[1]].to_owned());
+        let span: iced::widget::text::Span<'_, ()> = iced::widget::text::Span::new(text[range[0]..range[1]].to_owned());
         spans.push(if highlighted[range[0]] {
             span.font(iced::Font { weight: iced::font::Weight::Bold, ..font })
         } else { span.font(font) });
     }
-    iced::widget::rich_text(spans).width(Length::Fill).into()
+    iced::widget::rich_text(spans)
+        .size(design::TEXT_BODY)
+        .line_height(iced::widget::text::LineHeight::Absolute(design::LINE_BODY.into()))
+        .width(Length::Fill).into()
 }
 
 pub fn matches(text: &str, query: &str) -> bool {
@@ -158,7 +167,7 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         }
         let mut heading: Vec<Element<'a, Message>> = vec![
             if query.trim().is_empty() { design::title(self.title).into() }
-            else { highlighted(breadcrumb, query, design::heading_font()).into() }
+            else { highlighted(breadcrumb, query, design::heading_font()) }
         ];
         if !self.detail.is_empty() {
             heading.push(
