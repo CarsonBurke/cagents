@@ -1392,13 +1392,26 @@ impl RemoteActor {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    /// A proxy input can still be waiting for transport or outcome recovery.
+    /// Metadata RPCs must not overtake that user's latest unconfirmed controls.
+    fn account_input_pending(&self) -> bool {
+        let pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        !pending.is_empty()
+            || self.0.recovering_inputs.load(Ordering::Acquire)
+            || self.0.uncertain_input.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
     pub fn account_switch_generation(&self)->Result<Option<u64>,String> {
+        if self.account_input_pending() { return Ok(None); }
         if self.state().completed {
             if let Some(snapshot)=self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref() {return Ok(Some(snapshot.generation));}
         }
-        self.call("account_switch_generation",Value::Null)
+        let generation = self.call("account_switch_generation",Value::Null)?;
+        Ok(if self.account_input_pending() { None } else { generation })
     }
     pub fn completed_account_options(&self)->Result<Option<super::AccountSwitchOptions>,String> {
+        if self.account_input_pending() {
+            return Err("Previous retained inputs are still settling; current account options are not yet confirmed".into());
+        }
         // A finally retired helper cannot answer RPC. Its exact final attached
         // publication remains immutable in this proxy, without hydrating disk.
         if self.state().completed {
@@ -1406,9 +1419,14 @@ impl RemoteActor {
                 return Ok(Some(super::AccountSwitchOptions::capture(snapshot)));
             }
         }
-        self.call("completed_account_options",Value::Null)
+        let options = self.call("completed_account_options",Value::Null)?;
+        if self.account_input_pending() {
+            return Err("A retained input arrived while account options were captured; wait for its confirmed outcome".into());
+        }
+        Ok(options)
     }
     pub fn close_for_account_switch(&self,generation:u64)->Result<Option<super::AccountSwitchOptions>,String> {
+        if self.account_input_pending() { return Ok(None); }
         let cached=if self.state().completed {
             self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref().map(|snapshot|(snapshot.generation,super::AccountSwitchOptions::capture(snapshot)))
         } else {None};
@@ -3721,6 +3739,31 @@ done"#;
         assert!(actor.close_for_account_switch(76).unwrap().is_none(),"a stale generation grants no handoff");
         // Metadata alone does not call publish_retirement or reconstruct scope.
         assert!(actor.launch_account_scope().is_err());
+    }
+
+    #[test]
+    fn account_switch_cannot_overtake_unconfirmed_proxy_input_or_reattachment() {
+        let actor=RemoteActor::fixture(); // No endpoint: any mistaken RPC would fail.
+        actor.publish_closed(Snapshot{generation:77,selected_model:Some("old-confirmed".into()),exited:true,..Snapshot::default()});
+        actor.0.recovering_inputs.store(true,Ordering::Release);
+        assert_eq!(actor.account_switch_generation().unwrap(),None);
+        assert!(actor.completed_account_options().unwrap_err().contains("still settling"));
+        assert!(actor.close_for_account_switch(77).unwrap().is_none());
+        actor.0.recovering_inputs.store(false,Ordering::Release);
+        *actor.0.uncertain_input.lock().unwrap()=Some(InputIdentity{
+            sequence:1,id:uuid::Uuid::new_v4(),hash:payload_digest(b"unconfirmed-model-control")
+        });
+        assert_eq!(actor.account_switch_generation().unwrap(),None);
+        assert!(actor.completed_account_options().unwrap_err().contains("still settling"));
+        assert!(actor.close_for_account_switch(77).unwrap().is_none());
+        let identity=actor.0.uncertain_input.lock().unwrap().take().unwrap();
+        actor.0.pending.lock().unwrap().push(Pending{identity,payload:Value::Null,bytes:0,reply:None});
+        assert_eq!(actor.account_switch_generation().unwrap(),None);
+        assert!(actor.completed_account_options().unwrap_err().contains("still settling"));
+        assert!(actor.close_for_account_switch(77).unwrap().is_none());
+        actor.0.pending.lock().unwrap().clear();
+        assert_eq!(actor.account_switch_generation().unwrap(),Some(77));
+        assert_eq!(actor.completed_account_options().unwrap().unwrap().model.as_deref(),Some("old-confirmed"));
     }
 
 }
