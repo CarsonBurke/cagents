@@ -3083,7 +3083,8 @@ fn automation_does_not_reserve_or_close_a_successful_parent_with_running_native_
     let source = std::fs::read_to_string(&script).unwrap();
     let marker = r#"      printf 'prompt\n' >> "$HOME/../prompts""#;
     assert!(source.contains(marker));
-    let extra = r#"      printf '{"type":"system","subtype":"task_started","task_id":"still-running","task_type":"local_agent","description":"Useful background work"}\n'"#;
+    let extra = r#"      printf '{"type":"assistant","uuid":"background-launch","message":{"id":"background-launch-message","role":"assistant","content":[{"type":"tool_use","id":"background-tool","name":"Agent","input":{"run_in_background":true,"description":"Useful background work","prompt":"Continue working"}}]}}\n'
+      printf '{"type":"system","subtype":"task_started","task_id":"still-running","tool_use_id":"background-tool","task_type":"local_agent","description":"Useful background work"}\n'"#;
     let source = source.replace(marker, &format!("{marker}\n{extra}"));
     std::fs::write(&script,source).unwrap();
     let mut definition = automation_fixture(&host,&request).definition;
