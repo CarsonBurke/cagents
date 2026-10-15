@@ -325,16 +325,14 @@ impl TerminalSessionStop {
             Ok(other) => return Err(format!("Session stop cleanup is unconfirmed: {other:?}")),
             Err(error) => return Err(format!("Session stop cleanup is unconfirmed; its owner remains retained: {error}")),
         }
-        if let Some(worker) = self.handle.take_worker_until(deadline).map_err(|error|error.to_string())? {
-            if !join_worker_until(worker, &self.handle.inner.published, deadline, true) {
-                return Err("Terminal stop cleanup exceeded its deadline; its exact owner remains retained".into());
-            }
+        if !self.handle.join_worker_until(deadline,true) {
+            return Err("Terminal stop cleanup exceeded its deadline; its exact owner remains retained".into());
         }
         if !self.handle.is_completed() {
             return Err("Terminal stop cleanup has not been confirmed".into());
         }
-        self.handle.release_completed_holder();
-        Ok(())
+        self.handle.release_completed_holder_until(deadline)
+
     }
 }
 
@@ -1439,7 +1437,11 @@ impl TerminalHandle {
     }
 
     fn release_completed_holder(&self) -> Result<(), String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        self.release_completed_holder_until(std::time::Instant::now()+std::time::Duration::from_secs(3))
+    }
+
+    fn release_completed_holder_until(&self,deadline:std::time::Instant)->Result<(),String> {
+        if std::time::Instant::now()>=deadline {return Err("Terminal cleanup deadline expired; its owner remains retained".into());}
         let mut retained = self.inner.published.retained_holder.try_lock()
             .map_err(|_| "Another close retains this terminal holder; retry after its deadline".to_owned())?;
         if let Some(holder) = retained.as_mut() {holder.close_until(deadline)?;}
@@ -1447,7 +1449,7 @@ impl TerminalHandle {
         let holder = retained.take();
         drop(retained);
         drop(holder);
-        *self.inner.published.archive.lock().unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Released;
+        *self.inner.published.archive.try_lock().map_err(|_|"Terminal completion metadata is busy; retry exact cleanup".to_string())? = ArchivePhase::Released;
         self.inner.published.completed.store(true, Ordering::Release);
         self.inner.published.archive_ready.notify_all();
         Ok(())
@@ -6574,7 +6576,7 @@ mod tests {
     fn preserve_admission_winner_prevents_session_stop_from_killing_successor_ownership() {
         let (mut worker,events)=capture_worker_for(shell_session("exec cat").launch);
         let (commands,receiver)=command_channel(4);worker.commands=receiver;
-        let handle=TerminalHandle {inner:Arc::new(HandleInner {commands,events,published:worker.published.clone(),worker:Mutex::new(None)})};
+        let handle=TerminalHandle {inner:Arc::new(HandleInner {commands,events,published:worker.published.clone(),worker:Arc::new(Mutex::new(None))})};
         let preserving=handle.clone();
         let call=thread::spawn(move||preserving.preserve_for_restart());
         let command=worker.commands.recv_timeout(Duration::from_secs(2)).unwrap();
