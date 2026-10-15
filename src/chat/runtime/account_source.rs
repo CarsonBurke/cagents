@@ -55,6 +55,7 @@ impl CapturedAccountSource {
     }
 }
 impl Handle {
+    /// Filesystem/SQLite capture: callers must release HostState before entry.
     pub(crate) fn capture_account_source(&self, expires: Instant) -> Result<CapturedAccountSource, String> {
         if Instant::now() >= expires { return Err("Account source capture deadline expired".into()); }
         let scope = self.0.launch_account_scope.as_ref().map_err(Clone::clone)?;
@@ -91,8 +92,10 @@ impl Handle {
         check_owner(&store)?;
         drop(store); // capture_export_source also explicitly ended its snapshot.
         scope.revalidate()?;
+        let proof = CapturedAccountSource { scope: scope.clone(), source_session: session, receipt };
+        // Account alias metadata allocation also belongs to the original budget.
         if Instant::now() >= expires { return Err("Account source capture deadline expired".into()); }
-        Ok(CapturedAccountSource { scope: scope.clone(), source_session: session, receipt })
+        Ok(proof)
     }
 }
 
