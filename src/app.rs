@@ -85,7 +85,7 @@ use url::Url;
 
 use crate::{
     account::{self, Account},
-    design::{self, DockLayout, InspectorLayout, space},
+    design::{self, InspectorLayout, space},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
         ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
@@ -20909,7 +20909,9 @@ mod tests {
                 "{} · {} · {}",
                 provider.label(),
                 app.account_ui.provider_status(provider),
-                app.account_ui.onboarding_action(provider).map_or("Checking…", |(label, _)| label)
+                app.account_ui
+                    .onboarding_action(provider)
+                    .map_or("Checking…", |(label, _)| label)
             );
             assert!(
                 nodes.root().iter().chain(nodes.children()).any(|node| {
