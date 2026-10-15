@@ -448,7 +448,10 @@ impl Phase {
     }
 }
 
+pub(super) mod closing;
+
 pub(super) struct State {
+    pub(super) close_dialog: Option<closing::Confirmation>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -491,6 +494,7 @@ impl Default for State {
         let (sender, receiver) = async_channel::unbounded();
         Self {
             image_viewer: None,
+            close_dialog: None,
             files: HashMap::new(),
             sender,
             receiver,
@@ -1458,6 +1462,7 @@ enum QueuedStep {
 }
 
 pub(super) struct Runtime {
+    recorded_model: Option<String>,
     find: Option<String>,
     find_focused: bool,
     find_matches: Vec<String>,
@@ -2056,8 +2061,10 @@ impl Runtime {
     ) -> Self {
         let permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let selected_model = closing::recipe_model(&session.launch.recipe);
         let mut runtime = Self {
             target,
+            recorded_model: selected_model,
             session,
             snapshot: Arc::new(Snapshot {
                 permission_mode,
@@ -2295,6 +2302,9 @@ impl Runtime {
                 .iter()
                 .any(|message| &message.id == id)
         });
+        if snapshot.selected_model.is_some() {
+            self.recorded_model.clone_from(&snapshot.selected_model);
+        }
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
@@ -4206,6 +4216,32 @@ impl Cagents {
                 }
             }
         }
+        let mut conversation_drafts = self.durable.conversation_drafts.clone();
+        let mut conversation_models = self.durable.conversation_models.clone();
+        for (card, draft) in &chat_drafts {
+            if let Some(CardKind::Chat(session)) = self.card_state(*card).map(|card| &card.kind)
+                && let Some(key) = closing::draft_key(session)
+            { conversation_drafts.insert(key, draft.clone()); }
+        }
+        for runtime in self.chat_ui.parked.values() {
+            if let Some(key) = closing::draft_key(&runtime.session) {
+                if let Some(model) = runtime.snapshot.selected_model.as_ref().or(runtime.recorded_model.as_ref()) { conversation_models.insert(key.clone(), model.clone()); }
+                let draft = runtime.unsent_text();
+                if draft.is_empty() { conversation_drafts.remove(&key); }
+                else { conversation_drafts.insert(key, draft); }
+            }
+        }
+        for (card, state) in &self.cards {
+            if let CardRuntime::Chat(runtime) = state
+                && let Some(session) = self.chat_return_session(*card)
+                && let Some(key) = closing::draft_key(&session)
+            {
+                if let Some(model) = runtime.snapshot.selected_model.as_ref().or(runtime.recorded_model.as_ref()) { conversation_models.insert(key.clone(), model.clone()); }
+                let draft = runtime.unsent_text();
+                if draft.is_empty() { conversation_drafts.remove(&key); }
+                else { conversation_drafts.insert(key, draft); }
+            }
+        }
         let editors = self
             .durable
             .cards
@@ -4230,12 +4266,16 @@ impl Cagents {
         }
         if defaults.is_empty()
             && chat_drafts == self.durable.chat_drafts
+            && conversation_drafts == self.durable.conversation_drafts
+            && conversation_models == self.durable.conversation_models
             && repository_navigation == self.durable.repository_navigation
         {
             return Arc::clone(&self.durable);
         }
         let mut saved = (*self.durable).clone();
         saved.chat_drafts = chat_drafts;
+        saved.conversation_drafts = conversation_drafts;
+        saved.conversation_models = conversation_models;
         saved.repository_navigation = repository_navigation;
         if defaults.is_empty() {
             return Arc::new(saved);
@@ -4401,6 +4441,9 @@ impl Cagents {
             Some((source, (index + 1, durable + 1)))
         });
         let card_id = CardId::new();
+        if let Some(key) = closing::draft_key(&session)
+            && let Some(draft) = self.durable.conversation_drafts.get(&key)
+        { self.chat_ui.drafts.insert(card_id, draft.clone()); }
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "chat");
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.
@@ -4616,6 +4659,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.remember_conversation_draft(card);
         // The runtime is about to be dropped, so its unsent text is captured
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
@@ -4808,7 +4852,10 @@ impl Cagents {
     /// knows it: the runtime's session carries the identity the provider has
     /// confirmed since the card was saved.
     fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
-        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
+        if let Some(runtime) = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(&**runtime),
+            _ => self.chat_ui.parked.get(&card).map(|runtime| &**runtime),
+        } {
             let mut session = runtime.session.clone();
             if let Some(handle) = runtime.handle() {
                 let observed = handle.session();
@@ -4855,6 +4902,7 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        self.remember_conversation_draft(card);
         if matches!(
             self.chat_ui.phases.get(&card),
             Some(Phase::Closing { restart: None, .. })
@@ -6247,6 +6295,9 @@ impl Cagents {
                                 visible,
                                 self.settings.editor_syntax_theme,
                             );
+                            if let Some(key) = closing::draft_key(&session)
+                                && let Some(model) = self.durable.conversation_models.get(&key)
+                            { runtime.recorded_model = Some(model.clone()); }
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
@@ -12639,10 +12690,14 @@ mod tests {
             .target
     }
 
-    /// Closes `card` the way its close button does, and checks that it is gone
-    /// for good: off the strip, tombstoned, and held by nothing.
+    /// Explicitly end a conversation through its confirmation flow.
+    fn request_end_chat(app: &mut Cagents, card: CardId) {
+        drop(app.update(Message::ChatClose(closing::Action::End(card))));
+        if app.chat_ui.close_dialog.is_some() { drop(app.update(Message::ChatClose(closing::Action::Confirm))); }
+    }
+
     fn close_chat(app: &mut Cagents, card: CardId) {
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(app, card);
         if let Some(Phase::Closing {
             target,
             restart: None,
@@ -12850,7 +12905,7 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = failed_chat(&mut app);
         let saved = app.chat_return_session(card).unwrap();
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let target = app.chat_ui.phases[&card].target();
         let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
             target,
@@ -12979,9 +13034,9 @@ mod tests {
     fn closing_a_chat_twice_is_one_close() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, None);
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let closing = app.chat_ui.phases[&card].target();
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
         assert_eq!(app.chat_ui.phases[&card].target(), closing);
         let _ = app.update(Message::CommitClose(card));
@@ -14017,7 +14072,7 @@ mod tests {
         let card = failed_chat(&mut app);
         let _ = app.update(Message::ChatUi(Action::Switch(card)));
         let target = local_return(&app).0;
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
             target,
             Err(ReturnRefused::SourceLive),
@@ -14106,7 +14161,7 @@ mod tests {
             let card = live_chat(&mut app, None);
             let _ = app.update(Message::ChatUi(Action::Switch(card)));
             let target = local_return(&app).0;
-            let _ = app.update(Message::CloseCard(card));
+            request_end_chat(&mut app, card);
             assert!(matches!(
                 app.chat_ui.phases.get(&card),
                 Some(Phase::Returning {
@@ -14328,7 +14383,7 @@ mod tests {
         let card = draft_chat(&mut app);
         write(&mut app, card, "hello");
         let target = chat_runtime(&app, card).target;
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let _ = app.handle_chat_ui(Action::Submit(target, PromptMode::Send));
         assert!(!app.chat_start_pending(card));
     }
@@ -14495,7 +14550,7 @@ mod tests {
     fn a_discarded_card_never_strands_a_start() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = failed_chat(&mut app);
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let closing = app.chat_ui.phases[&card].target();
         let saved = app.chat_return_session(card).unwrap();
         let _ = app.update(Message::RetryCard(card));
@@ -14545,7 +14600,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         assert!(matches!(
             app.chat_ui.phases.get(&card),
             Some(Phase::Returning {

@@ -1215,6 +1215,16 @@ pub struct WorkspaceState {
     /// Unsent native-chat composer text, keyed by the card that owns it.
     #[serde(default)]
     pub chat_drafts: HashMap<CardId, String>,
+    /// Drafts follow provider conversation identity across closed/recreated cards.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub conversation_drafts: HashMap<String, String>,
+    /// Last observed model for display; never rewrites an issued launch recipe.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub conversation_models: HashMap<String, String>,
+    /// Original channel follows provider identity when ending retires its card.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub conversation_channels: HashMap<String, ChannelId>,
+
     /// Most recently visited workspace identities, newest first. Missing
     /// identities are pruned when navigation opens; this grants no ownership.
     #[serde(default)]
@@ -1254,6 +1264,9 @@ impl Default for WorkspaceState {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            conversation_drafts: HashMap::new(),
+            conversation_models: HashMap::new(),
+            conversation_channels: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,

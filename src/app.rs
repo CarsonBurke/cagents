@@ -3936,6 +3936,7 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ChatClose(chat_ui::closing::Action),
     Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -11174,7 +11175,7 @@ impl Cagents {
     /// therefore act on a keystroke, because the user is aiming it at the
     /// dialog - and a terminal acts by writing to a shell.
     fn modal_is_open(&self) -> bool {
-        self.update_ui.confirmation.is_some() || self.other_modal_is_open()
+        self.chat_ui.close_dialog.is_some() || self.update_ui.confirmation.is_some() || self.other_modal_is_open()
     }
 
     fn other_modal_is_open(&self) -> bool {
@@ -13126,6 +13127,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.reconcile_chat_close_backing_state();
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -15011,10 +15013,11 @@ impl Application for Cagents {
                 if self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
-                    || self.chat_has_parked_runtime(id) =>
+                    =>
             {
-                self.begin_chat_close(id)
+                self.request_chat_tab_close(id)
             }
+            Message::CloseCard(id) if self.chat_has_parked_runtime(id) => self.begin_chat_close(id),
             Message::CloseCard(id) => self.begin_card_close(id),
             Message::CloseCardUnasked(id) => self.close_card_unasked(id),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
@@ -15676,6 +15679,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if self.chat_ui.close_dialog.is_some() {
+                    return if is_escape_press(&event) { self.update_chat_close(chat_ui::closing::Action::Cancel) } else { Task::none() };
+                }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
@@ -16163,6 +16169,7 @@ impl Application for Cagents {
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::ChatClose(action) => self.update_chat_close(action),
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
@@ -16612,6 +16619,7 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = self.chat_close_dialog() { return Some(dialog); }
         if let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);
         }
