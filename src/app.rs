@@ -3856,7 +3856,7 @@ fn settings_update(
         return SettingsDecision::Invalid(refusal(field, &next).unwrap_or(message));
     }
     let attempted = next.clone();
-    let next = match next.validate() {
+    let next = match next.validate_transition(current) {
         Ok(next) => next,
         Err(error) => {
             return SettingsDecision::Invalid(

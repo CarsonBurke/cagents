@@ -13518,6 +13518,25 @@ mod tests {
     }
 
     #[test]
+    fn agents_controls_repair_invalid_siblings_one_field_at_a_time() {
+        let mut current = AppSettings { default_shell: Some("/missing/shell".into()), agents: std::collections::BTreeMap::from([
+            ("claude".into(), settings::AgentLaunchSettings { executable: Some("/missing/claude".into()), environment: std::collections::BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), "forbidden".into())]), permission_mode: Some("plan".into()), ..Default::default() }),
+            ("codex".into(), settings::AgentLaunchSettings { executable: Some("/missing/codex".into()), ..Default::default() }),
+        ]), ..Default::default() };
+        for (field, value) in [
+            (SettingsField::Agent(Provider::Claude, AgentSetting::Executable), "/bin/sh"),
+            (SettingsField::Agent(Provider::Codex, AgentSetting::Executable), "/bin/sh"),
+            (SettingsField::DefaultShell, "/bin/sh"),
+            (SettingsField::Agent(Provider::Claude, AgentSetting::Environment), "[]"),
+        ] {
+            let SettingsDecision::Persist(next) = settings_update(&current, field, value) else { panic!("repair {field:?} must not reject invalid siblings") };
+            current = next;
+        }
+        assert_eq!(current.agents["claude"].permission_mode.as_deref(), Some("plan"));
+        current.validate().unwrap();
+    }
+
+    #[test]
     fn new_draft_uses_provider_defaults_and_keeps_composer_choices_local() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);

@@ -68,6 +68,19 @@ impl AgentLaunchSettings {
         Ok(())
     }
 
+    /// Validate changed fields independently so retained invalid siblings can
+    /// be repaired one control at a time without weakening launch validation.
+    pub fn validate_changes(&self, previous: &Self, provider: Provider) -> Result<(), String> {
+        Self {
+            model: (self.model != previous.model).then(|| self.model.clone()).flatten(),
+            effort: (self.effort != previous.effort).then(|| self.effort.clone()).flatten(),
+            permission_mode: (self.permission_mode != previous.permission_mode).then(|| self.permission_mode.clone()).flatten(),
+            executable: (self.executable != previous.executable).then(|| self.executable.clone()).flatten(),
+            arguments: if self.arguments != previous.arguments { self.arguments.clone() } else { vec![] },
+            environment: if self.environment != previous.environment { self.environment.clone() } else { Default::default() },
+        }.validate(provider)
+    }
+
     /// Apply before account isolation. The selected home and credential
     /// removals always have the final say over inherited launch environment.
     pub fn apply_launch(&self, recipe: &mut LaunchRecipe) {
@@ -204,6 +217,36 @@ mod tests {
         assert_eq!(loaded.agents["claude"].permission_mode.as_deref(), Some("plan"));
         assert!(loaded.clone().validate().is_err(), "new saves must still refuse unusable launch settings");
         assert_eq!(loaded.agents["codex"].model.as_deref(), Some("keep-model"));
+    }
+
+    #[test]
+    fn multiple_unavailable_paths_can_be_repaired_and_saved_one_at_a_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let settings = super::super::AppSettings {
+            default_shell: Some("/missing/configured-shell".into()),
+            agents: BTreeMap::from([
+                ("claude".into(), AgentLaunchSettings { executable: Some("/missing/claude-wrapper".into()), permission_mode: Some("plan".into()), ..Default::default() }),
+                ("codex".into(), AgentLaunchSettings { executable: Some("/missing/codex-wrapper".into()), permission_mode: Some("readOnly".into()), ..Default::default() }),
+            ]), ..Default::default()
+        };
+        std::fs::write(&path, toml::to_string(&settings).unwrap()).unwrap();
+        let mut current = super::super::load(&path).unwrap();
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut repaired = current.clone();
+            repaired.agents.get_mut(provider_key(provider)).unwrap().executable = Some("/bin/sh".into());
+            repaired.clone().validate_transition(&current).unwrap();
+            super::super::save_merged(&path, &current, &repaired).unwrap();
+            current = super::super::load(&path).unwrap();
+            assert_eq!(current.agents[provider_key(provider)].executable.as_deref(), Some("/bin/sh"));
+        }
+        let mut repaired = current.clone(); repaired.default_shell = Some("/bin/sh".into());
+        super::super::save_merged(&path, &current, &repaired).unwrap();
+        let loaded = super::super::load(&path).unwrap();
+        assert_eq!(loaded, repaired);
+        assert_eq!(loaded.agents["claude"].permission_mode.as_deref(), Some("plan"));
+        assert_eq!(loaded.agents["codex"].permission_mode.as_deref(), Some("readOnly"));
+        loaded.validate().unwrap();
     }
 
     #[test]

@@ -1598,6 +1598,21 @@ impl AppSettings {
         self.validate_with_agent_launches(true)
     }
 
+    /// Validate edited launch fields while retaining unavailable saved paths
+    /// and policy in other fields. Each selected launch still validates fully.
+    pub fn validate_transition(self, previous: &Self) -> Result<Self, SettingsError> {
+        if self.default_shell != previous.default_shell && self.default_shell.as_deref().is_some_and(|path| !agents::executable_available(path)) {
+            return Err(SettingsError::AgentLaunch("Default shell must be an absolute path to an executable file.".into()));
+        }
+        for provider in crate::agent::Provider::ALL {
+            let key = agents::provider_key(provider);
+            if let Some(configuration) = self.agents.get(key) {
+                configuration.validate_changes(previous.agents.get(key).unwrap_or(&AgentLaunchSettings::default()), provider).map_err(SettingsError::AgentLaunch)?;
+            }
+        }
+        self.validate_with_agent_launches(false)
+    }
+
     fn validate_with_agent_launches(mut self, check_launches: bool) -> Result<Self, SettingsError> {
         // Loading must retain pinned launch policy even if a binary disappears.
         // New edits are validated here; each actual launch validates again.
@@ -1909,14 +1924,15 @@ pub fn save_merged(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
-    let current = load_unlocked(path)?.settings;
-    let mut current = toml::Value::try_from(current)?;
+    let previous = load_unlocked(path)?.settings;
+    let mut current = toml::Value::try_from(&previous)?;
     merge_changed_fields(
         &toml::Value::try_from(base)?,
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let settings = current.try_into::<AppSettings>()?.validate_transition(&previous)?;
+    save_validated_unlocked(path, &settings)
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
@@ -1976,6 +1992,10 @@ pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), Settin
 
 fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
     let settings = settings.clone().validate()?;
+    save_validated_unlocked(path, &settings)
+}
+
+fn save_validated_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
     let directory = open_private_directory(parent)?;
