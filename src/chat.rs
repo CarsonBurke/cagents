@@ -887,6 +887,10 @@ pub struct Snapshot {
     /// and autonomous turns, even when publications coalesce the idle state.
     #[serde(default)]
     pub turn_generation: u64,
+    /// Daemon source-clock time at the observed turn boundary. Kept in resident
+    /// metadata so a first attachment can time work whose prompt is paged out.
+    #[serde(default)]
+    pub turn_started_at: Option<u64>,
     /// Daemon wall-clock time when a provider-confirmed turn and its delegated
     /// work finished. Historical imports without an observed turn have no time.
     #[serde(default)]

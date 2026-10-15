@@ -1497,6 +1497,9 @@ pub(super) struct Runtime {
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
     source_clock: Option<chat::client::SourceClock>,
+    /// Tiny interaction metadata survives transcript window/cache eviction.
+    turn_started_at: Option<u64>,
+    turn_prompt_id: Option<String>,
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
     /// Only the latest explicitly requested preview is retained outside recency.
@@ -2068,6 +2071,8 @@ impl Runtime {
                 ..Snapshot::default()
             }),
             source_clock: None,
+            turn_started_at: None,
+            turn_prompt_id: None,
             finished_stamp: None,
             connection,
             queued: None,
@@ -2494,6 +2499,34 @@ impl Runtime {
             {
                 self.asked_after.insert(last.id.clone());
             }
+        }
+        fn latest_user(state: &Snapshot) -> Option<&Arc<chat::Item>> {
+            state.items.iter().rev().find(|item| {
+                item.role == chat::Role::User
+                    && matches!(
+                        item.content,
+                        ItemContent::Text {
+                            thinking: false,
+                            ..
+                        }
+                    )
+            })
+        }
+        let current_user = latest_user(&snapshot);
+        let previous_user = latest_user(&self.snapshot);
+        let new_turn = snapshot.turn_generation != self.snapshot.turn_generation
+            || snapshot.session_id != self.snapshot.session_id
+            || (!self.snapshot.busy && snapshot.busy);
+        if new_turn {
+            self.turn_prompt_id = None;
+            self.turn_started_at = snapshot.turn_started_at;
+        }
+        if self.turn_prompt_id.is_none()
+            && let Some(user) = current_user
+            && previous_user.is_none_or(|previous| previous.id != user.id)
+        {
+            self.turn_started_at = user.started_at.or(user.at).or(self.turn_started_at);
+            self.turn_prompt_id = Some(user.id.clone());
         }
         self.source_clock = source_clock;
         let cache = &self.cache;
