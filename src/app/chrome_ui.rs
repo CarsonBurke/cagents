@@ -1068,7 +1068,7 @@ enum PaneMenuCommand {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct PaneMenu(CardId, PaneMenuCommand);
+struct PaneMenu<'a>(CardId, PaneMenuCommand, &'a palette_ui::PaletteOrigin);
 
 impl PaneMenuCommand {
     fn command(self) -> workspace_widget::GlobalShortcut {
@@ -1095,12 +1095,32 @@ mod command_registry_tests {
     use super::*;
 
     #[test]
+    fn emitted_pane_menu_refuses_a_replacement_generation_before_dispatch() {
+        for command in [PaneMenuCommand::Close, PaneMenuCommand::CopyPath, PaneMenuCommand::EndConversation] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let directory = tempfile::tempdir().unwrap();
+            drop(app.new_native_chat(crate::agent::Provider::Codex, Some(directory.path().into())));
+            let card = app.workspace.focused().unwrap();
+            let origin = app.pane_command_origin(card);
+            let old_message = widget::menu::Action::message(&PaneMenu(card, command, &origin));
+            app.card_state_mut(card).unwrap().generation += 1;
+            let before = app.durable.cards.len();
+            drop(app.update(old_message));
+            assert_eq!(app.durable.cards.len(), before);
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.notices.recent().any(|entry| entry.notice.message.contains("original pane or document changed")));
+        }
+    }
+
+    #[test]
     fn palette_every_pane_context_menu_command_maps_to_a_registered_id() {
         let card = CardId::new();
         let target = chat_ui::Target {
             card,
             generation: 1,
         };
+        let app = super::super::tests::context_inspector_test_app(false);
+        let origin = app.pane_command_origin(card);
         for menu in [
             PaneMenuCommand::Rename,
             PaneMenuCommand::Clone,
@@ -1119,8 +1139,8 @@ mod command_registry_tests {
             let descriptor = workspace_widget::shortcut_descriptor(menu.command());
             assert!(!descriptor.id().is_empty());
             assert!(!descriptor.label.is_empty());
-            match widget::menu::Action::message(&PaneMenu(card, menu)) {
-                Message::Palette(palette_ui::Action::RunPane(id, command)) => {
+            match widget::menu::Action::message(&PaneMenu(card, menu, &origin)) {
+                Message::Palette(palette_ui::Action::RunPane(id, command, _)) => {
                     assert_eq!(id, card);
                     assert_eq!(command, menu.command());
                     assert!(!matches!(
@@ -1128,11 +1148,11 @@ mod command_registry_tests {
                         PaneMenuCommand::Fork(_) | PaneMenuCommand::ReviewChanges(_)
                     ));
                 }
-                Message::Palette(palette_ui::Action::MovePaneToChannel(id, channel)) => {
+                Message::Palette(palette_ui::Action::MovePaneToChannel(id, channel, _)) => {
                     assert_eq!(id, card);
                     assert!(menu == PaneMenuCommand::MoveTo(channel));
                 }
-                Message::Palette(palette_ui::Action::RunChatPane(actual, command)) => {
+                Message::Palette(palette_ui::Action::RunChatPane(actual, command, _)) => {
                     assert_eq!(
                         actual, target,
                         "retain the conversation generation captured by the menu"
@@ -1149,17 +1169,17 @@ mod command_registry_tests {
     }
 }
 
-impl widget::menu::Action for PaneMenu {
+impl widget::menu::Action for PaneMenu<'_> {
     type Message = Message;
     fn message(&self) -> Message {
         let action = match self.1 {
             PaneMenuCommand::MoveTo(channel) => {
-                palette_ui::Action::MovePaneToChannel(self.0, channel)
+                palette_ui::Action::MovePaneToChannel(self.0, channel, Arc::new(self.2.clone()))
             }
             PaneMenuCommand::Fork(target) | PaneMenuCommand::ReviewChanges(target) => {
-                palette_ui::Action::RunChatPane(target, self.1.command())
+                palette_ui::Action::RunChatPane(target, self.1.command(), Arc::new(self.2.clone()))
             }
-            _ => palette_ui::Action::RunPane(self.0, self.1.command()),
+            _ => palette_ui::Action::RunPane(self.0, self.1.command(), Arc::new(self.2.clone())),
         };
         Message::Palette(action)
     }
@@ -2495,7 +2515,9 @@ impl Cagents {
         // Destination metadata can change without changing this pane. The
         // daemon's model epoch retires an open menu before its Move payloads
         // could be replaced under the pointer, without cloning every channel.
+        let origin = self.pane_command_origin(id);
         let menu_identity = (
+            origin.clone(),
             self.workspace_model.identity,
             self.workspace_model.sequence,
             id,
@@ -2510,37 +2532,37 @@ impl Cagents {
                 widget::menu::Item::Button(
                     "Rename…".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::Rename),
+                    PaneMenu(id, PaneMenuCommand::Rename, &origin),
                 ),
                 widget::menu::Item::Button(
                     "Clone pane".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::Clone),
+                    PaneMenu(id, PaneMenuCommand::Clone, &origin),
                 ),
                 widget::menu::Item::Button(
                     "Copy path".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::CopyPath),
+                    PaneMenu(id, PaneMenuCommand::CopyPath, &origin),
                 ),
                 widget::menu::Item::Button(
                     "Reveal in Projects".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::Reveal),
+                    PaneMenu(id, PaneMenuCommand::Reveal, &origin),
                 ),
                 widget::menu::Item::Button(
                     "Close other panes".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::CloseOthers),
+                    PaneMenu(id, PaneMenuCommand::CloseOthers, &origin),
                 ),
                 widget::menu::Item::Button(
                     "Close panes to the right".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::CloseToRight),
+                    PaneMenu(id, PaneMenuCommand::CloseToRight, &origin),
                 ),
                 widget::menu::Item::Button(
                     "Close pane".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::Close),
+                    PaneMenu(id, PaneMenuCommand::Close, &origin),
                 ),
             ];
             if self
@@ -2550,28 +2572,28 @@ impl Cagents {
                 entries.push(widget::menu::Item::Button(
                     "Close conversation…".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::EndConversation),
+                    PaneMenu(id, PaneMenuCommand::EndConversation, &origin),
                 ));
             }
             if self.chat_switch_available(id) && self.chat_switch_ready(id) {
                 entries.push(widget::menu::Item::Button(
                     self.chat_switch_label(id).into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::Switch),
+                    PaneMenu(id, PaneMenuCommand::Switch, &origin),
                 ));
             }
             if let Some(target) = self.chat_fork_target(id) {
                 entries.push(widget::menu::Item::Button(
                     "Fork conversation…".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::Fork(target)),
+                    PaneMenu(id, PaneMenuCommand::Fork(target), &origin),
                 ));
             }
             if let Some(target) = self.chat_changes_target(id) {
                 entries.push(widget::menu::Item::Button(
                     "Review file changes".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::ReviewChanges(target)),
+                    PaneMenu(id, PaneMenuCommand::ReviewChanges(target), &origin),
                 ));
             }
             let destinations = self.pane_move_destinations(id);
@@ -2583,7 +2605,7 @@ impl Cagents {
                     widget::menu::Item::Button(
                         format!("Move to {}", self.pane_move_destination_label(channel)),
                         None,
-                        PaneMenu(id, PaneMenuCommand::MoveTo(channel.id)),
+                        PaneMenu(id, PaneMenuCommand::MoveTo(channel.id), &origin),
                     )
                 }));
             }
@@ -2591,7 +2613,7 @@ impl Cagents {
                 entries.push(widget::menu::Item::Button(
                     "Move to channel…".into(),
                     None,
-                    PaneMenu(id, PaneMenuCommand::MoveToChannel),
+                    PaneMenu(id, PaneMenuCommand::MoveToChannel, &origin),
                 ));
             }
             entries.retain(|entry| match entry {
@@ -2602,7 +2624,7 @@ impl Cagents {
             });
             fn group(entry: &widget::menu::Item<PaneMenu, String>) -> u8 {
                 match entry {
-                    widget::menu::Item::Button(_, _, PaneMenu(_, command)) => match command {
+                    widget::menu::Item::Button(_, _, PaneMenu(_, command, _)) => match command {
                         PaneMenuCommand::Rename
                         | PaneMenuCommand::Clone
                         | PaneMenuCommand::Fork(_) => 0,

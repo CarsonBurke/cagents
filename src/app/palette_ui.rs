@@ -13,6 +13,7 @@ pub(super) struct State {
     panes_only: bool,
     sidebar_target: Option<sidebar::commands::CommandTarget>,
     move_pane: Option<CardId>,
+    move_origin: Option<Arc<PaletteOrigin>>,
     move_destinations: Vec<(crate::model::ChannelId, String)>,
     git_target: Option<sidebar::git_commands::GitTarget>,
     git_captured: bool,
@@ -41,14 +42,14 @@ pub enum Action {
         Command,
         crate::repository::StashEntry,
     ),
-    MovePaneToChannel(CardId, crate::model::ChannelId),
+    MovePaneToChannel(CardId, crate::model::ChannelId, Arc<PaletteOrigin>),
     Close,
     Query(String),
     Run(u64, MessageBox),
     Submit,
     FocusPane(CardId),
-    RunPane(CardId, Command),
-    RunChatPane(chat_ui::Target, Command),
+    RunPane(CardId, Command, Arc<PaletteOrigin>),
+    RunChatPane(chat_ui::Target, Command, Arc<PaletteOrigin>),
 }
 /// One small shared context per result pass, rather than one document/path
 /// copy per row. Global commands do not acquire a pane-relative dependency.
@@ -120,7 +121,7 @@ fn entry_key(message: &Message) -> String {
             format!("command:{}", command.id())
         }
         Message::Palette(Action::RunGitStash(_, command, _)) => format!("command:{}", command.id()),
-        Message::Palette(Action::MovePaneToChannel(_, _)) => {
+        Message::Palette(Action::MovePaneToChannel(_, _, _)) => {
             format!("command:{}", Command::MovePaneToChannel.id())
         }
         Message::Palette(Action::FocusPane(id))
@@ -175,9 +176,9 @@ fn same_palette_entry(left: &Message, right: &Message) -> bool {
             Message::Palette(Action::RunGitStash(rt, rc, re)),
         ) => lt == rt && lc == rc && le.reference == re.reference && le.oid == re.oid,
         (
-            Message::Palette(Action::MovePaneToChannel(lc, lt)),
-            Message::Palette(Action::MovePaneToChannel(rc, rt)),
-        ) => lc == rc && lt == rt,
+            Message::Palette(Action::MovePaneToChannel(lc, lt, lo)),
+            Message::Palette(Action::MovePaneToChannel(rc, rt, ro)),
+        ) => lc == rc && lt == rt && lo == ro,
         (
             Message::Sidebar(SidebarAction::OpenWorktree {
                 project_id: lp,
@@ -523,6 +524,7 @@ impl Cagents {
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
                 self.palette.move_pane = None;
+                self.palette.move_origin = None;
                 self.palette.move_destinations.clear();
                 self.reset_palette_selection();
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
@@ -617,7 +619,8 @@ impl Cagents {
                     }
                 }
             }
-            Action::MovePaneToChannel(card, channel) => {
+            Action::MovePaneToChannel(card, channel, origin) => {
+                if self.pane_command_origin(card) != *origin { return self.stale_pane_command(); }
                 self.update(Message::MovePaneToChannel { card, channel })
             }
             Action::MovePane(card) => {
@@ -639,6 +642,7 @@ impl Cagents {
                 }
                 let task = self.update_palette(Action::Open);
                 self.palette.move_pane = Some(card);
+                self.palette.move_origin = Some(Arc::new(self.pane_command_origin(card)));
                 self.palette.move_destinations = destinations;
                 self.reset_palette_selection();
                 task
@@ -657,6 +661,7 @@ impl Cagents {
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
                 self.palette.move_pane = None;
+                self.palette.move_origin = None;
                 self.palette.move_destinations.clear();
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
@@ -674,7 +679,7 @@ impl Cagents {
                 if generation != self.palette.generation { return Task::none(); }
                 self.activate_palette_entry(*message)
             },
-            Action::RunChatPane(target, command) => {
+            Action::RunChatPane(target, command, origin) => {
                 let current = match command {
                     Command::ForkConversation => self.chat_fork_target(target.card),
                     Command::ReviewConversationChanges => self.chat_changes_target(target.card),
@@ -686,17 +691,18 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                self.update_palette(Action::RunPane(target.card, command))
+                self.update_palette(Action::RunPane(target.card, command, origin))
             }
-            Action::RunPane(id, command) => match self.pane_command_message(id, command) {
-                Some(message) => self.update(message),
-                None => {
-                    self.status = Some(TransientNotice::warning(
-                        "This pane command is no longer available",
-                    ));
-                    Task::none()
+            Action::RunPane(id, command, origin) => {
+                if self.pane_command_origin(id) != *origin { return self.stale_pane_command(); }
+                match self.pane_command_message(id, command) {
+                    Some(message) => self.update(message),
+                    None => {
+                        self.status = Some(TransientNotice::warning("This pane command is no longer available"));
+                        Task::none()
+                    }
                 }
-            },
+            }
             Action::FocusPane(id) => {
                 let Some(card) = self.card_state(id).filter(|card| card.existence.is_open()) else {
                     return Task::none();
@@ -752,6 +758,7 @@ impl Cagents {
         self.palette.query = None;
         self.palette.selected_message = None;
         self.palette.move_pane = None;
+                self.palette.move_origin = None;
         self.palette.move_destinations.clear();
         self.palette.stash_picker = None;
         let command = self.update(message);
@@ -1132,6 +1139,8 @@ impl Cagents {
                 .collect();
         }
         if let Some(card) = self.palette.move_pane {
+            let Some(origin) = self.palette.move_origin.as_ref() else { return Vec::new(); };
+            if self.pane_command_origin(card) != **origin { return Vec::new(); }
             let (_, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
             let mut entries: Vec<_> = self
                 .palette
@@ -1142,7 +1151,7 @@ impl Cagents {
                         (
                             score,
                             label.clone(),
-                            Message::Palette(Action::MovePaneToChannel(card, *channel)),
+                            Message::Palette(Action::MovePaneToChannel(card, *channel, origin.clone())),
                         )
                     })
                 })
@@ -1394,7 +1403,7 @@ impl Cagents {
                     Message::Palette(Action::RunGitStash(target, command, entry)) => target
                         .stash_action(&self.sidebar_model, &self.sidebar_state, *command, entry)
                         .is_some(),
-                    Message::Palette(Action::MovePaneToChannel(card, channel)) => {
+                    Message::Palette(Action::MovePaneToChannel(card, channel, _)) => {
                         self.can_move_pane_to_channel(*card, *channel)
                     }
                     _ => true,
@@ -1783,8 +1792,20 @@ impl Cagents {
         flags
     }
 
+    fn stale_pane_command(&mut self) -> Task<Message> {
+        self.status = Some(TransientNotice::warning("The original pane or document changed; open its menu again"));
+        Task::none()
+    }
+
     fn palette_origin(&self) -> PaletteOrigin {
-        let card = self.workspace.focused();
+        self.command_origin(self.workspace.focused(), true)
+    }
+
+    pub(super) fn pane_command_origin(&self, card: CardId) -> PaletteOrigin {
+        self.command_origin(Some(card), false)
+    }
+
+    fn command_origin(&self, card: Option<CardId>, workspace: bool) -> PaletteOrigin {
         let state = card.and_then(|card| self.card_state(card));
         let repository = card.and_then(|card| match self.cards.get(&card) {
             Some(CardRuntime::Repository(runtime)) => Some(runtime.command_target(card)),
@@ -1793,12 +1814,13 @@ impl Cagents {
         PaletteOrigin {
             pane: state.map(|state| (state.id, state.generation)),
             session: state.and_then(|state| match &state.kind { CardKind::Terminal(session) => Some(session.id), CardKind::Chat(session) => Some(session.id), _ => None }),
-            chat: card.and_then(|card| match self.cards.get(&card) { Some(CardRuntime::Chat(runtime)) => Some(runtime.target), _ => None }),
+            chat: card.and_then(|card| match self.cards.get(&card) { Some(CardRuntime::Chat(runtime)) => Some(runtime.target), _ => self.parked_chat_runtime(card).map(|runtime| runtime.target) }),
             browser: state.and_then(|state| match &state.kind { CardKind::Browser(session) => Some((session.id, session.history_index, *blake3::hash(session.current_url.as_str().as_bytes()).as_bytes())), _ => None }),
             repository,
             directory: state.and_then(super::worktree_ui::card_directory).map(Path::to_path_buf),
-            workspace: self.active_workspace.clone(), channel: self.durable.active_channel,
-            worktree: self.sidebar_state.active_worktree().cloned(),
+            workspace: workspace.then(|| self.active_workspace.clone()).flatten(),
+            channel: workspace.then_some(self.durable.active_channel).flatten(),
+            worktree: workspace.then(|| self.sidebar_state.active_worktree().cloned()).flatten(),
         }
     }
 
