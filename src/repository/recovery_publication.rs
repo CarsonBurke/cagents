@@ -41,6 +41,7 @@ struct Holding {
     parent: fs_safety::Root,
     files: Vec<Arc<fs::File>>,
     private_metadata: fs::Metadata,
+    target: Option<(WorktreeAuthority, RepoPath)>,
     context: FilesystemRecoveryContext,
     // Native owners above close before their creation/private charge releases.
     slot: Option<RecoverySlot>,
@@ -87,8 +88,28 @@ impl Holding {
             private_metadata,
             slot: Some(slot),
             files: vec![],
+            target: None,
             context,
         })
+    }
+    fn verify_target(&self, name: &OsStr) -> Result<(), String> {
+        let (source, path) = self
+            .target
+            .as_ref()
+            .ok_or("Original source-relative Undo target is unavailable")?;
+        source.validate().map_err(|e| e.to_string())?;
+        let root = source.retained_worktree_root();
+        let (actual, actual_name) =
+            fs_safety::open_parent_beneath(&root, path.as_path()).map_err(|e| e.to_string())?;
+        let original = self.parent.metadata().map_err(|e| e.to_string())?;
+        let named = actual.metadata().map_err(|e| e.to_string())?;
+        if actual_name != name || (original.dev(), original.ino()) != (named.dev(), named.ino()) {
+            return Err(
+                "The original source-relative Undo parent changed; no replacement was modified"
+                    .into(),
+            );
+        }
+        Ok(())
     }
     fn root(&self) -> &fs_safety::Root {
         self.publication.directory()
@@ -564,6 +585,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         name: &OsStr,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, String> {
+        holding.target = Some((source.clone(), entry.path.clone()));
+        holding.verify_target(name)?;
         holding.validate()?;
         let materialized = match &entry.before {
             SavedEntry::Absent => None,
@@ -655,6 +678,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let before_publication: Result<(), String> = (|| {
             if current.is_some() {
                 holding.validate()?;
+                holding.verify_target(name)?;
                 fs_safety::rename_new_between(
                     &holding.parent,
                     name,
@@ -716,6 +740,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             holding.validate()?;
             fs_safety::sync_directory(holding.root()).map_err(|error| error.to_string())?;
+            holding.verify_target(name)?;
             if let Some((generated, _)) = &materialized {
                 fs_safety::rename_new_between(
                     holding.root(),
@@ -734,6 +759,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 holding
                     .validate()
                     .and_then(|()| proof.same_identity(holding, previous))
+                    .and_then(|()| holding.verify_target(name))
                     .and_then(|()| {
                         fs_safety::rename_new_between(
                             holding.root(),
