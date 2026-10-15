@@ -222,6 +222,7 @@ fn schema17_upgrade_preserves_issued_end_and_all_stored_authority_before_locate(
         let count: u64 = registry.db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap();
         assert!(count > 0, "preservation fixture must populate {table}");
     }
+    super::super::automation_extensions_schema::discard_for_legacy_fixture(&registry.db);
     registry.db.pragma_update(None, "user_version", 17).unwrap();
     let before = super::super::schema::stored_contents(&registry.db);
     let issued = located_source_json(&registry, pane.id);
@@ -231,8 +232,19 @@ fn schema17_upgrade_preserves_issued_end_and_all_stored_authority_before_locate(
     let path = directory.path().join("model.sqlite3");
     for _ in 0..2 {
         let registry = Registry::at(&path).unwrap();
-        assert_eq!(registry.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 18);
-        assert_eq!(super::super::schema::stored_contents(&registry.db), before);
+        assert_eq!(registry.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), super::super::SCHEMA_VERSION);
+        let migrated=super::super::schema::stored_contents(&registry.db);
+        for (name,ddl,rows) in &before {
+            let (_,current_ddl,current_rows)=migrated.iter().find(|(table,_,_)|table==name).expect("original table retained");
+            if name=="metadata" {
+                let columns=rows.first().map(Vec::len).unwrap_or(0);
+                let original_columns:Vec<_>=current_rows.iter().map(|row|row[..columns].to_vec()).collect();
+                assert_eq!(&original_columns,rows,"original metadata unchanged");
+            } else {
+                assert_eq!(current_ddl,ddl,"original {name} layout unchanged");
+                assert_eq!(current_rows,rows,"original {name} authority unchanged");
+            }
+        }
         assert_eq!(registry.agent(accepted.agent.id).unwrap(), agent);
         assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
         assert_eq!(located_source_json(&registry, pane.id), issued);
