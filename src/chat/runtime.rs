@@ -373,6 +373,7 @@ impl Handle {
                     login_recovery: None,
                     dirty: false,
                     activity: ActivityState::Idle,
+                    activity_outcome: None,
                     ready: false,
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
@@ -1569,6 +1570,7 @@ struct Actor {
     login_recovery: Option<String>,
     dirty: bool,
     activity: ActivityState,
+    activity_outcome: Option<crate::agent::ActivityOutcome>,
     /// Whether the provider was taking prompts when activity was last published.
     ready: bool,
     attention: TurnAttention,
@@ -2385,7 +2387,9 @@ impl Actor {
         self.ready = state.ready;
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
-        if activity != self.activity {
+        let activity_changed = activity != self.activity;
+        let outcome_changed = outcome != self.activity_outcome;
+        if activity_changed {
             self.activity = activity;
             if let Some((run, update)) = self.execution.activity(activity) {
                 (self.notify)(Update::Execution { run, update });
@@ -2396,11 +2400,10 @@ impl Actor {
                     kind: crate::notifications::Kind::Waiting,
                 }));
             }
-            (self.notify)(Update::Activity {
-                state: activity,
-                generation,
-                outcome,
-            });
+        }
+        if activity_changed || outcome_changed {
+            self.activity_outcome = outcome.clone();
+            (self.notify)(Update::Activity { state: activity, generation, outcome });
         }
         if became_ready {
             (self.notify)(Update::Ready);
@@ -3047,6 +3050,40 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unchanged_idle_activity_publishes_new_outcomes_once_with_their_reason() {
+        struct ActivityFixture;
+        impl Adapter for ActivityFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step { events: vec![Event::Ready(true)], ..Default::default() })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        let spec = ProcessSpec { execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,
+            program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:BTreeMap::new() };
+        let mut adapter:Box<dyn Adapter> = Box::new(ActivityFixture);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec,&mut initial).unwrap();
+        let (send,receive) = crossbeam_channel::unbounded();
+        let handle = Handle::start(spec,adapter,initial,store,None,move |update| { let _ = send.send(update); }).unwrap();
+        until(&handle,|snapshot| snapshot.ready);
+        receive.try_iter().for_each(drop);
+        for outcome in [crate::agent::ActivityOutcome::Failed { reason:"Provider exited with status 3".into() }, crate::agent::ActivityOutcome::Succeeded] {
+            {
+                let mut state = handle.0.state.lock().unwrap();
+                state.outcome = Some(outcome.clone());
+                state.generation += 1;
+            }
+            handle.command(Command::Compact).unwrap();
+            let updates = receive.try_iter().filter_map(|update| match update { Update::Activity { state,outcome,.. } => Some((state,outcome)), _ => None }).collect::<Vec<_>>();
+            assert_eq!(updates,vec![(ActivityState::Idle,Some(outcome))]);
+            handle.command(Command::Compact).unwrap();
+            assert!(!receive.try_iter().any(|update| matches!(update,Update::Activity { .. })));
+        }
+        handle.close().unwrap();
+    }
+
     #[test]
     fn prompt_suggestion_metadata_cannot_survive_a_turn_session_or_process_boundary() {
         let mut state = Snapshot {
