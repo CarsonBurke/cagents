@@ -1530,7 +1530,7 @@ mod tests {
             let matched: Element<'static, Message> = if nested {
                 widget::scrollable(widget::container(widget::scrollable(widget::container(prose).width(4000))
                     .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
-                    .id(inner.clone())).width(6000))
+                    .width(600).id(inner.clone())).width(6000))
                     .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
                     .id(outer.clone()).into()
             } else { prose };
