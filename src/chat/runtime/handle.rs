@@ -585,13 +585,21 @@ impl Handle {
             Owner::Remote(remote) => remote.close(),
         }
     }
-    pub(crate) fn fence_session_stop_until(&self, actor_id: uuid::Uuid, deadline: std::time::Instant) -> Result<(), String> {
+    pub(crate) fn fence_session_stop_until(
+        &self,
+        actor_id: uuid::Uuid,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.fence_session_stop_until(actor_id, deadline),
             Owner::Remote(remote) => remote.fence_session_stop_until(actor_id, deadline),
         }
     }
-    pub(crate) fn stop_session_until(&self, actor_id: uuid::Uuid, deadline: std::time::Instant) -> Result<(), String> {
+    pub(crate) fn stop_session_until(
+        &self,
+        actor_id: uuid::Uuid,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
         self.fence_session_stop_until(actor_id, deadline)?;
         self.close_until(deadline)
     }

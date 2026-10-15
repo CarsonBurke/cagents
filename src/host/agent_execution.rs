@@ -1212,7 +1212,9 @@ fn create_console_with_restart(
         let receipt = if let Some((_, source)) = restart {
             let current = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                let record = state.chats.get(&session.id)
+                let record = state
+                    .chats
+                    .get(&session.id)
                     .filter(|record| record.handle.same_actor(handle))
                     .ok_or("The restarted provider changed before its pair was saved")?;
                 let mut current = record.session.clone();
@@ -1221,12 +1223,20 @@ fn create_console_with_restart(
                 current
             };
             Some(chat::RestartReceipt::confirm(source.clone(), current)?)
-        } else { None };
-        let mut registry = registry.lock().unwrap_or_else(|p|p.into_inner());
-        if let Some((previous,_)) = restart {
-            registry.rebind_restarted_agent(previous, receipt.as_ref().ok_or("The restart receipt disappeared")?)?;
         } else {
-            let expected = registry.agent(agent)?.session.ok_or("Provider binding disappeared")?;
+            None
+        };
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((previous, _)) = restart {
+            registry.rebind_restarted_agent(
+                previous,
+                receipt.as_ref().ok_or("The restart receipt disappeared")?,
+            )?;
+        } else {
+            let expected = registry
+                .agent(agent)?
+                .session
+                .ok_or("Provider binding disappeared")?;
             registry.bind_agent_console(agent, &expected, descriptor.session.clone())?;
         }
         Ok::<_, String>(receipt)

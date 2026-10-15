@@ -215,8 +215,13 @@ impl HostState {
                     Disposition::Blocked,
                     "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
                 )
-            } else if !aligned || (launch.terminal_recipe().is_none()
-                && !matches!(record.handle.native_continuity(), crate::chat::NativeContinuity::RetainedClaudeActor { .. })) {
+            } else if !aligned
+                || (launch.terminal_recipe().is_none()
+                    && !matches!(
+                        record.handle.native_continuity(),
+                        crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+                    ))
+            {
                 (
                     Disposition::Blocked,
                     "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.",

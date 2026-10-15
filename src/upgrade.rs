@@ -599,16 +599,23 @@ pub(crate) mod handoff {
 
         /// The oldest version that can hold this checkpoint.
         fn format(&self) -> u16 {
-            if self.chats.iter().any(|chat| matches!(chat.source.native_continuity, chat::NativeContinuity::RetainedClaudeActor { .. })) {
+            if self.chats.iter().any(|chat| {
+                matches!(
+                    chat.source.native_continuity,
+                    chat::NativeContinuity::RetainedClaudeActor { .. }
+                )
+            }) {
                 // Old readers cannot authenticate this actor or its input/outbox
                 // ownership and must never relaunch its issued recipe.
                 5
             } else if self.preserve_carried {
                 // Older readers may relaunch a missing carried holder.
                 4
-            } else if self.chats.iter().any(|chat| {
-                chat.source.native_continuity.retains_provider()
-            }) {
+            } else if self
+                .chats
+                .iter()
+                .any(|chat| chat.source.native_continuity.retains_provider())
+            {
                 // Older readers would ignore this metadata and relaunch a
                 // recipe while its native holder still owns the server.
                 3
@@ -806,7 +813,11 @@ pub(crate) mod handoff {
                 }
                 source_proof(chat.source.proof.clone(), &mut proofs)?;
                 validate_chat_source(&chat.source, &chat.launch)?;
-                if matches!(chat.source.native_continuity, chat::NativeContinuity::RetainedClaudeActor { .. }) && chat.launch.session_id.is_none() {
+                if matches!(
+                    chat.source.native_continuity,
+                    chat::NativeContinuity::RetainedClaudeActor { .. }
+                ) && chat.launch.session_id.is_none()
+                {
                     // The exact retained actor, not a guessed provider thread,
                     // owns this pre-first-result conversation. IDs above remain
                     // unique and adoption independently proves the actor record.
@@ -844,17 +855,22 @@ pub(crate) mod handoff {
         }
         let mut confirmed = source.launch.clone();
         confirmed.session_id = launch.session_id.clone();
-        if matches!(source.native_continuity, chat::NativeContinuity::RetainedClaudeActor { .. }) && launch.session_id.is_none() {
+        if matches!(
+            source.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { .. }
+        ) && launch.session_id.is_none()
+        {
             if source.launch != *launch {
                 return Err("Unnamed retained Claude source recipe is inconsistent".into());
             }
         } else {
-        let recipe = confirmed
-            .terminal_recipe()
-            .ok_or("Native chat has no exact resumable provider identity")?;
-        if source.launch.provider != launch.provider || Some(recipe) != launch.terminal_recipe() {
-            return Err("Upgrade native source recipe is inconsistent".into());
-        }
+            let recipe = confirmed
+                .terminal_recipe()
+                .ok_or("Native chat has no exact resumable provider identity")?;
+            if source.launch.provider != launch.provider || Some(recipe) != launch.terminal_recipe()
+            {
+                return Err("Upgrade native source recipe is inconsistent".into());
+            }
         }
         if let Some(terminal) = &source.terminal
             && (terminal.id != source.id
@@ -1783,28 +1799,48 @@ mod tests {
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,
-                recipe: LaunchRecipe { program: "claude".into(), arguments: vec!["--print".into()],
-                    working_directory: directory.path().into(), environment: Default::default(), unset_environment: Default::default() },
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec!["--print".into()],
+                    working_directory: directory.path().into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
                 session_id: None,
             },
-            proof: Some(checkpoint.proof.clone()), terminal: None, owned_codex_listener: None,
+            proof: Some(checkpoint.proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
             native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 1 },
         };
-        checkpoint.chats.push(handoff::Chat {launch:source.launch.clone(),source:source.clone(),previous_sources:Vec::new()});
+        checkpoint.chats.push(handoff::Chat {
+            launch: source.launch.clone(),
+            source: source.clone(),
+            previous_sources: Vec::new(),
+        });
         store.save(&checkpoint).unwrap();
-        let restored=store.load().unwrap().unwrap();
+        let restored = store.load().unwrap().unwrap();
         restored.validate().unwrap();
-        assert_eq!(restored.chats[0].source,source);
-        let mut saved:serde_json::Value=serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
-        assert_eq!(saved["version"],5);
-        saved["version"]=4.into();
-        fs::write(&store.path,serde_json::to_vec(&saved).unwrap()).unwrap();
-        assert!(store.load().is_err(),"old reader cannot relaunch an unnamed retained actor");
-        let mut wrong=restored;
-        wrong.chats[0].launch.recipe.arguments.push("--other-account".into());
+        assert_eq!(restored.chats[0].source, source);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 5);
+        saved["version"] = 4.into();
+        fs::write(&store.path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(
+            store.load().is_err(),
+            "old reader cannot relaunch an unnamed retained actor"
+        );
+        let mut wrong = restored;
+        wrong.chats[0]
+            .launch
+            .recipe
+            .arguments
+            .push("--other-account".into());
         assert!(wrong.validate().is_err());
-        wrong.chats[0].launch=source.launch.clone();
-        wrong.chats[0].source.native_continuity=crate::chat::NativeContinuity::RetainedClaudeActor {protocol:2};
+        wrong.chats[0].launch = source.launch.clone();
+        wrong.chats[0].source.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
         assert!(wrong.validate().is_err());
     }
 

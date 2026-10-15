@@ -27,7 +27,9 @@ struct Capture {
 }
 
 impl Tracker {
-    pub fn has_pending(&self) -> bool { !self.runs.is_empty() }
+    pub fn has_pending(&self) -> bool {
+        !self.runs.is_empty()
+    }
     pub fn active(&self) -> Option<RunId> {
         self.active
     }
@@ -56,10 +58,15 @@ impl Tracker {
         diagnostic: Option<&str>,
         usage: Usage,
     ) -> Vec<(RunId, Update)> {
-        let state = if cancelled { State::Cancelled }
-            else if status.is_some_and(|status| status.success()) { State::Interrupted }
-            else if status.is_some() || diagnostic.is_some() { State::Failed }
-            else { State::Interrupted };
+        let state = if cancelled {
+            State::Cancelled
+        } else if status.is_some_and(|status| status.success()) {
+            State::Interrupted
+        } else if status.is_some() || diagnostic.is_some() {
+            State::Failed
+        } else {
+            State::Interrupted
+        };
         let reason = if cancelled {
             "The agent was stopped before its provider reported a final result".to_owned()
         } else {
@@ -223,7 +230,9 @@ pub(super) fn exit_reason(
             "Provider exited with status {}",
             status.code().unwrap_or_default()
         ),
-        Some(_) => "Provider exited with status 0 before reporting this prompt's final result".into(),
+        Some(_) => {
+            "Provider exited with status 0 before reporting this prompt's final result".into()
+        }
         None => "The provider exited before reporting this prompt's final result".into(),
     };
     let reason = match diagnostic.filter(|message| !message.is_empty()) {
@@ -269,10 +278,21 @@ mod tests {
             tracker.start(run, "request".into()).unwrap();
             // Many tool calls must never imply provider-reported success.
             for index in 0..300 {
-                tracker.observe(run, &Event::Item(crate::chat::Item {
-                    id:format!("tool-{index}"),role:Role::Assistant,started_at:None,at:None,
-                    content:ItemContent::Tool {name:"Bash".into(),input:"true".into(),output:"done".into(),status:crate::chat::ToolStatus::Succeeded},
-                }));
+                tracker.observe(
+                    run,
+                    &Event::Item(crate::chat::Item {
+                        id: format!("tool-{index}"),
+                        role: Role::Assistant,
+                        started_at: None,
+                        at: None,
+                        content: ItemContent::Tool {
+                            name: "Bash".into(),
+                            input: "true".into(),
+                            output: "done".into(),
+                            status: crate::chat::ToolStatus::Succeeded,
+                        },
+                    }),
+                );
             }
             let updates = tracker.ended(
                 stop,

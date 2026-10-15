@@ -1276,7 +1276,8 @@ impl StateStore {
         replacement: &crate::chat::Session,
     ) -> Result<()> {
         if !crate::chat::is_upgrade_recovery(source, replacement)
-            && !crate::chat::is_unnamed_retained_claude_recovery(source, replacement) {
+            && !crate::chat::is_unnamed_retained_claude_recovery(source, replacement)
+        {
             return Err(StoreError::InvalidState(
                 "Upgrade recovery changed the saved conversation configuration or lacks complete distinct ownership proofs".into(),
             ));
@@ -3751,7 +3752,8 @@ fn validate_chat_identity(
             Some("identity")
         } else if stored.launch.provider != session.launch.provider {
             Some("provider")
-        } else if stored.native_continuity.retains_provider() && stored.native_continuity != session.native_continuity
+        } else if stored.native_continuity.retains_provider()
+            && stored.native_continuity != session.native_continuity
         {
             Some("native continuity")
         } else if stored.owned_codex_listener != session.owned_codex_listener
@@ -7371,38 +7373,59 @@ mod tests {
     #[test]
     fn retained_claude_before_first_result_persists_and_keeps_actor_capability() {
         let directory = tempdir().unwrap();
-        let path=directory.path().join("claude.sqlite3");
-        let store=StateStore::open(&path,boot("chat-boot")).unwrap();
-        let (mut workspace,mut source)=agent_workspace(crate::agent::Provider::Claude);
-        source.proof=source.terminal.as_ref().unwrap().continuity.live_proof();
-        source.terminal=None;
-        source.launch.session_id=None;
-        source.launch.recipe.arguments=vec!["--print".into()];
-        source.native_continuity=crate::chat::NativeContinuity::RetainedClaudeActor {protocol:1};
-        let card=workspace.cards[0].id;
-        workspace.cards[0].kind=CardKind::Chat(source.clone());
-        let mut lane=SaveLane::default();
-        lane.save(&store,&workspace).unwrap();
+        let path = directory.path().join("claude.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+        source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+        source.terminal = None;
+        source.launch.session_id = None;
+        source.launch.recipe.arguments = vec!["--print".into()];
+        source.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 1 };
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
         drop(store);
-        let store=StateStore::open(&path,boot("chat-boot")).unwrap();
-        assert_eq!(store.load_card(card,None).unwrap().unwrap().kind,CardKind::Chat(source.clone()));
-        let mut adopted=source.clone();
-        adopted.proof.as_mut().unwrap().host_incarnation="successor-before-first-result".into();
-        let mut changed=adopted.clone();
-        changed.launch.recipe.arguments.push("--different-option".into());
-        assert!(store.rebind_chat_upgrade(card,&source,&changed).is_err());
-        store.rebind_chat_upgrade(card,&source,&adopted).unwrap();
-        store.rebind_chat_upgrade(card,&source,&adopted).unwrap();
-        assert_eq!(store.load_card(card,None).unwrap().unwrap().kind,CardKind::Chat(adopted.clone()));
-        let mut confirmed=adopted;
-        confirmed.launch.session_id=Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
-        workspace.cards[0].kind=CardKind::Chat(confirmed.clone());
-        lane.save(&store,&workspace).unwrap();
-        assert_eq!(store.load_card(card,None).unwrap().unwrap().kind,CardKind::Chat(confirmed.clone()));
-        for continuity in [crate::chat::NativeContinuity::ReconnectOnly,crate::chat::NativeContinuity::RetainedClaudeActor {protocol:2}] {
-            let mut wrong=confirmed.clone();wrong.native_continuity=continuity;
-            workspace.cards[0].kind=CardKind::Chat(wrong);
-            assert!(matches!(card_refusal(lane.save(&store,&workspace),card),StoreError::InvalidState(_)));
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        let mut adopted = source.clone();
+        adopted.proof.as_mut().unwrap().host_incarnation = "successor-before-first-result".into();
+        let mut changed = adopted.clone();
+        changed
+            .launch
+            .recipe
+            .arguments
+            .push("--different-option".into());
+        assert!(store.rebind_chat_upgrade(card, &source, &changed).is_err());
+        store.rebind_chat_upgrade(card, &source, &adopted).unwrap();
+        store.rebind_chat_upgrade(card, &source, &adopted).unwrap();
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(adopted.clone())
+        );
+        let mut confirmed = adopted;
+        confirmed.launch.session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        workspace.cards[0].kind = CardKind::Chat(confirmed.clone());
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(confirmed.clone())
+        );
+        for continuity in [
+            crate::chat::NativeContinuity::ReconnectOnly,
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        ] {
+            let mut wrong = confirmed.clone();
+            wrong.native_continuity = continuity;
+            workspace.cards[0].kind = CardKind::Chat(wrong);
+            assert!(matches!(
+                card_refusal(lane.save(&store, &workspace), card),
+                StoreError::InvalidState(_)
+            ));
         }
     }
 

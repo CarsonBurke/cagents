@@ -509,7 +509,10 @@ impl ClientHandle {
 
     #[cfg(test)]
     pub(crate) fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
-        assert!(super::is_upgrade_recovery(&source, &session) || super::is_unnamed_retained_claude_recovery(&source, &session));
+        assert!(
+            super::is_upgrade_recovery(&source, &session)
+                || super::is_unnamed_retained_claude_recovery(&source, &session)
+        );
         assert_eq!(snapshot.session_id, session.launch.session_id);
         let proof = session.proof.clone().unwrap();
         let mut handle = Self::fixture(session.clone(), snapshot);
@@ -1529,34 +1532,105 @@ mod tests {
 
     #[test]
     fn handled_command_refusals_do_not_become_shared_snapshot_errors() {
-        for initial_error in [None,Some("previous unsolicited error".to_owned())] {
-            let (client,mut server) = UnixStream::pair().unwrap();
+        for initial_error in [None, Some("previous unsolicited error".to_owned())] {
+            let (client, mut server) = UnixStream::pair().unwrap();
             let seed = initial_error.clone();
-            let (advance_send,advance_receive) = std::sync::mpsc::channel();
-            let (done_send,done_receive) = std::sync::mpsc::channel();
+            let (advance_send, advance_receive) = std::sync::mpsc::channel();
+            let (done_send, done_receive) = std::sync::mpsc::channel();
             let worker = thread::spawn(move || {
-                server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let proof = host_proof("live");
                 let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-                let connect:ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-                handoff_reply(&mut server,&mut codec,Some(connect.request_id),&proof,ServerMessage::Response { response:ServerResponse::Connected {proof:proof.clone(),resumed:Vec::new()} });
-                let start:ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-                let ClientRequest::ChatStart { session,.. } = start.request else { panic!("expected chat start") };
-                handoff_reply(&mut server,&mut codec,Some(start.request_id),&proof,ServerMessage::Response { response:ServerResponse::ChatAttached {session,snapshot:Snapshot { generation:1,error:seed,..Default::default() }} });
-                let command:ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-                assert!(matches!(command.request,ClientRequest::ChatCommand {..}));
-                handoff_reply(&mut server,&mut codec,Some(command.request_id),&proof,ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,"Command was refused",false)));
-                advance_receive.recv_timeout(Duration::from_secs(5)).unwrap();
-                handoff_reply(&mut server,&mut codec,None,&proof,ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,"Unsolicited provider failure",false)));
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(connect.request_id),
+                    &proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                );
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { session, .. } = start.request else {
+                    panic!("expected chat start")
+                };
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(start.request_id),
+                    &proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatAttached {
+                            session,
+                            snapshot: Snapshot {
+                                generation: 1,
+                                error: seed,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                );
+                let command: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(command.request, ClientRequest::ChatCommand { .. }));
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(command.request_id),
+                    &proof,
+                    ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                        "Command was refused",
+                        false,
+                    )),
+                );
+                advance_receive
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    None,
+                    &proof,
+                    ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                        "Unsolicited provider failure",
+                        false,
+                    )),
+                );
                 done_receive.recv_timeout(Duration::from_secs(5)).unwrap();
             });
-            let (wake_send,wake_receive) = std::sync::mpsc::channel();
-            let handle = ClientHandle::connect_on(client,omp_card(None,None),Intent::Start,None,false,None,None,move |wake| { let _=wake_send.send(wake); }).unwrap();
-            assert_eq!(handle.send(Command::Compact).unwrap_err(),"Command was refused");
-            assert_eq!(handle.snapshot().error,initial_error);
+            let (wake_send, wake_receive) = std::sync::mpsc::channel();
+            let handle = ClientHandle::connect_on(
+                client,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                move |wake| {
+                    let _ = wake_send.send(wake);
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                handle.send(Command::Compact).unwrap_err(),
+                "Command was refused"
+            );
+            assert_eq!(handle.snapshot().error, initial_error);
             advance_send.send(()).unwrap();
-            while handle.snapshot().error.as_deref()!=Some("Unsolicited provider failure") { wake_receive.recv_timeout(Duration::from_secs(5)).unwrap(); }
+            while handle.snapshot().error.as_deref() != Some("Unsolicited provider failure") {
+                wake_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
             done_send.send(()).unwrap();
             worker.join().unwrap();
         }
@@ -2650,28 +2724,50 @@ mod tests {
     #[test]
     fn unnamed_retained_claude_upgrade_carries_only_the_exact_attached_receipt() {
         for mismatch in 0..3 {
-            let mut source=omp_card(None,Some(host_proof("prior")));
-            source.launch.provider=crate::agent::Provider::Claude;
-            source.launch.recipe.program="claude".into();
-            source.launch.recipe.arguments=vec!["--print".into()];
-            source.native_continuity=super::super::NativeContinuity::RetainedClaudeActor {protocol:1};
-            let mut replacement=source.clone();replacement.proof=Some(host_proof("live"));
-            let result=restore_with_lineage(source.clone(),Some(replacement.clone()),move |request| {
-                let ClientRequest::ChatAttach {mut session}=request else {panic!("must attach existing actor without provider start");};
-                let mut snapshot=Snapshot {native_continuity:session.native_continuity.clone(),ready:true,..Default::default()};
-                match mismatch {
-                    1=>{session.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(),"/unrelated-account".into());},
-                    2=>snapshot.session_id=Some(CONVERSATION.into()),
-                    _=>{},
-                }
-                ServerMessage::Response {response:ServerResponse::ChatAttached {session,snapshot}}
-            });
-            if mismatch==0 {
-                let handle=result.unwrap();
-                assert_eq!(handle.upgrade_recovery(),Some(&(source,replacement.clone())));
-                assert_eq!(handle.session(),replacement);
+            let mut source = omp_card(None, Some(host_proof("prior")));
+            source.launch.provider = crate::agent::Provider::Claude;
+            source.launch.recipe.program = "claude".into();
+            source.launch.recipe.arguments = vec!["--print".into()];
+            source.native_continuity =
+                super::super::NativeContinuity::RetainedClaudeActor { protocol: 1 };
+            let mut replacement = source.clone();
+            replacement.proof = Some(host_proof("live"));
+            let result =
+                restore_with_lineage(source.clone(), Some(replacement.clone()), move |request| {
+                    let ClientRequest::ChatAttach { mut session } = request else {
+                        panic!("must attach existing actor without provider start");
+                    };
+                    let mut snapshot = Snapshot {
+                        native_continuity: session.native_continuity.clone(),
+                        ready: true,
+                        ..Default::default()
+                    };
+                    match mismatch {
+                        1 => {
+                            session
+                                .launch
+                                .recipe
+                                .environment
+                                .insert("CLAUDE_CONFIG_DIR".into(), "/unrelated-account".into());
+                        }
+                        2 => snapshot.session_id = Some(CONVERSATION.into()),
+                        _ => {}
+                    }
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatAttached { session, snapshot },
+                    }
+                });
+            if mismatch == 0 {
+                let handle = result.unwrap();
+                assert_eq!(
+                    handle.upgrade_recovery(),
+                    Some(&(source, replacement.clone()))
+                );
+                assert_eq!(handle.session(), replacement);
                 assert!(!handle.session().is_unstarted());
-            } else {assert!(result.is_err(),"invalid unnamed attachment {mismatch}");}
+            } else {
+                assert!(result.is_err(), "invalid unnamed attachment {mismatch}");
+            }
         }
     }
 

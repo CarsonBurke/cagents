@@ -56,7 +56,11 @@ impl BuildIdentity {
                 .and_then(|metadata| metadata.split('.').next())
                 .map(str::to_owned),
             capabilities: match kind {
-                Kind::Native => vec!["event-driven-orphan-reaping".into(), "provider-exit-diagnostics".into(), "provider-retained-output".into()],
+                Kind::Native => vec![
+                    "event-driven-orphan-reaping".into(),
+                    "provider-exit-diagnostics".into(),
+                    "provider-retained-output".into(),
+                ],
                 Kind::Terminal => Vec::new(),
             },
         }
@@ -166,12 +170,21 @@ impl Record {
     pub(crate) fn is_outdated(&self) -> bool {
         self.build.as_ref().is_none_or(|build| {
             build.version != crate::VERSION
-                || (self.kind == Kind::Native && !build.capabilities.iter()
-                    .any(|capability| capability == "event-driven-orphan-reaping"))
-                || (self.kind == Kind::Native && !build.capabilities.iter()
-                    .any(|capability| capability == "provider-exit-diagnostics"))
-                || (self.kind == Kind::Native && !build.capabilities.iter()
-                    .any(|capability| capability == "provider-retained-output"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "event-driven-orphan-reaping"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-exit-diagnostics"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-retained-output"))
         })
     }
 
@@ -191,12 +204,16 @@ impl Record {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            children.extend(raw.split_whitespace().filter_map(|pid| pid.parse::<i32>().ok()));
+            children.extend(
+                raw.split_whitespace()
+                    .filter_map(|pid| pid.parse::<i32>().ok()),
+            );
         }
         let zombies = children
             .into_iter()
             .filter(|pid| {
-                fs::read_to_string(format!("/proc/{pid}/stat")).ok()
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
                     .and_then(|stat| {
                         stat.rsplit_once(')').map(|(_, fields)| {
                             let mut fields = fields.split_whitespace();
@@ -324,22 +341,49 @@ pub(crate) const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v1";
 /// discovery visibility only. Socket peer, daemon lease and actor epoch still
 /// authenticate attachment and every semantic ACK.
 pub(crate) fn application_matches(kind: Kind, application: &str) -> bool {
-    application_matches_for(kind, application, crate::instance::APPLICATION_ID, crate::instance::IS_DEVELOPMENT)
+    application_matches_for(
+        kind,
+        application,
+        crate::instance::APPLICATION_ID,
+        crate::instance::IS_DEVELOPMENT,
+    )
 }
-fn application_matches_for(kind: Kind, application: &str, current: &str, development: bool) -> bool {
-    application == current || (kind == Kind::Terminal && production_family(application, current, development))
+fn application_matches_for(
+    kind: Kind,
+    application: &str,
+    current: &str,
+    development: bool,
+) -> bool {
+    application == current
+        || (kind == Kind::Terminal && production_family(application, current, development))
 }
 fn production_family(application: &str, current: &str, development: bool) -> bool {
-    !development && matches!(current, "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless")
-        && matches!(application, "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless")
+    !development
+        && matches!(
+            current,
+            "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless"
+        )
+        && matches!(
+            application,
+            "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless"
+        )
 }
 pub(crate) fn record_application_matches(record: &Record) -> bool {
-    record_application_matches_for(record, crate::instance::APPLICATION_ID, crate::instance::IS_DEVELOPMENT)
+    record_application_matches_for(
+        record,
+        crate::instance::APPLICATION_ID,
+        crate::instance::IS_DEVELOPMENT,
+    )
 }
 fn record_application_matches_for(record: &Record, current: &str, development: bool) -> bool {
     application_matches_for(record.kind, &record.application, current, development)
         || (record.kind == Kind::Native
-            && record.build.as_ref().is_some_and(|build| build.capabilities.iter().any(|capability| capability == RETAINED_CLAUDE_CAPABILITY))
+            && record.build.as_ref().is_some_and(|build| {
+                build
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == RETAINED_CLAUDE_CAPABILITY)
+            })
             && production_family(&record.application, current, development))
 }
 
@@ -477,26 +521,57 @@ mod tests {
             actor.application = prior.into();
             actor.build = Some(BuildIdentity::current(Kind::Native));
             let original = serde_json::to_vec(&actor).unwrap();
-            assert!(!record_application_matches_for(&actor, current, false), "native Codex stays exact");
-            actor.build.as_mut().unwrap().capabilities.push("claude-actor-v1".into());
+            assert!(
+                !record_application_matches_for(&actor, current, false),
+                "native Codex stays exact"
+            );
+            actor
+                .build
+                .as_mut()
+                .unwrap()
+                .capabilities
+                .push("claude-actor-v1".into());
             let original_actor = serde_json::to_vec(&actor).unwrap();
             assert!(record_application_matches_for(&actor, current, false));
-            assert!(!record_application_matches_for(&actor, current, true), "development cannot acquire production actors");
-            assert!(!record_application_matches_for(&actor, "another.installation", false));
-            assert_eq!(serde_json::to_vec(&actor).unwrap(), original_actor, "visibility never retags application/process provenance");
+            assert!(
+                !record_application_matches_for(&actor, current, true),
+                "development cannot acquire production actors"
+            );
+            assert!(!record_application_matches_for(
+                &actor,
+                "another.installation",
+                false
+            ));
+            assert_eq!(
+                serde_json::to_vec(&actor).unwrap(),
+                original_actor,
+                "visibility never retags application/process provenance"
+            );
             actor.build.as_mut().unwrap().capabilities.pop();
             assert_eq!(serde_json::to_vec(&actor).unwrap(), original);
             assert!(!record_application_matches_for(&actor, current, false));
             actor.build = None;
-            assert!(!record_application_matches_for(&actor, current, false), "legacy records cannot infer the actor protocol");
+            assert!(
+                !record_application_matches_for(&actor, current, false),
+                "legacy records cannot infer the actor protocol"
+            );
         }
         let mut foreign = record();
         foreign.kind = Kind::Native;
         foreign.application = "dev.cagents.Cagents.Development".into();
-        foreign.build.as_mut().unwrap().capabilities.push("claude-actor-v1".into());
+        foreign
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push("claude-actor-v1".into());
         assert!(!record_application_matches_for(&foreign, FULL, false));
         foreign.application = "another.installation".into();
-        assert!(!record_application_matches_for(&foreign, BROWSERLESS, false));
+        assert!(!record_application_matches_for(
+            &foreign,
+            BROWSERLESS,
+            false
+        ));
     }
 
     fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {

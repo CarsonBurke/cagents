@@ -1061,37 +1061,77 @@ impl Registry {
         }
         let source = HostedSession::Chat(receipt.source().clone());
         let replacement = HostedSession::Chat(receipt.replacement().clone());
-        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let mut agent = read_agent(&tx, expected.id)?;
-        if &agent != expected || agent.closed
-            || agent.session.as_ref().is_none_or(|session| !session.same_process(&source))
-            || agent.console.as_ref().is_some_and(|console| receipt.source().terminal.as_ref() != Some(console))
-        { return Err("The accepted agent or its console changed before restart was saved".into()); }
+        if &agent != expected
+            || agent.closed
+            || agent
+                .session
+                .as_ref()
+                .is_none_or(|session| !session.same_process(&source))
+            || agent
+                .console
+                .as_ref()
+                .is_some_and(|console| receipt.source().terminal.as_ref() != Some(console))
+        {
+            return Err(
+                "The accepted agent or its console changed before restart was saved".into(),
+            );
+        }
         if let Some(HostedSession::Chat(saved)) = &agent.session {
-            if saved.launch.session_id.as_ref().is_some_and(|id| receipt.source().launch.session_id.as_ref() != Some(id))
+            if saved
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| receipt.source().launch.session_id.as_ref() != Some(id))
                 || saved.owned_codex_listener != receipt.source().owned_codex_listener
-            { return Err("The accepted conversation identity changed before restart was saved".into()); }
+            {
+                return Err(
+                    "The accepted conversation identity changed before restart was saved".into(),
+                );
+            }
         }
         require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         if agent.console.is_some() {
             agent.console = receipt.replacement().terminal.clone();
         }
         agent.session = Some(replacement.clone());
-        let authority: Option<String> = tx.query_row(
-            "SELECT source FROM agent_authorities WHERE session_id = ?1", [source.id().to_string()], |row|row.get(0)
-        ).optional().map_err(|error| error.to_string())?;
+        let authority: Option<String> = tx
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id = ?1",
+                [source.id().to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
         if let Some(authority) = authority {
             let authority: HostedSession = decode(&authority)?;
             if !authority.same_process(&source) {
                 return Err("The issuing capability changed during native restart".into());
             }
-            tx.execute("UPDATE agent_authorities SET source = ?2 WHERE session_id = ?1",
-                params![source.id().to_string(), encode(&replacement)?]).map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE agent_authorities SET source = ?2 WHERE session_id = ?1",
+                params![source.id().to_string(), encode(&replacement)?],
+            )
+            .map_err(|error| error.to_string())?;
         }
-        tx.execute("UPDATE agents SET record = ?2, session_id = ?3 WHERE id = ?1",
-            params![agent.id.to_string(), encode(&agent)?, replacement.id().to_string()]).map_err(|error| error.to_string())?;
-        tx.execute("UPDATE metadata SET sequence = sequence + 1 WHERE key = 0", []).map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE agents SET record = ?2, session_id = ?3 WHERE id = ?1",
+            params![
+                agent.id.to_string(),
+                encode(&agent)?,
+                replacement.id().to_string()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(agent)
     }
@@ -1272,7 +1312,9 @@ impl Registry {
     /// run/session pairs. A live session or a busy indicator alone is not proof
     /// that this accepted command reached its original reducer.
     pub(in crate::host) fn interrupt_unproven_agent_runs_except(
-        &mut self, now_ms: u64, retained: &[(RunId, HostedSession)],
+        &mut self,
+        now_ms: u64,
+        retained: &[(RunId, HostedSession)],
     ) -> Result<(), String> {
         let records = self
             .db
@@ -1286,8 +1328,15 @@ impl Registry {
         for record in records {
             let run: Run = decode(&record)?;
             let agent = self.agent(run.agent)?;
-            if !agent.closed && retained.iter().any(|(id, source)| *id == run.id
-                && agent.session.as_ref().is_some_and(|current| current.same_process(source))) {
+            if !agent.closed
+                && retained.iter().any(|(id, source)| {
+                    *id == run.id
+                        && agent
+                            .session
+                            .as_ref()
+                            .is_some_and(|current| current.same_process(source))
+                })
+            {
                 continue;
             }
             self.update_agent_run(run.id, run.revision, Update::Finished {
@@ -1326,63 +1375,67 @@ impl Registry {
 }
 
 /// A remote actor receipt and its semantic run update share this transaction.
-pub(super) fn update_agent_run_in(tx: &Transaction<'_>, id: RunId, revision: u64, update: Update, now_ms: u64) -> Result<Run, String> {
-        let record: String = tx
-            .query_row(
-                "SELECT record FROM agent_runs WHERE id = ?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        let mut run: Run = decode(&record)?;
-        if run.revision != revision || run.state.is_terminal() {
-            return Err("The agent run has already advanced or finished".into());
-        }
-        match update {
-            Update::Started { provider_key } => {
-                if run.state != State::Accepted
-                    || provider_key.is_empty()
-                    || provider_key.len() > 1024
-                {
-                    return Err("The provider start does not match an accepted run".into());
-                }
-                run.provider_key = Some(provider_key);
-                run.started_ms = Some(now_ms);
-                run.state = State::Running;
-            }
-            Update::Waiting if run.state == State::Running => run.state = State::Waiting,
-            Update::Resumed if run.state == State::Waiting => run.state = State::Running,
-            Update::Finished { state, mut result } if state.is_terminal() => {
-                if state == State::Succeeded && run.provider_key.is_none() {
-                    return Err("An unconfirmed provider turn cannot succeed".into());
-                }
-                result.bound();
-                run.result = result;
-                run.state = state;
-                run.finished_ms = Some(now_ms);
-            }
-            _ => return Err("The provider update does not match the agent run state".into()),
-        }
-        run.revision = run
-            .revision
-            .checked_add(1)
-            .ok_or("Agent run revision exhausted")?;
-        tx.execute(
-            "UPDATE agent_runs SET state = ?2, revision = ?3, record = ?4 WHERE id = ?1",
-            params![
-                id.to_string(),
-                state_key(run.state),
-                run.revision,
-                encode(&run)?
-            ],
+pub(super) fn update_agent_run_in(
+    tx: &Transaction<'_>,
+    id: RunId,
+    revision: u64,
+    update: Update,
+    now_ms: u64,
+) -> Result<Run, String> {
+    let record: String = tx
+        .query_row(
+            "SELECT record FROM agent_runs WHERE id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-        tx.execute(
-            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
-            [],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(run)
+    let mut run: Run = decode(&record)?;
+    if run.revision != revision || run.state.is_terminal() {
+        return Err("The agent run has already advanced or finished".into());
+    }
+    match update {
+        Update::Started { provider_key } => {
+            if run.state != State::Accepted || provider_key.is_empty() || provider_key.len() > 1024
+            {
+                return Err("The provider start does not match an accepted run".into());
+            }
+            run.provider_key = Some(provider_key);
+            run.started_ms = Some(now_ms);
+            run.state = State::Running;
+        }
+        Update::Waiting if run.state == State::Running => run.state = State::Waiting,
+        Update::Resumed if run.state == State::Waiting => run.state = State::Running,
+        Update::Finished { state, mut result } if state.is_terminal() => {
+            if state == State::Succeeded && run.provider_key.is_none() {
+                return Err("An unconfirmed provider turn cannot succeed".into());
+            }
+            result.bound();
+            run.result = result;
+            run.state = state;
+            run.finished_ms = Some(now_ms);
+        }
+        _ => return Err("The provider update does not match the agent run state".into()),
+    }
+    run.revision = run
+        .revision
+        .checked_add(1)
+        .ok_or("Agent run revision exhausted")?;
+    tx.execute(
+        "UPDATE agent_runs SET state = ?2, revision = ?3, record = ?4 WHERE id = ?1",
+        params![
+            id.to_string(),
+            state_key(run.state),
+            run.revision,
+            encode(&run)?
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(run)
 }
 
 fn state_key(state: State) -> &'static str {
@@ -2134,63 +2187,138 @@ mod tests {
             let (mut registry, directory, request) = fixture();
             let accepted = registry.submit_agent(&Origin::User, &request, 10).unwrap();
             let source = source();
-            registry.bind_agent(accepted.agent.id, None, source.clone()).unwrap();
-            let running = registry.update_agent_run(accepted.run.id, accepted.run.revision,
-                Update::Started { provider_key: "retained-command".into() }, 11).unwrap();
+            registry
+                .bind_agent(accepted.agent.id, None, source.clone())
+                .unwrap();
+            let running = registry
+                .update_agent_run(
+                    accepted.run.id,
+                    accepted.run.revision,
+                    Update::Started {
+                        provider_key: "retained-command".into(),
+                    },
+                    11,
+                )
+                .unwrap();
             let mut retained = source;
             let mut run = accepted.run.id;
-            let HostedSession::Chat(candidate) = &mut retained else { unreachable!() };
+            let HostedSession::Chat(candidate) = &mut retained else {
+                unreachable!()
+            };
             match changed {
                 "run" => run = RunId::new(),
-                "proof" => candidate.proof.as_mut().unwrap().host_incarnation = crate::model::HostIncarnation::new("unrelated"),
-                "account" => { candidate.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into()); },
+                "proof" => {
+                    candidate.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("unrelated")
+                }
+                "account" => {
+                    candidate
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into());
+                }
                 "actor" => candidate.id = crate::model::TerminalId::new(),
                 "provider" => candidate.launch.provider = Provider::Codex,
-                _ => {},
+                _ => {}
             }
             drop(registry);
             let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-            registry.interrupt_unproven_agent_runs_except(12, &[(run, retained)]).unwrap();
+            registry
+                .interrupt_unproven_agent_runs_except(12, &[(run, retained)])
+                .unwrap();
             let actual = registry.agent_run(accepted.run.id).unwrap();
             if changed == "none" {
-                assert_eq!(actual, running, "authenticated live reducer retains the original accepted run");
-                assert!(!matches!(registry.claim_agent_dispatch(&accepted, 13), Ok(true)), "retaining a run never authorizes redelivery");
+                assert_eq!(
+                    actual, running,
+                    "authenticated live reducer retains the original accepted run"
+                );
+                assert!(
+                    !matches!(registry.claim_agent_dispatch(&accepted, 13), Ok(true)),
+                    "retaining a run never authorizes redelivery"
+                );
             } else {
-                assert_eq!(actual.state, State::Interrupted, "{changed} is not evidence for this accepted run");
+                assert_eq!(
+                    actual.state,
+                    State::Interrupted,
+                    "{changed} is not evidence for this accepted run"
+                );
             }
         }
     }
 
     #[test]
     fn console_restart_preserves_acceptance_runs_and_capability_and_fences_stale_pair() {
-        let (mut registry,_directory,request)=fixture();
-        let accepted=registry.submit_agent(&Origin::User,&request,1).unwrap();
-        let HostedSession::Chat(mut original)=source() else {unreachable!()};
-        let issued=HostedSession::Chat(original.clone());
-        registry.bind_agent(accepted.agent.id,None,issued.clone()).unwrap();
-        let capability=registry.fresh_agent_authority(&issued).unwrap();
-        let recipe=crate::model::LaunchRecipe {
-            program:"/matched/cagents".into(),arguments:vec!["agent".into(),"console".into(),accepted.agent.id.to_string()],
-            working_directory:original.launch.recipe.working_directory.clone(),environment:Default::default(),unset_environment:Default::default(),
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let HostedSession::Chat(mut original) = source() else {
+            unreachable!()
         };
-        let mut terminal=crate::terminal_ipc::TerminalDescriptor::relaunchable(original.id,recipe,None).session;
-        let proof=original.proof.as_ref().unwrap();
-        terminal.continuity=crate::model::TerminalContinuity::Live {host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone()};
-        registry.bind_agent_console(accepted.agent.id,&issued,terminal.clone()).unwrap();
-        original.terminal=Some(terminal);
-        let before=registry.agent(accepted.agent.id).unwrap();
-        let run=registry.agent_run(accepted.run.id).unwrap();
-        let mut replacement=original.clone();replacement.terminal.as_mut().unwrap().transcript_path=Some("/fixture/new-console.log".into());
-        let receipt=crate::chat::RestartReceipt::confirm(original,replacement.clone()).unwrap();
-        let rebound=registry.rebind_restarted_agent(&before,&receipt).unwrap();
-        assert_eq!(rebound.id,before.id);assert_eq!(rebound.spec,before.spec);assert_eq!(rebound.origin,before.origin);
-        assert_eq!(rebound.console,replacement.terminal);assert_eq!(rebound.session,Some(HostedSession::Chat(replacement.clone())));
-        assert_eq!(registry.agent_run(run.id).unwrap(),run);
-        assert_eq!(registry.register_agent_authority(&HostedSession::Chat(replacement.clone())).unwrap(),capability);
-        let stored:String=registry.db.query_row("SELECT source FROM agent_authorities WHERE session_id=?1",[replacement.id.to_string()],|row|row.get(0)).unwrap();
-        assert_eq!(decode::<HostedSession>(&stored).unwrap(),HostedSession::Chat(replacement));
-        assert!(registry.rebind_restarted_agent(&before,&receipt).is_err());
-        assert_eq!(registry.agent(rebound.id).unwrap(),rebound);
+        let issued = HostedSession::Chat(original.clone());
+        registry
+            .bind_agent(accepted.agent.id, None, issued.clone())
+            .unwrap();
+        let capability = registry.fresh_agent_authority(&issued).unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/matched/cagents".into(),
+            arguments: vec![
+                "agent".into(),
+                "console".into(),
+                accepted.agent.id.to_string(),
+            ],
+            working_directory: original.launch.recipe.working_directory.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut terminal =
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(original.id, recipe, None)
+                .session;
+        let proof = original.proof.as_ref().unwrap();
+        terminal.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        registry
+            .bind_agent_console(accepted.agent.id, &issued, terminal.clone())
+            .unwrap();
+        original.terminal = Some(terminal);
+        let before = registry.agent(accepted.agent.id).unwrap();
+        let run = registry.agent_run(accepted.run.id).unwrap();
+        let mut replacement = original.clone();
+        replacement.terminal.as_mut().unwrap().transcript_path =
+            Some("/fixture/new-console.log".into());
+        let receipt = crate::chat::RestartReceipt::confirm(original, replacement.clone()).unwrap();
+        let rebound = registry.rebind_restarted_agent(&before, &receipt).unwrap();
+        assert_eq!(rebound.id, before.id);
+        assert_eq!(rebound.spec, before.spec);
+        assert_eq!(rebound.origin, before.origin);
+        assert_eq!(rebound.console, replacement.terminal);
+        assert_eq!(
+            rebound.session,
+            Some(HostedSession::Chat(replacement.clone()))
+        );
+        assert_eq!(registry.agent_run(run.id).unwrap(), run);
+        assert_eq!(
+            registry
+                .register_agent_authority(&HostedSession::Chat(replacement.clone()))
+                .unwrap(),
+            capability
+        );
+        let stored: String = registry
+            .db
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id=?1",
+                [replacement.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            decode::<HostedSession>(&stored).unwrap(),
+            HostedSession::Chat(replacement)
+        );
+        assert!(registry.rebind_restarted_agent(&before, &receipt).is_err());
+        assert_eq!(registry.agent(rebound.id).unwrap(), rebound);
     }
 
     #[test]

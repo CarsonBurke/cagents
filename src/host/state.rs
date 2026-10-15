@@ -275,7 +275,8 @@ pub(crate) struct HostState {
     model_watchers: BTreeSet<ClientId>,
     client_pids: BTreeMap<ClientId, u32>,
     pub(super) notifications: Option<super::notifications::Handle>,
-    pub(super) native_actor_restarts: BTreeMap<TerminalId, super::chat::retained_actor::PreparedRestart>,
+    pub(super) native_actor_restarts:
+        BTreeMap<TerminalId, super::chat::retained_actor::PreparedRestart>,
     pub(super) native_actor_outcomes: Option<super::chat::retained_actor::Broker>,
     pub(super) native_actor_startups: BTreeMap<TerminalId, super::chat::retained_actor::Startup>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
@@ -1143,15 +1144,27 @@ impl HostState {
 
     /// Typed native recovery may inspect this authenticated current worker
     /// before its durable native-console association has been installed.
-    pub(super) fn native_terminal_projection(&self, id: TerminalId) -> Result<TerminalSession, String> {
-        let terminal = self.terminals.get(&id).ok_or("The native console worker is unavailable")?;
+    pub(super) fn native_terminal_projection(
+        &self,
+        id: TerminalId,
+    ) -> Result<TerminalSession, String> {
+        let terminal = self
+            .terminals
+            .get(&id)
+            .ok_or("The native console worker is unavailable")?;
         if terminal.handle.is_completed() || !self.proof().is_complete() {
-            return Err("The native console worker completed or its current ownership is unavailable".into());
+            return Err(
+                "The native console worker completed or its current ownership is unavailable"
+                    .into(),
+            );
         }
         let proof = self.proof();
         let mut current = terminal.session.clone();
-        current.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(),
-            boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        current.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
         Ok(current)
     }
 
@@ -1898,9 +1911,11 @@ fn prepare_upgrade_with_carry_policy(
         // A durable native holder also keeps its paired terminal alive. Its
         // exact environment remains only in the two holders' private memory.
         let carries = |id: &TerminalId, record: &TerminalRecord| {
-            (state.chats.get(id).is_some_and(|chat| {
-                chat.handle.native_continuity().retains_provider()
-            }) || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
+            (state
+                .chats
+                .get(id)
+                .is_some_and(|chat| chat.handle.native_continuity().retains_provider())
+                || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
                 && holders.is_some()
         };
         let carried = state
@@ -1970,7 +1985,10 @@ fn prepare_upgrade_with_carry_policy(
             super::super::chat::protocol::align_resume_identity(&mut launch)
                 .map_err(upgrade_error)?;
             if launch.terminal_recipe().is_none()
-                && !matches!(source.native_continuity, crate::chat::NativeContinuity::RetainedClaudeActor { .. })
+                && !matches!(
+                    source.native_continuity,
+                    crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+                )
             {
                 return Err(upgrade_error(format!(
                     "Native chat {} has no exact resumable conversation; wait for provider initialization or close it explicitly",
@@ -2675,9 +2693,11 @@ fn restore_upgrade_from(
         return Ok(Vec::new());
     };
     checkpoint.validate()?;
-    if checkpoint.chats.iter().any(|chat| {
-        !chat.source.native_continuity.retains_provider()
-    }) {
+    if checkpoint
+        .chats
+        .iter()
+        .any(|chat| !chat.source.native_continuity.retains_provider())
+    {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
             store.path.display()
@@ -2758,8 +2778,7 @@ fn restore_upgrade_from(
         // checkpoint, but their authenticated holders retain the final screen.
         // Restore those receipts before requiring a native pair to match.
         if checkpoint.chats.iter().any(|chat| {
-            chat.source.terminal.is_some()
-                && chat.source.native_continuity.retains_provider()
+            chat.source.terminal.is_some() && chat.source.native_continuity.retains_provider()
         }) {
             restore_orphaned_holders(host)?;
         }

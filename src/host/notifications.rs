@@ -152,12 +152,19 @@ impl Handle {
 
     /// Receipt confirms the FULL journal transaction, never merely enqueueing.
     /// Callers wait outside HostState and keep helper outbox entries on error.
-    pub(in crate::host) fn record_committed(&self, event: Event) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+    pub(in crate::host) fn record_committed(
+        &self,
+        event: Event,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
         event.validate()?;
         let (receipt, result) = std::sync::mpsc::channel();
         let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
-        if pending.stopped { return Err("Notification journal is stopping; outcome remains unacknowledged".into()); }
-        if pending.committed_events.len() >= MAX_PENDING { return Err("Notification commit queue is full; outcome remains unacknowledged".into()); }
+        if pending.stopped {
+            return Err("Notification journal is stopping; outcome remains unacknowledged".into());
+        }
+        if pending.committed_events.len() >= MAX_PENDING {
+            return Err("Notification commit queue is full; outcome remains unacknowledged".into());
+        }
         pending.committed_events.push_back((event, receipt));
         drop(pending);
         let _ = self.0.wake.try_send(());
@@ -782,7 +789,9 @@ async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>
 }
 
 fn record_attention_committed(
-    journal: &mut Journal, event: Event, suppressed: bool,
+    journal: &mut Journal,
+    event: Event,
+    suppressed: bool,
     receipt: Option<std::sync::mpsc::Sender<Result<(), String>>>,
 ) -> Result<Option<crate::notifications::Notice>, String> {
     let result = journal.record(event, suppressed);
@@ -801,12 +810,30 @@ mod tests {
     fn helper_attention_receipt_waits_for_the_actual_durable_journal_commit() {
         let (shared, _receiver) = shared();
         let handle = Handle(shared.clone());
-        let event = Event::session(TerminalId::new(), crate::agent::Provider::Claude, "/repo".into(), crate::notifications::Evidence {
-            key: "stable-helper-turn".into(), kind: crate::notifications::Kind::Succeeded,
-        });
+        let event = Event::session(
+            TerminalId::new(),
+            crate::agent::Provider::Claude,
+            "/repo".into(),
+            crate::notifications::Evidence {
+                key: "stable-helper-turn".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            },
+        );
         let receipt = handle.record_committed(event.clone()).unwrap();
-        assert!(matches!(receipt.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)), "queueing alone never confirms delivery");
-        let (queued, reply) = shared.pending.lock().unwrap().committed_events.pop_front().unwrap();
+        assert!(
+            matches!(
+                receipt.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "queueing alone never confirms delivery"
+        );
+        let (queued, reply) = shared
+            .pending
+            .lock()
+            .unwrap()
+            .committed_events
+            .pop_front()
+            .unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attention.sqlite3");
         let mut journal = Journal::open(&path).unwrap();
@@ -814,18 +841,47 @@ mod tests {
         assert_eq!(receipt.recv().unwrap(), Ok(()));
         drop(journal);
         let mut reopened = Journal::open(&path).unwrap();
-        assert!(reopened.list().unwrap().iter().any(|notice| notice.event == event));
+        assert!(
+            reopened
+                .list()
+                .unwrap()
+                .iter()
+                .any(|notice| notice.event == event)
+        );
         let replay = handle.record_committed(event.clone()).unwrap();
-        let (queued, reply) = shared.pending.lock().unwrap().committed_events.pop_front().unwrap();
+        let (queued, reply) = shared
+            .pending
+            .lock()
+            .unwrap()
+            .committed_events
+            .pop_front()
+            .unwrap();
         record_attention_committed(&mut reopened, queued, false, Some(reply)).unwrap();
         assert_eq!(replay.recv().unwrap(), Ok(()));
-        assert_eq!(reopened.list().unwrap().len(), 1, "stable evidence replay is idempotent");
-        rusqlite::Connection::open(&path).unwrap().execute("DROP TABLE seen", []).unwrap();
-        let mut next = event.clone(); next.evidence.key = "journal-write-fails".into();
+        assert_eq!(
+            reopened.list().unwrap().len(),
+            1,
+            "stable evidence replay is idempotent"
+        );
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE seen", [])
+            .unwrap();
+        let mut next = event.clone();
+        next.evidence.key = "journal-write-fails".into();
         let failed = handle.record_committed(next).unwrap();
-        let (queued, reply) = shared.pending.lock().unwrap().committed_events.pop_front().unwrap();
+        let (queued, reply) = shared
+            .pending
+            .lock()
+            .unwrap()
+            .committed_events
+            .pop_front()
+            .unwrap();
         assert!(record_attention_committed(&mut reopened, queued, false, Some(reply)).is_err());
-        assert!(failed.recv().unwrap().is_err(), "a failed durable write cannot ACK helper delivery");
+        assert!(
+            failed.recv().unwrap().is_err(),
+            "a failed durable write cannot ACK helper delivery"
+        );
         shared.pending.lock().unwrap().stopped = true;
         assert!(handle.record_committed(event).is_err());
     }
@@ -1407,8 +1463,16 @@ async fn run(
             }
             queue_withdrawal(&mut withdrawals, id);
         }
-        let events = pending.events.into_values().map(|event| (event, None))
-            .chain(pending.committed_events.into_iter().map(|(event, receipt)| (event, Some(receipt))));
+        let events = pending
+            .events
+            .into_values()
+            .map(|event| (event, None))
+            .chain(
+                pending
+                    .committed_events
+                    .into_iter()
+                    .map(|(event, receipt)| (event, Some(receipt))),
+            );
         for (event, receipt) in events {
             if stopped(&shared) {
                 return;

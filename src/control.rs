@@ -837,13 +837,15 @@ impl ControlClient {
     pub fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), ControlError> {
         let chat_id = session.id;
         self.attached_chats.insert(chat_id);
-        let closed = self.request_with_deadline(
-            ClientRequest::ChatCloseSession { session },
-            Instant::now() + CHAT_CLOSE_TIMEOUT,
-        ).and_then(|response|match response {
-            ServerResponse::ChatClosed { .. }=>Ok(()),
-            response=>Err(unexpected_response("a native chat close",&response)),
-        });
+        let closed = self
+            .request_with_deadline(
+                ClientRequest::ChatCloseSession { session },
+                Instant::now() + CHAT_CLOSE_TIMEOUT,
+            )
+            .and_then(|response| match response {
+                ServerResponse::ChatClosed { .. } => Ok(()),
+                response => Err(unexpected_response("a native chat close", &response)),
+            });
         let detached = match &closed {
             // The daemon removed the chat, and every notification about it,
             // before answering.
@@ -852,10 +854,13 @@ impl ControlClient {
             // stop the notifications of a chat it did not close.
             Err(ControlError::Remote { .. } | ControlError::UnexpectedResponse { .. }) => matches!(
                 self.request_strict(ClientRequest::ChatDetach { chat_id }),
-                Ok(ServerResponse::Detached) | Err(ControlError::Remote {
-                    code: ProtocolErrorCode::PermissionDenied | ProtocolErrorCode::TerminalNotFound | ProtocolErrorCode::TerminalUnavailable,
-                    ..
-                })
+                Ok(ServerResponse::Detached)
+                    | Err(ControlError::Remote {
+                        code: ProtocolErrorCode::PermissionDenied
+                            | ProtocolErrorCode::TerminalNotFound
+                            | ProtocolErrorCode::TerminalUnavailable,
+                        ..
+                    })
             ),
             Err(_) => false,
         };
@@ -4927,30 +4932,84 @@ mod tests {
 
             // Exactly one source-bound close, with no ChatAttach/actor restart.
             let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            let ClientRequest::ChatCloseSession {session}=close.request else {
+            let ClientRequest::ChatCloseSession { session } = close.request else {
                 panic!("expected source-bound close");
             };
-            assert_eq!(session.id,closed);
-            send(&mut server_stream,None,activity(closed, ActivityState::Working));
-            send(&mut server_stream,None,ServerMessage::ChatObserved{chat_id:closed,epoch:1});
-            send(&mut server_stream,None,activity(closed,ActivityState::Idle));
-            send(&mut server_stream,None,ServerMessage::ChatChanged{chat_id:closed});
-            respond(&mut server_stream,close.request_id,ServerResponse::ChatClosed{chat_id:closed,snapshot:crate::chat::Snapshot::default()});
+            assert_eq!(session.id, closed);
+            send(
+                &mut server_stream,
+                None,
+                activity(closed, ActivityState::Working),
+            );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::ChatObserved {
+                    chat_id: closed,
+                    epoch: 1,
+                },
+            );
+            send(
+                &mut server_stream,
+                None,
+                activity(closed, ActivityState::Idle),
+            );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::ChatChanged { chat_id: closed },
+            );
+            respond(
+                &mut server_stream,
+                close.request_id,
+                ServerResponse::ChatClosed {
+                    chat_id: closed,
+                    snapshot: crate::chat::Snapshot::default(),
+                },
+            );
 
             // Both a post-subscription teardown failure and a source refusal
             // are safely detached; neither path needs a provider attachment.
-            for (id,subscribed) in [(refused,true),(elsewhere,false)] {
-                let close:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(close.request,ClientRequest::ChatCloseSession{session} if session.id==id));
-                if subscribed {send(&mut server_stream,None,activity(id,ActivityState::Working));}
-                send(&mut server_stream,Some(close.request_id),ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,"Exact source could not be closed",false)));
-                let detach:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-                assert_eq!(detach.request,ClientRequest::ChatDetach{chat_id:id});
+            for (id, subscribed) in [(refused, true), (elsewhere, false)] {
+                let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(
+                    matches!(close.request,ClientRequest::ChatCloseSession{session} if session.id==id)
+                );
                 if subscribed {
-                    send(&mut server_stream,None,activity(id,ActivityState::Idle));
-                    respond(&mut server_stream,detach.request_id,ServerResponse::Detached);
+                    send(
+                        &mut server_stream,
+                        None,
+                        activity(id, ActivityState::Working),
+                    );
+                }
+                send(
+                    &mut server_stream,
+                    Some(close.request_id),
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        "Exact source could not be closed",
+                        false,
+                    )),
+                );
+                let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(detach.request, ClientRequest::ChatDetach { chat_id: id });
+                if subscribed {
+                    send(&mut server_stream, None, activity(id, ActivityState::Idle));
+                    respond(
+                        &mut server_stream,
+                        detach.request_id,
+                        ServerResponse::Detached,
+                    );
                 } else {
-                    send(&mut server_stream,Some(detach.request_id),ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,"No attached actor exists",true)));
+                    send(
+                        &mut server_stream,
+                        Some(detach.request_id),
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::TerminalUnavailable,
+                            "No attached actor exists",
+                            true,
+                        )),
+                    );
                 }
             }
 

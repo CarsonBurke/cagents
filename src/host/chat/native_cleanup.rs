@@ -19,14 +19,23 @@ impl NativeClose {
 #[derive(Clone)]
 enum NativeOwner {
     Server(chat::native_holder::Detached),
-    Actor { record: registry::Record, handle: Handle },
+    Actor {
+        record: registry::Record,
+        handle: Handle,
+    },
 }
 impl NativeOwner {
     fn record(&self) -> &registry::Record {
-        match self { Self::Server(owner) => &owner.record, Self::Actor { record, .. } => record }
+        match self {
+            Self::Server(owner) => &owner.record,
+            Self::Actor { record, .. } => record,
+        }
     }
     fn close_retaining_receipt(&self) -> Result<(), String> {
-        match self { Self::Server(owner) => owner.close_retaining_receipt(), Self::Actor { handle, .. } => handle.close() }
+        match self {
+            Self::Server(owner) => owner.close_retaining_receipt(),
+            Self::Actor { handle, .. } => handle.close(),
+        }
     }
 }
 
@@ -41,7 +50,9 @@ struct RetainedPair {
 /// Only the authenticated exact holder and current exclusive daemon lease can
 /// authorize it; disappearance alone never counts as a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
-    if retained_actor::reconcile_startup(host, source)? { return Ok(()); }
+    if retained_actor::reconcile_startup(host, source)? {
+        return Ok(());
+    }
     close_retained_inner(host, source, false)
 }
 
@@ -114,12 +125,26 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
                     Some(NativeOwner::Actor { handle, .. }) => handle.clone(),
                     _ => Handle::adopt_remote(record, source.clone(), proof.clone(), |_| {})?,
                 };
-                host.lock().unwrap_or_else(|p| p.into_inner()).native_closing.insert(source.id, NativeClose {
-                    source: source.clone(), owner: NativeOwner::Actor { record: record.clone(), handle: handle.clone() }, closed: true, paired: None,
-                });
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .native_closing
+                    .insert(
+                        source.id,
+                        NativeClose {
+                            source: source.clone(),
+                            owner: NativeOwner::Actor {
+                                record: record.clone(),
+                                handle: handle.clone(),
+                            },
+                            closed: true,
+                            paired: None,
+                        },
+                    );
                 retained_actor::finish_close(host, &handle, source)?;
             }
-            if !restart { retire_closed_execution(host, source, record, &proof)?; }
+            if !restart {
+                retire_closed_execution(host, source, record, &proof)?;
+            }
             return Ok(());
         }
         let mut pending = match pending {
@@ -151,44 +176,63 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
                 let record = registry::evidence(&socket, Kind::Native)?
                     .ok_or("No exact native holder or confirmed close receipt is available")?;
                 if Handle::is_remote_record(&record) {
-                    if restart { return Err("The retained Claude actor must restart inside its existing owner".into()); }
+                    if restart {
+                        return Err(
+                            "The retained Claude actor must restart inside its existing owner"
+                                .into(),
+                        );
+                    }
                     let inspection = Handle::inspect_remote(&record, proof.clone())?;
-                    let paired = retained_pair(host, inspection.source.terminal.as_ref(), inspection.paired_holder.as_ref(), &proof)?;
+                    let paired = retained_pair(
+                        host,
+                        inspection.source.terminal.as_ref(),
+                        inspection.paired_holder.as_ref(),
+                        &proof,
+                    )?;
                     // The helper independently recognizes the entire issued
                     // descriptor before changing attachment epoch or closing.
-                    let handle = Handle::adopt_remote(&record, source.clone(), proof.clone(), |_| {})?;
+                    let handle =
+                        Handle::adopt_remote(&record, source.clone(), proof.clone(), |_| {})?;
                     let pending = NativeClose {
-                        source: source.clone(), owner: NativeOwner::Actor { record, handle }, closed: false, paired,
+                        source: source.clone(),
+                        owner: NativeOwner::Actor { record, handle },
+                        closed: false,
+                        paired,
                     };
-                    host.lock().unwrap_or_else(|p| p.into_inner()).native_closing.insert(source.id, pending.clone());
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .native_closing
+                        .insert(source.id, pending.clone());
                     pending
                 } else {
-                let (recovery, exited) = chat::native_holder::inspect(&record, &proof)?;
-                if restart && !exited { return Err("The retained provider is still alive; reattach its existing session instead of starting another writer".into()); }
+                    let (recovery, exited) = chat::native_holder::inspect(&record, &proof)?;
+                    if restart && !exited {
+                        return Err("The retained provider is still alive; reattach its existing session instead of starting another writer".into());
+                    }
 
-                if &recovery.source != source && !recovery.previous_sources.contains(source) {
-                    return Err(
-                        "Native holder does not recognize this exact issued descriptor".into(),
-                    );
-                }
-                let paired = retained_pair(
-                    host,
-                    recovery.source.terminal.as_ref(),
-                    recovery.paired_holder.as_ref(),
-                    &proof,
-                )?;
-                let (holder, _) = chat::native_holder::adopt(&record, source, &proof)?;
-                let pending = NativeClose {
-                    source: source.clone(),
-                    owner: NativeOwner::Server(holder.preserve()),
-                    closed: false,
-                    paired,
-                };
-                host.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .native_closing
-                    .insert(source.id, pending.clone());
-                pending
+                    if &recovery.source != source && !recovery.previous_sources.contains(source) {
+                        return Err(
+                            "Native holder does not recognize this exact issued descriptor".into(),
+                        );
+                    }
+                    let paired = retained_pair(
+                        host,
+                        recovery.source.terminal.as_ref(),
+                        recovery.paired_holder.as_ref(),
+                        &proof,
+                    )?;
+                    let (holder, _) = chat::native_holder::adopt(&record, source, &proof)?;
+                    let pending = NativeClose {
+                        source: source.clone(),
+                        owner: NativeOwner::Server(holder.preserve()),
+                        closed: false,
+                        paired,
+                    };
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .native_closing
+                        .insert(source.id, pending.clone());
+                    pending
                 }
             }
         };
@@ -250,7 +294,9 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
         }
         // Keep the proved owner while durable retirement is retryable. An SQL
         // failure cannot force a second Release or lose its cleanup evidence.
-        if !restart { retire_closed_execution(host, source, pending.owner.record(), &proof)?; }
+        if !restart {
+            retire_closed_execution(host, source, pending.owner.record(), &proof)?;
+        }
         Ok(())
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -268,15 +314,21 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> R
                         .into(),
                 );
             }
-            if !restart { state.chats.remove(&source.id); }
+            if !restart {
+                state.chats.remove(&source.id);
+            }
         }
         state.native_closing.remove(&source.id);
         state.native_adoption_failures.clear(source.id);
         if !restart {
-            if let Some(notifications) = &state.notifications { notifications.retire(source.id); }
+            if let Some(notifications) = &state.notifications {
+                notifications.retire(source.id);
+            }
         }
         drop(state);
-        if !restart { super::super::state::retire_unattached_upgrade_chat(host, source.id); }
+        if !restart {
+            super::super::state::retire_unattached_upgrade_chat(host, source.id);
+        }
     }
     result
 }

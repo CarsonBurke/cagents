@@ -3,8 +3,8 @@ mod agent_execution;
 mod automations;
 mod chat;
 mod client;
-mod delivery;
 mod deferred;
+mod delivery;
 pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
@@ -254,7 +254,10 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs_except(crate::chat::now_ms().unwrap_or(0), &retained_runs)
+            .interrupt_unproven_agent_runs_except(
+                crate::chat::now_ms().unwrap_or(0),
+                &retained_runs,
+            )
             .map_err(io::Error::other)?;
     }
     let _agent_activity = activity::Monitor::start(&host)?;
@@ -440,14 +443,17 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         // A committed upgrade transfers ownership, including when the final
         // checkpoint write fails. Explicit Stop/Close still tears down the
         // provider; exiting the upgrading daemon must not undo preservation.
-        let closed = if upgrading
-            && chat.native_continuity().retains_provider() {
+        let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
             chat.close()
         };
         let closed = closed.and_then(|()| {
-            if upgrading { Ok(()) } else { chat::retained_actor::finish_close(host, &chat, &session) }
+            if upgrading {
+                Ok(())
+            } else {
+                chat::retained_actor::finish_close(host, &chat, &session)
+            }
         });
         match closed {
             Ok(()) if !upgrading => {
