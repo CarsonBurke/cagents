@@ -11987,11 +11987,11 @@ pub(crate) mod tests {
             project_id(1),
             WorktreeId::from_uuid(Uuid::from_u128(3)),
         ));
-        let quiet = project_list(&model, &state, true, false, &crate::settings::KeyboardShortcuts::default());
+        let quiet = project_list(&model, &state, true, false, &Arc::new(crate::settings::KeyboardShortcuts::default()));
         assert!(Tree::new(&quiet).find(&id).is_none());
         state.controls_expanded = true;
         state.query = "fix".into();
-        let result = project_list(&model, &state, true, false, &crate::settings::KeyboardShortcuts::default());
+        let result = project_list(&model, &state, true, false, &Arc::new(crate::settings::KeyboardShortcuts::default()));
         assert!(
             Tree::new(&result).find(&id).is_some(),
             "a matching inactive worktree must be mounted so Search Down can focus it"
@@ -12339,7 +12339,7 @@ pub(crate) mod tests {
                     None,
                     "",
                     show,
-                &crate::settings::KeyboardShortcuts::default())
+                &Arc::new(crate::settings::KeyboardShortcuts::default()))
             };
             let counts = [true, false].map(|show| {
                 let mut element = row(show);
@@ -12402,7 +12402,7 @@ pub(crate) mod tests {
                 Some(Arc::from([SelectionRow::Worktree(project_id(1), worktree.id)])),
                 "",
                 true,
-            &crate::settings::KeyboardShortcuts::default());
+            &Arc::new(crate::settings::KeyboardShortcuts::default()));
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -12880,7 +12880,7 @@ pub(crate) mod tests {
                 None,
                 query,
                 true,
-            &crate::settings::KeyboardShortcuts::default());
+            &Arc::new(crate::settings::KeyboardShortcuts::default()));
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
             let node = element.as_widget_mut().layout(
@@ -12969,7 +12969,7 @@ pub(crate) mod tests {
                     None,
                     false,
                     row_interaction::StickyViewport::default(),
-                &crate::settings::KeyboardShortcuts::default()),
+                &Arc::new(crate::settings::KeyboardShortcuts::default())),
                 width,
             )
         };
@@ -13320,7 +13320,7 @@ pub(crate) mod tests {
             (false, 259.5),
             (true, COMPACT_WIDTH),
         ] {
-            let mut element = project_list(&model, &state, compact, false, &crate::settings::KeyboardShortcuts::default());
+            let mut element = project_list(&model, &state, compact, false, &Arc::new(crate::settings::KeyboardShortcuts::default()));
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -13914,7 +13914,7 @@ pub(crate) mod tests {
                 design::NAVIGATION_DEFAULT_WIDTH,
                 false,
                 navigation,
-                &crate::settings::KeyboardShortcuts::default(),
+                &Arc::new(crate::settings::KeyboardShortcuts::default()),
             ),
             bounds,
             cache,
@@ -15361,7 +15361,7 @@ pub(crate) mod tests {
                     compact,
                     false,
                     false,
-                    &crate::settings::KeyboardShortcuts::default(),
+                    &Arc::new(crate::settings::KeyboardShortcuts::default()),
                 ),
             );
             assert_eq!(
@@ -15381,7 +15381,7 @@ pub(crate) mod tests {
                     compact,
                     false,
                     false,
-                    &crate::settings::KeyboardShortcuts::default(),
+                    &Arc::new(crate::settings::KeyboardShortcuts::default()),
                 ),
             );
             assert_eq!(actions[0], SidebarAction::SetFilter(SidebarFilter::All));
@@ -15396,7 +15396,7 @@ pub(crate) mod tests {
                         compact,
                         false,
                         true,
-                        &crate::settings::KeyboardShortcuts::default()
+                        &Arc::new(crate::settings::KeyboardShortcuts::default())
                     )
                 )
                 .is_empty()
@@ -15418,7 +15418,7 @@ pub(crate) mod tests {
                 false,
                 loading,
                 false,
-                &crate::settings::KeyboardShortcuts::default(),
+                &Arc::new(crate::settings::KeyboardShortcuts::default()),
             );
             let mut tree = Tree::new(&element);
             // The sidebar adds another four pixels of padding on each side.
@@ -15781,7 +15781,7 @@ pub(crate) mod tests {
                     compact,
                     false,
                     modal_open,
-                    &crate::settings::KeyboardShortcuts::default(),
+                    &Arc::new(crate::settings::KeyboardShortcuts::default()),
                 );
                 let mut tree = Tree::new(&element);
                 let viewport = Rectangle::with_size(Size::new(260.0, 44.0));
@@ -15999,7 +15999,7 @@ pub(crate) mod tests {
                 None,
                 "",
                 true,
-            &crate::settings::KeyboardShortcuts::default());
+            &Arc::new(crate::settings::KeyboardShortcuts::default()));
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(460.0, WORKTREE_ROW_HEIGHT));
             let node = element.as_widget_mut().layout(
