@@ -3863,7 +3863,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
 fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
     let fault = shortcuts.fault()?;
     let Some(owner) = fault.conflicts_with else {
-        if fault.action != action { return None; }
+        if fault.action != action {
+            return None;
+        }
         let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
             return None;
         };
@@ -11273,8 +11275,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -12475,21 +12480,39 @@ impl Cagents {
     fn retry_shortcut_drafts(&mut self) {
         loop {
             let mut progressed = false;
-            let fields: Vec<_> = SettingsField::SHORTCUTS.into_iter().filter(|field| self.settings_invalid.contains_key(field)).collect();
+            let fields: Vec<_> = SettingsField::SHORTCUTS
+                .into_iter()
+                .filter(|field| self.settings_invalid.contains_key(field))
+                .collect();
             for field in fields {
                 let action = field.shortcut_action().expect("shortcut field");
-                let value = self.settings_draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).expect("registered shortcut").1.to_owned();
+                let value = self
+                    .settings_draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered shortcut")
+                    .1
+                    .to_owned();
                 match settings_update(&self.settings, field, &value) {
                     SettingsDecision::Persist(settings) => {
                         self.settings = settings;
                         self.settings_invalid.remove(&field);
                         progressed = true;
                     }
-                    SettingsDecision::Unchanged => { self.settings_invalid.remove(&field); progressed = true; }
-                    SettingsDecision::Invalid(reason) => { self.settings_invalid.insert(field, reason); }
+                    SettingsDecision::Unchanged => {
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Invalid(reason) => {
+                        self.settings_invalid.insert(field, reason);
+                    }
                 }
             }
-            if !progressed { break; }
+            if !progressed {
+                break;
+            }
         }
     }
 
@@ -12507,9 +12530,17 @@ impl Cagents {
                 let previous = self.settings.clone();
                 self.retry_shortcut_drafts();
                 let changed = previous != self.settings;
-                let save = if changed || self.settings_save_error.is_some() { self.save_settings_task(false) } else { Task::none() };
+                let save = if changed || self.settings_save_error.is_some() {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
                 self.refresh_settings_feedback();
-                let effect = if changed { self.synchronize_settings(&previous) } else { Task::none() };
+                let effect = if changed {
+                    self.synchronize_settings(&previous)
+                } else {
+                    Task::none()
+                };
                 Task::batch([save, effect])
             }
             SettingsDecision::Persist(settings) => {
