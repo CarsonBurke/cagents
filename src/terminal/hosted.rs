@@ -1957,6 +1957,12 @@ async fn serve_connection(
     }
 
     let mut presentation_restored=false;
+    // Attach registers a subscription before its descriptor reply is encoded.
+    // Retain broadcasts without publishing/cursor advancement until the reply
+    // proves this exact worker; a same-ID successor must not inherit consent.
+    let mut unconfirmed=std::collections::VecDeque::new();
+    let mut unconfirmed_bytes=0usize;
+    let mut unconfirmed_codec=None;
 
     loop {
         published.expire_retained(Instant::now());
@@ -2091,14 +2097,18 @@ async fn serve_connection(
             }
         }
 
-        let work = wait_for_work_async(
+        let work = if attached && !unconfirmed.is_empty() {
+            let envelope=unconfirmed.pop_front().expect("nonempty above");
+            if unconfirmed.is_empty() {unconfirmed_bytes=0;unconfirmed_codec=None;}
+            ClientWork::Server(envelope)
+        } else {wait_for_work_async(
             stop,
             (attached && pending.len() < MAX_IN_FLIGHT_REQUESTS && !pending.values().any(|kind|matches!(kind,PendingRequest::KeyDelivery(_)))).then_some(*commands),
             connection.incoming(),
             published,
             &connection.credit,
         )
-        .await;
+        .await};
         let envelope = match work {
             ClientWork::Acknowledge | ClientWork::RetainedExpired => continue,
             ClientWork::Stop => {
@@ -2129,6 +2139,19 @@ async fn serve_connection(
             return ConnectionEnd::Retry;
         }
 
+        if !attached && envelope.request_id.is_none() && matches!(&envelope.message,
+            ServerMessage::Event {..} | ServerMessage::Snapshot {..} | ServerMessage::Redraw {..}
+            | ServerMessage::TerminalObserved {..} | ServerMessage::Synchronized {..}) {
+            let codec=unconfirmed_codec.get_or_insert_with(||FrameCodec::new(MAX_FRAME_BYTES));
+            if codec.encode(&*envelope).is_err() {return ConnectionEnd::Retry;}
+            let bytes=codec.encoded().len();
+            if unconfirmed.len()>=EVENT_CAPACITY || unconfirmed_bytes.saturating_add(bytes)>MAX_FRAME_BYTES {
+                return ConnectionEnd::Retry;
+            }
+            unconfirmed_bytes+=bytes;
+            unconfirmed.push_back(envelope);
+            continue;
+        }
         match envelope.message {
             ServerMessage::Response { response } => {
                 let Some(request_id) = envelope.request_id else {
@@ -3576,6 +3599,37 @@ mod tests {
         let deadline=Instant::now()+Duration::from_secs(2);
         while weak.upgrade().is_some() {assert!(Instant::now()<deadline);thread::yield_now();}
         assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_reattach_buffers_semantic_payload_until_worker_is_authenticated() {
+        for replacement in [false,true] {
+            let directory=tempfile::tempdir_in("/var/tmp").unwrap();let socket=directory.path().join("pre-attach.sock");
+            let listener=UnixListener::bind(&socket).unwrap();let proof=proof("pre-attach");let source=session();
+            let handle=HostedTerminalHandle::connect_at(socket,source.id,Some(proof.clone()),|_|{}).unwrap();
+            let mut first=accept_connection(&listener);let original=receipt_connect(&mut first,&proof,source.clone());
+            handle.wait_until_attached(Duration::from_secs(2)).unwrap();drop(first);
+            let mut stream=accept_connection(&listener);
+            let connect:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+            receipt_response(&mut stream,&proof,connect.request_id,ServerResponse::Connected {proof:proof.clone(),resumed:Vec::new()});
+            let attach:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();assert!(matches!(attach.request,ClientRequest::Attach {..}));
+            write_frame(&mut stream,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:None,proof:proof.clone(),message:ServerMessage::Event {terminal_id:source.id,sequence:1,event:super::super::ipc::WireTerminalEvent::TitleChanged {title:"pre-descriptor-payload".into()}}}).unwrap();
+            let mut terminal=TerminalDescriptor::relaunchable(source.id,source.launch.clone(),None);
+            terminal.session=source.clone();terminal.execution_instance=if replacement {uuid::Uuid::new_v4()} else {original.execution_instance};terminal.attached=true;
+            receipt_response(&mut stream,&proof,attach.request_id,ServerResponse::Attached {terminal});
+            let events=handle.events();let deadline=Instant::now()+Duration::from_secs(2);let mut saw_title=false;
+            loop {
+                for event in events.try_iter() {
+                    if let TerminalEvent::TitleChanged(title)=event {assert_eq!(title,"pre-descriptor-payload");saw_title=true;}
+                }
+                if replacement && handle.inner.stop.is_requested() {break;}
+                if !replacement && saw_title {break;}
+                assert!(Instant::now()<deadline,"reattach did not settle");thread::yield_now();
+            }
+            assert_eq!(saw_title,!replacement,"payload may only inherit its authenticated worker binding");
+            assert_eq!(handle.execution_instance(),Some(original.execution_instance));
+            assert_eq!(handle.inner.published.event_sequence.load(Ordering::Acquire),if replacement {0} else {1});
+        }
     }
 
     #[test]
