@@ -24,6 +24,7 @@ pub enum Operation {
     Inspect { repository:PathBuf, path:PathBuf },
     StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },
     SetDisposableIgnoredDirectories { repository:PathBuf, path:PathBuf, directories:Vec<String> },
+    GetDisposableIgnoredDirectories {repository:PathBuf,path:PathBuf},
     DeleteBranch { repository:PathBuf, branch:String, force:bool, expected_oid:Option<String> },
 }
 
@@ -37,10 +38,11 @@ impl Operation {
             | Self::Inspect { repository, .. }
             | Self::StaleLock { repository, .. }
             | Self::SetDisposableIgnoredDirectories { repository, .. }
+            | Self::GetDisposableIgnoredDirectories {repository,..}
             | Self::DeleteBranch {repository,..} => Some(repository),
         }
     }
-    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..}) }
+    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..} | Self::GetDisposableIgnoredDirectories {..}) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +70,7 @@ pub enum Reply {
     /// Repository snapshots keep their byte-exact path schema without pulling
     /// the daemon's Git/SQLite implementation into the control CLI.
     Inspected { snapshot:String, disposable_ignored_directories:Vec<String> },
+    DisposableIgnoredDirectories {directories:Vec<String>},
     BranchDeleted {branch:String},
     BranchDeleteRefused {failure:BranchDeleteFailure},
 }
