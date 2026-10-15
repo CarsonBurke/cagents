@@ -11398,11 +11398,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         let admin_dir = self.created_admin_dir(journal);
         if residual.branch_exists && owned && admin_dir.is_some() {
-            let (admin, admin_root, _checkout_root) = admin_dir.expect("admin identity checked");
+            let (admin, admin_root, checkout_root) = admin_dir.expect("admin identity checked");
             journal.admin_dir = Some(admin);
             if let Err(error) = worktree_setup_intent::record_creation_identity(&admin_root, journal.request.operation_id) {
                 journal.state = WorktreeOperationState::ReconcileRequired;
                 journal.detail = format!("Worktree created; creation identity publication requires reconciliation: {error}");
+                return;
+            }
+            if !worktree_setup_intent::named_directory_matches(&admin_root) || !worktree_setup_intent::named_directory_matches(&checkout_root) {
+                journal.state = WorktreeOperationState::ReconcileRequired;
+                journal.detail = "Creation directory identity changed while publishing its generation; inspect before reconciliation".into();
                 return;
             }
             journal.state = WorktreeOperationState::Created;
@@ -11465,11 +11470,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let git_dir = self.git_dir(destination, &token).ok()?;
         crate::secure_file::reject_symlink_components(&git_dir).ok()?;
         let admin_root = fs_safety::Root::open(&git_dir).ok()?;
-        let same_named_directory = |root: &fs_safety::Root| {
-            use std::os::unix::fs::MetadataExt;
-            root.metadata().ok().zip(fs::symlink_metadata(root.path()).ok()).is_some_and(|(held, named)|
-                named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino())
-        };
         // A linked worktree must resolve to its own administrative directory,
         // whose backlink names exactly this destination's .git file.
         if git_dir.parent() != Some(journal.common_dir.join("worktrees").as_path())
@@ -11488,7 +11488,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return None;
         }
         if journal.checkout_completed {
-            return (same_named_directory(&checkout_root) && same_named_directory(&admin_root)).then_some((git_dir, admin_root, checkout_root));
+            return (worktree_setup_intent::named_directory_matches(&checkout_root) && worktree_setup_intent::named_directory_matches(&admin_root)).then_some((git_dir, admin_root, checkout_root));
         }
         // HEAD and backlinks precede checkout in Git. Without a recorded
         // successful exit, require a real index and a clean index/worktree
@@ -11504,7 +11504,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     &token,
                 )
                 .is_ok_and(|output| output.stdout.is_empty());
-        (clean && same_named_directory(&checkout_root) && same_named_directory(&admin_root)).then_some((git_dir, admin_root, checkout_root))
+        (clean && worktree_setup_intent::named_directory_matches(&checkout_root) && worktree_setup_intent::named_directory_matches(&admin_root)).then_some((git_dir, admin_root, checkout_root))
     }
 
     /// Publish creation metadata after Git success is durable. Recovery never
