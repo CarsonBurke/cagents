@@ -14627,6 +14627,7 @@ mod tests {
             message: "bad beta".into(),
             source: None,
             code: None,
+            protocol:None,
         }]);
         assert_eq!(runtime.language.marks.len(), 1);
         assert_eq!(

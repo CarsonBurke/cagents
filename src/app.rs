@@ -23878,6 +23878,7 @@ mod tests {
             message: message.into(),
             source: None,
             code: None,
+            protocol:None,
         }
     }
 

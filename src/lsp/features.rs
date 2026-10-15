@@ -165,7 +165,10 @@ impl LspManager {
         let c=self.capabilities(doc);let snapshot=self.documents.get(&doc).and_then(|r|self.snapshots.latest(&r.uri));
         let Some(snapshot)=snapshot else{return self.fail_feature(doc,LspError::UnknownDocument(doc.0));};
         let range=match snapshot.range_to_utf16(range){Ok(r)=>r,Err(e)=>return self.fail_feature(doc,e)};
-        let diagnostics=diagnostics.iter().filter_map(|d|Some(lsp_types::Diagnostic {range:snapshot.range_to_utf16(d.range).ok()?,severity:Some(match d.severity{LspSeverity::Error=>lsp_types::DiagnosticSeverity::ERROR,LspSeverity::Warning=>lsp_types::DiagnosticSeverity::WARNING,LspSeverity::Information=>lsp_types::DiagnosticSeverity::INFORMATION,LspSeverity::Hint=>lsp_types::DiagnosticSeverity::HINT}),message:d.message.clone(),source:d.source.clone(),code:d.code.clone().map(lsp_types::NumberOrString::String),..Default::default()})).collect();
+        let diagnostics=diagnostics.iter().filter_map(|d|{
+            let mut raw=d.protocol.as_deref().cloned().unwrap_or_else(||lsp_types::Diagnostic{message:d.message.clone(),source:d.source.clone(),code:d.code.clone().map(lsp_types::NumberOrString::String),severity:Some(match d.severity{LspSeverity::Error=>lsp_types::DiagnosticSeverity::ERROR,LspSeverity::Warning=>lsp_types::DiagnosticSeverity::WARNING,LspSeverity::Information=>lsp_types::DiagnosticSeverity::INFORMATION,LspSeverity::Hint=>lsp_types::DiagnosticSeverity::HINT}),..Default::default()});
+            raw.range=snapshot.range_to_utf16(d.range).ok()?;Some(raw)
+        }).collect();
         self.feature_request(doc,LspPosition::default(),RequestKind::CodeActions,RequestArgs::CodeActions{range,diagnostics},Duration::from_secs(15),c.ready&&c.code_actions)
     }
     pub fn request_resolve_code_action(&mut self,doc:LspDocumentId,item:LspCodeAction)->LspRequestId {
