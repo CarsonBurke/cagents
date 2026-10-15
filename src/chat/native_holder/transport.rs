@@ -204,6 +204,11 @@ impl Holder {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::chat) fn disconnect_control_for_test(&self) {
+        self.control.as_ref().unwrap().shutdown(std::net::Shutdown::Both).unwrap();
+    }
+
     pub fn preserve(mut self) -> super::Detached {
         self.release_on_drop = false;
         self.control.take();
@@ -250,8 +255,18 @@ impl Holder {
                 self.identity.close()
             };
         };
-        send(control, &Request::Release, TIMEOUT)?;
-        match receive(control, TIMEOUT)? {
+        let response=send(control, &Request::Release, TIMEOUT)
+            .and_then(|()|receive(control, TIMEOUT));
+        let response=match response {
+            Ok(response)=>response,
+            Err(error)=> {
+                // A retry must inspect/adopt this exact retained holder instead
+                // of repeatedly writing to an irrecoverably broken stream.
+                self.control.take();
+                return Err(error);
+            }
+        };
+        match response {
             Some(Report::Released) => {
                 if !self.identity.receipt(retain)? {
                     return Err("Native holder released without durable cleanup evidence".into());
@@ -261,7 +276,10 @@ impl Holder {
                 Ok(())
             }
             Some(Report::Failed(error)) => Err(error),
-            _ => Err("Native holder did not acknowledge server teardown".into()),
+            _ => {
+                self.control.take();
+                Err("Native holder did not acknowledge server teardown".into())
+            },
         }
     }
 }

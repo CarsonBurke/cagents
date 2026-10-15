@@ -5785,6 +5785,7 @@ mod tests {
             assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
             return;
         }
+        for broken_control in [false,true] {
         let mut source=super::super::native_holder::fixture_source();
         let boot=crate::daemon::read_boot_id().unwrap();
         source.proof.as_mut().unwrap().boot_id=boot.clone();
@@ -5793,13 +5794,18 @@ mod tests {
         let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
         let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::OwnedUnixWebSocket {socket:source.owned_codex_listener.as_ref().unwrap().socket.clone()},program:"/bin/sleep".into(),arguments:vec!["60".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let holder=super::super::native_holder::spawn(spec,source.clone()).unwrap();
+        let mut holder=super::super::native_holder::spawn(spec,source.clone()).unwrap();
         let root=crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
         let record=crate::daemon::holder_registry::evidence(&crate::daemon::holder_registry::socket(&root,source.id),crate::daemon::holder_registry::Kind::Native).unwrap().unwrap();
         assert!(record.root.is_current());
         let receipt=root.join(format!("{}-{}-{}.closed",source.id,record.holder.pid,record.holder.start));
-        let mut invalid=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
-        invalid.write_all(b"transient invalid cleanup receipt").unwrap();drop(invalid);
+        if broken_control {
+            holder.confirm(uuid::Uuid::new_v4().to_string(),super::super::native_holder::fixture_identity(),record.root.clone()).unwrap();
+            holder.disconnect_control_for_test();
+        } else {
+            let mut invalid=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
+            invalid.write_all(b"transient invalid cleanup receipt").unwrap();drop(invalid);
+        }
         let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
         let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
         let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
@@ -5815,10 +5821,11 @@ mod tests {
         assert!(handle.0.retained_native.lock().unwrap().is_some());
         assert!(record.root.is_current(),"the failed attempt must retain the same actual provider owner");
         assert!(!handle.is_completed());assert!(handle.owns_work());
-        std::fs::remove_file(&receipt).unwrap();
+        if !broken_control {std::fs::remove_file(&receipt).unwrap();}
         handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
         assert!(handle.0.retained_native.lock().unwrap().is_none());assert!(handle.is_completed());
         assert!(!record.root.is_current(),"the later same close API must progress through exact native cleanup");
+        }
     }
 
     fn worker_blocked_in_tls_destruction()->(JoinHandle<()>,crossbeam_channel::Sender<()>,crossbeam_channel::Receiver<()>) {
