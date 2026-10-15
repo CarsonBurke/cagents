@@ -441,6 +441,22 @@ fn initial_editor_protections(runtime: &Path, paths: &[PathBuf]) -> io::Result<V
         .collect()
 }
 
+/// Worker-only physical lease for an explicit local filesystem operation,
+/// including CLI/daemon intake without an initialized window. This grants no
+/// registry, placement, remote-path, or publication authority. The caller must
+/// run on the host owning this already-open Root and compose its real domain
+/// proof before effects; it never silently receives an unprotected None.
+pub fn protect_operation(root: &crate::fs_safety::Root) -> io::Result<Protection> {
+    protect_operation_in_runtime(&crate::instance::runtime_directory()?, root)
+}
+fn protect_operation_in_runtime(runtime: &Path, root: &crate::fs_safety::Root) -> io::Result<Protection> {
+    let protection = acquire(runtime, root.path(), false)?;
+    if !protection.protects_root(root)? {
+        return Err(io::Error::other("The operation source root changed while acquiring cleanup protection; no file was changed."));
+    }
+    Ok(protection)
+}
+
 /// A displaying process protects the next directory before it exposes it.
 /// Remote paths cannot be interpreted by this computer; remote automatic
 /// cleanup remains unavailable until that window has equivalent host leases.
@@ -1193,5 +1209,24 @@ mod tests {
             inode,
             std::os::unix::fs::MetadataExt::ino(&before.metadata().unwrap())
         );
+    }
+}
+
+#[cfg(test)]
+mod operation_root_tests {
+    use super::*;
+    #[test]
+    fn operation_protection_needs_no_window_flag_and_refuses_a_replaced_open_root() {
+        let runtime = tempfile::tempdir().unwrap(); let directory = tempfile::tempdir().unwrap();
+        let named = directory.path().join("root"); let moved = directory.path().join("original");
+        std::fs::create_dir(&named).unwrap(); let root = crate::fs_safety::Root::open(&named).unwrap();
+        let protection = protect_operation_in_runtime(runtime.path(), &root).unwrap();
+        assert!(protection.protects_root(&root).unwrap());
+        assert!(fixture_protection(runtime.path(), &named, true).is_err());
+        drop(protection);
+        std::fs::rename(&named, &moved).unwrap(); std::fs::create_dir(&named).unwrap();
+        assert!(protect_operation_in_runtime(runtime.path(), &root).is_err());
+        assert!(std::fs::read_dir(&named).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&moved).unwrap().next().is_none());
     }
 }
