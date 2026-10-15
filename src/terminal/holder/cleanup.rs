@@ -43,11 +43,25 @@ fn digest(source: &TerminalSession) -> Result<[u8; 32], String> {
     Ok(Sha256::digest(serde_json::to_vec(&source).map_err(|e| e.to_string())?).into())
 }
 
-pub(crate) fn publish(
-    record: &Record,
-    recovery: &Recovery,
-    _family: &crate::daemon::owned_children::ReapedFamily,
-) -> Result<(), String> {
+/// Bounded private lineage captured from an authenticated spawn/adoption.
+/// Keep the digest rather than another copy of the issued recipe/environment.
+pub(crate) struct SourceReceipt {
+    digest: [u8;32],
+    proof: HostSessionProof,
+}
+
+impl SourceReceipt {
+    pub(crate) fn capture(source: &TerminalSession) -> Result<Self,String> {
+        Ok(Self {digest:digest(source)?, proof:source.continuity.live_proof()
+            .ok_or("Terminal close source has no ownership proof")?})
+    }
+
+    pub(crate) fn confirmed(&self, expected: &Record) -> Result<bool,String> {
+        confirmed_receipt(expected,&self.proof,Some(self.digest))
+    }
+}
+
+pub(crate) fn publish(record: &Record, recovery: &Recovery, _family: &crate::daemon::owned_children::ReapedFamily) -> Result<(), String> {
     if record.root.is_current() {
         return Err("Terminal root has not been reaped".into());
     }
