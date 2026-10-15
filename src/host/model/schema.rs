@@ -247,6 +247,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("registry.sqlite3");
         let registry = Registry::at(&path).unwrap();
+        registry.db.execute("INSERT INTO projects(repository,name,ordinal,kind) VALUES('/retained-missing-metadata','original custom name',7,'folder')",[]).unwrap();
         automation_extensions_schema::discard_for_legacy_fixture(&registry.db);
         registry.db.pragma_update(None, "user_version", 17).unwrap();
         drop(registry);
@@ -272,6 +273,8 @@ mod tests {
                 let old_columns=rows.first().map(Vec::len).unwrap_or(0);
                 let projected:Vec<_>=new_rows.iter().map(|row|row[..old_columns].to_vec()).collect();
                 assert_eq!(projected,rows,"preexisting metadata authority retained");
+            } else if name=="projects" {
+                automation_extensions_schema::assert_checkout_only_extension(&ddl,&rows,new_ddl,new_rows);
             } else {
                 assert_eq!(new_ddl,&ddl,"preexisting {name} layout retained");
                 assert_eq!(new_rows,&rows,"preexisting {name} rows retained");

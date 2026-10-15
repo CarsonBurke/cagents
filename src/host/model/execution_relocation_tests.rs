@@ -240,6 +240,8 @@ fn schema17_upgrade_preserves_issued_end_and_all_stored_authority_before_locate(
                 let columns=rows.first().map(Vec::len).unwrap_or(0);
                 let original_columns:Vec<_>=current_rows.iter().map(|row|row[..columns].to_vec()).collect();
                 assert_eq!(&original_columns,rows,"original metadata unchanged");
+            } else if name=="projects" {
+                super::super::automation_extensions_schema::assert_checkout_only_extension(ddl,rows,current_ddl,current_rows);
             } else {
                 assert_eq!(current_ddl,ddl,"original {name} layout unchanged");
                 assert_eq!(current_rows,rows,"original {name} authority unchanged");
