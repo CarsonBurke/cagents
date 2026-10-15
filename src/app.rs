@@ -13801,7 +13801,13 @@ impl Application for Cagents {
                                     SidebarWorktree::from_repository(record, status.as_ref());
                                 row.head_repository =
                                     loaded.head_repositories.get(&record.id).cloned();
-                                row.apply_status_error(loaded.status_order.errors.get(&record.id).map(String::as_str));
+                                row.apply_status_error(
+                                    loaded
+                                        .status_order
+                                        .errors
+                                        .get(&record.id)
+                                        .map(String::as_str),
+                                );
                                 row
                             })
                             .collect();
@@ -17792,9 +17798,14 @@ fn load_repository(
             let status = if worktree.bare {
                 None
             } else {
-                status_order.reads.insert(worktree.id, git_ui::next_status_read());
+                status_order
+                    .reads
+                    .insert(worktree.id, git_ui::next_status_read());
                 match service.status_projection(
-                    &worktree.path, true, sidebar::STATUS_DISPLAY_LIMIT, &cancellation,
+                    &worktree.path,
+                    true,
+                    sidebar::STATUS_DISPLAY_LIMIT,
+                    &cancellation,
                 ) {
                     Ok(status) => Some(status.display_summary()),
                     Err(error) => {
@@ -17803,7 +17814,9 @@ fn load_repository(
                     }
                 }
             };
-            if let Some(status) = &status { git_ui::apply_status_head(&mut worktree, status); }
+            if let Some(status) = &status {
+                git_ui::apply_status_head(&mut worktree, status);
+            }
             (worktree, status)
         })
         .collect::<Vec<_>>();
