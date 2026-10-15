@@ -424,6 +424,17 @@ impl Handle {
             history_only: matches!(spec.transport, TransportSpec::History),
             stderr_lease: stderr_lease.clone(),
         });
+        {
+            // Registration and a fresh seed share Store ownership. If an old
+            // cache reader just poisoned this retained Store, the replacement
+            // observes that fact even when the reader sampled its old Weak.
+            let mut store=store.lock().unwrap_or_else(|p|p.into_inner());
+            let mut state=state.lock().unwrap_or_else(|p|p.into_inner());
+            store.register_source_authority_observer(Arc::downgrade(&inner));
+            store.publish_source_authority(&mut state);
+            *inner.source_authority.lock().unwrap_or_else(|p|p.into_inner())=store.source_authority();
+            inner.source_unavailable.store(store.source_authority_unavailable().is_some(),Ordering::Release);
+        }
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
         let (started, startup) = crossbeam_channel::bounded(1);

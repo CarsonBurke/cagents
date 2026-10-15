@@ -6,8 +6,17 @@ pub(super) struct Clock {
     last: Option<crate::chat::runtime::SourceAuthority>,
     floor: u64,
     unavailable:Option<crate::chat::SourceAuthorityUnavailableCause>,
+    // A retained Store can outlive and replace its LocalHandle. Readers sample
+    // the current observer while holding Store, then invoke it after unlock.
+    observer:std::sync::Weak<crate::chat::runtime::Inner>,
 }
 impl Store {
+    pub(in crate::chat::runtime) fn register_source_authority_observer(&mut self,observer:std::sync::Weak<crate::chat::runtime::Inner>) {
+        self.source_authority.observer=observer;
+    }
+    pub(in crate::chat::runtime) fn source_authority_observer(&self)->std::sync::Weak<crate::chat::runtime::Inner> {
+        self.source_authority.observer.clone()
+    }
     /// After exact old actor completion/join, replacement callers include its
     /// final metadata generation before binding this same Store to a new actor.
     pub(in crate::chat::runtime) fn note_source_generation_floor(&mut self,generation:u64) {
