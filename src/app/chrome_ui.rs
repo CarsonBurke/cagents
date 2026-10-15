@@ -1933,11 +1933,17 @@ impl Cagents {
             children.push(tooltip(indicator, label));
         }
         if self.sidebar_state.has_card_update(id) {
-            let detail = self.settings.notifications.message_previews.then(|| {
-                card.and_then(super::notification_ui::card_session)
-                    .and_then(|session| self.notification_ui.previews.get(&session))
-                    .map(|(_, text)| text.as_str())
-            }).flatten().unwrap_or("Needs attention");
+            let detail = self
+                .settings
+                .notifications
+                .message_previews
+                .then(|| {
+                    card.and_then(super::notification_ui::card_session)
+                        .and_then(|session| self.notification_ui.previews.get(&session))
+                        .map(|preview| preview.text.as_str())
+                })
+                .flatten()
+                .unwrap_or("Needs attention");
             children.push(tooltip(
                 Icon::Attention
                     .handle()

@@ -32,10 +32,18 @@ struct Pending {
     acknowledged: BTreeSet<uuid::Uuid>,
 }
 
+pub(super) struct Preview {
+    pub notice: uuid::Uuid,
+    pub rank: usize,
+    pub text: String,
+    seen: u64,
+}
+
 pub(super) struct State {
     pub snapshot: Snapshot,
     /// Derived once per broker snapshot, never searched during row rendering.
-    pub previews: HashMap<TerminalId, (usize, String)>,
+    pub previews: HashMap<TerminalId, Preview>,
+    preview_generation: u64,
     presence: Arc<Mutex<Presence>>,
     pending: Arc<Mutex<Pending>>,
     wake: Option<crossbeam_channel::Sender<()>>,
@@ -53,6 +61,7 @@ impl Default for State {
         Self {
             snapshot: Snapshot::default(),
             previews: HashMap::new(),
+            preview_generation: 0,
             presence: Arc::new(Mutex::new(Presence::default())),
             pending: Arc::new(Mutex::new(Pending::default())),
             wake: None,
@@ -356,17 +365,41 @@ impl Cagents {
                         self.observe_agent_update_for_card(card);
                     }
                 }
-                self.notification_ui.previews.clear();
+                self.notification_ui.preview_generation =
+                    self.notification_ui.preview_generation.wrapping_add(1);
+                let generation = self.notification_ui.preview_generation;
                 for (rank, notice) in snapshot.notices.iter().enumerate() {
-                    if !notice.acknowledged && notice.event.content.is_some()
+                    if !notice.acknowledged
+                        && notice.event.content.is_some()
                         && !self.notification_ui.acknowledged.contains(&notice.id)
-                        && let Some(session) = notice.event.source_session() {
-                        self.notification_ui.previews.entry(session).or_insert_with(|| {
-                            let message = crate::notifications::presentation::message(&notice.event, true);
-                            (rank, format!("{}\n{}", message.title, message.body))
-                        });
+                        && let Some(session) = notice.event.source_session()
+                    {
+                        if let Some(cached) = self.notification_ui.previews.get_mut(&session) {
+                            if cached.seen == generation {
+                                continue;
+                            }
+                            if cached.notice == notice.id {
+                                cached.rank = rank;
+                                cached.seen = generation;
+                                continue;
+                            }
+                        }
+                        let message =
+                            crate::notifications::presentation::message(&notice.event, true);
+                        self.notification_ui.previews.insert(
+                            session,
+                            Preview {
+                                notice: notice.id,
+                                rank,
+                                text: format!("{}\n{}", message.title, message.body),
+                                seen: generation,
+                            },
+                        );
                     }
                 }
+                self.notification_ui
+                    .previews
+                    .retain(|_, cached| cached.seen == generation);
                 self.notification_ui.snapshot = snapshot;
                 self.refresh_sidebar_channels();
                 self.notification_ui.last_focus = None;
@@ -558,6 +591,48 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_preview_projection_reuses_text_and_retires_acknowledged_context() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let session = TerminalId::new();
+        let mut event = crate::notifications::Event::session(
+            session,
+            crate::agent::Provider::Codex,
+            "/repo".into(),
+            crate::notifications::Evidence {
+                key: "response".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            },
+        );
+        event.content = Some(crate::notifications::Content {
+            conversation: "Example".into(),
+            preview: "Ready to review.".into(),
+            request: None,
+        });
+        let mut notice = crate::notifications::Notice {
+            id: uuid::Uuid::new_v4(),
+            event,
+            delivered: true,
+            acknowledged: false,
+            window: None,
+        };
+        let snapshot = |notice| Snapshot {
+            notices: vec![notice],
+            diagnostic: None,
+        };
+        drop(app.update_notifications(Action::Snapshot(snapshot(notice.clone()))));
+        let allocation = app.notification_ui.previews[&session].text.as_ptr();
+        drop(app.update_notifications(Action::Snapshot(snapshot(notice.clone()))));
+        assert_eq!(
+            app.notification_ui.previews[&session].text.as_ptr(),
+            allocation,
+            "unchanged journal records must not reformat and reallocate every snapshot"
+        );
+        notice.acknowledged = true;
+        drop(app.update_notifications(Action::Snapshot(snapshot(notice))));
+        assert!(!app.notification_ui.previews.contains_key(&session));
+    }
 
     fn live_session(app: &mut Cagents) -> TerminalSession {
         let CardKind::Terminal(session) = &mut Arc::make_mut(&mut app.durable).cards[0].kind else {

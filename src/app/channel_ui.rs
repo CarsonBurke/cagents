@@ -887,7 +887,7 @@ impl Cagents {
                 let mut unread = false;
                 let mut chats = 0;
                 let mut has_panes = false;
-                let mut notification_preview: Option<&(usize, String)> = None;
+                let mut notification_preview: Option<&super::notification_ui::Preview> = None;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
                     let Some(card) = durable.cards.iter().find(|card| {
@@ -903,7 +903,8 @@ impl Cagents {
                             _ => None,
                         };
                         if let Some(preview) = session.and_then(|session| previews.get(&session))
-                            && notification_preview.is_none_or(|known| preview.0 < known.0) {
+                            && notification_preview.is_none_or(|known| preview.rank < known.rank)
+                        {
                             notification_preview = Some(preview);
                         }
                     }
@@ -925,7 +926,9 @@ impl Cagents {
                         _ => {}
                     }
                 }
-                let notification_preview = notification_preview.filter(|_| unread).map(|(_, text)| text);
+                let notification_preview = notification_preview
+                    .filter(|_| unread)
+                    .map(|preview| &preview.text);
                 let unchanged = project.channels.get(index).is_some_and(|row| {
                     row.id == channel.id
                         && row.title == title
