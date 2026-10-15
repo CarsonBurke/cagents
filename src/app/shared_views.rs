@@ -4374,6 +4374,7 @@ mod tests {
     }
 
     fn retained_chat_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
+        use crate::chat;
         let (mut app, source, destination, mut pane) = channel_move_fixture();
         let CardKind::Terminal(terminal) = moving_terminal_kind() else {
             unreachable!()
