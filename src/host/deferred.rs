@@ -1,7 +1,7 @@
 //! Bounded provider acknowledgements never occupy an IPC input worker. One
 //! process-wide completion selector sleeps on replies or their actual deadline.
 use super::{delivery::DeliveryQueue,state::{ClientId,SharedHost}};
-use crate::{chat::Command,model::{TerminalId,HostSessionId,BootId,HostIncarnation},terminal_ipc::{ClientRequest,ProtocolError,ProtocolErrorCode,ServerEnvelope,ServerMessage,ServerResponse,PROTOCOL_VERSION}};
+use crate::{chat::Command,model::{TerminalId,HostSessionId,BootId,HostIncarnation,HostSessionProof},terminal_ipc::{ClientRequest,ProtocolError,ProtocolErrorCode,ServerEnvelope,ServerMessage,ServerResponse,PROTOCOL_VERSION}};
 use crossbeam_channel::{Receiver,Sender};
 use std::{collections::{BTreeMap,BTreeSet,VecDeque},sync::{Arc,Mutex,OnceLock},time::{Duration,Instant}};
 
@@ -9,8 +9,7 @@ const PER_CLIENT:usize=64;
 const NORMAL_TOTAL:usize=1024;
 const INTERRUPT_TOTAL:usize=256;
 type ClientKey=(HostSessionId,BootId,HostIncarnation,ClientId);
-fn client_key(host:&SharedHost,client:ClientId)->ClientKey {
-    let state=host.lock().unwrap_or_else(|p|p.into_inner());let proof=state.proof();
+fn client_key(proof:&HostSessionProof,client:ClientId)->ClientKey {
     (proof.host_session_id.clone(),proof.boot_id.clone(),proof.host_incarnation.clone(),client)
 }
 #[derive(Default)]
@@ -37,8 +36,8 @@ impl Drop for Credit {
 }
 struct Pending {reply:Receiver<Result<(),String>>,deadline:Instant,complete:Box<dyn FnOnce(Result<(),String>)+Send>,_credit:Credit}
 struct Broker {incoming:Sender<Pending>,cancel:Sender<ClientKey>,budget:Arc<Mutex<Budget>>}
+static BROKER:OnceLock<Result<Broker,String>>=OnceLock::new();
 fn broker()->Result<&'static Broker,String> {
-    static BROKER:OnceLock<Result<Broker,String>>=OnceLock::new();
     BROKER.get_or_init(|| {
         let (incoming,receive)=crossbeam_channel::bounded(NORMAL_TOTAL+INTERRUPT_TOTAL);
         let (cancel,cancelled)=crossbeam_channel::bounded(NORMAL_TOTAL+INTERRUPT_TOTAL);
@@ -48,7 +47,12 @@ fn broker()->Result<&'static Broker,String> {
 }
 
 pub(super) fn disconnected(host:&SharedHost,client:ClientId) {
-    if let Ok(broker)=broker() {let _=broker.cancel.try_send(client_key(host,client));}
+    let proof=host.lock().unwrap_or_else(|p|p.into_inner()).proof().clone();
+    disconnected_proof(&proof,client);
+}
+pub(super) fn disconnected_proof(proof:&HostSessionProof,client:ClientId) {
+    // Shared IO cleanup must not acquire HostLock or initialize a service.
+    if let Some(Ok(broker))=BROKER.get() {let _=broker.cancel.try_send(client_key(proof,client));}
 }
 
 pub(super) fn is_deferred(request:&ClientRequest)->bool {
@@ -61,7 +65,8 @@ pub(super) fn try_defer(host:&SharedHost,client_id:ClientId,request_id:u64,deliv
     let ClientRequest::ChatCommand {chat_id,command}=&request else {unreachable!()};
     let refused=|message:String|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false);
     let broker=broker().map_err(refused)?;
-    let credit=Credit::acquire(&broker.budget,client_key(host,client_id),*chat_id,matches!(command,Command::Interrupt)).map_err(refused)?;
+    let proof=host.lock().unwrap_or_else(|p|p.into_inner()).proof().clone();
+    let credit=Credit::acquire(&broker.budget,client_key(&proof,client_id),*chat_id,matches!(command,Command::Interrupt)).map_err(refused)?;
     let gate=super::client::control_gate(host);
     let _admission=gate.read().unwrap_or_else(|p|p.into_inner());
     super::client::ensure_control_open(host)?;
@@ -69,9 +74,7 @@ pub(super) fn try_defer(host:&SharedHost,client_id:ClientId,request_id:u64,deliv
     // This preserves the exact interactive ownership/agent gate used by the
     // synchronous ChatCommand path; only waiting for its reply is deferred.
     let reply=super::chat::enqueue_deferred(host,client_id,request)?;
-    let host=host.clone();
     let complete=Box::new(move |result:Result<(),String>| {
-        let proof=host.lock().unwrap_or_else(|p|p.into_inner()).proof().clone();
         let message=match result {
             Ok(())=>ServerMessage::Response {response:ServerResponse::Accepted},
             Err(message)=>ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::InvalidRequest,crate::chat::protocol::preview(message.as_bytes(),1024),false)),
