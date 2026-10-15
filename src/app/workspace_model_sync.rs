@@ -2291,7 +2291,10 @@ mod tests {
             crate::workspace_model::views::managed_display(&app.workspace_model, &agent).unwrap();
         assert!(app.adopt_execution_agent_display(&agent, display).is_some());
         assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
-        assert!(matches!(app.cards.get(&pane.id), Some(CardRuntime::Loading)));
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Loading)
+        ));
         assert!(
             app.durable
                 .channels
