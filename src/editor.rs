@@ -159,7 +159,9 @@ fn binary_preview(mut file: File, offset: u64) -> Result<BinaryPreview, FileIoEr
         bytes: metadata.len(),
         modified: metadata.modified().ok(),
         mime: binary_mime(&header[..read]),
-        error: None,
+        error: (metadata.len() > MAX_EDITABLE_FILE_BYTES).then(|| format!(
+            "This file exceeds the {MAX_EDITABLE_FILE_BYTES} byte editing limit. Showing a bounded byte preview.",
+        )),
         offset,
         data: data.into(),
         hex: hex.into(),
@@ -510,17 +512,12 @@ fn load_regular_file(
     };
     if metadata.len() > limit && !document && image::ImageFormat::from_path(relative_path).is_err()
     {
-        let mut sample = [0; 4096];
-        let mut descriptor = &file;
-        let read = descriptor.read(&mut sample).map_err(io_error)?;
-        descriptor.seek(io::SeekFrom::Start(0)).map_err(io_error)?;
-        if sample[..read].contains(&0)
-            || std::str::from_utf8(&sample[..read]).is_err_and(|error| error.error_len().is_some())
-        {
-            return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(
-                binary_preview(file, 0)?,
-            )));
-        }
+        // An ASCII prefix cannot prove an oversized file is text. Keep the
+        // same editing limit while exposing bounded bytes and file actions
+        // for both unknown binary files and oversized UTF-8 text.
+        return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(
+            binary_preview(file, 0)?,
+        )));
     }
     if metadata.len() > limit {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::Oversize {
@@ -1308,6 +1305,31 @@ mod tests {
     }
 
     #[test]
+    fn oversized_files_keep_byte_preview_after_an_ascii_header() {
+        let root = tempdir().unwrap();
+        let mut binary = File::create(root.path().join("late-binary.bin")).unwrap();
+        binary.write_all(&vec![b'a'; 5000]).unwrap();
+        binary.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
+            content(root.path(), "late-binary.bin") else { panic!("bounded binary preview"); };
+        assert_eq!(preview.bytes, MAX_EDITABLE_FILE_BYTES + 1);
+        assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
+        assert!(preview.data[..5000].iter().all(|byte| *byte == b'a'));
+        assert_eq!(preview.data[5000], 0);
+        assert!(preview.error.as_deref().unwrap().contains("editing limit"));
+        let next = load_binary_page(root.path(), Path::new("late-binary.bin"), BINARY_PREVIEW_BYTES).unwrap();
+        assert_eq!(next.data.len(), BINARY_PREVIEW_BYTES as usize);
+        assert!(next.error.as_deref().unwrap().contains("editing limit"));
+
+        fs::write(root.path().join("large-text.txt"), vec![b'x'; MAX_EDITABLE_FILE_BYTES as usize + 1]).unwrap();
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(text)) =
+            content(root.path(), "large-text.txt") else { panic!("oversized text remains read-only"); };
+        assert_eq!(text.data.len(), BINARY_PREVIEW_BYTES as usize);
+        assert!(text.data.iter().all(|byte| *byte == b'x'));
+        assert!(text.error.as_deref().unwrap().contains("editing limit"));
+    }
+
+    #[test]
     fn image_headers_cannot_bypass_pixel_or_file_limits() {
         let root = tempdir().unwrap();
         let path = root.path().join("wide.png");
@@ -1428,14 +1450,10 @@ mod tests {
             "x".repeat(MAX_EDITABLE_FILE_BYTES as usize + 1),
         )
         .unwrap();
-        assert!(matches!(
-            content(root.path(), "big.txt"),
-            FileContent::ReadOnly(ReadOnlyReason::Oversize {
-                limit: MAX_EDITABLE_FILE_BYTES,
-                kind: OversizeKind::Editable,
-                ..
-            })
-        ));
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
+            content(root.path(), "big.txt") else { panic!("oversized text is not editable"); };
+        assert_eq!(preview.bytes, MAX_EDITABLE_FILE_BYTES + 1);
+        assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
     }
 
     #[test]
