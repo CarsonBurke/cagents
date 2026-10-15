@@ -9832,10 +9832,19 @@ mod tests {
         async fn reply(handle: &FakeHandle, id: i64) -> Value {
             let deadline = tokio::time::Instant::now() + WAIT;
             loop {
-                if let Some(response) = handle.entries("").into_iter().find(|response| response.id == Some(id)) {
-                    return response.result.expect("workspace request returned a result");
+                if let Some(response) = handle
+                    .entries("")
+                    .into_iter()
+                    .find(|response| response.id == Some(id))
+                {
+                    return response
+                        .result
+                        .expect("workspace request returned a result");
                 }
-                assert!(tokio::time::Instant::now() < deadline, "missing workspace reply {id}");
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "missing workspace reply {id}"
+                );
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
@@ -9847,23 +9856,29 @@ mod tests {
                     "range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"newText":"x"}]}]});
             let response_edit = edit.clone();
             let mut manager = rust_manager();
-            let slot = install_fake(&mut manager,
+            let slot = install_fake(
+                &mut manager,
                 json!({"textDocumentSync":2,"renameProvider":true,"codeActionProvider":{"resolveProvider":true}}),
                 move |request| {
                     let result = match request.method.as_str() {
                         "textDocument/rename" => {
                             let mut edit = response_edit.clone();
-                            if request.params["newName"] == "unknown_annotation" { edit["changeAnnotations"] = json!({}); }
+                            if request.params["newName"] == "unknown_annotation" {
+                                edit["changeAnnotations"] = json!({});
+                            }
                             edit
                         }
                         "textDocument/codeAction" => json!([
                             {"title":"Direct annotated action","edit":response_edit},
                             {"title":"Lazy annotated action","data":{"opaque":7}}]),
-                        "codeAction/resolve" => json!({"title":"Resolved annotated action","edit":response_edit,"data":request.params["data"]}),
+                        "codeAction/resolve" => {
+                            json!({"title":"Resolved annotated action","edit":response_edit,"data":request.params["data"]})
+                        }
                         _ => return vec![],
                     };
                     vec![json!({"jsonrpc":"2.0","id":request.id,"result":result})]
-                });
+                },
+            );
             let events = manager.events();
             let doc = LspDocumentId(1);
             manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "a𝄞b");
@@ -9872,59 +9887,116 @@ mod tests {
 
             let rename = manager.request_rename(doc, LspPosition::new(0, 0), "renamed".into());
             let converted = next_matching(&events, |event| match event {
-                LspEvent::WorkspaceEdit { request, edit, .. } if *request == rename => Some(edit.clone()),
+                LspEvent::WorkspaceEdit { request, edit, .. } if *request == rename => {
+                    Some(edit.clone())
+                }
                 _ => None,
-            }).await;
+            })
+            .await;
             assert!(converted.requires_confirmation);
             assert_eq!(converted.annotations[0].label, "Rename export");
-            assert_eq!(converted.documents[0].edits[0].range, LspRange::new(LspPosition::new(0, 1), LspPosition::new(0, 2)));
+            assert_eq!(
+                converted.documents[0].edits[0].range,
+                LspRange::new(LspPosition::new(0, 1), LspPosition::new(0, 2))
+            );
 
-            let request = manager.request_code_actions(doc, LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)), &[]);
+            let request = manager.request_code_actions(
+                doc,
+                LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)),
+                &[],
+            );
             let mut items = next_matching(&events, |event| match event {
-                LspEvent::CodeActions { request: at, items, .. } if *at == request => Some(items.clone()),
+                LspEvent::CodeActions {
+                    request: at, items, ..
+                } if *at == request => Some(items.clone()),
                 _ => None,
-            }).await;
+            })
+            .await;
             assert_eq!(items.len(), 2);
             let direct = items.remove(0).edit.unwrap();
             assert!(direct.requires_confirmation);
-            assert_eq!(direct.annotations[0].description.as_deref(), Some("Public API changes"));
+            assert_eq!(
+                direct.annotations[0].description.as_deref(),
+                Some("Public API changes")
+            );
             let request = manager.request_resolve_code_action(doc, items.remove(0));
             let resolved = next_matching(&events, |event| match event {
-                LspEvent::CodeActionResolved { request: at, item, .. } if *at == request => Some(item.clone()),
+                LspEvent::CodeActionResolved {
+                    request: at, item, ..
+                } if *at == request => Some(item.clone()),
                 _ => None,
-            }).await;
+            })
+            .await;
             assert!(resolved.edit.unwrap().requires_confirmation);
-            assert_eq!(handle.entries("codeAction/resolve")[0].params["data"], json!({"opaque":7}));
+            assert_eq!(
+                handle.entries("codeAction/resolve")[0].params["data"],
+                json!({"opaque":7})
+            );
 
-            let bad = manager.request_rename(doc, LspPosition::new(0, 0), "unknown_annotation".into());
+            let bad =
+                manager.request_rename(doc, LspPosition::new(0, 0), "unknown_annotation".into());
             next_matching(&events, |event| match event {
-                LspEvent::RequestFailed { request, error: LspError::Unsupported(message), .. }
-                    if *request == bad && message.contains("unknown workspace-edit annotation") => Some(()),
+                LspEvent::RequestFailed {
+                    request,
+                    error: LspError::Unsupported(message),
+                    ..
+                } if *request == bad && message.contains("unknown workspace-edit annotation") => {
+                    Some(())
+                }
                 _ => None,
-            }).await;
+            })
+            .await;
 
-            handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":900,"method":"workspace/applyEdit",
-                "params":{"label":"Server annotated edit","edit":edit}}))).unwrap();
+            handle
+                .push
+                .send(Outgoing::Message(
+                    json!({"jsonrpc":"2.0","id":900,"method":"workspace/applyEdit",
+                "params":{"label":"Server annotated edit","edit":edit}}),
+                ))
+                .unwrap();
             let id = next_matching(&events, |event| match event {
-                LspEvent::ApplyWorkspaceEdit { id, label, edit, .. } => {
+                LspEvent::ApplyWorkspaceEdit {
+                    id, label, edit, ..
+                } => {
                     assert_eq!(label.as_deref(), Some("Server annotated edit"));
                     assert!(edit.requires_confirmation);
                     assert_eq!(edit.annotations[0].label, "Rename export");
                     Some(*id)
                 }
                 _ => None,
-            }).await;
-            assert!(handle.entries("").iter().all(|entry| entry.id != Some(900)), "server waits for explicit approval");
-            manager.respond_workspace_edit(id, false, Some("fixture leaves all buffers unchanged".into()));
+            })
+            .await;
+            assert!(
+                handle.entries("").iter().all(|entry| entry.id != Some(900)),
+                "server waits for explicit approval"
+            );
+            manager.respond_workspace_edit(
+                id,
+                false,
+                Some("fixture leaves all buffers unchanged".into()),
+            );
             assert_eq!(reply(&handle, 900).await["applied"], json!(false));
             let mut unknown = edit;
             unknown["changeAnnotations"] = json!({});
-            handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":901,"method":"workspace/applyEdit",
-                "params":{"edit":unknown}}))).unwrap();
+            handle
+                .push
+                .send(Outgoing::Message(
+                    json!({"jsonrpc":"2.0","id":901,"method":"workspace/applyEdit",
+                "params":{"edit":unknown}}),
+                ))
+                .unwrap();
             let refused = reply(&handle, 901).await;
             assert_eq!(refused["applied"], json!(false));
-            assert!(refused["failureReason"].as_str().unwrap().contains("unknown workspace-edit annotation"));
-            assert_eq!(manager.snapshots.latest(&uri).unwrap().full_text().as_ref(), "a𝄞b");
+            assert!(
+                refused["failureReason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown workspace-edit annotation")
+            );
+            assert_eq!(
+                manager.snapshots.latest(&uri).unwrap().full_text().as_ref(),
+                "a𝄞b"
+            );
             manager.begin_shutdown().await;
         });
     }

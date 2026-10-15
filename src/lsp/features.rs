@@ -568,7 +568,9 @@ pub(super) async fn perform_feature(
                 partial_result_params: Default::default(),
             })
             .await
-            .map(|items| R::CodeActions(items.map(|items| items.into_iter().map(|item| item.0).collect()))),
+            .map(|items| {
+                R::CodeActions(items.map(|items| items.into_iter().map(|item| item.0).collect()))
+            }),
         (RequestKind::ResolveCodeAction, RequestArgs::Resolve(item)) => server
             .request::<workspace_wire::ResolveCodeAction>(item)
             .await
@@ -1387,7 +1389,9 @@ impl Drop for ServerEditGuard {
 pub(super) fn apply_workspace_edit_wire(
     state: &mut RouterState,
     params: workspace_wire::ApplyWorkspaceEditParams,
-) -> impl std::future::Future<Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>>
+) -> impl std::future::Future<
+    Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>,
+>
 + Send
 + 'static
 + use<> {
@@ -1397,7 +1401,9 @@ pub(super) fn apply_workspace_edit_wire(
 pub(super) fn apply_workspace_edit(
     state: &mut RouterState,
     params: lsp_types::ApplyWorkspaceEditParams,
-) -> impl std::future::Future<Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>>
+) -> impl std::future::Future<
+    Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>,
+>
 + Send
 + 'static
 + use<> {
@@ -1407,7 +1413,9 @@ fn apply_workspace_edit_with_timeout(
     state: &mut RouterState,
     params: lsp_types::ApplyWorkspaceEditParams,
     timeout: Duration,
-) -> impl std::future::Future<Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>>
+) -> impl std::future::Future<
+    Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>,
+>
 + Send
 + 'static
 + use<> {
@@ -1746,7 +1754,11 @@ mod tests {
     fn workspace_annotations_require_confirmation_and_bad_ranges_refuse_the_whole_batch() {
         // Exercise the wire decoder rather than constructing OneOf::Right:
         // lsp-types' plain-first JSON union otherwise discards annotationId.
-        let decode = |value| serde_json::from_value::<workspace_wire::WorkspaceEdit>(value).unwrap().0;
+        let decode = |value| {
+            serde_json::from_value::<workspace_wire::WorkspaceEdit>(value)
+                .unwrap()
+                .0
+        };
         let store = SnapshotStore::default();
         let uri = Arc::new(Url::parse("file:///repo/a.rs").unwrap());
         let key = SessionKey {
@@ -1755,9 +1767,7 @@ mod tests {
         };
         store.register(LspDocumentId(1), &uri, &key, 4, Arc::from("a𝄞b"));
         let value = json!({"changeAnnotations":{"confirm":{"label":"Rename export","needsConfirmation":true}},"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[{"annotationId":"confirm","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"newText":"x"}]}]});
-        let converted =
-            convert_workspace_edit(&store, decode(value.clone()), None)
-                .unwrap();
+        let converted = convert_workspace_edit(&store, decode(value.clone()), None).unwrap();
         assert!(converted.requires_confirmation);
         assert_eq!(converted.annotations[0].label, "Rename export");
         assert!(converted.annotations[0].needs_confirmation);
