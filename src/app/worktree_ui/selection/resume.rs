@@ -280,4 +280,39 @@ mod tests {
         assert!(prepared.additional_guards.is_empty());
     }
 
+    #[test]
+    fn unavailable_launch_lease_releases_filing_guard_without_a_resume_receipt() {
+        let launch = tempfile::tempdir().unwrap();
+        let filing = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots.clear();
+        app.active_workspace = Some(filing.path().to_owned());
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        let entry = entry(launch.path());
+        let scope = placement::Snapshot::capture(&app, entry.card, &entry.session);
+        let _exclusive = crate::worktree_cleanup::fixture_protection(runtime.path(), launch.path(), true).unwrap();
+        let result = prepare_resume(launch.path(), false, &scope, &owner_watch::Monitor::default(), Path::canonicalize, Path::is_dir,
+            |path| crate::worktree_cleanup::fixture_protection(runtime.path(), path, false).map(Some));
+        assert!(result.is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), filing.path(), true).is_ok());
+    }
+
+    #[test]
+    fn adoption_while_resume_prepares_reuses_existing_logical_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots.insert(directory.path().to_owned());
+        let entry = entry(directory.path());
+        let logical = entry.session.clone();
+        let task = app.select_resume_then(entry, None);
+        let receipt = crate::app::tests::task_app_message(task);
+        drop(app.insert_chat_card(logical.clone(), None, None));
+        let existing = app.existing_conversation_card(&logical).unwrap();
+        let count = app.durable.cards.len();
+        drop(app.update(receipt));
+        assert_eq!(app.durable.cards.len(), count);
+        assert_eq!(app.existing_conversation_card(&logical), Some(existing));
+    }
+
 }
