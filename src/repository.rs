@@ -898,6 +898,20 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
     paths
 }
 
+/// Replacement objects can change the bytes behind an unchanged object id.
+/// Packed refs are conservatively a count dependency since they can publish or
+/// remove replacements alongside unrelated branch refs.
+fn snapshot_count_admin_changed(previous: &BTreeMap<PathBuf, Option<FileIdentity>>, current: &BTreeMap<PathBuf, Option<FileIdentity>>) -> bool {
+    let replacement_base = std::env::var_os("GIT_REPLACE_REF_BASE")
+        .filter(|value| !value.is_empty()).map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("refs/replace"));
+    let relevant = |path: &&PathBuf| path.file_name().is_some_and(|name| name == "packed-refs")
+        || path.ancestors().any(|ancestor| ancestor.ends_with(&replacement_base));
+    let previous: BTreeMap<_, _> = previous.iter().filter(|(path, _)| relevant(path)).collect();
+    let current: BTreeMap<_, _> = current.iter().filter(|(path, _)| relevant(path)).collect();
+    previous != current
+}
+
 impl SnapshotCache {
     /// Ignored-folder expansion is independent of porcelain status. Observe
     /// its directory membership too, so the slow fallback repairs missed events.
@@ -4467,6 +4481,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
         let admin = snapshot_admin_fingerprint(worktree);
         if !cache.admin.is_empty() && cache.admin != admin {
+            if snapshot_count_admin_changed(&cache.admin, &admin) {
+                cache.numstats.clear(); cache.numstats_ready = false;
+            }
             cache.invalidate(true);
         }
         if cache.options != Some(options) {
@@ -9134,6 +9151,31 @@ mod tests {
             let counts: Vec<_> = commands.iter().filter(|command| command.arguments.iter().any(|arg| arg == "--numstat")).collect();
             assert_eq!(counts.len(), 2, "semantic attribute changes still invalidate every measured basis");
             assert!(counts.iter().all(|command| !command.arguments.iter().any(|arg| arg == "--")));
+        }
+
+        #[test]
+        fn cached_numstat_observes_loose_and_packed_replacement_objects() {
+            let directory = tempfile::tempdir().unwrap(); let root = directory.path();
+            let outside = tempfile::tempdir().unwrap(); let replacement_file = outside.path().join("replacement");
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked"), "base\n").unwrap();
+            git(root, &["add", "-A"]); git(root, &["commit", "-m", "initial"]);
+            fs::write(root.join("tracked"), "working\n").unwrap();
+            let service = service(); let cancel = CancellationToken::new(); let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions { untracked_files: false, ..Default::default() };
+            let initial = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&initial, "tracked", ChangeArea::Unstaged), (Some(1), Some(1)));
+            let original = String::from_utf8(git_output(root, &["rev-parse", "HEAD:tracked"])).unwrap().trim().to_owned();
+            fs::write(&replacement_file, "one\ntwo\n").unwrap();
+            let replacement = String::from_utf8(git_output(root, &["hash-object", "-w", replacement_file.to_str().unwrap()])).unwrap().trim().to_owned();
+            git(root, &["replace", &original, &replacement]);
+            let replaced = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&replaced, "tracked", ChangeArea::Unstaged), (Some(1), Some(2)));
+            git(root, &["pack-refs", "--all"]);
+            service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            git(root, &["replace", "-d", &original]);
+            let removed = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&removed, "tracked", ChangeArea::Unstaged), (Some(1), Some(1)));
         }
 
         #[test]
