@@ -794,7 +794,9 @@ impl Cagents {
                 .iter()
                 .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
                 .map_or_else(
-                    || project.repository.clone(),
+                    || project.repository.parent()
+                        .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                        .unwrap_or(&project.repository).to_path_buf(),
                     |worktree| worktree.path.clone(),
                 ),
         )
@@ -1020,6 +1022,21 @@ fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> 
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn primary_channel_guard_and_selection_share_git_directory_fallback() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(),
+            "repo".into(), "/repo/.git".into(), vec![], vec![]));
+        let channel = ProjectChannel {id:ChannelId::new(), project_id:project, title:String::new(),
+            title_source:Default::default(), ordinal:0, shared:false, cards:vec![], focused:None};
+        Arc::make_mut(&mut app.durable).channels.push(channel.clone());
+        let protected = app.project_primary_worktree(project).unwrap();
+        drop(app.select_channel(channel.id));
+        assert_eq!(protected, Path::new("/repo"));
+        assert_eq!(app.active_workspace.as_deref(), Some(protected.as_path()));
+    }
 
     #[test]
     fn missing_daemon_is_not_close_proof_for_a_retained_native_card() {
