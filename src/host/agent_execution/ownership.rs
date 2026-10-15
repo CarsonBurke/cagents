@@ -16,36 +16,45 @@ pub(in crate::host) fn interactive(
     request: ClientRequest,
     apply: impl FnOnce(ClientRequest) -> Result<ServerResponse, ProtocolError>,
 ) -> Result<ServerResponse, ProtocolError> {
-    interactive_inner(host,client,request,false,apply)
+    interactive_inner(host, client, request, false, apply)
 }
 
 /// Input-pool admission must never wait behind teardown/reconciliation.
 /// The same ownership checks run under the exact gate when it is available.
 pub(in crate::host) fn try_interactive(
-    host:&SharedHost,
-    client:super::super::state::ClientId,
-    request:ClientRequest,
-    apply:impl FnOnce(ClientRequest)->Result<ServerResponse,ProtocolError>,
-)->Result<ServerResponse,ProtocolError> {
-    interactive_inner(host,client,request,true,apply)
+    host: &SharedHost,
+    client: super::super::state::ClientId,
+    request: ClientRequest,
+    apply: impl FnOnce(ClientRequest) -> Result<ServerResponse, ProtocolError>,
+) -> Result<ServerResponse, ProtocolError> {
+    interactive_inner(host, client, request, true, apply)
 }
 
-fn admission_lock<T>(lock:&Mutex<T>,nonblocking:bool)->Result<std::sync::MutexGuard<'_,T>,ProtocolError> {
-    if !nonblocking {return Ok(lock.lock().unwrap_or_else(|poisoned|poisoned.into_inner()));}
+fn admission_lock<T>(
+    lock: &Mutex<T>,
+    nonblocking: bool,
+) -> Result<std::sync::MutexGuard<'_, T>, ProtocolError> {
+    if !nonblocking {
+        return Ok(lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    }
     match lock.try_lock() {
-        Ok(guard)=>Ok(guard),
-        Err(std::sync::TryLockError::Poisoned(poisoned))=>Ok(poisoned.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock)=>Err(ProtocolError::new(ProtocolErrorCode::QueueFull,"Agent ownership is changing; retry after the pending operation finishes",true)),
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(ProtocolError::new(
+            ProtocolErrorCode::QueueFull,
+            "Agent ownership is changing; retry after the pending operation finishes",
+            true,
+        )),
     }
 }
 
 fn interactive_inner(
-    host:&SharedHost,
-    client:super::super::state::ClientId,
-    request:ClientRequest,
-    nonblocking:bool,
-    apply:impl FnOnce(ClientRequest)->Result<ServerResponse,ProtocolError>,
-)->Result<ServerResponse,ProtocolError> {
+    host: &SharedHost,
+    client: super::super::state::ClientId,
+    request: ClientRequest,
+    nonblocking: bool,
+    apply: impl FnOnce(ClientRequest) -> Result<ServerResponse, ProtocolError>,
+) -> Result<ServerResponse, ProtocolError> {
     if client == EXECUTION_CLIENT {
         return apply(request);
     }
@@ -69,14 +78,14 @@ fn interactive_inner(
     };
     let unavailable =
         |message: String| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
-    let agent = admission_lock(&registry,nonblocking)?
+    let agent = admission_lock(&registry, nonblocking)?
         .agent_for_session(id)
         .map_err(unavailable)?;
     let Some(agent) = agent else {
         return apply(request);
     };
     let gate = agent_gate(host, agent.id);
-    let _dispatch = admission_lock(&gate,nonblocking)?;
+    let _dispatch = admission_lock(&gate, nonblocking)?;
     if claims {
         let authorized = host
             .lock()
@@ -94,7 +103,7 @@ fn interactive_inner(
                 "The exact agent session is no longer attached".into(),
             ));
         }
-        admission_lock(&registry,nonblocking)?
+        admission_lock(&registry, nonblocking)?
             .claim_agent_interaction(agent.id, None)
             .map_err(unavailable)?;
     }

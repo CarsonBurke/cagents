@@ -2031,7 +2031,9 @@ fn prepare_upgrade_with_carry_policy(
         let handle = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             if state.descriptor(0, terminal.source.id)?.session != terminal.source {
-                return Err(upgrade_error("A carried terminal changed before its input could be verified"));
+                return Err(upgrade_error(
+                    "A carried terminal changed before its input could be verified",
+                ));
             }
             state.terminals[&terminal.source.id].handle.clone()
         };

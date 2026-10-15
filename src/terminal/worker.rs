@@ -464,7 +464,9 @@ impl PublishedState {
 
     fn request_interrupt(&self, key: Option<KeyInput>) -> bool {
         let mut order = self.input_order.lock().unwrap_or_else(|p| p.into_inner());
-        if order.handoff { return false; }
+        if order.handoff {
+            return false;
+        }
         order.generation = order
             .generation
             .checked_add(1)
@@ -761,7 +763,9 @@ impl std::fmt::Debug for TerminalHandle {
 
 impl TerminalHandle {
     /// Warm fixed join resources before measuring the host's idle baseline.
-    pub(crate) fn initialize_worker_joins() -> Result<(), String> { joins::initialize() }
+    pub(crate) fn initialize_worker_joins() -> Result<(), String> {
+        joins::initialize()
+    }
 
     /// Captured from the authenticated original holder before worker startup;
     /// never rediscovered by a reusable terminal ID.
@@ -821,12 +825,24 @@ impl TerminalHandle {
             }),
             Ok(Err(error)) => {
                 let slot = Arc::new(Mutex::new(Some(worker)));
-                let _ = joins::join_until(&slot, &published, std::time::Instant::now() + WORKER_JOIN_TIMEOUT, true, true);
+                let _ = joins::join_until(
+                    &slot,
+                    &published,
+                    std::time::Instant::now() + WORKER_JOIN_TIMEOUT,
+                    true,
+                    true,
+                );
                 Err(TerminalStartError::Worker(error))
             }
             Err(_) => {
                 let slot = Arc::new(Mutex::new(Some(worker)));
-                let _ = joins::join_until(&slot, &published, std::time::Instant::now() + WORKER_JOIN_TIMEOUT, true, true);
+                let _ = joins::join_until(
+                    &slot,
+                    &published,
+                    std::time::Instant::now() + WORKER_JOIN_TIMEOUT,
+                    true,
+                    true,
+                );
                 Err(TerminalStartError::WorkerExited)
             }
         }
@@ -1218,8 +1234,10 @@ impl TerminalHandle {
     /// in this parser cannot be silently discarded with its replacement.
     pub(crate) fn check_input_drained(&self) -> Result<(), String> {
         let (reply, result) = crossbeam_channel::bounded(1);
-        self.try_command(Command::CheckInputDrained(reply)).map_err(|error| error.to_string())?;
-        result.recv_timeout(Duration::from_secs(3))
+        self.try_command(Command::CheckInputDrained(reply))
+            .map_err(|error| error.to_string())?;
+        result
+            .recv_timeout(Duration::from_secs(3))
             .map_err(|error| format!("Cannot verify terminal input before upgrade: {error}"))?
     }
 
@@ -1243,11 +1261,25 @@ impl TerminalHandle {
     /// terminal that may already belong to a successor.
     pub(crate) fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
         {
-            let mut order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
-            if order.handoff { return Err("Terminal ownership is already changing".into()); }
+            let mut order = self
+                .inner
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if order.handoff {
+                return Err("Terminal ownership is already changing".into());
+            }
             order.handoff = true;
         }
-        let reopen = || self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner()).handoff = false;
+        let reopen = || {
+            self.inner
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .handoff = false
+        };
         let (reply, result) = crossbeam_channel::bounded(1);
         if let Err(error) = self.send_command(Command::Carry { socket, reply }) {
             reopen();
@@ -1255,7 +1287,10 @@ impl TerminalHandle {
         }
         let carried = match result.recv_timeout(WORKER_JOIN_TIMEOUT * 2) {
             Ok(Ok(carried)) => carried,
-            Ok(Err(error)) => { reopen(); return Err(error); }
+            Ok(Err(error)) => {
+                reopen();
+                return Err(error);
+            }
             // A timeout cannot prove this worker still owns the PTY. Keep
             // admission fenced; never acknowledge input that might be lost.
             Err(_) => return Err("terminal carry outcome is unknown after its deadline".into()),
@@ -1323,7 +1358,8 @@ impl TerminalHandle {
             let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
             if !self.join_worker_until(deadline, true) {
                 return TerminalCloseResult::Unknown(
-                    "Terminal worker close is still pending; its exact join owner is retained".into(),
+                    "Terminal worker close is still pending; its exact join owner is retained"
+                        .into(),
                 );
             }
         }
@@ -1430,7 +1466,13 @@ impl TerminalHandle {
     }
 
     fn join_worker_until(&self, deadline: std::time::Instant, escalate: bool) -> bool {
-        joins::join_until(&self.inner.worker, &self.inner.published, deadline, escalate, true)
+        joins::join_until(
+            &self.inner.worker,
+            &self.inner.published,
+            deadline,
+            escalate,
+            true,
+        )
     }
 
     #[cfg(test)]
@@ -1439,7 +1481,9 @@ impl TerminalHandle {
         impl Drop for Reopen {
             fn drop(&mut self) {
                 let mut phase = self.0.archive.lock().unwrap_or_else(|p| p.into_inner());
-                if matches!(*phase, ArchivePhase::Preparing) { *phase = ArchivePhase::Live; }
+                if matches!(*phase, ArchivePhase::Preparing) {
+                    *phase = ArchivePhase::Live;
+                }
                 self.0.archive_ready.notify_all();
             }
         }
@@ -1524,7 +1568,11 @@ impl TerminalHandle {
             }
         }
         if let Command::Interrupt(key) = command {
-            return if published.request_interrupt(key) { Ok(()) } else { Err(TerminalSendError::Closed) };
+            return if published.request_interrupt(key) {
+                Ok(())
+            } else {
+                Err(TerminalSendError::Closed)
+            };
         }
         // Serialize input admission with the priority cancellation boundary.
         // Commands submitted after Ctrl+C must survive its queue drain.
@@ -1534,7 +1582,9 @@ impl TerminalHandle {
             .input_order
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if order.handoff { return Err(TerminalSendError::Closed); }
+        if order.handoff {
+            return Err(TerminalSendError::Closed);
+        }
         if matches!(command, Command::CloseChecked { .. }) {
             let mut priority = published
                 .priority_close
@@ -2464,7 +2514,10 @@ impl Worker {
     }
 
     fn retain_carried_for_handoff(&mut self, command: &Command, carried: &mut Option<Command>) {
-        if matches!(command, Command::CheckInputDrained(_) | Command::PrepareUpgrade(_) | Command::Carry { .. }) {
+        if matches!(
+            command,
+            Command::CheckInputDrained(_) | Command::PrepareUpgrade(_) | Command::Carry { .. }
+        ) {
             if let Some(command) = carried.take() {
                 // An interrupt can retain a control ahead of the command a
                 // previous scroll coalescer already selected. Include that
@@ -3155,7 +3208,10 @@ impl Worker {
     }
 
     fn input_drained_for_handoff(&self) -> Result<(), String> {
-        if !self.pending_input.is_empty() || !self.commands.is_empty() || !self.retained_commands.is_empty() {
+        if !self.pending_input.is_empty()
+            || !self.commands.is_empty()
+            || !self.retained_commands.is_empty()
+        {
             return Err("Terminal input or control is still pending; let it finish or cancel input before upgrading".into());
         }
         Ok(())
@@ -4815,7 +4871,12 @@ mod tests {
             Command::Interrupt(None),
             Command::Paste("not-admitted".into(), PasteOrigin::Clipboard),
             Command::Focus(true),
-            Command::Resize(TerminalSize { columns: 80, rows: 24, cell_width_px: 8, cell_height_px: 16 }),
+            Command::Resize(TerminalSize {
+                columns: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+            }),
             Command::Scroll(ScrollCommand::Bottom),
             Command::Hide,
             Command::Reveal,
@@ -4825,8 +4886,17 @@ mod tests {
             assert_eq!(handle.try_command(command), Err(TerminalSendError::Full));
         }
         assert!(started.elapsed() < Duration::from_millis(250));
-        assert!(handle.inner.commands.is_empty(), "refused controls were not accepted");
-        assert!(!handle.inner.published.interrupt_requested.load(Ordering::Acquire));
+        assert!(
+            handle.inner.commands.is_empty(),
+            "refused controls were not accepted"
+        );
+        assert!(
+            !handle
+                .inner
+                .published
+                .interrupt_requested
+                .load(Ordering::Acquire)
+        );
         *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Live;
         handle.inner.published.archive_ready.notify_all();
         handle.input(b"admitted-after-preparation\n").unwrap();
@@ -6612,16 +6682,31 @@ mod tests {
         let expected = worker.pending_input.clone();
         let (reply, result) = crossbeam_channel::bounded(1);
         assert!(!worker.handle_command(Command::CheckInputDrained(reply)));
-        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
         let (reply, result) = crossbeam_channel::bounded(1);
-        assert!(!worker.handle_command(Command::Carry { socket: socket.clone(), reply }));
-        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        assert!(!worker.handle_command(Command::Carry {
+            socket: socket.clone(),
+            reply
+        }));
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
         assert_eq!(worker.pending_input, expected);
         assert!(!worker.carried);
         assert!(!socket.exists());
         worker.pending_input.clear();
         assert!(worker.input_drained_for_handoff().is_ok());
-        worker.retained_commands.push_back(Command::Input(b"retained".to_vec()));
+        worker
+            .retained_commands
+            .push_back(Command::Input(b"retained".to_vec()));
         assert!(worker.input_drained_for_handoff().is_err());
         worker.retained_commands.clear();
         worker.run();
@@ -6635,29 +6720,57 @@ mod tests {
         // The scroll was selected before priority interruption was published.
         assert!(worker.published.request_interrupt(None));
         let generation = worker.published.input_order.lock().unwrap().generation;
-        commands.send(Command::OrderedInput { generation,
-            input: Box::new(Command::Input(b"after interrupt".to_vec())) }).unwrap();
+        commands
+            .send(Command::OrderedInput {
+                generation,
+                input: Box::new(Command::Input(b"after interrupt".to_vec())),
+            })
+            .unwrap();
         let (reply, result) = crossbeam_channel::bounded(1);
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = directory.path().join("must-not-detach.sock");
-        commands.send(Command::Carry { socket: socket.clone(), reply }).unwrap();
+        commands
+            .send(Command::Carry {
+                socket: socket.clone(),
+                reply,
+            })
+            .unwrap();
         let mut carried = None;
-        let scroll = coalesce_scroll_command(Command::Scroll(ScrollCommand::Delta(1)), &worker.commands, &mut carried);
+        let scroll = coalesce_scroll_command(
+            Command::Scroll(ScrollCommand::Delta(1)),
+            &worker.commands,
+            &mut carried,
+        );
         assert!(matches!(scroll, Command::Scroll(_)));
         assert!(matches!(carried, Some(Command::OrderedInput { .. })));
         let boundary = worker.interrupt_input();
-        assert!(!is_cancelable_input_before(carried.as_ref().unwrap(), boundary));
+        assert!(!is_cancelable_input_before(
+            carried.as_ref().unwrap(),
+            boundary
+        ));
         assert!(worker.pending_input.is_empty());
         assert!(worker.commands.is_empty());
         assert_eq!(worker.retained_commands.len(), 1);
-        let command = worker.retained_commands.pop_front().expect("retained carry control");
+        let command = worker
+            .retained_commands
+            .pop_front()
+            .expect("retained carry control");
         assert!(matches!(command, Command::Carry { .. }));
         worker.retain_carried_for_handoff(&command, &mut carried);
         assert!(!worker.handle_command(command));
-        let error = result.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
-        assert!(error.contains("Terminal input or control is still pending"), "{error}");
+        let error = result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.contains("Terminal input or control is still pending"),
+            "{error}"
+        );
         assert!(carried.is_none());
-        assert!(matches!(worker.retained_commands.front(), Some(Command::OrderedInput { .. })));
+        assert!(matches!(
+            worker.retained_commands.front(),
+            Some(Command::OrderedInput { .. })
+        ));
         assert!(!worker.carried);
         assert!(!socket.exists());
         worker.retained_commands.clear();
@@ -6670,11 +6783,19 @@ mod tests {
         let (mut worker, events) = capture_worker_for(shell_session("exec cat").launch);
         let (commands, receiver) = command_channel(4);
         worker.commands = receiver;
-        let handle = TerminalHandle { inner: Arc::new(HandleInner {
-            commands, events, published: worker.published.clone(), worker: Arc::new(Mutex::new(None)),
-        }) };
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events,
+                published: worker.published.clone(),
+                worker: Arc::new(Mutex::new(None)),
+            }),
+        };
         worker.published.input_order.lock().unwrap().handoff = true;
-        assert_eq!(handle.input(b"later".to_vec()), Err(TerminalSendError::Closed));
+        assert_eq!(
+            handle.input(b"later".to_vec()),
+            Err(TerminalSendError::Closed)
+        );
         assert_eq!(handle.input(vec![3]), Err(TerminalSendError::Closed));
         assert!(worker.commands.is_empty());
         assert!(!worker.published.interrupt_requested.load(Ordering::Acquire));
@@ -6709,10 +6830,13 @@ mod tests {
             let message = worker
                 .pty_rx
                 .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .unwrap_or_else(|error| panic!(
-                    "Integrated Bash prompt did not finish: {error}; output={:?}; exit={:?}",
-                    String::from_utf8_lossy(&prompt_bytes), worker.child_exit_rx.try_recv(),
-                ));
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Integrated Bash prompt did not finish: {error}; output={:?}; exit={:?}",
+                        String::from_utf8_lossy(&prompt_bytes),
+                        worker.child_exit_rx.try_recv(),
+                    )
+                });
             if let PtyMessage::Bytes(bytes) = &message {
                 prompt_bytes.extend_from_slice(bytes);
             }
@@ -6929,54 +7053,104 @@ mod tests {
     }
 
     fn latched_tls_worker() -> (JoinHandle<()>, crossbeam_channel::Sender<()>) {
-        struct Cleanup { entered: Sender<()>, release: Receiver<()> }
-        impl Drop for Cleanup { fn drop(&mut self) { self.entered.send(()).unwrap(); let _ = self.release.recv(); } }
+        struct Cleanup {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                let _ = self.release.recv();
+            }
+        }
         thread_local! { static CLEANUP: RefCell<Option<Cleanup>> = const { RefCell::new(None) }; }
         let (entered, observed) = crossbeam_channel::bounded(1);
         let (release, blocked) = crossbeam_channel::bounded(1);
-        let worker = thread::spawn(move || CLEANUP.with(|slot| *slot.borrow_mut() = Some(Cleanup { entered, release: blocked })));
+        let worker = thread::spawn(move || {
+            CLEANUP.with(|slot| {
+                *slot.borrow_mut() = Some(Cleanup {
+                    entered,
+                    release: blocked,
+                })
+            })
+        });
         observed.recv_timeout(Duration::from_secs(2)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !worker.is_finished() { assert!(Instant::now() < deadline); thread::yield_now(); }
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
         (worker, release)
     }
 
     #[test]
     fn worker_join_deadline_includes_blocked_tls_destruction() {
         struct Release(Sender<()>);
-        impl Drop for Release { fn drop(&mut self) { let _ = self.0.try_send(()); } }
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
         let (worker, release) = latched_tls_worker();
         let release = Release(release);
         let slot = Arc::new(Mutex::new(Some(worker)));
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         let started = Instant::now();
-        assert!(!joins::join_until(&slot, &published, started + Duration::from_millis(40), false, true));
-        assert!(started.elapsed() < Duration::from_millis(250), "is_finished must not authorize caller-side pthread join");
+        assert!(!joins::join_until(
+            &slot,
+            &published,
+            started + Duration::from_millis(40),
+            false,
+            true
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "is_finished must not authorize caller-side pthread join"
+        );
         assert_eq!(published.worker_join.load(Ordering::Acquire), 1);
-        assert!(Arc::strong_count(&slot) > 1, "the exact join slot remains owned by the shared service");
+        assert!(
+            Arc::strong_count(&slot) > 1,
+            "the exact join slot remains owned by the shared service"
+        );
         drop(release);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while published.worker_join.load(Ordering::Acquire) == 1 { assert!(Instant::now() < deadline); thread::yield_now(); }
+        while published.worker_join.load(Ordering::Acquire) == 1 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
         assert!(joins::join_until(&slot, &published, deadline, false, true));
     }
 
     #[test]
     fn final_handle_drop_does_not_join_a_blocked_tls_destructor() {
         struct Release(Sender<()>);
-        impl Drop for Release { fn drop(&mut self) { let _ = self.0.try_send(()); } }
-        let (worker, release) = latched_tls_worker(); let release = Release(release);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
+        let (worker, release) = latched_tls_worker();
+        let release = Release(release);
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         let slot = Arc::new(Mutex::new(Some(worker)));
-        let handle = TerminalHandle { inner: Arc::new(HandleInner {
-            commands: command_channel(1).0, events: crossbeam_channel::unbounded().1,
-            published: Arc::clone(&published), worker: Arc::clone(&slot),
-        }) };
-        let started = Instant::now(); drop(handle);
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands: command_channel(1).0,
+                events: crossbeam_channel::unbounded().1,
+                published: Arc::clone(&published),
+                worker: Arc::clone(&slot),
+            }),
+        };
+        let started = Instant::now();
+        drop(handle);
         assert!(started.elapsed() < Duration::from_millis(250));
         assert_eq!(published.worker_join.load(Ordering::Acquire), 1);
         drop(release);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while published.worker_join.load(Ordering::Acquire) == 1 { assert!(Instant::now() < deadline); thread::yield_now(); }
+        while published.worker_join.load(Ordering::Acquire) == 1 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
         assert_eq!(published.worker_join.load(Ordering::Acquire), 2);
     }
 
