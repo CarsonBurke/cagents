@@ -8,6 +8,7 @@ pub(super) struct State {
     reassign: Option<(SettingsField, String, usize)>,
     filtering_key: bool,
     query: Option<String>,
+    generation: u64,
     selected_message: Option<Message>,
     panes_only: bool,
     sidebar_target: Option<sidebar::commands::CommandTarget>,
@@ -43,7 +44,7 @@ pub enum Action {
     MovePaneToChannel(CardId, crate::model::ChannelId),
     Close,
     Query(String),
-    Run(MessageBox),
+    Run(u64, MessageBox),
     Submit,
     FocusPane(CardId),
     RunPane(CardId, Command),
@@ -397,6 +398,7 @@ impl Cagents {
     pub(super) fn update_palette(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Record(field) => {
+                self.palette.generation = self.palette.generation.wrapping_add(1);
                 self.palette.git_target = None;
                 self.palette.git_captured = false;
                 self.palette.stash_picker = None;
@@ -410,6 +412,7 @@ impl Cagents {
                 Task::none()
             }
             Action::FilterKey => {
+                self.palette.generation = self.palette.generation.wrapping_add(1);
                 self.palette.filtering_key = true;
                 self.palette.recording = None;
                 self.palette.query = None;
@@ -507,6 +510,7 @@ impl Cagents {
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
+                self.palette.generation = self.palette.generation.wrapping_add(1);
                 self.palette.sidebar_target = self.capture_sidebar_command_target();
                 self.palette.git_target = sidebar::git_commands::GitTarget::capture(
                     &self.sidebar_model,
@@ -640,6 +644,7 @@ impl Cagents {
                 task
             }
             Action::Close => {
+                self.palette.generation = self.palette.generation.wrapping_add(1);
                 self.palette.git_target = None;
                 self.palette.git_captured = false;
                 self.palette.stash_picker = None;
@@ -659,11 +664,16 @@ impl Cagents {
                 })
             }
             Action::Query(query) => {
+                if self.palette.query.is_none() { return Task::none(); }
+                self.palette.generation = self.palette.generation.wrapping_add(1);
                 self.palette.query = Some(query);
                 self.reset_palette_selection();
                 self.reveal_palette_selection()
             }
-            Action::Run(MessageBox(message)) => self.activate_palette_entry(*message),
+            Action::Run(generation, MessageBox(message)) => {
+                if generation != self.palette.generation { return Task::none(); }
+                self.activate_palette_entry(*message)
+            },
             Action::RunChatPane(target, command) => {
                 let current = match command {
                     Command::ForkConversation => self.chat_fork_target(target.card),
@@ -724,7 +734,7 @@ impl Cagents {
     /// Click and Enter activate the captured row only while that exact target
     /// remains among the current results. Never substitute a refreshed row.
     fn activate_palette_entry(&mut self, message: Message) -> Task<Message> {
-        if !self.palette.is_open() || !self.palette_entries().iter().any(|(_, _, candidate)| same_palette_entry(&message, candidate)) {
+        if self.palette.query.is_none() || !self.palette_entries().iter().any(|(_, _, candidate)| same_palette_entry(&message, candidate)) {
             self.status = Some(TransientNotice::warning("The selected result is no longer available; choose another result"));
             return Task::none();
         }
@@ -738,6 +748,7 @@ impl Cagents {
             .retain(|recent| recent != &key);
         self.settings.palette_recents.insert(0, key);
         self.settings.palette_recents.truncate(24);
+        self.palette.generation = self.palette.generation.wrapping_add(1);
         self.palette.query = None;
         self.palette.selected_message = None;
         self.palette.move_pane = None;
@@ -1458,7 +1469,7 @@ impl Cagents {
                 .width(Length::Fill)
                 .height(ROW_HEIGHT)
                 .on_press_maybe(
-                    enabled.then(|| Message::Palette(Action::Run(MessageBox(Box::new(message))))),
+                    enabled.then(|| Message::Palette(Action::Run(self.palette.generation, MessageBox(Box::new(message))))),
                 )
                 .into();
                 let button = if self.palette.panes_only && pane.is_some() {
@@ -3818,7 +3829,7 @@ mod tests {
             assert!(app.palette_selection_index(&refreshed).is_none());
             let active = app.active_workspace.clone();
             let before = app.settings.palette_recents.clone();
-            drop(app.update_palette(if click { Action::Run(MessageBox(Box::new(captured))) } else { Action::Submit }));
+            drop(app.update_palette(if click { Action::Run(app.palette.generation, MessageBox(Box::new(captured))) } else { Action::Submit }));
             assert!(app.palette.is_open());
             assert_eq!(
                 app.active_workspace, active,
@@ -3854,7 +3865,7 @@ mod tests {
             assert!(app.command_available(Command::CloseFocusedCard));
             assert!(app.palette_selection_index(&app.palette_entries()).is_none());
             let recents = app.settings.palette_recents.clone();
-            drop(app.update_palette(if click { Action::Run(MessageBox(Box::new(captured))) } else { Action::Submit }));
+            drop(app.update_palette(if click { Action::Run(app.palette.generation, MessageBox(Box::new(captured))) } else { Action::Submit }));
             assert_eq!(app.workspace.focused(), Some(second));
             assert!(app.card_state(first).unwrap().existence.is_open());
             assert!(app.card_state(second).unwrap().existence.is_open());
@@ -3879,11 +3890,41 @@ mod tests {
             let replacement = RepositoryRuntime::dirty_fixture_at(card, "second.md".into());
             app.cards.insert(card, CardRuntime::Repository(Box::new(replacement)));
             assert!(app.command_available(Command::EditorDiscardEdits));
-            drop(app.update_palette(if click { Action::Run(MessageBox(Box::new(captured))) } else { Action::Submit }));
+            drop(app.update_palette(if click { Action::Run(app.palette.generation, MessageBox(Box::new(captured))) } else { Action::Submit }));
             let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("repository retained") };
             assert_eq!(runtime.selected_path(), Some(Path::new("second.md")));
             assert!(runtime.is_dirty(), "obsolete discard never changes the replacement buffer");
             assert!(app.palette.query.is_some());
+        }
+    }
+
+    #[test]
+    fn pointer_results_expire_when_result_list_is_replaced_by_recorder_or_reopened() {
+        for replacement in 0..4 {
+            let mut app = settings_focus_fixture();
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            drop(app.update_palette(Action::Open));
+            drop(app.update_palette(Action::Query("#".into())));
+            let message = app.palette_entries().into_iter().find_map(|(_, _, message)| matches!(message, Message::Sidebar(SidebarAction::OpenWorktree { .. })).then_some(message)).unwrap();
+            let old_generation = app.palette.generation;
+            match replacement {
+                0 => { drop(app.update_palette(Action::Record(SettingsField::ShortcutNewTerminal))); }
+                1 => { drop(app.update_palette(Action::FilterKey)); }
+                2 => { drop(app.update_palette(Action::Close)); drop(app.update_palette(Action::Open)); drop(app.update_palette(Action::Query("#".into()))); }
+                _ => { drop(app.update_palette(Action::Query("#alpha".into()))); }
+            }
+            let before_workspace = app.active_workspace.clone();
+            let before_recents = app.settings.palette_recents.clone();
+            let before_query = app.palette.query.clone();
+            let before_recording = app.palette.recording;
+            let before_filter = app.palette.filtering_key;
+            drop(app.update_palette(Action::Run(old_generation, MessageBox(Box::new(message)))));
+            assert_eq!(app.active_workspace, before_workspace);
+            assert_eq!(app.settings.palette_recents, before_recents);
+            assert_eq!(app.palette.query, before_query);
+            assert_eq!(app.palette.recording, before_recording);
+            assert_eq!(app.palette.filtering_key, before_filter);
         }
     }
 
@@ -3899,7 +3940,7 @@ mod tests {
         let recents = app.settings.palette_recents.clone();
         app.sidebar_state.acknowledge_agent_update(card);
         assert!(!app.command_available(Command::MarkAllRead));
-        drop(app.update_palette(Action::Run(MessageBox(Box::new(captured)))));
+        drop(app.update_palette(Action::Run(app.palette.generation, MessageBox(Box::new(captured)))));
         assert!(app.palette.is_open());
         assert_eq!(app.palette.query.as_deref(), Some(">mark all read"));
         assert_eq!(app.settings.palette_recents, recents);
@@ -4908,7 +4949,7 @@ mod tests {
             let _ = focus_fixture_step(&app, &mut tree, &renderer, open, false);
             let run = if click {
                 let (_, _, message) = app.palette_entries().pop().unwrap();
-                app.update_palette(Action::Run(MessageBox(Box::new(message))))
+                app.update_palette(Action::Run(app.palette.generation, MessageBox(Box::new(message))))
             } else {
                 app.update_palette(Action::Submit)
             };
@@ -5141,7 +5182,7 @@ mod settings_recorder_tests {
             }];
         drop(app.update_palette(Action::Open));
         assert!(app.command_available(Command::GitApplyStash));
-        drop(app.update_palette(Action::Run(MessageBox(Box::new(Message::RunCommand(Command::GitApplyStash))))));
+        drop(app.update_palette(Action::Run(app.palette.generation, MessageBox(Box::new(Message::RunCommand(Command::GitApplyStash))))));
         assert!(app.palette.query.is_some());
         assert!(app.palette.git_captured);
         assert_eq!(app.palette.stash_picker, Some(Command::GitApplyStash));
