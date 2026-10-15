@@ -4,6 +4,9 @@
 use serde::Serialize;
 use serde_json::Value;
 
+#[cfg(feature = "host")]
+pub(crate) mod attempts;
+
 const MAX_BUCKETS: usize = 128;
 const MAX_CREDIT_ROWS: usize = 128;
 const MAX_IDENTIFIER_BYTES: usize = 1024;
