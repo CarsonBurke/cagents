@@ -860,6 +860,8 @@ impl Cagents {
     /// Refresh cached rows after state changes, never during rendering.
     pub(super) fn refresh_sidebar_channels(&mut self) {
         let durable = &self.durable;
+        let previews = &self.notification_ui.previews;
+        let allow_previews = self.settings.notifications.message_previews;
         // A failure outlives nothing: a channel that has gone since, however
         // it went, has nothing left to retry.
         self.channel_ui
@@ -885,6 +887,7 @@ impl Cagents {
                 let mut unread = false;
                 let mut chats = 0;
                 let mut has_panes = false;
+                let mut notification_preview: Option<&(usize, String)> = None;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
                     let Some(card) = durable.cards.iter().find(|card| {
@@ -893,6 +896,17 @@ impl Cagents {
                         continue;
                     };
                     has_panes = true;
+                    if allow_previews {
+                        let session = match &card.kind {
+                            CardKind::Chat(session) => Some(session.id),
+                            CardKind::Terminal(session) => Some(session.id),
+                            _ => None,
+                        };
+                        if let Some(preview) = session.and_then(|session| previews.get(&session))
+                            && notification_preview.is_none_or(|known| preview.0 < known.0) {
+                            notification_preview = Some(preview);
+                        }
+                    }
                     if matches!(&card.kind, CardKind::Chat(_))
                         || matches!(&card.kind, CardKind::Terminal(session)
                             if crate::agent::Provider::recognize_launch(&session.launch).is_some())
@@ -911,6 +925,7 @@ impl Cagents {
                         _ => {}
                     }
                 }
+                let notification_preview = notification_preview.filter(|_| unread).map(|(_, text)| text);
                 let unchanged = project.channels.get(index).is_some_and(|row| {
                     row.id == channel.id
                         && row.title == title
@@ -921,6 +936,7 @@ impl Cagents {
                         && row.has_panes == has_panes
                         && row.ordinal == channel.ordinal
                         && row.deletion == deletion
+                        && row.notification_preview.as_ref() == notification_preview
                 });
                 if !unchanged {
                     let mut row = SidebarChannel::new(
@@ -934,6 +950,7 @@ impl Cagents {
                         channel.ordinal,
                     );
                     row.deletion = deletion;
+                    row = row.with_notification_preview(notification_preview.cloned());
                     if index < project.channels.len() {
                         project.channels[index] = row;
                     } else {

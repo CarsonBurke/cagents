@@ -1,6 +1,7 @@
 //! One daemon broker: provider callbacks only coalesce bounded semantic records.
 //! The broker alone touches SQLite and the desktop portal, outside HostState.
 mod journal;
+mod batching;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -10,7 +11,7 @@ use std::{
 };
 
 use ashpd::{
-    desktop::notification::{Notification, NotificationProxy},
+    desktop::notification::{Button, Notification, NotificationProxy, Priority},
     zbus,
     zvariant::OwnedValue,
 };
@@ -683,15 +684,18 @@ async fn connect(
 }
 
 async fn send(portal: &Portal, notice: &Notice, application_action: bool) -> Result<(), String> {
-    let body = crate::notifications::context(&notice.event);
+    // Content reaching this point has already passed broker privacy policy.
+    let message = crate::notifications::presentation::message(&notice.event, true);
     let id = notice.id.to_string();
     let action = if application_action {
         format!("app.{OPEN_ACTION}")
     } else {
         SIGNAL_OPEN_ACTION.to_owned()
     };
-    let notification = Notification::new(notice.event.evidence.kind.label())
-        .body(body.as_str())
+    let notification = Notification::new(&message.title)
+        .body(message.body.as_str())
+        .priority(if message.needs_input { Priority::High } else { Priority::Normal })
+        .button(Button::new(message.action, action.as_str()).target(id.as_str()))
         .default_action(action.as_str())
         .default_action_target(id.as_str());
     tokio::time::timeout(
@@ -776,6 +780,7 @@ mod tests {
         let session = TerminalId::new();
         let lineage = crate::agent_execution::Lineage(session);
         let inbox = Event {
+            content: None,
             target: Target::SessionInbox(lineage),
             source_session: Some(session),
             provider: None,
@@ -834,6 +839,7 @@ mod tests {
         let notice = Notice {
             id: Uuid::new_v4(),
             event: Event {
+                content: None,
                 target: Target::Session(TerminalId::new()),
                 source_session: None,
                 provider: None,
@@ -900,6 +906,7 @@ mod tests {
         }));
         let session = TerminalId::new();
         let event = |key: &str| Event {
+            content: None,
             target: crate::notifications::Target::Session(session),
             source_session: Some(session),
             provider: Some(crate::agent::Provider::Codex),
@@ -1201,6 +1208,7 @@ async fn run(
     // Only events observed during this daemon lifetime are eligible for retry.
     // Restored attention stays visible in the UI without announcing old backlog.
     let mut delivery = BTreeMap::<Target, Notice>::new();
+    let mut delivery_schedule = batching::Schedule::default();
     let mut withdrawals = BTreeSet::new();
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
@@ -1209,17 +1217,30 @@ async fn run(
         ..Default::default()
     };
     match &mut journal {
-        Ok(journal) => match journal.list() {
+        Ok(journal) => {
+            if !policy.message_previews {
+                match journal.clear_content() {
+                    Ok(ids) => withdrawals.extend(ids),
+                    Err(error) => snapshot.diagnostic = Some(error),
+                }
+            }
+            match journal.list() {
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
+            }
         },
         Err(error) => snapshot.diagnostic = Some(error.clone()),
+    }
+    if !policy.message_previews {
+        for notice in &mut snapshot.notices { notice.event.content = None; }
     }
     publish(&shared, &host, snapshot.clone());
     while wait_for_work(
         &mut receiver,
-        (proxy.is_none() && (!delivery.is_empty() || !withdrawals.is_empty()))
-            .then_some(next_attempt),
+        if proxy.is_none() {
+            if !withdrawals.is_empty() { Some(next_attempt) }
+            else { delivery_schedule.deadline().map(|due| due.max(next_attempt)) }
+        } else { delivery_schedule.deadline() },
     )
     .await
     {
@@ -1300,6 +1321,13 @@ async fn run(
                     snapshot.diagnostic = Some(error);
                 }
             }
+            if !policy.message_previews {
+                match journal.clear_content() {
+                    Ok(ids) => withdrawals.extend(ids),
+                    Err(error) => snapshot.diagnostic = Some(error),
+                }
+                for notice in delivery.values_mut() { notice.event.content = None; }
+            }
             next_attempt = Instant::now();
             retry_delay = RETRY_DELAY;
         }
@@ -1346,7 +1374,7 @@ async fn run(
             }
             queue_withdrawal(&mut withdrawals, id);
         }
-        for event in pending.events.into_values() {
+        for mut event in pending.events.into_values() {
             if stopped(&shared) {
                 return;
             }
@@ -1357,6 +1385,7 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
+            if !policy.message_previews { event.content = None; }
             match journal.record(event, suppressed) {
                 Ok(Some(notice)) => {
                     delivery.remove(&notice.event.target());
@@ -1368,6 +1397,7 @@ async fn run(
                         queue_withdrawal(&mut withdrawals, old.id);
                     }
                     if !suppressed {
+                        delivery_schedule.update(notice.event.target(), notice.event.evidence.kind, Instant::now());
                         delivery.insert(notice.event.target(), notice);
                     }
                 }
@@ -1378,6 +1408,9 @@ async fn run(
         match journal.list() {
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
+        }
+        if !policy.message_previews {
+            for notice in &mut snapshot.notices { notice.event.content = None; }
         }
         for notice in delivery.values_mut() {
             if let Some(current) = snapshot
@@ -1409,7 +1442,7 @@ async fn run(
             policy.allows(notice.event.evidence.kind, focused)
         });
         let backlog_due =
-            (!delivery.is_empty() || !withdrawals.is_empty()) && Instant::now() >= next_attempt;
+            (delivery.keys().any(|target| delivery_schedule.ready(target, Instant::now())) || !withdrawals.is_empty()) && Instant::now() >= next_attempt;
         // A test is a person asking right now, so it retries a portal that
         // the backlog is still backing off from. Its failure is answered to
         // that person rather than raised as every window's diagnostic, and
@@ -1446,7 +1479,7 @@ async fn run(
             let batch: Vec<_> = if failed {
                 Vec::new()
             } else {
-                delivery.values().take(8).cloned().collect()
+                delivery.values().filter(|notice| delivery_schedule.ready(&notice.event.target(), Instant::now())).take(8).cloned().collect()
             };
             for notice in batch {
                 if stopped(&shared) {
@@ -1489,7 +1522,7 @@ async fn run(
                 proxy = None;
                 next_attempt = Instant::now() + retry_delay;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
-            } else if (!delivery.is_empty() || !withdrawals.is_empty())
+            } else if (delivery.keys().any(|target| delivery_schedule.ready(target, Instant::now())) || !withdrawals.is_empty())
                 && let Some(shared) = shared.upgrade()
             {
                 let _ = shared.wake.try_send(());
@@ -1498,6 +1531,9 @@ async fn run(
         match journal.list() {
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
+        }
+        if !policy.message_previews {
+            for notice in &mut snapshot.notices { notice.event.content = None; }
         }
         for (action, token) in pending.actions {
             if let Some(notice) = snapshot.notices.iter().find(|notice| notice.id == action) {
@@ -1536,6 +1572,7 @@ async fn run(
                 }
             }
         }
+        delivery_schedule.retain(|target| delivery.contains_key(target));
         publish(&shared, &host, snapshot.clone());
     }
 }

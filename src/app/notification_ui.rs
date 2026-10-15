@@ -34,6 +34,8 @@ struct Pending {
 
 pub(super) struct State {
     pub snapshot: Snapshot,
+    /// Derived once per broker snapshot, never searched during row rendering.
+    pub previews: HashMap<TerminalId, (usize, String)>,
     presence: Arc<Mutex<Presence>>,
     pending: Arc<Mutex<Pending>>,
     wake: Option<crossbeam_channel::Sender<()>>,
@@ -50,6 +52,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             snapshot: Snapshot::default(),
+            previews: HashMap::new(),
             presence: Arc::new(Mutex::new(Presence::default())),
             pending: Arc::new(Mutex::new(Pending::default())),
             wake: None,
@@ -353,7 +356,19 @@ impl Cagents {
                         self.observe_agent_update_for_card(card);
                     }
                 }
+                self.notification_ui.previews.clear();
+                for (rank, notice) in snapshot.notices.iter().enumerate() {
+                    if !notice.acknowledged && notice.event.content.is_some()
+                        && !self.notification_ui.acknowledged.contains(&notice.id)
+                        && let Some(session) = notice.event.source_session() {
+                        self.notification_ui.previews.entry(session).or_insert_with(|| {
+                            let message = crate::notifications::presentation::message(&notice.event, true);
+                            (rank, format!("{}\n{}", message.title, message.body))
+                        });
+                    }
+                }
                 self.notification_ui.snapshot = snapshot;
+                self.refresh_sidebar_channels();
                 self.notification_ui.last_focus = None;
                 self.sync_notification_presence();
                 Task::none()
@@ -802,6 +817,7 @@ mod tests {
         let notice = crate::notifications::Notice {
             id,
             event: crate::notifications::Event {
+                content: None,
                 target: crate::notifications::Target::Session(session),
                 source_session: Some(session),
                 provider: Some(Provider::Claude),
@@ -847,6 +863,7 @@ mod tests {
             notices: vec![crate::notifications::Notice {
                 id,
                 event: crate::notifications::Event {
+                    content: None,
                     target: crate::notifications::Target::Session(session),
                     source_session: Some(session),
                     provider: Some(Provider::Claude),

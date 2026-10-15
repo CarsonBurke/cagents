@@ -4,6 +4,7 @@
 //! acknowledge attention; they do not each send a desktop notification.
 
 pub mod review;
+pub mod presentation;
 #[cfg(feature = "ui")]
 pub mod ui;
 use serde::{Deserialize, Serialize};
@@ -90,6 +91,18 @@ pub struct Evidence {
     pub kind: Kind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestType { Approval, Question, Consent }
+
+/// Opt-in semantic context; the broker removes this before persistence when
+/// previews are disabled. Producers bound and sanitize it before enqueue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Content {
+    pub conversation: String,
+    pub preview: String,
+    pub request: Option<RequestType>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub target: Target,
@@ -100,6 +113,8 @@ pub struct Event {
     #[serde(default)]
     pub destination: Option<Destination>,
     pub evidence: Evidence,
+    #[serde(default)]
+    pub content: Option<Content>,
 }
 
 impl Event {
@@ -116,10 +131,20 @@ impl Event {
             directory: Some(directory),
             destination: None,
             evidence,
+            content: None,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(content) = &self.content {
+            if content.conversation.chars().count() > presentation::TITLE_LIMIT
+                || content.preview.chars().count() > presentation::PREVIEW_LIMIT
+                || content.conversation.chars().chain(content.preview.chars()).any(char::is_control)
+                || (content.request.is_some() && self.evidence.kind != Kind::Waiting)
+            {
+                return Err("Notification preview exceeds its text boundary".into());
+            }
+        }
         if self.evidence.key.len() > 1024
             || self
                 .directory
@@ -132,7 +157,7 @@ impl Event {
             destination.validate()?;
         }
         if matches!(self.target, Target::SessionInbox(_)) {
-            if self.evidence.kind != Kind::MessageReceived
+            if self.content.is_some() || self.evidence.kind != Kind::MessageReceived
                 || self.source_session.is_none()
                 || self.provider.is_some()
                 || self.directory.is_some()
@@ -150,7 +175,7 @@ impl Event {
         }
         if let Target::PullRequest(request) = &self.target {
             request.validate()?;
-            if self.evidence.kind != Kind::ReviewRequested
+            if self.content.is_some() || self.evidence.kind != Kind::ReviewRequested
                 || self.evidence.key != request.request
                 || self.source_session.is_some()
                 || self.provider.is_some()
@@ -206,6 +231,8 @@ pub struct Preferences {
     pub waiting: bool,
     pub while_focused: bool,
     pub review_requests: bool,
+    /// Explicit opt-in; existing configurations retain metadata-only alerts.
+    pub message_previews: bool,
 }
 
 impl Default for Preferences {
@@ -217,6 +244,7 @@ impl Default for Preferences {
             waiting: true,
             while_focused: false,
             review_requests: true,
+            message_previews: false,
         }
     }
 }
@@ -306,6 +334,7 @@ pub enum Field {
     Waiting,
     WhileFocused,
     ReviewRequests,
+    MessagePreviews,
 }
 
 impl Preferences {
@@ -317,6 +346,7 @@ impl Preferences {
             Field::Waiting => self.waiting,
             Field::WhileFocused => self.while_focused,
             Field::ReviewRequests => self.review_requests,
+            Field::MessagePreviews => self.message_previews,
         }
     }
     pub fn set(&mut self, field: Field, value: bool) {
@@ -327,6 +357,7 @@ impl Preferences {
             Field::Waiting => &mut self.waiting,
             Field::WhileFocused => &mut self.while_focused,
             Field::ReviewRequests => &mut self.review_requests,
+            Field::MessagePreviews => &mut self.message_previews,
         } = value;
     }
 }
@@ -350,7 +381,7 @@ impl Preferences {
     }
 }
 
-/// Only bounded, non-content context may cross into desktop notifications.
+/// Private metadata-only context. Rich excerpts are a separate explicit opt-in.
 pub fn context(event: &Event) -> String {
     if matches!(event.target, Target::SessionInbox(_)) {
         return "Open the terminal and run cagents inbox to read messages.".into();
@@ -387,6 +418,7 @@ mod tests {
     fn inbox_attention_is_distinct_fixed_and_compatible_with_waiting_preferences() {
         let session = TerminalId::new();
         let event = Event {
+            content: None,
             target: Target::SessionInbox(crate::agent_execution::Lineage(session)),
             source_session: Some(session),
             provider: None,
@@ -427,6 +459,7 @@ mod tests {
         assert_eq!(event.target(), Target::Session(session));
         assert_eq!(event.source_session(), Some(session));
         let event = Event {
+            content: None,
             target: Target::AgentRun(RunId::new()),
             source_session: None,
             provider: None,
@@ -459,6 +492,7 @@ mod tests {
             notices: vec![Notice {
                 id,
                 event: Event {
+                    content: None,
                     target: target.clone(),
                     source_session: None,
                     provider: None,
@@ -521,6 +555,7 @@ mod tests {
     #[test]
     fn context_is_bounded_and_does_not_include_parent_paths() {
         let event = Event {
+            content: None,
             target: Target::Session(TerminalId::new()),
             source_session: None,
             provider: Some(Provider::Codex),

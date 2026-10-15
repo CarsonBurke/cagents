@@ -237,6 +237,11 @@ fn settings_category_controls<'a>(
                     "Notify while focused",
                     "Also notify while you are watching that agent. Off by default.",
                 ),
+                (
+                    Field::MessagePreviews,
+                    "Show message previews",
+                    "Include conversation names and response or request excerpts on the desktop. These may be visible on a shared or locked screen. Off by default.",
+                ),
             ];
             let mut controls: Vec<_> = fields
                 .into_iter()
@@ -274,7 +279,7 @@ fn settings_category_controls<'a>(
             ));
             vec![settings_group(
                 "Agent notifications",
-                "Alerts contain the provider and folder name, never prompts or output.",
+                "Private alerts show the provider and folder. Message previews are available when you choose to enable them.",
                 controls,
             )]
         }

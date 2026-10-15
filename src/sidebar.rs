@@ -417,6 +417,8 @@ pub struct SidebarChannel {
     pub selected: bool,
     pub activity: Option<crate::agent::ActivityState>,
     pub unread: bool,
+    /// Bounded derived context from the shared notification journal.
+    pub notification_preview: Option<String>,
     pub chats: usize,
     pub has_panes: bool,
     /// The creation rank the shared registry assigned. Carried on the row
@@ -433,6 +435,14 @@ pub struct SidebarChannel {
 }
 
 impl SidebarChannel {
+    pub fn with_notification_preview(mut self, preview: Option<String>) -> Self {
+        if let Some(preview) = &preview {
+            self.tooltip = format!("{}\n{preview}", self.tooltip).into_boxed_str();
+            self.accessible_name = format!("{}, {preview}", self.accessible_name).into_boxed_str();
+        }
+        self.notification_preview = preview;
+        self
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ChannelId,
@@ -453,6 +463,7 @@ impl SidebarChannel {
             selected,
             activity,
             unread,
+            notification_preview: None,
             chats,
             has_panes,
             ordinal,

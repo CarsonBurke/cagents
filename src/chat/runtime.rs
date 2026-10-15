@@ -425,12 +425,10 @@ impl Handle {
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
-                    if !actor.attention.settled && !preserve_holder {
-                        (actor.notify)(Update::Attention(crate::notifications::Evidence {
+                    let attention = (!actor.attention.settled && !preserve_holder).then(|| crate::notifications::Evidence {
                             key: actor.attention.key.clone(),
                             kind: crate::notifications::Kind::Failed,
-                        }));
-                    }
+                    });
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     let stderr =
                         String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
@@ -443,6 +441,9 @@ impl Handle {
                         message,
                         fatal: true,
                     });
+                    // Publish the bounded diagnosis before attention samples
+                    // it, while keeping retained native outcomes unconfirmed.
+                    if let Some(evidence) = attention { (actor.notify)(Update::Attention(evidence)); }
                 }
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
@@ -731,6 +732,10 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .usage
             .clone()
+    }
+    /// Bounded resident metadata only; never reads or hydrates transcript pages.
+    pub(crate) fn notification_content(&self, kind: crate::notifications::Kind) -> crate::notifications::Content {
+        self.0.state.lock().unwrap_or_else(|p| p.into_inner()).notification_content(kind)
     }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -2240,6 +2245,12 @@ impl Actor {
                 } => Some(message.clone()),
                 _ => None,
             };
+            // The disk-backed transcript store consumes text/tool items. Keep
+            // their bounded live excerpt before that boundary, without ever
+            // hydrating the page a window happens to be reading.
+            if matches!(&event, Event::Item(_) | Event::TextDelta { .. }) {
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).notification_preview.observe(&event);
+            }
             let events = self
                 .store
                 .lock()
@@ -2494,6 +2505,7 @@ fn recover_history_error(
 }
 
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
+    state.notification_preview.observe(&event);
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
@@ -4478,6 +4490,59 @@ mod tests {
         assert_eq!(handle.snapshot(None).unwrap().finished_at, None);
         handle.command(Command::Refresh).unwrap();
         assert!(handle.snapshot(None).unwrap().finished_at.unwrap() >= first);
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn notification_preview_uses_live_store_events_without_paging_or_tool_output() {
+        struct NotificationFixture(usize);
+        impl Adapter for NotificationFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step { events: vec![Event::Ready(true)], ..Default::default() })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                let events = match self.0 {
+                    1 => vec![
+                        Event::Session { id: "notification-fixture".into(), title: Some("Repair authentication".into()) },
+                        Event::TurnStarted,
+                        Event::Item(Item { id: "tool".into(), role: Role::Assistant, at: None, started_at: None,
+                            content: ItemContent::Tool { name: "test".into(), input: "private arguments".into(), output: "raw-tool-garbage".repeat(10000), status: ToolStatus::Succeeded } }),
+                        Event::TextDelta { id: "answer".into(), role: Role::Assistant, thinking: false,
+                            delta: format!("## Done\nRepaired authentication.\n```sh\nraw-code-garbage\n```\nAll tests passed. {}", "More result. ".repeat(10000)) },
+                        Event::TurnFinished { key: Some("one".into()), outcome: crate::notifications::Kind::Succeeded },
+                    ],
+                    2 => vec![Event::History { items: vec![text("old", "Historical answer must not notify")], has_earlier: false }],
+                    3 => vec![Event::Request(super::super::Request { kind: super::super::RequestKind::Question,
+                        id: "question".into(), title: "Migration strategy".into(), description: "Choose the migration strategy?".into(),
+                        fields: vec![super::super::Field { id: "secret".into(), label: "Secret".into(), description: String::new(), choices: vec![], multiple: false, secret: true, initial: "fixture-secret".into() }], actions: vec![] })],
+                    _ => return Err("fixture exhausted".into()),
+                };
+                Ok(Step { events, ..Default::default() })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(), arguments: vec![], working_directory: directory.path().into(), environment: BTreeMap::new() };
+        let mut adapter: Box<dyn Adapter> = Box::new(NotificationFixture(0));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle.command(Command::Refresh).unwrap();
+        let response = handle.notification_content(crate::notifications::Kind::Succeeded);
+        assert_eq!(response.conversation, "Repair authentication");
+        assert!(response.preview.starts_with("Done Repaired authentication. All tests passed."));
+        assert!(!response.preview.contains("garbage"));
+        assert!(response.preview.chars().count() <= crate::notifications::presentation::PREVIEW_LIMIT);
+        handle.command(Command::Refresh).unwrap();
+        assert_eq!(handle.notification_content(crate::notifications::Kind::Succeeded), response);
+        handle.command(Command::Refresh).unwrap();
+        let waiting = handle.notification_content(crate::notifications::Kind::Waiting);
+        assert_eq!(waiting.request, Some(crate::notifications::RequestType::Question));
+        assert_eq!(waiting.preview, "Choose the migration strategy?");
+        assert!(!waiting.preview.contains("fixture-secret"));
         handle.close().unwrap();
     }
 

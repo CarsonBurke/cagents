@@ -247,6 +247,25 @@ impl Journal {
             .map_err(|error| error.to_string())
     }
 
+    /// Remove opt-in excerpts without changing attention, delivery or evidence
+    /// identities. Turning privacy back on must also cover restored notices.
+    pub fn clear_content(&mut self) -> Result<Vec<Uuid>, String> {
+        self.0.transaction::<_, diesel::result::Error, _>(|connection| {
+            let rows = notices::table.select((notices::session, notices::id, notices::event))
+                .load::<(String,String,String)>(connection)?;
+            let mut changed = Vec::new();
+            for (target,id,serialized) in rows {
+                let mut event = Event::from_journal(&serialized).map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                if event.content.take().is_none() { continue; }
+                let event = serde_json::to_string(&event).map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                let id = id.parse().map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                diesel::update(notices::table.find(target)).set(notices::event.eq(event)).execute(connection)?;
+                changed.push(id);
+            }
+            Ok(changed)
+        }).map_err(|error| format!("Could not clear private notification previews: {error}"))
+    }
+
     pub fn acknowledge(&mut self, id: Uuid) -> Result<Option<String>, String> {
         diesel::update(notices::table.filter(notices::id.eq(id.to_string())))
             .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
@@ -329,6 +348,28 @@ mod tests {
     };
     use rusqlite::Connection;
 
+    #[test]
+    fn disabling_previews_clears_retained_text_without_changing_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let mut original = event(TerminalId::new(), "one");
+        original.content = Some(crate::notifications::Content {
+            conversation: "Private conversation".into(), preview: "Private response".into(), request: None,
+        });
+        let notice = journal.record(original, false).unwrap().unwrap();
+        journal.delivered(notice.id).unwrap();
+        journal.acknowledge(notice.id).unwrap();
+        assert_eq!(journal.clear_content().unwrap(), vec![notice.id]);
+        assert!(journal.clear_content().unwrap().is_empty());
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        let retained = reopened.list().unwrap();
+        assert_eq!(retained[0].id, notice.id);
+        assert!(retained[0].acknowledged && retained[0].delivered);
+        assert!(retained[0].event.content.is_none());
+    }
+
     fn seed_owners(journal: &mut Journal) {
         let rows: Vec<_> = (1..MAX_SESSIONS)
             .map(|i| {
@@ -351,6 +392,7 @@ mod tests {
         message: crate::model::MessageId,
     ) -> Event {
         Event {
+            content: None,
             target: Target::SessionInbox(lineage),
             source_session: Some(session),
             provider: None,
@@ -744,6 +786,7 @@ mod tests {
 
     fn event(session: TerminalId, key: &str) -> Event {
         Event {
+            content: None,
             target: crate::notifications::Target::Session(session),
             source_session: Some(session),
             provider: Some(Provider::Codex),
@@ -810,6 +853,7 @@ mod tests {
             request: "request-one".into(),
         };
         let make = |request: ReviewRequest| Event {
+            content: None,
             evidence: Evidence {
                 key: request.request.clone(),
                 kind: Kind::ReviewRequested,

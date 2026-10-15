@@ -715,6 +715,7 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
         HostedSession::Terminal(session) => session.id,
     });
     Some(Event {
+        content: None,
         target: Target::AgentRun(run.id),
         source_session,
         provider: Some(agent.spec.provider),

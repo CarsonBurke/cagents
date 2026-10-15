@@ -415,6 +415,15 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
             }
         }
     }
+    // Never acquire provider state while holding HostState. Snapshot paging
+    // and ownership publication use their own locks, independently.
+    let content = if let Update::Attention(evidence) = &update {
+        let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&id).map(|record| record.handle.clone());
+        handle.map(|handle| {
+            let content = handle.notification_content(evidence.kind);
+            (handle, content)
+        })
+    } else { None };
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let proof = state.proof().clone();
     // A conversation that starts or settles may take the messages left for it.
@@ -433,12 +442,17 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
         if let Some(record) = state.chats.get(&id)
             && let Some(notifications) = &state.notifications
         {
-            notifications.record(crate::notifications::Event::session(
+            let mut event = crate::notifications::Event::session(
                 id,
                 record.session.launch.provider,
                 record.session.launch.recipe.working_directory.clone(),
                 evidence.clone(),
-            ));
+            );
+            if let Some((handle, content)) = &content
+                && record.handle.same_actor(handle) {
+                event.content = Some(content.clone());
+            }
+            notifications.record(event);
         }
         return;
     }
