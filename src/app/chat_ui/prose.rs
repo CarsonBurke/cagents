@@ -249,6 +249,16 @@ pub(super) fn fence_language(info: &str) -> Option<&str> {
         .find(|word| !word.is_empty())
 }
 
+pub(super) type PaletteMap=HashMap<u64,Arc<[Span<'static,String>]>>;
+pub(super) type Palettes=[Arc<PaletteMap>;2];
+pub(super) fn palettes(blocks:&HashMap<u64,CodeBlock>)->Palettes {
+    std::array::from_fn(|dark|Arc::new(blocks.iter().map(|(key,block)|(*key,block.spans(dark!=0).clone())).collect()))
+}
+fn palette(cached:&CachedItem,dark:bool)->Arc<PaletteMap> {
+    cached.palette_views.as_ref().map(|palettes|palettes[usize::from(dark)].clone())
+        .unwrap_or_else(||Arc::new(cached.blocks.iter().map(|(key,block)|(*key,block.spans(dark).clone())).collect()))
+}
+
 /// An item's parsed Markdown as an element that owns what it draws.
 pub(super) fn view(
     cached: &CachedItem,
@@ -261,7 +271,7 @@ pub(super) fn view(
     }
     Renderer {
         target,
-        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        blocks: palette(cached,cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
@@ -285,7 +295,7 @@ pub(super) fn content_view(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        blocks: palette(cached,cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
@@ -305,7 +315,7 @@ pub(super) fn items_for_test(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        blocks: palette(cached,cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
@@ -840,6 +850,19 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 mod tests {
     use super::*;
 
+    #[test]
+    fn prepared_palette_maps_are_shared_across_views_in_both_appearances() {
+        let theme=crate::settings::EditorSyntaxTheme::Auto;
+        let blocks=(0..200).map(|key|(key,CodeBlock::new(Some("rust"),"let value = 1;",theme))).collect();
+        let prepared=palettes(&blocks);
+        let mut cached=CachedItem::new(&ItemContent::Text{text:"body".into(),thinking:false,phase:chat::Phase::Final},theme);
+        cached.blocks=blocks;cached.palette_views=Some(prepared.clone());
+        for _ in 0..1000 {for dark in [false,true] {
+            assert!(Arc::ptr_eq(&palette(&cached,dark),&prepared[usize::from(dark)]));
+        }}
+        let weak=Arc::downgrade(&prepared[0]);drop(prepared);drop(cached);
+        assert!(weak.upgrade().is_none());
+    }
     #[test]
     fn huge_inline_paragraph_does_not_materialize_presentation_on_ui_layout() {
         use iced::advanced::{layout, widget::Tree};
