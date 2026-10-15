@@ -519,7 +519,8 @@ impl Cagents {
             return self.update_editor_features(Action::Dismiss(card));
         }
         let Some(doc) = self.lsp_document(card) else { return Task::none(); };
-        if self.lsp.signature_trigger(doc, character) {
+        let visible = matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_signature_visible());
+        if self.lsp.signature_trigger_with_context(doc, character, visible) {
             self.update_editor_features(Action::Signature(card, Some(character.to_string())))
         } else { Task::none() }
     }
@@ -800,11 +801,12 @@ impl Cagents {
                 let operation = Operation { card, doc, version, kind: LspEditKind::CodeAction, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
                 let Some(at) = runtime.cursor_position() else { return Task::none(); };
+                let active = runtime.editor_signature_help().cloned();
                 if let Some((previous, _)) = self.editor_features.signature_requests.remove(&card) {
                     self.editor_features.requests.remove(&previous);
                     self.lsp.cancel(previous);
                 }
-                let request = self.lsp.request_signature_help(operation.doc, at, trigger);
+                let request = self.lsp.request_signature_help_retrigger(operation.doc, at, trigger, active.is_some(), active);
                 self.editor_features.signature_requests.insert(card, (request, at));
                 self.editor_features.requests.insert(request, operation);
                 Task::none()
