@@ -24,7 +24,18 @@ enum InputPayload {
 pub(crate) struct ActorIdentity { pub instance:uuid::Uuid,pub record:Record }
 #[derive(Clone,Serialize,Deserialize)]
 pub(crate) struct Resident {
-    pub snapshot:Snapshot,
+    pub generation:u64,
+    pub session_id:Option<String>,
+    pub title:Option<String>,
+    pub ready:bool,
+    pub busy:bool,
+    pub waiting:bool,
+    pub working:bool,
+    pub activity:crate::agent::ActivityState,
+    pub outcome:Option<crate::agent::ActivityOutcome>,
+    pub usage:chat::Usage,
+    pub native_continuity:chat::NativeContinuity,
+    pub requests:Vec<chat::Request>,
     pub completed:bool,
     pub idle:bool,
     pub failure:Option<String>,
@@ -69,7 +80,7 @@ struct Remote {
     epoch:uuid::Uuid,
     proof:HostSessionProof,
     socket:PathBuf,
-    state:Mutex<Resident>,
+    state:Mutex<Arc<Resident>>,
     source:Mutex<chat::Session>,
     environment:crate::terminal_ipc::ChatExecutionEnvironment,
     recovery_environment:BTreeMap<String,String>,
@@ -84,7 +95,7 @@ struct Remote {
 }
 impl RemoteActor {
     pub fn identity(&self)->ActorIdentity {self.0.identity.clone()}
-    pub fn state(&self)->Resident {self.0.state.lock().unwrap_or_else(|p|p.into_inner()).clone()}
+    pub fn state(&self)->Arc<Resident> {self.0.state.lock().unwrap_or_else(|p|p.into_inner()).clone()}
     pub fn execution_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {self.0.environment.clone()}
     pub fn recovery_environment_matches(&self,value:&BTreeMap<String,String>)->bool {&self.0.recovery_environment==value}
     #[cfg(test)]
@@ -139,7 +150,7 @@ impl RemoteActor {
         if attached.protocol!=PROTOCOL {return Err("Retained Claude actor protocol is incompatible; no prompt was replayed".into());}
         validate_record(&attached.identity.record)?;
         let socket=registry::socket(&registry::directory(Kind::Native)?,attached.identity.record.terminal);
-        let remote=Self(Arc::new(Remote {identity:attached.identity,epoch:attached.epoch,proof,socket,input_sequence:Mutex::new(attached.resident.next_input),state:Mutex::new(attached.resident),source:Mutex::new(attached.source),environment:attached.execution_environment,recovery_environment:attached.recovery_environment,pending:Mutex::new(Vec::new()),notify:Arc::new(notify),stop:AtomicBool::new(false),installed:AtomicBool::new(false),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(startup)}));
+        let remote=Self(Arc::new(Remote {identity:attached.identity,epoch:attached.epoch,proof,socket,input_sequence:Mutex::new(attached.resident.next_input),state:Mutex::new(Arc::new(attached.resident)),source:Mutex::new(attached.source),environment:attached.execution_environment,recovery_environment:attached.recovery_environment,pending:Mutex::new(Vec::new()),notify:Arc::new(notify),stop:AtomicBool::new(false),installed:AtomicBool::new(false),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(startup)}));
         let weak=Arc::downgrade(&remote.0);
         let worker=thread::Builder::new().name("cagents-actor-proxy".into()).spawn(move||{
             loop {
@@ -149,13 +160,13 @@ impl RemoteActor {
                 let old=actor.state();
                 if let Ok(Some(state))=actor.call::<Option<Resident>>("state",json!([old.changed])) {
                     let changed=state.changed!=old.changed;
-                    let generation=state.snapshot.generation;
-                    let activity=state.snapshot.activity();
-                    let outcome=state.snapshot.outcome.clone();
-                    let activity_changed=activity!=old.snapshot.activity()||outcome!=old.snapshot.outcome;
-                    let ready=state.snapshot.ready&&!old.snapshot.ready;
+                    let generation=state.generation;
+                    let activity=state.activity;
+                    let outcome=state.outcome.clone();
+                    let activity_changed=activity!=old.activity||outcome!=old.outcome;
+                    let ready=state.ready&&!old.ready;
                     let usage:Vec<_>=state.account_reports.iter().filter(|report|!old.account_reports.contains(report)).cloned().collect();
-                    *actor.0.state.lock().unwrap_or_else(|p|p.into_inner())=state;
+                    *actor.0.state.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(state);
                     if changed {(actor.0.notify)(Update::Observed {generation});(actor.0.notify)(Update::Presentation);}
                     if activity_changed {(actor.0.notify)(Update::Activity {state:activity,generation,outcome});}
                     if ready {(actor.0.notify)(Update::Ready);}
@@ -295,14 +306,14 @@ impl Server {
     fn resident(&self)->Result<Resident,String> {
         // Clone resident metadata only. Do not hydrate the Store or serialize
         // any growing parent/child tool body to service periodic observation.
-        let mut snapshot=self.actor.0.state.lock().unwrap_or_else(|p|p.into_inner()).clone();
-        snapshot.native_continuity=chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()};
-        snapshot.items.clear();
-        for child in &mut snapshot.subagents {child.items.clear();}
+        let state=self.actor.0.state.lock().unwrap_or_else(|p|p.into_inner());
+        let generation=state.generation;let session_id=state.session_id.clone();let title=state.title.clone();let ready=state.ready;let busy=state.busy;let waiting=state.waiting;let working=state.is_working();let activity=state.activity();let outcome=state.outcome.clone();let usage=state.usage.clone();let requests=state.requests.clone();
+        drop(state);
         let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
         let failure=journal.loss()?.or_else(||self.actor.failure());
-        Ok(Resident {snapshot,completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,changed:self.changed.load(Ordering::Acquire)})
+        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()},completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,changed:self.changed.load(Ordering::Acquire)})
     }
+
     fn attached(&self)->Result<Attached,String> {Ok(Attached {protocol:PROTOCOL,identity:self.identity.clone(),epoch:self.epoch,resident:self.resident()?,source:self.source.clone(),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()})}
     fn finish_inputs(&mut self) {
         let journal=self.journal.clone();
