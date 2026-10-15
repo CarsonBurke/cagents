@@ -629,6 +629,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 authority: authority.clone(),
             }),
             authority: Some(authority),
+            recovery_context: self.recovery_context.clone(),
             creation_executor: self.creation_executor.clone(),
         })
     }
@@ -648,6 +649,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 authority: authority.clone(),
             }),
             authority: Some(authority),
+            // Source cleanup/placement consent never transfers to the newly
+            // created destination. Its mutations need a fresh domain context.
+            recovery_context: None,
             creation_executor: self.creation_executor.clone(),
         })
     }
@@ -667,6 +671,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 authority: authority.clone(),
             }),
             authority: Some(authority),
+            recovery_context: self.recovery_context.clone(),
             creation_executor: self.creation_executor.clone(),
         })
     }

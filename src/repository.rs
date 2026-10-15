@@ -3928,6 +3928,7 @@ pub struct RepositoryService<E = SystemProcessExecutor> {
     git: PathBuf,
     executor: Arc<E>,
     authority: Option<WorktreeAuthority>,
+    recovery_context: Option<crate::filesystem_recovery_context::FilesystemRecoveryContext>,
     // Verified creation-journal handoffs and fixed typed recovery-object
     // commands may use this original executor. It is never exposed through a
     // public authority API or used for ordinary foreign commands.
@@ -3949,6 +3950,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             creation_executor: executor.clone(),
             executor,
             authority: None,
+            recovery_context: None,
+        }
+    }
+
+    /// Retain the exact context captured by this queued intent. This constructor
+    /// performs no filesystem/IPC work; each producer validates its actual held
+    /// source and registration lease on the blocking worker before effects.
+    pub fn with_recovery_context(&self, context: crate::filesystem_recovery_context::FilesystemRecoveryContext) -> Self {
+        Self {
+            git: self.git.clone(),
+            executor: self.executor.clone(),
+            authority: self.authority.clone(),
+            recovery_context: Some(context),
+            creation_executor: self.creation_executor.clone(),
         }
     }
 
