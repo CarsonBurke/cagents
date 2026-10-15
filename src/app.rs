@@ -9644,6 +9644,7 @@ impl Cagents {
             self.cancel_workspace_preview();
             return Task::none();
         }
+        self.project_ui.activation = None;
         let first = self.chrome_ui.workspace_preview.replace(action).is_none();
         self.workspace_cycle_modifiers = modifiers
             & (keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::LOGO);

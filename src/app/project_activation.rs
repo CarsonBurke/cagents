@@ -28,6 +28,10 @@ impl Cagents {
     }
 
     pub(super) fn resume_project_activation(&mut self) -> Task<Message> {
+        if crate::device::is_remote() {
+            self.project_ui.activation = None;
+            return Task::none();
+        }
         if self.update_prepared || self.modal_is_open() || self.focused_repository_is_saving() {
             return Task::none();
         }
@@ -80,12 +84,15 @@ impl Cagents {
 /// pointer-rest observations and background read completions are not choices.
 pub(super) fn supersedes_project_activation(message: &Message) -> bool {
     matches!(message,
-        Message::OpenRepository | Message::FocusCard(_) | Message::FocusAdjacent(_)
+        Message::OpenRepository | Message::NewWindow | Message::WindowCloseRequested(_)
+        | Message::FocusCard(_) | Message::FocusAdjacent(_)
         | Message::ActivateSession { .. } | Message::NewTerminal | Message::NewBrowser
         | Message::OpenBrowser(_) | Message::OpenLink(..) | Message::OpenDocumentLink(..)
         | Message::ChromeUi(chrome_ui::Action::Launch(_))
+        | Message::ProjectUi(project_ui::Action::Command { .. } | project_ui::Action::ConfirmDelete
+            | project_ui::Action::ConfirmRemove | project_ui::Action::RetryDelete(_))
         | Message::Viewport { event: WorkspaceViewportEvent::PointerFocused(_), .. }
-        | Message::Sidebar(SidebarAction::OpenRepository { .. } | SidebarAction::OpenWorktree { .. }
+        | Message::Sidebar(SidebarAction::ProjectCommand { .. } | SidebarAction::OpenRepository { .. } | SidebarAction::OpenWorktree { .. }
             | SidebarAction::OpenChannel { .. } | SidebarAction::OpenPullRequest { .. }
             | SidebarAction::BrowsePullRequests { .. } | SidebarAction::NewChannel { .. }
             | SidebarAction::NewWorktree { .. } | SidebarAction::OpenSettings | SidebarAction::OpenAutomations)
