@@ -292,14 +292,17 @@ impl TextSnapshot {
             if cells.insert(Arc::as_ptr(&snapshot.serialized) as usize) {
                 memory.payload_bytes += std::mem::size_of::<OnceLock<Arc<str>>>() + header;
                 if let Some(text) = snapshot.serialized.get()
-                    && texts.insert(Arc::as_ptr(text) as *const () as usize) {
+                    && texts.insert(Arc::as_ptr(text) as *const () as usize)
+                {
                     memory.serialized_bytes += text.len();
                     memory.payload_bytes += text.len() + header;
                 }
             }
         }
         while let Some(node) = stack.pop() {
-            if !nodes.insert(std::ptr::from_ref(node) as usize) { continue; }
+            if !nodes.insert(std::ptr::from_ref(node) as usize) {
+                continue;
+            }
             memory.nodes += 1;
             memory.payload_bytes += std::mem::size_of::<Node>() + header;
             match node {
@@ -309,7 +312,10 @@ impl TextSnapshot {
                         memory.payload_bytes += line.text.len() + header;
                     }
                 }
-                Node::Branch { left, right, .. } => { stack.push(left); stack.push(right); }
+                Node::Branch { left, right, .. } => {
+                    stack.push(left);
+                    stack.push(right);
+                }
             }
         }
         memory
@@ -352,7 +358,8 @@ impl TextSnapshot {
         Self {
             root: build(&lines),
             serialized: Arc::new(OnceLock::new()),
-            #[cfg(test)] serializations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            serializations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
     pub fn len(&self) -> usize {
@@ -366,8 +373,13 @@ impl TextSnapshot {
     }
     /// Shares immutable lines while giving a consumer its own empty text
     /// cache. Protocol history must not retain a full string cached by a diff.
-    pub fn without_cached_text(&self)->Self {
-        Self {root:self.root.clone(),serialized:Arc::new(OnceLock::new()),#[cfg(test)] serializations:Arc::clone(&self.serializations)}
+    pub fn without_cached_text(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            serialized: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            serializations: Arc::clone(&self.serializations),
+        }
     }
 
     /// A functional replacement for protocol-compatible native lines. Only
@@ -419,33 +431,52 @@ impl TextSnapshot {
         }
         let mut left: Vec<_> = self.root.as_deref().into_iter().collect();
         let mut right: Vec<_> = other.root.as_deref().into_iter().collect();
-        fn expand<'a>(stack:&mut Vec<&'a Node>,node:&'a Node)->bool {
-            if let Node::Branch {left,right,..} = node {
-                stack.pop();stack.push(right);stack.push(left);true
-            } else {false}
+        fn expand<'a>(stack: &mut Vec<&'a Node>, node: &'a Node) -> bool {
+            if let Node::Branch { left, right, .. } = node {
+                stack.pop();
+                stack.push(right);
+                stack.push(left);
+                true
+            } else {
+                false
+            }
         }
-        while let (Some(&a),Some(&b)) = (left.last(),right.last()) {
-            if std::ptr::eq(a,b) {left.pop();right.pop();continue;}
-            if a.bytes() == b.bytes() {
-                if let (Node::Line(a),Node::Line(b)) = (a,b) {
-                    if !a.text.bytes().chain(a.terminator.bytes()).eq(b.text.bytes().chain(b.terminator.bytes())) {return false;}
-                    left.pop();right.pop();continue;
-                }
-                let expanded_left = expand(&mut left,a);
-                let expanded_right = expand(&mut right,b);
-                debug_assert!(expanded_left || expanded_right);
-            } else if a.bytes() > b.bytes() && expand(&mut left,a) {
+        while let (Some(&a), Some(&b)) = (left.last(), right.last()) {
+            if std::ptr::eq(a, b) {
+                left.pop();
+                right.pop();
                 continue;
-            } else if b.bytes() > a.bytes() && expand(&mut right,b) {
+            }
+            if a.bytes() == b.bytes() {
+                if let (Node::Line(a), Node::Line(b)) = (a, b) {
+                    if !a
+                        .text
+                        .bytes()
+                        .chain(a.terminator.bytes())
+                        .eq(b.text.bytes().chain(b.terminator.bytes()))
+                    {
+                        return false;
+                    }
+                    left.pop();
+                    right.pop();
+                    continue;
+                }
+                let expanded_left = expand(&mut left, a);
+                let expanded_right = expand(&mut right, b);
+                debug_assert!(expanded_left || expanded_right);
+            } else if a.bytes() > b.bytes() && expand(&mut left, a) {
+                continue;
+            } else if b.bytes() > a.bytes() && expand(&mut right, b) {
                 continue;
             } else {
                 // Equal bytes can have different native line topology. Keep
                 // exact semantics in that rare case without materialization.
-                return Chunks::new(self.root.as_deref()).flat_map(str::bytes)
+                return Chunks::new(self.root.as_deref())
+                    .flat_map(str::bytes)
                     .eq(Chunks::new(other.root.as_deref()).flat_map(str::bytes));
             }
         }
-        left.iter().all(|node| node.bytes()==0) && right.iter().all(|node| node.bytes()==0)
+        left.iter().all(|node| node.bytes() == 0) && right.iter().all(|node| node.bytes() == 0)
     }
     pub fn protocol_compatible_lines(&self) -> bool {
         self.root.as_ref().is_none_or(|root| root.compatible())
@@ -461,20 +492,31 @@ impl TextSnapshot {
         })
     }
     #[cfg(test)]
-    pub fn is_materialized(&self) -> bool { self.serialized.get().is_some() }
+    pub fn is_materialized(&self) -> bool {
+        self.serialized.get().is_some()
+    }
     /// Serialize a transient payload without retaining a second full copy
     /// in every historical native snapshot (for example LSP wire messages).
     pub fn to_string_uncached(&self) -> String {
         #[cfg(test)]
-        self.serializations.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        self.serializations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut text = String::with_capacity(self.len());
-        if let Some(root) = &self.root {root.write(&mut text);}
+        if let Some(root) = &self.root {
+            root.write(&mut text);
+        }
         text
     }
     #[cfg(test)]
-    pub fn serialization_count(&self)->usize {self.serializations.load(std::sync::atomic::Ordering::Relaxed)}
+    pub fn serialization_count(&self) -> usize {
+        self.serializations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn text(&self) -> Arc<str> {
-        Arc::clone(self.serialized.get_or_init(|| Arc::from(self.to_string_uncached())))
+        Arc::clone(
+            self.serialized
+                .get_or_init(|| Arc::from(self.to_string_uncached())),
+        )
     }
     pub(super) fn replace_lines<'a>(
         &mut self,
@@ -492,7 +534,9 @@ impl TextSnapshot {
         self.root = join(join(left, replacement.root), right);
         self.serialized = Arc::new(OnceLock::new());
         #[cfg(test)]
-        { self.serializations = Arc::new(std::sync::atomic::AtomicUsize::new(0)); }
+        {
+            self.serializations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        }
     }
 }
 
@@ -520,42 +564,73 @@ mod tests {
     #[test]
     fn retained_payload_distinguishes_shared_edits_from_whole_rewrites() {
         let values: Vec<_> = (0..1024).map(|line| format!("line{line}")).collect();
-        let build = || TextSnapshot::from_lines(values.iter().map(|line| (line.as_str(),LineEnding::Lf,"\n")));
+        let build = || {
+            TextSnapshot::from_lines(
+                values
+                    .iter()
+                    .map(|line| (line.as_str(), LineEnding::Lf, "\n")),
+            )
+        };
         let mut shared = vec![build()];
         for line in 0..3 {
-            let next = shared.last().unwrap().replaced(Position {line,column:0},Position {line,column:0},"x").unwrap();
+            let next = shared
+                .last()
+                .unwrap()
+                .replaced(
+                    Position { line, column: 0 },
+                    Position { line, column: 0 },
+                    "x",
+                )
+                .unwrap();
             shared.push(next);
         }
         let disjoint: Vec<_> = (0..4).map(|_| build()).collect();
         let incremental = TextSnapshot::retained_payload(&shared);
         let rewritten = TextSnapshot::retained_payload(&disjoint);
-        assert_eq!(rewritten.nodes,4*(2*1024-1));
-        assert!(incremental.nodes < rewritten.nodes/2,"unchanged AVL allocations must remain shared");
-        assert!(incremental.payload_bytes < rewritten.payload_bytes/2);
-        assert_eq!(incremental.serialized_bytes,0);
+        assert_eq!(rewritten.nodes, 4 * (2 * 1024 - 1));
+        assert!(
+            incremental.nodes < rewritten.nodes / 2,
+            "unchanged AVL allocations must remain shared"
+        );
+        assert!(incremental.payload_bytes < rewritten.payload_bytes / 2);
+        assert_eq!(incremental.serialized_bytes, 0);
         let _text = shared[0].text();
         let cached = TextSnapshot::retained_payload(&shared);
-        assert_eq!(cached.serialized_bytes,shared[0].len());
-        let protocol: Vec<_> = shared.iter().map(TextSnapshot::without_cached_text).collect();
+        assert_eq!(cached.serialized_bytes, shared[0].len());
+        let protocol: Vec<_> = shared
+            .iter()
+            .map(TextSnapshot::without_cached_text)
+            .collect();
         let detached = TextSnapshot::retained_payload(&protocol);
-        assert_eq!(detached.nodes,incremental.nodes);
-        assert_eq!(detached.line_text_bytes,incremental.line_text_bytes);
-        assert_eq!(detached.serialized_bytes,0);
+        assert_eq!(detached.nodes, incremental.nodes);
+        assert_eq!(detached.line_text_bytes, incremental.line_text_bytes);
+        assert_eq!(detached.serialized_bytes, 0);
     }
 
     #[test]
     fn detached_consumer_cache_shares_lines_without_retaining_full_text() {
-        let source = TextSnapshot::from_lines([("first",LineEnding::Lf,"\n"),("second",LineEnding::None,"")]);
+        let source = TextSnapshot::from_lines([
+            ("first", LineEnding::Lf, "\n"),
+            ("second", LineEnding::None, ""),
+        ]);
         let text = source.text();
         let weak = Arc::downgrade(&text);
         let protocol = source.without_cached_text();
-        assert!(Arc::ptr_eq(source.root.as_ref().unwrap(),protocol.root.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            source.root.as_ref().unwrap(),
+            protocol.root.as_ref().unwrap()
+        ));
         assert!(source.same_text(&protocol));
-        assert!(source.is_materialized());assert!(!protocol.is_materialized());
-        drop(text);drop(source);
-        assert!(weak.upgrade().is_none(),"protocol history must not own the diff's full serialization");
-        assert_eq!(protocol.line(1).unwrap().text,"second");
-        assert_eq!(protocol.text().as_ref(),"first\nsecond");
+        assert!(source.is_materialized());
+        assert!(!protocol.is_materialized());
+        drop(text);
+        drop(source);
+        assert!(
+            weak.upgrade().is_none(),
+            "protocol history must not own the diff's full serialization"
+        );
+        assert_eq!(protocol.line(1).unwrap().text, "second");
+        assert_eq!(protocol.text().as_ref(), "first\nsecond");
     }
 
     #[test]

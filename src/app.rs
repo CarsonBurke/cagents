@@ -6383,7 +6383,12 @@ impl Cagents {
         }
         self.register_channel_card(card_id);
         let mut pane = self.pull_request_pane(&view);
-        pane.runtime.set_diff_surface_visible(self.workspace_surfaces_visible() && self.card_state(card_id).is_some_and(|state| state.existence.is_open() && state.exposure == Exposure::Visible));
+        pane.runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card_id).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         self.cards
             .insert(card_id, CardRuntime::PullRequests(Box::new(pane)));
         let index = self.workspace.cards().len();
@@ -6778,7 +6783,12 @@ impl Cagents {
         if let Some(navigation) = self.durable.repository_navigation.get(&card) {
             runtime.restore_navigation(navigation);
         }
-        runtime.set_diff_surface_visible(self.workspace_surfaces_visible() && self.card_state(card).is_some_and(|state| state.existence.is_open() && state.exposure == Exposure::Visible));
+        runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -6800,7 +6810,12 @@ impl Cagents {
             return Task::none();
         }
         let mut pane = self.pull_request_pane(&view);
-        pane.runtime.set_diff_surface_visible(self.workspace_surfaces_visible() && self.card_state(card).is_some_and(|state| state.existence.is_open() && state.exposure == Exposure::Visible));
+        pane.runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         self.cards
             .insert(card, CardRuntime::PullRequests(Box::new(pane)));
         self.open_pending_pull_request(card)
@@ -8121,8 +8136,18 @@ impl Cagents {
                     let _ = runtime
                         .set_visible(transition.to == VisibilityClass::Visible && surfaces_visible);
                 }
-                Some(CardRuntime::Repository(runtime)) => tasks.push(repository_task(runtime.refresh_diff_visibility(transition.id,transition.to == VisibilityClass::Visible && surfaces_visible))),
-                Some(CardRuntime::PullRequests(pane)) => tasks.push(repository_task(pane.runtime.refresh_diff_visibility(transition.id,transition.to == VisibilityClass::Visible && surfaces_visible))),
+                Some(CardRuntime::Repository(runtime)) => {
+                    tasks.push(repository_task(runtime.refresh_diff_visibility(
+                        transition.id,
+                        transition.to == VisibilityClass::Visible && surfaces_visible,
+                    )))
+                }
+                Some(CardRuntime::PullRequests(pane)) => {
+                    tasks.push(repository_task(pane.runtime.refresh_diff_visibility(
+                        transition.id,
+                        transition.to == VisibilityClass::Visible && surfaces_visible,
+                    )))
+                }
                 #[cfg(feature = "integrated-browser")]
                 Some(CardRuntime::Browser(browser)) => {
                     let _ = browser
@@ -11129,8 +11154,18 @@ impl Cagents {
                 }
                 .map_err(|error| error.to_string()),
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
-                CardRuntime::Repository(runtime) => { tasks.push(repository_task(runtime.refresh_diff_visibility(*id,visible))); Ok(()) }
-                CardRuntime::PullRequests(pane) => { tasks.push(repository_task(pane.runtime.refresh_diff_visibility(*id,visible))); Ok(()) }
+                CardRuntime::Repository(runtime) => {
+                    tasks.push(repository_task(
+                        runtime.refresh_diff_visibility(*id, visible),
+                    ));
+                    Ok(())
+                }
+                CardRuntime::PullRequests(pane) => {
+                    tasks.push(repository_task(
+                        pane.runtime.refresh_diff_visibility(*id, visible),
+                    ));
+                    Ok(())
+                }
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
@@ -11409,7 +11444,9 @@ impl Cagents {
         self.context_inspector_overlay_active = is_overlay;
         let visibility = if was_overlay != is_overlay {
             self.set_workspace_surfaces_visible(self.workspace_surfaces_visible())
-        } else { Task::none() };
+        } else {
+            Task::none()
+        };
         let focus = match context_overlay_change(was_overlay, is_overlay) {
             ContextOverlayChange::Entered => self.enter_context_overlay(),
             ContextOverlayChange::Exited
@@ -11430,7 +11467,7 @@ impl Cagents {
             }
             ContextOverlayChange::Unchanged => Task::none(),
         };
-        Task::batch([visibility,focus])
+        Task::batch([visibility, focus])
     }
 
     fn set_context_inspector_open(&mut self, open: bool) -> Task<Message> {
@@ -13997,15 +14034,22 @@ impl Application for Cagents {
                 // Measure the actual owning update thread, including runtime
                 // edits, intent draining and synchronous navigation bookkeeping.
                 // This deliberately excludes later layout/redraw and worker CPU.
-                let editor_performance = if cfg!(debug_assertions) && tracing::enabled!(target: "cagents::editor_performance", tracing::Level::DEBUG) {
+                let editor_performance = if cfg!(debug_assertions)
+                    && tracing::enabled!(target: "cagents::editor_performance", tracing::Level::DEBUG)
+                {
                     let kind = match &action {
-                        RepositoryAction::EditorAction { action: repository_widget::EditorAction::Edit(_), .. } => Some("edit"),
+                        RepositoryAction::EditorAction {
+                            action: repository_widget::EditorAction::Edit(_),
+                            ..
+                        } => Some("edit"),
                         RepositoryAction::WorkingDiffDue { .. } => Some("pause"),
                         RepositoryAction::WorkingDiffLoaded { .. } => Some("result"),
                         _ => None,
                     };
                     kind.map(|kind| (kind, Instant::now()))
-                } else { None };
+                } else {
+                    None
+                };
                 if let RepositoryAction::DiffAnnotations {
                     identity,
                     review_revision,
@@ -24752,15 +24796,24 @@ mod tests {
     #[test]
     fn viewport_transitions_hide_and_reveal_diff_work_without_a_repository_action() {
         use crate::workspace::VisibilityTransition;
-        let (mut app,card) = editing_repository_app();
-        for (from,to,expected) in [
-            (VisibilityClass::Visible,VisibilityClass::Overscan,false),
-            (VisibilityClass::Overscan,VisibilityClass::Offscreen,false),
-            (VisibilityClass::Offscreen,VisibilityClass::Visible,true),
+        let (mut app, card) = editing_repository_app();
+        for (from, to, expected) in [
+            (VisibilityClass::Visible, VisibilityClass::Overscan, false),
+            (VisibilityClass::Overscan, VisibilityClass::Offscreen, false),
+            (VisibilityClass::Offscreen, VisibilityClass::Visible, true),
         ] {
-            drop(app.apply_viewport(ViewportUpdate { offset_changed:false,transitions:vec![VisibilityTransition { id:card,from,to }] },false,false));
-            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("repository fixture") };
-            assert_eq!(runtime.diff_surface_is_visible(),expected);
+            drop(app.apply_viewport(
+                ViewportUpdate {
+                    offset_changed: false,
+                    transitions: vec![VisibilityTransition { id: card, from, to }],
+                },
+                false,
+                false,
+            ));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("repository fixture")
+            };
+            assert_eq!(runtime.diff_surface_is_visible(), expected);
         }
     }
 

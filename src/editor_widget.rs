@@ -57,9 +57,9 @@ use std::{
 
 #[path = "editor_widget/snapshot.rs"]
 mod snapshot;
-pub use snapshot::TextSnapshot;
 #[cfg(test)]
 pub use snapshot::SnapshotMemory;
+pub use snapshot::TextSnapshot;
 
 #[cfg(test)]
 thread_local! { static TEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
