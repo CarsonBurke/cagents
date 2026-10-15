@@ -4867,6 +4867,27 @@ mod tests {
     }
 
     #[test]
+    fn discarded_parked_attention_does_not_reappear_after_close() {
+        let (runtime, handle) = frame_cost::live_runtime(&[]);
+        let card = runtime.target.card;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut state = crate::app::tests::terminal_card_state();
+        state.id = card;
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        app.chat_ui.parked.insert(card, Box::new(runtime));
+        handle.observe_activity_for_test(crate::agent::ActivityState::Waiting);
+        app.sidebar_state.set_card_activity(card, crate::agent::Activity { provider: Provider::Claude, state: crate::agent::ActivityState::Waiting });
+        // This is the ordinary close path's cleanup before chat_discard.
+        app.sidebar_state.clear_agent_activity(card);
+        app.sidebar_state.acknowledge_agent_update(card);
+        app.chat_discard(card);
+        assert_eq!(app.sidebar_state.card_activity(card), None);
+        assert!(app.sidebar_state.card_outcome(card).is_none());
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(app.sidebar_state.intervention_count(), 0);
+    }
+
+    #[test]
     fn terminal_outcome_with_unknown_activity_marks_background_pane_unread() {
         use crate::agent::{ActivityOutcome, ActivityState};
         for outcome in [

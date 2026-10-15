@@ -4698,6 +4698,10 @@ impl Cagents {
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
+        // Forgetting a still-parked runtime can observe its final scalar state.
+        // A closed pane must not retain that attention after the actor detaches.
+        self.sidebar_state.clear_agent_activity(card);
+        self.sidebar_state.acknowledge_agent_update(card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
