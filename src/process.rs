@@ -1,6 +1,7 @@
 //! Bounded synchronous process execution shared by UI services and daemon workers.
 
 mod poll;
+mod record_capture;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -55,6 +56,8 @@ pub struct CommandSpec {
     pub stdin: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
     pub stdout_limit: usize,
+    /// Opt-in NUL record capture; excess output is drained and flagged.
+    pub stdout_record_limit: Option<usize>,
     pub stderr_limit: usize,
     // Borrowed only during execute; the journal service holds the owning file.
     pub(crate) inherited_lease: Option<i32>,
@@ -71,6 +74,7 @@ impl CommandSpec {
             stdin: None,
             timeout: Some(DEFAULT_COMMAND_TIMEOUT),
             stdout_limit: DEFAULT_STDOUT_LIMIT,
+            stdout_record_limit: None,
             stderr_limit: DEFAULT_STDERR_LIMIT,
             inherited_lease: None,
         }
@@ -118,6 +122,11 @@ impl CommandSpec {
     pub fn output_limits(mut self, stdout_limit: usize, stderr_limit: usize) -> Self {
         self.stdout_limit = stdout_limit;
         self.stderr_limit = stderr_limit;
+        self
+    }
+
+    pub fn stdout_record_limit(mut self, records: usize) -> Self {
+        self.stdout_record_limit = Some(records);
         self
     }
 
@@ -273,6 +282,8 @@ pub struct ProcessOutput {
     pub signal: Option<i32>,
     pub success: bool,
     pub stdout: Vec<u8>,
+    #[serde(default)]
+    pub stdout_truncated: bool,
     pub stderr: Vec<u8>,
 }
 
@@ -282,6 +293,7 @@ impl ProcessOutput {
             exit_code: status.code(),
             signal: exit_signal(&status),
             success: status.success(),
+            stdout_truncated: false,
             stdout,
             stderr,
         }
@@ -1130,6 +1142,55 @@ sys.exit(7)
         assert!(output.success);
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.stderr, b"warning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nul_listing_cap_drains_oversized_stdout_without_killing_the_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("listing-finished");
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "head -c 20971520 /dev/zero; printf finished > \"$MARKER\""])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(10_000)
+            .timeout(Duration::from_secs(10));
+        let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+        assert!(output.success);
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stdout, vec![0; 10_000]);
+        assert_eq!(std::fs::read(marker).unwrap(), b"finished");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_listing_still_obeys_cancellation_and_stderr_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("drained");
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let observed = marker.clone();
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if observed.exists() { cancel.cancel(); return; }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("listing did not finish draining before cancellation");
+        });
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "head -c 20971520 /dev/zero; printf ready > \"$MARKER\"; sleep 10"])
+            .env("MARKER", marker.as_os_str()).stdout_record_limit(100)
+            .timeout(Duration::from_secs(5));
+        let failure = SystemProcessExecutor.execute(&command, &cancellation).unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
+        assert_eq!(failure.stdout.len(), 100);
+
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "head -c 4096 /dev/zero; head -c 4096 /dev/zero >&2"])
+            .stdout_record_limit(100).output_limits(1024, 32);
+        let failure = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::OutputLimit);
+        assert!(failure.message.contains("stderr exceeded"));
     }
 
     #[cfg(unix)]

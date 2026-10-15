@@ -3288,6 +3288,7 @@ fn discard_reports_restored_paths_when_untracked_classification_fails() {
             {
                 return match self.failure {
                     ReadFailure::Malformed => Ok(ProcessOutput {
+                        stdout_truncated: false,
                         exit_code: Some(0),
                         signal: None,
                         success: true,

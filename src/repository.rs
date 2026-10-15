@@ -18,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod status_limit;
+
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
 use crate::persistence::{PendingOperation, PendingOperationStatus, StateStore, StoreError};
@@ -639,6 +641,8 @@ pub fn pull_request_refs(
 /// nor background branch/HEAD checks need an untracked scan.
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotOptions {
+    /// UI-only cap. Safety and full-group mutation reads remain uncapped.
+    pub status_limit: Option<usize>,
     pub untracked_changes: bool,
     pub untracked_files: bool,
 }
@@ -646,6 +650,7 @@ pub struct SnapshotOptions {
 impl Default for SnapshotOptions {
     fn default() -> Self {
         Self {
+            status_limit: None,
             untracked_changes: true,
             untracked_files: true,
         }
@@ -657,12 +662,15 @@ pub struct StatusSnapshot {
     /// This read deliberately skipped untracked files; zero is not authoritative.
     #[serde(default)]
     pub untracked_omitted: bool,
+    /// The listed entries are a lower bound, never a complete safety snapshot.
+    #[serde(default)]
+    pub listing_truncated: bool,
     pub head: HeadState,
     pub tracking: TrackingState,
     pub dirty: DirtyState,
-    /// Every changed path, one entry per area. `dirty` stays derived from the
-    /// same records so existing badges keep counting exactly what they did
-    /// before this field existed.
+    /// Every listed changed path, one entry per area. `dirty` is derived from
+    /// these same records. When `listing_truncated` is set, both are lower
+    /// bounds and must not authorize a destructive or whole-group operation.
     #[serde(default)]
     pub entries: Vec<ChangedPath>,
 }
@@ -839,6 +847,9 @@ pub struct RefListing {
 /// The files one worktree offers, split by whether Git tracks them.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkingFiles {
+    /// A UI listing cap omitted paths; absence is not authoritative.
+    #[serde(default)]
+    pub listing_truncated: bool,
     /// Tracked and untracked paths together, excluding ignored ones,
     /// deduplicated and sorted: the file tree shows both.
     pub paths: Vec<RepoPath>,
@@ -1859,6 +1870,7 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
     };
     Ok(StatusSnapshot {
         untracked_omitted: false,
+        listing_truncated: false,
         head,
         tracking,
         dirty,
@@ -3425,7 +3437,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         known_files: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<WorkingFiles, RepositoryError> {
-        let output = self.run_checked(
+        self.ignored_files_with_limit(worktree, known_files, None, cancellation)
+    }
+
+    pub fn ignored_files_with_limit(
+        &self,
+        worktree: &Path,
+        known_files: &[RepoPath],
+        limit: Option<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let (output, truncated) = self.listing_output(
             &self.git_read(
                 worktree,
                 [
@@ -3437,10 +3459,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     "-z",
                 ],
             ),
+            limit,
+            status_limit::Format::Files,
             cancellation,
         )?;
         let parsed = (|| {
-            let mut files = WorkingFiles::default();
+            let mut files = WorkingFiles { listing_truncated: truncated, ..WorkingFiles::default() };
             for (record, field) in nul_fields(&output.stdout, "git ls-files --ignored")?
                 .into_iter()
                 .enumerate()
@@ -3719,6 +3743,36 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    fn listing_output(&self, command: &CommandSpec, limit: Option<usize>, format: status_limit::Format, cancellation: &CancellationToken) -> Result<(ProcessOutput, bool), RepositoryError> {
+        let command = if let Some(limit) = limit {
+            let physical_records = match format {
+                status_limit::Format::Status => limit.saturating_mul(2).saturating_add(16),
+                status_limit::Format::Numstat => limit.saturating_mul(3),
+                status_limit::Format::Files => limit,
+            };
+            command.clone().output_limits(64 * 1024 * 1024, command.stderr_limit).stdout_record_limit(physical_records)
+        } else { command.clone() };
+        let mut output = self.run_checked(&command, cancellation)?;
+        let Some(limit) = limit else { return Ok((output, false)); };
+        let (length, truncated) = match status_limit::prefix(&output.stdout, limit, output.stdout_truncated, format) {
+            Ok((prefix, truncated)) => (prefix.len(), truncated),
+            Err(error) => return Err(RepositoryError::InvalidGitOutput { error, process: output }),
+        };
+        output.stdout.truncate(length);
+        output.stdout_truncated = truncated;
+        Ok((output, truncated))
+    }
+
+    fn status_listing(&self, worktree: &Path, untracked: bool, limit: Option<usize>, cancellation: &CancellationToken) -> Result<StatusSnapshot, RepositoryError> {
+        let command = self.status_command_with_untracked(worktree, untracked);
+        let (output, truncated) = self.listing_output(&command, limit, status_limit::Format::Status, cancellation)?;
+        let parsed = parse_status(&output.stdout);
+        let mut status = invalid_output(parsed, output)?;
+        status.untracked_omitted = !untracked;
+        status.listing_truncated = truncated;
+        Ok(status)
+    }
+
     /// Everything the source-control surfaces need about one worktree.
     pub fn snapshot(
         &self,
@@ -3736,10 +3790,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         options: SnapshotOptions,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, RepositoryError> {
-        let mut status =
-            self.status_with_untracked(worktree, options.untracked_changes, cancellation)?;
+        let mut status = self.status_listing(worktree, options.untracked_changes, options.status_limit, cancellation)?;
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
-            let output = self.run_checked(&self.numstat_command(worktree, staged), cancellation)?;
+            let (output, _) = self.listing_output(&self.numstat_command(worktree, staged), options.status_limit, status_limit::Format::Numstat, cancellation)?;
             let parsed = parse_numstat(&output.stdout);
             let records = invalid_output(parsed, output)?;
             merge_numstat(&mut status.entries, area, &records);
@@ -3751,9 +3804,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         } else {
             self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
         };
-        let output = self.run_checked(&files_command, cancellation)?;
+        let (output, truncated) = self.listing_output(&files_command, options.status_limit, status_limit::Format::Files, cancellation)?;
         let parsed = parse_working_files(&output.stdout);
-        let files = invalid_output(parsed, output)?;
+        let mut files = invalid_output(parsed, output)?;
+        files.listing_truncated = truncated;
 
         let remotes = self.remotes(worktree, cancellation)?;
 
@@ -6612,8 +6666,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ui_listing_cap_preserves_a_snapshot_when_status_exceeds_sixteen_megabytes() {
+        let mut stdout = b"# branch.head main\0# branch.oid (initial)\0".to_vec();
+        let path = "x".repeat(200);
+        for index in 0..90_000 { stdout.extend_from_slice(format!("? {index}-{path}\0").as_bytes()); }
+        assert!(stdout.len() > 16 * 1024 * 1024);
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![success(&stdout)]));
+        let service = RepositoryService::new("git", executor.clone());
+        let status = service.status_listing(Path::new("/repo"), true, Some(10_000), &CancellationToken::new()).unwrap();
+        assert!(status.listing_truncated);
+        assert_eq!(status.entries.len(), 10_000);
+        let command = &executor.commands.lock().unwrap()[0];
+        assert_eq!(command.stdout_record_limit, Some(20_016));
+        assert_eq!(command.stdout_limit, 64 * 1024 * 1024);
+    }
+
     fn success(stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
         Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(0),
             signal: None,
             success: true,
@@ -6871,6 +6942,7 @@ mod tests {
                 .snapshot_with_options(
                     root,
                     SnapshotOptions {
+                        status_limit: None,
                         untracked_changes: false,
                         untracked_files: false,
                     },
@@ -7433,6 +7505,7 @@ mod tests {
 
     fn exit(code: i32, stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
         Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(code),
             signal: None,
             success: code == 0,
@@ -9651,6 +9724,7 @@ mod tests {
                     success(b""),
                     success(format!("{endpoint}\n").as_bytes()),
                     Ok(ProcessOutput {
+                        stdout_truncated: false,
                         exit_code: Some(128),
                         signal: None,
                         success: false,
@@ -10398,6 +10472,7 @@ mod tests {
             return;
         }
         let refusal = Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(128),
             signal: None,
             success: false,

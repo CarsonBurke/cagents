@@ -2729,6 +2729,7 @@ pub enum SettingsField {
     TerminalCursorStyle,
     TerminalTheme,
     MaxHotCards,
+    GitStatusLimit,
     HibernationDelayMs,
     TerminalFontSize,
     TerminalFontFamily,
@@ -2863,6 +2864,7 @@ impl SettingsField {
             Self::TerminalCursorStyle => "Cursor shape",
             Self::TerminalTheme => "Color theme",
             Self::MaxHotCards => "Maximum hot panes",
+            Self::GitStatusLimit => "Changes shown",
             Self::HibernationDelayMs => "Hibernation delay (ms)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
@@ -2958,6 +2960,7 @@ impl SettingsField {
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
+            | Self::GitStatusLimit
             | Self::HibernationDelayMs
             | Self::ManagedWorktreeDirectory
             | Self::WorktreeSort
@@ -3136,6 +3139,7 @@ struct SettingsDraft {
     terminal_theme: String,
     has_custom_terminal_theme: bool,
     max_hot_cards: String,
+    git_status_limit: String,
     hibernation_delay_ms: String,
     terminal_font_size: String,
     terminal_font_family: String,
@@ -3190,6 +3194,7 @@ impl SettingsDraft {
             terminal_theme: settings.terminal_theme.id().into(),
             has_custom_terminal_theme: settings.custom_terminal_theme.is_some(),
             max_hot_cards: settings.max_hot_cards.to_string(),
+            git_status_limit: settings.git_status_limit.to_string(),
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
             terminal_font_family: settings.terminal_font_family.clone(),
@@ -3245,6 +3250,7 @@ impl SettingsDraft {
             SettingsField::TerminalTheme => self.terminal_theme = value,
             SettingsField::TerminalCursorStyle => self.terminal_cursor_style = value,
             SettingsField::MaxHotCards => self.max_hot_cards = value,
+            SettingsField::GitStatusLimit => self.git_status_limit = value,
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
             SettingsField::TerminalFontFamily => self.terminal_font_family = value,
@@ -3654,6 +3660,10 @@ fn settings_update(
             .parse::<f32>()
             .map(|value| next.terminal_scroll_speed = value)
             .map_err(|_| "Scroll speed must be a number.".to_owned()),
+        SettingsField::GitStatusLimit => value.parse::<usize>().ok()
+            .filter(|value| (1..=100_000).contains(value))
+            .ok_or_else(|| "Changes shown must be a whole number from 1 to 100000.".to_owned())
+            .map(|value| next.git_status_limit = value),
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
@@ -3959,6 +3969,13 @@ pub enum Message {
         key: ActiveWorktreeKey,
         request: u64,
         result: Result<Box<RepositorySnapshot>, String>,
+    },
+    SourceControlGroupSelection {
+        key: ActiveWorktreeKey,
+        generation: u64,
+        area: crate::repository::ChangeArea,
+        command: sidebar::ChangeGroupCommand,
+        result: Result<Vec<crate::repository::PathSelection>, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -10943,6 +10960,7 @@ impl Cagents {
         let worktree = key.canonical_path.clone();
         let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
         let options = crate::repository::SnapshotOptions {
+            status_limit: Some(self.settings.git_status_limit),
             untracked_changes,
             untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
         };
@@ -10967,8 +10985,9 @@ impl Cagents {
                     .map_err(|error| error.to_string())?;
                 if browse_files {
                     let ignored = service
-                        .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
+                        .ignored_files_with_limit(&worktree, &snapshot.files.paths, options.status_limit, &cancellation)
                         .map_err(|error| error.to_string())?;
+                    snapshot.files.listing_truncated |= ignored.listing_truncated;
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
                     repository_widget::expand_ignored_directories(
@@ -12512,6 +12531,11 @@ impl Cagents {
             }
         }
         let mut tasks = Vec::new();
+        if previous.git_status_limit != self.settings.git_status_limit
+            && let Some(key) = self.sidebar_state.active_worktree().cloned()
+        {
+            tasks.push(self.reload_source_control(&key));
+        }
         if previous.editor_font_family() != self.settings.editor_font_family()
             || previous.editor_font_size() != self.settings.editor_font_size()
         {
@@ -14087,7 +14111,8 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
-                if matches!(&action, SidebarAction::FilesPage { key, .. }
+                if matches!(&action, SidebarAction::ChangeViewport { key, .. }
+                    | SidebarAction::FilesPage { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. }
                     | SidebarAction::ToggleFilesFilter { key }
                     | SidebarAction::CommitMessageChanged { key, .. }
@@ -14099,17 +14124,23 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
-                let action = if matches!(action, SidebarAction::ChangeGroup { .. }) {
-                    let Some(source) = &self.sidebar_model.source_control else {
-                        return Task::none();
-                    };
-                    let Some(resolved) = sidebar::resolve_group_command(source, &action) else {
-                        return Task::none();
-                    };
-                    resolved
-                } else {
-                    action
-                };
+                if let SidebarAction::ChangeGroup { key, area, command } = &action {
+                    if !self.source_control_is_bound(key) { return Task::none(); }
+                    let key = key.clone();
+                    let area = *area;
+                    let command = *command;
+                    let generation = self.sidebar_state.begin_group_selection();
+                    return cosmic::task::future(async move {
+                        let worktree = key.canonical_path.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            RepositoryService::system("git").status(&worktree, &CancellationToken::default())
+                                .map(|status| status.area(area).map(crate::repository::PathSelection::from_changed_path).collect())
+                                .map_err(|error| error.to_string())
+                        }).await.map_err(|error| format!("group selection reader failed: {error}"))
+                            .and_then(|result| result);
+                        Message::SourceControlGroupSelection { key, generation, area, command, result }
+                    });
+                }
                 // Entering a worktree that is being deleted is refused, and
                 // for the same reason before the selection would claim it.
                 if self
@@ -14409,7 +14440,7 @@ impl Application for Cagents {
                     | SidebarAction::SetChangesTab { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::SetChangeListMode { .. }
-                    | SidebarAction::ChangePage { .. }
+                    | SidebarAction::ChangeViewport { .. }
                     | SidebarAction::ChangeGroup { .. }
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
@@ -16294,6 +16325,21 @@ impl Application for Cagents {
                     Err(error) => SourceControlModel::failed(key, error),
                 });
                 Task::none()
+            }
+            Message::SourceControlGroupSelection { key, generation, area, command, result } => {
+                if !self.source_control_is_bound(&key) || !self.sidebar_state.finish_group_selection(generation) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(selection) => sidebar::resolve_group_selection(&key, area, command, selection)
+                        .map_or_else(Task::none, |action| cosmic::task::message(Message::Sidebar(action))),
+                    Err(error) => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                            source.set_error(Some(format!("Could not read all paths for this action: {error}")));
+                        }
+                        Task::none()
+                    }
+                }
             }
             Message::SourceControlLoaded {
                 key,

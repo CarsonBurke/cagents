@@ -667,6 +667,8 @@ const fn default_show_status_bar() -> bool {
     true
 }
 
+const fn default_git_status_limit() -> usize { 10_000 }
+
 const fn default_show_worktree_changes_icons() -> bool {
     true
 }
@@ -835,6 +837,9 @@ pub struct AppSettings {
     pub auto_delete_merged_worktrees: bool,
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
+    /// Maximum changed paths mounted in a source-control snapshot. Safety reads remain complete.
+    #[serde(default = "default_git_status_limit")]
+    pub git_status_limit: usize,
     #[serde(default)]
     pub default_worktree_pane: DefaultPane,
     #[serde(default)]
@@ -950,6 +955,7 @@ impl Default for AppSettings {
             managed_worktree_directory: default_managed_worktree_directory(),
             auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
+            git_status_limit: default_git_status_limit(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -1584,6 +1590,7 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        self.git_status_limit = self.git_status_limit.clamp(1, 100_000);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -2807,6 +2814,17 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn git_status_limit_defaults_and_clamps_to_bounded_range() {
+        assert_eq!(AppSettings::default().git_status_limit, 10_000);
+        let mut settings = AppSettings::default();
+        settings.git_status_limit = 0;
+        assert_eq!(settings.validate().unwrap().git_status_limit, 1);
+        let mut settings = AppSettings::default();
+        settings.git_status_limit = usize::MAX;
+        assert_eq!(settings.validate().unwrap().git_status_limit, 100_000);
+    }
+
     #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
