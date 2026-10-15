@@ -18,6 +18,27 @@ pub fn provider_key(provider: Provider) -> &'static str {
     match provider { Provider::Claude => "claude", Provider::Codex => "codex", Provider::Omp => "omp" }
 }
 
+/// Saved provider launch preferences, including unavailable pins that must
+/// remain visible and must never silently fall back to another executable.
+pub fn provider_settings(provider: Provider) -> Result<AgentLaunchSettings, String> {
+    let path = super::default_path().map_err(|error| error.to_string())?;
+    let settings = super::load(path).map_err(|error| error.to_string())?;
+    Ok(settings.agents.get(provider_key(provider)).cloned().unwrap_or_default())
+}
+
+/// Account discovery and authentication use the same pinned CLI as launches.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn provider_executable(provider: Provider, search_path: Option<&std::ffi::OsStr>) -> Result<std::path::PathBuf, String> {
+    let configuration = provider_settings(provider)?;
+    if let Some(executable) = configuration.executable {
+        if !executable_available(&executable) {
+            return Err(format!("{} executable must be an absolute path to an executable file.", provider.label()));
+        }
+        return Ok(executable.into());
+    }
+    crate::account::probe::find_executable(provider.executable(), search_path).ok_or_else(|| format!("{} is not installed", provider.label()))
+}
+
 pub fn permission_modes(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &["manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"],
@@ -263,16 +284,20 @@ mod tests {
         let shell = root.join("configured-shell");
         std::fs::write(&shell, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let settings = super::super::AppSettings { default_shell: Some(shell.to_string_lossy().into_owned()), ..Default::default() };
+        let settings = super::super::AppSettings { default_shell: Some(shell.to_string_lossy().into_owned()), agents: BTreeMap::from([("claude".into(), AgentLaunchSettings { executable: Some(shell.to_string_lossy().into_owned()), ..Default::default() })]), ..Default::default() };
         super::super::save(super::super::default_path().unwrap(), &settings).unwrap();
         let ui = LaunchRecipe::shell(root.clone()).unwrap();
         let cli = crate::control::terminal_spawn_recipe(root.clone(), vec![]).unwrap();
         assert_eq!(ui.program, shell.to_string_lossy());
         assert_eq!(cli.program, ui.program);
+        #[cfg(any(feature = "ui", feature = "host"))]
+        assert_eq!(provider_executable(Provider::Claude, Some(std::ffi::OsStr::new("/missing/provider/bin"))).unwrap(), shell);
         let explicit = crate::control::terminal_spawn_recipe(root.clone(), vec!["/bin/echo".into(), "explicit".into()]).unwrap();
         assert_eq!(explicit.program, "/bin/echo");
         assert_eq!(explicit.arguments, ["explicit"]);
         std::fs::remove_file(&shell).unwrap();
+        #[cfg(any(feature = "ui", feature = "host"))]
+        assert!(provider_executable(Provider::Claude, Some(std::ffi::OsStr::new("/usr/bin:/bin"))).is_err());
         assert_eq!(crate::model::login_shell(), Err(crate::model::LoginShellError::ConfiguredUnavailable));
         assert!(crate::control::terminal_spawn_recipe(root, vec![]).is_err(), "a missing pinned shell cannot silently switch to the login shell");
     }
