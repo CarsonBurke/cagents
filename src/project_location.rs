@@ -131,6 +131,28 @@ fn discover_checkout(directory: &Path) -> Result<Option<PathBuf>, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Read only a small regular locator. Opening a FIFO/device must not stall
+/// checkout inspection before the caller can observe cancellation. This bounds
+/// special-file waits and allocation; ordinary filesystem I/O can still stall.
+fn read_git_locator(path: &Path) -> io::Result<Vec<u8>> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    const LIMIT: u64 = 64 * 1024;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > LIMIT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Git locator is not a bounded regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Git locator exceeds its size limit"));
+    }
+    Ok(bytes)
+}
+
 /// Filesystem identity for a verified checkout marker, including linked and
 /// separate Git directories. No Git subprocess is needed during navigation.
 pub(crate) fn checkout_identity(directory: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -144,11 +166,11 @@ pub(crate) fn checkout_identity(directory: &Path) -> Option<(PathBuf, PathBuf)> 
     let admin = if marker.is_dir() {
         fs::canonicalize(marker).ok()?
     } else {
-        let content = fs::read(marker).ok()?;
+        let content = read_git_locator(&marker).ok()?;
         let path = reference(content.strip_prefix(b"gitdir: ")?);
         fs::canonicalize(directory.join(path)).ok()?
     };
-    let common = match fs::read(admin.join("commondir")) {
+    let common = match read_git_locator(&admin.join("commondir")) {
         Ok(content) => fs::canonicalize(admin.join(reference(&content))).ok()?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => admin.clone(),
         Err(_) => return None,
@@ -289,6 +311,74 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkout_identity_rejects_special_and_oversized_locators() {
+        const CHILD: &str = "CAGENTS_TEST_CHECKOUT_LOCATOR_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            let marker = root.join(".git");
+            let fifo = CString::new(marker.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            assert_eq!(checkout_identity(root), None);
+            fs::remove_file(&marker).unwrap();
+            let admin = root.join("admin");
+            fs::create_dir(&admin).unwrap();
+            fs::write(&marker, b"gitdir: admin\n").unwrap();
+            let common = admin.join("commondir");
+            let fifo = CString::new(common.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            assert_eq!(checkout_identity(root), None);
+            fs::remove_file(&common).unwrap();
+            fs::write(&common, vec![b'a'; 64 * 1024 + 1]).unwrap();
+            assert_eq!(checkout_identity(root), None);
+            fs::remove_file(&common).unwrap();
+            fs::write(&marker, vec![b'a'; 64 * 1024 + 1]).unwrap();
+            assert_eq!(checkout_identity(root), None);
+            return;
+        }
+        // The parent remains bounded if a regression blocks on an unwritten
+        // FIFO. This child creates no subprocesses and is always reaped.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "project_location::tests::checkout_identity_rejects_special_and_oversized_locators", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if child.try_wait().unwrap().is_some() { break; }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("checkout locator inspection stalled: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
+
+    #[test]
+    fn checkout_identity_preserves_byte_paths_and_primary_linked_roles() {
+        use std::os::unix::ffi::OsStrExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let canonical = fixture.path().canonicalize().unwrap();
+        let root = canonical.as_path();
+        let admin = root.join(std::ffi::OsStr::from_bytes(b"admin-\xff"));
+        let common = root.join(std::ffi::OsStr::from_bytes(b"common-\xfe"));
+        fs::create_dir(&admin).unwrap();
+        fs::create_dir(&common).unwrap();
+        fs::write(root.join(".git"), b"gitdir: admin-\xff\n").unwrap();
+        assert_eq!(checkout_identity(root), Some((admin.clone(), admin.clone())));
+        fs::write(admin.join("commondir"), b"../common-\xfe\n").unwrap();
+        assert_eq!(checkout_identity(root), Some((admin, common)));
+        fs::remove_file(root.join(".git")).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        let ordinary = root.join(".git");
+        assert_eq!(checkout_identity(root), Some((ordinary.clone(), ordinary)));
+    }
 
     #[test]
     fn discovery_ignores_inherited_git_redirection() {
