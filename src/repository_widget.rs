@@ -15532,23 +15532,26 @@ mod tests {
             DiffBasis::IndexToWorktree,
             DiffState::ready(staged_text_diff(model)),
         );
+        let row_height = runtime.diff_typography().line_height;
         runtime.diff_viewport = ListViewport {
-            offset: 105.0,
+            offset: 3.5 * row_height,
             height: 120.0,
         };
         runtime.diff_horizontal = 44.0;
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
-        assert_eq!(runtime.diff_viewport.offset, 270.0);
+        // Preserve the midpoint of row 3: its own annotation contributes
+        // half its height, while the leading block and row 1 precede it.
+        assert_eq!(runtime.diff_viewport.offset, 60.0 + 90.0 + 3.5 * row_height + 15.0);
         assert_eq!(runtime.diff_horizontal, 44.0);
         let unchanged = runtime.diff_viewport.offset;
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
         assert_eq!(runtime.diff_viewport.offset, unchanged);
         drop(runtime.update(RepositoryAction::NextChange { card }));
-        assert_eq!(runtime.diff_viewport.offset, 390.0);
+        assert_eq!(runtime.diff_viewport.offset, 60.0 + 90.0 + 30.0 + 7.0 * row_height);
         drop(runtime.update(RepositoryAction::PreviousChange { card }));
-        assert_eq!(runtime.diff_viewport.offset, 210.0);
+        assert_eq!(runtime.diff_viewport.offset, 60.0 + 90.0 + 2.0 * row_height);
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 0.0, &[]));
-        assert_eq!(runtime.diff_viewport.offset, 60.0);
+        assert_eq!(runtime.diff_viewport.offset, 2.0 * row_height);
     }
 
     #[test]

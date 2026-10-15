@@ -27080,8 +27080,7 @@ mod tests {
 
     #[test]
     fn diff_working_location_keeps_focus_and_card_count_during_an_active_save() {
-        let (mut app, _) = pull_request_test_app(&[]);
-        let saving = app.workspace.focused().unwrap();
+        let (mut app, saving) = editing_repository_app();
         let (origin, task) = app.add_pull_requests_card(PathBuf::from("/repo"));
         drop(task);
         let (runtime, identity) =
