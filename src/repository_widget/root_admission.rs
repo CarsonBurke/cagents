@@ -176,6 +176,14 @@ mod tests {
         }
     }
 
+    async fn receipt(task: Task<RepositoryAction>) -> RepositoryAction {
+        let mut stream = iced::runtime::task::into_stream(task).expect("actual file worker task");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(action) = action { return action; }
+        }
+        panic!("file worker must return its owned receipt");
+    }
+
     #[tokio::test]
     async fn unconfigured_runtime_refuses_editable_but_preserves_binary_viewing() {
         let directory = tempfile::tempdir().unwrap();
@@ -235,10 +243,7 @@ mod tests {
         let (mut old, _) = RepositoryRuntime::selection_fixture(card, "binary.bin");
         old.descriptor.worktree = directory.path().to_path_buf();
         let task = old.open_file(card, "binary.bin".into());
-        let mut stream = iced::runtime::task::into_stream(task).unwrap();
-        let receipt = loop {
-            if let Some(iced::runtime::Action::Output(action)) = stream.next().await { break action; }
-        };
+        let receipt = receipt(task).await;
         let RepositoryAction::EditorFilePrepared { identity: old_identity, .. } = &receipt else { panic!("actual phase-one file receipt"); };
         let (mut replacement, _) = RepositoryRuntime::selection_fixture(card, "binary.bin");
         replacement.descriptor.worktree = directory.path().to_path_buf();
@@ -250,5 +255,99 @@ mod tests {
         assert!(matches!(replacement.document, DocumentState::Loading));
         finish(&mut replacement, current).await;
         assert!(matches!(replacement.document, DocumentState::ReadOnly { reason: ReadOnlyReason::BinaryPreview(_), .. }));
+    }
+
+    // This peer exercises actual client framing and original descriptor
+    // transfer. Its replies are SCRIPTED, not daemon Registry19 acceptance.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn framed_original_pair_is_installed_before_enrollment_and_reused_by_undo() {
+        use crate::edited_root_admission::{AdmissionPhase, EditedRootAdmissions, test_peer::{Event, ScriptedEditedRootPeer}};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("source.txt"), "original").unwrap();
+        std::fs::write(directory.path().join("other.txt"), "second").unwrap();
+        let original = crate::editor::worktree_root(directory.path()).unwrap();
+        let peer = ScriptedEditedRootPeer::start(&original);
+        let ledger = Arc::new(std::sync::Mutex::new(EditedRootAdmissions::default()));
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "source.txt");
+        runtime.descriptor.worktree = directory.path().to_path_buf();
+        runtime.set_recovery_endpoint(peer.endpoint());
+        runtime.set_edited_root_admissions(ledger.clone());
+        let task = runtime.open_file(card, "source.txt".into());
+        assert_eq!(ledger.lock().unwrap().len(), 1, "window owns the ticket before the lazy phase-one task");
+        let prepared = receipt(task).await;
+        assert!(matches!(prepared, RepositoryAction::EditorFilePrepared { .. }));
+        assert!(peer.events().is_empty(), "phase one performed no negative registration");
+        let ticket = ledger.lock().unwrap().tickets().next().unwrap().clone();
+        assert_eq!(ticket.phase(), AdmissionPhase::Prepared);
+        let task = runtime.update(prepared);
+        assert!(ticket.has_worker(), "phase two is fenced before returning a lazy task");
+        assert!(peer.events().is_empty());
+        finish(&mut runtime, task).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some("original"));
+        let task = runtime.open_file(card, "other.txt".into());
+        finish(&mut runtime, task).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some("second"));
+        assert_eq!(peer.events().iter().filter(|event| **event == Event::Prepared).count(), 1, "same original checkout reuses its real lease");
+        let roots = runtime.retained_editor_root_admissions();
+        assert!(!roots.is_empty());
+        let pair = roots[0].retained_admission().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign = Arc::new(crate::editor::worktree_root(foreign.path()).unwrap());
+        assert!(crate::editor::FileRootIdentity::admitted(foreign, pair.clone(), Instant::now() + Duration::from_secs(2)).is_err(), "an actual successful pair cannot authorize a different original root");
+        drop(roots);
+        drop(runtime);
+        ledger.lock().unwrap().request_unowned_retirements();
+        assert!(ledger.lock().unwrap().next_retirement().unwrap().is_none(), "actual queued/Undo owner still retains the raw lease");
+        drop(pair);
+        ledger.lock().unwrap().request_unowned_retirements();
+        let retirement = ledger.lock().unwrap().next_retirement().unwrap().expect("last actual holder drained");
+        retirement.run(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert_eq!(ticket.phase(), AdmissionPhase::Settled);
+        drop(ticket);
+        drop(ledger);
+        let events = peer.finish();
+        assert_eq!(events.iter().filter(|event| **event == Event::Released).count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn held_actual_enrollment_receipt_cannot_publish_in_replacement_runtime() {
+        use crate::edited_root_admission::{EditedRootAdmissions, test_peer::{Event, ScriptedEditedRootPeer}};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("source.txt"), "original").unwrap();
+        let original = crate::editor::worktree_root(directory.path()).unwrap();
+        let peer = ScriptedEditedRootPeer::start(&original);
+        let ledger = Arc::new(std::sync::Mutex::new(EditedRootAdmissions::default()));
+        let card = CardId::new();
+        let (mut old, _) = RepositoryRuntime::selection_fixture(card, "source.txt");
+        old.descriptor.worktree = directory.path().to_path_buf();
+        old.set_recovery_endpoint(peer.endpoint());
+        old.set_edited_root_admissions(ledger.clone());
+        let task = old.open_file(card, "source.txt".into());
+        let prepared = receipt(task).await;
+        let task = old.update(prepared);
+        let admitted = receipt(task).await;
+        let RepositoryAction::EditorFileAdmitted { identity, .. } = &admitted else { panic!("actual successful enrollment worker receipt"); };
+        assert!(peer.events().contains(&Event::Activated));
+        drop(old);
+        // A new Runtime reuses the numeric path/generation, while its actual
+        // worker reads a different current content classification.
+        std::fs::write(directory.path().join("source.txt"), [0, 255, 1]).unwrap();
+        let (mut replacement, _) = RepositoryRuntime::selection_fixture(card, "source.txt");
+        replacement.descriptor.worktree = directory.path().to_path_buf();
+        let current = replacement.open_file(card, "source.txt".into());
+        assert!(replacement.accepts_selected(identity));
+        drop(replacement.update(admitted));
+        assert!(matches!(replacement.document, DocumentState::Loading));
+        finish(&mut replacement, current).await;
+        assert!(matches!(replacement.document, DocumentState::ReadOnly { reason: ReadOnlyReason::BinaryPreview(_), .. }));
+        drop(replacement);
+        ledger.lock().unwrap().request_unowned_retirements();
+        let retirement = ledger.lock().unwrap().next_retirement().unwrap().expect("late completion dropped only its passive original pair");
+        retirement.run(Instant::now() + Duration::from_secs(2)).unwrap();
+        drop(ledger);
+        assert!(peer.finish().contains(&Event::Released));
     }
 }
