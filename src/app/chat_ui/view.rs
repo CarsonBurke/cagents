@@ -1,5 +1,6 @@
 use super::coordination::Coordinated;
 use super::*;
+use crate::workspace_widget::GlobalShortcut as RegisteredAction;
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
@@ -1075,6 +1076,24 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
+        } else if let Some(outcome) = snapshot
+            .outcome
+            .as_ref()
+            .filter(|outcome| outcome.reason().is_some())
+        {
+            (Some(Icon::Warning), outcome.label())
+        } else if matches!(
+            &snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Cancelled)
+        ) && (!snapshot.is_working() || snapshot.exited)
+        {
+            (Some(Icon::Cancel), "Cancelled")
+        } else if matches!(
+            &snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Succeeded)
+        ) && (!snapshot.is_working() || snapshot.exited)
+        {
+            (Some(Icon::Check), "Finished")
         } else if self.disconnected {
             (Some(Icon::Warning), "Disconnected")
         } else if snapshot.exited && self.session.owns_codex_listener() {
@@ -1101,6 +1120,10 @@ impl Runtime {
                     snapshot.detail.as_str()
                 },
             )
+        } else if let Some(crate::agent::ActivityOutcome::Cancelled) = &snapshot.outcome {
+            (Some(Icon::Cancel), "Cancelled")
+        } else if let Some(crate::agent::ActivityOutcome::Failed { .. }) = &snapshot.outcome {
+            (Some(Icon::Warning), "Failed")
         } else if snapshot.finished_at.is_some() {
             match snapshot.detail.as_str() {
                 "Turn interrupted" => (Some(Icon::Cancel), "Interrupted"),
@@ -1133,11 +1156,7 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
-        let available = !transitioning
-            && !self.disconnected
-            && !self.snapshot.exited
-            && self.pending.is_none()
-            && self.queued.is_none();
+        let available = self.command_controls_available(transitioning);
         let snapshot = &self.snapshot;
         // One theme lookup and one settings value per frame, rather than one
         // per rendered message.
@@ -1321,7 +1340,8 @@ impl Runtime {
                 }
             }
             if !snapshot.has_later
-                && snapshot.activity() == crate::agent::ActivityState::Idle
+                && (snapshot.activity() == crate::agent::ActivityState::Idle
+                    || (snapshot.outcome.is_some() && snapshot.exited))
                 && snapshot.queued_messages.is_empty()
                 && self.queued.is_none()
                 && self.followups.is_empty()
@@ -1464,7 +1484,15 @@ impl Runtime {
             content.push(
                 widget::button::custom(design::caption("↓ New activity"))
                     .class(crate::ui_controls::control_style(true, None))
-                    .on_press_maybe((!self.disconnected).then(|| action(Action::Latest(target))))
+                    .on_press_maybe(
+                        self.registered_chat_request(
+                            RegisteredAction::ChatLatest,
+                            transitioning,
+                            false,
+                        )
+                        .and_then(|request| request.action())
+                        .map(action),
+                    )
                     .into(),
             );
         }
@@ -1793,10 +1821,7 @@ impl Runtime {
             .height(Length::Fill)
             .into(),
         ];
-        let has_text = self
-            .composer
-            .lines()
-            .any(|line| !line.text.trim().is_empty());
+        let has_text = self.composer_has_text();
         let has_draft = has_text || !self.attachments.is_empty();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
@@ -1909,10 +1934,8 @@ impl Runtime {
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
-                    if press.modifiers.command()
-                        && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
-                    {
-                        return Some(text_editor::Binding::Custom(action(Action::Latest(target))));
+                    if !matches!(press.status, text_editor::Status::Focused { .. }) {
+                        return None;
                     }
                     if !press.modifiers.shift()
                         && !press.modifiers.control()
@@ -2000,7 +2023,6 @@ impl Runtime {
         }
         if !snapshot.capabilities.interrupt_modes.is_empty() {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
-            let next = if mode == "wait" { "immediate" } else { "wait" };
             actions.push(
                 crate::ui_controls::icon_button(
                     Icon::Jump,
@@ -2010,12 +2032,15 @@ impl Runtime {
                         "Steering: after tools"
                     },
                 )
-                .on_press_maybe(available.then(|| {
-                    action(Action::Command(
-                        target,
-                        Command::SetInterruptMode { mode: next.into() },
-                    ))
-                }))
+                .on_press_maybe(
+                    self.registered_chat_request(
+                        RegisteredAction::ChatToggleSteering,
+                        transitioning,
+                        false,
+                    )
+                    .and_then(|request| request.action())
+                    .map(action),
+                )
                 .into(),
             );
         }
@@ -2023,7 +2048,8 @@ impl Runtime {
             actions.push(icon(
                 Icon::Attachment,
                 "Attach files",
-                available && !self.attachment_chooser_pending,
+                self.registered_chat_request(RegisteredAction::ChatAttach, transitioning, false)
+                    .is_some(),
                 Action::Attach(target),
             ));
         }
@@ -2081,7 +2107,17 @@ impl Runtime {
                         design::muted_icon_color
                     }))
                     .on_press_maybe(
-                        (available && has_draft).then(|| action(Action::Submit(target, *mode))),
+                        self.registered_chat_request(
+                            match mode {
+                                PromptMode::Send => RegisteredAction::ChatSend,
+                                PromptMode::Steer => RegisteredAction::ChatSteer,
+                                PromptMode::Queue => RegisteredAction::ChatQueue,
+                            },
+                            transitioning,
+                            has_draft,
+                        )
+                        .and_then(|request| request.action())
+                        .map(action),
                     )
                     .into(),
             );
@@ -2153,7 +2189,8 @@ impl Runtime {
         );
         let usage = &snapshot.usage;
         // Prefer a wider chat over hiding its status and settings behind a
-        // scrollbar. The footer wraps only when the pane itself is too narrow.
+        // scrollbar. Narrow panes keep the primary status on one line and move
+        // secondary details into the overflow control.
         // The line always says what the conversation is doing, idle
         // included: a reader glancing at a card should never have to infer
         // its state from the absence of a word. The order is the order of
@@ -2191,6 +2228,7 @@ impl Runtime {
                 .into(),
             );
         }
+        let primary_status_count = status.len();
         if let Some(channel) = &place.channel {
             status.push(
                 crate::interaction::tooltip(
@@ -2271,17 +2309,28 @@ impl Runtime {
             let (label, tooltip) = cost_estimate_label(estimate);
             spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
         }
+        let compact_footer = content_width < 600.0;
+        let mut secondary = if compact_footer {
+            status.split_off(primary_status_count)
+        } else {
+            Vec::new()
+        };
         let mut footer = status;
         if let Some(notice) = permissions::notice(snapshot) {
             footer.push(
                 widget::button::custom(
-                    widget::row::with_children(vec![
-                        crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                        design::caption(notice)
-                            .class(cosmic::theme::Text::Custom(design::warning_text))
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .into(),
-                    ])
+                    widget::row::with_children(
+                        std::iter::once(crate::ui_controls::passive_icon(
+                            Icon::Warning,
+                            design::COMPACT_ICON_SIZE,
+                        ))
+                        .chain((!compact_footer).then(|| {
+                            design::caption(notice)
+                                .class(cosmic::theme::Text::Custom(design::warning_text))
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .into()
+                        })),
+                    )
                     .spacing(step::GAP_XS)
                     .align_y(Alignment::Center),
                 )
@@ -2298,16 +2347,53 @@ impl Runtime {
                 .into(),
             );
         }
-        footer.push(
-            widget::row::with_children(spend)
+        let spend = widget::row::with_children(spend)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .into();
+        if compact_footer {
+            // Model/reasoning/account popovers are anchored inside this
+            // overflow. Keyboard shortcuts can open them while More is closed.
+            let details_open = self.footer_picker
+                || self.model_picker.is_some()
+                || self.reasoning_picker
+                || self.account_picker;
+            secondary.push(spend);
+            footer.push(widget::Space::new().width(Length::Fill).into());
+            footer.push(crate::ui_controls::popover(
+                crate::ui_controls::icon_button(Icon::More, "Conversation details and settings")
+                    .id(card_control_id(target.card, "chat-footer-details"))
+                    .on_press(action(Action::FooterPicker(target, !details_open))),
+                details_open.then(|| {
+                    widget::container(
+                        widget::flex_row(secondary)
+                            .spacing(step::GAP_S as u16)
+                            .align_items(Alignment::Center),
+                    )
+                    .padding(space::S)
+                    .width((content_width - 32.0).max(200.0))
+                    .into()
+                }),
+                widget::popover::Position::Top,
+                action(Action::FooterPicker(target, false)),
+            ));
+        } else {
+            footer.push(spend);
+        }
+        let footer_row: Element<'_, Message> = if compact_footer {
+            widget::row::with_children(footer)
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
-                .into(),
-        );
-        let footer = crate::ui_controls::popover(
+                .width(Length::Fill)
+                .into()
+        } else {
             widget::flex_row(footer)
                 .spacing(step::GAP_S as u16)
-                .align_items(Alignment::Center),
+                .align_items(Alignment::Center)
+                .into()
+        };
+        let footer = crate::ui_controls::popover(
+            footer_row,
             self.permission_picker
                 .then(|| self.permissions_view(available, content_width - 32.0)),
             widget::popover::Position::Top,
@@ -2329,6 +2415,7 @@ impl Runtime {
             .width(Length::Fill)
             .into(),
             widget::container(footer)
+                .id(card_control_id(target.card, "chat-footer"))
                 .padding(
                     iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
                 )
@@ -2527,7 +2614,13 @@ impl Runtime {
                             )
                             .width(Length::Fill)
                             .on_press_maybe(
-                                enabled.then(|| action(Action::Command(target, Command::Compact))),
+                                self.registered_chat_request(
+                                    RegisteredAction::ChatCompact,
+                                    !available,
+                                    false,
+                                )
+                                .and_then(|request| request.action())
+                                .map(action),
                             )
                             .into(),
                     );
@@ -2573,14 +2666,24 @@ impl Runtime {
             controls.push(self.account_picker(accounts, transitioning, shortcuts));
         }
         let draft = self.is_draft();
-        if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
+        let selected_model = snapshot.selected_model.as_ref().or_else(|| {
+            if draft {
+                None
+            } else {
+                self.recorded_model.as_ref()
+            }
+        });
+        if (snapshot.capabilities.model_selection && !snapshot.models.is_empty())
+            || draft
+            || selected_model.is_some()
+        {
             let label: Cow<'a, str> = match snapshot
                 .models
                 .iter()
-                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref())
+                .find(|model| Some(&model.id) == selected_model)
             {
                 Some(model) => model.label.as_str().into(),
-                None => match &snapshot.selected_model {
+                None => match selected_model {
                     // A model the provider no longer lists is still the one
                     // chosen, so it is named rather than hidden.
                     Some(id) => id.as_str().into(),
@@ -2592,7 +2695,10 @@ impl Runtime {
                     None => "Model".into(),
                 },
             };
-            if transitioning {
+            if transitioning
+                || (!draft
+                    && (!snapshot.capabilities.model_selection || snapshot.models.is_empty()))
+            {
                 controls.push(design::caption(label).into());
             } else {
                 controls.push(self.model_picker(label, offers, shortcuts));
@@ -2602,7 +2708,7 @@ impl Runtime {
             && let Some(model) = snapshot
                 .models
                 .iter()
-                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref())
+                .find(|model| Some(&model.id) == selected_model)
             && !model.reasoning.is_empty()
         {
             let selected = model
@@ -2622,6 +2728,7 @@ impl Runtime {
                     selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
                 ))
                 .name("Choose reasoning effort")
+                .id(card_control_id(target.card, "chat-reasoning-picker"))
                 .class(crate::ui_controls::control_style(open, None))
                 .padding(CONTROL_PADDING)
                 .on_press(action(Action::ReasoningPicker(target, !open)));
@@ -2633,6 +2740,11 @@ impl Runtime {
                             .enumerate()
                             .map(|(index, reasoning)| {
                                 widget::button::custom(design::body(reasoning.as_str()))
+                                    .name(reasoning.as_str())
+                                    .id(card_control_id(
+                                        target.card,
+                                        &format!("chat-reasoning-choice-{index}"),
+                                    ))
                                     .class(crate::ui_controls::control_style(
                                         Some(index) == selected,
                                         None,
@@ -2892,6 +3004,7 @@ impl Runtime {
             .align_y(Alignment::Center),
         )
         .name("Choose a model")
+        .id(card_control_id(target.card, "chat-model-picker"))
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::ModelPicker(target, !open)));
@@ -2942,28 +3055,17 @@ impl Runtime {
         let Some(mode) = &self.snapshot.fast_mode else {
             return Some(models);
         };
-        let available = !self.disconnected
-            && !self.snapshot.exited
-            && self.pending.is_none()
-            && self.queued.is_none()
-            && self.snapshot.ready
-            && self.snapshot.capabilities.fast_mode
-            && self.snapshot.read_only_reason.is_none()
-            && mode.changeable();
         let label = match mode.state {
             crate::chat::FastModeState::Off => "Fast mode: off",
             crate::chat::FastModeState::On => "Fast mode: on",
             crate::chat::FastModeState::Cooldown => "Fast mode: cooldown",
         };
         let control = crate::interaction::tooltip(
-            crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
-                action(Action::Command(
-                    self.target,
-                    Command::SetFastMode {
-                        enabled: !mode.enabled(),
-                    },
-                ))
-            })),
+            crate::ui_controls::button::quiet(label).on_press_maybe(
+                self.registered_chat_request(RegisteredAction::ChatToggleFastMode, false, false)
+                    .and_then(|request| request.action())
+                    .map(action),
+            ),
             fast_mode_tooltip(mode),
         );
         Some(
@@ -4594,6 +4696,13 @@ fn model_list<'a>(
                     .align_y(Alignment::Center),
                 )
                 .name(name)
+                .id(card_control_id(
+                    target.card,
+                    &match id {
+                        Some(id) => format!("chat-model-choice-{provider:?}-named-{id}"),
+                        None => format!("chat-model-choice-{provider:?}-default"),
+                    },
+                ))
                 .class(crate::ui_controls::control_style(selected, None))
                 .selected(selected)
                 .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
@@ -4650,6 +4759,84 @@ mod frame_cost;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resumed_model_is_visible_before_first_turn_without_cloning_transcript_snapshot() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        drop(app.new_native_chat(Provider::Codex, Some(directory.path().into())));
+        let card = app.workspace.focused().unwrap();
+        let mut session = app.chat_return_session(card).unwrap();
+        session.launch.session_id = Some("recorded-conversation".into());
+        super::super::closing::set_model(&mut session.launch.recipe, "recorded-model");
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                session_id: Some("recorded-conversation".into()),
+                ..Snapshot::default()
+            },
+        ));
+        let mut runtime = Runtime::new(
+            Target {
+                card,
+                generation: 1,
+            },
+            session,
+            Connection::Live(Arc::clone(&handle)),
+            true,
+            Default::default(),
+        );
+        runtime.refresh();
+        assert!(runtime.snapshot.selected_model.is_none());
+        assert!(
+            Arc::ptr_eq(&runtime.snapshot, &handle.snapshot()),
+            "display metadata must not copy a transcript snapshot on every refresh"
+        );
+        let mut element: Element<'_, Message> =
+            widget::column::with_children(runtime.session_controls(
+                false,
+                None,
+                Vec::new(),
+                &crate::settings::KeyboardShortcuts::default(),
+            ))
+            .into();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = cosmic::iced::advanced::widget::Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &cosmic::iced::advanced::layout::Limits::new(
+                iced::Size::ZERO,
+                iced::Size::new(800.0, 100.0),
+            ),
+        );
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl cosmic::iced::advanced::widget::Operation for Texts {
+            fn traverse(
+                &mut self,
+                visit: &mut dyn FnMut(&mut dyn cosmic::iced::advanced::widget::Operation),
+            ) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let mut texts = Texts::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            cosmic::iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut texts,
+        );
+        assert!(
+            texts.0.iter().any(|text| text == "recorded-model"),
+            "{:?}",
+            texts.0
+        );
+        assert!(!texts.0.iter().any(|text| text == "Model"));
+    }
+
     use super::*;
 
     fn native_child_fixture() -> chat::Subagent {
@@ -4862,6 +5049,48 @@ mod tests {
                 hovered.bounds, probe.bounds,
                 "hover controls must not move neighboring messages"
             );
+        }
+    }
+
+    #[test]
+    fn terminal_run_outcomes_have_distinct_footer_status() {
+        use crate::agent::ActivityOutcome;
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        for (outcome, label, glyph) in [
+            (ActivityOutcome::Succeeded, "Finished", Icon::Check),
+            (ActivityOutcome::Cancelled, "Cancelled", Icon::Cancel),
+            (
+                ActivityOutcome::Failed {
+                    reason: "Provider exited with code 3".into(),
+                },
+                "Failed",
+                Icon::Warning,
+            ),
+            (
+                ActivityOutcome::Interrupted {
+                    reason: "Provider exited before its final result".into(),
+                },
+                "Interrupted",
+                Icon::Warning,
+            ),
+        ] {
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.finished_at = Some(42);
+            snapshot.outcome = Some(outcome);
+            assert_eq!(runtime.conversation_status(false), (Some(glyph), label));
+            let mut next = (*runtime.snapshot).clone();
+            next.generation += 1;
+            _handle.replace_snapshot_for_test(next);
+            runtime.refresh();
+            assert!(
+                runtime
+                    .finished_stamp
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .starts_with(label)
+            );
+            assert!(runtime.turns.iter().all(|turn| !turn.running));
         }
     }
 
@@ -5719,6 +5948,220 @@ mod tests {
         assert_eq!(bounds.x, 0.0);
         assert_eq!(bounds.y, 0.0);
         assert_eq!(bounds.width, 600.0);
+    }
+
+    #[test]
+    fn compact_chat_footer_is_one_line_at_four_hundred_fifty_pixels() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct FooterBounds {
+            id: widget::Id,
+            bounds: Option<iced::Rectangle>,
+        }
+        impl Operation for FooterBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == Some(&self.id) {
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let items = frame_cost::transcript(1);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        Arc::make_mut(&mut runtime.snapshot).usage.context_limit = 200_000;
+        Arc::make_mut(&mut runtime.snapshot).usage.context_tokens = 100_000;
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut element = runtime.view(
+            None,
+            false,
+            true,
+            &shortcuts,
+            450.0,
+            Place {
+                channel: Some("A long conversation name".into()),
+                name: "A long repository name".into(),
+                branch: Some("feature/a-long-branch-name".into()),
+            },
+            true,
+            None,
+            vec![],
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(450.0, 700.0)),
+        );
+        let mut probe = FooterBounds {
+            id: card_control_id(runtime.target.card, "chat-footer"),
+            bounds: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let bounds = probe.bounds.expect("footer mounted");
+        assert!(
+            bounds.height <= design::PRIMARY_CONTROL_SIZE + step::GAP_M + 1.0,
+            "footer wrapped: {bounds:?}"
+        );
+        assert!(bounds.width <= 450.0);
+    }
+
+    #[test]
+    fn compact_footer_keeps_nested_model_and_reasoning_pickers_interactive() {
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation, operation::Focusable},
+        };
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        fn click(
+            app: &Cagents,
+            target: Target,
+            cache: Cache,
+            renderer: &mut cosmic::Renderer,
+            role: &str,
+        ) -> (Cache, Vec<Message>) {
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+                panic!("chat");
+            };
+            let view = runtime.view(
+                None,
+                false,
+                true,
+                &app.settings.keyboard_shortcuts,
+                450.0,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut ui = UserInterface::build(view, iced::Size::new(450.0, 700.0), cache, renderer);
+            struct Bounds {
+                id: widget::Id,
+                rect: Option<iced::Rectangle>,
+            }
+            impl Operation for Bounds {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    _: &mut dyn Focusable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.rect = Some(bounds);
+                    }
+                }
+            }
+            let mut bounds = Bounds {
+                id: card_control_id(target.card, role),
+                rect: None,
+            };
+            // Unlike a11y_nodes in pinned COSMIC, operate also traverses the
+            // actual nested overlay layouts and their live focusable controls.
+            ui.operate(renderer, &mut bounds);
+            let rect = bounds
+                .rect
+                .unwrap_or_else(|| panic!("missing mounted control {role}"));
+            let pointer = iced::Point::new(rect.center_x(), rect.center_y());
+            let mut messages = Vec::new();
+            ui.update(
+                &[
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )),
+                ],
+                iced::mouse::Cursor::Available(pointer),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            (ui.into_cache(), messages)
+        }
+        fn apply(app: &mut Cagents, messages: Vec<Message>) {
+            for message in messages {
+                drop(app.update(message));
+            }
+        }
+
+        let (mut live, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
+        let snapshot = Arc::make_mut(&mut live.snapshot);
+        snapshot.capabilities.model_selection = true;
+        snapshot.capabilities.reasoning_selection = true;
+        snapshot.models = vec![
+            chat::Model {
+                id: "model-a".into(),
+                label: "Fixture model A".into(),
+                reasoning: vec!["low".into(), "high".into()],
+            },
+            model("model-b", "Fixture model B"),
+        ];
+        snapshot.selected_model = Some("model-a".into());
+        snapshot.reasoning = Some("low".into());
+        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut cache = Cache::new();
+        for picker in ["chat-model-picker", "chat-reasoning-picker"] {
+            let (next, messages) = click(&app, target, cache, &mut renderer, "chat-footer-details");
+            cache = next;
+            apply(&mut app, messages);
+            let (next, messages) = click(&app, target, cache, &mut renderer, picker);
+            cache = next;
+            apply(&mut app, messages);
+            let label = if picker == "chat-model-picker" {
+                "chat-model-choice-Claude-named-model-b"
+            } else {
+                "chat-reasoning-choice-1"
+            };
+            let (next, messages) = click(&app, target, cache, &mut renderer, label);
+            cache = next;
+            assert!(
+                messages.iter().any(|message| match message {
+                    Message::ChatUi(Action::Model(actual, id)) =>
+                        *actual == target && id == "model-b",
+                    Message::ChatUi(Action::Reasoning(actual, id, effort)) =>
+                        *actual == target && id == "model-a" && effort == "high",
+                    _ => false,
+                }),
+                "nested picker must publish its selection"
+            );
+            drop(app.handle_chat_ui(Action::FooterPicker(target, false)));
+        }
+        // The keyboard command must mount More's anchor and the model popup
+        // even though the overflow has not been opened with the pointer.
+        drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
+        let (_, messages) = click(
+            &app,
+            target,
+            cache,
+            &mut renderer,
+            "chat-model-choice-Claude-named-model-b",
+        );
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::Model(actual, id)) if *actual == target && id == "model-b")));
     }
 
     #[test]
@@ -6691,6 +7134,134 @@ mod tests {
         let mut unfocused = key(Named::ArrowUp, Modifiers::empty());
         unfocused.status = text_editor::Status::Active;
         assert!(!queue_key(&unfocused, true));
+    }
+
+    #[test]
+    fn mounted_chat_composers_dispatch_only_the_actual_keyboard_focus_owner() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use iced::keyboard::{
+            Key,
+            key::{Code, Named, Physical},
+        };
+        let (mut first, _first_handle) = frame_cost::live_runtime(&[]);
+        let (mut second, _second_handle) = frame_cost::live_runtime(&[]);
+        first.replace_draft(text_editor::Content::with_text("first draft"));
+        second.replace_draft(text_editor::Content::with_text("second draft"));
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        fn pane<'a>(
+            runtime: &'a Runtime,
+            shortcuts: &'a crate::settings::KeyboardShortcuts,
+        ) -> Element<'a, Message> {
+            runtime.view(
+                None,
+                false,
+                false,
+                shortcuts,
+                400.0,
+                Place {
+                    channel: None,
+                    name: "Fixture".into(),
+                    branch: None,
+                },
+                true,
+                None,
+                vec![],
+            )
+        }
+        let sidebar = widget::Id::new("chat.registry.sidebar");
+        let mut element: Element<'_, Message> = widget::row::with_children(vec![
+            widget::container(pane(&first, &shortcuts))
+                .width(400)
+                .height(600)
+                .into(),
+            widget::container(pane(&second, &shortcuts))
+                .width(400)
+                .height(600)
+                .into(),
+            widget::text_input("Sidebar", "query")
+                .id(sidebar.clone())
+                .on_input(|_| Message::ChatUi(Action::CopyLiteral(String::new())))
+                .width(240)
+                .into(),
+        ])
+        .into();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(1100.0, 620.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        for (target, expected) in [
+            (sidebar, None),
+            (
+                card_control_id(first.target.card, "chat-composer"),
+                Some(first.target),
+            ),
+            (
+                card_control_id(second.target.card, "chat-composer"),
+                Some(second.target),
+            ),
+        ] {
+            let mut focus = iced::advanced::widget::operation::focusable::focus::<()>(target);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            for (key, code, latest) in [
+                (Named::End, Code::End, true),
+                (Named::Enter, Code::Enter, false),
+            ] {
+                let event = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: Key::Named(key),
+                    modified_key: Key::Named(key),
+                    physical_key: Physical::Code(code),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                });
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                let actions: Vec<_> = messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::ChatUi(Action::Composer(target, _)) if latest => Some(*target),
+                        Message::ChatUi(Action::Submit(target, PromptMode::Send)) if !latest => {
+                            Some(*target)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(actions, expected.into_iter().collect::<Vec<_>>());
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Latest(_)))),
+                    "CtrlEnd must use registered root routing; native editing cannot retain a retired Latest alias"
+                );
+                assert!(
+                    messages.iter().all(|message| match message {
+                        Message::ChatUi(
+                            Action::Composer(target, _)
+                            | Action::ComposerCursor(target, _)
+                            | Action::Submit(target, _),
+                        ) => Some(*target) == expected,
+                        _ => false,
+                    }),
+                    "inactive composers and sidebar fields must not publish another chat action"
+                );
+            }
+        }
     }
 
     fn press(modifiers: keyboard::Modifiers, focused: bool) -> text_editor::KeyPress {

@@ -20,7 +20,7 @@ pub(super) struct RowOffsets {
     offsets: Vec<f64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum Anchor {
     Leading(f64),
     Row { row: usize, fraction: f64 },
@@ -422,6 +422,23 @@ impl DiffLayout {
             let folded = Self::fold(Some(model), mode, &self.reveals);
             self.offsets[layout_index(mode)] = RowOffsets::uniform(folded.len(), self.row_height);
             self.folded[layout_index(mode)] = folded;
+        }
+    }
+
+    pub fn set_row_height(&mut self, height: f32) {
+        if self.row_height == height {
+            return;
+        }
+        self.row_height = height;
+        for (index, rows) in self.offsets.iter_mut().enumerate() {
+            let leading = rows.leading_height();
+            let annotations = rows
+                .annotations()
+                .iter()
+                .map(|(row, height)| (*row, *height))
+                .collect::<Vec<_>>();
+            *rows = RowOffsets::uniform(self.folded[index].len(), height);
+            rows.annotate(leading, &annotations);
         }
     }
 

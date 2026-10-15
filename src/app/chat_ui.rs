@@ -14,6 +14,8 @@ use std::sync::{
 };
 
 mod auth_recovery;
+mod commands;
+pub(in crate::app) use commands::RegisteredChatCommand;
 mod changes;
 mod clipboard_image;
 mod completion;
@@ -293,6 +295,7 @@ pub enum Action {
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
+    FooterPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -448,7 +451,11 @@ impl Phase {
     }
 }
 
+pub(super) mod closing;
+
 pub(super) struct State {
+    pub(super) close_dialog: Option<closing::Confirmation>,
+    close_generation: u64,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -491,6 +498,8 @@ impl Default for State {
         let (sender, receiver) = async_channel::unbounded();
         Self {
             image_viewer: None,
+            close_dialog: None,
+            close_generation: 0,
             files: HashMap::new(),
             sender,
             receiver,
@@ -1458,6 +1467,7 @@ enum QueuedStep {
 }
 
 pub(super) struct Runtime {
+    recorded_model: Option<String>,
     find: Option<String>,
     find_focused: bool,
     find_matches: Vec<String>,
@@ -1551,6 +1561,7 @@ pub(super) struct Runtime {
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
     permission_picker: bool,
+    footer_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
@@ -2056,8 +2067,10 @@ impl Runtime {
     ) -> Self {
         let permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let selected_model = closing::recipe_model(&session.launch.recipe);
         let mut runtime = Self {
             target,
+            recorded_model: selected_model,
             session,
             snapshot: Arc::new(Snapshot {
                 permission_mode,
@@ -2115,6 +2128,7 @@ impl Runtime {
             failures: Vec::new(),
             reasoning_picker: false,
             permission_picker: false,
+            footer_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
             picker_focus: 0,
@@ -2237,6 +2251,20 @@ impl Runtime {
             cached.rehighlight(theme);
         }
     }
+    pub(super) fn native_activity(&self) -> Option<Activity> {
+        self.handle().map(|handle| Activity {
+            provider: self.session.launch.provider,
+            state: handle.take_activity(),
+        })
+    }
+
+    pub(super) fn activity_outcome(&self) -> Option<crate::agent::ActivityOutcome> {
+        match self.handle() {
+            Some(handle) => handle.activity_outcome(),
+            None => self.snapshot.outcome.clone(),
+        }
+    }
+
     fn source_now_ms(&self) -> Option<u64> {
         self.source_clock
             .map(chat::client::SourceClock::now)
@@ -2273,7 +2301,9 @@ impl Runtime {
         {
             return;
         }
-        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
+        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at
+            || self.snapshot.outcome != snapshot.outcome
+        {
             self.finished_stamp = snapshot.finished_at.and_then(|at| {
                 let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
                 let full = format!(
@@ -2283,7 +2313,16 @@ impl Runtime {
                     time.day,
                     time.clock()
                 );
-                Some((at, format!("Finished at {}", time.clock()), full))
+                let label = snapshot
+                    .outcome
+                    .as_ref()
+                    .map_or("Finished", crate::agent::ActivityOutcome::label);
+                let full = snapshot
+                    .outcome
+                    .as_ref()
+                    .and_then(crate::agent::ActivityOutcome::reason)
+                    .map_or_else(|| full.clone(), |reason| format!("{full} · {reason}"));
+                Some((at, format!("{label} at {}", time.clock()), full))
             });
         }
         self.subagent_scroll
@@ -2295,6 +2334,9 @@ impl Runtime {
                 .iter()
                 .any(|message| &message.id == id)
         });
+        if snapshot.selected_model.is_some() {
+            self.recorded_model.clone_from(&snapshot.selected_model);
+        }
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
@@ -2523,6 +2565,12 @@ impl Runtime {
             self.failures.retain(|(anchor, message)| {
                 anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
             });
+        }
+        let mut turns = turns;
+        if snapshot.outcome.is_some() && (!snapshot.is_working() || snapshot.exited) {
+            for turn in &mut turns {
+                turn.running = false;
+            }
         }
         self.turns = turns;
         reconcile_disclosure(&mut self.opened, &self.turns);
@@ -3263,6 +3311,42 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    pub(super) fn chat_control_available(
+        &self,
+        card: CardId,
+        command: crate::workspace_widget::GlobalShortcut,
+    ) -> bool {
+        use crate::workspace_widget::GlobalShortcut;
+        if self.chat_start_pending(card) {
+            return false;
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return false;
+        };
+        match command {
+            GlobalShortcut::ChatAccount => {
+                runtime.choosing()
+                    && self
+                        .chat_accounts(
+                            runtime.session.launch.provider,
+                            &runtime.session.launch.recipe,
+                        )
+                        .is_some()
+            }
+            GlobalShortcut::ChatModel => {
+                runtime.is_draft()
+                    || (runtime.snapshot.capabilities.model_selection
+                        && !runtime.snapshot.models.is_empty())
+            }
+            GlobalShortcut::ChatPermissions => {
+                !runtime.snapshot.capabilities.permission_modes.is_empty()
+                    && !(runtime.session.launch.provider == Provider::Codex
+                        && runtime.snapshot.busy)
+            }
+            _ => false,
+        }
+    }
+
     /// Keyboard and palette commands use the same pickers as the composer.
     /// Respect the control's availability before capturing a selection gesture.
     pub(super) fn open_chat_control(
@@ -3273,7 +3357,7 @@ impl Cagents {
         let Some(card) = self.workspace.focused() else {
             return Task::none();
         };
-        if self.chat_start_pending(card) {
+        if !self.chat_control_available(card, command) {
             return Task::none();
         }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
@@ -3281,29 +3365,11 @@ impl Cagents {
         };
         let target = runtime.target;
         let action = match command {
-            GlobalShortcut::ChatAccount
-                if runtime.choosing()
-                    && self
-                        .chat_accounts(
-                            runtime.session.launch.provider,
-                            &runtime.session.launch.recipe,
-                        )
-                        .is_some() =>
-            {
-                Action::AccountPicker(target, !runtime.account_picker)
-            }
-            GlobalShortcut::ChatModel
-                if runtime.is_draft()
-                    || (runtime.snapshot.capabilities.model_selection
-                        && !runtime.snapshot.models.is_empty()) =>
-            {
+            GlobalShortcut::ChatAccount => Action::AccountPicker(target, !runtime.account_picker),
+            GlobalShortcut::ChatModel => {
                 Action::ModelPicker(target, runtime.model_picker.is_none())
             }
-            GlobalShortcut::ChatPermissions
-                if !runtime.snapshot.capabilities.permission_modes.is_empty()
-                    && !(runtime.session.launch.provider == Provider::Codex
-                        && runtime.snapshot.busy) =>
-            {
+            GlobalShortcut::ChatPermissions => {
                 Action::PermissionPicker(target, !runtime.permission_picker)
             }
             _ => return Task::none(),
@@ -4061,7 +4127,14 @@ impl Cagents {
     }
 
     pub(super) fn new_native_thread(&mut self) -> Task<Message> {
+        if self.terminal_directory().is_none() {
+            return self.update_onboarding(onboarding_ui::Action::HomeChat);
+        }
         self.new_native_chat(self.preferred_chat_provider(), None)
+    }
+
+    pub(super) fn new_native_thread_at(&mut self, directory: PathBuf) -> Task<Message> {
+        self.new_native_chat(self.preferred_chat_provider(), Some(directory))
     }
 
     fn preferred_chat_provider(&self) -> Provider {
@@ -4206,6 +4279,54 @@ impl Cagents {
                 }
             }
         }
+        let mut conversation_drafts = self.durable.conversation_drafts.clone();
+        let mut conversation_models = self.durable.conversation_models.clone();
+        for (card, draft) in &chat_drafts {
+            if let Some(CardKind::Chat(session)) = self.card_state(*card).map(|card| &card.kind)
+                && let Some(key) = closing::draft_key(session)
+            {
+                conversation_drafts.insert(key, draft.clone());
+            }
+        }
+        for runtime in self.chat_ui.parked.values() {
+            if let Some(key) = closing::draft_key(&runtime.session) {
+                if let Some(model) = runtime
+                    .snapshot
+                    .selected_model
+                    .as_ref()
+                    .or(runtime.recorded_model.as_ref())
+                {
+                    conversation_models.insert(key.clone(), model.clone());
+                }
+                let draft = runtime.unsent_text();
+                if draft.is_empty() {
+                    conversation_drafts.remove(&key);
+                } else {
+                    conversation_drafts.insert(key, draft);
+                }
+            }
+        }
+        for (card, state) in &self.cards {
+            if let CardRuntime::Chat(runtime) = state
+                && let Some(session) = self.chat_return_session(*card)
+                && let Some(key) = closing::draft_key(&session)
+            {
+                if let Some(model) = runtime
+                    .snapshot
+                    .selected_model
+                    .as_ref()
+                    .or(runtime.recorded_model.as_ref())
+                {
+                    conversation_models.insert(key.clone(), model.clone());
+                }
+                let draft = runtime.unsent_text();
+                if draft.is_empty() {
+                    conversation_drafts.remove(&key);
+                } else {
+                    conversation_drafts.insert(key, draft);
+                }
+            }
+        }
         let editors = self
             .durable
             .cards
@@ -4228,14 +4349,23 @@ impl Cagents {
                 }
             }
         }
+        let mut agent_updates = self.sidebar_state.unread_updates().clone();
+        agent_updates.retain(|card, _| open_cards.contains(card));
+        if agent_updates != self.durable.agent_updates {
+            Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
+        }
         if defaults.is_empty()
             && chat_drafts == self.durable.chat_drafts
+            && conversation_drafts == self.durable.conversation_drafts
+            && conversation_models == self.durable.conversation_models
             && repository_navigation == self.durable.repository_navigation
         {
             return Arc::clone(&self.durable);
         }
         let mut saved = (*self.durable).clone();
         saved.chat_drafts = chat_drafts;
+        saved.conversation_drafts = conversation_drafts;
+        saved.conversation_models = conversation_models;
         saved.repository_navigation = repository_navigation;
         if defaults.is_empty() {
             return Arc::new(saved);
@@ -4306,11 +4436,13 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
+            || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
+        runtime.footer_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
         runtime.branch_picker = false;
@@ -4401,6 +4533,11 @@ impl Cagents {
             Some((source, (index + 1, durable + 1)))
         });
         let card_id = CardId::new();
+        if let Some(key) = closing::draft_key(&session)
+            && let Some(draft) = self.durable.conversation_drafts.get(&key)
+        {
+            self.chat_ui.drafts.insert(card_id, draft.clone());
+        }
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "chat");
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.
@@ -4416,15 +4553,17 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: chat_card_title(session.launch.provider).into(),
-            width_fraction: beside
-                .and_then(|(source, _)| self.card_state(source))
-                .map_or(self.settings.default_native_pane_fraction, |source| {
-                    if matches!(source.kind, CardKind::Chat(_)) {
-                        source.width_fraction
-                    } else {
-                        self.settings.default_native_pane_fraction
-                    }
-                }),
+            width_fraction: self.new_pane_fraction(
+                beside
+                    .and_then(|(source, _)| self.card_state(source))
+                    .map_or(self.settings.default_native_pane_fraction, |source| {
+                        if matches!(source.kind, CardKind::Chat(_)) {
+                            source.width_fraction
+                        } else {
+                            self.settings.default_native_pane_fraction
+                        }
+                    }),
+            ),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -4616,6 +4755,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.remember_conversation_draft(card);
         // The runtime is about to be dropped, so its unsent text is captured
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
@@ -4811,7 +4951,10 @@ impl Cagents {
     /// knows it: the runtime's session carries the identity the provider has
     /// confirmed since the card was saved.
     fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
-        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
+        if let Some(runtime) = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(&**runtime),
+            _ => self.chat_ui.parked.get(&card).map(|runtime| &**runtime),
+        } {
             let mut session = runtime.session.clone();
             if let Some(handle) = runtime.handle() {
                 let observed = handle.session();
@@ -4832,6 +4975,11 @@ impl Cagents {
             _ => None,
         }
     }
+    /// Read retained attention without exposing the parked-runtime registry.
+    pub(super) fn parked_chat_runtime(&self, card: CardId) -> Option<&Runtime> {
+        self.chat_ui.parked.get(&card).map(Box::as_ref)
+    }
+
     pub(super) fn chat_has_parked_runtime(&self, card: CardId) -> bool {
         self.chat_ui.parked.contains_key(&card)
     }
@@ -4858,6 +5006,7 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        self.remember_conversation_draft(card);
         if matches!(
             self.chat_ui.phases.get(&card),
             Some(Phase::Closing { restart: None, .. })
@@ -5739,6 +5888,7 @@ impl Cagents {
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
+            | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
@@ -5831,6 +5981,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -6217,7 +6368,7 @@ impl Cagents {
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
                         let channel_name = snapshot_channel_name(&snapshot);
-                        let title = snapshot.title.clone();
+                        let title = snapshot_channel_name(&snapshot).map(|(title, _)| title);
                         let activity = Activity {
                             provider: session.launch.provider,
                             state: handle.take_activity(),
@@ -6250,6 +6401,11 @@ impl Cagents {
                                 visible,
                                 self.settings.editor_syntax_theme,
                             );
+                            if let Some(key) = closing::draft_key(&session)
+                                && let Some(model) = self.durable.conversation_models.get(&key)
+                            {
+                                runtime.recorded_model = Some(model.clone());
+                            }
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
@@ -6560,12 +6716,18 @@ impl Cagents {
                         }
                         _ => None,
                     };
+                    let activity = matches!(wake, Wake::Activity | Wake::Changed)
+                        .then(|| runtime.native_activity())
+                        .flatten();
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
                     if let Some((name, source)) = name {
                         self.suggest_channel_title(target.card, name, source);
+                    }
+                    if let Some(activity) = activity {
+                        self.observe_agent_activity_for_card(target.card, Some(activity));
                     }
                     return Task::none();
                 }
@@ -6607,7 +6769,7 @@ impl Cagents {
                         let channel_name = needs_name
                             .then(|| snapshot_channel_name(&snapshot))
                             .flatten();
-                        let title = snapshot.title.clone();
+                        let title = snapshot_channel_name(&snapshot).map(|(title, _)| title);
                         if let Some((name, source)) = channel_name {
                             self.suggest_channel_title(target.card, name, source);
                         }
@@ -7154,12 +7316,23 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
+            Action::FooterPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.footer_picker = open;
+                    runtime.model_picker = None;
+                    runtime.reasoning_picker = false;
+                    runtime.account_picker = false;
+                    runtime.permission_picker = false;
+                    runtime.composer_actions = false;
+                }
+            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
+                    runtime.footer_picker = false;
                     if open {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
@@ -7218,6 +7391,7 @@ impl Cagents {
                     runtime.history_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
                         target.card,
                         "chat-composer",
@@ -8009,6 +8183,7 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.permission_picker = false;
+                runtime.footer_picker = false;
                 if !runtime
                     .snapshot
                     .capabilities
@@ -8411,6 +8586,7 @@ impl Cagents {
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
+                runtime.footer_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -8436,6 +8612,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.account_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
         }
@@ -11221,6 +11398,63 @@ mod tests {
     }
 
     #[test]
+    fn palette_chat_control_availability_matches_live_capabilities_and_pending_start() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session.launch.provider = Provider::Codex;
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.models.clear();
+            snapshot.capabilities.model_selection = false;
+            snapshot.capabilities.permission_modes.clear();
+        }
+        for command in [
+            Command::ChatAccount,
+            Command::ChatModel,
+            Command::ChatPermissions,
+        ] {
+            assert!(
+                !app.command_available(command),
+                "unavailable live control: {command:?}"
+            );
+        }
+        {
+            let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
+            snapshot.capabilities.model_selection = true;
+            snapshot.models = vec![fixture_model("fixture-model", &[])];
+            snapshot.capabilities.permission_modes = vec!["default".into()];
+            snapshot.busy = false;
+        }
+        assert!(app.command_available(Command::ChatModel));
+        assert!(app.command_available(Command::ChatPermissions));
+        assert!(
+            !app.command_available(Command::ChatAccount),
+            "live conversations cannot select a draft account"
+        );
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+        assert!(
+            !app.command_available(Command::ChatPermissions),
+            "busy Codex cannot change permissions"
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachment_chooser_pending = true;
+        for command in [
+            Command::ChatAccount,
+            Command::ChatModel,
+            Command::ChatPermissions,
+        ] {
+            assert!(
+                !app.command_available(command),
+                "pending start control: {command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn chat_selection_commands_open_exclusive_pickers_without_changing_the_draft() {
         use crate::workspace_widget::GlobalShortcut;
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -12572,6 +12806,71 @@ mod tests {
     }
 
     #[test]
+    fn prompt_and_provider_titles_name_the_chat_tab_and_window() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = Snapshot {
+            ready: true,
+            ..Snapshot::default()
+        };
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "prompt".into(),
+            role: chat::Role::User,
+            content: text("Implement conversation titles"),
+            started_at: None,
+            at: None,
+        }));
+        for title in [None, Some("Provider summary".to_owned())] {
+            snapshot.title = title.clone();
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot.clone());
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            drop(app.sync_chrome());
+            let expected = title.as_deref().unwrap_or("Implement conversation titles");
+            assert_eq!(
+                app.card_display_title(app.card_state(card).unwrap()),
+                expected
+            );
+            assert_eq!(app.card_chrome[&card].title, expected);
+            assert_eq!(app.core.window.header_title, expected);
+        }
+    }
+
+    #[test]
+    fn manual_channel_name_titles_its_main_chat_without_hiding_sibling_titles() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let mut sibling = app.card_state(card).unwrap().clone();
+        sibling.id = CardId::new();
+        sibling.title = "Sibling conversation".into();
+        let sibling_id = sibling.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(sibling);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: crate::model::ChannelId::new(),
+            project_id: crate::model::ProjectId::new(),
+            title: "My renamed conversation".into(),
+            title_source: crate::model::ChannelTitleSource::Manual,
+            ordinal: 1,
+            shared: false,
+            cards: vec![card, sibling_id],
+            focused: Some(card),
+        });
+        assert_eq!(
+            app.card_display_title(app.card_state(card).unwrap()),
+            "My renamed conversation"
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(sibling_id).unwrap()),
+            "Sibling conversation"
+        );
+        drop(app.sync_chrome());
+        assert_eq!(app.core.window.header_title, "My renamed conversation");
+    }
+
+    #[test]
     fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -12671,10 +12970,21 @@ mod tests {
             .target
     }
 
-    /// Closes `card` the way its close button does, and checks that it is gone
-    /// for good: off the strip, tombstoned, and held by nothing.
+    /// Explicitly end a conversation through its confirmation flow.
+    fn request_end_chat(app: &mut Cagents, card: CardId) {
+        drop(app.update(Message::ChatClose(closing::Action::End(card))));
+        if let Some(target) = app
+            .chat_ui
+            .close_dialog
+            .as_ref()
+            .map(closing::Confirmation::target)
+        {
+            drop(app.update(Message::ChatClose(closing::Action::Confirm(target))));
+        }
+    }
+
     fn close_chat(app: &mut Cagents, card: CardId) {
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(app, card);
         if let Some(Phase::Closing {
             target,
             restart: None,
@@ -12914,7 +13224,7 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = failed_chat(&mut app);
         let saved = app.chat_return_session(card).unwrap();
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let target = app.chat_ui.phases[&card].target();
         let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
             target,
@@ -13043,9 +13353,9 @@ mod tests {
     fn closing_a_chat_twice_is_one_close() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, None);
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let closing = app.chat_ui.phases[&card].target();
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
         assert_eq!(app.chat_ui.phases[&card].target(), closing);
         let _ = app.update(Message::CommitClose(card));
@@ -14081,7 +14391,7 @@ mod tests {
         let card = failed_chat(&mut app);
         let _ = app.update(Message::ChatUi(Action::Switch(card)));
         let target = local_return(&app).0;
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
             target,
             Err(ReturnRefused::SourceLive),
@@ -14170,7 +14480,7 @@ mod tests {
             let card = live_chat(&mut app, None);
             let _ = app.update(Message::ChatUi(Action::Switch(card)));
             let target = local_return(&app).0;
-            let _ = app.update(Message::CloseCard(card));
+            request_end_chat(&mut app, card);
             assert!(matches!(
                 app.chat_ui.phases.get(&card),
                 Some(Phase::Returning {
@@ -14392,7 +14702,7 @@ mod tests {
         let card = draft_chat(&mut app);
         write(&mut app, card, "hello");
         let target = chat_runtime(&app, card).target;
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let _ = app.handle_chat_ui(Action::Submit(target, PromptMode::Send));
         assert!(!app.chat_start_pending(card));
     }
@@ -14559,7 +14869,7 @@ mod tests {
     fn a_discarded_card_never_strands_a_start() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = failed_chat(&mut app);
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         let closing = app.chat_ui.phases[&card].target();
         let saved = app.chat_return_session(card).unwrap();
         let _ = app.update(Message::RetryCard(card));
@@ -14609,7 +14919,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let _ = app.update(Message::CloseCard(card));
+        request_end_chat(&mut app, card);
         assert!(matches!(
             app.chat_ui.phases.get(&card),
             Some(Phase::Returning {

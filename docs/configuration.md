@@ -112,7 +112,7 @@ chat_enter_sends = true
 show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
-shortcut_defaults_revision = 5
+shortcut_defaults_revision = 7
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -122,7 +122,7 @@ chat_model = ["Ctrl+Shift+M"]
 chat_permissions = ["Ctrl+Shift+O"]
 new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
-close_focused_column = ["Ctrl+W"]
+close_focused_column = ["Ctrl+Shift+W"]
 search_projects = ["Ctrl+Shift+F"]
 find_in_pane = ["Ctrl+F"]
 previous_column = ["Ctrl+PageUp"]
@@ -134,8 +134,8 @@ review_toggle_viewed = ["Alt+V"]
 review_next_file = ["Alt+Down"]
 review_previous_file = ["Alt+Up"]
 review_next_unviewed = ["Alt+Shift+Down"]
-review_next_change = ["Alt+J"]
-review_previous_change = ["Alt+K"]
+review_next_change = ["Alt+J", "F7"]
+review_previous_change = ["Alt+K", "Shift+F7"]
 
 [notifications]
 enabled = true
@@ -187,11 +187,17 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `pull_request_open_target` | string | `"review"` | What opening a pull request in the sidebar does: `"review"` opens the in-app review pane, and `"link"` opens the pull request's web page as a link, using the settings above |
 | `managed_worktree_directory` | string | `"worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root |
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
+| `git_status_limit` | integer | `10000` | Maximum changed paths shown in each source-control snapshot; normalized to `1`–`100000`. Oversized listings show a notice. Safety checks and bulk group actions read complete status independently. |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
 | `editor_auto_close` | boolean | `true` | Pairs brackets and quotes, wraps selected text, and types over an existing closer. Turn it off to insert characters literally |
 | `editor_tab_width` | integer | `4` | `1` through `16` columns. Changes native tab stops without rewriting tabs. Also supplies the space indentation fallback when neither file content nor `.editorconfig` sets it |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
+| `editor_find_options.case_sensitive` | boolean | `false` | Match case in the native editor Find strip |
+| `editor_find_options.regex` | boolean | `false` | Interpret Find queries as bounded regular expressions |
+| `editor_find_options.whole_word` | boolean | `false` | Require word boundaries outside each Find match |
+| `editor_replace_preserve_case` | boolean | `false` | Preserve upper, lower and title case in plain-text replacements |
 | `editor_syntax_theme` | string | `"auto"` | Syntax colors for editors and diffs: `"auto"` (follows the app theme), `"solarized_dark"`, `"mocha"`, `"ocean"`, `"eighties"`, or `"inspired_github"` (`"inspired_git_hub"`, written by earlier versions, is also read) |
+| `diff_ignore_whitespace` | boolean | `false` | Ignores horizontal whitespace when comparing lines, while retaining exact original text for copying and patches. The diff toolbar changes this preference |
 | `confirm_terminal_close` | boolean | `true` | Asks before closing a terminal that has a foreground program or background jobs. An idle shell closes without asking |
 | `chat_enter_sends` | boolean | `true` | When on, Enter sends a chat message and Shift+Enter starts a new line. When off, Enter starts a new line and Ctrl+Enter sends |
 | `show_status_bar` | boolean | `true` | Shows the bottom status bar with the usage limits left on each signed-in provider account. Hiding it also stops the usage checks that feed it, unless the Accounts pane is open |
@@ -200,7 +206,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
 | `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `5` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `palette_recents` | array of strings | `[]` | Recent command and navigation IDs, most recent first. Written by the palette and bounded to 24 entries |
+| `shortcut_defaults_revision` | integer | `7` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -223,6 +230,54 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 
 ## Keyboard shortcuts
 
+The command palette, Keyboard settings, and pane context menus share the same
+command definitions. Additional commands are unbound by default: `new_browser`,
+`open_folder`, `new_worktree`, `close_other_panes`, `close_panes_to_right`,
+`copy_path`, `reveal_in_projects`, `fork_conversation`, `focus_sidebar_tree`,
+`restart_daemon`, `toggle_theme`, `resume_conversation`, `switch_pane`, and
+`review_conversation_changes`. Set their chord lists under `[keyboard_shortcuts]`,
+or bind them in **Settings → Keyboard**. For example:
+
+```toml
+copy_path = ["Ctrl+Alt+Shift+K"]
+close_other_panes = []
+```
+
+`focus_project_1` through `focus_project_9` select projects in sidebar order.
+The `settings_general`, `settings_appearance`, `settings_terminal`,
+`settings_links`, `settings_keyboard`, `settings_native_chat`, `settings_editor`,
+`settings_accounts`, `settings_notifications`, and `settings_about` commands
+open the corresponding Settings section. These commands also start unbound.
+`end_conversation` ends a native conversation through its existing confirmation
+flow and starts unbound. Closing a pane tab can instead hide its conversation.
+
+Native code-buffer actions are separately configurable as
+`keyboard_shortcuts.editor_undo` (`Ctrl+Z`), `editor_redo` (`Ctrl+Shift+Z`,
+`Ctrl+Y`), `editor_cut` (`Ctrl+X`), `editor_copy` (`Ctrl+C`), `editor_paste`
+(`Ctrl+V`) and `editor_select_all` (`Ctrl+A`). These bindings apply only to the
+editable code buffer. Other text fields and terminal programs retain their own
+editing keys. Rebinding or clearing an editor action also replaces its original
+code-buffer chord; menu hints follow the current binding.
+
+`next_diagnostic` (`F8`) and `previous_diagnostic` (`Shift+F8`) navigate the
+editable buffer's diagnostics. They are available when the buffer has
+diagnostics, and their bindings can be changed or cleared in Keyboard settings.
+
+Diff selections use `diff_copy` (`Ctrl+C`) and `diff_select_all` (`Ctrl+A`).
+`diff_copy_old`, `diff_copy_new`, `diff_copy_patch`,
+`diff_copy_line_reference` and `diff_open_in_editor` start unbound. These
+commands act in a focused diff; typing in its Find field retains normal text
+editing. A row menu retains its original source and row even if focus moves.
+
+Sidebar commands such as `copy_branch`, `new_worktree_from_branch`,
+`rename_channel`, `mark_channel_read`, `mark_worktree_read`, `delete_channel`,
+`delete_worktree`, `remove_project` and `delete_selected_rows` start unbound.
+Open the palette while the target sidebar row or file has focus to invoke a
+command for that target. A stale selection does not retarget the command to a
+pane. The `open_in_external_editor` command uses the first configured editor;
+a menu entry for another configured editor keeps that editor as its target.
+
+
 Each action takes a list of chords. A chord has one key and one or more
 modifiers, joined by `+`. Names are case-insensitive.
 
@@ -232,19 +287,26 @@ modifiers, joined by `+`. Names are case-insensitive.
 - Keys: `A`-`Z`, `0`-`9`, `Left`, `Right`, `Up`, `Down`, `Tab`, `PageUp`, or
   `PageDown`, punctuation, or `F1`–`F12`. Use `Comma` and `Plus` for separator
   keys, for example `Ctrl+Comma`.
-- No chord can appear twice, even under different actions.
-- A chord you bind here is not passed to the program running in a pane.
-  For that reason, bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and `Ctrl+Q`
-  cannot be bound. Versions with more modifiers, such as `Ctrl+Shift+C`, can
-  be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
-  with a letter or arrow, can be bound but then no longer reach a terminal.
-  The defaults bind **Ctrl+W** to close the focused pane, **Alt+R** to cycle
-  pane width, and **Ctrl+T** to create a native thread tab.
-- `search_projects` defaults to **Ctrl+Shift+F**. `find_in_pane` defaults to
-  **Ctrl+F**, opening find in the focused terminal, editor, or chat transcript.
-  In a pane without find, Ctrl+F searches projects.
-  File and hunk navigation also works in local diff panes. Viewed-file commands
-  act only in a pull request pane. The chords reach terminals outside that scope.
+- Actions that can run in the same context cannot share a chord. Native editor
+  editing actions can share an editing chord with an action that only runs
+  outside text controls; Redo and Reopen pane share `Ctrl+Shift+Z` this way.
+- Terminal interception follows the action's **Send to terminal** policy in
+  Keyboard settings. `terminal_passthrough_actions` stores serialized action
+  names whose chords reach the focused terminal. Its defaults include
+  `rename_pane`, `new_native_thread`, `find_in_pane`, `cycle_pane_width` and
+  `focus_pane_1` through `focus_pane_9`; removing a name explicitly enables
+  that action in terminals. Bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and
+  `Ctrl+Q` remain reserved to preserve interruption, EOF and flow control.
+- **Ctrl+F** finds in the focused editor or chat, and falls back to project
+  search for panes without find. It stays in sidebar and inspector text fields
+  when those have keyboard focus. **Ctrl+Shift+F** searches projects outside
+  terminals and searches terminal scrollback inside them. Sending
+  `search_projects` to the terminal releases this chord too.
+- Native text controls retain undo, redo, selection and word navigation even
+  when a global action is bound to those editing chords. Reopen pane's
+  **Ctrl+Shift+Z** default applies outside text controls.
+- File and hunk navigation work in review panes; viewed-file commands apply
+  to pull request panes. Their chords reach terminals outside that scope.
 - `chat_account`, `chat_model`, and `chat_permissions` apply only to the
   focused native chat. Account selection is available before the conversation
   starts. Up/Down or Tab/Shift+Tab choose an account or permission mode, and
@@ -410,7 +472,7 @@ them back as version 3 the next time it saves.
   | `new_terminal` | `Ctrl+T` | `Ctrl+Shift+T` |
   | `new_channel` | `Alt+G` | `Ctrl+Shift+G` |
   | `clone_pane` | `Alt+E` | `Ctrl+Shift+D` |
-  | `close_focused_column` | `Ctrl+Shift+W` (revisions 2–3) | `Ctrl+W` |
+  | `close_focused_column` | `Ctrl+W` (revisions 1, 4–5) | `Ctrl+Shift+W` |
   | `previous_column` | `Alt+Q`, `Alt+Left` | `Ctrl+PageUp` |
   | `next_column` | `Alt+W`, `Alt+Right` | `Ctrl+PageDown` |
   | `cycle_pane_width` | `Ctrl+Shift+R` (revisions 2–3) | `Alt+R` |
@@ -424,7 +486,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 5`, after which an old default you choose
+  `shortcut_defaults_revision = 7`, after which an old default you choose
   again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
@@ -536,3 +598,83 @@ and saving cannot modify these dependency sources.
 
 Server errors remain dismissible notices. Informational server messages expire
 automatically, and server log messages go to the diagnostic log.
+
+The command registry also exposes `keyboard_shortcuts.mark_all_read` and
+`keyboard_shortcuts.clone_repository` (both unbound by default), and
+`keyboard_shortcuts.search_in_project` (`Ctrl+Alt+F`). `focus_last_pane`
+uses `Alt+0`; `next_attention` and `previous_attention` follow the configured
+attention navigation bindings. All of these appear in Keyboard settings.
+
+The unbound Git command settings are `git_fetch`, `git_push`, `git_publish`,
+`git_sync`, `git_sync_rebase`, `git_stash`, `git_stash_untracked`, `git_stashes`,
+`git_apply_stash`, `git_pop_stash`, `git_drop_stash`, `git_commit`, `git_amend`,
+`git_refresh`, `git_abort`, `git_continue` and `git_output`, under
+`[keyboard_shortcuts]`. They use the active worktree's existing Git controls;
+commit uses that worktree's subject, description and amend choice. Stash
+commands open a target picker and retain its exact stash object identity.
+
+`git_accept_ours` and `git_accept_theirs` are unbound commands for the focused
+conflict row. They accept the chosen side and stage that exact path, using the
+same operation as the row buttons; a changed worktree or selection retires the
+captured command.
+
+Native code-buffer language actions are configurable as `editor_complete`
+(`Ctrl+Space`), `go_to_definition` (`F12`), `find_references` (`Shift+F12`),
+`show_hover` and `show_diagnostics` (unbound). Clearing or remapping these
+bindings retires their original native chords. `Space` is accepted as a named
+key in configured chords and the shortcut recorder.
+
+File-surface commands are `editor_save` (`Ctrl+S`), `editor_discard_edits`,
+`editor_edit`, `editor_preview` and `editor_diff` (the latter four unbound).
+Their availability follows the file toolbar, including save and read-only
+checks. Clearing or remapping `editor_save` retires the original `Ctrl+S`
+binding. Repository commands keep ordinary fields, chat and terminal input
+separate; the Keyboard table shows **Scoped** for bindings whose pane context
+cannot take a terminal's keys.
+
+PDF viewer commands `pdf_first_page`, `pdf_previous_page`, `pdf_next_page`, `pdf_last_page`, `pdf_zoom_out`, `pdf_zoom_in`, `pdf_fit` and `pdf_toggle_colors` are unbound by default. They appear in Keyboard settings; palette availability reflects the mounted PDF preview. Page and zoom limits use the same availability as the viewer toolbar.
+
+Diff presentation commands (`diff_unified`, `diff_split`, `diff_ignore_whitespace`, `diff_working`, `diff_staged`, `diff_branch`, `diff_history`, `diff_revert`, `diff_retry`) and explicit selected-row mutation commands (`diff_stage_selection`, `diff_unstage_selection`, `diff_revert_selection`) are unbound by default. Selection commands require actual changed rows and retain the displayed source, selected rows and layout revision through palette activation. Existing confirmation and mutation handling still apply.
+
+`stage_or_unstage_file` defaults to Ctrl+Shift+S, preferring Stage when the file has unstaged changes and otherwise Unstage. `stage_file` and `unstage_file` are separate unbound actions. These operate on the current file, including a clean native editor; the selected-row commands remain separate. Clearing or rebinding the toggle retires Ctrl+Shift+S. Toolbar hints use current configured bindings and only advertise the toggle for the direction it would perform.
+
+Diff presentation and staging commands are configurable as `diff_unified`,
+`diff_split`, `diff_ignore_whitespace`, `diff_working`, `diff_staged`,
+`diff_branch`, `diff_history`, `stage_file`, `unstage_file`,
+`stage_or_unstage_file`, `diff_revert` and `diff_retry`. Only
+`stage_or_unstage_file` starts bound (`Ctrl+Shift+S`); clearing it retires the
+old staging shortcut. Explicit selected-row actions are `diff_stage_selection`,
+`diff_unstage_selection` and `diff_revert_selection`. Current-hunk actions are
+`diff_stage_hunk`, `diff_unstage_hunk` and `diff_revert_hunk`; they are available
+only when no rows are selected. Mutation availability uses the actual current
+worktree and source/layout identity, including selection and save guards.
+
+Browser controls are `browser_back` (`Alt+Left`), `browser_forward`
+(`Alt+Right`), `browser_reload` (`Ctrl+R`, `F5`), `browser_address` (`Ctrl+L`),
+`browser_stop`, `browser_open_system` and `browser_import_logins` (the last three
+unbound). Remapping or clearing the registered navigation actions retires their
+old aliases. Native address and other text fields keep their editing keys;
+only the conventional Back/Forward action-and-chord pairs override word motion
+in browser content. Browserless mode retains saved browser descriptors and
+exposes the actual system-browser action, without embedded-runtime commands.
+
+Explicit conversation actions are `chat_send`, `chat_steer`, `chat_queue`,
+`chat_interrupt`, `chat_compact`, `chat_attach`, `chat_reasoning`, `chat_latest`,
+`chat_take_back_queued`, `chat_cancel_queued`, `chat_toggle_steering` and
+`chat_toggle_fast_mode`. They start unbound except `chat_latest` (`Ctrl+End`),
+whose original hardcoded route is retired when the binding changes. `End` is
+accepted by configured chords, menus and the recorder. These explicit aliases
+are separate from the composer's field confirmation policy: Enter versus
+Ctrl+Enter follows `enter_sends`, Ctrl+Shift+Enter selects the alternate delivery
+mode while busy, and Escape cancels through the existing confirmation flow.
+A pending-first-message cancellation retains that exact starting session;
+newly submitted messages do not inherit an older palette result's cancellation.
+
+Whole-area Git commands (`git_stage_all_unstaged`, `git_stage_all_untracked`,
+`git_stage_all_conflicts`, `git_unstage_all_staged`, `git_discard_all_unstaged`,
+`git_discard_all_untracked`) start unbound and appear in Keyboard → Git. They
+require an active nonempty area without an explicit selection in that area.
+Group header controls use the selected-changes commands when rows are selected.
+Captured whole-area commands refuse a changed selection, and the backend reads
+the complete current area when the queued operation runs. Discard retains its
+confirmation.

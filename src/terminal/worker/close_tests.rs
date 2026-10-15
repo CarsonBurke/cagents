@@ -214,8 +214,48 @@ fn installed_fish() -> Option<PathBuf> {
 }
 
 #[test]
-fn an_idle_shell_closes_without_confirmation_from_its_daemon_owner() {
-    CloseSafetyShell::shell(Path::new("/bin/bash")).assert_unconfirmed_close();
+fn a_shell_without_prompt_integration_requires_confirmation_even_when_idle() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
+}
+
+#[test]
+fn an_unsent_command_without_prompt_integration_is_never_discarded_silently() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    shell.terminal.input(b"echo unfinished-command").unwrap();
+    shell.wait_for_text("unfinished-command");
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
+}
+
+#[test]
+fn an_unsent_fish_command_requires_confirmation_and_a_cleared_line_does_not() {
+    let Some(fish) = installed_fish() else { return };
+    let shell = CloseSafetyShell::shell(&fish);
+    shell.terminal.input(b"echo unfinished-command").unwrap();
+    shell.wait_for_text("unfinished-command");
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    shell.terminal.input(b"\x15").unwrap();
+    shell.wait_for("cleared prompt", || {
+        !shell.screen().contains("unfinished-command")
+    });
+    shell.assert_unconfirmed_close();
 }
 
 #[test]
@@ -256,7 +296,7 @@ fn an_exec_replacement_cannot_inherit_the_shells_idle_close_authority() {
 fn checked_close_delivers_its_kill_provenance_before_reporting_completion() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     assert_eq!(
-        shell.terminal.close_checked(false),
+        shell.terminal.close_checked(true),
         TerminalCloseResult::Closed
     );
     // close_checked joins teardown; its Exited event is already observable
@@ -272,15 +312,21 @@ fn checked_close_delivers_its_kill_provenance_before_reporting_completion() {
 }
 
 #[test]
-fn a_shell_builtin_read_closes_without_confirmation_under_process_only_detection() {
+fn a_shell_builtin_read_requires_confirmation_without_prompt_integration() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     shell
         .terminal
         .input(b"printf 'READY_%s\\n' BUILTIN; read reply\n")
         .unwrap();
     shell.wait_for_text("READY_BUILTIN");
-    // This deliberately does not attempt to classify in-shell execution.
-    shell.assert_unconfirmed_close();
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
 }
 
 #[test]

@@ -589,6 +589,12 @@ fn settings_category_controls<'a>(
                 SettingsField::MaxHotCards,
                 invalid,
             );
+            let git_status_limit = setting_input(
+                "Changed paths shown per worktree (1–100000). Larger repositories keep a capped list; bulk group actions still include every path.",
+                &draft.git_status_limit,
+                SettingsField::GitStatusLimit,
+                invalid,
+            );
             let hibernation = setting_stepper(
                 "Hibernation delay",
                 "Seconds to wait before an idle terminal is hibernated.",
@@ -616,7 +622,7 @@ fn settings_category_controls<'a>(
                 settings_group(
                     "Performance",
                     "Balance active panes and background resource use.",
-                    vec![hot_panes, hibernation],
+                    vec![hot_panes, hibernation, git_status_limit],
                 ),
                 settings_group(
                     "Reset",
@@ -1533,6 +1539,71 @@ fn keyboard_groups<'a>(
     groups
 }
 
+fn shortcut_group(field: SettingsField) -> &'static str {
+    workspace_widget::shortcut_descriptor(field.shortcut_action().expect("shortcut field"))
+        .category()
+}
+
+fn keyboard_groups<'a>(
+    draft: &'a SettingsDraft,
+    invalid: &'a HashMap<SettingsField, String>,
+) -> Vec<Group<'a, Message>> {
+    let mut groups = vec![settings_group("Keyboard shortcuts", "Leave blank to unbind optional actions. Required actions need at least one chord. Fixed chords belong to native surfaces.", vec![setting_field("Filter shortcuts", "", widget::row::with_children(vec![
+        widget::button::text("Filter by pressed key").on_press(Message::Palette(palette_ui::Action::FilterKey)).into(),
+        widget::button::text("Conflicts").on_press(Message::SettingsSearchChanged("conflicts".into())).into(),
+    ]).spacing(space::S).into()).label_in_control()]).compact()];
+    let shortcut_values = draft.keyboard_shortcuts.shortcut_values();
+    for group in workspace_widget::SHORTCUT_CATEGORIES {
+        let mut rows: Vec<_> = SettingsField::SHORTCUTS
+            .into_iter()
+            .filter(|field| shortcut_group(*field) == group)
+            .map(|field| {
+                let action = field.shortcut_action().expect("shortcut field");
+                let value = shortcut_values
+                    .iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered draft")
+                    .1;
+                shortcut_input(
+                    workspace_widget::shortcut_descriptor(action).label,
+                    value,
+                    field,
+                    &draft.keyboard_shortcuts,
+                    invalid,
+                )
+            })
+            .collect();
+        for fixed in settings::FIXED_SHORTCUTS
+            .iter()
+            .chain(settings::TEXT_EDITING_SHORTCUTS)
+            .filter(|fixed| fixed.scope == group)
+        {
+            let keys = fixed.chords.join(", ");
+            let row = widget::row::with_children(vec![
+                design::body(fixed.label)
+                    .width(Length::FillPortion(3))
+                    .into(),
+                design::caption(keys.clone())
+                    .width(Length::FillPortion(4))
+                    .into(),
+                design::caption("Fixed").width(64).into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center);
+            rows.push(
+                setting_field(fixed.label, "", row.into())
+                    .label_in_control()
+                    .keywords(&keys)
+                    .keywords("fixed"),
+            );
+        }
+        if !rows.is_empty() {
+            groups.push(settings_group(group, "Action · Keys · Source · Terminal", rows).compact());
+        }
+    }
+    groups
+}
+
 fn shortcut_input<'a>(
     label: &'static str,
     value: &'a str,
@@ -1548,7 +1619,7 @@ fn shortcut_input<'a>(
         .position(|candidate| *candidate == field)
         .expect("shortcut index");
     let chords = settings::parse_chords(value);
-    let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
+    let default = settings::format_chords(workspace_widget::default_shortcut_keys(action));
     let source = if value == default { "Default" } else { "User" };
     let mut controls: Vec<Element<'a, Message>> = chords
         .iter()
@@ -1593,13 +1664,19 @@ fn shortcut_input<'a>(
                     break;
                 }
                 Ok(binding) => {
-                    if let Some(reason) = settings::shortcut_chord_refusal(binding) {
+                    if let Some(reason) = settings::shortcut_chord_refusal_for(action.id(), binding)
+                    {
                         error = Some(sentence(reason));
                         break;
                     }
                     if let Some((other, _)) =
                         draft.shortcut_values().into_iter().find(|(other, value)| {
                             *other != action
+                                && settings::shortcut_binding_conflicts(
+                                    action.id(),
+                                    other.id(),
+                                    binding,
+                                )
                                 && settings::parse_chords(value).iter().any(|chord| {
                                     settings::parse_shortcut(chord)
                                         .is_ok_and(|candidate| candidate == binding)
@@ -1626,10 +1703,43 @@ fn shortcut_input<'a>(
             .width(Length::FillPortion(4))
             .into(),
         design::caption(source).width(64).into(),
+        {
+            let scope = workspace_widget::shortcut_descriptor(action).scope;
+            if scope.applies_to(workspace_widget::FocusedPane::Terminal)
+                || scope == workspace_widget::ShortcutScope::OutsideTerminal
+            {
+                let action_key = KeyboardShortcuts::action_names()[index];
+                crate::ui_controls::field::checkbox(
+                    draft
+                        .terminal_passthrough_actions
+                        .iter()
+                        .any(|name| name == action_key),
+                )
+                .label("Send to terminal")
+                .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough {
+                    action: action_key.to_owned(),
+                    enabled,
+                })
+                .into()
+            } else {
+                crate::interaction::tooltip(
+                    design::caption("Scoped"),
+                    "Applies only in its pane context; terminals keep these keys",
+                )
+                .into()
+            }
+        },
     ])
     .spacing(space::S)
     .align_y(Alignment::Center);
     let mut children = vec![row.into()];
+    if let Some(reason) = chords
+        .iter()
+        .filter_map(|chord| settings::parse_shortcut(chord).ok())
+        .find_map(|binding| settings::text_editing_shortcut_conflict_for(action.id(), binding))
+    {
+        children.push(design::caption(format!("Scoped conflict: {reason}")).into());
+    }
     if let Some(reason) = &error {
         children.push(
             design::caption(reason.clone())
@@ -1652,11 +1762,31 @@ fn shortcut_input<'a>(
     .keywords(value)
     .keywords(settings::shortcut_search_keywords(value))
     .keywords(format!("keyboard_shortcuts {source} {conflict}"))
+    .keywords("send to terminal")
 }
 
 #[cfg(test)]
 mod keyboard_table_tests {
     use super::*;
+
+    #[test]
+    fn shortcut_rows_match_the_persisted_policy_registry() {
+        let mut table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
+        for (index, name) in KeyboardShortcuts::action_names().iter().enumerate() {
+            table.insert((*name).into(), vec![format!("action-{index}")].into());
+        }
+        let settings: KeyboardShortcuts = table.try_into().unwrap();
+        assert_eq!(
+            SettingsField::SHORTCUTS.len(),
+            KeyboardShortcuts::action_names().len()
+        );
+        for (field, values) in SettingsField::SHORTCUTS.into_iter().zip(settings.actions()) {
+            assert_eq!(
+                workspace_widget::shortcut_keys(field.shortcut_action().unwrap(), &settings),
+                values
+            );
+        }
+    }
 
     #[test]
     fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
@@ -1688,18 +1818,56 @@ mod keyboard_table_tests {
                 .view("Keyboard", "")
                 .unwrap();
             let mut tree = Tree::new(element.as_widget());
-            let height = element
-                .as_widget_mut()
-                .layout(
-                    &mut tree,
-                    &renderer,
-                    &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0)),
-                )
-                .size()
-                .height;
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(960.0, 0.0), Size::new(960.0, 1000.0)),
+            );
+            fn controls_row(node: &layout::Node) -> Option<&layout::Node> {
+                let children = node.children();
+                if children.len() == 4 && (children[2].size().width - 64.0).abs() < 0.1 {
+                    Some(node)
+                } else {
+                    children.iter().find_map(controls_row)
+                }
+            }
+            let row = controls_row(&node).expect("registered shortcut controls row");
             assert!(
-                height <= 64.0,
-                "{field:?} must keep its key chip, Record and Reset on one line; group height was {height}"
+                row.size().height <= 36.0,
+                "{field:?} controls must remain on one line: {:?}",
+                row.size()
+            );
+            for child in row.children() {
+                assert!(
+                    child.bounds().x + child.size().width <= row.size().width + 0.1,
+                    "{field:?} control exceeds row bounds: {:?} in {:?}",
+                    child.bounds(),
+                    row.size()
+                );
+            }
+            let keys = &row.children()[1];
+            for control in keys.children() {
+                assert!(
+                    control.bounds().x + control.size().width <= keys.size().width + 0.1,
+                    "{field:?} key, Record or Reset exceeds key cell: {:?} in {:?}",
+                    control.bounds(),
+                    keys.size()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn git_commands_are_mounted_in_the_keyboard_settings_table() {
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        for label in ["Fetch", "Accept ours and stage", "Trigger completion"] {
+            assert_eq!(
+                keyboard_groups(&draft, &HashMap::new())
+                    .into_iter()
+                    .filter_map(|group| group.view("Keyboard", label))
+                    .count(),
+                1,
+                "registered command {label} must have a visible settings row"
             );
         }
     }

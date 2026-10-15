@@ -878,13 +878,26 @@ impl Cagents {
                 .iter()
                 .filter(|channel| channel.project_id == project.id)
             {
-                let title = channel_display_title(channel);
+                let title = if channel.title.is_empty() {
+                    let branch = project
+                        .worktrees
+                        .iter()
+                        .find(|worktree| {
+                            sidebar::is_primary_worktree(&project.repository, &worktree.path)
+                        })
+                        .and_then(|worktree| worktree.branch.as_deref());
+                    new_channel_title(branch)
+                } else {
+                    channel_display_title(channel).to_owned()
+                };
                 let selected = durable.active_channel == Some(channel.id);
                 let deletion = channel_ui.row_deletion(channel.id);
                 let mut activity = None;
                 let mut unread = false;
                 let mut chats = 0;
                 let mut has_panes = false;
+                let mut directories = Vec::new();
+                let mut outcome = None;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
                     let Some(card) = durable.cards.iter().find(|card| {
@@ -893,6 +906,17 @@ impl Cagents {
                         continue;
                     };
                     has_panes = true;
+                    if let Some(directory) = super::worktree_ui::card_directory(card) {
+                        directories.push(directory);
+                    }
+                    if let Some(next) = state.card_outcome(*id)
+                        && outcome.as_ref().is_none_or(|previous| {
+                            sidebar::outcome_priority(next) > sidebar::outcome_priority(previous)
+                        })
+                    {
+                        outcome = Some(next.clone());
+                    }
+
                     if matches!(&card.kind, CardKind::Chat(_))
                         || matches!(&card.kind, CardKind::Terminal(session)
                             if crate::agent::Provider::recognize_launch(&session.launch).is_some())
@@ -911,16 +935,25 @@ impl Cagents {
                         _ => {}
                     }
                 }
+                let worktree = sidebar::channel_worktree(&project.worktrees, directories);
+                let acknowledged_attention = state
+                    .attention_retained(sidebar::SelectionRow::Channel(channel.id))
+                    && !unread
+                    && !sidebar::attention_state(activity, unread, outcome.as_ref())
+                        .is_some_and(sidebar::AttentionState::needs_attention);
                 let unchanged = project.channels.get(index).is_some_and(|row| {
                     row.id == channel.id
                         && row.title == title
                         && row.selected == selected
                         && row.activity == activity
                         && row.unread == unread
+                        && row.acknowledged_attention == acknowledged_attention
                         && row.chats == chats
                         && row.has_panes == has_panes
                         && row.ordinal == channel.ordinal
                         && row.deletion == deletion
+                        && row.worktree == worktree
+                        && row.outcome == outcome
                 });
                 if !unchanged {
                     let mut row = SidebarChannel::new(
@@ -934,6 +967,8 @@ impl Cagents {
                         channel.ordinal,
                     );
                     row.deletion = deletion;
+                    row.acknowledged_attention = acknowledged_attention;
+                    row.set_attribution(worktree, outcome);
                     if index < project.channels.len() {
                         project.channels[index] = row;
                     } else {
@@ -951,6 +986,16 @@ fn channel_title_from_prompt(prompt: &str) -> Option<String> {
     crate::workspace_model::channel_title_from_prompt(prompt)
 }
 
+fn new_channel_title(branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!(
+            "New channel · {}",
+            branch.strip_prefix("refs/heads/").unwrap_or(branch)
+        ),
+        None => "New channel".into(),
+    }
+}
+
 /// A channel still waiting for its first accepted prompt has to be nameable
 /// anyway: a row has to label it, and a dialog about to destroy it has to say
 /// which one it means.
@@ -966,6 +1011,19 @@ pub(super) fn channel_display_title(channel: &ProjectChannel) -> &str {
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn new_channel_titles_name_the_branch() {
+        assert_eq!(
+            new_channel_title(Some("feature/login")),
+            "New channel · feature/login"
+        );
+        assert_eq!(
+            new_channel_title(Some("refs/heads/main")),
+            "New channel · main"
+        );
+        assert_eq!(new_channel_title(None), "New channel");
+    }
 
     #[test]
     fn missing_daemon_is_not_close_proof_for_a_retained_native_card() {
@@ -1056,6 +1114,12 @@ mod tests {
 
         let _ = app.handle_channel_ui(Action::Create(project));
         let first = app.durable.active_channel.expect("the first channel opens");
+        assert_eq!(app.active_workspace.as_deref(), Some(Path::new("/repo")));
+        app.refresh_sidebar_channels();
+        assert_eq!(
+            app.sidebar_model.projects[0].channels[0].title,
+            "New channel · main"
+        );
         let _ = app.handle_channel_ui(Action::Create(project));
         let second = app
             .durable

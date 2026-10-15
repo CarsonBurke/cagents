@@ -149,7 +149,7 @@ impl State {
     pub(super) fn open(&self) -> bool {
         !matches!(self.phase, Phase::Closed)
     }
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         matches!(
             self.phase,
             Phase::Scanning | Phase::Extracting | Phase::Importing

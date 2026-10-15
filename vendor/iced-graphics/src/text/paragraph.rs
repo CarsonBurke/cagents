@@ -133,6 +133,7 @@ impl core::text::Paragraph for Paragraph {
         buffer.set_size(Some(text.bounds.width), Some(text.bounds.height));
 
         buffer.set_wrap(text::to_wrap(text.wrapping));
+        buffer.set_ellipsize(text::to_ellipsize(text.ellipsize));
 
         buffer.set_rich_text(
             text.content.iter().enumerate().map(|(i, span)| {

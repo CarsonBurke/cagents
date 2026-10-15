@@ -973,10 +973,13 @@ impl Cagents {
                 Ok(editors) => {
                     let choices: Vec<_> =
                         editors.iter().map(|editor| editor.choice.clone()).collect();
-                    self.sidebar_model.external_editors = choices.clone();
+                    if self.sidebar_model.external_editors.as_ref() != choices.as_slice() {
+                        self.sidebar_model.external_editors = choices.into();
+                    }
                     for runtime in self.cards.values_mut() {
                         if let CardRuntime::Repository(runtime) = runtime {
-                            runtime.set_external_editors(choices.clone());
+                            runtime
+                                .set_external_editors(self.sidebar_model.external_editors.clone());
                         }
                     }
                     self.project_ui.editors = editors;
@@ -1027,6 +1030,13 @@ impl Cagents {
                     return Task::none();
                 }
                 match command {
+                    ProjectCommand::MarkRead => {
+                        return worktree_id.map_or_else(Task::none, |worktree| {
+                            self.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+                                project_id, worktree,
+                            )))
+                        });
+                    }
                     ProjectCommand::CopyPath => {
                         return iced::clipboard::write(target.path.display().to_string());
                     }
@@ -1157,6 +1167,11 @@ impl Cagents {
                     }
                     ProjectCommand::NewChannel => {
                         self.project_ui.dialog = None;
+                        if worktree_id.is_some() {
+                            let select = self.select_worktree(target.path.clone(), false);
+                            let thread = self.new_native_thread_at(target.path);
+                            return Task::batch([select, thread]);
+                        }
                         return cosmic::task::message(Message::Sidebar(
                             SidebarAction::NewChannel { project_id },
                         ));
@@ -2361,6 +2376,54 @@ mod tests {
             .iter()
             .flat_map(|project| &project.worktrees)
             .find(|worktree| worktree.id == id)
+    }
+
+    #[test]
+    fn worktree_context_new_thread_uses_the_linked_worktree_directory() {
+        for registered in [false, true] {
+            let repository = tempfile::tempdir().unwrap();
+            let linked_directory = tempfile::tempdir().unwrap();
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.path().to_owned(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                linked_directory.path().to_owned(),
+                Some("feature/login".into()),
+            );
+            let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
+            if registered {
+                let row = sidebar::SelectionRow::Worktree(project, linked.id);
+                let region = crate::input_trace::KeyboardRegion::from(
+                    crate::workspace_widget::FocusedPane::SidebarRows,
+                );
+                let _event = app
+                    .input_trace
+                    .scoped_keyboard_focus(region, Some(sidebar::selection_row_focus_id(row)));
+                drop(app.run_workspace_command(
+                    crate::workspace_widget::GlobalShortcut::NewThread,
+                    keyboard::Modifiers::empty(),
+                ));
+            } else {
+                drop(app.handle_project_action(Action::Command {
+                    project_id: project,
+                    worktree_id: Some(linked.id),
+                    command: ProjectCommand::NewChannel,
+                }));
+            }
+            assert_eq!(
+                app.active_workspace.as_deref(),
+                Some(linked_directory.path())
+            );
+            assert!(
+                app.durable.channels.is_empty(),
+                "a worktree action opens a thread directly"
+            );
+            assert!(app.durable.cards.iter().any(|card| matches!(&card.kind,
+            CardKind::Chat(session) if session.launch.recipe.working_directory == linked_directory.path())));
+        }
     }
 
     #[test]

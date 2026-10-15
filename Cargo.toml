@@ -61,6 +61,8 @@ ui = [
     "image/ico",
     "image/tiff",
     "dep:imara-diff",
+    "dep:ignore",
+    "dep:regex",
     "dep:jiff",
     "dep:libcosmic",
     "dep:lsp-types",
@@ -135,6 +137,7 @@ cookie = { version = "0.18", optional = true }
 net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
 yaml-rust = { version = "0.4.5", optional = true }
 unicode-width = { version = "0.2.2", optional = true }
+regex = { version = "1.13", optional = true }
 unicode-casefold = { version = "0.2", optional = true }
 unicode-linebreak = { version = "0.1", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
@@ -173,6 +176,7 @@ libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 # Pinned to the version `async-lsp` 0.2.4 depends on so protocol types unify.
 lsp-types = { version = "0.95", optional = true }
+ignore = { version = "0.4", optional = true }
 notify = { version = "8.2", optional = true }
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
