@@ -261,11 +261,13 @@ impl ReviewInputBarrier {
             shared.native_review = None;
         }
     }
-    pub(crate) fn confirm_review(
-        &self,
-        previous: Option<uuid::Uuid>,
-        current: Option<uuid::Uuid>,
-    ) {
+    /// A confirmed blur belongs to this whole window, including a Review
+    /// whose widget was evicted before its parent accepted the local callback.
+    /// Retain consumed physical releases and admitted key ownership.
+    pub(crate) fn end_window_review(&self) {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).native_review = None;
+    }
+    pub(crate) fn confirm_review(&self, previous: Option<uuid::Uuid>, current: Option<uuid::Uuid>) {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if shared.closing {
             return;
@@ -366,10 +368,16 @@ impl ReviewInputBarrier {
         }
     }
     #[cfg(test)]
-    pub(super) fn pending_counts(&self) -> (usize, usize) {
+    pub(crate) fn pending_counts(&self) -> (usize, usize) {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         shared.reap();
         (shared.owned.len(), shared.retiring.len())
+    }
+    #[cfg(test)]
+    pub(super) fn confirmed_held_keys(&self) -> usize {
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        shared.reap();
+        shared.owned.iter().filter(|key| key.confirmed).count()
     }
     /// Called only after the application commits its normal exit. Review has
     /// ended and no subsequent native event may create a new key lease.
@@ -552,6 +560,7 @@ pub(super) struct State {
     view: Option<View>,
     published: Option<Instant>,
     pub review: bool,
+    pending_review_exit: bool,
     pub selection: Option<TextSelection>,
     pub barrier: ReviewInputBarrier,
 }
@@ -619,6 +628,7 @@ impl State {
             return None;
         }
         if !view.focused && self.view.is_some_and(|old| old.focused) {
+            self.pending_review_exit |= self.review;
             self.review = false;
             self.selection = None;
         }
@@ -642,6 +652,11 @@ impl State {
             }
         }
         None
+    }
+    /// A native tree publication can observe focus loss before update runs.
+    /// Keep that local exit until a mutable event turn can notify the App.
+    pub fn take_review_exit(&mut self) -> bool {
+        std::mem::take(&mut self.pending_review_exit)
     }
     fn row_index(&self, node: NodeId) -> Option<usize> {
         self.row_ids

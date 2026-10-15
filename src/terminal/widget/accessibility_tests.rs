@@ -852,6 +852,20 @@ fn native_actions_from_replaced_same_id_tree_cannot_enter_successor_review() {
 }
 
 #[test]
+fn visible_review_blur_publishes_one_current_attachment_exit() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(&peer, "review-blur", ReviewInputBarrier::default(), true, true);
+    let mut tree = widget_tree(&widget);
+    let _ = widget.a11y_nodes(Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable);
+    assert_eq!(dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Unfocused)), vec![Message::Review(false)]);
+    assert!(!reviewing(&tree));
+    assert!(!widget.review_active);
+    assert!(dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Unfocused)).is_empty());
+    assert_no_pty_input(&peer.fence());
+}
+
+#[test]
 fn temporary_detach_keeps_the_same_attachment_review_and_visible_selection() {
     let mut peer = Peer::new();
     let renderer = renderer();
@@ -1883,24 +1897,57 @@ pub(crate) struct HeldKeyWidget {
     _renderer: Renderer,
 }
 impl HeldKeyWidget {
+    pub(crate) fn wait_for_press_admission(&self) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self._widget.review_input_barrier.confirmed_held_keys() != 1 {
+            assert!(Instant::now() < deadline, "original press was not authenticated and accepted");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    pub(crate) fn exit_review_through_native_focus_publication(&mut self) -> Vec<bool> {
+        let node = layout::Node::new(Size::new(640.0, 320.0));
+        let _ = self._widget.a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
+        assert!(reviewing(&self._tree));
+        // The actual winit native focus path operates first. Its next tree
+        // publication can observe the new focus before the A11y event update.
+        let mut unfocus = operation::unfocus();
+        self._widget.operate(&mut self._tree, Layout::new(&node), &self._renderer, &mut unfocus);
+        let _ = self._widget.a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
+        assert!(!reviewing(&self._tree));
+        let messages = dispatch(&mut self._widget, &mut self._tree, &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now())));
+        let exits = messages.into_iter().filter_map(|message| match message {
+            Message::Review(active) => Some(active), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(exits, vec![false]);
+        assert!(dispatch(&mut self._widget, &mut self._tree, &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now()))).is_empty());
+        exits
+    }
+    pub(crate) fn acknowledge_review_exit(&mut self, revision: u64) {
+        self._widget.review_active = false;
+        self._widget.suppress_focus_reports = false;
+        self._widget.review_revision = revision;
+        self._widget.diff(&mut self._tree);
+        dispatch(&mut self._widget, &mut self._tree, &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now())));
+    }
+    pub(crate) fn wait_key_pairs(&self, expected: (usize, usize)) {
+        wait_key_counts(&self._widget.review_input_barrier, expected);
+    }
     pub(crate) fn enter_review(&mut self) {
-        self._widget.review_active = true;
+        let node = layout::Node::new(Size::new(640.0, 320.0));
+        let nodes = self._widget.a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
+        let root = nodes.root()[0].id().clone();
+        assert_eq!(dispatch(&mut self._widget, &mut self._tree, &self._renderer,
+            action(root, Action::Focus, None)), vec![Message::Review(true)]);
+        // Match the App's acknowledgment after the actual native entry. A
+        // revision acknowledgment alone must never manufacture a local entry.
         self._widget.suppress_focus_reports = true;
         self._widget.review_revision += 1;
-        dispatch(
-            &mut self._widget,
-            &mut self._tree,
-            &self._renderer,
-            Event::Window(window::Event::RedrawRequested(Instant::now())),
-        );
-        assert!(
-            self._tree
-                .state
-                .downcast_ref::<WidgetState>()
-                .a11y
-                .borrow()
-                .review
-        );
+        dispatch(&mut self._widget, &mut self._tree, &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now())));
+        assert!(reviewing(&self._tree));
     }
 }
 pub(crate) fn hold_key_in_widget(
