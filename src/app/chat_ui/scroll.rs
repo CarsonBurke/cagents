@@ -1,5 +1,8 @@
 //! Layout-time anchoring around iced's native scrollable. Its own state remains
 //! authoritative for wheel, thumb, keyboard and touch input.
+mod block;
+pub(super) use block::block;
+
 use super::view::Scroll;
 use super::*;
 use iced::advanced::{
@@ -27,16 +30,17 @@ pub(super) type Observations = Rc<std::cell::RefCell<HashMap<Option<String>, Scr
 /// Persist only reader geometry and stable row IDs across native tree eviction.
 /// No source text, widgets, fonts or shaped paragraphs are retained here.
 #[derive(Clone, Default)]
-pub(super) struct Memory(Rc<std::cell::RefCell<Anchor>>);
+pub(super) struct Memory(Rc<std::cell::RefCell<Anchor>>, Rc<std::cell::RefCell<block::Positions>>);
 struct ReaderState { memory: Memory, restore: bool }
 
 impl Memory {
-    pub fn clear(&self) { *self.0.borrow_mut() = Anchor::default(); }
+    pub fn clear(&self) { *self.0.borrow_mut() = Anchor::default(); *self.1.borrow_mut() = block::Positions::default(); }
     pub fn retain_children(&self, children: &[chat::Subagent]) {
         let mut state = self.0.borrow_mut();
         let active = state.active.and_then(|index| state.contexts.get(index)).map(|context| context.subagent.clone());
         state.contexts.retain(|context| context.subagent.as_ref().is_none_or(|id| children.iter().any(|child| &child.id == id)));
         state.active = active.and_then(|active| state.contexts.iter().position(|context| context.subagent == active));
+        self.1.borrow_mut().entries.retain(|(context, _), _| context.as_ref().is_none_or(|id| children.iter().any(|child| &child.id == id)));
         if state.reported.as_ref().is_some_and(|report| report.subagent.as_ref().is_some_and(|id| !children.iter().any(|child| &child.id == id))) {
             state.reported = None;
         }

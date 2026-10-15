@@ -226,11 +226,20 @@ impl ToolText {
         &self, theme: crate::settings::EditorSyntaxTheme, limit: Option<(f32, bool)>,
         target: Target, find: Option<&str>, logical: selectable_prose::Logical,
     ) -> Element<'static, Message> {
-        self.surface(theme, limit, target, find, Some(logical))
+        self.surface(theme, limit, target, find, Some(logical), None)
     }
 
     /// `limit` is the height the text scrolls within and whether it follows
     /// its end.
+    pub(super) fn view_logical_with_reader(
+        &self, theme: crate::settings::EditorSyntaxTheme, limit: Option<(f32, bool)>,
+        target: Target, find: Option<&str>, logical: selectable_prose::Logical,
+        memory: scroll::Memory, context: Option<String>,
+    ) -> Element<'static, Message> {
+        let identity = logical.identity;
+        self.surface(theme, limit, target, find, Some(logical), Some((memory, context, identity)))
+    }
+
     fn surface(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
@@ -238,6 +247,7 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
         logical: Option<selectable_prose::Logical>,
+        reader: Option<(scroll::Memory, Option<String>, u64)>,
     ) -> Element<'static, Message> {
         let mut syntax = self.syntax.borrow_mut();
         if self.text.len() > CachedItem::HIGHLIGHT_LIMIT { *syntax = None; }
@@ -272,13 +282,14 @@ impl ToolText {
                 design::scrollbar(),
             ))
             .height(Length::Shrink);
-        if follows {
-            widget::container(scroll::tool_output(scrolled.anchor_bottom()))
-                .max_height(height)
-                .into()
-        } else {
-            widget::container(scrolled).max_height(height).into()
-        }
+        let scrolled: Element<'static, Message> = if follows {
+            scroll::tool_output(scrolled.anchor_bottom())
+        } else { scrolled.into() };
+        let scrolled = match reader {
+            Some((memory, context, identity)) => scroll::block(scrolled, memory, context, identity, follows),
+            None => scrolled,
+        };
+        widget::container(scrolled).max_height(height).into()
     }
 }
 

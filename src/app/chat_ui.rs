@@ -972,6 +972,8 @@ struct CachedItem {
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
+    reader_memory: scroll::Memory,
+    reader_context: Option<String>,
     /// Each fenced block the Markdown parsed, ready to draw, keyed by the
     /// block's language and text: what a frame looks a block up by. The
     /// palette is the runtime's, applied when the block is highlighted, so a
@@ -1028,6 +1030,8 @@ impl CachedItem {
         coordination: Option<chat::coordination::Coordination>,
     ) -> Self {
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
+        let reader_memory = previous.as_ref().map(|cached| cached.reader_memory.clone()).unwrap_or_default();
+        let reader_context = previous.as_ref().and_then(|cached| cached.reader_context.clone());
         let (
             image,
             image_source,
@@ -1106,6 +1110,7 @@ impl CachedItem {
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
+            reader_memory, reader_context,
             blocks: HashMap::new(),
             open: None,
             detail: None,
@@ -2326,6 +2331,8 @@ impl Runtime {
                 .filter(|previous| !Arc::ptr_eq(previous, item))
                 .is_some_and(|previous| self.handle().is_some_and(|handle| handle.known_append(previous, item)));
             if let Some(cached) = self.cache.get_mut(&item.id) {
+                cached.reader_memory = self.scroll_memory.clone();
+                cached.reader_context.clone_from(&self.selected_subagent);
                 if matches!(item.content, ItemContent::Image { .. }) {
                     // Snapshot items are immutable. A retained Arc makes the
                     // common unchanged-item check constant-time; compare image
@@ -2375,6 +2382,8 @@ impl Runtime {
                 cached.image_item = Some(item.clone());
             }
             cached.item = Some(item.clone());
+            cached.reader_memory = self.scroll_memory.clone();
+            cached.reader_context.clone_from(&self.selected_subagent);
             self.cache.insert(item.id.clone(), cached);
             presentation_changed = true;
         }
