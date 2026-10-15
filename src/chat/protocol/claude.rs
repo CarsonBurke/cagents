@@ -10312,6 +10312,10 @@ for line in sys.stdin:
             |_| {},
         )
         .unwrap();
+        // Spawn completion precedes actor.run(initial). Cross its ordered
+        // metadata command barrier before any fixture inspects startup fields;
+        // this issues no SDK request and does not hydrate the transcript.
+        let _ = handle.account_switch_generation().unwrap();
         (handle, log)
     }
 
