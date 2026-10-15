@@ -5526,7 +5526,7 @@ fn project_view<'a>(
                 .iter()
                 .any(|worktree| project.worktree_attention(worktree.id).unread);
         let outcome = entity.channels.iter().filter_map(|channel| channel.outcome.as_ref())
-            .chain(project.attention.values().filter_map(|summary| summary.outcome))
+            .chain(entity.worktrees.iter().filter_map(|worktree| project.worktree_attention(worktree.id).outcome))
             .max_by_key(|outcome| outcome_priority(outcome));
         if let Some(indicator) = outcome_indicator(activity, unread, outcome) {
             identity = identity.push(indicator);
