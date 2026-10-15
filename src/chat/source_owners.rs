@@ -36,27 +36,29 @@ pub(crate) fn reader_capacity()->usize { READER_CAPACITY.load(std::sync::atomic:
 /// A weak reference follows the actual immutable allocation, including queued
 /// render replies and offline writers. It never keeps source text alive.
 #[derive(Clone)]
-enum WeakOwner { Item(std::sync::Weak<Item>), Patch(std::sync::Weak<str>) }
+enum WeakOwner { Item(std::sync::Weak<Item>), Patch(std::sync::Weak<str>), Raw(std::sync::Weak<str>) }
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]
 struct OwnerId(u8,usize);
 #[derive(Clone,Copy)]
-enum Owner<'a> { Item(&'a Arc<Item>), Patch(&'a Arc<str>) }
+enum Owner<'a> { Item(&'a Arc<Item>), Patch(&'a Arc<str>), Raw(&'a Arc<str>) }
 impl Owner<'_> {
     fn id(self)->OwnerId {match self {
         Self::Item(item)=>OwnerId(0,Arc::as_ptr(item) as usize),
         Self::Patch(text)=>OwnerId(1,Arc::as_ptr(text) as *const () as usize),
+        Self::Raw(text)=>OwnerId(2,Arc::as_ptr(text) as *const () as usize),
     }}
-    fn weak(self)->WeakOwner {match self {Self::Item(item)=>WeakOwner::Item(Arc::downgrade(item)),Self::Patch(text)=>WeakOwner::Patch(Arc::downgrade(text))}}
+    fn weak(self)->WeakOwner {match self {Self::Item(item)=>WeakOwner::Item(Arc::downgrade(item)),Self::Patch(text)=>WeakOwner::Patch(Arc::downgrade(text)),Self::Raw(text)=>WeakOwner::Raw(Arc::downgrade(text))}}
 }
 impl WeakOwner {
-    fn id(&self)->OwnerId {match self {Self::Item(item)=>OwnerId(0,item.as_ptr() as usize),Self::Patch(text)=>OwnerId(1,text.as_ptr() as *const () as usize)}}
-    fn strong_count(&self)->usize {match self {Self::Item(item)=>item.strong_count(),Self::Patch(text)=>text.strong_count()}}
+    fn id(&self)->OwnerId {match self {Self::Item(item)=>OwnerId(0,item.as_ptr() as usize),Self::Patch(text)=>OwnerId(1,text.as_ptr() as *const () as usize),Self::Raw(text)=>OwnerId(2,text.as_ptr() as *const () as usize)}}
+    fn strong_count(&self)->usize {match self {Self::Item(item)=>item.strong_count(),Self::Patch(text)|Self::Raw(text)=>text.strong_count()}}
 }
 #[derive(Default)]
 struct Owners {
     entries:Vec<(WeakOwner,usize)>,
     provenance:HashMap<OwnerId,ResidentSource>,
     patch_provenance:HashMap<OwnerId,ResidentPatch>,
+    raw_provenance:HashMap<OwnerId,ResidentRaw>,
     last_emitted:Option<Usage>,
     reserved:usize,
     turnover:Option<(WeakOwner,WeakOwner)>,
@@ -71,6 +73,7 @@ impl Owners {
         let live:HashSet<_>=self.entries.iter().map(|(owner,_)|owner.id()).collect();
         self.provenance.retain(|pointer,_|live.contains(pointer));
         self.patch_provenance.retain(|pointer,_|live.contains(pointer));
+        self.raw_provenance.retain(|pointer,_|live.contains(pointer));
         if self.turnover.as_ref().is_some_and(|(old,new)|old.strong_count()==0 || new.strong_count()==0) {self.turnover=None;}
     }
     fn bytes(&self)->usize {self.entries.iter().map(|(_,bytes)|*bytes).sum()}
@@ -144,6 +147,41 @@ pub(crate) fn resident_patch(text:&Arc<str>)->Option<ResidentPatch> {
     let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());state.prune();emit(pool,&mut state);
     state.patch_provenance.get(&Owner::Patch(text).id()).cloned()
 }
+/// Original calls have their own typed provenance. A derived patch is never
+/// promoted to original JSON, and canonical JSON does not promise wire spacing.
+#[derive(Clone,Debug,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+pub(crate) struct ResidentRaw {
+    pub source:SourceKey,
+    pub field:super::cache::raw::RawSourceField,
+    pub epoch:SourceEpoch,
+    pub source_len:usize,
+    pub metadata:super::cache::raw::RawSourceMetadata,
+}
+impl ResidentRaw {
+    fn valid(&self,text:&str)->bool {
+        use super::cache::raw::{RawSourceField,RawRepresentation};
+        !self.source.source_id.is_empty() && self.source_len==text.len() && text.len()<=SOURCE_BYTES
+            && self.metadata.complete_call && !self.metadata.tool_name.is_empty()
+            && matches!((self.field,self.metadata.representation),
+                (RawSourceField::ToolInput,RawRepresentation::StreamJson|RawRepresentation::CanonicalJson)
+                |(RawSourceField::CommandCall,RawRepresentation::CommandMetadataJson))
+    }
+}
+#[derive(Clone,Debug,Default,serde::Serialize,serde::Deserialize)]
+pub(crate) struct ResidentRawCalls {pub calls:Vec<(Arc<str>,ResidentRaw)>}
+pub(crate) fn admit_raw(text:&Arc<str>,record:&ResidentRaw,replaced:Option<&Arc<str>>)->Admission {
+    if !record.valid(text) {return Admission::Capacity;}
+    let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());
+    let id=Owner::Raw(text).id();
+    if state.raw_provenance.get(&id).is_some_and(|previous|previous!=record) {return Admission::Capacity;}
+    let result=state.admit_owner(Owner::Raw(text),text.len(),replaced.map(Owner::Raw));
+    if result==Admission::Ready {state.raw_provenance.insert(id,record.clone());}
+    emit(pool,&mut state);result
+}
+pub(crate) fn resident_raw(text:&Arc<str>)->Option<ResidentRaw> {
+    let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());state.prune();emit(pool,&mut state);
+    state.raw_provenance.get(&Owner::Raw(text).id()).cloned()
+}
 pub(crate) fn resident_sources(snapshot:&Snapshot)->Vec<ResidentSource> {
     let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());state.prune();emit(pool,&mut state);resident_sources_in(&state,snapshot)
 }
@@ -169,8 +207,9 @@ impl Reservation {
     pub(crate) fn adopt(self,items:&[(Arc<Item>,ResidentSource)])->Result<(),ReserveError> {self.adopt_mixed(items,&[])}
     /// Only the exact source entries recorded in the private cache header are
     /// selected here; raw bounded fragments are accounted separately.
-    pub(crate) fn adopt_mixed(mut self,items:&[(Arc<Item>,ResidentSource)],patches:&[(Arc<str>,ResidentPatch)])->Result<(),ReserveError> {
-        let mut unique=HashMap::new();let mut prose=HashMap::new();let mut patch_proofs=HashMap::new();
+    pub(crate) fn adopt_mixed(self,items:&[(Arc<Item>,ResidentSource)],patches:&[(Arc<str>,ResidentPatch)])->Result<(),ReserveError> {self.adopt_all(items,patches,&[])}
+    pub(crate) fn adopt_all(mut self,items:&[(Arc<Item>,ResidentSource)],patches:&[(Arc<str>,ResidentPatch)],raw:&[(Arc<str>,ResidentRaw)])->Result<(),ReserveError> {
+        let mut unique=HashMap::new();let mut prose=HashMap::new();let mut patch_proofs=HashMap::new();let mut raw_proofs=HashMap::new();
         let mut roots=HashMap::new();let mut root_files=HashMap::new();let mut total=0usize;
         for (item,record) in items {
             let bytes=text_bytes(item).ok_or(ReserveError::InvalidPayload)?;
@@ -188,16 +227,26 @@ impl Reservation {
             if let Some(previous)=patch_proofs.insert(id,record) {if previous!=record {return Err(ReserveError::InvalidPayload);}}
             if unique.insert(id,(owner,bytes)).is_none() {total=total.checked_add(bytes).ok_or(ReserveError::InvalidPayload)?;}
         }
+        let mut raw_keys=HashMap::new();
+        for (text,record) in raw {
+            if !record.valid(text) {return Err(ReserveError::InvalidPayload);}
+            let owner=Owner::Raw(text);let id=owner.id();let bytes=text.len();
+            if raw_keys.insert((&record.source,record.field),id).is_some_and(|previous|previous!=id) {return Err(ReserveError::InvalidPayload);}
+            if let Some(previous)=raw_proofs.insert(id,record) {if previous!=record {return Err(ReserveError::InvalidPayload);}}
+            if unique.insert(id,(owner,bytes)).is_none() {total=total.checked_add(bytes).ok_or(ReserveError::InvalidPayload)?;}
+        }
         if total!=self.bytes {return Err(ReserveError::InvalidPayload);}
         let mut owners=self.pool.lock().unwrap_or_else(|error|error.into_inner());owners.prune();
         if prose.iter().any(|(id,record)|owners.provenance.get(id).is_some_and(|existing|existing!=*record))
-            || patch_proofs.iter().any(|(id,record)|owners.patch_provenance.get(id).is_some_and(|existing|existing!=*record)) {
+            || patch_proofs.iter().any(|(id,record)|owners.patch_provenance.get(id).is_some_and(|existing|existing!=*record))
+            || raw_proofs.iter().any(|(id,record)|owners.raw_provenance.get(id).is_some_and(|existing|existing!=*record)) {
             drop(owners);return Err(ReserveError::InvalidPayload);
         }
         owners.reserved-=self.bytes;self.bytes=0;
         for (id,(owner,bytes)) in unique {if !owners.entries.iter().any(|(existing,_)|existing.id()==id) {owners.entries.push((owner.weak(),bytes));}}
         for (id,record) in prose {owners.provenance.insert(id,record.clone());}
         for (id,record) in patch_proofs {owners.patch_provenance.insert(id,record.clone());}
+        for (id,record) in raw_proofs {owners.raw_provenance.insert(id,record.clone());}
         emit(&self.pool,&mut owners);Ok(())
     }
 }
@@ -316,6 +365,36 @@ mod tests {
         }
         let second_record=patch_record(&decoded_again,1);
         reserve_in(pool.clone(),first.len()*2,first.len()).unwrap().adopt_mixed(&[],&[(first,record),(decoded_again,second_record)]).unwrap();
+    }
+
+    fn raw_record(text:&str)->ResidentRaw {
+        use super::super::cache::raw::{RawSourceField,RawSourceMetadata,RawRepresentation};
+        ResidentRaw {source:SourceKey {agent_id:None,source_id:"opaque-original-call".into()},field:RawSourceField::ToolInput,
+            epoch:source_epoch(5),source_len:text.len(),metadata:RawSourceMetadata {tool_name:"Write".into(),representation:RawRepresentation::StreamJson,complete_call:true}}
+    }
+    #[test]
+    fn raw_call_adoption_tracks_exact_weak_owner_and_frozen_representation() {
+        let text:Arc<str>=Arc::from("{ \"path\": \"original.rs\" }");let weak=Arc::downgrade(&text);let record=raw_record(&text);
+        let pool=Arc::new(Mutex::new(Owners::default()));
+        let reservation=reserve_in(pool.clone(),text.len(),text.len()).unwrap();
+        reservation.adopt_all(&[],&[],&[(text.clone(),record.clone())]).unwrap();
+        {let state=pool.lock().unwrap();assert_eq!(state.bytes(),text.len());assert_eq!(state.raw_provenance[&Owner::Raw(&text).id()],record);assert!(state.patch_provenance.is_empty());}
+        drop(text);assert!(weak.upgrade().is_none());let mut state=pool.lock().unwrap();state.prune();assert_eq!(state.bytes(),0);assert!(state.raw_provenance.is_empty());
+    }
+    #[test]
+    fn raw_restore_rejects_duplicate_decoded_keys_incomplete_or_mislabeled_sources() {
+        use super::super::cache::raw::RawSourceField;
+        let text:Arc<str>=Arc::from("{}");let duplicate:Arc<str>=Arc::from("{}");let record=raw_record(&text);
+        let pool=Arc::new(Mutex::new(Owners::default()));
+        let reservation=reserve_in(pool.clone(),4,2).unwrap();
+        assert_eq!(reservation.adopt_all(&[],&[],&[(text.clone(),record.clone()),(duplicate,record.clone())]),Err(ReserveError::InvalidPayload));
+        assert_eq!(pool.lock().unwrap().reserved,0);
+        for change in 0..3 {
+            let mut invalid=record.clone();match change {0=>invalid.metadata.complete_call=false,1=>invalid.field=RawSourceField::CommandCall,_=>invalid.source_len+=1};
+            let reservation=reserve_in(pool.clone(),text.len(),text.len()).unwrap();
+            assert_eq!(reservation.adopt_all(&[],&[],&[(text.clone(),invalid)]),Err(ReserveError::InvalidPayload));
+            assert_eq!(pool.lock().unwrap().reserved,0);
+        }
     }
 
 }
