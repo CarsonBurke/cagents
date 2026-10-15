@@ -2038,9 +2038,8 @@ fn build_router(context: &SessionContext) -> Router<RouterState> {
     router.request::<request::RegisterCapability, _>(|_, _| std::future::ready(Ok(())));
     router.request::<request::UnregisterCapability, _>(|_, _| std::future::ready(Ok(())));
     router.request::<request::WorkDoneProgressCreate, _>(|_, _| std::future::ready(Ok(())));
-    // No per-server configuration is exposed, so every requested section is
-    // answered with null rather than an error, which servers read as "use
-    // your defaults".
+    // Return configured dotted sections; absent sections use JSON null so
+    // the server can retain its own defaults.
     router.request::<request::WorkspaceConfiguration, _>(|state, params| {
         std::future::ready(Ok(params.items.into_iter().map(|item|features::configuration(&state.configuration,item.section.as_deref())).collect()))
     });
@@ -2210,7 +2209,7 @@ fn client_capabilities() -> lsp_types::ClientCapabilities {
             work_done_progress: Some(true),
             ..Default::default()
         }),
-        workspace:Some(lsp_types::WorkspaceClientCapabilities {apply_edit:Some(true),configuration:Some(true),workspace_edit:Some(lsp_types::WorkspaceEditClientCapabilities {document_changes:Some(true),change_annotation_support:Some(lsp_types::ChangeAnnotationWorkspaceEditClientCapabilities {groups_on_label:Some(true)}),..Default::default()}),..Default::default()}),
+        workspace:Some(lsp_types::WorkspaceClientCapabilities {apply_edit:Some(true),configuration:Some(true),workspace_edit:Some(lsp_types::WorkspaceEditClientCapabilities {document_changes:Some(true),change_annotation_support:Some(lsp_types::ChangeAnnotationWorkspaceEditClientCapabilities {groups_on_label:Some(false)}),..Default::default()}),..Default::default()}),
         // No alternative position encoding is advertised, so the server must
         // use UTF-16, which is what the conversion layer above implements.
         ..Default::default()
@@ -8940,6 +8939,7 @@ mod tests {
             let doc=LspDocumentId(1);let events=manager.events();manager.open_for_test(doc,&file,&worktree,rust_language(),1,"a𝄞foo\n");
             let handle=handle_of(&slot).await;await_ready(&events,doc).await;
             assert_eq!(handle.wait_for("initialize").await.params["initializationOptions"],json!({"check":{"command":"clippy"}}));
+            assert_eq!(handle.entries("initialize")[0].params["capabilities"]["workspace"]["workspaceEdit"]["changeAnnotationSupport"]["groupsOnLabel"],json!(false));
             assert_eq!(handle.wait_for("workspace/didChangeConfiguration").await.params["settings"]["rust-analyzer"]["check"]["command"],json!("clippy"));
             assert!(manager.capabilities(doc).rename);assert!(manager.signature_trigger(doc,'('));
             let request=manager.request_prepare_rename(doc,LspPosition::new(0,2));
