@@ -146,6 +146,11 @@ enum Command {
         revision: u64,
         reply: Sender<Result<(), String>>,
     },
+    StopSession {
+        instance: uuid::Uuid,
+        deadline: std::time::Instant,
+        reply: Sender<super::ipc::TerminalCloseResult>,
+    },
     CloseChecked {
         allow_active: bool,
         deadline: std::time::Instant,
@@ -305,6 +310,32 @@ enum Visibility {
 }
 
 type WakeCallback = dyn Fn(TerminalWake) + Send + Sync + 'static;
+
+/// Admitted stop of an exact worker. Waiting and joining happen after global
+/// admission is released. Dropping this receipt never reopens worker input.
+pub(crate) struct TerminalSessionStop {
+    handle: TerminalHandle,
+    result: Receiver<super::ipc::TerminalCloseResult>,
+}
+impl TerminalSessionStop {
+    pub(crate) fn finish(self, deadline: std::time::Instant) -> Result<(), String> {
+        match self.result.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(super::ipc::TerminalCloseResult::Closed) => {},
+            Ok(other) => return Err(format!("Session stop cleanup is unconfirmed: {other:?}")),
+            Err(error) => return Err(format!("Session stop cleanup is unconfirmed; its owner remains retained: {error}")),
+        }
+        if let Some(worker) = self.handle.take_worker_until(deadline).map_err(|error|error.to_string())? {
+            if !join_worker_until(worker, &self.handle.inner.published, deadline, true) {
+                return Err("Terminal stop cleanup exceeded its deadline; its exact owner remains retained".into());
+            }
+        }
+        if !self.handle.is_completed() {
+            return Err("Terminal stop cleanup has not been confirmed".into());
+        }
+        self.handle.release_completed_holder();
+        Ok(())
+    }
+}
 
 enum ArchivePhase {
     Live,
@@ -1235,7 +1266,7 @@ impl TerminalHandle {
     pub(crate) fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
         {
             let mut order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
-            if order.handoff { return Err("Terminal ownership is already changing".into()); }
+            if order.handoff || order.closing { return Err("Terminal ownership is already changing or stopping".into()); }
             order.handoff = true;
         }
         let reopen = || self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner()).handoff = false;
@@ -1269,6 +1300,36 @@ impl TerminalHandle {
     /// history, enqueue worker commands or authorize closing a live shell.
     pub(crate) fn close_observation(&self) -> Result<(u64, bool), String> {
         self.inner.published.close_observation()
+    }
+
+    /// Atomically fence input, priority interrupts and ownership changes on
+    /// this exact worker, then publish its internal stop control. No cleanup
+    /// wait or process inspection occurs while the caller holds admission.
+    pub(crate) fn fence_session_stop(&self, instance: uuid::Uuid, deadline: std::time::Instant) -> Result<TerminalSessionStop, String> {
+        let published = &self.inner.published;
+        let phase = published.archive.lock().unwrap_or_else(|p|p.into_inner());
+        let mut order = published.input_order.lock().unwrap_or_else(|p|p.into_inner());
+        if published.execution_instance != instance {
+            return Err("The terminal worker was replaced; its replacement was preserved".into());
+        }
+        if order.handoff || matches!(*phase, ArchivePhase::Preparing) {
+            return Err("Terminal ownership is changing; refresh before stopping it".into());
+        }
+        let (reply, result) = crossbeam_channel::bounded(1);
+        if published.completed.load(Ordering::Acquire) {
+            order.closing = true;
+            let _ = reply.send(super::ipc::TerminalCloseResult::Closed);
+        } else {
+            if !matches!(*phase, ArchivePhase::Live) {
+                return Err("Terminal ownership is not live or confirmed complete".into());
+            }
+            let mut priority = published.priority_close.lock().unwrap_or_else(|p|p.into_inner());
+            if priority.is_some() { return Err("A terminal close is already pending; refresh after it settles".into()); }
+            order.closing = true;
+            *priority = Some(Command::StopSession {instance, deadline, reply});
+            let _ = published.capture_tx.try_send(());
+        }
+        Ok(TerminalSessionStop {handle:self.clone(),result})
     }
 
     /// Terminal providers currently expose no authoritative turn revision or
@@ -1447,6 +1508,9 @@ impl TerminalHandle {
     /// holder. Serialize with completion, then transfer any final retained
     /// screen; a live parser that cannot serialize is honestly screen-lost.
     pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
+        if self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner()).closing {
+            return Err("Terminal session stop already owns cleanup".into());
+        }
         let (reply, result) = crossbeam_channel::bounded(1);
         if self
             .send_command(Command::PreserveForRestart(reply))
@@ -1549,7 +1613,7 @@ impl TerminalHandle {
             .input_order
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if order.handoff { return Err(TerminalSendError::Closed); }
+        if order.handoff || order.closing { return Err(TerminalSendError::Closed); }
         if matches!(command, Command::CloseChecked { .. }) {
             let mut priority = published
                 .priority_close
@@ -2546,6 +2610,23 @@ impl Worker {
                     Err("This terminal cannot confirm that its work is unchanged. Close it explicitly, then refresh the worktree.".into())
                 };
                 let _ = reply.send(outcome);
+            }
+            Command::StopSession {instance, deadline, reply} => {
+                use super::ipc::TerminalCloseResult;
+                if self.published.execution_instance != instance {
+                    let _ = reply.send(TerminalCloseResult::Unknown("The terminal worker was replaced".into()));
+                    return false;
+                }
+                let outcome = match self.inspect_close(deadline) {
+                    Ok((_, mut family)) => match family.kill(deadline) {
+                        Ok(()) => { self.checked_shutdown = true; self.holder.prove_cleanup(); TerminalCloseResult::Closed },
+                        Err(detail) => TerminalCloseResult::Unknown(detail),
+                    },
+                    Err(detail) => TerminalCloseResult::Unknown(detail),
+                };
+                let close = outcome == TerminalCloseResult::Closed;
+                let _ = reply.send(outcome);
+                return close;
             }
             Command::CloseChecked {
                 allow_active,

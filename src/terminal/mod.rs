@@ -44,7 +44,7 @@ pub use widget::{CellMetrics, TerminalWidget};
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
 #[cfg(feature = "host")]
-pub(crate) use worker::UpgradeSnapshot;
+pub(crate) use worker::{UpgradeSnapshot, TerminalSessionStop};
 #[cfg(all(test, feature = "host"))]
 pub(crate) use worker::flush_archived_notices;
 #[cfg(feature = "host")]
