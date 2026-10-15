@@ -50,7 +50,11 @@ impl Policy {
         Ok(Node {directory,ordinary,git,exclude,has_git,bytes:a+b+c})
     }
     pub(super) fn allows(&mut self,entry:&DirEntry)->bool {
-        if self.cancel.is_cancelled() || self.error.is_some() || entry.file_name()==".git" {return false;}
+        // Walk filters internally before yielding. Give the caller its next
+        // entry so its cancellation/error guard can stop immediately instead
+        // of filtering every remaining sibling without returning control.
+        if self.cancel.is_cancelled() || self.error.is_some() {return true;}
+        if entry.file_name()==".git" {return false;}
         if entry.path()==self.root.path() {return true;}
         let is_dir=entry.file_type().is_some_and(|kind|kind.is_dir());
         if !is_dir && !entry.file_type().is_some_and(|kind|kind.is_file()) {return false;}
@@ -131,6 +135,30 @@ fn global_path(root:&Root,cancel:&CancellationToken)->Result<Option<PathBuf>,Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_filter_returns_control_before_visiting_all_filtered_siblings() {
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let directory=tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(".ignore"),"*\n").unwrap();
+        for index in 0..32 {std::fs::write(directory.path().join(format!("ignored-{index}")),"needle\n").unwrap();}
+        let root=Arc::new(Root::open(directory.path()).unwrap());
+        let cancel=CancellationToken::default();
+        let policy=Policy::new(root,cancel.clone(),false,true).unwrap();
+        let seen=Arc::new(AtomicUsize::new(0));let visits=seen.clone();let token=cancel.clone();
+        let mut walker=ignore::WalkBuilder::new(directory.path());
+        walker.standard_filters(false).filter_entry(move |entry| {
+            visits.fetch_add(1,Ordering::Relaxed);
+            if entry.depth()>0 {token.cancel();}
+            policy.lock().unwrap().allows(entry)
+        });
+        for entry in walker.build() {
+            // Same admission ordering as the actual search worker: canceled
+            // control entries can never reach match/file processing.
+            if cancel.is_cancelled() {break;}
+            assert_eq!(entry.unwrap().depth(),0);
+        }
+        assert_eq!(seen.load(Ordering::Relaxed),2,"filter must yield root+one child, not enumerate every canceled sibling");
+    }
     #[test]
     fn ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources() {
         use std::os::unix::ffi::OsStrExt;
