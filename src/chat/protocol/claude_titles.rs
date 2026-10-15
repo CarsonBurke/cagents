@@ -197,9 +197,15 @@ mod tests {
         let cwd = Path::new("/work");
         for name in ["1341", "🔐", "🧑‍💻"] {
             let mut file = tempfile::tempfile().unwrap();
-            append(&mut file, json!({"type":"user","sessionId":id,"cwd":cwd,"message":{}}));
+            append(
+                &mut file,
+                json!({"type":"user","sessionId":id,"cwd":cwd,"message":{}}),
+            );
             file.seek(SeekFrom::End(0)).unwrap();
-            append(&mut file, json!({"type":"custom-title","sessionId":id,"customTitle":name}));
+            append(
+                &mut file,
+                json!({"type":"custom-title","sessionId":id,"customTitle":name}),
+            );
             assert_eq!(named_title(&mut file, &id, cwd).as_deref(), Some(name));
         }
     }
