@@ -81,10 +81,15 @@ fn candidates(host: &SharedHost) -> Result<Candidates, String> {
         record.instance, record.session.clone(), record.handle.clone(), record.current_directory().to_owned(),
     )).collect();
     let natives = state.chats.values().map(|record| {
-        let pair_valid = state.terminals.get(&record.session.id).is_none_or(|terminal| {
-            record.paired_terminal.as_ref().is_some_and(|expected| terminal.handle.same_worker(expected))
-                && record.session.terminal.as_ref().is_some_and(|source| super::chat::matches_paired_terminal(&terminal.session, source, state.proof()))
-        });
+        let pair_valid = match (record.paired_terminal.as_ref(), state.terminals.get(&record.session.id)) {
+            (Some(expected), Some(terminal)) => terminal.handle.same_worker(expected)
+                && record.session.terminal.as_ref().is_some_and(|source| super::chat::matches_paired_terminal(&terminal.session, source, state.proof())),
+            // A retained handle can keep an orphaned paired worker alive even
+            // after its inventory entry disappeared. Never omit that owner.
+            (Some(expected), None) => expected.is_completed(),
+            (None, Some(_)) => false,
+            (None, None) => true,
+        };
         (record.execution_instance, record.session.clone(), record.handle.clone(), pair_valid)
     }).collect();
     let mut starting: Vec<_> = state.spawning_scopes.iter().map(|(id, (instance, path))| (*id, *instance, path.clone())).collect();
