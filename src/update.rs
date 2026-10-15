@@ -1128,7 +1128,12 @@ pub(crate) fn inspect_source_panes(
         ));
     }
     let result: Result<(), String> = serde_json::from_reader(&mut output)?;
-    result.map_err(invalid)
+    result.map_err(invalid)?;
+    let (current_protocol, current_proof) = source::inspect_identity(request.proof.as_ref())?;
+    if current_protocol != request.protocol || current_proof != request.proof {
+        return Err(invalid("Source ownership changed during pane inspection; source windows remain usable"));
+    }
+    Ok(())
 }
 
 /// Probe only a fixed, owned companion beside an authenticated editor process.
