@@ -10784,6 +10784,7 @@ fn changes_footer<'a>(
     let input_key = key.clone();
     let can_commit = source.mutations_available() && !modal_open
         && !source.busy()
+        && (!state.commit_draft.amend || source.operation.is_none())
         && !state.commit_draft.subject.trim().is_empty()
         && (source.staged_count > 0
             || (state.commit_draft.amend && source.head_oid.is_some())
@@ -10933,7 +10934,10 @@ fn changes_footer<'a>(
         .text_size(design::TEXT_CAPTION)
         .spacing(6)
         .on_toggle_maybe(
-            (!modal_open && !source.busy() && source.head_oid.is_some()).then(|| {
+            (!modal_open
+                && !source.busy()
+                && (state.commit_draft.amend
+                    || (source.head_oid.is_some() && source.operation.is_none()))).then(|| {
                 let key = key.clone();
                 move |amend| SidebarAction::AmendChanged {
                     key: key.clone(),
