@@ -12965,11 +12965,15 @@ impl Cagents {
                 };
                 self.settings_base = loaded;
                 let previous = std::mem::replace(&mut self.settings, next);
-                let mut draft = SettingsDraft::from_settings(&self.settings);
-                for field in self.settings_pending.keys().chain(self.settings_invalid.keys()).copied() {
-                    draft.preserve_field(&self.settings_draft, field);
+                // An acknowledgement/own-file notification with identical values
+                // must not normalize the spelling the user is still editing.
+                if previous != self.settings {
+                    let mut draft = SettingsDraft::from_settings(&self.settings);
+                    for field in self.settings_pending.keys().chain(self.settings_invalid.keys()).copied() {
+                        draft.preserve_field(&self.settings_draft, field);
+                    }
+                    self.settings_draft = draft;
                 }
-                self.settings_draft = draft;
                 self.synchronize_settings(&previous)
             }
         }
@@ -19842,6 +19846,19 @@ mod tests {
         let persisted = settings::load_live(&path).unwrap();
         assert_eq!(persisted.terminal_font_size, 20.0);
         assert_eq!(persisted.terminal_font_family, "monospace");
+    }
+
+    #[test]
+    fn settings_unchanged_save_ack_preserves_numeric_display_spelling() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 20.0;
+        app.settings_draft.terminal_font_size = "20.00".into();
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+        assert_eq!(app.settings_draft.terminal_font_size, "20.00");
     }
 
     #[test]
