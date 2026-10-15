@@ -1208,45 +1208,18 @@ pub(crate) fn save_file_at_with_hooks_in_context(
 
 /// Recreates a document the user explicitly chose to save after deletion.
 /// Publication refuses any replacement that appeared meanwhile.
-pub fn save_missing_file(
-    worktree: &Path,
-    path: &Path,
-    text: &str,
-) -> Result<SaveOutcome, FileIoError> {
+pub fn save_missing_file(worktree: &Path, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(path)?;
-    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
+    let protection = std::sync::Arc::new(crate::worktree_cleanup::protect(worktree).map_err(io_error)?);
     let root = worktree_root(worktree)?;
-    save_missing_file_at(&root, path, text)
+    let context = recovery_context_at(&root, protection)?;
+    presence::save_missing_file_at_in_context(&root, path, text, &context)
 }
 
-pub(crate) fn save_missing_file_at(
-    root: &Root,
-    path: &Path,
-    text: &str,
-) -> Result<SaveOutcome, FileIoError> {
-    validate_repo_path(path)?;
-    let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
-    let (mut file, temporary) =
-        fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
-    let result = (|| {
-        file.write_all(text.as_bytes()).map_err(io_error)?;
-        file.sync_all().map_err(io_error)?;
-        fs_safety::rename_new_within(&parent, &temporary, &name).map_err(resolve_error)
-    })();
-    if let Err(error) = result {
-        let _ = fs_safety::unlink_within(&parent, &temporary);
-        return Err(error);
-    }
-    let durability = match fs_safety::sync_directory(&parent) {
-        Ok(()) => SaveDurability::Durable,
-        Err(error) => SaveDurability::Unconfirmed {
-            error: error.to_string(),
-        },
-    };
-    Ok(SaveOutcome::Saved {
-        content_hash: blake3::hash(text.as_bytes()),
-        durability,
-    })
+pub(crate) fn save_missing_file_at(root: &Root, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
+    let protection = std::sync::Arc::new(crate::worktree_cleanup::protect(root.path()).map_err(io_error)?);
+    let context = recovery_context_at(root, protection)?;
+    presence::save_missing_file_at_in_context(root, path, text, &context)
 }
 
 /// Moves a regular file to a new repository-relative name without replacing

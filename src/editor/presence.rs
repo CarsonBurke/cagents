@@ -85,7 +85,7 @@ pub(crate) fn save_document_file_at_in_context(root: &Root, path: &Path, text: &
         return save_file_at_in_context(root, path, text, expected_hash, overwrite, context);
     }
     if !presence.expected_present && presence.desired_present && presence.external_missing_recreate && presence.restoration.is_none() {
-        return recreate_missing_document_file(root, path, text, context);
+        return save_missing_file_at_in_context(root, path, text, context);
     }
     let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
     if presence.expected_present && presence.desired_present {
@@ -123,7 +123,11 @@ pub(crate) fn save_document_file_at_in_context(root: &Root, path: &Path, text: &
 
 // Explicit confirmation of an external deletion may create a fresh private
 // file; owned absence still requires its immutable restoration template.
-fn recreate_missing_document_file(root: &Root, path: &Path, text: &str, context: &RecoveryContext) -> Result<SaveOutcome, FileIoError> {
+pub(super) fn save_missing_file_at_in_context(root: &Root, path: &Path, text: &str, context: &RecoveryContext) -> Result<SaveOutcome, FileIoError> {
+    save_missing_file_in_context_with_hook(root, path, text, context, || Ok(()))
+}
+fn save_missing_file_in_context_with_hook(root: &Root, path: &Path, text: &str, context: &RecoveryContext, before_publish: impl FnOnce() -> io::Result<()>) -> Result<SaveOutcome, FileIoError> {
+    validate_repo_path(path)?;
     let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
     require_new_destination(&parent, Path::new(&name))?;
     let mut holding = PresenceHolding::create_in_context(&parent, &name, context)?;
@@ -133,6 +137,7 @@ fn recreate_missing_document_file(root: &Root, path: &Path, text: &str, context:
         temporary.set_permissions(Permissions::from_mode(0o600)).map_err(io_error)?;
         temporary.write_all(text.as_bytes()).map_err(io_error)?;
         temporary.sync_all().map_err(io_error)?;
+        before_publish().map_err(io_error)?;
         holding.publish_temporary()
     })();
     if let Err(error) = written { return Err(holding.finish_error(error)); }
@@ -503,6 +508,22 @@ fn immutable_metadata_template_with_hook(holding: &mut PresenceHolding, source: 
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn missing_file_private_publication_preserves_racing_public_destination() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        let context = RecoveryContext::with_guard((), 0).unwrap();
+        let path = Path::new("file.rs");
+        let error = save_missing_file_in_context_with_hook(&root, path, "mine", &context, || fs::write(directory.path().join(path), "foreign")).unwrap_err();
+        assert_eq!(fs::read(directory.path().join(path)).unwrap(), b"foreign");
+        assert!(error.recovery_authority().is_none(), "owned private cleanup can complete without deleting the public replacement");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        fs::remove_file(directory.path().join(path)).unwrap();
+        let outcome = super::super::save_missing_file_at(&root, path, "confirmed").unwrap();
+        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        assert_eq!(fs::read(directory.path().join(path)).unwrap(), b"confirmed");
+        assert_eq!(fs::metadata(directory.path().join(path)).unwrap().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn presence_recovery_retains_exact_parent_after_replacement_and_resolves_only_original() {
