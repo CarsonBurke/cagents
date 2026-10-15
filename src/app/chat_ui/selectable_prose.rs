@@ -984,6 +984,8 @@ mod tests {
             spans: vec![Span::new("cat cat")].into(),
             matches: vec![0..3, 4..7],
             current: Some(4..7),
+            flow: None,
+            flow_ready: None,
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
             target: Target {
