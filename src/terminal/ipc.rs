@@ -921,6 +921,9 @@ pub struct TerminalHandoffReceipt {
     /// Positive publication after this operation's own pairing or first
     /// confirmed thread learning. The original captured intent stays above.
     pub retained_binding: Option<ChatSourceBinding>,
+    /// Retained native publication boundary of the returned resource ID.
+    /// A later terminal -> native -> retired transition invalidates this stamp.
+    pub terminal_native_epoch: uuid::Uuid,
     pub terminal: TerminalDescriptor,
 }
 

@@ -246,6 +246,7 @@ pub fn same_removal_pane_source(expected:&Pane,current:&Pane,handoff:Option<&cra
 pub fn handoff_source_matches(expected:&Pane,receipt:&crate::terminal::ipc::TerminalHandoffReceipt)->bool {
     let CardKind::Chat(issued)=&expected.kind else {return false;};
     !receipt.operation.is_nil() && !receipt.source_execution_instance.is_nil()
+        && !receipt.terminal_native_epoch.is_nil()
         && !receipt.source_binding.backend.is_nil()
         && receipt.source_binding.execution_instance==receipt.source_execution_instance
         && handoff_chat_source_matches(&receipt.source_binding.source,&receipt.source)
@@ -633,7 +634,7 @@ pub(crate) mod handoff_tests {
         let before=Pane {id:CardId::new(),title:"Chat".into(),user_title:None,width_fraction:1.0,pending_terminal_start:false,kind:CardKind::Chat(chat.clone()),scope:None};
         let mut confirmed=chat;confirmed.launch.session_id=Some("confirmed".into());
         let execution_instance=uuid::Uuid::new_v4();
-        let receipt=TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(),source:confirmed.clone(),source_execution_instance:execution_instance,source_binding:ChatSourceBinding {source:confirmed,execution_instance,backend:uuid::Uuid::new_v4()},retained_binding:None,terminal};
+        let receipt=TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(),source:confirmed.clone(),source_execution_instance:execution_instance,source_binding:ChatSourceBinding {source:confirmed,execution_instance,backend:uuid::Uuid::new_v4()},retained_binding:None,terminal_native_epoch:uuid::Uuid::new_v4(),terminal};
         (before,receipt)
     }
     #[test]
@@ -655,7 +656,7 @@ pub(crate) mod handoff_tests {
         assert!(same_removal_pane_source(&before,&current,Some(&promoted)),"metadata promotion does not replace the concrete source backend");
         promoted.source_binding.source.launch.session_id=Some("other-known-thread".into());
         assert!(!same_removal_pane_source(&before,&current,Some(&promoted)),"known backend conversation remains exact");
-        for variant in 0..7 {
+        for variant in 0..8 {
             let mut changed=current.clone();let mut proof=receipt.clone();
             match variant {
                 0=>changed.id=CardId::new(),
@@ -664,6 +665,7 @@ pub(crate) mod handoff_tests {
                 3=>proof.source.launch.recipe.program="foreign".into(),
                 4=>proof.source_binding.backend=uuid::Uuid::nil(),
                 5=>proof.terminal.execution_instance=uuid::Uuid::nil(),
+                6=>proof.terminal_native_epoch=uuid::Uuid::nil(),
                 _=>if let CardKind::Terminal(source)=&mut changed.kind {source.launch.working_directory="/foreign".into();},
             }
             assert!(!same_removal_pane_source(&before,&changed,Some(&proof)),"variant {variant}");

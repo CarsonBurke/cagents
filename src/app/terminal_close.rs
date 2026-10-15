@@ -638,6 +638,7 @@ impl Cagents {
         let proof=receipt.source.proof.clone().filter(HostSessionProof::is_complete)?;
         if source.continuity.live_proof().is_some_and(|issued|issued!=proof) {return None;}
         if receipt.operation.is_nil() || receipt.terminal.execution_instance.is_nil()
+            || receipt.terminal_native_epoch.is_nil()
             || !self.pane_close_decision_current(card,batch)
             || !self.card_state(card).is_some_and(|state|state.existence.is_open()
                 && same_removal_source(&CardKind::Terminal(source.clone()),&state.kind)) {
@@ -1805,6 +1806,8 @@ mod tests {
         assert_eq!(Some(&captured.proof),receipt.source.proof.as_ref());
         assert_eq!(captured.execution_instance,receipt.terminal.execution_instance);
         assert!(matches!(captured.source.continuity,TerminalContinuity::Exited {..}));
+        let mut missing_epoch=receipt.clone();missing_epoch.terminal_native_epoch=uuid::Uuid::nil();
+        assert!(app.capture_handoff_card_close_for(card,None,&missing_epoch,None).is_none(),"no unknown returned-resource publication fallback");
         receipt.source.proof=None;
         assert!(app.capture_handoff_card_close_for(card,None,&receipt,None).is_none(),"no nil/unknown proof fallback");
     }
