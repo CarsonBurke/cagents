@@ -12059,7 +12059,7 @@ fn status_summary(
         )),
         Some(_) if listing_truncated => parts.push("change listing capped".to_owned()),
         Some(_) if untracked_omitted => parts.push("no tracked changes".to_owned()),
-        Some(_) => parts.push("clean".to_owned()),
+        Some(_) => parts.push("No changes".to_owned()),
         None => parts.push("status unavailable".to_owned()),
     }
     if detached {
