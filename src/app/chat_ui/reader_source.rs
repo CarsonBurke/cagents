@@ -6,7 +6,7 @@ use std::{collections::VecDeque, sync::Arc};
 pub(super) struct Source {
     digest: blake3::Hash,
     // Allocate incremental state only once this source actually grows.
-    hasher: Option<Box<blake3::Hasher>>,
+    hasher: Option<Arc<blake3::Hasher>>,
     ancestors: Arc<VecDeque<blake3::Hash>>,
 }
 impl Source {
@@ -24,9 +24,10 @@ impl Source {
         if ancestors.len() == 256 { ancestors.pop_front(); }
         ancestors.push_back(self.digest);
         let hasher = self.hasher.get_or_insert_with(|| {
-            let mut hasher = Box::new(blake3::Hasher::new());
-            hasher.update(previous.as_bytes()); hasher
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(previous.as_bytes()); Arc::new(hasher)
         });
+        let hasher = Arc::make_mut(hasher);
         hasher.update(suffix.as_bytes()); self.digest = hasher.finalize();
     }
     pub fn updated(previous: &Self, old: &str, new: &str) -> Self {
@@ -46,8 +47,21 @@ mod tests {
         assert!(source.accepts(original));
         assert!(Source::new("wide line\nshort").accepts(source.digest()));
         assert!(!Source::new("short").accepts(original));
-        for _ in 0..300 { source.append("", "x"); }
+        let mut body = "wide line\nshort".to_owned();
+        for _ in 0..300 { source.append(&body, "x"); body.push('x'); }
         assert_eq!(source.ancestors.len(), 256);
         assert!(!source.accepts(original));
+    }
+    #[test]
+    fn line_descriptors_share_incremental_hash_state_and_append_uses_copy_on_write() {
+        let mut source = Source::new("line\n"); source.append("line\n", "tail");
+        let clones: Vec<_> = (0..10_000).map(|_|source.clone()).collect();
+        let state = source.hasher.as_ref().unwrap();
+        assert_eq!(Arc::strong_count(state),10_001);
+        assert!(clones.iter().all(|clone|Arc::ptr_eq(state,clone.hasher.as_ref().unwrap())));
+        let prior = source.digest(); source.append("line\ntail", " new");
+        assert!(source.accepts(prior));
+        assert!(clones.iter().all(|clone|clone.digest()==prior));
+        assert_eq!(Arc::strong_count(source.hasher.as_ref().unwrap()),1);
     }
 }
