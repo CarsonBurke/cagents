@@ -2345,6 +2345,7 @@ mod tests {
         let key = ActiveWorktreeKey { project_id: ProjectId::new(),
             worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
         let mut app = app_with_status_snapshot(baseline, &key);
+        app.refresh_ui.git.entries.get_mut(&key.project_id).unwrap().cancellation = None;
         let admin = root.join(".git");
         let oid = fs::read(admin.join("refs/heads/main")).unwrap();
         fs::write(admin.join("MERGE_HEAD"), oid).unwrap();
@@ -2355,7 +2356,6 @@ mod tests {
         let initial = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
         drop(app.update(initial));
         assert_eq!(app.sidebar_model.projects[0].worktrees[0].operation, Some(GitOperationKind::Merge));
-        let delayed = app.refresh_ui.git.entries[&key.project_id].snapshot.clone();
         fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap();
         let failed = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
         assert!(matches!(&failed, Message::SourceControlLoaded { result: Ok(read), .. }
@@ -2374,6 +2374,10 @@ mod tests {
             if snapshot.status_updates == HashSet::from([key.worktree_id])));
         drop(app.update(retry));
         assert!(app.sidebar_model.projects[0].worktrees[0].operation_error.is_none());
+        let (delayed, _) = read_local(key.project_id,
+            app.refresh_ui.git.entries[&key.project_id].snapshot.clone(), git_watch::Change {
+                worktrees: [key.worktree_id].into(), ..Default::default()
+            }, CancellationToken::default()).unwrap();
         fs::remove_file(admin.join("MERGE_HEAD")).unwrap();
         let complete = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
         drop(app.update(complete));
