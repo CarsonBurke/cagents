@@ -519,6 +519,37 @@ mod tests {
     }
 
     #[test]
+    fn configured_file_completion_consumes_a_fragment_and_requests_editor_focus() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "first\n").unwrap();
+        std::fs::write(root.path().join("b.rs"), "first\nsecond\n").unwrap();
+        let mut app = editor();
+        let card = open_file(&mut app, root.path(), "a.rs");
+        let tab = app.tab_mut(card).unwrap();
+        let read = tab.runtime.open_file_location(card, "b.rs".into(), 0, 0, 0);
+        tab.pending_fragment = Some("L2".into());
+        let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let completion = executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(read).unwrap();
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action @ RepositoryAction::ConfiguredFileLoaded { .. }) = action { return action; }
+            }
+            panic!("the actual configured read did not complete");
+        });
+        let delivered = app.update(Message::Repository(completion));
+        assert!(app.tab(card).unwrap().pending_fragment.is_none());
+        assert_eq!(app.tab(card).unwrap().runtime.cursor_position(), Some(LspPosition::new(1, 0)));
+        let focus_requests = executor.block_on(async {
+            let mut count = 0;
+            if let Some(mut stream) = iced::runtime::task::into_stream(delivered) {
+                while let Some(action) = stream.next().await { if matches!(action, iced::runtime::Action::Widget(_)) { count += 1; } }
+            }
+            count
+        });
+        assert!(focus_requests > 0, "the normal load must publish its native editor focus operation");
+    }
+
+    #[test]
     fn loaded_navigation_applies_position_without_focusing_behind_a_modal() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "a😀éX\n").unwrap();

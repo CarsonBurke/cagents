@@ -638,6 +638,11 @@ pub struct Workspace {
     config: WorkspaceConfig,
 }
 
+fn next_focus_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Workspace {
     pub fn new(config: WorkspaceConfig) -> Result<Self, WorkspaceError> {
         let config = config.validate()?;
@@ -645,7 +650,7 @@ impl Workspace {
             cards: Vec::new(),
             card_indices: Arc::default(),
             focused: None,
-            focus_revision: 0,
+            focus_revision: next_focus_revision(),
             viewport_width: 0.0,
             geometry: StripGeometry::build(&[], 0.0, config),
             layout_transition: None,
@@ -673,7 +678,7 @@ impl Workspace {
     pub fn focus_revision(&self) -> u64 { self.focus_revision }
 
     fn set_focused(&mut self, focused: Option<CardId>) {
-        if self.focused != focused { self.focus_revision = self.focus_revision.wrapping_add(1); }
+        if self.focused != focused { self.focus_revision = next_focus_revision(); }
         self.focused = focused;
     }
 
