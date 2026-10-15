@@ -1884,7 +1884,7 @@ fn native_focus_batch_overrides_stale_builder_and_next_diff_retires_the_override
             key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, pressed));
     }
     let keys: Vec<_> = peer.fence().into_iter().filter_map(|request| match request {
-        ClientRequest::Key {key, ..} => Some(key), _ => None,
+        ClientRequest::Key {input, ..} => Some(input), _ => None,
     }).collect();
     assert_eq!(keys.len(), 2);
     assert_eq!(keys[0].action, KeyAction::Press);
