@@ -3007,17 +3007,26 @@ impl Worker {
 }
 
 fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> String {
-    let mut process = None;
-    let mut directory = None;
     #[cfg(target_os = "linux")]
-    if let Some(group) = group.filter(|group| *group > 0) {
-        // The group comes from this PTY's tcgetpgrp, never an untrusted title.
-        // Two bounded reads avoid a process-tree scan for ordinary shells.
-        process = std::fs::read_to_string(format!("/proc/{group}/comm"))
-            .ok()
-            .and_then(|name| crate::names::normalize_card_name(name.trim()));
-        directory = std::fs::read_link(format!("/proc/{group}/cwd")).ok();
-    }
+    let (process, directory) = match group.filter(|group| *group > 0) {
+        Some(group) => {
+            // The group comes from this PTY's tcgetpgrp. Two bounded reads
+            // avoid a process-tree scan for ordinary shells.
+            let process = std::fs::read_to_string(format!("/proc/{group}/comm"))
+                .ok()
+                .and_then(|name| crate::names::normalize_card_name(name.trim()));
+            (
+                process,
+                std::fs::read_link(format!("/proc/{group}/cwd")).ok(),
+            )
+        }
+        None => (None, None),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (process, directory): (Option<String>, Option<PathBuf>) = {
+        let _ = group;
+        (None, None)
+    };
     let process = process.unwrap_or_else(|| {
         std::path::Path::new(&launch.program)
             .file_name()
@@ -3917,6 +3926,27 @@ mod tests {
             super::foreground_process_title(None, &launch),
             "fish · alpha"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_process_title_tracks_foreground_process_directory() {
+        use std::os::unix::process::CommandExt;
+        let directory = tempfile::tempdir().unwrap();
+        let foreground_directory = directory.path().join("alpha");
+        std::fs::create_dir(&foreground_directory).unwrap();
+        let mut launch = LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        launch.program = "/bin/false".into();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .current_dir(&foreground_directory)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let title = super::foreground_process_title(Some(child.id() as libc::pid_t), &launch);
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert_eq!(title, "sleep · alpha");
     }
 
     #[test]
