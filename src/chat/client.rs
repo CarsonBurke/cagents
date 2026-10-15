@@ -251,6 +251,53 @@ fn transmit(
         )
         .map_err(|e| e.to_string())
 }
+// Keep admission and socket backpressure asynchronous. Callers include this
+// future in the same deadline as the reply; dropping it never leaves a sender
+// task waiting to transmit a stale request later.
+async fn transmit_async(
+    wire: &Mutex<Wire>,
+    alive: &AtomicBool,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+) -> Result<(), String> {
+    let mut frame = Vec::new();
+    FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES).write(&mut frame, &ClientEnvelope {
+        version: PROTOCOL_VERSION, request_id: id, proof: Some(proof.clone()), request,
+    }).map_err(|error| error.to_string())?;
+    loop {
+        if try_transmit_frame(wire, alive, &frame)? { return Ok(()); }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn try_transmit_frame(wire: &Mutex<Wire>, alive: &AtomicBool, frame: &[u8]) -> Result<bool, String> {
+    use std::{os::fd::AsRawFd, sync::TryLockError};
+    if !alive.load(Ordering::Acquire) { return Err("Chat is disconnected".into()); }
+    let wire = match wire.try_lock() {
+        Ok(wire) => wire,
+        Err(TryLockError::WouldBlock) => return Ok(false),
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    if !alive.load(Ordering::Acquire) { return Err("Chat is disconnected".into()); }
+    // MSG_DONTWAIT affects only this call. Setting O_NONBLOCK would also alter
+    // the cloned descriptor used by the blocking response reader.
+    // SAFETY: the wire guard owns a live socket; frame remains valid for send.
+    let sent = unsafe { libc::send(wire.stream.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    if sent == frame.len() as isize { return Ok(true); }
+    if sent < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) { return Ok(false); }
+        alive.store(false, Ordering::Release);
+        let _ = wire.stream.shutdown(Shutdown::Both);
+        return Err(error.to_string());
+    }
+    // A cancelled partial frame must never be followed by another writer's
+    // frame. Close this connection; the daemon's actor remains independent.
+    alive.store(false, Ordering::Release);
+    let _ = wire.stream.shutdown(Shutdown::Both);
+    Err("The daemon connection closed after an incomplete request write".into())
+}
 fn receive(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
@@ -1356,20 +1403,24 @@ impl ClientHandle {
     /// Fetch a bounded original-text page on this connection's own reply channel.
     /// The existing reader resolves the future; no request spawns an actor or thread.
     pub async fn source_page(&self, query: super::cache::SourceQuery) -> Result<super::cache::SourcePage, super::cache::SourceError> {
+        self.source_page_with_timeout(query,Duration::from_secs(40)).await
+    }
+    async fn source_page_with_timeout(&self,query:super::cache::SourceQuery,timeout:Duration)->Result<super::cache::SourcePage,super::cache::SourceError>{
         use super::cache::SourceError;
         if !self.inner.alive.load(Ordering::Acquire) {return Err(SourceError::Transport("Chat is disconnected".into()));}
         let id=self.inner.next.fetch_add(1,Ordering::Relaxed);
         let (reply,response)=tokio::sync::oneshot::channel();
         {
             let mut pending=self.inner.source_pending.lock().unwrap_or_else(|p|p.into_inner());
+            if !self.inner.alive.load(Ordering::Acquire){return Err(SourceError::Transport("Chat is disconnected".into()));}
             if pending.len()>=64 {return Err(SourceError::Transport("Source request capacity reached".into()));}
             pending.insert(id,reply);
         }
         let _request=SourceRequest{pending:&self.inner.source_pending,id};
-        transmit(&self.inner.wire,&self.inner.proof,id,ClientRequest::ChatCommand{chat_id:self.inner.id,command:Command::LoadSource{query}}).map_err(SourceError::Transport)?;
-        tokio::time::timeout(Duration::from_secs(40),response).await
-            .map_err(|_|SourceError::Transport("Source request timed out".into()))?
-            .map_err(|_|SourceError::Transport("Source request disconnected".into()))?
+        tokio::time::timeout(timeout,async{
+            transmit_async(&self.inner.wire,&self.inner.alive,&self.inner.proof,id,ClientRequest::ChatCommand{chat_id:self.inner.id,command:Command::LoadSource{query}}).await.map_err(SourceError::Transport)?;
+            response.await.map_err(|_|SourceError::Transport("Source request disconnected".into()))?
+        }).await.map_err(|_|SourceError::Transport("Source request timed out".into()))?
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
         self.request(ClientRequest::ChatCommand {
@@ -3214,6 +3265,65 @@ mod tests {
             tokio::task::yield_now().await;
             assert_eq!(handle.inner.source_pending.lock().unwrap().len(),1);
             task.abort();assert!(task.await.unwrap_err().is_cancelled());
+            assert!(handle.inner.source_pending.lock().unwrap().is_empty());
+        });
+    }
+
+    fn source_query()->super::super::cache::SourceQuery{super::super::cache::SourceQuery{source:super::super::cache::SourceKey{agent_id:None,source_id:"bounded-source".into()},offset:0,limit:256,expected_epoch:None,until:None}}
+    #[test]
+    fn source_query_deadline_includes_shared_wire_admission() {
+        use super::super::cache::SourceError;
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let holder = handle.clone();
+        let (locked, acquired) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _wire = holder.inner.wire.lock().unwrap();
+            locked.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(2));
+        });
+        acquired.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let started = Instant::now();
+        let result = runtime.block_on(handle.source_page_with_timeout(source_query(),Duration::from_millis(50)));
+        let elapsed = started.elapsed();
+        release.send(()).unwrap(); holder.join().unwrap();
+        assert!(matches!(result, Err(SourceError::Transport(message)) if message.contains("timed out")));
+        assert!(elapsed < Duration::from_secs(1), "wire admission blocked for {elapsed:?}");
+        assert!(handle.inner.source_pending.lock().unwrap().is_empty());
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn source_query_deadline_and_cancellation_cover_socket_backpressure() {
+        use std::os::fd::AsRawFd;
+        use super::super::cache::SourceError;
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        {
+            let wire = handle.inner.wire.lock().unwrap();
+            // Fill the socket without changing descriptor flags shared with
+            // the response reader. The fixture peer never consumes writes.
+            let byte = [0u8];
+            loop {
+                // SAFETY: the wire owns the socket and byte is a live buffer.
+                let sent = unsafe { libc::send(wire.stream.as_raw_fd(), byte.as_ptr().cast(), byte.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+                if sent < 0 {
+                    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                    break;
+                }
+                assert_eq!(sent, 1);
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let result = runtime.block_on(handle.source_page_with_timeout(source_query(),Duration::from_millis(50)));
+        assert!(matches!(result, Err(SourceError::Transport(message)) if message.contains("timed out")));
+        assert!(handle.inner.source_pending.lock().unwrap().is_empty());
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+        runtime.block_on(async {
+            let requester = handle.clone();
+            let request = tokio::spawn(async move { requester.source_page(source_query()).await });
+            while handle.inner.source_pending.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+            request.abort(); assert!(request.await.unwrap_err().is_cancelled());
             assert!(handle.inner.source_pending.lock().unwrap().is_empty());
         });
     }
