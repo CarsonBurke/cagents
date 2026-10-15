@@ -95,7 +95,8 @@ where
 pub fn checkbox<'a, Message>(checked: bool) -> widget::Checkbox<'a, Message, cosmic::Theme> {
     widget::checkbox(checked)
         .size(design::ROW_ICON_SIZE)
-        .text_size(design::TEXT_BODY)
+        .font(design::interface_font())
+        .text_size(design::interface_size())
         .spacing(space::S)
 }
 
@@ -104,7 +105,8 @@ pub fn checkbox<'a, Message>(checked: bool) -> widget::Checkbox<'a, Message, cos
 pub fn toggle<'a, Message>(on: bool) -> widget::Toggler<'a, Message> {
     widget::toggler(on)
         .size(design::STATUS_ICON_SIZE)
-        .text_size(design::TEXT_BODY)
+        .font(design::interface_font())
+        .text_size(design::interface_size())
         .spacing(space::M)
 }
 
