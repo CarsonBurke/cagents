@@ -176,14 +176,19 @@ fn restore_authenticated(
         .map(crate::agent_execution::HostedSession::Chat)
         .collect();
     let execution_registry = super::super::agent_execution::registry(host)?;
-    let directory = execution_registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retained_agent_directory(&retained)?;
+    let (directory, operational_directory) = {
+        let registry = execution_registry.lock().unwrap_or_else(|p| p.into_inner());
+        (registry.retained_agent_directory(&retained)?, registry.retained_agent_execution_directory(&retained)?)
+    };
     let (mut spec, mut adapter) = chat::protocol::codex::create_restored(&recovery)?;
     spec.environment = recovery.execution_environment.0.clone();
     spec.execution =
         directory.map(|identity| Arc::new(chat::protocol::ExecutionContext::restored(identity)));
+    if let Some(directory) = operational_directory {
+        if let Some(context) = &spec.execution { context.verify_directory(&directory)?; }
+        adapter.relocate_directory(&directory)?;
+        spec.working_directory = directory;
+    }
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
