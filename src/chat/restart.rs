@@ -34,6 +34,16 @@ impl RestartReceipt {
         { return false; }
         match (&old.terminal, &new.terminal) {
             (None, None) => true,
+            (None, Some(next)) => {
+                next.id == new.id && next.continuity.live_proof().as_ref() == new.proof.as_ref()
+                    && (crate::agent_execution::console_agent(&next.launch).is_some()
+                        && next.launch.environment.is_empty() && next.launch.unset_environment.is_empty()
+                        && next.launch.working_directory == new.launch.recipe.working_directory
+                        && next.owned_codex_listener.is_none()
+                        || new.owns_codex_listener()
+                            && next.owned_codex_listener == new.owned_codex_listener
+                            && new.launch.terminal_recipe().as_ref() == Some(&next.launch))
+            }
             (Some(previous), Some(next)) => {
                 if previous.id != old.id || next.id != old.id
                     || previous.continuity.live_proof().as_ref() != old.proof.as_ref()

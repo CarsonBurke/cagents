@@ -22,7 +22,7 @@ mod directory;
 pub(super) mod mailbox;
 mod ownership;
 mod restart;
-pub(super) use restart::{prepare_restart_pair, restore_restart_pair};
+pub(super) use restart::{PairPlan, prepare_restart_pair, restore_restart_pair};
 pub(super) mod terminals;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,

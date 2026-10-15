@@ -130,6 +130,7 @@ struct Inner {
     id: TerminalId,
     session: Session,
     upgrade_recovery: Option<(Session, Session)>,
+    restart_recovery: Option<super::RestartReceipt>,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
@@ -481,6 +482,7 @@ impl ClientHandle {
                 id: session.id,
                 session,
                 upgrade_recovery: None,
+                restart_recovery: None,
                 proof,
                 wire: Arc::new(Mutex::new(Wire {
                     stream,
@@ -517,6 +519,26 @@ impl ClientHandle {
         let inner = Arc::get_mut(&mut handle.inner).unwrap();
         inner.proof = proof;
         inner.upgrade_recovery = Some((source, session));
+        handle
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_restart(receipt:super::RestartReceipt,snapshot:Snapshot)->Self {
+        assert!(receipt.is_valid());
+        assert_eq!(snapshot.session_id,receipt.replacement().launch.session_id);
+        let mut handle=Self::fixture(receipt.replacement().clone(),snapshot);
+        let inner=Arc::get_mut(&mut handle.inner).unwrap();
+        inner.proof=receipt.replacement().proof.clone().unwrap();
+        inner.restart_recovery=Some(receipt);
+        handle
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_upgrade_restart(source:Session,receipt:super::RestartReceipt,snapshot:Snapshot)->Self {
+        assert!(super::is_upgrade_recovery(&source,receipt.source()));
+        let resolved=receipt.source().clone();
+        let mut handle=Self::fixture_restart(receipt,snapshot);
+        Arc::get_mut(&mut handle.inner).unwrap().upgrade_recovery=Some((source,resolved));
         handle
     }
 
@@ -827,6 +849,8 @@ impl ClientHandle {
                 &mut upgrade_recovery,
             )?
         };
+        let restart_source=match &request {ClientRequest::ChatAttach{session}=>Some(session.clone()),_=>None};
+        let mut restart_recovery=None;
         codec
             .write(
                 &mut stream,
@@ -897,6 +921,18 @@ impl ClientHandle {
                     crate::daemon_health::frame(&stream, None, health_request);
                     break (session, snapshot);
                 }
+                ServerMessage::Response {
+                    response:ServerResponse::ChatRestarted{receipt,snapshot},
+                } if envelope.request_id==Some(attach_request) => {
+                    if !receipt.is_valid() || restart_source.as_ref()!=Some(receipt.source())
+                        || receipt.replacement().id!=id || receipt.replacement().proof.as_ref()!=Some(&proof)
+                        || snapshot.session_id!=receipt.replacement().launch.session_id {
+                        return Err("Daemon returned an invalid exact provider restart receipt".into());
+                    }
+                    let session=receipt.replacement().clone();
+                    restart_recovery=Some(receipt);
+                    break(session,snapshot);
+                }
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
@@ -913,7 +949,8 @@ impl ClientHandle {
             }
         };
         if let Some((_, resolved)) = &upgrade_recovery
-            && (&session != resolved || initial.session_id != resolved.launch.session_id)
+            && ((&session != resolved && !restart_recovery.as_ref().is_some_and(|receipt| receipt.source()==resolved && receipt.replacement()==&session))
+                || initial.session_id != resolved.launch.session_id)
         {
             return Err(
                 "The attached conversation did not confirm the daemon's exact upgrade replacement"
@@ -954,6 +991,7 @@ impl ClientHandle {
             id,
             session,
             upgrade_recovery,
+            restart_recovery,
             proof: proof.clone(),
             wire: wire.clone(),
             cancel,
@@ -1182,6 +1220,7 @@ impl ClientHandle {
         }
         session
     }
+    pub(crate) fn restart_recovery(&self)->Option<&super::RestartReceipt>{self.inner.restart_recovery.as_ref()}
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner.upgrade_recovery.as_ref()
     }
@@ -2613,6 +2652,32 @@ mod tests {
         );
         worker.join().unwrap();
         result
+    }
+
+    #[test]
+    fn restart_receipt_is_correlated_with_exact_attach_and_composes_with_upgrade_lineage() {
+        for mismatch in 0..3 {
+            let source=omp_card(None,Some(host_proof("prior")));
+            let mut resolved=source.clone();resolved.proof=Some(host_proof("live"));resolved.launch.session_id=Some(CONVERSATION.into());
+            let result=restore_with_lineage(source,Some(resolved.clone()),move |request| {
+                let ClientRequest::ChatAttach{session}=request else{panic!("expected exact attach")};
+                assert_eq!(session,resolved);
+                let mut replacement=session.clone();
+                let recipe=crate::model::LaunchRecipe{program:"/matched/cagents".into(),arguments:vec!["agent".into(),"console".into(),crate::model::AgentId::new().to_string()],working_directory:session.launch.recipe.working_directory.clone(),environment:Default::default(),unset_environment:Default::default()};
+                let mut terminal=crate::terminal_ipc::TerminalDescriptor::relaunchable(session.id,recipe,None).session;
+                let proof=session.proof.as_ref().unwrap();
+                terminal.continuity=crate::model::TerminalContinuity::Live{host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone()};
+                replacement.terminal=Some(terminal);
+                let receipt=super::super::RestartReceipt::confirm(session,replacement.clone()).unwrap();
+                let mut value=serde_json::to_value(&receipt).unwrap();
+                if mismatch==1 {value["source"]["launch"]["recipe"]["program"]=serde_json::json!("invented-provider");}
+                let receipt=serde_json::from_value(value).unwrap();
+                let snapshot=Snapshot{session_id:Some(if mismatch==2{"invented-thread".into()}else{CONVERSATION.into()}),ready:true,..Default::default()};
+                ServerMessage::Response{response:ServerResponse::ChatRestarted{receipt,snapshot}}
+            });
+            if mismatch==0 {let handle=result.unwrap();assert!(handle.upgrade_recovery().is_some());assert!(handle.restart_recovery().unwrap().is_valid());assert!(handle.session().terminal.is_some());}
+            else {assert!(result.err().unwrap().message.contains("restart receipt"));}
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 mod account_isolation_tests;
 mod native_cleanup;
 mod native_recovery;
+pub(super) mod restart;
 mod owned_listener;
 #[cfg(test)]
 mod startup_tests;
@@ -760,6 +761,9 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    if restart_launch.is_none() && host.lock().unwrap_or_else(|p|p.into_inner()).chat_restarts.get(&session.id).is_some_and(|restart|restart.pending()) {
+        return Err(unavailable("This conversation has a pending exact restart; attach to retry its retained owner"));
+    }
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
     // the account-wide list of conversations.
@@ -2031,6 +2035,10 @@ pub(super) fn restart_completed_with_execution(
     source: &Session,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
 ) -> Result<Option<ServerResponse>, ProtocolError> {
+    restart::run(host,client,source,execution)
+}
+
+fn restart_completed_inner(host:&SharedHost, client:ClientId, source:&Session, execution:Option<Arc<chat::protocol::ExecutionContext>>) -> Result<Option<ServerResponse>,ProtocolError> {
     let replacement = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(source.proof.as_ref(), state.proof())?;
@@ -2113,6 +2121,19 @@ fn process_inner(
     client: ClientId,
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
+    // Keep explicit close/return and a restart's full pair publication mutually
+    // exclusive. Weak entries retain only currently executing transitions.
+    let transition = match &request {
+        ClientRequest::ChatAttach {session} | ClientRequest::ChatStart {session,..}=>Some(session.id),
+        ClientRequest::ChatClose {chat_id} | ClientRequest::ChatReturnTerminal {chat_id}=>Some(*chat_id),
+        _=>None,
+    }.map(|id|restart::transition_gate(host,id));
+    let _transition=match transition.as_ref().map(|gate|gate.try_lock()) {
+        Some(Ok(guard))=>Some(guard),
+        Some(Err(std::sync::TryLockError::Poisoned(poison)))=>Some(poison.into_inner()),
+        Some(Err(std::sync::TryLockError::WouldBlock))=>return Err(unavailable("This exact conversation already has a lifecycle transition in progress; retry its current pane")),
+        None=>None,
+    };
     match request {
         ClientRequest::ChatPrepareResume { source } => {
             let proof = host
@@ -2415,6 +2436,7 @@ fn process_inner(
             Ok(response)
         }
         ClientRequest::ChatReturnTerminal { chat_id } => {
+            restart::require_finished(host,chat_id)?;
             let (handle, mut session) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.shutting_down {
@@ -2569,6 +2591,7 @@ fn process_inner(
                     ));
                 }
                 let mut record = state.chats.remove(&chat_id);
+                state.chat_restarts.remove(&chat_id);
                 state.chat_handoffs.insert(
                     chat_id,
                     TerminalHandoff::new(
@@ -2608,6 +2631,7 @@ fn process_inner(
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatClose { chat_id } => {
+            restart::require_not_busy(host,chat_id)?;
             let handle = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
@@ -2711,6 +2735,7 @@ fn process_inner(
                 }
                 state.inventory_generation += 1;
                 let record = state.chats.remove(&chat_id);
+                state.chat_restarts.remove(&chat_id);
                 if let Some(notifications) = &state.notifications {
                     notifications.retire(chat_id);
                 }
