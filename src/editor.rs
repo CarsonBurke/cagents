@@ -11,9 +11,8 @@ use thiserror::Error;
 use crate::fs_safety::{self, ResolveError, Root};
 
 mod presence;
-mod recovery;
-pub use recovery::RecoveryAuthority;
-pub(crate) use recovery::RecoverySlot;
+pub use crate::recovery_authority::RecoveryAuthority;
+pub(crate) use crate::recovery_authority::RecoverySlot;
 pub use presence::FileRestoration;
 pub(crate) use presence::{PresenceSave, save_document_file, save_document_file_at, capture_restoration_at};
 

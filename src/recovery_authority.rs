@@ -1,6 +1,5 @@
-//! Bounded live authority for editor recovery. Descriptions are diagnostic
+//! Bounded live authority for filesystem recovery across isolated build lanes. Descriptions are diagnostic
 //! spellings; only the producer's retained descriptors authorize retry.
-use super::FileIoError;
 use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 // Each admitted producer may retain at most sixteen descriptors. Reserving
@@ -17,11 +16,11 @@ fn budget() -> Arc<Budget> {
 /// Producers must retain no more than MAX_RECOVERY_DESCRIPTORS descriptors.
 pub(crate) struct RecoverySlot { budget: Arc<Budget> }
 impl RecoverySlot {
-    pub(crate) fn reserve() -> Result<Self, FileIoError> { Self::from_budget(budget()) }
-    fn from_budget(budget: Arc<Budget>) -> Result<Self, FileIoError> {
+    pub(crate) fn reserve() -> Result<Self, String> { Self::from_budget(budget()) }
+    fn from_budget(budget: Arc<Budget>) -> Result<Self, String> {
         budget.used.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |used| (used < budget.limit).then_some(used + 1))
-            .map_err(|_| FileIoError::Io("Editor recovery capacity is exhausted. Resolve an earlier editor recovery before changing files.".into()))?;
+            .map_err(|_| "Recovery capacity is exhausted. Resolve an earlier recovery before changing files.".to_owned())?;
         Ok(Self { budget })
     }
     pub(crate) fn retain(self, description: String, retry: impl FnMut() -> Result<(), String> + Send + 'static) -> RecoveryAuthority {
@@ -44,6 +43,15 @@ struct RecoveryInner { description: String, resolved: AtomicBool, work: Mutex<Re
 #[derive(Clone)]
 pub struct RecoveryAuthority(Arc<RecoveryInner>);
 impl RecoveryAuthority {
+    /// Join existing bounded payloads without reserving a new slot after an
+    /// effect. Nested cleanup errors must not discard an earlier authority.
+    pub(crate) fn combine(self, other: Self) -> Self {
+        if self == other { return self; }
+        let description = format!("{}; {}", self.description(), other.description()).chars().take(2048).collect();
+        Self(Arc::new(RecoveryInner { description, resolved: AtomicBool::new(false), work: Mutex::new(RecoveryWork {
+            retry: Some(Box::new(move || { self.retry()?; other.retry() })), slot: None,
+        }) }))
+    }
     pub fn description(&self) -> &str { &self.0.description }
     pub fn is_resolved(&self) -> bool { self.0.resolved.load(Ordering::Acquire) }
     /// Blocking worker only. The producer revalidates retained authority and
