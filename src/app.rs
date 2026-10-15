@@ -345,6 +345,11 @@ impl NoticeLog {
             .retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
     }
 
+    fn has_expiring_notices(&self) -> bool {
+        self.entries.iter().any(|entry| entry.expires_at.is_some())
+            || self.daemon_conditions.values().any(|(_, expiry)| expiry.is_some())
+    }
+
     fn record(&mut self, notice: TransientNotice) {
         self.record_at(notice, Instant::now());
     }
@@ -431,8 +436,10 @@ impl NoticeLog {
 
     fn refresh_daemon_notice(&mut self, now: Instant) {
         const KEY: &str = "daemon-session-recovery";
-        self.entries.retain(|entry| entry.notice.key.as_deref() != Some(KEY));
+        self.daemon_conditions
+            .retain(|_, (_, expiry)| expiry.is_none_or(|expiry| expiry > now));
         if self.daemon_conditions.is_empty() {
+            self.entries.retain(|entry| entry.notice.key.as_deref() != Some(KEY));
             return;
         }
         let interrupted = self.condition_targets("daemon-interrupted-turns");
@@ -471,7 +478,22 @@ impl NoticeLog {
             condition.details.as_ref().map_or_else(|| condition.message.clone(), |details| format!("{}\n{details}", condition.message))
         }).collect::<Vec<_>>().join("\n\n"));
         notice.key = Some(KEY.into());
+        let expires_at = if notice.severity == NoticeSeverity::Success {
+            self.daemon_conditions.get("daemon-connectivity").and_then(|(_, expiry)| *expiry)
+        } else {
+            None
+        };
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.notice.key.as_deref() == Some(KEY)) {
+            // A poll changing neither targets nor details must not replace the
+            // user's open Details panel or its focused/dismissable identity.
+            entry.notice = notice;
+            entry.expires_at = expires_at;
+            return;
+        }
         self.record_at(notice, now);
+        if let Some(entry) = self.entries.back_mut() {
+            entry.expires_at = expires_at;
+        }
     }
 
     /// Newest first: the log reads downward from the most recent event.
@@ -16708,11 +16730,7 @@ impl Application for Cagents {
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
-            if self
-                .notices
-                .entries
-                .iter()
-                .any(|entry| entry.expires_at.is_some())
+            if self.notices.has_expiring_notices()
             {
                 iced::time::every(Duration::from_secs(1)).map(Message::ExpireNotices)
             } else {
@@ -20179,6 +20197,39 @@ mod tests {
         log.record(TransientNotice::success("Daemon reconnected 1 chat.").key("daemon-connectivity"));
         assert_eq!(log.len(), 1);
         assert_eq!(log.recent().next().unwrap().notice.severity, NoticeSeverity::Success);
+    }
+
+    #[test]
+    fn mixed_recovery_success_expires_while_warning_is_visible_and_cannot_resurrect() {
+        let mut log = NoticeLog::default();
+        let past = Instant::now() - Duration::from_secs(10);
+        let card = CardId::new();
+        log.record_at(TransientNotice::success("Daemon reconnected 1 chat.")
+            .key("daemon-connectivity"), past);
+        log.record_at(TransientNotice::warning("Interrupted")
+            .key("daemon-interrupted-turns").targets([card]), past);
+        assert_eq!(log.len(), 1);
+        assert!(log.recent().next().unwrap().expires_at.is_none());
+        assert!(log.has_expiring_notices(), "the hidden success still needs its expiry subscription");
+        log.resolve_target("daemon-interrupted-turns", card);
+        assert!(log.is_empty(), "resolving the warning cannot revive an expired success");
+        assert!(!log.has_expiring_notices());
+    }
+
+    #[test]
+    fn repeated_visibility_reapply_preserves_open_details_and_notice_identity() {
+        let mut log = NoticeLog::default();
+        let card = CardId::new();
+        let failure = vec![(card, "terminal worker has closed".into())];
+        log.workspace_visibility_result(failure.clone());
+        let entry = log.entries.back_mut().unwrap();
+        entry.details_open = true;
+        let id = entry.id;
+        log.workspace_visibility_result(failure);
+        let entry = log.entries.back().unwrap();
+        assert_eq!(entry.id, id);
+        assert!(entry.details_open);
+        assert_eq!(log.len(), 1);
     }
 
     #[test]
