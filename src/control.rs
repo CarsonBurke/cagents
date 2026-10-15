@@ -3091,6 +3091,18 @@ fn project_output(
     client: &mut ControlClient,
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
+    project_output_with_activation(client, command, |repository| {
+        if let Err(error) = instance::activate_project(repository) {
+            tracing::warn!(%error, "project registered, but window selection was unavailable");
+        }
+    })
+}
+
+fn project_output_with_activation(
+    client: &mut ControlClient,
+    command: ResolvedProject,
+    activate: impl FnOnce(&Path),
+) -> Result<CommandOutput, AppError> {
     match command {
         ResolvedProject::Open { repository, kind } => {
             // The same upsert a window publishes when it opens a repository,
@@ -3110,6 +3122,9 @@ fn project_output(
                     "the daemon accepted the project but did not report it",
                 )
             })?;
+            // Shared existence is committed first. Only one local window gets
+            // the separate selection request; headless use still succeeds.
+            activate(&repository);
             let human = project_line(&project);
             Ok(CommandOutput {
                 command: "project.open",
@@ -4329,8 +4344,12 @@ mod tests {
         }
         .resolved()
         .unwrap();
-        let output = project_output(&mut client, resolved).unwrap();
+        let mut selected = None;
+        let output = project_output_with_activation(&mut client, resolved, |path| {
+            selected = Some(path.to_path_buf());
+        }).unwrap();
         server.join().unwrap();
+        assert_eq!(selected, Some(expected.clone()));
         assert_eq!(output.command, "project.open");
         assert_eq!(output.data["project"]["ordinal"], json!(2));
         assert_eq!(output.data["sequence"], json!(4));

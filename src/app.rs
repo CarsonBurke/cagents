@@ -26,6 +26,7 @@ mod history_ui;
 mod latency_ui;
 mod notification_ui;
 mod palette_ui;
+mod project_activation;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
@@ -4166,6 +4167,8 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
+    ActivateProject(PathBuf),
+    ResumeProjectActivation,
     ActivateUi {
         token: Option<String>,
     },
@@ -5199,7 +5202,9 @@ impl Cagents {
             self.repository_generations.insert(project_id, generation);
             return self.device_project_read_task(path, project_id, generation, kind);
         }
-        let project_id = project_id.unwrap_or_default();
+        let project_id = project_id
+            .or_else(|| self.project_ui.pending_loads.get(&path).copied())
+            .unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository) {
                 self.status = Some(TransientNotice::warning(
@@ -5221,6 +5226,7 @@ impl Cagents {
             self.project_ui.closed.remove(&repository);
             self.project_ui.reopening.insert(project_id, repository);
         }
+        self.project_ui.pending_loads.insert(path.clone(), project_id);
         self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
         let generation = self.repository_load_sequence;
         self.repository_generations.insert(project_id, generation);
@@ -13204,6 +13210,9 @@ impl Application for Cagents {
             self.deferred_navigation.push_back(message);
             return Task::none();
         }
+        if project_activation::supersedes_project_activation(&message) {
+            self.project_ui.activation = None;
+        }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
             // Whatever this message starts is measured from now. Its first
             // frame then moves it by the time since the input that began it,
@@ -13432,6 +13441,7 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                self.finish_project_activation_load(project_id, result.is_ok());
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
@@ -13576,7 +13586,7 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return task;
+                            return Task::batch([task, cosmic::task::message(Message::ResumeProjectActivation)]);
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -15250,6 +15260,11 @@ impl Application for Cagents {
                 }
                 self.sync_context_overlay_state()
             }
+            Message::ActivateProject(repository) => {
+                self.request_project_activation(repository);
+                Task::none()
+            }
+            Message::ResumeProjectActivation => Task::none(),
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
                 let activation = match token {
@@ -16436,6 +16451,7 @@ impl Application for Cagents {
         // and it is the one place that can bound the history.
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
+        let task = Task::batch([task, self.resume_project_activation()]);
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
@@ -16535,7 +16551,9 @@ impl Application for Cagents {
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
             )
-            .map(|activation| match activation.update {
+            .map(|activation| match activation.project {
+                Some(repository) => Message::ActivateProject(repository),
+                None => match activation.update {
                 Some(request) => Message::UiUpdate(request),
                 None => match activation.session {
                     Some(session) => Message::ActivateSession {
@@ -16545,6 +16563,7 @@ impl Application for Cagents {
                     None => Message::ActivateUi {
                         token: activation.token,
                     },
+                },
                 },
             }),
             event::listen_with(|event, status, event_window| match event {
