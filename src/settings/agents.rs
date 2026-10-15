@@ -325,6 +325,7 @@ mod tests {
         #[cfg(any(feature = "ui", feature = "host"))]
         assert!(provider_executable(Provider::Claude, Some(std::ffi::OsStr::new("/usr/bin:/bin"))).is_err());
         assert_eq!(crate::model::login_shell(), Err(crate::model::LoginShellError::ConfiguredUnavailable));
+        assert!(crate::model::system_login_shell().is_ok(), "a terminal-only stale pin cannot disable login-environment discovery");
         assert!(crate::control::terminal_spawn_recipe(root, vec![]).is_err(), "a missing pinned shell cannot silently switch to the login shell");
     }
 

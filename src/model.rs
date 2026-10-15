@@ -285,6 +285,12 @@ fn login_shell_for_device(remote_shell: Option<&str>) -> Result<String, LoginShe
     if let Some(shell) = crate::settings::default_path().ok().and_then(|path| crate::settings::load(path).ok()).and_then(|settings| settings.default_shell) {
         return if crate::settings::agents::executable_available(&shell) { Ok(shell) } else { Err(LoginShellError::ConfiguredUnavailable) };
     }
+    system_login_shell()
+}
+
+/// Login environment discovery uses the account's login shell, independently
+/// of a terminal-only executable override (which may be a wrapper).
+pub(crate) fn system_login_shell() -> Result<String, LoginShellError> {
     choose_login_shell(
         passwd_shell(),
         std::env::var_os("SHELL").and_then(|shell| shell.into_string().ok()),
