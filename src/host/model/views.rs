@@ -319,6 +319,21 @@ pub(super) fn apply(
 }
 
 impl Registry {
+    /// One bounded shared-view metadata row, without hydrating projects,
+    /// agents, automation history or retired pane indexes. The account caller
+    /// walks until None under its mutation reservation and time budget.
+    pub(in crate::host) fn account_view_page(&self, after: Option<&str>) -> Result<Option<(String, Vec<crate::workspace_model::views::Pane>)>, String> {
+        let row: Option<(String, Option<String>)> = self.db.query_row(
+            "SELECT scope, CASE WHEN length(CAST(panes AS BLOB)) <= 16777216 THEN panes ELSE NULL END FROM shared_views WHERE scope > ?1 ORDER BY scope LIMIT 1",
+            [after.unwrap_or("")], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        row.map(|(scope, panes)| {
+            let panes = panes.ok_or("Shared account pane metadata exceeds its census byte bound")?;
+            let panes = serde_json::from_str(&panes).map_err(|e| format!("Cannot decode account pane ownership: {e}"))?;
+            Ok((scope, panes))
+        }).transpose()
+    }
+
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
         Ok(read(&self.db, scope)?.revision)
     }

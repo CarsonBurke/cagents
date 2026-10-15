@@ -1124,6 +1124,14 @@ pub(crate) mod handoff {
                 .unwrap_or_default())
         }
 
+        /// Host-only exact private evidence for ownership census. Public
+        /// diagnostic summaries cannot establish physical account scope.
+        #[cfg(feature = "host")]
+        pub(crate) fn unattached_sources(&self) -> Result<Vec<Chat>, String> {
+            Ok(self.read_unattached::<UnattachedChat>()?.unwrap_or_default()
+                .into_iter().map(|chat| chat.evidence).collect())
+        }
+
         fn read_unattached<T: serde::de::DeserializeOwned>(
             &self,
         ) -> Result<Option<Vec<T>>, String> {

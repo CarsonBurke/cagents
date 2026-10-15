@@ -349,7 +349,31 @@ pub(super) fn ensure_account_homes_unused(
     host: &SharedHost,
     accounts: impl IntoIterator<Item = crate::account::Account>,
 ) -> Result<(), ProtocolError> {
+    ensure_account_homes_unused_inner(host, accounts, Instant::now() + Duration::from_secs(10), true)
+}
+
+pub(super) fn ensure_account_homes_unused_until(
+    host: &SharedHost,
+    accounts: impl IntoIterator<Item = crate::account::Account>,
+    deadline: Instant,
+) -> Result<(), ProtocolError> {
+    // The deletion permit separately qualifies exact pending/retained sources
+    // against authenticated captured ownership. Ordinary lifecycle callers
+    // retain the legacy conservative guard until they use that typed census.
+    ensure_account_homes_unused_inner(host, accounts, deadline, false)
+}
+
+fn ensure_account_homes_unused_inner(
+    host: &SharedHost,
+    accounts: impl IntoIterator<Item = crate::account::Account>,
+    deadline: Instant,
+    conservative_pending: bool,
+) -> Result<(), ProtocolError> {
+    let check_deadline = || if Instant::now() >= deadline {
+        Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest, "Account ownership census timed out", false))
+    } else { Ok(()) };
     for account in accounts {
+        check_deadline()?;
         let home = account.resolved_home().unwrap();
         let selected_home = |provider: crate::agent::Provider,
                              environment: &std::collections::BTreeMap<String, String>,
@@ -402,7 +426,9 @@ pub(super) fn ensure_account_homes_unused(
                 .filter(|(id, _)| state.account_terminal_in_use(**id))
             {
                 for provider in crate::account::Account::PROVIDERS {
-                    paths.extend(selected_recipe(provider, &record.session.launch));
+                    if conservative_pending || record.execution_environment.is_none() {
+                        paths.extend(selected_recipe(provider, &record.session.launch));
+                    }
                     if let Some(environment) = &record.execution_environment {
                         paths.extend(selected_home(
                             provider,
@@ -449,25 +475,24 @@ pub(super) fn ensure_account_homes_unused(
                 .values()
                 .filter(|record| record.handle.owns_work() || !record.subscribers.is_empty())
             {
-                paths.extend(selected_recipe(
-                    record.session.launch.provider,
-                    &record.session.launch.recipe,
-                ));
+                if conservative_pending {
+                    paths.extend(selected_recipe(record.session.launch.provider, &record.session.launch.recipe));
+                }
                 match record.handle.launch_account_scope() {
                     Ok(scope) => scopes.push(scope.clone()),
-                    Err(_) if record.session.launch.provider == account.provider => {
+                    Err(_) if conservative_pending && record.session.launch.provider == account.provider => {
                         unresolved_native = true
                     }
                     Err(_) => {}
                 }
             }
-            for session in state.chat_spawning.values() {
+            for session in state.chat_spawning.values().filter(|_| conservative_pending) {
                 paths.extend(selected_recipe(
                     session.launch.provider,
                     &session.launch.recipe,
                 ));
             }
-            for pending in state.chat_handoffs.values() {
+            for pending in state.chat_handoffs.values().filter(|_| conservative_pending) {
                 paths.extend(selected_recipe(
                     pending.source().launch.provider,
                     &pending.source().launch.recipe,
@@ -480,7 +505,7 @@ pub(super) fn ensure_account_homes_unused(
                 paths,
                 scopes,
                 unresolved_native
-                    || state
+                    || conservative_pending && state
                         .native_closing
                         .values()
                         .any(|pending| pending.may_own_provider(account.provider)),
@@ -491,10 +516,11 @@ pub(super) fn ensure_account_homes_unused(
         // Shared model membership also covers another window's parked or
         // completed panes. Read the independent connection outside HostState.
         if let Some(registry) = registry {
-            let model = registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .model()
+            let mut after = None;
+            loop {
+                check_deadline()?;
+                let page = super::account_lifecycle::deletion::lock_registry(&registry, deadline)
+                .and_then(|registry| registry.account_view_page(after.as_deref()))
                 .map_err(|message| {
                     ProtocolError::new(
                         ProtocolErrorCode::InvalidRequest,
@@ -502,7 +528,10 @@ pub(super) fn ensure_account_homes_unused(
                         false,
                     )
                 })?;
-            for pane in model.views.into_iter().flat_map(|view| view.panes) {
+                let Some((scope, panes)) = page else { break; };
+                after = Some(scope);
+            for pane in panes {
+                check_deadline()?;
                 match pane.kind {
                     crate::model::CardKind::Chat(session) => paths.extend(selected_recipe(
                         session.launch.provider,
@@ -515,6 +544,7 @@ pub(super) fn ensure_account_homes_unused(
                     }
                     _ => {}
                 }
+            }
             }
         }
         use std::os::unix::fs::MetadataExt;
@@ -553,7 +583,8 @@ pub(super) fn ensure_account_homes_unused(
         // Unattached holders keep their effective environment private. Their
         // provider is enough to identify uncertainty, not enough to authorize
         // changing a home. Inspect durable summaries outside HostState.
-        if let Some(store) = upgrade {
+        if let Some(store) = upgrade.filter(|_| conservative_pending) {
+            check_deadline()?;
             let retained = store.unattached().map_err(|error| ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
                 format!("Cannot verify retained account ownership: {error}. Resolve retained conversations before changing accounts."),
@@ -570,6 +601,7 @@ pub(super) fn ensure_account_homes_unused(
                 ));
             }
         }
+        check_deadline()?;
     }
     Ok(())
 }
@@ -604,7 +636,11 @@ pub(super) fn process_request(
                 crate::account::remote::affected_accounts(operation).map_err(|message| {
                     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
                 })?;
-            ensure_account_homes_unused(host, accounts.clone())?;
+            if !matches!(operation, crate::account::remote::Operation::DeleteFiles { .. })
+                || accounts.iter().any(crate::account::Account::is_linked)
+            {
+                ensure_account_homes_unused(host, accounts.clone())?;
+            }
             super::account_lifecycle::Reservation::install(host, &accounts)?
         };
         let reply =

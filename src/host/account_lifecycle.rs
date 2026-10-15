@@ -16,7 +16,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-mod deletion;
+pub(super) mod deletion;
 pub(crate) use deletion::DeletionPermit;
 
 type Map = BTreeMap<uuid::Uuid, Reserved>;

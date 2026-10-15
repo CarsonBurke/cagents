@@ -128,15 +128,15 @@ impl DeletionPermit<'_> {
 
 fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces: &BTreeSet<String>) -> Result<(), String> {
     let deadline = Instant::now() + CENSUS_BUDGET;
-    crate::host::client::ensure_account_homes_unused(host, vec![account.clone()])
+    crate::host::client::ensure_account_homes_unused_until(host, vec![account.clone()], deadline)
         .map_err(|e| e.message)?;
-    let (registry, installed_terminals, proof, current_scopes) = {
+    let (registry, installed_terminals, proof, current_scopes, mut pending, mut failures, upgrade) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.native_adoption_failures.is_empty()
-            || !state.native_closing.is_empty() || !state.chat_bindings.is_empty()
-            || !state.execution_startups.is_empty()
+        if !state.chat_bindings.is_empty()
+            || state.execution_startups.values().any(|(source, _)| matches!(source, crate::agent_execution::HostedSession::Terminal(_)))
+            || state.chat_handoffs.values().any(|handoff| !state.terminals.contains_key(&handoff.replacement().id))
         {
-            return Err("Account ownership is unresolved during native adoption, closure or launch; finish that operation before deleting files".into());
+            return Err("A pending binding or terminal launch has no captured physical account ownership; finish it before deleting files".into());
         }
         let registry = state.execution_registry.clone()
             .ok_or("Account deletion requires the complete durable ownership registry")?;
@@ -144,16 +144,35 @@ fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces
             .filter_map(|record| record.handle.holder_identity().cloned())
             .collect::<Vec<_>>();
         let scopes = state.chats.values().map(|record| {
-            record.handle.launch_account_scope().cloned().map_err(str::to_owned)
+            (record.session.clone(), record.handle.launch_account_scope().cloned().map_err(str::to_owned))
         }).collect::<Vec<_>>();
-        (registry, installed, state.proof().clone(), scopes)
+        let pending = state.native_closing.values().map(|close| close.source().clone())
+            .chain(state.chat_spawning.values().cloned())
+            .chain(state.execution_startups.values().filter_map(|(source, _)| match source {
+                crate::agent_execution::HostedSession::Chat(source) => Some(source.clone()), _ => None,
+            })).chain(state.chat_handoffs.values().map(|handoff| handoff.source().clone()))
+            .collect::<Vec<_>>();
+        (registry, installed, state.proof().clone(), scopes, pending,
+            state.native_adoption_failures.pending_source_hashes(), state.account_cleanup_evidence())
     };
+    if let Some(upgrade) = upgrade {
+        check_time(deadline)?;
+        pending.extend(upgrade.unattached_sources()?.into_iter().map(|chat| chat.source));
+        check_time(deadline)?;
+    }
     // Include completed/unsubscribed records too: generic completion or Stop
     // is not final retirement. Explicit management close removes the record.
-    for scope in current_scopes {
-        let scope = scope.map_err(|_| "A hosted conversation has unknown account ownership; explicitly close it before deleting files")?;
-        if overlaps(home, account, &scope, namespaces)? {
-            return Err("A hosted conversation still owns this physical account; explicitly close it before deleting files".into());
+    for (source, scope) in current_scopes {
+        match scope {
+            Ok(scope) => {
+                if overlaps(home, account, &scope, namespaces)? {
+                    return Err("A hosted conversation still owns this physical account; explicitly close it before deleting files".into());
+                }
+                discharge_pending(&mut pending, &mut failures, &source)?;
+            }
+            // A retained exact owner may supply its authenticated captured
+            // scope below. A public recipe cannot discharge this uncertainty.
+            Err(_) => pending.push(source),
         }
     }
     // Read-only strict inventory: unlike discover(), this never skips or
@@ -168,6 +187,18 @@ fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces
         for directory in &mut evidence {
             directory.allow(&record, false);
             if closed { directory.allow(&record, true); }
+        }
+    }
+    // Strong v5 proof is self-contained after retention removes a terminal's
+    // resident record. Old root-only receipts are never promoted by this path.
+    for directory in &mut evidence {
+        if directory.kind == Kind::Terminal {
+            for entry in &mut directory.entries {
+                check_time(deadline)?;
+                if entry.closed && let Some(record) = &entry.record {
+                    entry.allowed = crate::terminal::holder::cleanup::retired_for_census(record, &proof)?;
+                }
+            }
         }
     }
     // Each mutex hold reads at most 128 owners. Walk through the empty page,
@@ -208,6 +239,7 @@ fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces
                 // Exact finally-retired Unknown scope can be excluded from
                 // live access. It supplies no physical/session purge authority.
                 for directory in &mut evidence { directory.allow(owner.owner(), true); }
+                discharge_pending(&mut pending, &mut failures, owner.source())?;
             } else {
                 let scope = owner.scope().map_err(|_| {
                     "An unretired actor has unknown account ownership; explicitly close it before deleting account files"
@@ -221,13 +253,29 @@ fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces
                 // Only an authenticated exact foreign owner can explain its
                 // live discovery record. Unknown/unregistered files still fail.
                 for directory in &mut evidence { directory.allow(owner.owner(), false); }
+                discharge_pending(&mut pending, &mut failures, owner.source())?;
             }
         }
     }
+    if !pending.is_empty() || !failures.is_empty() {
+        return Err("A pending or retained conversation has no exact foreign ownership or final retirement; resolve it before deleting files".into());
+    }
     for directory in &evidence { directory.finish(deadline)?; }
-    crate::host::client::ensure_account_homes_unused(host, vec![account.clone()])
+    crate::host::client::ensure_account_homes_unused_until(host, vec![account.clone()], deadline)
         .map_err(|e| e.message)?;
     check_time(deadline)
+}
+
+fn discharge_pending(
+    pending: &mut Vec<crate::chat::Session>,
+    failures: &mut Vec<(crate::model::TerminalId, Vec<[u8; 32]>)>,
+    source: &crate::chat::Session,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    pending.retain(|candidate| candidate != source);
+    let digest: [u8;32] = Sha256::digest(serde_json::to_vec(source).map_err(|e|e.to_string())?).into();
+    failures.retain(|(id, hashes)| *id != source.id || !hashes.contains(&digest));
+    Ok(())
 }
 
 fn overlaps(home: &Home, account: &Account, scope: &LaunchAccountScope, namespaces: &BTreeSet<String>) -> Result<bool, String> {
@@ -250,7 +298,7 @@ fn check_time(deadline: Instant) -> Result<(), String> {
     } else { Ok(()) }
 }
 
-fn lock_registry<'a>(
+pub(in crate::host) fn lock_registry<'a>(
     registry: &'a std::sync::Mutex<crate::host::model::Registry>,
     deadline: Instant,
 ) -> Result<std::sync::MutexGuard<'a, crate::host::model::Registry>, String> {
@@ -331,7 +379,10 @@ impl Directory {
                 } else { serde_json::from_slice(&bytes).map_err(|e| e.to_string())? };
                 let expected = if closed { format!("{}-{}-{}.closed", record.terminal, record.holder.pid, record.holder.start) }
                     else { format!("{}.json", record.terminal) };
-                if text != expected || record.kind != kind || !matches!(record.version, 3 | 4)
+                if text != expected || record.kind != kind || !match kind {
+                    Kind::Terminal => matches!(record.version, 3 | 4 | 5),
+                    Kind::Native => matches!(record.version, 3 | 4),
+                }
                     || !holders::record_application_matches(&record)
                 { return Err("Holder record does not match its exact private namespace".into()); }
                 if !closed { records.insert(record.terminal.to_string()); }
@@ -527,7 +578,7 @@ mod tests {
                 .env("XDG_DATA_HOME",directory.path().join("data"))
                 .env("XDG_CACHE_HOME",directory.path().join("cache"))
                 .env("XDG_RUNTIME_DIR",directory.path().join("runtime"))
-                .env("PATH","/usr/bin:/bin").output().unwrap();
+                .env("PATH","/usr/bin:/bin").env("TERM","xterm-256color").output().unwrap();
             assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
             return;
         }
@@ -538,7 +589,9 @@ mod tests {
         store.update(|registry|registry.register(Registered {key,provider:Provider::Claude,linked_home:None,label:None,email:None,organization:None,added_at:0},&[]).unwrap()).unwrap();
         let account=Account::managed(Provider::Claude,key,path.clone());
         let proof=HostSessionProof {host_session_id:HostSessionId::new("permit-fixture"),boot_id:crate::daemon::read_boot_id().unwrap(),host_incarnation:HostIncarnation::new("permit-fixture")};
-        let host=std::sync::Arc::new(HostMutex::new(HostState::new(proof)));
+        let runtime=crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease=crate::daemon::HostLease::acquire(&runtime,&proof).unwrap();
+        let host=std::sync::Arc::new(HostMutex::new(HostState::new(proof.clone())));
         host.lock().unwrap().install_model(crate::host::model::Registry::at(&root.join("model.sqlite3")).unwrap());
         let reservation=Reservation::install(&host,&[account.clone()]).unwrap();
         let scope=LaunchAccountScope::resolve(Provider::Claude,&root,|key|(key=="CLAUDE_CONFIG_DIR").then(||path.clone().into_os_string())).unwrap();
@@ -548,7 +601,36 @@ mod tests {
         let mut wrong=scope.clone();wrong.inode+=1;
         assert!(permit.authorize_scope(&wrong).is_err());
 
+        // Real registered ordinary-terminal close leaves durable strong proof
+        // after its resident state is gone. It cannot strand unrelated account
+        // deletion, and its receipt is neither removed nor promoted from v4.
+        let terminal=crate::model::TerminalSession {
+            id:crate::model::TerminalId::new(),launch:crate::model::LaunchRecipe {
+                program:"/bin/sh".into(),arguments:vec!["-c".into(),"exec /bin/cat".into()],working_directory:root.clone(),
+                environment:Default::default(),unset_environment:Default::default(),
+            },owned_codex_listener:None,recovery_origin:None,predecessor:None,transcript_path:None,resume_hint:None,
+            continuity:crate::model::TerminalContinuity::DetachedSameBoot {host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone()},
+        };
+        let handle=crate::terminal::TerminalHandle::spawn(terminal.clone(),crate::terminal::TerminalConfig {
+            holder_recovery:Some(crate::terminal::holder::Recovery {source:terminal.clone(),previous_sources:Vec::new(),relaunches:Vec::new(),options:Default::default(),execution_environment:None}),
+            ..Default::default()
+        },|_|{}).unwrap();
+        let closed_owner=handle.holder_identity().cloned().unwrap();
+        handle.close_with_receipt(&terminal,&proof).unwrap();
+        drop(handle);
+        assert!(host.lock().unwrap().terminals.is_empty());
+        let closed_path=holders::directory(Kind::Terminal).unwrap().join(format!("{}-{}-{}.closed",closed_owner.terminal,closed_owner.holder.pid,closed_owner.holder.start));
+        assert!(closed_path.exists());
+        permit.authorize_scope(&scope).unwrap();
+        assert!(closed_path.exists(),"the deletion census classifies positive retirement without erasing it");
+
         let registry=host.lock().unwrap().execution_registry.clone().unwrap();
+        {
+            let _held=registry.lock().unwrap();
+            let started=Instant::now();
+            assert!(crate::host::client::ensure_account_homes_unused_until(&host,[account.clone()],started+Duration::from_millis(30)).is_err());
+            assert!(started.elapsed()<Duration::from_secs(1),"unrelated registry lock cannot exceed the caller census deadline");
+        }
         // The final owner sorts after a full 128-row page. A one-page census
         // would miss it. Earlier owners have proved exact final retirement;
         // this fixture tests the trusted registry consumer, not helper teardown.
@@ -581,12 +663,22 @@ mod tests {
         let foreign_scope=LaunchAccountScope::resolve(Provider::Claude,&root,|key|(key=="CLAUDE_CONFIG_DIR").then(||foreign_path.clone().into_os_string())).unwrap();
         let mut foreign_owner=record(Kind::Native);foreign_owner.holder.pid=i32::MAX;foreign_owner.root.pid=i32::MAX;
         let mut foreign_source=last.source().clone();foreign_source.id=foreign_owner.terminal;
+        // Immutable requested metadata may differ from actual startup scope.
+        // Only captured ownership can prove this is a foreign pending actor.
+        foreign_source.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(),path.display().to_string());
         registry.lock().unwrap().register_native_actor_ownership(uuid::Uuid::from_u128(130),&foreign_owner,&foreign_source,Ok(&foreign_scope)).unwrap();
         let key=crate::chat::annotations::storage::account_key(&foreign_scope);
         assert!(missing_permit.reserve_registered_namespaces(&missing_account.id(),&[key]).is_err(),"an unrelated label cannot hide a historical namespace writer");
         assert!(super::super::ensure_captured_scope(&host,Some(&foreign_scope)).is_err(),"failed census retains its namespace guard until reservation drop");
         drop(missing_permit);drop(missing_reservation);
         super::super::ensure_captured_scope(&host,Some(&foreign_scope)).unwrap();
+        host.lock().unwrap().chat_spawning.insert(foreign_source.id,foreign_source.clone());
+        permit.authorize_scope(&scope).unwrap();
+        host.lock().unwrap().chat_spawning.remove(&foreign_source.id);
+        let mut unknown_source=foreign_source.clone();unknown_source.id=crate::model::TerminalId::new();
+        host.lock().unwrap().chat_spawning.insert(unknown_source.id,unknown_source.clone());
+        assert!(permit.verify().is_err(),"a recipe claiming a foreign home is not authenticated pending ownership");
+        host.lock().unwrap().chat_spawning.remove(&unknown_source.id);
         // A stale registration/path and a released lease independently revoke
         // the borrowed permit; no deletion has occurred in this fixture.
         let retained=root.join("retained-home");std::fs::rename(&path,&retained).unwrap();

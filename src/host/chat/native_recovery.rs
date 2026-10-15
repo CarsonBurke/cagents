@@ -15,6 +15,9 @@ struct AdoptionFailure {
 }
 
 impl AdoptionFailures {
+    pub(in crate::host) fn pending_source_hashes(&self) -> Vec<(TerminalId, Vec<[u8; 32]>)> {
+        self.0.iter().map(|failure| (failure.id, failure.sources.clone())).collect()
+    }
     pub(in crate::host) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
