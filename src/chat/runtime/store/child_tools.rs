@@ -154,6 +154,9 @@ impl Store {
     /// A kind replacement invalidates the old tool source and optional cache.
     /// Its distinct marker permits ongoing prose but not ambiguous tool replay.
     fn remove_child_tool(&mut self, agent: &str, id: &str) -> Result<(), String> {
+        // A no-op still admits the following prose write/forward. Refuse an
+        // unknown marker version before touching another source or pending lane.
+        guard(&self.db, self.raw_sources.nonce)?;
         // Prose token deltas must not repeatedly acquire a writer after the
         // old tool has already become a retained replacement marker.
         let exists: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tools WHERE agent=?1 AND id=?2)",
@@ -258,6 +261,12 @@ impl Store {
             _ => {}
         }
         if self.child_tools_unavailable.is_some() {
+            // The optional tool writer may be disabled while prose continues.
+            // It still cannot interpret markers from an unsupported namespace.
+            if matches!(event, Event::SubagentTextDelta { .. })
+                || matches!(event, Event::SubagentItem {item,..} if matches!(&item.content, ItemContent::Text { .. })) {
+                guard(&self.db, self.raw_sources.nonce)?;
+            }
             return Ok(None);
         }
         let delta = match event {
@@ -1107,6 +1116,58 @@ mod tests {
                 assert_eq!(store.db.total_changes(), before, "guard must precede every mutation");
                 assert_eq!(store.db.query_row("SELECT count(*) FROM child_tools WHERE id='known'", [], |row| row.get::<_, usize>(0)).unwrap(), 1);
                 assert_eq!(store.db.query_row("SELECT count(*) FROM child_tool_revoked", [], |row| row.get::<_, usize>(0)).unwrap(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn future_child_schema_refuses_prose_before_any_source_flush_or_forward() {
+        for replacement_marker in [false, true] {
+            for streamed in [false, true] {
+                for unavailable in [false, true] {
+                    let mut store = Store::new().unwrap();
+                    if replacement_marker {
+                        put(&mut store, "one", tool("same", "private tool", ""));
+                        let prose = Item {id: "same".into(), content: ItemContent::Text {
+                            text: "replacement prose".into(), thinking: false, phase: Phase::Final,
+                        }, ..tool("same", "", "")};
+                        put(&mut store, "one", prose);
+                    }
+                    store.apply(Event::SubagentTextDelta {id: "pending".into(), item_id: "unrelated".into(),
+                        role: Role::Assistant, thinking: false, delta: "retained pending prose".into()}).unwrap();
+                    assert!(store.pending_child_source.is_some());
+                    if unavailable { store.child_tools_unavailable = Some(BUDGET_ERROR); }
+                    let availability = store.child_tools_unavailable;
+                    store.db.execute("UPDATE child_tool_schema SET version=?1", [VERSION + 1]).unwrap();
+                    let before = store.db.total_changes();
+                    let revision = store.source_revision;
+                    let ordinal = store.child_file_ordinal;
+                    let dirty = store.dirty;
+                    let event = if streamed {
+                        Event::SubagentTextDelta {id: "one".into(), item_id: "same".into(),
+                            role: Role::Assistant, thinking: false, delta: "must not append".into()}
+                    } else {
+                        Event::SubagentItem {id: "one".into(), item: Item {id: "same".into(),
+                            content: ItemContent::Text {text: "must not replace".into(), thinking: false, phase: Phase::Final},
+                            ..tool("same", "", "")}}
+                    };
+                    let failure = store.apply(event).unwrap_err();
+                    assert!(failure.contains("schema changed"), "{failure}");
+                    assert_eq!(store.db.total_changes(), before);
+                    assert_eq!(store.source_revision, revision);
+                    assert_eq!(store.child_file_ordinal, ordinal);
+                    assert_eq!(store.dirty, dirty);
+                    assert_eq!(store.child_tools_unavailable, availability);
+                    assert!(store.pending_child_source.is_some(), "the earlier source must not flush");
+                    store.db.execute("UPDATE child_tool_schema SET version=?1", [VERSION]).unwrap();
+                    let page = store.source_page(crate::chat::cache::SourceQuery {
+                        source: crate::chat::cache::SourceKey {agent_id: Some("pending".into()), source_id: "unrelated".into()},
+                        offset: 0, limit: crate::chat::cache::PAGE_BYTES, expected_epoch: None, until: None,
+                    }).unwrap();
+                    assert_eq!(page.text, "retained pending prose", "refusal preserves the original pending bytes");
+                    let target = store.db.query_row("SELECT len FROM child_sources WHERE agent='one' AND id='same'", [], |row| row.get::<_,usize>(0)).optional().unwrap();
+                    assert_eq!(target, replacement_marker.then_some("replacement prose".len()));
+                }
             }
         }
     }
