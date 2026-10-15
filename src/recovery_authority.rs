@@ -39,12 +39,15 @@ fn context_budget() -> Arc<Mutex<ContextUsage>> {
 }
 struct ContextInner {
     // Dropping an owned lease closes its FDs; no namespace mutation runs here.
-    _guard: Box<dyn Send + Sync>,
+    guard: Option<Box<dyn Send + Sync>>,
     descriptors: usize,
     budget: Arc<Mutex<ContextUsage>>,
 }
 impl Drop for ContextInner {
     fn drop(&mut self) {
+        // Keep charged capacity until the actual native guards have closed.
+        // Never hold the budget mutex across a producer's guard destructor.
+        drop(self.guard.take());
         let mut used = self
             .budget
             .lock()
@@ -83,7 +86,7 @@ impl RecoveryContext {
         used.descriptors = total;
         drop(used);
         Ok(Self(Arc::new(ContextInner {
-            _guard: Box::new(guard),
+            guard: Some(Box::new(guard)),
             descriptors,
             budget,
         })))
@@ -352,6 +355,22 @@ mod tests {
         b.retry().unwrap();
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
+    #[test]
+    fn cleanup_context_capacity_stays_charged_until_guard_destructor_finishes() {
+        struct Guard { started: std::sync::mpsc::Sender<()>, release: Arc<std::sync::Barrier> }
+        impl Drop for Guard { fn drop(&mut self) { self.started.send(()).unwrap(); self.release.wait(); } }
+        let budget = Arc::new(Mutex::new(ContextUsage::default()));
+        let (started, signal) = std::sync::mpsc::channel(); let release = Arc::new(std::sync::Barrier::new(2));
+        let context = RecoveryContext::from_budget(Guard { started, release: release.clone() }, 128, budget.clone()).unwrap();
+        let cleanup = std::thread::spawn(move || drop(context));
+        signal.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(RecoveryContext::from_budget((), 1, budget.clone()).is_err());
+        assert_eq!(budget.lock().unwrap().descriptors, 128);
+        release.wait(); cleanup.join().unwrap();
+        let replacement = RecoveryContext::from_budget((), 128, budget.clone()).unwrap();
+        drop(replacement); assert_eq!(budget.lock().unwrap().descriptors, 0);
+    }
+
     #[test]
     fn cleanup_context_is_shared_bounded_and_survives_parent_drop_until_resolution() {
         struct Guard(Arc<AtomicUsize>);
