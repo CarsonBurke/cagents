@@ -157,6 +157,22 @@ mod tests {
     }
 
     #[test]
+    fn window_close_waits_for_unopened_only_publication_without_exiting_mid_write() {
+        let mut app = app();
+        let card = CardId::new();
+        let operation = operation(&app, card);
+        app.editor_features.publication = Some(Publication { ticket: 8, operation, cards: Vec::new() });
+        assert!(app.window_close_transient_blocker().is_some());
+        let window = window::Id::unique();
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert_eq!(app.transient_work_close, Some(window));
+        assert!(app.exit.is_none());
+        drop(app.update_editor_features(Action::Published { ticket: 8, result: Ok(workspace::PublicationReport::default()) }));
+        assert!(!app.editor_features.publishing());
+        assert!(app.exit.is_none());
+    }
+
+    #[test]
     fn a_selected_target_still_loading_is_not_treated_as_an_unopened_file() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.rs"), "fn old() {}\n").unwrap();
@@ -240,6 +256,7 @@ pub(super) struct State {
 
 impl State {
     pub fn modal_open(&self) -> bool { self.preview.is_some() || self.publication.is_some() }
+    pub fn publishing(&self) -> bool { self.publication.is_some() }
     fn next(&mut self) -> u64 { self.next_ticket = self.next_ticket.wrapping_add(1).max(1); self.next_ticket }
 }
 

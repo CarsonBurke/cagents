@@ -11891,6 +11891,7 @@ impl Cagents {
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
+        if self.editor_features.publishing() { return Some("Wait for the workspace edit to finish applying before closing the window."); }
         if let Some(blocker) = self.automation_ui.draft_close_blocker() {
             return Some(blocker);
         }
