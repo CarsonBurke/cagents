@@ -778,6 +778,100 @@ mod tests {
     }
 
     #[test]
+    fn archived_release_restores_unsent_notes_and_drops_history_and_loaded_edit_bodies() {
+        // These are UI ownership fixtures with injected body/query results,
+        // not proof of a private archive RPC or account-revocation producer.
+        for release in 0..3 {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = super::super::tests::live_chat(&mut app, Some("11111111-1111-4111-8111-111111111111"));
+            let owner = crate::model::AgentId::new();
+            Arc::make_mut(&mut app.durable).automation_archives.insert(card, owner);
+            if release != 0 { app.mark_automation_archive(card); }
+            let descriptor = app.card_state(card).unwrap().kind.clone();
+            let body = Snapshot {
+                generation: 9, ready: true, exited: true,
+                items: ["earlier private prompt", "latest private prompt"].into_iter().enumerate()
+                    .map(|(index, text)| Arc::new(chat::Item {
+                        id: format!("private-prompt-{index}"), role: chat::Role::User,
+                        content: ItemContent::Text {text:text.into(), thinking:false, phase:chat::Phase::Final},
+                        at:None, started_at:None,
+                    })).collect(),
+                ..Default::default()
+            };
+            let (target, late, old_page, old_patch) = {
+                let runtime = match app.cards.get_mut(&card).unwrap() {CardRuntime::Chat(runtime)=>runtime,_=>unreachable!()};
+                runtime.visible.store(true, Ordering::Relaxed);
+                runtime.replace_draft(EditorContent::with_text("Keep my typed unsent notes"));
+                runtime.install_snapshot(Arc::new(body.clone()), None);
+                runtime.recall(true);
+                assert_eq!(runtime.composer.text(), "latest private prompt");
+                assert_eq!(runtime.unsent_text(), "Keep my typed unsent notes");
+                runtime.changes.show();
+                runtime.changes.select(key("private.rs"));
+                let loaded = runtime.changes.request(true);
+                assert!(runtime.changes.complete(loaded, Ok(page(loaded, key("private.rs"), "-private old body\n+private edited body\n", 0))));
+                let old_page = Arc::downgrade(runtime.changes.page.as_ref().unwrap());
+                let old_patch = Arc::downgrade(&runtime.changes.patch.as_ref().unwrap().text);
+                let late = runtime.changes.request(false); // Keeps the loaded patch while a list refresh runs.
+                (runtime.target, late, old_page, old_patch)
+            };
+            match release {
+                0 => app.mark_automation_archive(card),
+                1 => app.chat_card_runtime_mut(target).unwrap().set_visible(false).unwrap(),
+                _ => app.chat_card_runtime_mut(target).unwrap().revoke_automation_archive_history(),
+            }
+            assert!(old_page.upgrade().is_none(), "loaded page must release its body owner");
+            assert!(old_patch.upgrade().is_none(), "rendered patch must release its body owner");
+            let mut late_list = chat::FileChangesSummary::default();
+            late_list.request_id = late;
+            drop(app.update(Message::ChatUi(Action::ChangesLoaded(target, late, Ok(chat::FileChangeReply::Files(late_list))))));
+            drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+            drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+            drop(app.update(Message::ChatUi(Action::ChangesPicker(target, true))));
+            let runtime = app.chat_card_runtime_mut(target).unwrap();
+            assert!(runtime.history.is_empty() && runtime.history_cursor.is_none() && runtime.history_stash.is_none());
+            assert_eq!(runtime.composer.text(), "Keep my typed unsent notes");
+            assert!(!runtime.changes.open && runtime.changes.waiting.is_empty());
+            assert!(runtime.changes.page.is_none() && runtime.changes.patch.is_none() && runtime.changes.list.is_none());
+            if release == 2 {
+                runtime.set_visible(true).unwrap();
+                runtime.install_snapshot(Arc::new(body), None);
+                runtime.recall(true);
+                assert!(runtime.history.is_empty() && runtime.snapshot.items.is_empty());
+                assert_eq!(runtime.composer.text(), "Keep my typed unsent notes");
+            }
+            assert_eq!(app.card_state(card).unwrap().kind, descriptor);
+            assert_eq!(app.durable.automation_archives.get(&card), Some(&owner));
+        }
+    }
+
+    #[test]
+    fn pending_edit_body_reply_cannot_restore_an_archived_or_revoked_reader() {
+        for archived in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = super::super::tests::live_chat(&mut app, Some("11111111-1111-4111-8111-111111111111"));
+            let (target, id) = {
+                let runtime = match app.cards.get_mut(&card).unwrap() {CardRuntime::Chat(runtime)=>runtime,_=>unreachable!()};
+                runtime.changes.show();
+                runtime.changes.select(key("sensitive.rs"));
+                (runtime.target, runtime.changes.request(true))
+            };
+            if archived {
+                Arc::make_mut(&mut app.durable).automation_archives.insert(card, crate::model::AgentId::new());
+                app.mark_automation_archive(card);
+                app.chat_card_runtime_mut(target).unwrap().revoke_automation_archive_history();
+            }
+            drop(app.update(Message::ChatUi(Action::ChangesLoaded(target, id,
+                Ok(page(id, key("sensitive.rs"), "-private source\n+late private source\n", 0))))));
+            let runtime = app.chat_card_runtime_mut(target).unwrap();
+            assert_eq!(runtime.changes.page.is_some(), !archived);
+            assert_eq!(runtime.changes.patch.is_some(), !archived);
+            assert_eq!(runtime.changes.open, !archived);
+            assert!(runtime.changes.waiting.is_empty());
+        }
+    }
+
+    #[test]
     fn unknown_totals_are_not_presented_as_zero() {
         assert_eq!(totals(Some(7), Some(3)), "+7 −3");
         assert_eq!(totals(None, Some(3)), "Line totals unavailable");

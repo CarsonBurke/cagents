@@ -2073,6 +2073,9 @@ impl Runtime {
     /// composer. Walking older from the draft keeps the draft; walking newer
     /// past the newest message brings it back.
     fn recall(&mut self, older: bool) {
+        if self.archive_history_revoked && matches!(self.connection, Connection::Archived) {
+            return;
+        }
         let next = match (self.history_cursor, older) {
             (None, true) => {
                 let Some(newest) = self.history.len().checked_sub(1) else {
@@ -2098,6 +2101,9 @@ impl Runtime {
     /// Recalled prompts are complete history entries, including multiline
     /// ones. Both arrows keep walking that history until the draft returns.
     fn history_navigation(&self) -> (bool, bool) {
+        if self.archive_history_revoked && matches!(self.connection, Connection::Archived) {
+            return (false, false);
+        }
         let browsing = self.history_cursor.is_some();
         let older =
             !self.history.is_empty() && (browsing || self.composer.cursor().position.line == 0);
@@ -2802,7 +2808,22 @@ impl Runtime {
         }
     }
 
+    /// These caches came from the previous reader, separately from the typed
+    /// local draft. Invalidate pending edit-page deliveries before dropping bodies.
+    fn release_archived_auxiliary_presentation(&mut self) {
+        if self.history_cursor.take().is_some() {
+            let unsent = self.history_stash.take().unwrap_or_default();
+            self.replace_draft(unsent);
+        }
+        self.history_stash = None;
+        self.history = Vec::new();
+        self.changes.close();
+    }
+
     pub(super) fn release_transcript_presentation(&mut self) {
+        if matches!(self.connection, Connection::Archived) {
+            self.release_archived_auxiliary_presentation();
+        }
         self.cache = HashMap::new();
         let snapshot = Arc::make_mut(&mut self.snapshot);
         snapshot.items = Vec::new();
@@ -5178,6 +5199,7 @@ impl Cagents {
                     .reader_revoked(card, runtime.session.id);
             if !matches!(runtime.connection, Connection::Archived) {
                 runtime.connection = Connection::Archived;
+                runtime.release_archived_auxiliary_presentation();
                 runtime.archive_evicted = !revoked;
                 if !runtime.visible.load(Ordering::Relaxed) {
                     runtime.release_transcript_presentation();
@@ -5420,7 +5442,10 @@ impl Cagents {
                 if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                     runtime.target = target;
                     runtime.session = session.clone();
-                    runtime.connection = Connection::Archived;
+                    if !matches!(runtime.connection, Connection::Archived) {
+                        runtime.connection = Connection::Archived;
+                        runtime.release_archived_auxiliary_presentation();
+                    }
                     if history_revoked {
                         runtime.revoke_automation_archive_history();
                     }
@@ -8847,6 +8872,10 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if matches!(runtime.connection, Connection::Archived) {
+                    runtime.changes.close();
+                    return Task::none();
+                }
                 if open {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
