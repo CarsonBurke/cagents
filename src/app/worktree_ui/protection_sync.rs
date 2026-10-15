@@ -259,11 +259,17 @@ mod tests {
         assert!(app.worktree_protection_sync.inflight.is_some());
         let mut stream = iced::runtime::task::into_stream(task).expect("camera update has tasks");
         let (generation, receipt) = tokio::runtime::Builder::new_current_thread()
-            .build().unwrap().block_on(async move {
+            .build()
+            .unwrap()
+            .block_on(async move {
                 while let Some(action) = stream.next().await {
                     if let iced::runtime::Action::Output(cosmic::Action::App(
-                        Message::WorktreeProtectionsPrepared { generation, receipt },
-                    )) = action {
+                        Message::WorktreeProtectionsPrepared {
+                            generation,
+                            receipt,
+                        },
+                    )) = action
+                    {
                         return (generation, receipt);
                     }
                     // Viewport updates also emit a scroll widget operation.
@@ -281,11 +287,20 @@ mod tests {
             // Use the production desired-set and receipt commit, injecting only
             // the private runtime directory for real filesystem locks.
             drop(app.sync_worktree_protections());
-            let (generation, paths, _) = app.worktree_protection_sync.inflight.clone()
+            let (generation, paths, _) = app
+                .worktree_protection_sync
+                .inflight
+                .clone()
                 .expect("changed paths must prepare a replacement");
-            let prepared = app.worktree_protections.synchronization_snapshot()
-                .fixture_prepare_sync(runtime, paths).unwrap();
-            (generation, Receipt(Arc::new(Mutex::new(Some(Ok(prepared))))))
+            let prepared = app
+                .worktree_protections
+                .synchronization_snapshot()
+                .fixture_prepare_sync(runtime, paths)
+                .unwrap();
+            (
+                generation,
+                Receipt(Arc::new(Mutex::new(Some(Ok(prepared))))),
+            )
         }
         fn denied(result: std::io::Result<crate::worktree_cleanup::Protection>) {
             assert!(matches!(result, Err(error)
@@ -303,42 +318,70 @@ mod tests {
         let mut app = empty_window();
         let mut draft = crate::app::tests::terminal_card_state();
         let id = draft.id;
-        draft.kind = CardKind::Chat(chat::fresh_session_deferred_policy(
-            crate::agent::Provider::Codex, TerminalId::new(), nested.clone(),
-            &crate::account::Account::system(crate::agent::Provider::Codex),
-        ).unwrap());
+        draft.kind = CardKind::Chat(
+            chat::fresh_session_deferred_policy(
+                crate::agent::Provider::Codex,
+                TerminalId::new(),
+                nested.clone(),
+                &crate::account::Account::system(crate::agent::Provider::Codex),
+            )
+            .unwrap(),
+        );
         Arc::make_mut(&mut app.durable).cards.push(draft);
-        Arc::make_mut(&mut app.durable).card_scopes.insert(id, filing.clone());
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(id, filing.clone());
         app.worktree_owners.insert(id, filing.clone());
         app.active_workspace = Some(filing.clone());
-        assert!(app.cards.is_empty(), "no daemon actor protects this unstarted draft");
+        assert!(
+            app.cards.is_empty(),
+            "no daemon actor protects this unstarted draft"
+        );
         let (generation, receipt) = prepare(&mut app, runtime.path());
         assert!(app.worktree_protection_sync.desired.contains(&nested));
         assert!(app.worktree_protection_sync.desired.contains(&filing));
         let ready = runtime.path().join("fixture-window-ready");
         drop(crate::instance::owned_lock(&ready, libc::LOCK_SH | libc::LOCK_NB).unwrap());
         drop(app.window_protections_prepared(generation, receipt));
-        assert!(matches!(crate::instance::owned_lock(&ready, libc::LOCK_SH | libc::LOCK_NB),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert!(
+            matches!(crate::instance::owned_lock(&ready, libc::LOCK_SH | libc::LOCK_NB),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
         // A separate remover only needs the root's exclusive lease. The
         // nested issued cwd must also protect that containing Git worktree.
-        denied(crate::worktree_cleanup::fixture_protection(runtime.path(), &source, true));
+        denied(crate::worktree_cleanup::fixture_protection(
+            runtime.path(),
+            &source,
+            true,
+        ));
         std::fs::rename(&source, &moved).unwrap();
         app.worktree_protection_sync.invalidate();
         let (generation, receipt) = prepare(&mut app, runtime.path());
         drop(app.window_protections_prepared(generation, receipt));
         assert!(app.worktree_protections.needs_retry());
-        assert!(matches!(crate::instance::owned_lock(&ready, libc::LOCK_SH | libc::LOCK_NB),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
-        denied(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true));
+        assert!(
+            matches!(crate::instance::owned_lock(&ready, libc::LOCK_SH | libc::LOCK_NB),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        denied(crate::worktree_cleanup::fixture_protection(
+            runtime.path(),
+            &moved,
+            true,
+        ));
         Arc::make_mut(&mut app.durable).cards[0].existence = Existence::Closed {
             tombstone: crate::model::Tombstone {
-                operation_id: None, closed_at_unix_ms: 1, reason: Some("fixture pane closed".into()),
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("fixture pane closed".into()),
             },
         };
         let (generation, receipt) = prepare(&mut app, runtime.path());
         assert!(!app.worktree_protection_sync.desired.contains(&nested));
-        denied(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true));
+        denied(crate::worktree_cleanup::fixture_protection(
+            runtime.path(),
+            &moved,
+            true,
+        ));
         drop(app.window_protections_prepared(generation, receipt));
         drop(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).unwrap());
         assert!(app.worktree_protections.protects_exact(&filing));

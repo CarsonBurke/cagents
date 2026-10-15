@@ -6216,16 +6216,30 @@ mod tests {
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         // A metadata-only follow-up must pass through the normalized lane too.
-        workspace.conversation_channels.insert("Codex:session-id".into(), ChannelId::new());
+        workspace
+            .conversation_channels
+            .insert("Codex:session-id".into(), ChannelId::new());
         lane.save(&store, &workspace).unwrap();
-        assert_eq!(store.load_workspace_manifest(workspace.id).unwrap().unwrap().conversation_channels,
-            workspace.conversation_channels);
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_channels,
+            workspace.conversation_channels
+        );
         drop(store);
         let store = StateStore::open(&database, boot("new-process")).unwrap();
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
-        assert_eq!(restored.conversation_channels, workspace.conversation_channels);
+        assert_eq!(
+            restored.conversation_channels,
+            workspace.conversation_channels
+        );
         let mut legacy = serde_json::to_value(&workspace).unwrap();
-        legacy.as_object_mut().unwrap().remove("conversation_channels");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_channels");
         let legacy = serde_json::from_value::<WorkspaceState>(legacy).unwrap();
         assert!(legacy.conversation_channels.is_empty());
     }

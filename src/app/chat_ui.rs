@@ -4135,7 +4135,9 @@ impl Cagents {
                 return Task::batch(tasks);
             };
             if let Some(scope) = self.active_workspace.clone() {
-                Arc::make_mut(&mut self.durable).card_scopes.insert(card, scope.clone());
+                Arc::make_mut(&mut self.durable)
+                    .card_scopes
+                    .insert(card, scope.clone());
                 self.worktree_owners.insert(card, scope);
             }
             card

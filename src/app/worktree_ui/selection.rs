@@ -30,7 +30,10 @@ impl State {
     }
 
     pub(super) fn pending_paths(&self) -> impl Iterator<Item = &Path> {
-        self.requested.iter().chain(self.additional_paths.iter()).map(PathBuf::as_path)
+        self.requested
+            .iter()
+            .chain(self.additional_paths.iter())
+            .map(PathBuf::as_path)
     }
 
     pub(in crate::app) fn cancel(&mut self) {
@@ -206,12 +209,17 @@ impl Cagents {
         intent: Intent,
     ) -> Task<Message> {
         let intent = match intent {
-            Intent::ResumePlacement { entry, replace, .. } => return self.select_resume_then(entry, replace),
+            Intent::ResumePlacement { entry, replace, .. } => {
+                return self.select_resume_then(entry, replace);
+            }
             other => other,
         };
         let local_window = crate::instance::window_is_initialized() && !crate::device::is_remote();
         #[cfg(test)]
-        let local_window = self.worktree_selection.local_window_override.unwrap_or(local_window);
+        let local_window = self
+            .worktree_selection
+            .local_window_override
+            .unwrap_or(local_window);
         self.select_worktree_then_with_window(path, create, intent, local_window)
     }
 
@@ -231,7 +239,10 @@ impl Cagents {
             && self.durable.active_channel.is_none()
             && self.active_workspace.as_ref() == Some(&path)
             && resolved.as_ref() == Some(&path)
-            && self.worktree_owner_paths.cached.get(&path)
+            && self
+                .worktree_owner_paths
+                .cached
+                .get(&path)
                 .is_some_and(|physical| self.worktree_protections.protects_exact(physical))
         {
             // A repository reload can reproject the current strip from cached
@@ -240,7 +251,10 @@ impl Cagents {
             let selected = self.select_worktree_inner(path, false);
             let initialization = self.initialize_prepared_scope_runtimes();
             return Task::batch([
-                cancelled, selected, initialization, self.resolve_worktree_owner_paths(),
+                cancelled,
+                selected,
+                initialization,
+                self.resolve_worktree_owner_paths(),
             ]);
         }
         // Headless fixture windows own no filesystem leases. Keep their
@@ -365,7 +379,11 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    pub(in crate::app) fn prepared_selection_navigates(&self, generation: u64, receipt: &Receipt) -> bool {
+    pub(in crate::app) fn prepared_selection_navigates(
+        &self,
+        generation: u64,
+        receipt: &Receipt,
+    ) -> bool {
         generation == self.worktree_selection.generation
             && self.worktree_selection.pending
             && receipt.0.lock().unwrap().as_ref().is_some_and(
@@ -376,7 +394,9 @@ impl Cagents {
                             Intent::Channel { id, path, .. } => {
                                 self.channel_scope_path(*id).as_ref() == Some(path)
                             }
-                            Intent::ResumePlacement { entry, snapshot, .. } => snapshot.still_current(self, entry.card, &entry.session),
+                            Intent::ResumePlacement {
+                                entry, snapshot, ..
+                            } => snapshot.still_current(self, entry.card, &entry.session),
                             _ => true,
                         }
                         && result.is_ok()
@@ -403,9 +423,22 @@ impl Cagents {
         > + Send
         + 'static,
     ) -> Task<Message> {
-        self.prepare_worktree_selection_receipt(generation, path, create, intent, epoch, move |path| {
-            prepare(path).map(|(path, canonical, guard)| Prepared { path, canonical, guard, resume: None, additional_guards: Vec::new() })
-        })
+        self.prepare_worktree_selection_receipt(
+            generation,
+            path,
+            create,
+            intent,
+            epoch,
+            move |path| {
+                prepare(path).map(|(path, canonical, guard)| Prepared {
+                    path,
+                    canonical,
+                    guard,
+                    resume: None,
+                    additional_guards: Vec::new(),
+                })
+            },
+        )
     }
 
     fn prepare_worktree_selection_receipt(
@@ -473,7 +506,9 @@ impl Cagents {
         if roots != self.known_worktree_roots || epoch != self.worktree_owner_paths.watch.epoch() {
             return self.select_worktree_then(requested, create, intent);
         }
-        if let Intent::ResumePlacement { entry, snapshot, .. } = &intent
+        if let Intent::ResumePlacement {
+            entry, snapshot, ..
+        } = &intent
             && !snapshot.still_current(self, entry.card, &entry.session)
         {
             drop(result);
@@ -544,7 +579,12 @@ impl Cagents {
         self.worktree_protection_sync.invalidate();
         self.worktree_owner_paths
             .install_prepared(prepared.canonical);
-        let selected = self.commit_worktree_selection_scope(prepared.path, create, &intent, prepared.resume.as_ref());
+        let selected = self.commit_worktree_selection_scope(
+            prepared.path,
+            create,
+            &intent,
+            prepared.resume.as_ref(),
+        );
         let initialization = self.initialize_prepared_scope_runtimes();
         let after = self.finish_worktree_selection_with_context(intent, context_scope);
         Task::batch([
@@ -573,7 +613,8 @@ impl Cagents {
     ) -> Task<Message> {
         match intent {
             Intent::ResumePlacement { entry, .. } => self.commit_resumed_selection_scope(
-                resume.expect("resume destination travels with its physical guard"), &entry.title,
+                resume.expect("resume destination travels with its physical guard"),
+                &entry.title,
             ),
             Intent::Channel { id, .. } => self.select_channel_inner(*id),
             _ => self.select_worktree_inner(path, create),
@@ -640,7 +681,9 @@ impl Cagents {
                 beside,
                 ephemeral,
             } => self.insert_chat_card_with_lifetime(session, beside, ephemeral, None),
-            Intent::ResumePlacement { entry, replace, .. } | Intent::Resume { entry, replace } => self.commit_resumed_conversation(entry, replace),
+            Intent::ResumePlacement { entry, replace, .. } | Intent::Resume { entry, replace } => {
+                self.commit_resumed_conversation(entry, replace)
+            }
             Intent::Focus { card, activate } => {
                 self.set_terminal_review_owner(None);
                 let focus = self.focus_workspace_card(card);
@@ -677,8 +720,12 @@ mod tests {
             let path = directory.path().join(format!("worktree-{index}"));
             std::fs::create_dir(&path).unwrap();
             app.known_worktree_roots.insert(path.clone());
-            app.worktree_owner_paths.cached.insert(path.clone(), path.canonicalize().unwrap());
-            if index == 0 { selected = Some(path); }
+            app.worktree_owner_paths
+                .cached
+                .insert(path.clone(), path.canonicalize().unwrap());
+            if index == 0 {
+                selected = Some(path);
+            }
         }
         let selected = selected.unwrap();
         drop(app.select_worktree_inner(selected.clone(), false));
@@ -694,15 +741,28 @@ mod tests {
         for _ in 0..3 {
             // Force the initialized-local-window branch. The headless shortcut
             // cannot make this test pass without the real held-lease shortcut.
-            drop(app.select_worktree_then_with_window(selected.clone(), false, Intent::Navigate, true));
+            drop(app.select_worktree_then_with_window(
+                selected.clone(),
+                false,
+                Intent::Navigate,
+                true,
+            ));
             assert!(!app.worktree_selection.pending);
             assert!(app.worktree_selection.inflight.is_empty());
             assert!(app.worktree_owner_paths.queued.is_empty());
             assert!(app.worktree_owner_paths.inflight_generation.is_none());
             assert_eq!(app.active_workspace.as_ref(), Some(&selected));
         }
-        drop(app.select_worktree_then_with_window(selected, false, Intent::EnsureDefaultPane, true));
-        assert!(app.worktree_selection.pending, "dependent actions must still prepare");
+        drop(app.select_worktree_then_with_window(
+            selected,
+            false,
+            Intent::EnsureDefaultPane,
+            true,
+        ));
+        assert!(
+            app.worktree_selection.pending,
+            "dependent actions must still prepare"
+        );
     }
 
     #[test]
@@ -713,13 +773,17 @@ mod tests {
         let nested = parent.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.worktree_owner_paths.cached.insert(nested.clone(), nested.canonicalize().unwrap());
+        app.worktree_owner_paths
+            .cached
+            .insert(nested.clone(), nested.canonicalize().unwrap());
         drop(app.select_worktree_inner(nested.clone(), false));
         app.worktree_protections.install_prepared(Some(
             crate::worktree_cleanup::fixture_protection(runtime.path(), &nested, false).unwrap(),
         ));
         app.known_worktree_roots.insert(parent.clone());
-        app.worktree_owner_paths.cached.insert(parent.clone(), parent.canonicalize().unwrap());
+        app.worktree_owner_paths
+            .cached
+            .insert(parent.clone(), parent.canonicalize().unwrap());
         assert!(!app.worktree_protections.protects_exact(&parent));
         drop(app.select_worktree_then_with_window(nested.clone(), false, Intent::Navigate, true));
         assert!(app.worktree_selection.pending);
@@ -732,7 +796,12 @@ mod tests {
     fn automatic_repository_reprojection_preserves_pending_explicit_navigation() {
         let (mut app, _runtime, _directory, selected) = protected_reload_app();
         let destination = selected.parent().unwrap().join("worktree-1");
-        drop(app.select_worktree_then_with_window(destination, false, Intent::EnsureDefaultPane, true));
+        drop(app.select_worktree_then_with_window(
+            destination,
+            false,
+            Intent::EnsureDefaultPane,
+            true,
+        ));
         let generation = app.worktree_selection.generation;
         let inflight = app.worktree_selection.inflight.clone();
         assert!(app.worktree_selection.pending);

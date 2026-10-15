@@ -30,18 +30,28 @@ impl Replies {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (sender, receiver) = async_channel::bounded(1);
         (
-            Self { pending: pending.clone(), wake: sender },
-            ReplyReceiver { pending, wake: receiver },
+            Self {
+                pending: pending.clone(),
+                wake: sender,
+            },
+            ReplyReceiver {
+                pending,
+                wake: receiver,
+            },
         )
     }
 
     fn retain(&self, desired: &Desired) {
-        self.pending.lock().unwrap_or_else(|error| error.into_inner())
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
             .retain(|target, _| desired.contains_key(target));
     }
 
     fn publish(&self, reply: Reply) -> Result<(), ()> {
-        self.pending.lock().unwrap_or_else(|error| error.into_inner())
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
             .insert(reply.target, reply);
         match self.wake.try_send(()) {
             Ok(()) | Err(async_channel::TrySendError::Full(())) => Ok(()),
@@ -54,7 +64,10 @@ impl ReplyReceiver {
     async fn recv(&self) -> Result<Reply, async_channel::RecvError> {
         loop {
             let reply = {
-                let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 let target = pending.keys().next().copied();
                 target.and_then(|target| pending.remove(&target))
             };
@@ -152,25 +165,39 @@ impl Monitor {
                             .values()
                             .flat_map(|(launch, _)| config_paths(launch))
                             .collect::<HashSet<_>>();
-                        let previous = candidates.lock()
-                            .unwrap_or_else(|error| error.into_inner()).clone();
+                        let previous = candidates
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clone();
                         let mut failed = register_config_paths(
-                            &lexical, &candidates, &mut watcher, &mut registered, false,
+                            &lexical,
+                            &candidates,
+                            &mut watcher,
+                            &mut registered,
+                            false,
                         );
                         let mut stable_paths = None;
                         for _ in 0..3 {
-                            let physical = lexical.iter().map(|path| {
-                                (path.clone(), canonicalize(path).ok())
-                            }).collect::<HashMap<_, _>>();
-                            let paths = lexical.iter().cloned()
+                            let physical = lexical
+                                .iter()
+                                .map(|path| (path.clone(), canonicalize(path).ok()))
+                                .collect::<HashMap<_, _>>();
+                            let paths = lexical
+                                .iter()
+                                .cloned()
                                 .chain(physical.values().flatten().cloned())
                                 .collect::<HashSet<_>>();
                             failed |= register_config_paths(
-                                &paths, &candidates, &mut watcher, &mut registered, false,
+                                &paths,
+                                &candidates,
+                                &mut watcher,
+                                &mut registered,
+                                false,
                             );
-                            let validated = lexical.iter().map(|path| {
-                                (path.clone(), canonicalize(path).ok())
-                            }).collect::<HashMap<_, _>>();
+                            let validated = lexical
+                                .iter()
+                                .map(|path| (path.clone(), canonicalize(path).ok()))
+                                .collect::<HashMap<_, _>>();
                             if physical == validated {
                                 stable_paths = Some(paths);
                                 break;
@@ -181,7 +208,11 @@ impl Monitor {
                             // Keep old physical watches and candidates until
                             // the complete replacement mapping is validated.
                             failed |= register_config_paths(
-                                &paths, &candidates, &mut watcher, &mut registered, true,
+                                &paths,
+                                &candidates,
+                                &mut watcher,
+                                &mut registered,
+                                true,
                             );
                         }
                         failed |= !stable;
@@ -193,17 +224,24 @@ impl Monitor {
                             // retry; retain the last successfully read policy.
                             let retained = previous.into_iter().chain(lexical).collect();
                             register_config_paths(
-                                &retained, &candidates, &mut watcher, &mut registered, true,
+                                &retained,
+                                &candidates,
+                                &mut watcher,
+                                &mut registered,
+                                true,
                             );
                             worker_dirty.store(true, Ordering::Release);
                             for (&target, (launch, _)) in &next {
-                                if replies.publish(Reply {
-                                    target,
-                                    launch: launch.clone(),
-                                    mode: (current.get(&target) == next.get(&target))
-                                        .then(|| modes.get(&target).cloned().flatten())
-                                        .flatten(),
-                                }).is_err() {
+                                if replies
+                                    .publish(Reply {
+                                        target,
+                                        launch: launch.clone(),
+                                        mode: (current.get(&target) == next.get(&target))
+                                            .then(|| modes.get(&target).cloned().flatten())
+                                            .flatten(),
+                                    })
+                                    .is_err()
+                                {
                                     return;
                                 }
                             }
@@ -355,7 +393,8 @@ fn register_config_paths(
             candidates.extend(paths.iter().cloned());
         }
     }
-    let directories = paths.iter()
+    let directories = paths
+        .iter()
         .flat_map(|path| path.ancestors().skip(1))
         .filter(|path| path.is_dir())
         .map(Path::to_owned)
@@ -364,7 +403,11 @@ fn register_config_paths(
         return !directories.is_empty();
     };
     let mut failed = false;
-    for path in directories.difference(registered).cloned().collect::<Vec<_>>() {
+    for path in directories
+        .difference(registered)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
         if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
             registered.insert(path);
         } else {
@@ -516,26 +559,38 @@ mod tests {
     #[test]
     fn stalled_preview_receiver_retains_only_latest_policy_per_live_target() {
         let (replies, receiver) = Replies::channel();
-        let target = Target { card: CardId::new(), generation: 1 };
-        let retired = Target { card: CardId::new(), generation: 1 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let retired = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
         let launch = launch();
         for revision in 0..1000 {
-            replies.publish(Reply {
-                target,
-                launch: launch.clone(),
-                mode: Some(revision.to_string()),
-            }).unwrap();
+            replies
+                .publish(Reply {
+                    target,
+                    launch: launch.clone(),
+                    mode: Some(revision.to_string()),
+                })
+                .unwrap();
         }
-        replies.publish(Reply {
-            target: retired,
-            launch: launch.clone(),
-            mode: Some("retired".into()),
-        }).unwrap();
+        replies
+            .publish(Reply {
+                target: retired,
+                launch: launch.clone(),
+                mode: Some("retired".into()),
+            })
+            .unwrap();
         assert_eq!(receiver.pending.lock().unwrap().len(), 2);
         assert_eq!(receiver.wake.len(), 1);
         replies.retain(&HashMap::from([(target, (launch, 0))]));
         assert_eq!(receiver.pending.lock().unwrap().len(), 1);
-        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let reply = runtime.block_on(receiver.recv()).unwrap();
         assert_eq!(reply.target, target);
         assert_eq!(reply.mode.as_deref(), Some("999"));
@@ -713,16 +768,23 @@ mod tests {
                 result
             },
         );
-        let target = Target { card: CardId::new(), generation: 1 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
         let mut launch = launch();
         launch.recipe.working_directory = directory.path().into();
-        launch.recipe.environment.insert(
-            "CODEX_HOME".into(), account.to_string_lossy().into_owned(),
-        );
+        launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), account.to_string_lossy().into_owned());
         monitor.sync(std::iter::once((target, &launch)));
         assert_eq!(monitor.next_for_test().mode.as_deref(), Some("second"));
         std::fs::write(second.join("config.toml"), "changed target").unwrap();
-        assert_eq!(monitor.next_for_test().mode.as_deref(), Some("changed target"));
+        assert_eq!(
+            monitor.next_for_test().mode.as_deref(),
+            Some("changed target")
+        );
     }
 
     #[test]
@@ -740,12 +802,16 @@ mod tests {
         symlink(&first, &alias).unwrap();
         let source = alias.join("config.toml");
         let monitor = Monitor::with_resolver(move |_| std::fs::read_to_string(&source).ok(), true);
-        let target = Target { card: CardId::new(), generation: 1 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
         let mut launch = launch();
         launch.recipe.working_directory = directory.path().into();
-        launch.recipe.environment.insert(
-            "CODEX_HOME".into(), alias.to_string_lossy().into_owned(),
-        );
+        launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), alias.to_string_lossy().into_owned());
         monitor.sync(std::iter::once((target, &launch)));
         assert_eq!(monitor.next_for_test().mode.as_deref(), Some("first"));
         let replacement = directory.path().join("replacement");
@@ -753,7 +819,10 @@ mod tests {
         std::fs::rename(replacement, alias).unwrap();
         assert_eq!(monitor.next_for_test().mode.as_deref(), Some("second"));
         std::fs::write(second.join("config.toml"), "changed target").unwrap();
-        assert_eq!(monitor.next_for_test().mode.as_deref(), Some("changed target"));
+        assert_eq!(
+            monitor.next_for_test().mode.as_deref(),
+            Some("changed target")
+        );
     }
 
     #[test]
@@ -783,21 +852,35 @@ mod tests {
                 path.canonicalize()
             },
         );
-        let first_target = Target { card: CardId::new(), generation: 1 };
-        let second_target = Target { card: CardId::new(), generation: 1 };
+        let first_target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let second_target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
         let mut first_launch = launch();
         first_launch.recipe.working_directory = account.path().into();
         first_launch.recipe.environment.insert(
-            "CODEX_HOME".into(), account.path().to_string_lossy().into_owned(),
+            "CODEX_HOME".into(),
+            account.path().to_string_lossy().into_owned(),
         );
         let mut second_launch = first_launch.clone();
         second_launch.recipe.environment.insert(
-            "CODEX_HOME".into(), other.path().to_string_lossy().into_owned(),
+            "CODEX_HOME".into(),
+            other.path().to_string_lossy().into_owned(),
         );
         monitor.sync(std::iter::once((first_target, &first_launch)));
         assert_eq!(monitor.next_for_test().mode.as_deref(), Some("first"));
         inject.store(true, Ordering::Release);
-        monitor.sync([(first_target, &first_launch), (second_target, &second_launch)].into_iter());
+        monitor.sync(
+            [
+                (first_target, &first_launch),
+                (second_target, &second_launch),
+            ]
+            .into_iter(),
+        );
         for _ in 0..3 {
             let reply = monitor.next_for_test();
             if reply.target == first_target {
