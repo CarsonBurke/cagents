@@ -1261,7 +1261,17 @@ impl ClientHandle {
             .snapshot
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        snapshot.session_id.as_deref() == session && matches(&snapshot)
+        // Activity can advance without a Wake when its state is unchanged.
+        // Keep its monotonic generation floor locked through the borrowed
+        // predicate: consuming an activity edge cannot make an older body current.
+        let activity = self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        activity.generation <= snapshot.generation
+            && snapshot.session_id.as_deref() == session
+            && matches(&snapshot)
     }
 
     pub(crate) fn snapshot_with_clock(&self) -> (Arc<Snapshot>, Option<SourceClock>) {
@@ -3113,6 +3123,103 @@ mod tests {
             matches!(&handle.snapshot().items[0].content, ItemContent::Text { text, .. } if text == "resynchronized")
         );
         advance_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn provider_output_currentness_waits_for_same_state_activity_generation_without_wake() {
+        let initial = Snapshot {
+            generation: 7,
+            session_id: Some("diagnostic-session".into()),
+            turn_generation: 2,
+            exited: true,
+            provider_exit: Some(super::super::ProviderExitDiagnostic {
+                summary: "Provider exited".into(),
+                output: "retained output".into(),
+                log: None,
+            }),
+            ..Default::default()
+        };
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let proof = host_proof("diagnostic-floor");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec.write(server, &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: proof.clone(),
+                    message,
+                }).unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(&mut codec, &mut server, Some(connect.request_id), ServerMessage::Response {
+                response: ServerResponse::Connected { proof: proof.clone(), resumed: vec![] },
+            });
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else { panic!("start expected") };
+            let chat_id = session.id;
+            respond(&mut codec, &mut server, Some(start.request_id), ServerMessage::Response {
+                response: ServerResponse::ChatAttached { session, snapshot: initial.clone() },
+            });
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            respond(&mut codec, &mut server, None, ServerMessage::ChatActivity {
+                chat_id, state: initial.activity(), generation: 8, outcome: None,
+            });
+            // This separate stream's wake is only a frame-order barrier. Its
+            // epoch is deliberately unrelated to Snapshot/Activity generation.
+            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 100 });
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            respond(&mut codec, &mut server, None, ServerMessage::Response {
+                response: ServerResponse::ChatSnapshot { chat_id, snapshot: Some(initial.clone()) },
+            });
+            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 101 });
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut caught_up = initial;
+            caught_up.generation = 8;
+            respond(&mut codec, &mut server, None, ServerMessage::Response {
+                response: ServerResponse::ChatSnapshot { chat_id, snapshot: Some(caught_up) },
+            });
+            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 102 });
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Actual EOF is not a new generation or an explicit revocation.
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client, omp_card(None, None), Intent::Start, None, false, None, None,
+            move |wake| { let _ = wake_tx.send(wake); },
+        ).unwrap();
+        let proof = handle.diagnostic_proof().unwrap();
+        let current = || handle.diagnostic_snapshot_matches(&proof, Some("diagnostic-session"), |snapshot| {
+            snapshot.turn_generation == 2
+                && snapshot.provider_exit.as_ref().is_some_and(|exit| exit.output == "retained output")
+        });
+        assert!(current());
+        advance_tx.send(()).unwrap();
+        assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Observed),
+            "same-state generation must not need an Activity or Changed wake");
+        assert_eq!(handle.snapshot().generation, 7);
+        assert_eq!(handle.inner.activity.lock().unwrap().generation, 8);
+        let invoked = std::cell::Cell::new(false);
+        assert!(!handle.diagnostic_snapshot_matches(&proof, Some("diagnostic-session"), |_| {
+            invoked.set(true);
+            true
+        }));
+        assert!(!invoked.get(), "refuse before inspecting a known-stale diagnostic body");
+        handle.take_activity();
+        assert!(!current(), "draining activity must retain its generation floor");
+        advance_tx.send(()).unwrap();
+        assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Observed));
+        assert!(!current(), "a delayed older body must not heal the floor");
+        advance_tx.send(()).unwrap();
+        assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Observed));
+        assert!(current(), "a caught-up body with the exact tuple is readable");
+        advance_tx.send(()).unwrap();
+        assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(_)));
+        assert!(current(), "ordinary EOF alone does not revoke retained diagnostics");
         worker.join().unwrap();
     }
 
