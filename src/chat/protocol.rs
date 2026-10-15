@@ -3,6 +3,7 @@ use super::{Command, Event, Launch};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
+pub(crate) mod input_proof;
 pub mod claude;
 mod claude_edits;
 mod claude_permissions;
