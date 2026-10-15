@@ -2590,6 +2590,10 @@ mod tests {
         assert!(handle.return_terminal(binding.clone()).is_err(), "first request has no receipt");
         let deadline=Instant::now()+Duration::from_secs(2);
         while handle.inner.alive.load(Ordering::Acquire) {assert!(Instant::now()<deadline);thread::yield_now();}
+        if matches!(case,ReplayCase::CanonicalPair) {
+            assert_eq!(handle.source_binding(),receipt.retained_binding,"the actual old reader must have accepted canonical post-pair metadata before EOF");
+            assert_eq!(handle.snapshot().generation,2);
+        }
         let result=handle.return_terminal(binding);
         match case {
             ReplayCase::Exact|ReplayCase::CanonicalPair => assert_eq!(result.unwrap(),receipt),
