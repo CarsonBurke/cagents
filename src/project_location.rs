@@ -308,8 +308,8 @@ mod tests {
         let checkout = root.path().join("checkout with spaces");
         let metadata = root.path().join("metadata elsewhere");
         let output = Command::new("git")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["init", "--separate-git-dir"])
             .arg(&metadata)
             .arg(&checkout)
