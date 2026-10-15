@@ -62,11 +62,13 @@ mod tests {
             released.recv().unwrap();drop(lease);
         });
         selection.recv().unwrap();
+        let lookup_is_fenced=matches!(FENCES.get().unwrap().try_lock(),Err(std::sync::TryLockError::WouldBlock));
         let (attempt,attempted)=std::sync::mpsc::channel();
         let second=std::thread::spawn(move||{attempt.send(()).unwrap();acquire(id)});
         attempted.recv().unwrap();claim.send(()).unwrap();
         assert!(second.join().unwrap().is_err(),"the second lookup must share the already-claimed entry");
         release.send(()).unwrap();first.join().unwrap();
+        assert!(lookup_is_fenced,"even before CAS, another lookup must be unable to prune the selected false entry");
         drop(acquire(id).unwrap());
     }
     #[test]
