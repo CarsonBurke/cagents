@@ -152,7 +152,12 @@ fn combined_close_retained_lifecycle_refuses_while_real_restart_owns_claim_and_p
     assert!(reached, "actual second backend must be held before its initialization reply");
     assert!(refused.expect("close must promptly defer while B is initializing").unwrap_err().contains("lifecycle transition"));
     let (response, _, _) = restarted.unwrap();
-    assert!(matches!(response, ServerResponse::ChatAttached {..}));
+    let ServerResponse::ChatRestarted { receipt, .. } = response else {
+        panic!("completed Attach must return its exact restart receipt");
+    };
+    assert!(receipt.is_valid());
+    assert_eq!(receipt.source(), &fixture.source);
+    assert_eq!(receipt.replacement().id, fixture.source.id);
     fixture.handle.refresh_retained_state().unwrap();
     let successor = fixture.handle.provider_process().expect("actual restarted backend process");
     assert_ne!(successor, fixture.original); assert!(successor.is_current());
@@ -243,7 +248,12 @@ fn combined_close_retained_lifecycle_reconciliation_defers_to_initializing_resta
     assert!(error.contains("lifecycle transition"), "automatic cleanup must defer to initializing B: {error}");
     assert_eq!(before_refusal, after_refusal);
     let (response, _, _) = restarted.unwrap();
-    assert!(matches!(response, ServerResponse::ChatAttached {..}));
+    let ServerResponse::ChatRestarted { receipt, .. } = response else {
+        panic!("completed Attach must return its exact restart receipt");
+    };
+    assert!(receipt.is_valid());
+    assert_eq!(receipt.source(), &fixture.source);
+    assert_eq!(receipt.replacement().id, fixture.source.id);
     fixture.handle.refresh_retained_state().unwrap();
     let successor = fixture.handle.provider_process().expect("real initialized backend B");
     assert_ne!(successor, fixture.original); assert!(successor.is_current());

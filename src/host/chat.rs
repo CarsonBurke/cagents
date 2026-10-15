@@ -6472,9 +6472,7 @@ for line in sys.stdin:
         failed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         previous.close().unwrap();
         assert!(previous.is_completed());
-        let ServerResponse::ChatAttached {
-            session: restarted, ..
-        } = process(
+        let ServerResponse::ChatRestarted { receipt, .. } = process(
             &host,
             1,
             ClientRequest::ChatAttach {
@@ -6483,8 +6481,11 @@ for line in sys.stdin:
         )
         .unwrap()
         else {
-            panic!("supported same-ID restart did not attach");
+            panic!("supported same-ID restart did not return its correlated receipt");
         };
+        assert!(receipt.is_valid());
+        assert_eq!(receipt.source(), &source);
+        let restarted = receipt.replacement().clone();
         let replacement = {
             let state = host.lock().unwrap();
             let record = &state.chats[&source.id];
