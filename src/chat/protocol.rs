@@ -99,6 +99,29 @@ pub(crate) struct ExecutionContext {
 }
 
 impl ExecutionContext {
+    /// Pin the selected directory before an ordinary native provider starts.
+    /// The descriptor remains authoritative after a same-filesystem move;
+    /// opening a replacement at the old spelling never changes its identity.
+    pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let relative = path.strip_prefix("/").map_err(|_| "The selected provider directory must be absolute".to_owned())?;
+        let root = crate::fs_safety::Root::open("/".as_ref()).map_err(|error| error.to_string())?;
+        let directory = if relative.as_os_str().is_empty() {
+            std::fs::OpenOptions::new().read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open("/").map_err(|error| error.to_string())
+        } else {
+            crate::fs_safety::open_beneath(&root, relative).map_err(|error| error.to_string())
+        }
+            .map_err(|error| format!("Cannot pin the selected provider directory {}: {error}", path.display()))?;
+        if !directory.metadata().map_err(|error| error.to_string())?.is_dir() {
+            return Err("The selected provider directory is not a folder".into());
+        }
+        let context = Self::new(Some(std::sync::Arc::new(directory)));
+        context.verify_directory(path)?;
+        Ok(context)
+    }
+
     pub(crate) fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
         Self {
             directory,
@@ -207,6 +230,9 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Refresh cached operational paths after the caller verified the same
+    /// approved directory inode. This never changes provider launch provenance.
+    fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> { Ok(()) }
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(

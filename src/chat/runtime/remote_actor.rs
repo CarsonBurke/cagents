@@ -61,6 +61,8 @@ pub(crate) struct ActorInspection {
     pub recovery_environment:BTreeMap<String,String>,
 }
 #[derive(Serialize,Deserialize)]
+struct DirectoryEvidence {process:Process,identity:crate::agent_execution::DirectoryIdentity,path:PathBuf}
+#[derive(Serialize,Deserialize)]
 struct Startup {
     protocol:u32,
     source:chat::Session,
@@ -344,6 +346,12 @@ impl RemoteActor {
         receiver.recv_timeout(Duration::from_secs(10)).map_err(|_|"Retained interrupt acknowledgement remains unknown; never resend automatically".to_owned())?
     }
 
+    pub fn capture_directory(&self,candidate:&std::path::Path)->Result<super::DirectoryProof,String> {
+        let proof:DirectoryEvidence=self.call("capture_directory",json!([candidate]))?;
+        if proof.process!=self.0.identity.record.root || proof.path!=candidate {return Err("Retained provider directory evidence changed process or candidate".into());}
+        super::DirectoryProof::capture_owned_process(&proof.process,candidate,Some(proof.identity))
+    }
+    pub fn relocate_directory(&self,candidate:&std::path::Path)->Result<(),String> {self.call("relocate_directory",json!([candidate]))}
     pub fn commit_installation(&self)->Result<(),String> {
         self.call::<()>("commit",Value::Null)?;
         self.0.installed.store(true,Ordering::Release);
@@ -415,7 +423,7 @@ impl Server {
         let published=changed.clone();let outcomes=journal.clone();
         let account_reports=Arc::new(Mutex::new(Vec::<Update>::new()));let reported=account_reports.clone();
         if disconnected(control)? {return Err("Retained actor launch cancelled before process creation".into());}
-        let actor=LocalHandle::start_inner(spec_and_adapter.0,spec_and_adapter.1,initial,store,None,startup.source.launch.session_id.clone(),None,move|update|{
+        let actor=LocalHandle::start_inner(spec_and_adapter.0,spec_and_adapter.1,initial,store,None,startup.source.launch.session_id.clone(),None,false,move|update|{
             let mut journal=outcomes.lock().unwrap_or_else(|p|p.into_inner());
             if let Err(error)=journal.append(&update) {let _=journal.record_loss(&format!("Retained actor outcome continuity is unconfirmed: {error}"));}
             drop(journal);
@@ -500,6 +508,8 @@ impl Server {
             "exit_output"=>{let (id,offset)=decode!((String,u64));value!(self.actor.provider_exit_output(&id,offset)?)},
             "visible"=>{let (visible,)=decode!((bool,));self.actor.set_visible(visible);Ok(Value::Null)},
             "observe"=>{self.actor.observe_next_update();Ok(Value::Null)},
+            "capture_directory"=>{let (candidate,)=decode!((PathBuf,));let proof=self.actor.capture_execution_directory(&candidate)?;value!(DirectoryEvidence {process:proof.process,identity:proof.identity,path:proof.path})},
+            "relocate_directory"=>{let (candidate,)=decode!((PathBuf,));self.actor.relocate_execution_directory(&candidate)?;self.changed.fetch_add(1,Ordering::Release);Ok(Value::Null)},
             "readiness"=>value!(self.actor.check_update_readiness()?),
             "commit"=>{
                 self.installed=true;

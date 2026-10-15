@@ -1534,6 +1534,7 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> { self.cwd = directory.to_path_buf(); self.start["cwd"] = serde_json::Value::String(directory.to_string_lossy().into_owned()); Ok(()) }
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
