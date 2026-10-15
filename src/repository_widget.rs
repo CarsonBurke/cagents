@@ -3438,6 +3438,10 @@ impl RepositoryRuntime {
         (units == at.character).then_some(LspPosition::new(at.line, scalars))
     }
 
+    pub fn diagnostic_navigation_available(&self)->bool {
+        self.editable_surface_visible() && !self.language.diagnostics.is_empty()
+    }
+
     pub fn set_editor_diagnostics(&mut self, diagnostics: Vec<crate::lsp::LspDiagnostic>) {
         self.language.marks = if let DocumentState::Editable(document) = &self.document {
             diagnostics
