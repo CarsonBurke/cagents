@@ -52,7 +52,8 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
             let proof = self.proof.lock().unwrap().clone();
             if let Ok(inspection) = Handle::inspect_remote(&self.owner, proof.clone())
                 && let Ok(handle) = Handle::adopt_remote(&self.owner, inspection.source, proof, |_| {})
-                && handle.close().is_ok() && handle.finish_retained_close().is_ok() { return; }
+                && handle.close().is_ok() && handle.finish_retained_close().is_ok()
+                && self.pair.as_ref().is_none_or(|pair|!pair.root.is_current()&&!pair.holder.is_current()) { return; }
             // Only this fixture's exact process incarnations; no name/group sweep.
             for owner in std::iter::once(&self.owner).chain(self.pair.iter()) {
                 for process in [&owner.root,&owner.holder] { if process.is_current() { unsafe {libc::kill(process.pid,libc::SIGKILL);} } }
@@ -293,4 +294,73 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
     assert_eq!(fs::read_to_string(root.join("prompts")).unwrap().lines().count(), 1);
     super::super::agent_execution::close(&host, &Authority::default(), receipt.agent).unwrap();
     wait_until(|| !receipt.identity.record.holder.is_current() && !receipt.identity.record.root.is_current(), "explicit close did not retire exact native owners");
+}
+
+/// No prompt is written in this fixture: an initialized actor still lacks a
+/// provider-confirmed thread while its exact ownership proof rotates.
+#[test]
+fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
+    const MODE:&str="CAGENTS_UNNAMED_ACTOR_PERSISTENCE_TEST";
+    if std::env::var_os(MODE).is_none() {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        for path in ["home/.claude","run","data","config","cache","bin","project"] {fs::create_dir_all(root.path().join(path)).unwrap();}
+        let test=thread::current().name().unwrap().to_owned();
+        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",&test,"--nocapture"])
+            .env_clear().env(MODE,"1").env("CAGENTS_RETAINED_ACTOR_FIXTURE","1").env("CAGENTS_HOLDER_ROOT",root.path())
+            .env("HOME",root.path().join("home")).env("CLAUDE_CONFIG_DIR",root.path().join("home/.claude"))
+            .env("XDG_RUNTIME_DIR",root.path().join("run")).env("XDG_DATA_HOME",root.path().join("data"))
+            .env("XDG_CONFIG_HOME",root.path().join("config")).env("XDG_CACHE_HOME",root.path().join("cache"))
+            .env("PATH",format!("{}:/usr/bin:/bin",root.path().join("bin").display())).output().unwrap();
+        assert!(output.status.success(),"unnamed actor fixture failed: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+    }
+    let root=std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    install_provider(&root.join("bin/claude"));
+    let paths=crate::daemon::RuntimePaths::discover().unwrap();
+    let proof=|name|HostSessionProof {host_session_id:"unnamed-actor".into(),boot_id:crate::daemon::read_boot_id().unwrap(),host_incarnation:HostIncarnation::new(name)};
+    let first=proof("first");
+    let mut lease=Some(crate::daemon::HostLease::acquire(&paths,&first).unwrap());
+    let registry_path=root.join("registry.sqlite3");
+    let mut state=HostState::new(first);
+    state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let host=Arc::new(HostLock::new(state));
+    let launch=chat::fresh_session(Provider::Claude,TerminalId::new(),root.join("project"),&crate::account::Account::system(Provider::Claude)).unwrap();
+    let id=launch.id;
+    start_execution(&host,0,launch,Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap())).unwrap();
+    let handle=host.lock().unwrap().chats[&id].handle.clone();
+    wait_until(||handle.wait_ready(Instant::now()+Duration::from_millis(50),||false).is_ok(),"actor never initialized");
+    let identity=handle.actor_identity().unwrap();
+    struct Cleanup(crate::daemon::holder_registry::Record);
+    impl Drop for Cleanup {fn drop(&mut self) {for process in [&self.0.root,&self.0.holder] {if process.is_current() {unsafe {libc::kill(process.pid,libc::SIGKILL);}}}}}
+    let _cleanup=Cleanup(identity.record.clone());
+    let ServerResponse::ChatAttached {session:source,..}=session_snapshot(&host.lock().unwrap().chats[&id]) else {unreachable!()};
+    assert!(source.launch.session_id.is_none());
+    assert!(source.has_valid_native_continuity());
+    let pane=crate::model::CardId::new();
+    let workspace=crate::model::WorkspaceState {cards:vec![crate::model::CardState {id:pane,generation:0,title:"Pending conversation".into(),width_fraction:1.0,existence:crate::model::Existence::Open,exposure:crate::model::Exposure::Visible,residency:crate::model::Residency::Hot,kind:crate::model::CardKind::Chat(source.clone())}],focused:Some(pane),..Default::default()};
+    let storage_path=root.join("pane.sqlite3");
+    let storage=crate::persistence::StateStore::open(&storage_path,source.proof.as_ref().unwrap().boot_id.clone()).unwrap();
+    storage.save_workspace(&workspace,crate::persistence::SnapshotBase {workspace:0,cards:&BTreeMap::new()}).unwrap();
+    drop(handle);drop(host);drop(lease.take());
+    let next=proof("successor");
+    lease=Some(crate::daemon::HostLease::acquire(&paths,&next).unwrap());
+    let mut state=HostState::new(next);state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let successor=Arc::new(HostLock::new(state));
+    restore_orphaned_native(&successor,&[]).unwrap();
+    let handle=successor.lock().unwrap().chats[&id].handle.clone();
+    assert_eq!(handle.actor_identity(),Some(identity.clone()));
+    let ServerResponse::ChatAttached {session:replacement,snapshot}=session_snapshot(&successor.lock().unwrap().chats[&id]) else {unreachable!()};
+    assert!(replacement.launch.session_id.is_none());
+    assert_ne!(source.proof,replacement.proof);
+    // The real client socket contract is tested separately; this receipt is
+    // backed here by actual authenticated execed-helper adoption above.
+    let client=chat::client::ClientHandle::fixture_upgrade(source.clone(),replacement.clone(),snapshot);
+    let (issued,confirmed)=client.upgrade_recovery().unwrap();
+    storage.rebind_chat_upgrade(pane,issued,confirmed).unwrap();
+    drop(client);drop(storage);
+    let reopened=crate::persistence::StateStore::open(&storage_path,replacement.proof.as_ref().unwrap().boot_id.clone()).unwrap();
+    assert_eq!(reopened.load_card(pane,None).unwrap().unwrap().kind,crate::model::CardKind::Chat(replacement.clone()));
+    assert!(!root.join("prompts").exists(),"no accepted input may be replayed or synthesized");
+    handle.close().unwrap();retained_actor::finish_close(&successor,&handle,&replacement).unwrap();
+    assert!(!identity.record.root.is_current()&&!identity.record.holder.is_current());
+    drop(lease);
 }
