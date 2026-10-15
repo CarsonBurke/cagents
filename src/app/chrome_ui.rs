@@ -2532,8 +2532,8 @@ impl Cagents {
             },
         );
         crate::interaction::context_menu_lazy_keyed(tab, menu_identity, move || {
-            // A closed menu never clones source paths or examines native word
-            // selection. Materialize the owned action snapshot only on open.
+            // Defer the owned snapshot until the lazy menu needs its items;
+            // untouched headers avoid cloning paths or expanding word selections.
             let origin = self.pane_command_origin(id);
             let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
                 widget::menu::Item::Button(
