@@ -2943,6 +2943,7 @@ mod tests {
 
     #[test]
     fn provider_output_authenticated_wire_pages_ignore_coalesced_watch_updates() {
+        let _guard = diagnostic_read::diagnostic_test_guard();
         let (client, mut server) = UnixStream::pair().unwrap();
         let raw = format!("{}\x1b[31mred\x1b[0m €\n", "x".repeat(256 * 1024 - 2)).into_bytes();
         let expected = format!("{}red €\n", "x".repeat(256 * 1024 - 2));

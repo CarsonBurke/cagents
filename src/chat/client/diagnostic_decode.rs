@@ -149,6 +149,10 @@ fn reply(
     Ok(page)
 }
 #[cfg(test)]
+pub(super) fn reset_owned_page_capacity_for_test() { OWNED_PAGE_CAPACITY.store(0,Ordering::Release); }
+#[cfg(test)]
+pub(super) fn owned_page_capacity_for_test() -> usize { OWNED_PAGE_CAPACITY.load(Ordering::Acquire) }
+#[cfg(test)]
 static OWNED_PAGE_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]

@@ -1656,6 +1656,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum DelayedDiagnosticReply {
         Page,
+        OversizedFields,
         LargeError,
         WrongChat,
         Disconnect,
@@ -1743,6 +1744,11 @@ mod tests {
                         false,
                     ))
                 }
+                DelayedDiagnosticReply::OversizedFields => ServerMessage::Response {
+                    response:ServerResponse::ChatProviderExitOutput {
+                        chat_id,log_id:"x".repeat(6_900_000),offset:0,bytes:vec![1;1_100_000],next_offset:None,omitted:0,
+                    },
+                },
                 DelayedDiagnosticReply::Page | DelayedDiagnosticReply::WrongChat => {
                     ServerMessage::Response {
                         response: ServerResponse::ChatProviderExitOutput {
@@ -1832,7 +1838,7 @@ mod tests {
             }
             release_tx.send(()).unwrap();
         } else {
-            assert!(matches!(mode, DelayedDiagnosticReply::LargeError));
+            assert!(matches!(mode, DelayedDiagnosticReply::LargeError | DelayedDiagnosticReply::OversizedFields));
             assert_eq!(diagnostic_resource_usage().response_owners, 1);
             release_tx.send(()).unwrap();
             let completion = reader.join().unwrap();
@@ -1876,6 +1882,13 @@ mod tests {
         ] {
             delayed_diagnostic_reply_preserves_reservation(mode, true);
         }
+    }
+    #[test]
+    fn actual_authenticated_oversized_reply_refuses_before_owned_page_allocation() {
+        let _guard=diagnostic_test_guard();
+        super::super::diagnostic_decode::reset_owned_page_capacity_for_test();
+        delayed_diagnostic_reply_preserves_reservation(DelayedDiagnosticReply::OversizedFields,false);
+        assert_eq!(super::super::diagnostic_decode::owned_page_capacity_for_test(),0);
     }
     #[test]
     fn active_wire_error_compacts_allocation_before_queueing_completion() {
