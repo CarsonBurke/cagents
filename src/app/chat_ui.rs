@@ -2217,6 +2217,30 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    /// Readiness for the updater's saved-pane gate; no provider is launched here.
+    pub(super) fn restored_pane_ready(&self) -> Result<bool, String> {
+        if self.is_draft() {
+            return Err("A hosted conversation became an unstarted draft".into());
+        }
+        if self.disconnected {
+            return Err(self
+                .error
+                .clone()
+                .unwrap_or_else(|| "Conversation is disconnected".into()));
+        }
+        let handle = self
+            .handle()
+            .ok_or("Conversation has no native attachment")?;
+        if !handle.is_connected() {
+            return Err("Conversation connection closed during recovery".into());
+        }
+        let snapshot = handle.snapshot();
+        if snapshot.exited || snapshot.read_only_reason.is_some() {
+            return Err("Conversation cannot accept a message after recovery".into());
+        }
+        Ok(snapshot.ready && !snapshot.history_loading)
+    }
+
     /// Whether nothing has started yet, a start for the first message
     /// included.
     fn is_draft(&self) -> bool {
@@ -6115,7 +6139,8 @@ impl Cagents {
                             if account_source.is_some()
                                 || source != &attempt.session
                                 || &replacement != resolved
-                                || !chat::is_upgrade_recovery(source, &replacement)
+                                || !(chat::is_upgrade_recovery(source, &replacement)
+                                    || chat::is_upgrade_identity_learning(source, &replacement))
                                 || handle.snapshot().session_id != replacement.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
@@ -7319,7 +7344,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7440,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -10235,6 +10262,59 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_gate_requires_all_hundred_saved_panes_and_preserves_their_composers() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut cards = Vec::new();
+        for index in 0..100 {
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text(&format!("Draft {index}")));
+            cards.push((card, target));
+        }
+        assert_eq!(app.startup_pane_check(), Ok(true));
+        let (card, target) = cards[99];
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.disconnected = true;
+        runtime.error = Some("Upgrade replacement changed configuration".into());
+        assert!(
+            app.startup_pane_check()
+                .unwrap_err()
+                .contains(&card.to_string())
+        );
+        assert_eq!(chat_runtime(&app, card).composer.text().trim(), "Draft 99");
+        app.chat_runtime_mut(target).unwrap().disconnected = false;
+        assert_eq!(app.startup_pane_check(), Ok(true));
+    }
+
+    #[test]
+    fn a_closed_updater_pipe_after_surface_open_keeps_the_conversation_and_unsaved_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("Unsent recovery draft"));
+        app.startup_gate = crate::app::startup_gate::State::fixture_opened();
+        let cards = app.durable.cards.clone();
+        let task = app.update(Message::StartupReported(Err(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        )
+        .to_string())));
+        assert!(
+            iced::runtime::task::into_stream(task).is_none(),
+            "report failure must not issue window exit"
+        );
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "Unsent recovery draft"
+        );
+        assert!(app.status.is_some());
+    }
+
+    #[test]
     fn history_reconnect_discards_old_request_generation_and_navigation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, _) = history_fixture(&mut app);
@@ -11147,14 +11227,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11258,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -15113,13 +15201,20 @@ mod tests {
 
     #[test]
     fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
-        for (stale_reply, codex_resume) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (stale_reply, codex_resume, legacy_paired, learns_identity) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (false, false, true, false),
+            (true, false, true, false),
+            (false, false, true, true),
+            (true, false, true, true),
+        ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
             let mut source = chat_runtime(&app, card).session.clone();
-            if codex_resume {
+            if codex_resume || legacy_paired {
                 source.launch.provider = Provider::Codex;
                 source.launch.recipe.program = "codex".into();
                 source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
@@ -15130,9 +15225,30 @@ mod tests {
                     &allocator
                 ));
                 source.launch.session_id = Some(KNOWN_THREAD.into());
-                source.native_continuity = chat::NativeContinuity::Durable {
-                    provider_version: "0.100.0".into(),
-                };
+                if !legacy_paired {
+                    source.native_continuity = chat::NativeContinuity::Durable {
+                        provider_version: "0.100.0".into(),
+                    };
+                } else {
+                    let proof = source.proof.clone().unwrap();
+                    source.terminal = Some(TerminalSession {
+                        id: source.id,
+                        launch: source.launch.terminal_recipe().unwrap(),
+                        continuity: TerminalContinuity::Live {
+                            host_session_id: proof.host_session_id,
+                            boot_id: proof.boot_id,
+                            host_incarnation: proof.host_incarnation,
+                        },
+                        transcript_path: None,
+                        resume_hint: None,
+                        owned_codex_listener: None,
+                        recovery_origin: None,
+                        predecessor: None,
+                    });
+                }
+                if learns_identity {
+                    source.launch.session_id = None;
+                }
                 app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             }
             let directory = tempfile::tempdir().unwrap();
@@ -15149,6 +15265,9 @@ mod tests {
                 .flush(Duration::from_secs(10))
                 .unwrap();
             let mut replacement = source.clone();
+            if learns_identity {
+                replacement.launch.session_id = Some(KNOWN_THREAD.into());
+            }
             replacement.proof.as_mut().unwrap().host_incarnation = "upgraded-daemon".into();
             if codex_resume {
                 replacement
@@ -15156,18 +15275,31 @@ mod tests {
                     .recipe
                     .arguments
                     .splice(0..0, ["resume".into(), KNOWN_THREAD.into()]);
+            } else if legacy_paired {
+                let proof = replacement.proof.clone().unwrap();
+                replacement.terminal.as_mut().unwrap().continuity = TerminalContinuity::Live {
+                    host_session_id: proof.host_session_id,
+                    boot_id: proof.boot_id,
+                    host_incarnation: proof.host_incarnation,
+                };
             } else {
                 replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
             }
-            let handle = Arc::new(ClientHandle::fixture_upgrade(
-                source.clone(),
-                replacement.clone(),
-                Snapshot {
-                    session_id: replacement.launch.session_id.clone(),
-                    ready: true,
-                    ..Snapshot::default()
-                },
-            ));
+            let snapshot = Snapshot {
+                session_id: replacement.launch.session_id.clone(),
+                ready: true,
+                ..Snapshot::default()
+            };
+            let handle = Arc::new(if legacy_paired {
+                ClientHandle::fixture_upgrade_handshake(
+                    source.clone(),
+                    replacement.clone(),
+                    snapshot,
+                )
+                .unwrap()
+            } else {
+                ClientHandle::fixture_upgrade(source.clone(), replacement.clone(), snapshot)
+            });
             let target = app.chat_ui.next_target(card);
             app.chat_ui.phases.insert(
                 card,

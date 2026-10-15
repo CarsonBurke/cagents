@@ -274,6 +274,23 @@ pub fn ui_launch_handshake_requested() -> bool {
     env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref() == Some("1".as_ref())
 }
 
+/// Advertise the saved-pane inventory before the final readiness acknowledgement.
+/// This is progress only: the launcher must still await `report_ui_startup`.
+pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if ui_launch_handshake_requested() && !REPORTED.swap(true, Ordering::AcqRel) {
+        if saved_chats > 1152 {
+            return Err(io::Error::other(
+                "saved conversation inventory exceeds the recovery limit",
+            ));
+        }
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
 pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {

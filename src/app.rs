@@ -37,6 +37,7 @@ mod session_recovery;
 mod settings_ui;
 mod shared_views;
 mod sidebar_selection_ui;
+mod startup_gate;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
@@ -4088,6 +4089,8 @@ pub enum Message {
     },
     StartupWindowOpened(window::Id),
     StartupReported(Result<(), String>),
+    VerifyStartupPanes,
+    StartupPanesSaved(Result<SettingsSaved, String>, Result<(), String>),
     UiUpdate(instance::UiUpdateRequest),
     UiUpdateWatchdog(u64),
     UiUpdateFlushed {
@@ -4748,6 +4751,7 @@ struct SourceControlMutation {
 }
 
 pub struct Cagents {
+    startup_gate: startup_gate::State,
     device_ui: device_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
@@ -11272,8 +11276,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -12829,6 +12836,7 @@ impl Application for Cagents {
                 .take(WORKSPACE_HISTORY_LIMIT),
         );
         let mut app = Self {
+            startup_gate: startup_gate::State::default(),
             core,
             workspace,
             durable: Arc::new(durable),
@@ -14697,14 +14705,7 @@ impl Application for Cagents {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
                 }
-                let report = cosmic::task::future(async {
-                    let result =
-                        tokio::task::spawn_blocking(|| instance::report_ui_startup(&Ok(())))
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result.map_err(|error| error.to_string()));
-                    Message::StartupReported(result)
-                });
+                let report = self.begin_startup_gate();
                 // window::run silently drops callbacks for windows that have not
                 // opened yet. Initialize only after iced acknowledges this one.
                 #[cfg(feature = "integrated-browser")]
@@ -14712,10 +14713,22 @@ impl Application for Cagents {
                 #[cfg(not(feature = "integrated-browser"))]
                 report
             }
+            Message::VerifyStartupPanes => self.verify_startup_gate(),
+            Message::StartupPanesSaved(settings, saved) => {
+                self.startup_panes_saved(settings, saved)
+            }
             Message::StartupReported(result) => match result {
                 Ok(()) => Task::none(),
                 Err(error) => {
                     tracing::error!(%error, "could not acknowledge UI startup");
+                    if self.startup_gate.window_opened() {
+                        // The updater may have timed out and retained this
+                        // usable recovery window while closing its pipe.
+                        self.status = Some(TransientNotice::warning(format!(
+                            "The updater could not verify this window's recovery: {error}. Your chats and drafts remain available; verify them and save before updating again."
+                        )));
+                        return Task::none();
+                    }
                     iced::exit()
                 }
             },
@@ -25103,6 +25116,7 @@ mod tests {
         core.window.border_padding = Some(0);
 
         Cagents {
+            startup_gate: startup_gate::State::default(),
             workspace,
             durable,
             terminal_working_directories: HashMap::new(),
