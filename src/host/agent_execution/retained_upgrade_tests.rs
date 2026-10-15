@@ -106,9 +106,6 @@ fn retained_upgrade_checkpoint_case(pause_claude: bool) {
             assert!(inspected.source == source || inspected.previous_sources.contains(&source));
         } else {
             assert!(handle.actor_identity().is_none(), "Codex is the Local native-holder facade");
-            let (recovery, exited) = chat::native_holder::inspect(&owner, &old_proof).unwrap();
-            assert!(!exited);
-            assert!(recovery.source == source || recovery.previous_sources.contains(&source));
         }
         saved.push(Chat { launch:source.launch.clone(), source, previous_sources:Vec::new() });
         handles.push(handle);
@@ -119,7 +116,16 @@ fn retained_upgrade_checkpoint_case(pause_claude: bool) {
     checkpoint.validate().unwrap();
     let store = Store::discover().unwrap();
     store.save(&checkpoint).unwrap();
-    for handle in &handles { handle.preserve_for_restart().unwrap(); }
+    for ((handle, saved), owner) in handles.iter().zip(&saved).zip(&owners) {
+        handle.preserve_for_restart().unwrap();
+        if saved.source.launch.provider == Provider::Codex {
+            // Inspect uses the orphan listener: first positively disconnect the
+            // original live control channel while retaining its exact owner.
+            let (recovery, exited) = chat::native_holder::inspect(owner, &old_proof).unwrap();
+            assert!(!exited);
+            assert!(recovery.source == saved.source || recovery.previous_sources.contains(&saved.source));
+        }
+    }
     // Positive preservation acknowledgements and actual lease rotation; no
     // actor/Child/completed state is injected or relaunch recipe executed.
     drop(notifications);
