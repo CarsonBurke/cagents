@@ -4068,15 +4068,10 @@ impl Cagents {
                 if self.card_worktree(card) == Some(worktree.as_path())
                     || session.launch.recipe.working_directory == worktree)
         });
-        let existing = candidates.max_by_key(|(index, card)| {
-            let runtime = match self.cards.get(&card.id) {
-                Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
-                _ => self.chat_ui.parked.get(&card.id).map(Box::as_ref),
-            };
-            let at=runtime.map(|runtime|runtime.snapshot.items.iter()
-                .filter_map(|item| item.at.or(item.started_at)).max().or(runtime.snapshot.finished_at).unwrap_or(0)).unwrap_or(0);
-            (at, *index, Some(card.id) == self.workspace.focused())
-        }).map(|(_, card)| card.id);
+        // Durable creation order remains available for cold/hidden chats too.
+        // A hydrated older transcript must not outrank a newer draft merely
+        // because the draft has not received a timestamped provider item.
+        let existing = candidates.max_by_key(|(index, _)| *index).map(|(_, card)| card.id);
         let (card, open) = match existing {
             Some(card) => {
                 let channel = self.durable.channels.iter().find(|channel| channel.cards.contains(&card)).map(|channel| channel.id);
@@ -12252,6 +12247,19 @@ mod tests {
         assert_eq!(app.workspace.focused(),Some(second));
         assert_eq!(chat_runtime(&app,first).composer.text(),"Older unsent draft");
         assert_eq!(chat_runtime(&app,second).composer.text(),"Latest unsent draft\n\nSelected review context");
+        assert!(!app.chat_start_pending(second));
+    }
+
+    #[test]
+    fn pr_context_prefers_a_newer_draft_over_a_hydrated_older_conversation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first=live_chat(&mut app,Some("older-context"));
+        if let Some(CardRuntime::Chat(runtime))=app.cards.get_mut(&first){Arc::make_mut(&mut runtime.snapshot).finished_at=Some(1_000);}
+        let second=draft_chat(&mut app);write(&mut app,second,"Latest draft");
+        drop(app.focus_workspace_card(first));
+        drop(app.prepare_pr_agent_context(PathBuf::from(FIXTURE_DIRECTORY),"Review context".into()));
+        assert_eq!(app.workspace.focused(),Some(second));
+        assert_eq!(chat_runtime(&app,second).composer.text(),"Latest draft\n\nReview context");
         assert!(!app.chat_start_pending(second));
     }
 
