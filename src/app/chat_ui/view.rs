@@ -6789,7 +6789,7 @@ mod tests {
                 node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
             }
             #[derive(Default)]
-            struct ReadText(Vec<(String, iced::Rectangle)>);
+            struct ReadText(Vec<(String, iced::Rectangle, usize)>);
             impl Operation for ReadText {
                 fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
                     operate(self);
@@ -6809,7 +6809,8 @@ mod tests {
                                 .expect("empty physical row exposes its logical caret");
                             assert!(caret.width > 0.0 && caret.height > 0.0);
                         }
-                        self.0.push((prose.plain.to_string(), bounds));
+                        self.0.push((prose.plain.to_string(), bounds,
+                            prose.logical.as_ref().map_or(0, |logical| logical.start)));
                     }
                 }
             }
@@ -6823,7 +6824,7 @@ mod tests {
             assert!(!text.0.is_empty(), "current selectable glyph geometry is mounted");
             if raw_code {
                 assert_eq!(expected, source, "raw code oracle preserves every newline byte");
-                assert!(text.0.iter().filter(|(plain, _)| plain.is_empty()).count() > 1,
+                assert!(text.0.iter().filter(|(plain, _, _)| plain.is_empty()).count() > 1,
                     "both middle and terminal empty rows are mounted");
                 assert!(text.0.len() > 2, "code selection crosses real physical row widgets");
             } else {
@@ -6844,63 +6845,76 @@ mod tests {
             let last = text.0.last().unwrap().1;
             let start = iced::Point::new(first.x, first.y + 3.0);
             let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+            let mut selections = vec![(start, end, expected.as_str())];
+            if raw_code {
+                let blank = &text.0[1];
+                let next = &text.0[2];
+                assert!(blank.0.is_empty() && !next.0.is_empty());
+                selections.push((
+                    iced::Point::new(blank.1.x + 5.0, blank.1.y + blank.1.height / 2.0),
+                    iced::Point::new(next.1.x, next.1.y + 3.0),
+                    &source[blank.2..next.2],
+                ));
+            }
             let mut clipboard = ClipboardText::default();
             let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 30000.0));
-            for (event, pointer) in [
-                (
-                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
-                        iced::mouse::Button::Left,
-                    )),
-                    start,
-                ),
-                (
-                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
-                    end,
-                ),
-                (
-                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                        iced::mouse::Button::Left,
-                    )),
-                    end,
-                ),
-                (
-                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Character("c".into()),
-                        modified_key: keyboard::Key::Character("c".into()),
-                        physical_key: keyboard::key::Physical::Unidentified(
-                            keyboard::key::NativeCode::Unidentified,
-                        ),
-                        location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::CTRL,
-                        text: None,
-                        repeat: false,
-                    }),
-                    end,
-                ),
-            ] {
-                let mut messages = Vec::new();
-                let mut shell = iced::advanced::Shell::new(&mut messages);
-                element.as_widget_mut().update(
-                    &mut tree,
-                    &event,
-                    iced::advanced::Layout::new(&node),
-                    iced::mouse::Cursor::Available(pointer),
-                    &renderer,
-                    &mut clipboard,
-                    &mut shell,
-                    &viewport,
-                );
-                assert!(shell.is_event_captured());
-                if shell.is_layout_invalid() {
-                    node = element
-                        .as_widget_mut()
-                        .layout(&mut tree, &renderer, &limits);
+            for (start, end, expected_selection) in selections {
+                for (event, pointer) in [
+                    (
+                        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                            iced::mouse::Button::Left,
+                        )),
+                        start,
+                    ),
+                    (
+                        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                        end,
+                    ),
+                    (
+                        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                            iced::mouse::Button::Left,
+                        )),
+                        end,
+                    ),
+                    (
+                        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Character("c".into()),
+                            modified_key: keyboard::Key::Character("c".into()),
+                            physical_key: keyboard::key::Physical::Unidentified(
+                                keyboard::key::NativeCode::Unidentified,
+                            ),
+                            location: keyboard::Location::Standard,
+                            modifiers: keyboard::Modifiers::CTRL,
+                            text: None,
+                            repeat: false,
+                        }),
+                        end,
+                    ),
+                ] {
+                    let mut messages = Vec::new();
+                    let mut shell = iced::advanced::Shell::new(&mut messages);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        iced::advanced::Layout::new(&node),
+                        iced::mouse::Cursor::Available(pointer),
+                        &renderer,
+                        &mut clipboard,
+                        &mut shell,
+                        &viewport,
+                    );
+                    assert!(shell.is_event_captured());
+                    if shell.is_layout_invalid() {
+                        node = element
+                            .as_widget_mut()
+                            .layout(&mut tree, &renderer, &limits);
+                    }
                 }
+                assert_eq!(
+                    clipboard.0, expected_selection,
+                    "pointer copy preserves exact logical bytes, including empty physical rows"
+                );
             }
-            assert_eq!(
-                clipboard.0, expected,
-                "visual chunk seams are absent from copied logical source"
-            );
         }
     }
 
