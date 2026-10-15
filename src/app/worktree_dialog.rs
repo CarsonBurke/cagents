@@ -1156,14 +1156,22 @@ mod tests {
     fn branch_row_base_keeps_exact_local_identity_even_when_its_name_looks_qualified() {
         use crate::model::WorktreeId;
         for name in ["refs/heads/topic", "origin/main"] {
-            let Fixture {mut app, project, _state} = fixture();
+            let Fixture {
+                mut app,
+                project,
+                _state,
+            } = fixture();
             app.worktree_dialog = None;
-            let row = SidebarWorktree::from_durable(WorktreeId::new(),
-                "/repo/worktrees/source".into(), Some(name.into()));
+            let row = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                "/repo/worktrees/source".into(),
+                Some(name.into()),
+            );
             let worktree = row.id;
             app.sidebar_model.projects[0].worktrees.push(row);
             drop(app.handle_project_action(project_ui::Action::Command {
-                project_id: project, worktree_id: Some(worktree),
+                project_id: project,
+                worktree_id: Some(worktree),
                 command: crate::sidebar::ProjectCommand::NewWorktreeFromBranch,
             }));
             assert_eq!(dialog(&app).draft.base, format!("refs/heads/{name}"));

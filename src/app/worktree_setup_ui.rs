@@ -222,7 +222,6 @@ fn preparation(
     .map_err(|error| error.to_string())
 }
 
-
 /// Hold the original creation lease from the last intent read through every
 /// copy and its progress update. A superseding Resume or Skip must win before
 /// preparation starts or wait until all of these effects have settled.
@@ -238,14 +237,15 @@ fn prepare_recorded_setup(
     }
     let store = store.ok_or("The setup journal is unavailable")?;
     let service = RepositoryService::system("git");
-    let guard = service.worktree_setup_guard(store, creation, Some(&intent))
+    let guard = service
+        .worktree_setup_guard(store, creation, Some(&intent))
         .map_err(|error| error.to_string())?;
     let result = preparation(intent.clone(), destination, creation, token)?;
     let mut complete = intent.clone();
     complete.copy_done = true;
-    service.update_worktree_setup_intent_with_guard(
-        store, creation, Some(&intent), complete, &guard,
-    ).map_err(|error| error.to_string())?;
+    service
+        .update_worktree_setup_intent_with_guard(store, creation, Some(&intent), complete, &guard)
+        .map_err(|error| error.to_string())?;
     // The host obtains the same lease for its independently verified launch.
     // Never retain it while waiting for the StartWorktreeSetup RPC.
     drop(guard);
@@ -466,7 +466,10 @@ impl Cagents {
             };
             // A stale retained terminal from a previous run cannot stand in
             // for the run referenced by the durable creation intent.
-            if session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID")
+            if session
+                .launch
+                .environment
+                .get("CAGENTS_WORKTREE_SETUP_ID")
                 .is_none_or(|value| value != &run.to_string())
             {
                 continue;
@@ -815,7 +818,12 @@ impl Cagents {
                     }
                 }
                 RepositoryService::system("git")
-                    .update_worktree_setup_intent_guarded(&store, creation, Some(&expected), intent.clone())
+                    .update_worktree_setup_intent_guarded(
+                        &store,
+                        creation,
+                        Some(&expected),
+                        intent.clone(),
+                    )
                     .map_err(|error| error.to_string())?;
                 Ok(ReviewCompletion::Local {
                     creation,
@@ -1467,7 +1475,10 @@ mod tests {
         ));
         let run = OperationId::new();
         let mut session = fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
-        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string());
+        session
+            .launch
+            .environment
+            .insert("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string());
         session
             .launch
             .environment
@@ -1481,20 +1492,53 @@ mod tests {
         };
         Arc::make_mut(&mut app.durable).cards[0].kind = CardKind::Terminal(session);
         app.refresh_worktree_setup_rows();
-        assert!(matches!(app.sidebar_model.projects[0].worktrees[0].setup_status,
-            Some(WorktreeSetupStatus::Interrupted(_))), "a retained successful terminal alone cannot prove the current checkout generation");
+        assert!(
+            matches!(
+                app.sidebar_model.projects[0].worktrees[0].setup_status,
+                Some(WorktreeSetupStatus::Interrupted(_))
+            ),
+            "a retained successful terminal alone cannot prove the current checkout generation"
+        );
         let inventory = OperationId::new();
-        app.setup_ui.receipt_requests.insert(project, (inventory, "/repo".into(), Instant::now()));
-        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), inventory, Ok((vec![crate::worktree_control::SetupReceipt {
-            path: path.clone(), creation_id: OperationId::new(), run_id: Some(run),
-            skip: false, copy_done: true, has_commands: true,
-        }], Vec::new()))));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].setup_status,
-            Some(WorktreeSetupStatus::Succeeded), "the verified current receipt can promote its exact terminal result");
-        app.setup_ui.pending.insert(path.clone(), (run, CancellationToken::new()));
-        drop(app.finish_worktree_setup(run, path.clone(), Err("The checkout generation changed".into())));
-        assert!(matches!(app.sidebar_model.projects[0].worktrees[0].setup_status,
-            Some(WorktreeSetupStatus::Interrupted(_))), "old success must not overwrite a failed current preparation check");
+        app.setup_ui
+            .receipt_requests
+            .insert(project, (inventory, "/repo".into(), Instant::now()));
+        drop(app.finish_worktree_setup_receipts(
+            project,
+            "/repo".into(),
+            inventory,
+            Ok((
+                vec![crate::worktree_control::SetupReceipt {
+                    path: path.clone(),
+                    creation_id: OperationId::new(),
+                    run_id: Some(run),
+                    skip: false,
+                    copy_done: true,
+                    has_commands: true,
+                }],
+                Vec::new(),
+            )),
+        ));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0].setup_status,
+            Some(WorktreeSetupStatus::Succeeded),
+            "the verified current receipt can promote its exact terminal result"
+        );
+        app.setup_ui
+            .pending
+            .insert(path.clone(), (run, CancellationToken::new()));
+        drop(app.finish_worktree_setup(
+            run,
+            path.clone(),
+            Err("The checkout generation changed".into()),
+        ));
+        assert!(
+            matches!(
+                app.sidebar_model.projects[0].worktrees[0].setup_status,
+                Some(WorktreeSetupStatus::Interrupted(_))
+            ),
+            "old success must not overwrite a failed current preparation check"
+        );
         // Reusing a checkout path must not resurrect the retained old setup
         // result instead of showing the newly reserved terminal.
         let mut next = app.durable.cards[0].clone();
@@ -1511,17 +1555,38 @@ mod tests {
             .insert("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), "10".into());
         next.kind = CardKind::Terminal(session);
         let next_run = OperationId::new();
-        let CardKind::Terminal(session) = &mut next.kind else { unreachable!() };
-        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), next_run.to_string());
+        let CardKind::Terminal(session) = &mut next.kind else {
+            unreachable!()
+        };
+        session
+            .launch
+            .environment
+            .insert("CAGENTS_WORKTREE_SETUP_ID".into(), next_run.to_string());
         Arc::make_mut(&mut app.durable).cards.push(next);
         let inventory = OperationId::new();
-        app.setup_ui.receipt_requests.insert(project, (inventory, "/repo".into(), Instant::now()));
-        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), inventory, Ok((vec![crate::worktree_control::SetupReceipt {
-            path, creation_id: OperationId::new(), run_id: Some(next_run),
-            skip: false, copy_done: true, has_commands: true,
-        }], Vec::new()))));
-        assert!(matches!(app.sidebar_model.projects[0].worktrees[0].setup_status,
-            Some(WorktreeSetupStatus::Interrupted(_))));
+        app.setup_ui
+            .receipt_requests
+            .insert(project, (inventory, "/repo".into(), Instant::now()));
+        drop(app.finish_worktree_setup_receipts(
+            project,
+            "/repo".into(),
+            inventory,
+            Ok((
+                vec![crate::worktree_control::SetupReceipt {
+                    path,
+                    creation_id: OperationId::new(),
+                    run_id: Some(next_run),
+                    skip: false,
+                    copy_done: true,
+                    has_commands: true,
+                }],
+                Vec::new(),
+            )),
+        ));
+        assert!(matches!(
+            app.sidebar_model.projects[0].worktrees[0].setup_status,
+            Some(WorktreeSetupStatus::Interrupted(_))
+        ));
     }
 
     #[test]
@@ -2121,39 +2186,107 @@ mod tests {
         let token = CancellationToken::new();
         let git_service = RepositoryService::system("git");
         let git = |arguments: &[&str]| {
-            let command = git_service.git_base(&primary, false)
+            let command = git_service
+                .git_base(&primary, false)
                 .args(arguments)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null");
-            SystemProcessExecutor.execute(&command, &token)
-                .and_then(|output| output.require_success(&command.program)).unwrap();
+            SystemProcessExecutor
+                .execute(&command, &token)
+                .and_then(|output| output.require_success(&command.program))
+                .unwrap();
         };
         git(&["init", "--quiet", "-b", "main"]);
         std::fs::write(primary.join("tracked"), "initial").unwrap();
         git(&["add", "tracked"]);
-        git(&["-c", "user.name=Setup Contract", "-c", "user.email=setup@example.invalid", "commit", "-qm", "initial"]);
+        git(&[
+            "-c",
+            "user.name=Setup Contract",
+            "-c",
+            "user.email=setup@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
         std::fs::create_dir(primary.join(".cagents")).unwrap();
-        std::fs::write(primary.join(".cagents/worktree.toml"), "copy = [\".env\"]\n").unwrap();
+        std::fs::write(
+            primary.join(".cagents/worktree.toml"),
+            "copy = [\".env\"]\n",
+        )
+        .unwrap();
         std::fs::write(primary.join(".env"), "preserve").unwrap();
         let service = RepositoryService::system("git");
         let plan = crate::worktree_setup::load(&primary).unwrap().unwrap();
-        let mut request = service.resolve_worktree_request(&crate::repository::WorktreeInput {
-            repository: primary.clone(), input: "topic".into(), base: "main".into(),
-            managed_directory: ".worktrees/".into(), destination: String::new(), operation_id: OperationId::new(),
-        }, &token).unwrap();
-        let original = SetupIntent {primary: Some(primary), plan: Some(plan), skip: false,
-            run_id: Some(OperationId::new()), copy_done: false};
+        let mut request = service
+            .resolve_worktree_request(
+                &crate::repository::WorktreeInput {
+                    repository: primary.clone(),
+                    input: "topic".into(),
+                    base: "main".into(),
+                    managed_directory: ".worktrees/".into(),
+                    destination: String::new(),
+                    operation_id: OperationId::new(),
+                },
+                &token,
+            )
+            .unwrap();
+        let original = SetupIntent {
+            primary: Some(primary),
+            plan: Some(plan),
+            skip: false,
+            run_id: Some(OperationId::new()),
+            copy_done: false,
+        };
         request.setup_intent = Some(original.clone());
-        let store = crate::persistence::StateStore::open(root.path().join("journal.sqlite3"), crate::model::BootId::new("gui-prepare-test")).unwrap();
+        let store = crate::persistence::StateStore::open(
+            root.path().join("journal.sqlite3"),
+            crate::model::BootId::new("gui-prepare-test"),
+        )
+        .unwrap();
         let (progress, _) = async_channel::bounded(8);
         let report = service.create_worktree_journaled(&store, &request, 0, &token, &progress);
-        assert_eq!(report.state, crate::repository::WorktreeOperationState::Created, "{}", report.detail);
+        assert_eq!(
+            report.state,
+            crate::repository::WorktreeOperationState::Created,
+            "{}",
+            report.detail
+        );
         let mut skipped = original.clone();
-        skipped.run_id = Some(OperationId::new()); skipped.skip = true; skipped.copy_done = true;
-        service.update_worktree_setup_intent_guarded(&store, request.operation_id, Some(&original), skipped.clone()).unwrap();
-        assert!(prepare_recorded_setup(Some(&store), original, &request.destination, request.operation_id, &token).is_err());
-        assert!(!request.destination.join(".env").exists(), "a superseded run must not copy ignored files after an explicit skip");
-        assert_eq!(service.worktree_setup_creation(&store, request.operation_id).unwrap().unwrap().request.unwrap().setup_intent, Some(skipped));
+        skipped.run_id = Some(OperationId::new());
+        skipped.skip = true;
+        skipped.copy_done = true;
+        service
+            .update_worktree_setup_intent_guarded(
+                &store,
+                request.operation_id,
+                Some(&original),
+                skipped.clone(),
+            )
+            .unwrap();
+        assert!(
+            prepare_recorded_setup(
+                Some(&store),
+                original,
+                &request.destination,
+                request.operation_id,
+                &token
+            )
+            .is_err()
+        );
+        assert!(
+            !request.destination.join(".env").exists(),
+            "a superseded run must not copy ignored files after an explicit skip"
+        );
+        assert_eq!(
+            service
+                .worktree_setup_creation(&store, request.operation_id)
+                .unwrap()
+                .unwrap()
+                .request
+                .unwrap()
+                .setup_intent,
+            Some(skipped)
+        );
     }
 
     #[test]

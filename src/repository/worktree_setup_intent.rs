@@ -4,8 +4,13 @@ use super::*;
 
 /// An exact receipt's execution lease. Retain across file preparation and its
 /// progress CAS, then drop before requesting host terminal startup.
-pub struct WorktreeSetupGuard<'a> {store:&'a StateStore,creation_id:OperationId,entity_id:String,generation:u64,lease:fs::File}
-
+pub struct WorktreeSetupGuard<'a> {
+    store: &'a StateStore,
+    creation_id: OperationId,
+    entity_id: String,
+    generation: u64,
+    lease: fs::File,
+}
 
 /// Exact configuration reviewed for one creation. Execution still reloads and
 /// verifies this snapshot through `worktree_setup` before preparing commands.
@@ -254,54 +259,128 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Serialize production setup transitions across copied window journals
     /// and the host's actual setup execution, before taking a SQLite writer.
     pub fn update_worktree_setup_intent_guarded(
-        &self,store:&StateStore,creation_id:OperationId,
-        expected:Option<&WorktreeSetupIntent>,updated:WorktreeSetupIntent,
-    )->Result<WorktreeOperationReport,StoreError> {
-        let guard=self.worktree_setup_guard(store,creation_id,expected)?;
-        self.update_worktree_setup_intent_with_guard(store,creation_id,expected,updated,&guard)
+        &self,
+        store: &StateStore,
+        creation_id: OperationId,
+        expected: Option<&WorktreeSetupIntent>,
+        updated: WorktreeSetupIntent,
+    ) -> Result<WorktreeOperationReport, StoreError> {
+        let guard = self.worktree_setup_guard(store, creation_id, expected)?;
+        self.update_worktree_setup_intent_with_guard(store, creation_id, expected, updated, &guard)
     }
 
-    pub fn worktree_setup_guard<'a>(&self,store:&'a StateStore,creation_id:OperationId,expected:Option<&WorktreeSetupIntent>)->Result<WorktreeSetupGuard<'a>,StoreError> {
-        let initial=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation receipt is missing".into()))?;
-        let lease=self.worktree_setup_execution_lease(&initial)?;
+    pub fn worktree_setup_guard<'a>(
+        &self,
+        store: &'a StateStore,
+        creation_id: OperationId,
+        expected: Option<&WorktreeSetupIntent>,
+    ) -> Result<WorktreeSetupGuard<'a>, StoreError> {
+        let initial = store
+            .journaled_worktree_operation(creation_id)?
+            .ok_or_else(|| StoreError::InvalidState("Setup creation receipt is missing".into()))?;
+        let lease = self.worktree_setup_execution_lease(&initial)?;
         // Copies of a known creator journal are not independent authority.
         // Refuse ambiguous owners rather than preparing from divergent intent.
-        let mut paths=crate::instance::window_database_paths()?;
-        if let Some(directories)=crate::instance::project_dirs() {paths.push(directories.data_dir().join("worktree-operations.sqlite3"));}
-        paths.sort();paths.dedup();let mut owners=Vec::new();
-        for path in paths {
-            if path.try_exists()?&&crate::persistence::read_worktree_operation_at(&path,creation_id)?.is_some() {owners.push(path);}
+        let mut paths = crate::instance::window_database_paths()?;
+        if let Some(directories) = crate::instance::project_dirs() {
+            paths.push(directories.data_dir().join("worktree-operations.sqlite3"));
         }
-        if owners.len()>1||(owners.len()==1&&owners[0].canonicalize()?!=store.database_path().canonicalize()?) {
+        paths.sort();
+        paths.dedup();
+        let mut owners = Vec::new();
+        for path in paths {
+            if path.try_exists()?
+                && crate::persistence::read_worktree_operation_at(&path, creation_id)?.is_some()
+            {
+                owners.push(path);
+            }
+        }
+        if owners.len() > 1
+            || (owners.len() == 1
+                && owners[0].canonicalize()? != store.database_path().canonicalize()?)
+        {
             return Err(StoreError::InvalidState("Multiple window journals retain this setup creation; its unique original authority is unavailable".into()));
         }
-        let current=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation disappeared".into()))?;
-        let journal=settled_setup_journal(&current)?;
-        if current.entity_id!=initial.entity_id||current.base_generation!=initial.base_generation {return Err(StoreError::InvalidState("Setup receipt identity changed".into()));}
-        if journal.request.setup_intent.as_ref()!=expected {return Err(StoreError::InvalidState("Setup intent was superseded before preparation".into()));}
-        if journal.lease_identity!=Some(lease_file_identity(&lease)?) {return Err(StoreError::InvalidState("Setup creation lease identity changed".into()));}
-        Ok(WorktreeSetupGuard {store,creation_id,entity_id:current.entity_id,generation:current.base_generation,lease})
+        let current = store
+            .journaled_worktree_operation(creation_id)?
+            .ok_or_else(|| StoreError::InvalidState("Setup creation disappeared".into()))?;
+        let journal = settled_setup_journal(&current)?;
+        if current.entity_id != initial.entity_id
+            || current.base_generation != initial.base_generation
+        {
+            return Err(StoreError::InvalidState(
+                "Setup receipt identity changed".into(),
+            ));
+        }
+        if journal.request.setup_intent.as_ref() != expected {
+            return Err(StoreError::InvalidState(
+                "Setup intent was superseded before preparation".into(),
+            ));
+        }
+        if journal.lease_identity != Some(lease_file_identity(&lease)?) {
+            return Err(StoreError::InvalidState(
+                "Setup creation lease identity changed".into(),
+            ));
+        }
+        Ok(WorktreeSetupGuard {
+            store,
+            creation_id,
+            entity_id: current.entity_id,
+            generation: current.base_generation,
+            lease,
+        })
     }
 
-    pub fn update_worktree_setup_intent_with_guard(&self,store:&StateStore,creation_id:OperationId,expected:Option<&WorktreeSetupIntent>,updated:WorktreeSetupIntent,guard:&WorktreeSetupGuard<'_>)->Result<WorktreeOperationReport,StoreError> {
-        if guard.creation_id!=creation_id||!std::ptr::eq(guard.store,store) {return Err(StoreError::InvalidState("Setup preparation guard belongs to another receipt or store".into()));}
-        let row=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation disappeared".into()))?;
-        if row.entity_id!=guard.entity_id||row.base_generation!=guard.generation {return Err(StoreError::InvalidState("Setup preparation receipt identity changed".into()));}
-        let journal=settled_setup_journal(&row)?;
-        if journal.lease_identity!=Some(lease_file_identity(&guard.lease)?) {return Err(StoreError::InvalidState("Setup preparation lease identity changed".into()));}
-        self.update_worktree_setup_intent(store,creation_id,expected,updated)
+    pub fn update_worktree_setup_intent_with_guard(
+        &self,
+        store: &StateStore,
+        creation_id: OperationId,
+        expected: Option<&WorktreeSetupIntent>,
+        updated: WorktreeSetupIntent,
+        guard: &WorktreeSetupGuard<'_>,
+    ) -> Result<WorktreeOperationReport, StoreError> {
+        if guard.creation_id != creation_id || !std::ptr::eq(guard.store, store) {
+            return Err(StoreError::InvalidState(
+                "Setup preparation guard belongs to another receipt or store".into(),
+            ));
+        }
+        let row = store
+            .journaled_worktree_operation(creation_id)?
+            .ok_or_else(|| StoreError::InvalidState("Setup creation disappeared".into()))?;
+        if row.entity_id != guard.entity_id || row.base_generation != guard.generation {
+            return Err(StoreError::InvalidState(
+                "Setup preparation receipt identity changed".into(),
+            ));
+        }
+        let journal = settled_setup_journal(&row)?;
+        if journal.lease_identity != Some(lease_file_identity(&guard.lease)?) {
+            return Err(StoreError::InvalidState(
+                "Setup preparation lease identity changed".into(),
+            ));
+        }
+        self.update_worktree_setup_intent(store, creation_id, expected, updated)
     }
 
-    pub(crate) fn worktree_setup_execution_lease(&self,operation:&PendingOperation)->Result<fs::File,StoreError> {
+    pub(crate) fn worktree_setup_execution_lease(
+        &self,
+        operation: &PendingOperation,
+    ) -> Result<fs::File, StoreError> {
         use std::os::unix::fs::MetadataExt;
-        let journal=settled_setup_journal(operation)?;
-        let expected=journal.lease_identity.ok_or_else(||StoreError::InvalidState("Setup creation has no original lease identity".into()))?;
+        let journal = settled_setup_journal(operation)?;
+        let expected = journal.lease_identity.ok_or_else(|| {
+            StoreError::InvalidState("Setup creation has no original lease identity".into())
+        })?;
         // Do not wait on a starting/live setup after a caller's activity census.
         // A retry must obtain fresh activity and intent evidence.
         let lease=worktree_lease(&journal.lease_path,false).map_err(|error|StoreError::InvalidState(format!("Close the previous Worktree setup terminal, including its completed card, before resuming; setup ownership is still held or unavailable: {error}")))?;
-        let named=fs::symlink_metadata(&journal.lease_path)?;
-        if lease_file_identity(&lease)?!=expected||!named.file_type().is_file()||(named.dev(),named.ino())!=expected {
-            return Err(StoreError::InvalidState("Setup creation lease was replaced".into()));
+        let named = fs::symlink_metadata(&journal.lease_path)?;
+        if lease_file_identity(&lease)? != expected
+            || !named.file_type().is_file()
+            || (named.dev(), named.ino()) != expected
+        {
+            return Err(StoreError::InvalidState(
+                "Setup creation lease was replaced".into(),
+            ));
         }
         Ok(lease)
     }
@@ -453,27 +532,97 @@ mod tests {
 
     #[test]
     fn guarded_setup_transitions_share_the_original_lease_across_copied_stores() {
-        let root=tempfile::tempdir().unwrap();let mut request=request(root.path());
-        let original=intent(&request);request.setup_intent=Some(original.clone());let mut journal=journal(request);
+        let root = tempfile::tempdir().unwrap();
+        let mut request = request(root.path());
+        let original = intent(&request);
+        request.setup_intent = Some(original.clone());
+        let mut journal = journal(request);
         fs::create_dir_all(&journal.common_dir).unwrap();
-        let lease=worktree_lease(&journal.lease_path,true).unwrap();journal.lease_identity=Some(lease_file_identity(&lease).unwrap());drop(lease);
-        let first=StateStore::open(root.path().join("first.sqlite3"),crate::model::BootId::new("lease-test")).unwrap();
-        let copied=StateStore::open(root.path().join("copied.sqlite3"),crate::model::BootId::new("lease-test")).unwrap();
-        seed(&first,&journal,PendingOperationStatus::Applied);seed(&copied,&journal,PendingOperationStatus::Applied);
-        let service=RepositoryService::system("git");let id=journal.request.operation_id;
-        let row=first.journaled_worktree_operation(id).unwrap().unwrap();let running=service.worktree_setup_guard(&first,id,Some(&original)).unwrap();
-        let mut updated=original.clone();updated.skip=true;updated.run_id=Some(OperationId::new());
-        assert!(service.update_worktree_setup_intent_guarded(&copied,id,Some(&original),updated.clone()).is_err(),"a copied store must not bypass a starting or live execution");
-        assert_eq!(service.worktree_setup_creation(&copied,id).unwrap().unwrap().request.unwrap().setup_intent,Some(original.clone()));
-        assert!(service.update_worktree_setup_intent_with_guard(&copied,id,Some(&original),updated.clone(),&running).is_err(),"a preparation guard is bound to its exact store");
-        let mut prepared=original.clone();prepared.copy_done=true;
-        service.update_worktree_setup_intent_with_guard(&first,id,Some(&original),prepared,&running).unwrap();
+        let lease = worktree_lease(&journal.lease_path, true).unwrap();
+        journal.lease_identity = Some(lease_file_identity(&lease).unwrap());
+        drop(lease);
+        let first = StateStore::open(
+            root.path().join("first.sqlite3"),
+            crate::model::BootId::new("lease-test"),
+        )
+        .unwrap();
+        let copied = StateStore::open(
+            root.path().join("copied.sqlite3"),
+            crate::model::BootId::new("lease-test"),
+        )
+        .unwrap();
+        seed(&first, &journal, PendingOperationStatus::Applied);
+        seed(&copied, &journal, PendingOperationStatus::Applied);
+        let service = RepositoryService::system("git");
+        let id = journal.request.operation_id;
+        let row = first.journaled_worktree_operation(id).unwrap().unwrap();
+        let running = service
+            .worktree_setup_guard(&first, id, Some(&original))
+            .unwrap();
+        let mut updated = original.clone();
+        updated.skip = true;
+        updated.run_id = Some(OperationId::new());
+        assert!(
+            service
+                .update_worktree_setup_intent_guarded(&copied, id, Some(&original), updated.clone())
+                .is_err(),
+            "a copied store must not bypass a starting or live execution"
+        );
+        assert_eq!(
+            service
+                .worktree_setup_creation(&copied, id)
+                .unwrap()
+                .unwrap()
+                .request
+                .unwrap()
+                .setup_intent,
+            Some(original.clone())
+        );
+        assert!(
+            service
+                .update_worktree_setup_intent_with_guard(
+                    &copied,
+                    id,
+                    Some(&original),
+                    updated.clone(),
+                    &running
+                )
+                .is_err(),
+            "a preparation guard is bound to its exact store"
+        );
+        let mut prepared = original.clone();
+        prepared.copy_done = true;
+        service
+            .update_worktree_setup_intent_with_guard(
+                &first,
+                id,
+                Some(&original),
+                prepared,
+                &running,
+            )
+            .unwrap();
         drop(running);
-        assert!(service.worktree_setup_guard(&first,id,Some(&original)).is_err(),"stale preparation must fail before filesystem effects");
-        service.update_worktree_setup_intent_guarded(&copied,id,Some(&original),updated).unwrap();
-        let old=fs::File::open(&journal.lease_path).unwrap();fs::rename(&journal.lease_path,journal.lease_path.with_extension("retained")).unwrap();
-        drop(worktree_lease(&journal.lease_path,true).unwrap());
-        assert!(service.worktree_setup_execution_lease(&row).is_err(),"replacement lease inode must not inherit execution authority");drop(old);
+        assert!(
+            service
+                .worktree_setup_guard(&first, id, Some(&original))
+                .is_err(),
+            "stale preparation must fail before filesystem effects"
+        );
+        service
+            .update_worktree_setup_intent_guarded(&copied, id, Some(&original), updated)
+            .unwrap();
+        let old = fs::File::open(&journal.lease_path).unwrap();
+        fs::rename(
+            &journal.lease_path,
+            journal.lease_path.with_extension("retained"),
+        )
+        .unwrap();
+        drop(worktree_lease(&journal.lease_path, true).unwrap());
+        assert!(
+            service.worktree_setup_execution_lease(&row).is_err(),
+            "replacement lease inode must not inherit execution authority"
+        );
+        drop(old);
     }
 
     #[test]
@@ -481,7 +630,12 @@ mod tests {
         let mut value = serde_json::to_value(request(Path::new("/fixture"))).unwrap();
         value.as_object_mut().unwrap().remove("setup_intent");
         assert!(!value.as_object().unwrap().contains_key("base_reference"));
-        assert!(serde_json::from_value::<CreateWorktreeRequest>(value.clone()).unwrap().base_reference.is_none());
+        assert!(
+            serde_json::from_value::<CreateWorktreeRequest>(value.clone())
+                .unwrap()
+                .base_reference
+                .is_none()
+        );
         assert!(
             serde_json::from_value::<CreateWorktreeRequest>(value)
                 .unwrap()

@@ -7,7 +7,7 @@
 
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{
-    WorktreeSetupCreationIdentity, WorktreeSetupIntent, WorktreeSetupPlan, WorktreeSetupGuard,
+    WorktreeSetupCreationIdentity, WorktreeSetupGuard, WorktreeSetupIntent, WorktreeSetupPlan,
     worktree_setup_marker_matches,
 };
 
@@ -3137,7 +3137,6 @@ pub struct CreateWorktreeRequest {
     pub setup_intent: Option<WorktreeSetupIntent>,
 }
 
-
 impl CreateWorktreeRequest {
     fn resolved_base_reference(&self) -> Result<String, ValidationError> {
         self.base.validate()?;
@@ -5775,7 +5774,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             (BaseRevision::LocalBranch(branch.clone()), false, None)
         } else if !input.base.trim().is_empty() {
             let (base, reference) = self.resolve_worktree_base(
-                &repository, input.base.trim(), &refs, &remotes, cancellation,
+                &repository,
+                input.base.trim(),
+                &refs,
+                &remotes,
+                cancellation,
             )?;
             (base, false, reference)
         } else {
@@ -5852,7 +5855,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // branch whose literal short name happens to begin with refs/.
         if let Some(branch) = name.strip_prefix("refs/heads/") {
             if refs.local.iter().any(|local| local.name.as_str() == name) {
-                return Ok((BaseRevision::LocalBranch(ValidatedBranchName::parse(branch)?), None));
+                return Ok((
+                    BaseRevision::LocalBranch(ValidatedBranchName::parse(branch)?),
+                    None,
+                ));
             }
             return Err(
                 ValidationError::InvalidBase(format!("Local base {name} disappeared")).into(),
@@ -5868,7 +5874,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .ok_or_else(|| {
                     ValidationError::InvalidBase(format!("Tag base {name} disappeared"))
                 })?;
-            return Ok((BaseRevision::object_id(oid.to_string())?, Some(name.to_owned())));
+            return Ok((
+                BaseRevision::object_id(oid.to_string())?,
+                Some(name.to_owned()),
+            ));
         }
         let local_name = name.strip_prefix("refs/heads/").unwrap_or(name);
         if refs
@@ -5876,7 +5885,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .iter()
             .any(|local| local.name.as_str() == format!("refs/heads/{local_name}"))
         {
-            return Ok((BaseRevision::LocalBranch(ValidatedBranchName::parse(local_name)?), None));
+            return Ok((
+                BaseRevision::LocalBranch(ValidatedBranchName::parse(local_name)?),
+                None,
+            ));
         }
         let tag = format!(
             "refs/tags/{}",
@@ -5902,7 +5914,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .max_by_key(|(remote, _)| remote.len())
         {
             ValidatedBranchName::parse(branch)?;
-            return Ok((BaseRevision::remote_ref(format!("refs/remotes/{remote}/{branch}"))?, None));
+            return Ok((
+                BaseRevision::remote_ref(format!("refs/remotes/{remote}/{branch}"))?,
+                None,
+            ));
         }
         let branch = ValidatedBranchName::parse(name)?;
         let mut candidates: Vec<_> = refs
@@ -11658,9 +11673,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let (Some(admin), Some(oid)) = (&journal.admin_dir, &journal.base_oid) else {
             return;
         };
-        let basis = journal.request.resolved_base_reference()
+        let basis = journal
+            .request
+            .resolved_base_reference()
             .map_err(io::Error::other)
-            .and_then(|reference| crate::worktree_basis::CreationBasis::new(reference, oid.clone()));
+            .and_then(|reference| {
+                crate::worktree_basis::CreationBasis::new(reference, oid.clone())
+            });
         if let Ok(basis) = &basis
             && matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.creation_basis.as_ref() == Some(basis))
         {
@@ -12967,7 +12986,10 @@ mod worktree_journal_tests {
 
     #[test]
     fn explicit_tag_base_keeps_reference_and_commit_across_restart_and_tag_move() {
-        for (annotated, tag, qualified) in [(true, "release/v1", false), (false, "refs/tags/nested", true)] {
+        for (annotated, tag, qualified) in [
+            (true, "release/v1", false),
+            (false, "refs/tags/nested", true),
+        ] {
             let mut fixture = Fixture::new();
             let original = fixture.git(&["rev-parse", "HEAD"]);
             if annotated {
@@ -12978,26 +13000,60 @@ mod worktree_journal_tests {
             fixture.git(&["commit", "--allow-empty", "-m", "later work"]);
             let reference = format!("refs/tags/{tag}");
             let mut input = fixture.input("from-tag");
-            input.base = if qualified {reference.clone()} else {tag.into()};
+            input.base = if qualified {
+                reference.clone()
+            } else {
+                tag.into()
+            };
             fixture.resolve(input);
-            assert!(matches!(&fixture.request.base, BaseRevision::ObjectId(oid) if oid == &original));
-            assert_eq!(fixture.request.base_reference.as_deref(), Some(reference.as_str()));
+            assert!(
+                matches!(&fixture.request.base, BaseRevision::ObjectId(oid) if oid == &original)
+            );
+            assert_eq!(
+                fixture.request.base_reference.as_deref(),
+                Some(reference.as_str())
+            );
             let mut malformed = fixture.request.clone();
             malformed.base_reference = Some("refs/heads/main".into());
-            assert!(fixture.service.plan_worktree_creation(&malformed).is_err(), "a historical tag label cannot claim another ref kind");
-            assert_eq!(fixture.run(&CancellationToken::new()).state, WorktreeOperationState::Created);
+            assert!(
+                fixture.service.plan_worktree_creation(&malformed).is_err(),
+                "a historical tag label cannot claim another ref kind"
+            );
+            assert_eq!(
+                fixture.run(&CancellationToken::new()).state,
+                WorktreeOperationState::Created
+            );
             assert_eq!(fixture.git(&["rev-parse", "from-tag"]), original);
-            let basis = crate::worktree_basis::read(&fixture.request.destination).unwrap().unwrap();
+            let basis = crate::worktree_basis::read(&fixture.request.destination)
+                .unwrap()
+                .unwrap();
             assert_eq!(basis.reference, reference);
             assert_eq!(basis.oid, original);
             fixture.git(&["tag", "-f", tag, "HEAD"]);
             assert_ne!(fixture.git(&["rev-parse", &reference]), original);
-            let reopened = StateStore::open(fixture.directory.path().join("state.sqlite"), BootId::new("tag-basis-restart")).unwrap();
-            let report = fixture.service.rehydrate_worktree_operations(&reopened).unwrap().into_iter()
-                .find(|report| report.operation_id == fixture.request.operation_id).unwrap();
-            assert_eq!(report.request.unwrap().base_reference.as_deref(), Some(reference.as_str()));
-            let retained = crate::worktree_basis::read(&fixture.request.destination).unwrap().unwrap();
-            assert_eq!(retained, basis, "later tag movement must not rewrite the historical base or its resolved commit");
+            let reopened = StateStore::open(
+                fixture.directory.path().join("state.sqlite"),
+                BootId::new("tag-basis-restart"),
+            )
+            .unwrap();
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&reopened)
+                .unwrap()
+                .into_iter()
+                .find(|report| report.operation_id == fixture.request.operation_id)
+                .unwrap();
+            assert_eq!(
+                report.request.unwrap().base_reference.as_deref(),
+                Some(reference.as_str())
+            );
+            let retained = crate::worktree_basis::read(&fixture.request.destination)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                retained, basis,
+                "later tag movement must not rewrite the historical base or its resolved commit"
+            );
         }
     }
 
