@@ -221,13 +221,22 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
     create: impl FnOnce(&DirectoryNamespace, &Root, &Path, u32) -> Result<DirectoryCreation, DirectoryCreateError>,
 ) -> Result<RecoveryDirectory<T>, RecoveryDirectoryError> {
     if components(Path::new(leaf)).is_none_or(|parts| parts.len() != 1) {
-        return Err(RecoveryDirectoryError::Rejected(io::Error::new(io::ErrorKind::InvalidInput,
-            "Recovery holding requires one ordinary leaf name")));
+        drop(owner);
+        return Err(RecoveryDirectoryError::Rejected(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Recovery holding requires one ordinary leaf name",
+        )));
     }
-    admission.context().placement().require_payload_registration().map_err(RecoveryDirectoryError::Rejected)?;
+    if let Err(cause) = admission.context().placement().require_payload_registration() {
+        drop(owner);
+        return Err(RecoveryDirectoryError::Rejected(cause));
+    }
     if cancelled() {
-        return Err(RecoveryDirectoryError::Rejected(io::Error::new(io::ErrorKind::Interrupted,
-            "Recovery holding creation cancelled before any effect")));
+        drop(owner);
+        return Err(RecoveryDirectoryError::Rejected(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Recovery holding creation cancelled before any effect",
+        )));
     }
     let (context, slot) = admission.into_parts();
     // Qualified producer retains <=4 private handles plus bounded transient
@@ -237,8 +246,15 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
     let publication = match create(context.placement().namespace(),
         context.placement().directory(), Path::new(leaf), 0o700) {
         Ok(DirectoryCreation::Published(publication)) => publication,
-        Ok(DirectoryCreation::Existing(_)) => return Err(RecoveryDirectoryError::Rejected(
-            io::Error::new(io::ErrorKind::AlreadyExists, "Recovery holding already exists; it was left untouched"))),
+        Ok(DirectoryCreation::Existing(_)) => {
+            // Keep the original native owner inside the still-held slot on
+            // normal no-effect returns, not just on retained-error paths.
+            drop(owner);
+            return Err(RecoveryDirectoryError::Rejected(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Recovery holding already exists; it was left untouched",
+            )));
+        }
         Ok(DirectoryCreation::Unverified { directory, reason }) => {
             let cause = io::Error::other(format!("Recovery holding has no creation authority: {reason}"));
             let recovery = slot.retain("Unverified recovery holding was left untouched".into(), move || {
@@ -255,13 +271,19 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
         }
         Err(mut error) => {
             let cause = io::Error::other(error.to_string());
-            let Some(mut preparation) = error.take_recovery() else { return Err(RecoveryDirectoryError::Rejected(cause)); };
-            let recovery = slot.retain("Private holding staging requires retained cleanup".into(), move || {
-                let _ = &owner;
-                context.placement().validate().map_err(|e| e.to_string())?;
-                preparation.retry_cleanup().map_err(|e| e.to_string())?;
-                sync_directory(context.placement().directory()).map_err(|e| e.to_string())
-            });
+            let Some(mut preparation) = error.take_recovery() else {
+                drop(owner);
+                return Err(RecoveryDirectoryError::Rejected(cause));
+            };
+            let recovery = slot.retain(
+                "Private holding staging requires retained cleanup".into(),
+                move || {
+                    let _ = &owner;
+                    context.placement().validate().map_err(|e| e.to_string())?;
+                    preparation.retry_cleanup().map_err(|e| e.to_string())?;
+                    sync_directory(context.placement().directory()).map_err(|e| e.to_string())
+                },
+            );
             return Err(RecoveryDirectoryError::Retained { cause, recovery });
         }
     };
@@ -585,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_transfer_drop_keeps_original_native_owner_inside_creation_charge() {
+    fn native_owner_drop_stays_charged_on_transfer_and_existing_rejection() {
         struct NativeOwner {
             _file: Arc<fs::File>,
             entered: std::sync::mpsc::SyncSender<()>,
@@ -597,77 +619,89 @@ mod tests {
                 let _ = self.release.recv();
             }
         }
-        let source = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let runtime = tempfile::tempdir().unwrap();
-        let source_root = Arc::new(Root::open(source.path()).unwrap());
-        let parent = Arc::new(Root::open(outside.path()).unwrap());
-        let registry = Arc::new(UnknownEnrollment {
-            creation: Arc::new(std::sync::Mutex::new(UnknownCreation {
-                limit: Some(1),
-                ..UnknownCreation::default()
-            })),
-            // This case needs immediate successful enrollment, not the other
-            // fixture's first two deliberately unknown replies.
-            attempts: std::sync::atomic::AtomicUsize::new(2),
-            payload: std::sync::Mutex::new(None),
-            _outside: outside,
-            _runtime: runtime,
-        });
-        let placement = RecoveryPlacement::acquire(
-            parent,
-            source_root.clone(),
-            Arc::from([source_root.clone()]),
-            RecoveryRegistryCheck::from_lease(registry.clone()),
-        )
-        .unwrap();
-        let protection = Arc::new(Some(
-            crate::worktree_cleanup::fixture_protection(
-                registry._runtime.path(),
-                source.path(),
-                false,
+        for existing in [false, true] {
+            let source = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let source_root = Arc::new(Root::open(source.path()).unwrap());
+            let parent = Arc::new(Root::open(outside.path()).unwrap());
+            let registry = Arc::new(UnknownEnrollment {
+                creation: Arc::new(std::sync::Mutex::new(UnknownCreation {
+                    limit: Some(1),
+                    ..UnknownCreation::default()
+                })),
+                // This case needs immediate successful enrollment, not the other
+                // fixture's first two deliberately unknown replies.
+                attempts: std::sync::atomic::AtomicUsize::new(2),
+                payload: std::sync::Mutex::new(None),
+                _outside: outside,
+                _runtime: runtime,
+            });
+            let placement = RecoveryPlacement::acquire(
+                parent,
+                source_root.clone(),
+                Arc::from([source_root.clone()]),
+                RecoveryRegistryCheck::from_lease(registry.clone()),
             )
-            .unwrap(),
-        ));
-        let context = FilesystemRecoveryContext::new(&source_root, protection, placement).unwrap();
-        fs::write(source.path().join("original"), b"retained original").unwrap();
-        let file = Arc::new(fs::File::open(source.path().join("original")).unwrap());
-        let weak = Arc::downgrade(&file);
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let holding = prepare_recovery_directory_with_owner(
-            context.reserve_directory().unwrap(),
-            OsStr::new("holding"),
-            || false,
-            NativeOwner {
+            .unwrap();
+            let protection = Arc::new(Some(
+                crate::worktree_cleanup::fixture_protection(
+                    registry._runtime.path(),
+                    source.path(),
+                    false,
+                )
+                .unwrap(),
+            ));
+            let context = FilesystemRecoveryContext::new(&source_root, protection, placement).unwrap();
+            fs::write(source.path().join("original"), b"retained original").unwrap();
+            let file = Arc::new(fs::File::open(source.path().join("original")).unwrap());
+            let weak = Arc::downgrade(&file);
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            if existing {
+                fs::create_dir(registry._outside.path().join("holding")).unwrap();
+            }
+            let admission = context.reserve_directory().unwrap();
+            let owner = NativeOwner {
                 _file: file,
                 entered: entered_tx,
                 release: release_rx,
-            },
-        )
-        .unwrap();
-        let worker = std::thread::spawn(move || drop(holding.into_parts()));
-        let entered = entered_rx
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .is_ok();
-        let original_is_live = weak.upgrade().is_some();
-        let charged = registry.creation.lock().unwrap().in_flight;
-        let refused = context.reserve_directory().is_err();
-        // Always release/join before assertions, including the old bad order.
-        let _ = release_tx.send(());
-        let joined = worker.join().is_ok();
-        assert!(entered && joined && original_is_live);
-        assert_eq!(
-            charged, 1,
-            "T's original native owner must stay charged through Drop"
-        );
-        assert!(
-            refused,
-            "the isolated one-owner admission must remain exhausted"
-        );
-        assert!(weak.upgrade().is_none());
-        assert_eq!(registry.creation.lock().unwrap().in_flight, 0);
-        drop(context.reserve_directory().unwrap());
+            };
+            let worker = std::thread::spawn(move || {
+                let result = prepare_recovery_directory_with_owner(
+                    admission,
+                    OsStr::new("holding"),
+                    || false,
+                    owner,
+                );
+                if existing {
+                    assert!(matches!(result, Err(RecoveryDirectoryError::Rejected(_))));
+                } else {
+                    drop(result.unwrap().into_parts());
+                }
+            });
+            let entered = entered_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_ok();
+            let original_is_live = weak.upgrade().is_some();
+            let charged = registry.creation.lock().unwrap().in_flight;
+            let refused = context.reserve_directory().is_err();
+            // Always release/join before assertions, including the old bad order.
+            let _ = release_tx.send(());
+            let joined = worker.join().is_ok();
+            assert!(entered && joined && original_is_live);
+            assert_eq!(
+                charged, 1,
+                "T's original native owner must stay charged through Drop"
+            );
+            assert!(
+                refused,
+                "the isolated one-owner admission must remain exhausted"
+            );
+            assert!(weak.upgrade().is_none());
+            assert_eq!(registry.creation.lock().unwrap().in_flight, 0);
+            drop(context.reserve_directory().unwrap());
+        }
     }
 
     #[test]
