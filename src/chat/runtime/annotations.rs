@@ -5,6 +5,7 @@ use crate::{account::scope::LaunchAccountScope,chat::{annotations::{self,Approva
 pub(super) struct Authority {
     scope:Result<LaunchAccountScope,String>,
     session:Option<String>,
+    latest_proven:Option<String>,
     store:Option<annotations::storage::Store>,
     notice:Option<String>,
     retry_at:Option<std::time::Instant>,
@@ -12,13 +13,21 @@ pub(super) struct Authority {
     root:Option<std::path::PathBuf>,
 }
 impl Authority {
-    pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,store:None,notice:None,retry_at:None,#[cfg(test)] root:None}}
+    pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,latest_proven:None,store:None,notice:None,retry_at:None,#[cfg(test)] root:None}}
     pub(super) fn original(&self,user:Option<&str>,offset:usize,limit:usize)->Result<OriginalPage,OriginalError>{
-        self.store.as_ref().ok_or_else(||OriginalError::Unavailable("No qualified provider-confirmed original command is available".into()))?.original(user,offset,limit)
+        let store=self.store.as_ref().ok_or_else(||OriginalError::Unavailable(self.notice.clone().or_else(||self.scope.as_ref().err().cloned()).unwrap_or_else(||"No qualified provider-confirmed original command is available".into())))?;
+        let user=user.or(self.latest_proven.as_deref()).ok_or_else(||OriginalError::Unavailable("The provider's current latest user message has not been confirmed".into()))?;
+        store.original(Some(user),offset,limit)
+    }
+    /// Call only with provider-proven current conversation ordering; history
+    /// arrival and a persisted last annotation are not such evidence.
+    pub(super) fn latest_user(&mut self,user:&str)->Result<(),String>{
+        self.store.as_mut().ok_or("Qualified annotation storage is unavailable")?.latest_user(user)?;
+        self.latest_proven=Some(user.to_owned());Ok(())
     }
     pub(super) fn apply(&mut self,confirmed:Option<&Option<String>>,updates:Vec<ApprovalUpdate>,events:&mut Vec<Event>)->Option<String>{
         if let Some(identity)=confirmed && self.session.as_ref()!=identity.as_ref(){
-            self.session=identity.clone();self.store=None;self.notice=None;self.retry_at=None;
+            self.session=identity.clone();self.latest_proven=None;self.store=None;self.notice=None;self.retry_at=None;
         }
         if self.store.is_none() && self.retry_at.is_none_or(|at|std::time::Instant::now()>=at){
             if let (Ok(scope),Some(session))=(&self.scope,&self.session){
