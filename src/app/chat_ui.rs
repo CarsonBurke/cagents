@@ -14,6 +14,7 @@ use std::sync::{
 };
 
 mod auth_recovery;
+mod autolink;
 mod changes;
 mod clipboard_image;
 mod completion;

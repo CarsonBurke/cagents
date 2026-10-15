@@ -541,7 +541,7 @@ fn heading(
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
     widget::container(selectable_prose::text(
-        text.spans(heading_style(settings, level)),
+        autolink::spans(text.spans(heading_style(settings, level)), settings.style.link_color),
         match level {
             HeadingLevel::H1 => settings.h1_size,
             HeadingLevel::H2 => settings.h2_size,
@@ -589,7 +589,7 @@ fn paragraph(
     find: Option<&str>,
 ) -> Element<'static, Message> {
     selectable_prose::text(
-        text.spans(settings.style),
+        autolink::spans(text.spans(settings.style), settings.style.link_color),
         settings.text_size,
         settings.style.font,
         target,
@@ -990,4 +990,33 @@ mod tests {
             "and growing",
         );
     }
+    #[test]
+    fn bare_links_in_rendered_prose_dispatch_exact_scoped_document_actions() {
+        use cosmic::iced::advanced::{Layout,Shell,clipboard,layout,widget::Tree};
+        use cosmic::iced::{Event,Point,Rectangle,Size,mouse};
+        let target=Target {card:CardId::new(),generation:23};
+        let cached=CachedItem::new(&ItemContent::Text {
+            text:"https://example.com/bare and src/main.rs:42:7.".into(),thinking:false,phase:chat::Phase::Final,
+        },crate::settings::EditorSyntaxTheme::Auto);
+        let mut element=view(&cached,design::markdown_settings(&cosmic::Theme::dark(),design::TEXT_PROSE),target,None);
+        let renderer=crate::app::tests::headless_renderer();let mut tree=Tree::new(element.as_widget());
+        let viewport=Rectangle::with_size(Size::new(520.0,120.0));
+        let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(Size::ZERO,viewport.size()));
+        let mut found=std::collections::BTreeSet::new();
+        'positions: for y in (2..100).step_by(3) {for x in (2..518).step_by(4) {
+            let cursor=mouse::Cursor::Available(Point::new(x as f32,y as f32));
+            if element.as_widget().mouse_interaction(&tree,Layout::new(&node),cursor,&viewport,&renderer)!=mouse::Interaction::Pointer {continue;}
+            let mut messages=Vec::new();
+            for event in [mouse::Event::ButtonPressed(mouse::Button::Left),mouse::Event::ButtonReleased(mouse::Button::Left)] {
+                element.as_widget_mut().update(&mut tree,&Event::Mouse(event),Layout::new(&node),cursor,&renderer,
+                    &mut clipboard::Null,&mut Shell::new(&mut messages),&viewport);
+            }
+            for message in messages {if let Message::ChatUi(Action::OpenDocument(found_target,uri))=message {
+                assert_eq!(found_target,target);found.insert(uri);
+            }}
+            if found.len()==2 {break 'positions;}
+        }}
+        assert_eq!(found,std::collections::BTreeSet::from(["https://example.com/bare".to_owned(),"src/main.rs:42:7".to_owned()]));
+    }
+
 }
