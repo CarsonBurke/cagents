@@ -141,6 +141,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `schema_version` | integer | `3` | Exactly `3`. Required |
 | `max_hot_cards` | integer | `6` | `1` through `9223372036854775807`. The number of panes kept live; extra background panes can hibernate |
 | `hibernation_delay_ms` | integer | `30000` | `0` through `9223372036854775807` milliseconds before a background pane hibernates |
+| `agents` | table | `{}` | Per-provider launch defaults, executable paths, arguments and environment; see [Agents and terminal shell](#agents-and-terminal-shell) |
+| `default_shell` | optional path | unset | Absolute executable for new default terminals; otherwise uses the login-shell fallback |
 | `focus_follows_mouse` | boolean | `false` | Activates a pane after the pointer crosses into it and stays for 300 ms. Typing cancels the pending activation |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |

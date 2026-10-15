@@ -461,6 +461,9 @@ impl Cagents {
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let current = self.durable.cards.clone();
         let accounts = self.resume_catalog_accounts();
+        // Match new-chat launch policy: an invalid external file edit does not
+        // replace the last valid settings accepted by this window.
+        let agents = self.settings.agents.clone();
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let (sender, receiver) = async_channel::bounded(2);
         let spawned = std::thread::Builder::new()
@@ -492,18 +495,7 @@ impl Cagents {
                         }
                     }
                 }
-                let seeds = accounts
-                    .into_iter()
-                    .filter_map(|account| {
-                        chat::fresh_session(
-                            account.provider,
-                            TerminalId::new(),
-                            directory.clone(),
-                            &account,
-                        )
-                        .ok()
-                    })
-                    .collect();
+                let seeds = resume_seeds(accounts, &directory, &agents);
                 index(saved, seeds, &cache, &cancel, |progress| {
                     sender.send_blocking(progress).is_ok()
                 });
@@ -1011,6 +1003,33 @@ impl Cagents {
     }
 }
 
+/// Prepare history readers from one captured launch-policy snapshot. Keep
+/// path validation off the UI thread along with the provider history reads.
+fn resume_seeds(
+    accounts: Vec<crate::account::Account>,
+    directory: &Path,
+    agents: &std::collections::BTreeMap<String, settings::AgentLaunchSettings>,
+) -> Vec<chat::Session> {
+    accounts
+        .into_iter()
+        .filter_map(|account| {
+            let configuration = agents
+                .get(settings::agents::provider_key(account.provider))
+                .cloned()
+                .unwrap_or_default();
+            chat::fresh_session_configured(
+                account.provider,
+                TerminalId::new(),
+                directory.into(),
+                &account,
+                &configuration,
+                Default::default(),
+            )
+            .ok()
+        })
+        .collect()
+}
+
 /// Indices of the rows matching `query` within `scope`.
 fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize> {
     let query = query.trim().to_lowercase();
@@ -1028,6 +1047,32 @@ fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_seeds_keep_the_windows_captured_provider_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("pinned-history-wrapper");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = settings::AgentLaunchSettings {
+            executable: Some(executable.to_string_lossy().into_owned()),
+            model: Some("captured-history-model".into()),
+            permission_mode: Some("plan".into()),
+            arguments: vec!["--append-system-prompt".into(), "captured history policy".into()],
+            ..Default::default()
+        };
+        let seeds = resume_seeds(
+            vec![crate::account::Account::system(Provider::Claude)],
+            directory.path(),
+            &std::collections::BTreeMap::from([("claude".into(), policy)]),
+        );
+        let [seed] = seeds.as_slice() else { panic!("a valid captured policy must retain its history reader") };
+        assert_eq!(seed.launch.recipe.program, executable.to_string_lossy());
+        assert!(seed.launch.recipe.arguments.windows(2).any(|args| args == ["--model", "captured-history-model"]));
+        assert!(seed.launch.recipe.arguments.windows(2).any(|args| args == ["--permission-mode", "plan"]));
+        assert!(seed.launch.recipe.arguments.iter().any(|arg| arg == "captured history policy"));
+    }
 
     fn saved(directory: &Path) -> SavedConversation {
         let mut session = chat::fresh_session(

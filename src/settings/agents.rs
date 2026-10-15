@@ -40,6 +40,19 @@ pub fn permission_modes(provider: Provider) -> &'static [&'static str] {
     }
 }
 
+/// Explicit CLI requests also accept provider approval policies that are not
+/// conversation presets. Keep this distinct from the saved composer choices.
+pub fn validate_permission_override(provider: Provider, mode: &str) -> Result<(), String> {
+    let supported = permission_modes(provider).contains(&mode) || match provider {
+        Provider::Claude => mode == "default",
+        // Preserve approval-policy values understood by recorded Codex recipes,
+        // including policies from older CLI versions.
+        Provider::Codex => matches!(mode, "on-request" | "on-failure" | "untrusted" | "never"),
+        Provider::Omp => matches!(mode, "always-ask" | "write" | "yolo"),
+    };
+    if supported { Ok(()) } else { Err(format!("Choose a permission mode offered by {}.", provider.label())) }
+}
+
 /// Executable paths are absolute so a launch in another worktree means the
 /// same thing. `access` checks the current user's actual execute permission.
 pub fn executable_available(path: &str) -> bool {
@@ -308,11 +321,86 @@ mod tests {
         let explicit = crate::control::terminal_spawn_recipe(root.clone(), vec!["/bin/echo".into(), "explicit".into()]).unwrap();
         assert_eq!(explicit.program, "/bin/echo");
         assert_eq!(explicit.arguments, ["explicit"]);
+        let path = super::super::default_path().unwrap();
+        let valid_file = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "[invalid external edit").unwrap();
+        assert_eq!(crate::model::terminal_shell(), Err(crate::model::LoginShellError::PreferencesUnavailable));
+        assert!(crate::control::terminal_spawn_recipe(root.clone(), vec![]).is_err(), "fresh CLI must not silently choose another shell when preferences cannot be read");
+        let captured = LaunchRecipe::shell_with_settings(root.clone(), &settings).unwrap();
+        assert_eq!(captured.program, shell.to_string_lossy(), "running UI keeps its captured last valid shell policy");
+        assert!(crate::control::terminal_spawn_recipe(root.clone(), vec!["/bin/echo".into()]).is_ok());
+        #[cfg(feature = "host")]
+        {
+            let crate::device_service::Reply::Home { shell, shell_error, .. } = crate::device_service::execute(crate::device_service::Operation::Home).unwrap() else { panic!("device identity reply"); };
+            assert!(shell.is_empty());
+            assert!(shell_error.is_some(), "remote identity remains available and records terminal policy refusal");
+        }
+        std::fs::write(&path, valid_file).unwrap();
         std::fs::remove_file(&shell).unwrap();
         #[cfg(any(feature = "ui", feature = "host"))]
         assert!(provider_executable(Provider::Claude, Some(std::ffi::OsStr::new("/usr/bin:/bin"))).is_err());
-        assert_eq!(crate::model::login_shell(), Err(crate::model::LoginShellError::ConfiguredUnavailable));
+        assert_eq!(crate::model::terminal_shell(), Err(crate::model::LoginShellError::ConfiguredUnavailable));
+        assert!(crate::model::login_shell().is_ok(), "a terminal-only stale pin cannot disable login-environment discovery");
+        #[cfg(feature = "host")]
+        {
+            let crate::device_service::Reply::Home { shell: reported, .. } = crate::device_service::execute(crate::device_service::Operation::Home).unwrap() else { panic!("device identity reply"); };
+            assert_eq!(reported, shell.to_string_lossy(), "remote identity must preserve unavailable pin without blocking unrelated operations");
+        }
         assert!(crate::control::terminal_spawn_recipe(root, vec![]).is_err(), "a missing pinned shell cannot silently switch to the login shell");
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn explicit_permissions_refuse_unknown_and_cross_provider_modes() {
+        let root = tempfile::tempdir().unwrap();
+        for (provider, mode) in [
+            (Provider::Claude, "readOnly"), (Provider::Claude, "future-mode"),
+            (Provider::Codex, "plan"), (Provider::Codex, "future-mode"),
+            (Provider::Omp, "workspaceWrite"), (Provider::Omp, "future-mode"),
+        ] {
+            let result = crate::chat::fresh_session_configured(provider, crate::model::TerminalId::new(), root.path().into(), &crate::account::Account::system(provider), &AgentLaunchSettings::default(), LaunchDefaults { permission_mode: Some(mode), ..Default::default() });
+            assert!(result.is_err(), "{provider:?} must refuse {mode}");
+        }
+        for (provider, modes) in [
+            (Provider::Claude, &["default", "plan"][..]),
+            (Provider::Codex, &["on-request", "on-failure", "untrusted", "never", "workspaceWrite"][..]),
+            (Provider::Omp, &["always-ask", "write", "yolo"][..]),
+        ] {
+            for mode in modes {
+                crate::chat::fresh_session_configured(provider, crate::model::TerminalId::new(), root.path().into(), &crate::account::Account::system(provider), &AgentLaunchSettings::default(), LaunchDefaults { permission_mode: Some(mode), ..Default::default() }).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_first_provider_edits_merge_fields_without_losing_launch_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let base = super::super::AppSettings::default();
+        let mut launch_window = base.clone();
+        launch_window.agents.insert("claude".into(), AgentLaunchSettings {
+            executable: Some("/bin/sh".into()), arguments: vec!["--append-system-prompt".into(), "fixture".into()],
+            environment: BTreeMap::from([("PROVIDER_FIXTURE_VALUE".into(), "kept".into())]), ..Default::default()
+        });
+        super::super::save_merged(&path, &base, &launch_window).unwrap();
+        let mut model_window = base.clone();
+        model_window.agents.insert("claude".into(), AgentLaunchSettings { model: Some("chosen-model".into()), ..Default::default() });
+        super::super::save_merged(&path, &base, &model_window).unwrap();
+        let merged = super::super::load(&path).unwrap();
+        let expected = AgentLaunchSettings { model: Some("chosen-model".into()), ..launch_window.agents["claude"].clone() };
+        assert_eq!(merged.agents["claude"], expected);
+        let mut reset = merged.clone(); reset.agents.remove("claude");
+        super::super::save_merged(&path, &merged, &reset).unwrap();
+        assert!(!super::super::load(&path).unwrap().agents.contains_key("claude"), "explicit provider-table reset must still remove it");
+    }
+
+    #[test]
+    fn account_execution_validation_ignores_conversation_defaults_only() {
+        let configuration = AgentLaunchSettings { model: Some("future\nmodel".into()), permission_mode: Some("future-mode".into()), ..Default::default() };
+        assert!(configuration.validate(Provider::Claude).is_err());
+        configuration.validate_execution(Provider::Claude).unwrap();
+        let invalid = AgentLaunchSettings { executable: Some("/missing/pinned-wrapper".into()), ..configuration };
+        assert!(invalid.validate_execution(Provider::Claude).is_err());
     }
 
     #[test]
@@ -343,6 +431,18 @@ mod tests {
         assert_eq!(arguments, ["--fixture", "--model", "chosen-model", "--effort", "high"]);
         set_model_options(&mut arguments, Provider::Claude, None, None);
         assert_eq!(arguments, ["--fixture"]);
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn explicit_choices_override_retained_invalid_defaults_before_launch_validation() {
+        let configuration = AgentLaunchSettings { model: Some("bad\nmodel".into()), permission_mode: Some("future-permission-mode".into()), ..Default::default() };
+        let root = tempfile::tempdir().unwrap();
+        let account = crate::account::Account::system(Provider::Claude);
+        assert!(crate::chat::fresh_session_configured(Provider::Claude, crate::model::TerminalId::new(), root.path().into(), &account, &configuration, Default::default()).is_err());
+        let session = crate::chat::fresh_session_configured(Provider::Claude, crate::model::TerminalId::new(), root.path().into(), &account, &configuration, LaunchDefaults { model: Some("chosen-model"), permission_mode: Some("plan"), ..Default::default() }).unwrap();
+        assert!(session.launch.recipe.arguments.windows(2).any(|pair| pair == ["--model", "chosen-model"]));
+        assert!(session.launch.recipe.arguments.windows(2).any(|pair| pair == ["--permission-mode", "plan"]));
     }
 
     #[cfg(any(feature = "ui", feature = "host"))]

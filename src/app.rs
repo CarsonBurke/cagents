@@ -2726,6 +2726,7 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
 pub enum AgentSetting { Model, Effort, PermissionMode, Executable, Arguments, Environment }
 
 impl AgentSetting {
+    const fn key(self) -> &'static str { match self { Self::Model => "model", Self::Effort => "effort", Self::PermissionMode => "permission_mode", Self::Executable => "executable", Self::Arguments => "arguments", Self::Environment => "environment" } }
     const fn label(self) -> &'static str { match self { Self::Model => "Default model", Self::Effort => "Default effort", Self::PermissionMode => "Default permission mode", Self::Executable => "Executable", Self::Arguments => "Extra arguments", Self::Environment => "Environment" } }
 }
 
@@ -3883,7 +3884,6 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
     Some(match field {
 
         SettingsField::DefaultShell => "Default shell must be an absolute path to an executable file.".into(),
-        SettingsField::Agent(provider, _) => attempted.agents.get(settings::agents::provider_key(provider))?.validate(provider).err()?,
         SettingsField::TerminalScrollSize => format!(
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
@@ -5801,7 +5801,7 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
-        let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
+        let mut launch = match LaunchRecipe::shell_with_settings(working_directory.clone(), &self.settings) {
             Ok(launch) => launch,
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -14825,10 +14825,12 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::SettingsSaved { generation, result } => {
+                let mut refresh_accounts = false;
                 match result {
                     Ok(saved) => {
                         if saved.generation >= self.settings_ack_generation {
                             self.settings_save_error = None;
+                            refresh_accounts = saved.settings.agents != self.settings_base.agents;
                         }
                         self.acknowledge_settings_save(saved);
                     }
@@ -14841,7 +14843,12 @@ impl Application for Cagents {
                     Err(_) => {}
                 }
                 self.refresh_settings_feedback();
-                Task::none()
+                if refresh_accounts {
+                    // Discovery reads saved execution policy. Run after the
+                    // write acknowledgement, so it cannot observe old paths
+                    // or environment while the settings save is still queued.
+                    self.accounts_surface_changed()
+                } else { Task::none() }
             }
             Message::UiUpdate(request) => match request.action {
                 instance::UiUpdateAction::Prepare => {

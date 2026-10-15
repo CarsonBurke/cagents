@@ -91,6 +91,8 @@ pub enum Reply {
             crate::agent::Provider,
             std::collections::BTreeMap<String, String>,
         >,
+        #[serde(default)]
+        shell_error: Option<String>,
     },
     Accounts(#[serde(with = "wire_json")] serde_json::Value),
     Skills(Vec<crate::chat::Skill>),
@@ -263,10 +265,14 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             let path = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or("remote HOME is unavailable")?;
-            let shell = crate::model::login_shell().map_err(|error| error.to_string())?;
+            let (shell, shell_error) = match crate::model::terminal_shell_descriptor() {
+                Ok(shell) => (shell, None),
+                Err(error) => (String::new(), Some(error.to_string())),
+            };
             Ok(Reply::Home {
                 path,
                 shell,
+                shell_error,
                 environment: crate::agent::Provider::ALL
                     .into_iter()
                     .map(|provider| {
@@ -1643,6 +1649,14 @@ mod navigation_contract_tests {
         assert!(parse_navigation(b"branch refs/heads/main\0").is_err());
         assert!(parse_navigation(b"worktree relative\0\0").is_err());
     }
+    #[test]
+    fn legacy_device_identity_defaults_to_no_terminal_policy_error() {
+        let reply: Reply = serde_json::from_value(serde_json::json!({"Home": {"path": "/remote", "shell": "/bin/sh", "environment": {}}})).unwrap();
+        assert!(matches!(reply, Reply::Home { shell_error: None, .. }));
+        let reply = Reply::Home { path: "/remote".into(), shell: String::new(), environment: Default::default(), shell_error: Some("Terminal preferences could not be read".into()) };
+        assert_eq!(postcard::from_bytes::<Reply>(&postcard::to_allocvec(&reply).unwrap()).unwrap(), reply);
+    }
+
     #[test]
     fn navigation_round_trips_on_binary_wire() {
         let operation = Operation::ProjectNavigation {
