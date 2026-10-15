@@ -2303,16 +2303,22 @@ impl Editor {
         }
         tab.snapshot_loading = true;
         let root = tab.runtime.descriptor.worktree.clone();
+        let key = tab.navigation.active_worktree().cloned();
+        let requested = tab.navigation.files_reveal_demand().cloned();
+        let worker_path = requested.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .snapshot(&root, &CancellationToken::default())
-                    .map_err(|error| error.to_string())
+                let mut snapshot = RepositoryService::system("git").snapshot(&root, &CancellationToken::default()).map_err(|error| error.to_string())?;
+                let target = worker_path.as_ref().map(|path| cagents::repository::include_revealed_path(&root, &mut snapshot.files, path)).transpose()?.flatten();
+                Ok((snapshot, target))
             })
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
-            Message::Snapshot(id, result)
+            match (key, requested) {
+                (Some(key), Some(requested)) => Message::RevealedInFiles { card: id, key, requested, result },
+                _ => Message::Snapshot(id, result.map(|(snapshot, _)| snapshot)),
+            }
         })
     }
 
@@ -3884,20 +3890,10 @@ impl Application for Editor {
                                     ),
                             }
                         }
-                        SidebarAction::RevealChangeInFiles { key, path } => {
+                        SidebarAction::RevealChangeInFiles { path, .. } => {
                             tab.navigation.reveal_in_files(path.clone());
                             self.sidebar_panel = WorktreePanel::Files;
-                            let requested = path.clone();
-                            let root = key.canonical_path.clone();
-                            cosmic::task::future(async move {
-                                let worker_path = path.clone();
-                                let result = tokio::task::spawn_blocking(move || {
-                                    let mut snapshot = RepositoryService::system("git").snapshot(&root, &CancellationToken::default()).map_err(|error| error.to_string())?;
-                                    let target = cagents::repository::include_revealed_path(&root, &mut snapshot.files, &worker_path).map_err(|error| error.to_string())?;
-                                    Ok((snapshot, target))
-                                }).await.map_err(|error| error.to_string()).and_then(|result| result);
-                                Message::RevealedInFiles { card: id, key, requested, result }
-                            })
+                            self.refresh_snapshot(id, true)
                         }
                         SidebarAction::IgnoreChangePath { path, .. } => {
                             let eligible = tab.sidebar.source_control.as_ref().is_some_and(|source| source.group(cagents::repository::ChangeArea::Untracked).is_some_and(|group| group.rows().iter().any(|row| row.entry.path == path)));
@@ -4009,7 +4005,11 @@ impl Application for Editor {
                     Task::batch([task, report])
                 }
                 Message::RevealedInFiles { card, key, requested, result } => {
-                    let Some(tab) = self.tab_mut(card).filter(|tab| tab.navigation.active_worktree() == Some(&key) && tab.navigation.files_reveal_demand() == Some(&requested)) else { return Task::none(); };
+                    let Some(tab) = self.tab_mut(card) else { return Task::none(); };
+                    if !tab.snapshot_loading { return Task::none(); }
+                    tab.snapshot_loading = false;
+                    if std::mem::take(&mut tab.snapshot_refresh_pending) { return self.refresh_snapshot(card, false); }
+                    if tab.navigation.active_worktree() != Some(&key) || tab.navigation.files_reveal_demand() != Some(&requested) { return Task::none(); }
                     match result {
                         Ok((snapshot, target)) => {
                             let mut source = SourceControlModel::ready(key, &snapshot);
