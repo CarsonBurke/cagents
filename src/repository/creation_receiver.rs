@@ -33,6 +33,7 @@ impl ReceivedCreationScopes {
             || journal.existing_branch_oid.as_ref().is_some_and(|oid| !is_hex_oid(oid))
             || journal.observed_branch_oid.as_ref().is_some_and(|oid| !is_hex_oid(oid))
             || (journal.detached_creation && journal.existing_branch_oid.is_none())
+            || journal.detached_creation != journal.branch_advance_attempted
             || (journal.branch_advance_attempted && (!journal.detached_creation
                 || journal.observed_branch_oid != journal.base_oid))
             || ValidatedBranchName::parse(journal.request.branch.as_str()).is_err()
@@ -42,7 +43,8 @@ impl ReceivedCreationScopes {
         let Some(WorktreeCreationOutcome::Created { worktree: record, .. }) = report.outcome else {
             return Err(invalid("The settled creation has no exact Created outcome"));
         };
-        if record.path != journal.request.destination || record.lock.locked
+        if record.path != journal.request.destination || record.id != stable_worktree_id(&record.path)
+            || record.head_oid != journal.base_oid || record.lock.locked
             || record.lock.reason.is_some() || record.bare || record.detached
             || record.prunable_reason.is_some()
             || record.branch.as_deref() != Some(journal.request.branch.full_ref().as_str())
