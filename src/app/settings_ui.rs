@@ -61,6 +61,18 @@ fn setting_input<'a>(
     setting_field(label, detail, input.into()).error(error)
 }
 
+fn number_setting_factor(field: SettingsField) -> f64 {
+    match field {
+        SettingsField::UiScale | SettingsField::DefaultColumnFraction | SettingsField::DefaultNativePaneFraction | SettingsField::ChatContentFraction => 100.0,
+        SettingsField::HibernationDelayMs => 0.001,
+        _ => 1.0,
+    }
+}
+
+pub(super) fn number_setting_value(field: SettingsField, value: &str) -> String {
+    value.parse::<f64>().map(|number| if field == SettingsField::HibernationDelayMs { format!("{:.0}", number / number_setting_factor(field)) } else { format!("{}", number / number_setting_factor(field)) }).unwrap_or_else(|_| value.to_owned())
+}
+
 fn setting_stepper<'a>(
     label: &'static str,
     detail: impl Into<Cow<'a, str>> + 'a,
@@ -72,6 +84,7 @@ fn setting_stepper<'a>(
     default: f32,
     unit: &'static str,
     invalid: &'a HashMap<SettingsField, String>,
+    numeric_display: &'a HashMap<SettingsField, String>,
 ) -> Setting<'a, Message> {
     let (min, max, step, default) = (f64::from(min), f64::from(max), f64::from(step), f64::from(default));
     let current = value.parse::<f64>().unwrap_or(default).clamp(min, max);
@@ -79,17 +92,14 @@ fn setting_stepper<'a>(
         field,
         value: if field == SettingsField::HibernationDelayMs { format!("{:.0}", next.clamp(min, max)) } else { format!("{:.3}", next.clamp(min, max)) },
     };
-    let factor: f64 = match field { SettingsField::UiScale | SettingsField::DefaultColumnFraction | SettingsField::DefaultNativePaneFraction | SettingsField::ChatContentFraction => 100.0, SettingsField::HibernationDelayMs => 0.001, _ => 1.0 };
+    let factor = number_setting_factor(field);
     let unit = if factor == 100.0 { "%" } else if factor == 0.001 { " s" } else { unit };
-    let shown = value.parse::<f64>().map(|value| format!("{}", value * factor)).unwrap_or_else(|_| value.to_owned());
+    let shown = numeric_display.get(&field).cloned().unwrap_or_else(|| value.parse::<f64>().map(|value| format!("{}", value * factor)).unwrap_or_else(|_| value.to_owned()));
     let control = widget::row::with_children(vec![
         crate::ui_controls::icon_button(Icon::Minus, format!("Decrease {label}"))
             .on_press_maybe((current > min).then(|| change(current - step)))
             .into(),
-        crate::ui_controls::field::text(label, shown).on_input(move |value| {
-            let value = value.parse::<f64>().map(|number| if field == SettingsField::HibernationDelayMs { format!("{:.0}", number / factor) } else { format!("{}", number / factor) }).unwrap_or(value);
-            Message::SettingsDraftChanged { field, value }
-        }).width(76).into(),
+        crate::ui_controls::field::text(label, shown).on_input(move |value| Message::SettingsNumberDraftChanged { field, value }).width(76).into(),
         design::caption(unit).into(),
         crate::ui_controls::icon_button(Icon::Plus, format!("Increase {label}"))
             .on_press_maybe((current < max).then(|| change(current + step)))
@@ -461,7 +471,7 @@ fn settings_category_controls<'a>(
                 SettingsField::MaxHotCards,
                 invalid,
             );
-            let hibernation = setting_stepper("Hibernation delay", "Seconds to wait before an idle terminal is hibernated.", &draft.hibernation_delay_ms, SettingsField::HibernationDelayMs, 0.0, i64::MAX as f32, 1000.0, 30_000.0, " s", invalid);
+            let hibernation = setting_stepper("Hibernation delay", "Seconds to wait before an idle terminal is hibernated.", &draft.hibernation_delay_ms, SettingsField::HibernationDelayMs, 0.0, i64::MAX as f32, 1000.0, 30_000.0, " s", invalid, &draft.numeric_display);
             vec![
                 settings_group(
                     "Worktrees",
@@ -490,7 +500,7 @@ fn settings_category_controls<'a>(
             "Message composition and conversation presentation.",
             vec![
                 font_family_setting(&draft.chat_font_family, SettingsField::ChatFontFamily, context.fonts, invalid),
-                setting_stepper("Chat font size", "Size of transcript messages and Markdown, including existing messages.", &draft.chat_font_size, SettingsField::ChatFontSize, 8.0, 40.0, 1.0, 14.0, " px", invalid),
+                setting_stepper("Chat font size", "Size of transcript messages and Markdown, including existing messages.", &draft.chat_font_size, SettingsField::ChatFontSize, 8.0, 40.0, 1.0, 14.0, " px", invalid, &draft.numeric_display),
                 setting_field(
                     "Chat send key",
                     "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
@@ -525,7 +535,7 @@ fn settings_category_controls<'a>(
                     0.05,
                     0.5,
                     "",
-                 invalid),
+                 invalid, &draft.numeric_display),
             ],
         )],
         SettingsCategory::Editor => vec![
@@ -534,7 +544,7 @@ fn settings_category_controls<'a>(
                 "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal.",
                 vec![
                     font_family_setting(&draft.editor_font_family, SettingsField::EditorFontFamily, context.fonts, invalid),
-                    setting_stepper("Editor font size", "8–40 logical pixels; blank follows the terminal.", &draft.editor_font_size, SettingsField::EditorFontSize, 8.0, 40.0, 1.0, 14.0, " px", invalid),
+                    setting_stepper("Editor font size", "8–40 logical pixels; blank follows the terminal.", &draft.editor_font_size, SettingsField::EditorFontSize, 8.0, 40.0, 1.0, 14.0, " px", invalid, &draft.numeric_display),
                 ],
             ),
             settings_group("Editor", "Shared native editor and diff preferences.", {
@@ -576,7 +586,7 @@ fn settings_category_controls<'a>(
                 "Make the workbench comfortable on your display. Changes apply immediately and are saved automatically.",
                 vec![
                     font_family_setting(&draft.interface_font_family, SettingsField::InterfaceFontFamily, context.fonts, invalid),
-                    setting_stepper("Interface font size", "Size of workbench labels and controls.", &draft.interface_font_size, SettingsField::InterfaceFontSize, 10.0, 24.0, 1.0, 13.0, " px", invalid),
+                    setting_stepper("Interface font size", "Size of workbench labels and controls.", &draft.interface_font_size, SettingsField::InterfaceFontSize, 10.0, 24.0, 1.0, 13.0, " px", invalid, &draft.numeric_display),
                     setting_field(
                         "App theme",
                         "Colors for the entire application. Terminal and syntax palettes are independent.",
@@ -605,7 +615,7 @@ fn settings_category_controls<'a>(
                         0.05,
                         1.0,
                         "×",
-                     invalid),
+                     invalid, &draft.numeric_display),
                     setting_field(
                         "Status bar",
                         "A thin bar along the bottom of the window showing how much of each signed-in Claude Code, Codex and Omp account's usage limits is left.",
@@ -646,7 +656,7 @@ fn settings_category_controls<'a>(
                         0.05,
                         0.5,
                         "×",
-                     invalid),
+                     invalid, &draft.numeric_display),
                     setting_stepper(
                         "Native pane minimum width",
                         "Fraction of the workspace used by new native panes when sharing space. A lone pane fills the workspace; resize or cycle its width to override.",
@@ -657,7 +667,7 @@ fn settings_category_controls<'a>(
                         0.05,
                         0.5,
                         "",
-                     invalid),
+                     invalid, &draft.numeric_display),
                 ],
             ),
         ],
@@ -676,7 +686,7 @@ fn settings_category_controls<'a>(
                         1.0,
                         14.0,
                         " px",
-                     invalid),
+                     invalid, &draft.numeric_display),
                     font_family_setting(&draft.terminal_font_family, SettingsField::TerminalFontFamily, context.fonts, invalid),
                     setting_stepper(
                         "Line height",
@@ -688,7 +698,7 @@ fn settings_category_controls<'a>(
                         0.05,
                         1.286,
                         "×",
-                     invalid),
+                     invalid, &draft.numeric_display),
                     setting_stepper(
                         "Inner padding",
                         "Breathing room between terminal text and the pane edge.",
@@ -699,7 +709,7 @@ fn settings_category_controls<'a>(
                         2.0,
                         8.0,
                         " px",
-                     invalid),
+                     invalid, &draft.numeric_display),
                     setting_input(
                         "1–10 lines per mouse-wheel notch. Use scroll speed for high-resolution wheel or trackpad input.",
                         &draft.terminal_scroll_size,
@@ -716,7 +726,7 @@ fn settings_category_controls<'a>(
                         0.25,
                         1.0,
                         "×",
-                     invalid),
+                     invalid, &draft.numeric_display),
                     terminal_theme_choice(&draft.terminal_theme, draft.has_custom_terminal_theme),
                     setting_field(
                         "Multiline paste",
@@ -1600,6 +1610,29 @@ mod typography_settings_tests {
         settings::save(&path, &settings).unwrap();
         assert_eq!(settings::load(&path).unwrap().editor_font_family.as_deref(), Some(family));
         assert!(missing_font_warning("Example", &["example".into()], "system monospace").is_none());
+    }
+
+    #[test]
+    fn numeric_drafts_preserve_fractional_input_before_and_after_debounce() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        for (field, sequence, stored) in [
+            (SettingsField::TerminalLineHeight, ["1", "1.", "1.5"], "1.5"),
+            (SettingsField::ChatContentFraction, ["25", "25.", "25.5"], "0.255"),
+            (SettingsField::HibernationDelayMs, ["1", "1.", "1.5"], "1500"),
+        ] {
+            for value in sequence {
+                drop(app.queue_number_setting_input(field, value.into()));
+                assert_eq!(app.settings_draft.numeric_display[&field], value);
+            }
+            let (generation, value) = app.settings_pending[&field].clone();
+            assert_eq!(value, stored);
+            drop(app.autosave_setting(field, generation));
+            assert_eq!(app.settings_draft.numeric_display[&field], sequence[2]);
+            assert!(!app.settings_invalid.contains_key(&field));
+        }
+        assert_eq!(app.settings.terminal_line_height, 1.5);
+        assert_eq!(app.settings.chat_content_fraction, 0.255);
+        assert_eq!(app.settings.hibernation_delay_ms, 1500);
     }
 
     #[test]
