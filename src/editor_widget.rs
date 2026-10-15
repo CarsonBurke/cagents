@@ -99,6 +99,26 @@ impl SearchSnapshot {
         crate::editor_search::find_in_lines(self.lines(), query, options, cancelled)
     }
 
+    /// Validates sparse replacements against one immutable revision before
+    /// any native mutation. Higher ranges can then be applied first.
+    pub(crate) fn replacement_edits(&self, matches:&[(Position,Position)],query:&str,
+        replacement:&str,options:crate::editor_search::FindOptions,preserve:bool)
+        ->Result<Vec<(Position,Position,String)>,String> {
+        let replacement=crate::editor_search::Replacement::new(query,replacement,options,preserve)?;
+        let mut edits=Vec::with_capacity(matches.len());let mut copied=0;
+        for &(start,end) in matches {
+            if start.line!=end.line{return Err("A search match crosses a line boundary.".into());}
+            let line=self.source.line(start.line).ok_or("The selected match is outside the document.")?;
+            let from=self.source.byte_offset(start).ok_or("Invalid search position.")?;
+            let to=self.source.byte_offset(end).ok_or("Invalid search position.")?;
+            if to<from||from<copied{return Err("Search matches overlap.".into());}
+            let inserted=replacement.expand(&line.text,start.column,end.column)?;
+            if line.text.get(start.column..end.column)!=Some(inserted.as_str()){edits.push((start,end,inserted));}
+            copied=to;
+        }
+        Ok(edits)
+    }
+
     pub(crate) fn replace_matches_with(&self, matches: &[(Position, Position)], query: &str,
         replacement: &str, options: crate::editor_search::FindOptions, preserve: bool) -> Result<String, String> {
         let replacement = crate::editor_search::Replacement::new(query, replacement, options, preserve)?;

@@ -3994,6 +3994,10 @@ impl RepositoryRuntime {
             return;
         };
         self.pending_lsp_change = Some(version);
+        self.append_lsp_edit(edit);
+    }
+
+    fn append_lsp_edit(&mut self,edit:Option<LspTextEdit>){
         match edit {
             Some(edit) => self.lsp_edits.push(edit),
             // One indescribable edit poisons the batch: every later range is
@@ -5914,7 +5918,23 @@ impl RepositoryRuntime {
                 if self.find_matches.is_empty() {
                     return Task::none();
                 }
-                if all {
+                let mut protocols=Vec::new();
+                if all && self.find_matches.len()<=256 && document.content.text_len()>64*1024 {
+                    // Keep sparse fixes in a large file undoable without
+                    // retaining unchanged megabytes as a whole-file paste.
+                    // Dense replacement retains the single-splice path below.
+                    let snapshot=document.content.search_snapshot();
+                    let replacements=match snapshot.replacement_edits(&self.find_matches,&self.find_query,&self.replace_query,self.find_options,self.replace_preserve_case){Ok(edits)=>edits,Err(error)=>{self.find_error=Some(error);return Task::none();}};
+                    let before=document.content.cursor();let mut changes=Vec::with_capacity(replacements.len());
+                    for (start,end,inserted) in replacements.into_iter().rev(){
+                        let trailing_cr=trailing_carriage_return(&document.content).is_some();
+                        if let Some(change)=document.content.replace_range_recorded(start,end,&inserted){
+                            protocols.push(if trailing_cr||trailing_carriage_return(&document.content).is_some(){None}else{protocol_edit(&document.content,&change)});
+                            changes.push(change);
+                        }
+                    }
+                    if !changes.is_empty(){document.history.record_group(changes,before,document.content.cursor(),Instant::now());document.text_changed();}
+                } else if all {
                     let snapshot = document.content.search_snapshot();
                     let text = match snapshot.replace_matches_with(&self.find_matches, &self.find_query,
                         &self.replace_query, self.find_options, self.replace_preserve_case) {
@@ -5922,9 +5942,7 @@ impl RepositoryRuntime {
                         Err(error) => { self.find_error = Some(error); return Task::none(); }
                     };
                     document.content.perform(text_editor::Action::SelectAll);
-                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
-                        Arc::new(text),
-                    )));
+                    if let Applied::Changed(protocol)=document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text)))){protocols.push(protocol);}
                 } else {
                     let (start, end) = self.find_matches[self.find_index];
                     let replacement = document.content.with_line(start.line, |line, _| {
@@ -5939,9 +5957,12 @@ impl RepositoryRuntime {
                         position: end,
                         selection: Some(start),
                     });
-                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(replacement))));
+                    if let Applied::Changed(protocol)=document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(replacement)))){protocols.push(protocol);}
                 }
-                self.push_lsp_change(None);
+                let mut protocols=protocols.into_iter();
+                let Some(first)=protocols.next() else{return Task::none();};
+                self.push_lsp_change(first);
+                for protocol in protocols {self.append_lsp_edit(protocol);}
                 self.markdown_task(card)
             }
             RepositoryAction::ToggleToolbarOverflow { .. } => {
@@ -18002,6 +18023,23 @@ mod tests {
         drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "[".into() }));
         assert_eq!(runtime.find_total, 0);
         assert!(runtime.find_error.is_some());
+    }
+
+    #[test]
+    fn sparse_replace_all_near_editable_limit_retains_one_small_undo_transaction(){
+        let card=CardId::new();
+        let middle=format!("{}\n","x".repeat(127)).repeat(65_535);
+        let original=format!("target\n{middle}target\n");let expected=original.replace("target","value");
+        let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"large.txt",&original);
+        drop(runtime.update(RepositoryAction::OpenFind{card}));
+        let scan=runtime.update(RepositoryAction::FindQueryChanged{card,query:"target".into()});drop(runtime.update(find_output(scan)));
+        assert_eq!(runtime.find_total,2);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged{card,query:"value".into()}));
+        let scan=runtime.update(RepositoryAction::ReplaceMatch{card,all:true});drop(runtime.update(find_output(scan)));
+        assert_eq!(buffer_text(&runtime),expected);
+        let DocumentState::Editable(document)=&runtime.document else{unreachable!()};assert!(document.history.can_undo());
+        drop(runtime.update(RepositoryAction::Undo{card}));assert_eq!(buffer_text(&runtime),original);
+        drop(runtime.update(RepositoryAction::Redo{card}));assert_eq!(buffer_text(&runtime),expected);
     }
 
     #[test]
