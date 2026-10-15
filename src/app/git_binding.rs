@@ -1,6 +1,6 @@
 //! The Git panel retains the physical repository displayed by its first read.
 use super::*;
-use crate::repository::{WorktreeAuthority, WorktreeExecutor};
+use crate::repository::{GitReadSource, WorktreeAuthority, WorktreeExecutor};
 
 pub(super) type ScopedService =
     RepositoryService<WorktreeExecutor<crate::process::SystemProcessExecutor>>;
@@ -11,6 +11,7 @@ pub(super) struct Binding {
     pub(super) key: ActiveWorktreeKey,
     pub(super) authority: Option<WorktreeAuthority>,
     pub(super) initialized: bool,
+    pub(super) read_source: Option<GitReadSource>,
     pub(super) mutation_revision: Arc<std::sync::atomic::AtomicU64>,
 }
 impl Binding {
@@ -20,9 +21,18 @@ impl Binding {
             key,
             authority: None,
             initialized: false,
+            read_source: None,
             mutation_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
+    /// A mounted card keeps this exact reader alive across ordinary panel
+    /// navigation. Reconstruct the panel actor from that original source.
+    pub(super) fn from_read_source(key: ActiveWorktreeKey, source: GitReadSource) -> Option<Self> {
+        if !source.is_available() || source.authority().path() != key.canonical_path { return None; }
+        Some(Self { id: source.id(), key, authority: Some(source.authority().clone()),
+            initialized: true, mutation_revision: source.mutation_revision(), read_source: Some(source) })
+    }
+
     /// Blocking worker only. Once displayed, a refresh never recaptures a path.
     pub(super) fn initialize(&mut self) -> Result<(), String> {
         if !self.initialized {
@@ -34,11 +44,19 @@ impl Binding {
             } else {
                 None
             };
+            self.read_source = self.authority.as_ref().map(|authority|
+                GitReadSource::new(self.id, authority.clone(), self.mutation_revision.clone()));
             self.initialized = true;
+        }
+        if self.read_source.as_ref().is_some_and(|source| !source.is_available()) {
+            return Err("The original Git reader was retired. Reopen the project before retrying.".into());
         }
         Ok(())
     }
     pub(super) fn validate(&self) -> Result<(), String> {
+        if self.read_source.as_ref().is_some_and(|source| !source.is_available()) {
+            return Err("The original Git reader was retired. Reopen the project before retrying.".into());
+        }
         self.authority.as_ref().map_or(Ok(()), |authority| {
             authority.validate().map_err(|error| error.to_string())
         })
@@ -84,6 +102,9 @@ impl Binding {
     }
     /// Construction validates held worktree/private/common roots in a worker.
     pub(super) fn mutation_service(&self) -> Result<ScopedService, String> {
+        if !self.read_source.as_ref().is_some_and(GitReadSource::is_available) {
+            return Err("The original Git reader is unavailable. Reopen the project before retrying.".into());
+        }
         let authority = self
             .authority
             .clone()

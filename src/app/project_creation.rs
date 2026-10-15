@@ -125,6 +125,7 @@ impl Cagents {
     /// Called on actual ownership replacement, close or removal. Retained
     /// dialog and worker clones are invalidated together.
     pub(super) fn retire_project_creation_source(&mut self, project: ProjectId) {
+        self.retire_project_git_readers(project);
         self.invalidate_project_worktree_creations(project);
         if let Some(published) = self.project_ui.creation_sources.remove(&project) {
             published.source.invalidate();
@@ -171,7 +172,11 @@ impl Cagents {
                 }
             }
         }
-        self.retire_project_creation_source(project);
+        // A first completed project read has no prior creation owner to
+        // replace. It must not revoke an already initialized editor reader.
+        if self.project_ui.creation_sources.contains_key(&project) {
+            self.retire_project_creation_source(project);
+        }
         let Some(row) = self
             .sidebar_model
             .projects

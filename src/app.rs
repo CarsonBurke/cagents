@@ -25,6 +25,7 @@ mod file_ui;
 mod git_binding;
 mod git_group_ui;
 mod git_patch_ui;
+mod git_read_ui;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -10079,6 +10080,7 @@ impl Cagents {
             );
             return Task::none();
         }
+        let git_read_source = self.original_git_source_for_view(&view);
         let mut runtime = if self
             .sidebar_model
             .project(view.project)
@@ -10086,7 +10088,7 @@ impl Cagents {
         {
             RepositoryRuntime::new_directory(view)
         } else {
-            RepositoryRuntime::new(view)
+            RepositoryRuntime::new_with_git_read_source(view, git_read_source)
         };
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_editor_font(
@@ -15166,7 +15168,8 @@ impl Cagents {
             .source_control_mutations
             .get(&key.canonical_path)
             .filter(|active| active.binding.key == key)
-            .map(|active| active.binding.clone());
+            .map(|active| active.binding.clone())
+            .or_else(|| self.retained_runtime_git_binding(&key));
         let binding = self
             .refresh_ui
             .source_binding
@@ -18965,6 +18968,8 @@ impl Application for Cagents {
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
                     return Task::none();
                 };
+                if !self.runtime_git_source_is_current(runtime) { return Task::none(); }
+                let binding = runtime.git_read_source().unwrap().id();
                 let Some(source) = self
                     .sidebar_model
                     .source_control
@@ -18976,10 +18981,10 @@ impl Application for Cagents {
                 let Some(request) = runtime.selected_discard_request() else {
                     return Task::none();
                 };
-                self.update(Message::Sidebar(SidebarAction::RequestDiscard {
+                self.update(Message::Sidebar(sidebar::commands::bound(binding, SidebarAction::RequestDiscard {
                     key: source.key.clone(),
                     request,
-                }))
+                })))
             }
 
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
@@ -18989,6 +18994,8 @@ impl Application for Cagents {
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
                     return Task::none();
                 };
+                if !self.runtime_git_source_is_current(runtime) { return Task::none(); }
+                let binding = runtime.git_read_source().unwrap().id();
                 let Some(source) = self
                     .sidebar_model
                     .source_control
@@ -19001,7 +19008,7 @@ impl Application for Cagents {
                     return Task::none();
                 };
                 let key = source.key.clone();
-                self.update(Message::Sidebar(if stage {
+                self.update(Message::Sidebar(sidebar::commands::bound(binding, if stage {
                     SidebarAction::Stage {
                         key,
                         selection: vec![selection],
@@ -19011,7 +19018,7 @@ impl Application for Cagents {
                         key,
                         selection: vec![selection],
                     }
-                }))
+                })))
             }
             Message::ResolvedDiffBasis { card, basis } => {
                 let task = match self.cards.get_mut(&card) {

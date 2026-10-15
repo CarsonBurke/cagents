@@ -10,7 +10,7 @@ use crate::{git_patch, repository_widget::DiffMutationRequest};
 pub(super) struct Pending {
     card: CardId,
     buffer_only: bool,
-    binding_revision: Option<(crate::model::OperationId, u64)>,
+    read_receipt: Option<crate::repository::GitReadReceipt>,
     result: Arc<
         std::sync::OnceLock<Result<Option<Arc<repository_widget::PreparedDiffMutation>>, String>>,
     >,
@@ -21,7 +21,7 @@ impl Pending {
         Self {
             card,
             buffer_only,
-            binding_revision: None,
+            read_receipt: None,
             result: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -32,17 +32,11 @@ impl Pending {
 
 impl Cagents {
     fn prepared_diff_binding_current(&self, pending: &Pending) -> bool {
-        pending.binding_revision.is_none_or(|(id, revision)| {
-            self.refresh_ui
-                .source_binding
-                .as_ref()
-                .is_some_and(|binding| {
-                    binding.id == id
-                        && binding
-                            .mutation_revision
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            == revision
-                })
+        pending.buffer_only || pending.read_receipt.as_ref().is_some_and(|receipt| {
+            self.refresh_ui.source_binding.as_ref().is_some_and(|binding| {
+                receipt.source().id() == binding.id
+                    && binding.read_source.as_ref().is_some_and(|source| receipt.matches_source(source))
+            })
         })
     }
 
@@ -58,32 +52,32 @@ impl Cagents {
         let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
             return Task::none();
         };
-        let Some(source) = self
-            .sidebar_model
-            .source_control
-            .as_ref()
-            .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
-        else {
-            return Task::none();
-        };
         let Some(capture) = runtime.capture_diff_mutation(card, kind, request.as_deref()) else {
             return Task::none();
         };
-        let key = source.key.clone();
-        let mut pending = Pending::new(card, capture.applies_to_buffer());
-        pending.binding_revision = self
-            .refresh_ui
-            .source_binding
-            .as_ref()
-            .filter(|binding| binding.key == key)
-            .map(|binding| {
-                (
-                    binding.id,
-                    binding
-                        .mutation_revision
-                        .load(std::sync::atomic::Ordering::Acquire),
-                )
-            });
+        let buffer_only = capture.applies_to_buffer();
+        // Native Undo belongs to the mounted document, independently of the
+        // Git strip's current worktree. The row supplies routing, not authority.
+        let Some(key) = self.sidebar_model.project(runtime.descriptor.project)
+            .and_then(|project| project.worktrees.iter()
+                .find(|worktree| worktree.path == runtime.descriptor.worktree)
+                .map(|worktree| ActiveWorktreeKey {
+                    project_id: project.id,
+                    worktree_id: worktree.id,
+                    canonical_path: worktree.path.clone(),
+                }))
+        else { return Task::none(); };
+        let mut pending = Pending::new(card, buffer_only);
+        if !buffer_only {
+            if !self.runtime_git_source_is_current(runtime) { return Task::none(); }
+            let Some(receipt) = capture.git_read_receipt().filter(|receipt| {
+                self.refresh_ui.source_binding.as_ref()
+                    .filter(|binding| binding.key == key)
+                    .and_then(|binding| binding.read_source.as_ref())
+                    .is_some_and(|source| receipt.matches_source(source))
+            }) else { return Task::none(); };
+            pending.read_receipt = Some(receipt.clone());
+        }
         // A genuine native buffer Revert never writes Git or disk and remains
         // available on hosts without strong Git mutation authority.
         let reservation = if pending.buffer_only {
@@ -234,7 +228,10 @@ impl Cagents {
             }
             Err(error) => return self.update(complete(Some(error.clone()))),
         };
-        if self.modal_is_open() || !self.prepared_diff_binding_current(&pending) {
+        if self.modal_is_open()
+            || !self.prepared_diff_binding_current(&pending)
+            || prepared.git_read_receipt() != pending.read_receipt.as_ref()
+        {
             return self.update(complete(Some(
                 "The original Git source changed. Retry the selected change.".into(),
             )));
