@@ -207,6 +207,13 @@ pub(crate) fn prepare_recovery_directory(
 pub(crate) fn prepare_recovery_directory_with_owner<T: Send + 'static>(
     admission: FilesystemRecoveryReservation, leaf: &OsStr, cancelled: impl Fn() -> bool, owner: T,
 ) -> Result<RecoveryDirectory<T>, RecoveryDirectoryError> {
+    prepare_recovery_directory_using(admission, leaf, cancelled, owner, create_directory_in_namespace)
+}
+
+fn prepare_recovery_directory_using<T: Send + 'static>(
+    admission: FilesystemRecoveryReservation, leaf: &OsStr, cancelled: impl Fn() -> bool, owner: T,
+    create: impl FnOnce(&DirectoryNamespace, &Root, &Path, u32) -> Result<DirectoryCreation, DirectoryCreateError>,
+) -> Result<RecoveryDirectory<T>, RecoveryDirectoryError> {
     if components(Path::new(leaf)).is_none_or(|parts| parts.len() != 1) {
         return Err(RecoveryDirectoryError::Rejected(io::Error::new(io::ErrorKind::InvalidInput,
             "Recovery holding requires one ordinary leaf name")));
@@ -221,7 +228,7 @@ pub(crate) fn prepare_recovery_directory_with_owner<T: Send + 'static>(
     // work, inside this existing16-private-FD reservation. Shared context and
     // registry handles stay under the measured128-FD admission, not this bound.
     const { assert!(MAX_RECOVERY_DESCRIPTORS >= 16); }
-    let publication = match create_directory_in_namespace(context.placement().namespace(),
+    let publication = match create(context.placement().namespace(),
         context.placement().directory(), Path::new(leaf), 0o700) {
         Ok(DirectoryCreation::Published(publication)) => publication,
         Ok(DirectoryCreation::Existing(_)) => return Err(RecoveryDirectoryError::Rejected(
@@ -265,6 +272,18 @@ pub(crate) fn prepare_recovery_directory_with_owner<T: Send + 'static>(
     Ok(RecoveryDirectory { publication: pending.publication, owner: pending.owner,
         private_metadata: pending.private_metadata.expect("successful private setup records actual metadata"),
         context: pending.context, slot })
+}
+
+
+/// Same factory preflight/error ownership path, with the real producer's
+/// deterministic protected-INTERNAL acquisition failure. Test-only: no forged
+/// receipt, second slot, alternate cleanup, or production authority bypass.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn fixture_recovery_directory_preparation_failure<T: Send + 'static>(
+    admission: FilesystemRecoveryReservation, owner: T,
+) -> RecoveryDirectoryError {
+    prepare_recovery_directory_using(admission, OsStr::new("fixture-holding"), || false, owner,
+        |_, actual_parent, _, _| Err(fixture_directory_preparation_failure(actual_parent))).unwrap_err()
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -495,6 +514,28 @@ mod tests {
         assert_eq!(private.mode() & 0o7777, 0o700);
         publication.cleanup_empty().unwrap(); sync_directory(retained.placement().directory()).unwrap();
         drop((publication, owner, retained, slot)); assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn real_preparation_failure_keeps_original_owner_until_actual_private_repair() {
+        let (source, context) = context();
+        fs::write(source.path().join("original"), b"original bytes").unwrap();
+        let file = Arc::new(fs::File::open(source.path().join("original")).unwrap());
+        let weak = Arc::downgrade(&file);
+        let parent = context.placement().directory().try_clone().unwrap();
+        let error = fixture_recovery_directory_preparation_failure(context.reserve_directory().unwrap(), file);
+        let recovery = error.recovery().expect("real producer failure must retain Preparation");
+        drop(context);
+        assert!(weak.upgrade().is_some()); assert!(recovery.retry().is_err());
+        assert!(weak.upgrade().is_some(), "failed prepublication retry retains exact original owner");
+        let entries = names(&parent); assert_eq!(entries.len(), 1);
+        let outer = parent.path().join(&entries[0]);
+        assert_eq!(fs::read(outer.join("directory")).unwrap(), b"retained fixture artifact");
+        // Explicit repair of this isolated test's real interference. Retry
+        // still uses the retained Preparation, never this diagnostic spelling.
+        fs::remove_file(outer.join("directory")).unwrap();
+        recovery.retry().unwrap(); assert!(recovery.is_resolved());
+        assert!(weak.upgrade().is_none()); assert!(names(&parent).is_empty());
     }
 
 }
