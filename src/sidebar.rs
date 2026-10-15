@@ -4705,8 +4705,13 @@ fn project_identity_row<'a>(
         .on_press_maybe(
             project_primary_action(
                 project,
-                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
-            ).and_then(|action| gated(action, modal_open)),
+                if review_mode {
+                    SidebarFilter::PullRequests
+                } else {
+                    SidebarFilter::All
+                },
+            )
+            .and_then(|action| gated(action, modal_open)),
         );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
@@ -4730,16 +4735,20 @@ pub(crate) fn project_primary_action(
             repository: project.repository.clone(),
         });
     }
-    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
-        SidebarAction::BrowsePullRequests { project_id: project.id }
-    } else if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(
+        if filter == SidebarFilter::PullRequests && project.github_ready {
+            SidebarAction::BrowsePullRequests {
+                project_id: project.id,
+            }
+        } else if project.kind == ProjectKind::Folder {
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }
+        } else {
+            SidebarAction::ToggleProject(project.id)
+        },
+    )
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -4954,8 +4963,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = project_primary_action(project, state.filter)
-        .and_then(|action| gated(action, modal_open));
+    let reload =
+        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -10478,7 +10487,9 @@ mod row_interaction {
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
                 && let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key), modifiers, ..
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
                 }) = event
                 && modifiers.is_empty()
             {
@@ -11079,13 +11090,23 @@ pub(crate) mod tests {
         use cosmic::iced::advanced::{layout, widget::Tree};
         let renderer = headless_renderer();
         let height = |query| {
-            let mut label = search_label("Project fixture", query, CHILD_ROW_TEXT_SIZE, theme::Text::Default, false);
+            let mut label = search_label(
+                "Project fixture",
+                query,
+                CHILD_ROW_TEXT_SIZE,
+                theme::Text::Default,
+                false,
+            );
             let mut tree = Tree::new(label.as_widget());
-            label.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
-            ).size().height
+            label
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+                )
+                .size()
+                .height
         };
         design::configure_typography("", 13.0, "", 14.0);
         let small = [height(""), height("fixture")];
@@ -11093,8 +11114,14 @@ pub(crate) mod tests {
         let large = [height(""), height("fixture")];
         for (small, large) in small.into_iter().zip(large) {
             assert!(large > small, "sidebar identity must follow interface size");
-            assert!(large <= WORKTREE_ROW_HEIGHT, "largest line box must fit its row");
-            assert_eq!(large, 29.0, "plain and highlighted labels use the same absolute line box");
+            assert!(
+                large <= WORKTREE_ROW_HEIGHT,
+                "largest line box must fit its row"
+            );
+            assert_eq!(
+                large, 29.0,
+                "plain and highlighted labels use the same absolute line box"
+            );
         }
         design::configure_typography("", 13.0, "", 14.0);
     }
@@ -11293,58 +11320,61 @@ pub(crate) mod tests {
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
-        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
-        for (focused, modal) in [(false, false), (true, false), (true, true)] {
-            let state = SidebarState::default();
-            let renderer = headless_renderer();
-            let mut element = search(&state, modal);
-            let mut tree = Tree::new(&element);
-            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            );
-            if focused {
-                element.as_widget_mut().operate(
+        for key in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            for (focused, modal) in [(false, false), (true, false), (true, true)] {
+                let state = SidebarState::default();
+                let renderer = headless_renderer();
+                let mut element = search(&state, modal);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+                let node = element.as_widget_mut().layout(
                     &mut tree,
-                    Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if focused {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(search_focus_id()),
+                    );
+                }
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if focused && !modal {
+                        vec![if key == keyboard::key::Named::Escape {
+                            SidebarAction::ToggleControls
+                        } else {
+                            SidebarAction::FocusFirstSearchResult
+                        }]
+                    } else {
+                        vec![]
+                    }
                 );
             }
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
-                    text: None,
-                    repeat: false,
-                }),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                messages,
-                if focused && !modal {
-                    vec![if key == keyboard::key::Named::Escape {
-                        SidebarAction::ToggleControls
-                    } else {
-                        SidebarAction::FocusFirstSearchResult
-                    }]
-                } else {
-                    vec![]
-                }
-            );
-        }
         }
     }
 

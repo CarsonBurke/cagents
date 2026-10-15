@@ -1382,15 +1382,12 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill),
+                        crate::ui_controls::field::search("Find in conversation", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -2861,7 +2858,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2951,14 +2953,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -7359,8 +7365,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -7610,10 +7622,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(
