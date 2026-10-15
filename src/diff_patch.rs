@@ -129,11 +129,12 @@ pub fn unified_patch_paths(
         patch.extend(quoted_bytes(new_path.as_bytes()));
         patch.push(b'\n');
     }
-    // /dev/null headers represent text-file presence without guessing the
-    // existing file's mode. Empty files have no textual hunk, so their
-    // presence-only patch needs the ordinary regular-file mode marker.
-    // Mutation callers that restore executable modes must supply mode metadata.
-    if before.is_none() && after == Some("") {
+    // Git extended headers require an explicit creation marker, including
+    // nonempty additions with quoted paths. Content-only callers create an
+    // ordinary regular file; mode-aware callers replace this default with
+    // metadata captured alongside the source. Existing nonempty deletions
+    // deliberately omit a guessed mode so executable removal stays valid.
+    if before.is_none() && after.is_some() {
         patch.extend_from_slice(b"new file mode 100644\n");
     }
     if after.is_none() && before == Some("") {
