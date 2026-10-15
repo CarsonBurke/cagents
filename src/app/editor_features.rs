@@ -514,6 +514,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_open_target_is_not_mistaken_for_a_genuinely_unopened_target() {
+        for pending_target in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut app, a, b, a_doc, b_doc) = code_action_fixture(root.path()).await;
+            app.lsp.close(b_doc); app.lsp_documents.remove(&b_doc); app.lsp_contexts.remove(&b); app.cards.remove(&b);
+            // This typed old response describes B while it was not open. An
+            // actual pending manager registration must not bless newer text.
+            let edit = LspWorkspaceEdit { documents: vec![LspDocumentEdits {
+                path: root.path().join("b.rs"), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Utf16,
+                edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }],
+            }], ..Default::default() };
+            let pending_card = if pending_target {
+                let card = buffer(&mut app, root.path(), "b.rs", "fn unsaved_outside() {}\n");
+                app.lsp_documents.insert(b_doc, card); app.lsp_contexts.entry(card).or_default().document = Some(b_doc);
+                let path = root.path().join("b.rs"); let language = app.lsp.language_for(&path).unwrap();
+                app.lsp.open(b_doc, &path, root.path(), language, 1, "fn unsaved_outside() {}\n");
+                assert_eq!(app.lsp.document_version(b_doc), Some(1));
+                assert!(app.lsp.document_incarnation(b_doc).is_none(), "discovery completion has not been delivered");
+                Some(card)
+            } else { None };
+            let operation = app.editor_operation(a, LspEditKind::Rename).unwrap();
+            let mut tasks = VecDeque::from([app.prepare_editor_workspace_edit(operation, edit)]);
+            while let Some(task) = tasks.pop_front() {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::EditorFeatures(action))) = action { tasks.push_back(app.update_editor_features(action)); }
+                    }
+                }
+            }
+            if let Some(card) = pending_card {
+                assert!(app.editor_features.preview.is_none() && !app.editor_features.publishing());
+                assert_eq!(text(&app, card), "fn unsaved_outside() {}\n");
+                assert!(app.lsp_contexts[&a].failure.as_ref().is_some_and(|message| message.contains("synchronize")));
+            } else {
+                assert!(app.editor_features.preview.is_some(), "a genuinely unopened target remains supported");
+            }
+            assert_eq!(std::fs::read_to_string(root.path().join("b.rs")).unwrap(), "fn old() {}\n");
+            assert_eq!(text(&app, a), "fn old() {}\n");
+            app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn emitted_peer_edit_rejects_closed_or_reopened_uri_before_preview() {
         for reopen in [false, true] {
             let root = tempfile::tempdir().unwrap(); let original = "fn old() {}\n";
@@ -817,13 +860,13 @@ mod tests {
         let external_path = external.path().join("stdlib.rs");
         std::fs::write(&external_path, original).unwrap();
         let mut app = app();
-        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        app.lsp = LspManager::fixture_ready_format_on_save(LspDocumentId(1), &root.path().join("a.rs"), root.path(), original).await;
         let a = buffer(&mut app, root.path(), "a.rs", original);
         let read_only = buffer(&mut app, root.path(), external_path.to_str().unwrap(), original);
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&read_only) { runtime.set_external_source(external_path.clone()); }
         let b = buffer(&mut app, root.path(), "b.rs", original);
-        // Registration stays pending in this controller fixture: discovery
-        // events are not consumed, so no external server process can launch.
+        // Real framed synchronization supplies URI lifetime proof for every
+        // target. No external language server process is launched.
         for (card, doc, path) in [(a, LspDocumentId(1), root.path().join("a.rs")), (read_only, LspDocumentId(2), external_path.clone()), (b, LspDocumentId(3), root.path().join("b.rs"))] {
             app.lsp_documents.insert(doc, card);
             app.lsp_contexts.entry(card).or_default().document = Some(doc);
@@ -832,8 +875,9 @@ mod tests {
                 drop(runtime.take_lsp_edits());
                 runtime.set_lsp_document(Some(doc));
             }
-            let language = app.lsp.language_for(&path).unwrap();
-            app.lsp.open(doc, &path, root.path(), language, 1, original);
+            if doc != LspDocumentId(1) {
+                app.lsp.fixture_open_format_on_save_document(doc, &path, root.path(), original).await;
+            }
         }
         app.close_lsp_document(a);
         app.cards.remove(&a);
@@ -854,6 +898,7 @@ mod tests {
         assert!(!app.editor_features.modal_open());
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&b) { drop(runtime.update(RepositoryAction::Undo { card: b })); }
         assert_eq!(text(&app, b), original);
+        app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
     }
 
     #[test]
@@ -1625,6 +1670,9 @@ impl Cagents {
                     let Some((path, mut snapshot)) = runtime.workspace_edit_snapshot() else { return Err("Wait for the selected target to finish loading, or close its read-only view, before applying edits".into()); };
                     snapshot.protocol_version = self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc));
                     snapshot.protocol_incarnation = self.lsp_document(*card).and_then(|doc| self.lsp.document_incarnation(doc));
+                    if snapshot.protocol_incarnation.is_none() {
+                        return Err("Wait for the open target to synchronize with its language server, or close that target and prepare the edit again".into());
+                    }
                         if let Some(previous) = open.insert(path, snapshot.clone()) {
                             if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.protocol_incarnation != snapshot.protocol_incarnation || previous.writable != snapshot.writable {
                                 return Err("Two open views of the same file disagree".into());
