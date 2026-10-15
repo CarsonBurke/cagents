@@ -2358,7 +2358,19 @@ impl Server {
             }
             "retire" => {
                 self.check_retirement()?;
+                // The reducer and its final input completions have stopped.
+                // Keep the journal locked/sealed across the exact retirement
+                // receipt and cache disposition. A failed publication retains
+                // both helper ownership and the non-disposable evidence.
+                self.session_stopping = true;
+                let mut journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+                if self.installed {
+                    journal.seal_for_retirement()?;
+                }
                 final_snapshot::publish_retirement(&self.identity, &self.proof)?;
+                if self.installed {
+                    journal.allow_retired_cache_removal()?;
+                }
                 Ok(Value::Null)
             }
             _ => Err("Unknown retained actor method/version".into()),

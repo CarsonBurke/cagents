@@ -1480,7 +1480,8 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         // The original lease remains locked until our private cache is gone.
-        let _ = fs::remove_dir_all(&self.directory);
+        // An unacknowledged actor journal outlives the reducer and its lease.
+        let _ = crate::transcript_cache::remove_if_reclaimable(&self.directory);
     }
 }
 /// Bounds the identity fields a provider can make arbitrarily large so an

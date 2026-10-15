@@ -1,5 +1,9 @@
-//! Ephemeral chat cache ownership, shared with the service-free diagnostics CLI.
+//! Transcript cache and retained semantic-journal ownership, shared with diagnostics.
 //! A creation gate closes the mkdir/lease race; per-cache leases protect other daemons.
+#[cfg(feature = "host")]
+mod actor_journal;
+#[cfg(feature = "host")]
+pub(crate) use actor_journal::ActorJournalRetention;
 use std::{
     fs, io,
     os::unix::fs::MetadataExt,
@@ -73,6 +77,20 @@ pub(crate) fn create(root: &Path) -> io::Result<(PathBuf, File)> {
         let _ = fs::remove_dir_all(&directory);
     }
     result
+}
+
+/// The caller owns this cache's lease. A dead helper's semantic journal is
+/// evidence, not disposable transcript data, until explicitly sealed/drained.
+#[cfg(feature = "host")]
+pub(crate) fn remove_if_reclaimable(directory: &Path) -> io::Result<bool> {
+    if !actor_journal::reclaimable(directory)? {
+        return Ok(false);
+    }
+    match fs::remove_dir_all(directory) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn cache_directories(root: &Path) -> io::Result<Vec<PathBuf>> {
@@ -213,6 +231,9 @@ fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) => return Err(error),
+        }
+        if !actor_journal::reclaimable(&directory)? {
+            continue;
         }
         let mut entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,

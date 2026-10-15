@@ -46,6 +46,8 @@ pub(crate) struct ContinuityLoss {
 }
 pub(super) struct Journal {
     db: Connection,
+    retention: crate::transcript_cache::ActorJournalRetention,
+    retirement_sealed: bool,
     budget: usize,
     last_loss: Option<ContinuityLoss>,
     run_ids: std::collections::BTreeSet<crate::model::RunId>,
@@ -74,7 +76,7 @@ impl Journal {
     }
     fn with_budget(directory: &Path, budget: usize) -> Result<Self, String> {
         let path = directory.join("actor-journal.sqlite");
-        OpenOptions::new()
+        let created = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
@@ -82,6 +84,8 @@ impl Journal {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .map_err(|error| format!("Cannot create private actor journal: {error}"))?;
+        let retention = crate::transcript_cache::ActorJournalRetention::create(directory, &created)
+            .map_err(|error| error.to_string())?;
         let db = Connection::open(path).map_err(|error| error.to_string())?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL);
@@ -93,6 +97,8 @@ impl Journal {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             db,
+            retention,
+            retirement_sealed: false,
             budget,
             last_loss: None,
             run_ids: Default::default(),
@@ -110,6 +116,7 @@ impl Journal {
         Ok(self.continuity_loss()?.map(|loss| loss.reason))
     }
     pub fn record_loss(&mut self, reason: &str) -> Result<(), String> {
+        self.ensure_writable()?;
         if self.last_loss.is_none() {
             self.last_loss = Some(ContinuityLoss {
                 id: uuid::Uuid::new_v4(),
@@ -128,6 +135,7 @@ impl Journal {
         Ok(())
     }
     pub fn ack_loss(&mut self, id: uuid::Uuid) -> Result<(), String> {
+        self.ensure_writable()?;
         let mut loss = self
             .continuity_loss()?
             .ok_or("No retained continuity loss exists")?;
@@ -140,6 +148,7 @@ impl Journal {
         Ok(())
     }
     pub fn clear_acknowledged_loss_for_restart(&mut self) -> Result<(), String> {
+        self.ensure_writable()?;
         let Some(loss) = self.continuity_loss()? else {
             return Ok(());
         };
@@ -175,6 +184,9 @@ impl Journal {
                 | Update::TurnOutcome { .. }
         ) {
             return Ok(());
+        }
+        if self.retirement_sealed {
+            return Err("Retained semantic journal is sealed for final retirement".into());
         }
         if let Update::TurnOutcome { update } = update {
             // Native turn/input identities retain their exact source proof.
@@ -276,6 +288,7 @@ impl Journal {
     /// The authenticated daemon calls this only after its idempotent durable
     /// registry/notification transaction commits. Socket delivery is not an ACK.
     pub fn ack(&mut self, through: u64) -> Result<(), String> {
+        self.ensure_writable()?;
         let previous = self.number("outcome_ack")?;
         if through < previous {
             return Err("Outcome acknowledgement moved backwards".into());
@@ -355,6 +368,7 @@ impl Journal {
         Ok(self.run_ids.iter().copied().collect())
     }
     pub fn refuse_unexecuted_run(&mut self, run: crate::model::RunId) -> Result<(), String> {
+        self.ensure_writable()?;
         self.db
             .execute("DELETE FROM retained_runs WHERE run=?1", [run.to_string()])
             .map_err(|error| error.to_string())?;
@@ -373,6 +387,7 @@ impl Journal {
         if let Some(receipt) = self.input(identity)? {
             return Ok(receipt);
         }
+        self.ensure_writable()?;
         if self.loss()?.is_some() {
             return Err("Actor outcome continuity is unconfirmed; new input is refused".into());
         }
@@ -433,6 +448,7 @@ impl Journal {
         identity: &InputIdentity,
         mut state: InputState,
     ) -> Result<(), String> {
+        self.ensure_writable()?;
         let error = match &mut state {
             InputState::Acknowledged(Err(error)) | InputState::Unknown(error) => Some(error),
             _ => None,
@@ -502,6 +518,7 @@ impl Journal {
         &mut self,
         identities: &[InputIdentity],
     ) -> Result<(), String> {
+        self.ensure_writable()?;
         if identities.len() > 64 {
             return Err("Input retirement batch exceeds capacity".into());
         }
@@ -549,6 +566,7 @@ impl Journal {
     }
 
     pub fn retire_inputs(&mut self, through: u64) -> Result<(), String> {
+        self.ensure_writable()?;
         let mut query = self
             .db
             .prepare("SELECT state FROM inputs WHERE sequence<=?1")
@@ -583,6 +601,33 @@ impl Journal {
     pub fn latest(&self) -> Result<u64, String> {
         Ok(self.outcome_latest)
     }
+
+    fn ensure_writable(&self) -> Result<(), String> {
+        if self.retirement_sealed {
+            Err("Retained semantic journal is sealed for final retirement".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Called with the journal mutex held after the provider has joined and
+    /// final input completions have drained. No later semantic append is valid.
+    pub fn seal_for_retirement(&mut self) -> Result<(), String> {
+        if self.acknowledged()? != self.latest()?
+            || self.last_loss.as_ref().is_some_and(|loss| !loss.acknowledged)
+        {
+            return Err("Unacknowledged semantic evidence cannot become disposable cache".into());
+        }
+        self.retirement_sealed = true;
+        Ok(())
+    }
+
+    pub fn allow_retired_cache_removal(&self) -> Result<(), String> {
+        if !self.retirement_sealed {
+            return Err("Retained semantic journal has not been sealed".into());
+        }
+        self.retention.allow_removal().map_err(|error| error.to_string())
+    }
     #[cfg(test)]
     pub fn fail_input_storage(&self) {
         self.db.execute_batch("DROP TABLE inputs").unwrap();
@@ -610,6 +655,7 @@ impl Journal {
         .transpose()
     }
     pub fn admit_restart(&mut self, id: uuid::Uuid, hash: &[u8; 32]) -> Result<(), String> {
+        self.ensure_writable()?;
         let count: usize = self
             .db
             .query_row("SELECT COUNT(*) FROM restarts", [], |row| row.get(0))
@@ -635,6 +681,7 @@ impl Journal {
         id: uuid::Uuid,
         result: Result<crate::daemon::holder_registry::Process, super::restart::RestartFailure>,
     ) -> Result<super::restart::RestartState, String> {
+        self.ensure_writable()?;
         let state = super::restart::RestartState::Acknowledged(result);
         self.db
             .execute(
@@ -666,6 +713,52 @@ mod tests {
             id: id.into(),
         }
     }
+    #[test]
+    fn unacknowledged_sqlite_journal_survives_actual_store_drop() {
+        let store = super::super::super::Store::new().unwrap();
+        let directory = store.directory().to_owned();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(directory.clone());
+        let mut journal = Journal::open(&directory).unwrap();
+        journal.append(&Update::Attention(crate::notifications::Evidence {
+            key: "retained-after-drop".into(), kind: crate::notifications::Kind::Succeeded,
+        })).unwrap();
+        assert!(journal.seal_for_retirement().is_err());
+        assert!(journal.allow_retired_cache_removal().is_err());
+        drop(store);
+        assert!(directory.join("actor-journal.sqlite").exists());
+        assert_eq!(journal.page(0).unwrap().len(), 1);
+        assert!(!crate::transcript_cache::remove_if_reclaimable(&directory).unwrap());
+    }
+
+    #[test]
+    fn checked_retirement_fences_mutation_and_allows_delayed_reader_store_drop() {
+        let store = std::sync::Arc::new(super::super::super::Store::new().unwrap());
+        let reader = store.clone();
+        let directory = store.directory().to_owned();
+        let mut journal = Journal::open(&directory).unwrap();
+        let update = Update::Attention(crate::notifications::Evidence {
+            key: "durably-committed".into(), kind: crate::notifications::Kind::Succeeded,
+        });
+        journal.append(&update).unwrap();
+        journal.ack(1).unwrap();
+        journal.record_loss("explicitly committed continuity loss").unwrap();
+        assert!(journal.seal_for_retirement().is_err());
+        let loss = journal.continuity_loss().unwrap().unwrap();
+        journal.ack_loss(loss.id).unwrap();
+        journal.seal_for_retirement().unwrap();
+        assert!(journal.append(&update).is_err());
+        assert!(journal.record_loss("late mutation").is_err());
+        assert!(journal.admit_restart(uuid::Uuid::new_v4(), &[4;32]).is_err());
+        journal.allow_retired_cache_removal().unwrap();
+        drop(store);
+        assert!(directory.exists(), "reader retains the actual Store lease");
+        drop(journal);
+        drop(reader);
+        assert!(!directory.exists());
+    }
+
     #[test]
     fn exact_historical_turn_proof_repeats_until_ack_without_settling_current_run() {
         use crate::chat::turn_outcomes::TurnUpdate;
