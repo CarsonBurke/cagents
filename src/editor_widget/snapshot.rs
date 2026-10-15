@@ -257,6 +257,8 @@ impl<'a> Iterator for Chunks<'a> {
 pub struct TextSnapshot {
     root: Option<Arc<Node>>,
     serialized: Arc<OnceLock<Arc<str>>>,
+    #[cfg(test)]
+    serializations: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl PartialEq for TextSnapshot {
     fn eq(&self, other: &Self) -> bool {
@@ -300,6 +302,7 @@ impl TextSnapshot {
         Self {
             root: build(&lines),
             serialized: Arc::new(OnceLock::new()),
+            #[cfg(test)] serializations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
     pub fn len(&self) -> usize {
@@ -402,17 +405,20 @@ impl TextSnapshot {
         })
     }
     #[cfg(test)]
-    pub fn is_materialized(&self) -> bool {
-        self.serialized.get().is_some()
+    pub fn is_materialized(&self) -> bool { self.serialized.get().is_some() }
+    /// Serialize a transient payload without retaining a second full copy
+    /// in every historical native snapshot (for example LSP wire messages).
+    pub fn to_string_uncached(&self) -> String {
+        #[cfg(test)]
+        self.serializations.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        let mut text = String::with_capacity(self.len());
+        if let Some(root) = &self.root {root.write(&mut text);}
+        text
     }
+    #[cfg(test)]
+    pub fn serialization_count(&self)->usize {self.serializations.load(std::sync::atomic::Ordering::Relaxed)}
     pub fn text(&self) -> Arc<str> {
-        Arc::clone(self.serialized.get_or_init(|| {
-            let mut text = String::with_capacity(self.len());
-            if let Some(root) = &self.root {
-                root.write(&mut text);
-            }
-            Arc::from(text)
-        }))
+        Arc::clone(self.serialized.get_or_init(|| Arc::from(self.to_string_uncached())))
     }
     pub(super) fn replace_lines<'a>(
         &mut self,
@@ -429,6 +435,8 @@ impl TextSnapshot {
         let (_, right) = split(rest, old_end - first);
         self.root = join(join(left, replacement.root), right);
         self.serialized = Arc::new(OnceLock::new());
+        #[cfg(test)]
+        { self.serializations = Arc::new(std::sync::atomic::AtomicUsize::new(0)); }
     }
 }
 
