@@ -76,9 +76,8 @@ pub(in crate::host) fn interactive(
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let mut reserved = Vec::new();
         for session in executable {
-            if registry.is_archived_automation_session(session).map_err(unavailable)? {
-                reserved.push(registry.agent_for_session(session).map_err(unavailable)?
-                    .ok_or_else(|| unavailable("The pending archive owner is unavailable".into()))?);
+            if let Some(owner) = registry.archived_automation_owner(session).map_err(unavailable)? {
+                reserved.push(owner);
             }
         }
         reserved

@@ -198,18 +198,25 @@ impl Registry {
         &self,
         id: crate::model::TerminalId,
     ) -> Result<bool, String> {
+        Ok(self.archived_automation_owner(id)?.is_some())
+    }
+
+    pub(crate) fn archived_automation_owner(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<Option<crate::agent_execution::Agent>, String> {
         let record:Option<String>=self.db.query_row(
             "SELECT g.record FROM agents g LEFT JOIN agent_policies p ON p.agent=g.id WHERE g.session_id=?1 AND (g.closed=1 OR (coalesce(p.interactive,0)=0 AND EXISTS(SELECT 1 FROM automation_snapshots s WHERE s.agent=g.id)))",
             [id.to_string()],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
         let Some(record) = record else {
-            return Ok(false);
+            return Ok(None);
         };
         let agent: crate::agent_execution::Agent = decode(&record)?;
         if !matches!(
             agent.origin,
             crate::agent_execution::Origin::Automation { .. }
         ) {
-            return Ok(false);
+            return Ok(None);
         }
         if !agent
             .session
@@ -220,7 +227,7 @@ impl Registry {
         }
         // Closing this owner remains authoritative after its bounded history
         // expires: deleting transcript data never grants restart permission.
-        Ok(true)
+        Ok(Some(agent))
     }
 
     pub(crate) fn archived_automation_agents(

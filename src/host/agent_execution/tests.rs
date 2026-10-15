@@ -3206,6 +3206,7 @@ fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart()
     assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap(),"spawn\n");
     assert_eq!(snapshot.requests.len(),1);
     crate::host::chat::process(&host,17,ClientRequest::ChatClose { chat_id:session.id }).unwrap();
-    assert!(crate::host::chat::process(&host,17,ClientRequest::ChatAttach { session }).is_err(), "a completed reserved report must never enter a restart fallback");
+    let closed = crate::host::chat::process(&host,17,ClientRequest::ChatAttach { session }).unwrap_err();
+    assert!(closed.message.contains("read-only") && !closed.retryable, "a completed reserved report is read-only, not a missing live owner: {closed:?}");
     assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap(),"spawn\n");
 }
