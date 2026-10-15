@@ -21502,9 +21502,24 @@ mod tests {
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
-                .arg("-C").arg(directory.path()).args(args).output().unwrap();
-            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "init.templateDir=",
+                ])
+                .arg("-C")
+                .arg(directory.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
         };
         git(&["init", "-q"]);
         let before = "fn main() {\n    let answer = 1;\n}\n";
@@ -21531,7 +21546,8 @@ mod tests {
             state.id = repository;
             Arc::make_mut(&mut app.durable).cards.push(state);
             for card in [repository, pr] {
-                let (mut runtime, _) = RepositoryRuntime::diff_snapshot_fixture(card, "source.rs", before, after);
+                let (mut runtime, _) =
+                    RepositoryRuntime::diff_snapshot_fixture(card, "source.rs", before, after);
                 runtime.descriptor.repository = directory.path().join(".git");
                 runtime.descriptor.worktree = directory.path().to_path_buf();
                 runtime.set_diff_surface_visible(true);
@@ -21541,19 +21557,26 @@ mod tests {
                 app.card_state_mut(card).unwrap().exposure = Exposure::Visible;
                 let load = repository_task(runtime.refresh_diff_preferences(card));
                 if card == repository {
-                    app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
-                    app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+                    app.card_state_mut(card).unwrap().kind =
+                        CardKind::Repository(runtime.descriptor.clone());
+                    app.cards
+                        .insert(card, CardRuntime::Repository(Box::new(runtime)));
                 } else {
-                    let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else { panic!("PR fixture"); };
+                    let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+                        panic!("PR fixture");
+                    };
                     pane.runtime = runtime;
                 }
                 settle(&mut app, load).await;
             }
-            let model = |app: &Cagents, card| match app.cards.get(&card).unwrap() {
-                CardRuntime::Repository(runtime) => runtime.current_diff_model_snapshot(),
-                CardRuntime::PullRequests(pane) => pane.runtime.current_diff_model_snapshot(),
-                _ => unreachable!(),
-            }.expect("the returned task must install a ready model");
+            let model = |app: &Cagents, card| {
+                match app.cards.get(&card).unwrap() {
+                    CardRuntime::Repository(runtime) => runtime.current_diff_model_snapshot(),
+                    CardRuntime::PullRequests(pane) => pane.runtime.current_diff_model_snapshot(),
+                    _ => unreachable!(),
+                }
+                .expect("the returned task must install a ready model")
+            };
             for card in [repository, pr] {
                 let ready = model(&app, card);
                 assert_eq!(ready.syntax_theme(), settings::EditorSyntaxTheme::Mocha);
@@ -21566,9 +21589,15 @@ mod tests {
                 let ready = model(&app, card);
                 assert_eq!(ready.syntax_theme(), settings::EditorSyntaxTheme::Auto);
                 assert_eq!((ready.additions, ready.deletions), (1, 1));
-                assert_eq!((ready.before.as_ref(), ready.after.as_ref()), (before, after));
+                assert_eq!(
+                    (ready.before.as_ref(), ready.after.as_ref()),
+                    (before, after)
+                );
             }
-            assert_eq!(settings::load(&directory.path().join("settings.toml")).unwrap(), AppSettings::default());
+            assert_eq!(
+                settings::load(&directory.path().join("settings.toml")).unwrap(),
+                AppSettings::default()
+            );
         }
     }
 
