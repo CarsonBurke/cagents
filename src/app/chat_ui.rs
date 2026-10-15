@@ -12242,6 +12242,20 @@ mod tests {
     }
 
     #[test]
+    fn pr_context_uses_the_latest_worktree_chat_even_when_an_older_chat_is_focused() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = draft_chat(&mut app); write(&mut app, first, "Older unsent draft");
+        let second = draft_chat(&mut app); write(&mut app, second, "Latest unsent draft");
+        assert_ne!(first,second);
+        drop(app.focus_workspace_card(first));
+        drop(app.prepare_pr_agent_context(PathBuf::from(FIXTURE_DIRECTORY), "Selected review context".into()));
+        assert_eq!(app.workspace.focused(),Some(second));
+        assert_eq!(chat_runtime(&app,first).composer.text(),"Older unsent draft");
+        assert_eq!(chat_runtime(&app,second).composer.text(),"Latest unsent draft\n\nSelected review context");
+        assert!(!app.chat_start_pending(second));
+    }
+
+    #[test]
     fn pr_context_creates_a_default_provider_chat_without_sending() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.prepare_pr_agent_context(PathBuf::from(FIXTURE_DIRECTORY), "Review these selected threads".into()));
