@@ -31,7 +31,7 @@ fn session(id: u128, root: &Path) -> TerminalSession {
         program: "/bin/sh".into(),
         arguments: vec![
             "-c".into(),
-            "printf '%s\\n' \"$$\" > root-pid; exec /bin/sleep 600".into(),
+            "printf '%s' \"$$\" > root-pid; exec /bin/sleep 600".into(),
         ],
         working_directory: root.to_owned(),
         environment: Default::default(),
