@@ -120,11 +120,11 @@ pub mod tray;
 pub mod ui_controls;
 pub mod update;
 pub mod upgrade;
-pub mod worktree_cleanup;
 pub mod worktree_basis;
+pub mod worktree_branch;
+pub mod worktree_cleanup;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod worktree_setup;
-pub mod worktree_branch;
 pub use terminal::ipc as terminal_ipc;
 #[cfg(feature = "ui")]
 pub mod workspace;
