@@ -2916,8 +2916,8 @@ impl Cagents {
         let busy = self.worktree_busy_agents(target);
         if busy > 0 {
             rows.push(super::notice_body(format!(
-                "{busy} {} working in this worktree.",
-                if busy == 1 { "agent is" } else { "agents are" }
+                "{busy} {} in this worktree. Agent turns and commands in these sessions will be stopped.",
+                if busy == 1 { "session is busy or has unconfirmed activity" } else { "sessions are busy or have unconfirmed activity" }
             )));
         }
         let sessions = dialog.session_census.len();
