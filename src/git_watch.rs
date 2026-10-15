@@ -374,17 +374,26 @@ impl Project {
         })
     }
 
-    pub fn refresh_upstreams(&self, upstreams: &BTreeMap<WorktreeId, String>) -> Option<Self> {
-        if self
-            .worktrees
-            .iter()
-            .all(|worktree| worktree.upstream.as_ref() == upstreams.get(&worktree.id))
-        {
-            return None;
-        }
+    /// Partial status reads can learn a missed HEAD change too. Refresh only
+    /// pure routing metadata, retaining the existing census and polling reason.
+    pub fn refresh_routing<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a WorktreeRecord>,
+        upstreams: &BTreeMap<WorktreeId, String>,
+    ) -> Option<Self> {
+        let records = records.into_iter().map(|record| (record.id, record)).collect::<BTreeMap<_, _>>();
+        let changed = self.worktrees.iter().any(|worktree| {
+            records.get(&worktree.id).is_some_and(|record| record.path == worktree.root
+                && (record.branch != worktree.branch
+                    || worktree.upstream.as_ref() != upstreams.get(&worktree.id)))
+        });
+        if !changed { return None; }
         let mut next = self.clone();
         for worktree in &mut next.worktrees {
-            worktree.upstream = upstreams.get(&worktree.id).cloned();
+            if let Some(record) = records.get(&worktree.id).filter(|record| record.path == worktree.root) {
+                worktree.branch = record.branch.clone();
+                worktree.upstream = upstreams.get(&worktree.id).cloned();
+            }
         }
         Some(next)
     }
