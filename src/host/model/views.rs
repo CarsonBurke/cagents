@@ -52,8 +52,9 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 const RECENT_OPERATIONS: usize = 2048;
 
 pub(super) fn migrate_history(db: &Connection) -> Result<(), String> {
-    let transaction = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
     // The caller's version read precedes this writer admission. Another
     // opener may have completed this migration or installed a newer schema
     // while we waited; never write or downgrade from that stale decision.
@@ -79,32 +80,55 @@ pub(super) fn migrate_history(db: &Connection) -> Result<(), String> {
     let mut trimmed = false;
     for mut view in all(&transaction)? {
         if view.retired.len() > crate::workspace_model::views::RECENT_RETIRED_LIMIT {
-            view.retired.drain(..view.retired.len() - crate::workspace_model::views::RECENT_RETIRED_LIMIT);
-            view.revision = view.revision.checked_add(1).ok_or("view revision exhausted")?;
+            view.retired
+                .drain(..view.retired.len() - crate::workspace_model::views::RECENT_RETIRED_LIMIT);
+            view.revision = view
+                .revision
+                .checked_add(1)
+                .ok_or("view revision exhausted")?;
             write(&transaction, &view)?;
             trimmed = true;
         }
     }
     compact_operations(&transaction)?;
     if trimmed {
-        transaction.execute("UPDATE metadata SET sequence = sequence + 1 WHERE key = 0", []).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
     }
-    transaction.pragma_update(None, "user_version", 13).map_err(|error| error.to_string())?;
+    transaction
+        .pragma_update(None, "user_version", 13)
+        .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
 }
 
 fn retired(db: &Connection, scope: &Scope, id: crate::model::CardId) -> Result<bool, String> {
-    db.query_row("SELECT EXISTS(SELECT 1 FROM retired_view_panes WHERE scope=?1 AND id=?2)",
-        params![key(scope)?, id.to_string()], |row| row.get(0)).map_err(|error| error.to_string())
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM retired_view_panes WHERE scope=?1 AND id=?2)",
+        params![key(scope)?, id.to_string()],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
 }
 fn retire(db: &Connection, scope: &Scope, id: crate::model::CardId) -> Result<(), String> {
-    db.execute("INSERT OR IGNORE INTO retired_view_panes(scope,id) VALUES (?1,?2)",
-        params![key(scope)?, id.to_string()]).map(drop).map_err(|error| error.to_string())
+    db.execute(
+        "INSERT OR IGNORE INTO retired_view_panes(scope,id) VALUES (?1,?2)",
+        params![key(scope)?, id.to_string()],
+    )
+    .map(drop)
+    .map_err(|error| error.to_string())
 }
 fn compact_operations(db: &Connection) -> Result<(), String> {
-    db.execute("DELETE FROM shared_view_edits WHERE rowid NOT IN
-        (SELECT rowid FROM shared_view_edits ORDER BY rowid DESC LIMIT ?1)", [RECENT_OPERATIONS])
-        .map(drop).map_err(|error| error.to_string())
+    db.execute(
+        "DELETE FROM shared_view_edits WHERE rowid NOT IN
+        (SELECT rowid FROM shared_view_edits ORDER BY rowid DESC LIMIT ?1)",
+        [RECENT_OPERATIONS],
+    )
+    .map(drop)
+    .map_err(|error| error.to_string())
 }
 
 fn key(scope: &Scope) -> Result<String, String> {
@@ -208,7 +232,9 @@ pub(super) fn apply(
                     .map_err(|error| error.to_string())?;
             }
             for pane in panes {
-                if retired(transaction, scope, pane.id)? { continue; }
+                if retired(transaction, scope, pane.id)? {
+                    continue;
+                }
                 if view.panes.iter().any(|existing| {
                     existing.id != pane.id
                         && crate::workspace_model::views::same_resource(&existing.kind, &pane.kind)
@@ -251,8 +277,12 @@ pub(super) fn apply(
                         register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         target.retired.retain(|retired| retired != id);
-                        transaction.execute("DELETE FROM retired_view_panes WHERE scope=?1 AND id=?2",
-                            params![key(destination)?, id.to_string()]).map_err(|error| error.to_string())?;
+                        transaction
+                            .execute(
+                                "DELETE FROM retired_view_panes WHERE scope=?1 AND id=?2",
+                                params![key(destination)?, id.to_string()],
+                            )
+                            .map_err(|error| error.to_string())?;
                         target.apply(&Change::Insert {
                             pane,
                             before: *before,
@@ -280,7 +310,9 @@ pub(super) fn apply(
                     false
                 }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
-                    if retired(transaction, scope, pane.id)? { return Ok(false); }
+                    if retired(transaction, scope, pane.id)? {
+                        return Ok(false);
+                    }
                     if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
                         return Err(
                             "pane already belongs to another view; use an atomic transfer".into(),
@@ -644,30 +676,72 @@ mod tests {
         for index in 0..10_000 {
             let pane = if index == 0 { old.clone() } else { pane() };
             let id = pane.id;
-            assert!(apply(&transaction, &ModelEdit::ChangeView {
-                scope: scope.clone(), expected_revision: revision,
-                operation: Uuid::new_v4(), change: Change::Insert { pane, before: None },
-            }).unwrap());
+            assert!(
+                apply(
+                    &transaction,
+                    &ModelEdit::ChangeView {
+                        scope: scope.clone(),
+                        expected_revision: revision,
+                        operation: Uuid::new_v4(),
+                        change: Change::Insert { pane, before: None },
+                    }
+                )
+                .unwrap()
+            );
             revision += 1;
-            assert!(apply(&transaction, &ModelEdit::ChangeView {
-                scope: scope.clone(), expected_revision: revision,
-                operation: Uuid::new_v4(), change: Change::Remove { id },
-            }).unwrap());
+            assert!(
+                apply(
+                    &transaction,
+                    &ModelEdit::ChangeView {
+                        scope: scope.clone(),
+                        expected_revision: revision,
+                        operation: Uuid::new_v4(),
+                        change: Change::Remove { id },
+                    }
+                )
+                .unwrap()
+            );
             revision += 1;
         }
         let view = read(&transaction, &scope).unwrap();
-        assert_eq!(view.retired.len(), crate::workspace_model::views::RECENT_RETIRED_LIMIT);
+        assert_eq!(
+            view.retired.len(),
+            crate::workspace_model::views::RECENT_RETIRED_LIMIT
+        );
         assert!(!view.retired.contains(&old.id));
-        let operations: usize = transaction.query_row("SELECT count(*) FROM shared_view_edits", [], |row| row.get(0)).unwrap();
+        let operations: usize = transaction
+            .query_row("SELECT count(*) FROM shared_view_edits", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert!(operations <= RECENT_OPERATIONS);
         assert!(retired(&transaction, &scope, old.id).unwrap());
-        assert!(!apply(&transaction, &ModelEdit::ChangeView {
-            scope: scope.clone(), expected_revision: revision,
-            operation: Uuid::new_v4(), change: Change::Insert { pane: old.clone(), before: None },
-        }).unwrap());
-        assert!(!apply(&transaction, &ModelEdit::SeedView {
-            scope: scope.clone(), panes: vec![old], closed: vec![],
-        }).unwrap());
+        assert!(
+            !apply(
+                &transaction,
+                &ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: revision,
+                    operation: Uuid::new_v4(),
+                    change: Change::Insert {
+                        pane: old.clone(),
+                        before: None
+                    },
+                }
+            )
+            .unwrap()
+        );
+        assert!(
+            !apply(
+                &transaction,
+                &ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![old],
+                    closed: vec![],
+                }
+            )
+            .unwrap()
+        );
         assert!(read(&transaction, &scope).unwrap().panes.is_empty());
         transaction.commit().unwrap();
     }
@@ -678,12 +752,21 @@ mod tests {
         let pane = pane();
         seed(&mut registry, a, vec![pane.clone()]);
         for (source, destination) in [(a, b), (b, a)] {
-            let edit = edit(&mut registry, source, Change::Transfer {
-                id: pane.id, destination: Scope::Channel(destination), before: None,
-            });
+            let edit = edit(
+                &mut registry,
+                source,
+                Change::Transfer {
+                    id: pane.id,
+                    destination: Scope::Channel(destination),
+                    before: None,
+                },
+            );
             registry.apply(&edit).unwrap();
         }
-        assert_eq!(read(&registry.db, &Scope::Channel(a)).unwrap().panes, vec![pane]);
+        assert_eq!(
+            read(&registry.db, &Scope::Channel(a)).unwrap().panes,
+            vec![pane]
+        );
     }
 
     #[test]
@@ -695,27 +778,51 @@ mod tests {
         ).unwrap();
         // This is the exact decision migrate() makes before obtaining this
         // helper's Immediate writer. A separate real connection then wins.
-        let observed: u32 = registry.db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let observed: u32 = registry
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(observed, 12);
         let mut successor = Connection::open(&path).unwrap();
-        let transaction = successor.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let transaction = successor
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         transaction.execute_batch("CREATE TABLE successor_marker(value TEXT); INSERT INTO successor_marker VALUES('preserve');").unwrap();
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
         transaction.commit().unwrap();
-        let before: Vec<(String, String, String)> = successor.prepare(
-            "SELECT type, name, coalesce(sql, '') FROM sqlite_schema ORDER BY type, name",
-        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap()
-            .collect::<rusqlite::Result<_>>().unwrap();
+        let before: Vec<(String, String, String)> = successor
+            .prepare("SELECT type, name, coalesce(sql, '') FROM sqlite_schema ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         let error = migrate_history(&registry.db).unwrap_err();
         assert!(error.contains("newer than supported"), "{error}");
-        let actual: u32 = successor.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
-        assert_eq!(actual, SCHEMA_VERSION + 1, "a stale opener cannot lower the schema version");
-        let after: Vec<(String, String, String)> = successor.prepare(
-            "SELECT type, name, coalesce(sql, '') FROM sqlite_schema ORDER BY type, name",
-        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap()
-            .collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(after, before, "future-schema refusal must precede this migration's DDL");
-        let marker: String = successor.query_row("SELECT value FROM successor_marker", [], |row| row.get(0)).unwrap();
+        let actual: u32 = successor
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            actual,
+            SCHEMA_VERSION + 1,
+            "a stale opener cannot lower the schema version"
+        );
+        let after: Vec<(String, String, String)> = successor
+            .prepare("SELECT type, name, coalesce(sql, '') FROM sqlite_schema ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "future-schema refusal must precede this migration's DDL"
+        );
+        let marker: String = successor
+            .query_row("SELECT value FROM successor_marker", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(marker, "preserve");
     }
 
@@ -725,13 +832,28 @@ mod tests {
         seed(&mut registry, channel, vec![]);
         let scope = Scope::Channel(channel);
         let retired_ids = (0..2000).map(|_| CardId::new()).collect::<Vec<_>>();
-        registry.db.execute("UPDATE shared_views SET retired=?1 WHERE scope=?2",
-            params![serde_json::to_string(&retired_ids).unwrap(), key(&scope).unwrap()]).unwrap();
-        registry.db.execute_batch("DROP TABLE retired_view_panes; PRAGMA user_version=12;").unwrap();
+        registry
+            .db
+            .execute(
+                "UPDATE shared_views SET retired=?1 WHERE scope=?2",
+                params![
+                    serde_json::to_string(&retired_ids).unwrap(),
+                    key(&scope).unwrap()
+                ],
+            )
+            .unwrap();
+        registry
+            .db
+            .execute_batch("DROP TABLE retired_view_panes; PRAGMA user_version=12;")
+            .unwrap();
         drop(registry);
         let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-        assert_eq!(read(&registry.db, &scope).unwrap().retired.len(), crate::workspace_model::views::RECENT_RETIRED_LIMIT);
-        for id in retired_ids { assert!(retired(&registry.db, &scope, id).unwrap()); }
+        assert_eq!(
+            read(&registry.db, &scope).unwrap().retired.len(),
+            crate::workspace_model::views::RECENT_RETIRED_LIMIT
+        );
+        for id in retired_ids {
+            assert!(retired(&registry.db, &scope, id).unwrap());
+        }
     }
-
 }

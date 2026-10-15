@@ -109,7 +109,10 @@ impl Registry {
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
         // Writers commit independently of HostState. One read transaction
         // keeps metadata, views and agents on the same WAL snapshot.
-        let transaction = self.db.unchecked_transaction().map_err(|error| error.to_string())?;
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
         let (identity, sequence) = self
             .db
             .query_row(
@@ -229,7 +232,9 @@ impl Registry {
         // Acquire the WAL writer before any model reads. A Deferred read
         // transaction's later promotion cannot use busy_timeout to wait for
         // another connection's writer, and would spuriously fail pane edits.
-        let transaction = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        let transaction = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
@@ -417,11 +422,16 @@ impl Registry {
                 )
                 .map_err(|error| error.to_string())?;
         }
-        let sequence: u64 = transaction.query_row("SELECT sequence FROM metadata WHERE key=0", [], |row| row.get(0))
+        let sequence: u64 = transaction
+            .query_row("SELECT sequence FROM metadata WHERE key=0", [], |row| {
+                row.get(0)
+            })
             .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
         #[cfg(test)]
-        if let Some(after_commit) = self.after_workspace_commit.take() { after_commit(); }
+        if let Some(after_commit) = self.after_workspace_commit.take() {
+            after_commit();
+        }
         Ok(Applied {
             model: self.model()?,
             sequence,
@@ -1168,11 +1178,12 @@ mod tests {
         let before = registry.model().unwrap().sequence;
         registry.after_workspace_commit = Some(Box::new(move || {
             let connection = Connection::open(path).unwrap();
-            connection.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", []).unwrap();
+            connection
+                .execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+                .unwrap();
         }));
         let applied = registry.apply(&open("/sequence-race")).unwrap();
         assert_eq!(applied.sequence, before + 1);
         assert_eq!(applied.model.sequence, before + 2);
     }
-
 }

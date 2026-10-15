@@ -176,7 +176,8 @@ impl View {
                 if !self.retired.contains(id) {
                     self.retired.push(*id);
                     if self.retired.len() > RECENT_RETIRED_LIMIT {
-                        self.retired.drain(..self.retired.len() - RECENT_RETIRED_LIMIT);
+                        self.retired
+                            .drain(..self.retired.len() - RECENT_RETIRED_LIMIT);
                     }
                 }
             }
