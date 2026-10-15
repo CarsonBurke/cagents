@@ -532,13 +532,22 @@ impl Server {
         // Clone resident metadata only. Do not hydrate the Store or serialize
         // any growing parent/child tool body to service periodic observation.
         let state=self.actor.0.state.lock().unwrap_or_else(|p|p.into_inner());
-        let generation=state.generation;let session_id=state.session_id.clone();let title=state.title.clone();let ready=state.ready;let busy=state.busy;let waiting=state.waiting;let working=state.is_working();let activity=state.activity();let outcome=state.outcome.clone();let usage=state.usage.clone();let requests=state.requests.clone();
+        let generation=state.generation;let session_id=state.session_id.clone();let title=state.title.clone();let ready=state.ready;let busy=state.busy;let waiting=state.waiting;let outcome=state.outcome.clone();let usage=state.usage.clone();let requests=state.requests.clone();
         drop(state);
+        let close=self.actor.close_observation();
+        let activity=close.activity;let working=activity==crate::agent::ActivityState::Working;
+        let busy=busy||working;let ready=ready&&close.ready;
+        let idle=activity==crate::agent::ActivityState::Idle&&ready&&!close.closing;
+        let owns_work=close.owns_work;let completed=close.completed;
+        let provider_process=self.actor.provider_process();let actor_failure=self.actor.failure();
+        let confirmed_session=self.actor.confirmed_session_id();
+        let background_subagents=self.actor.background_subagents();let interrupt_subagents=self.actor.interrupt_subagents();
+        let account_reports=self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone();
         let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
         let continuity_loss=journal.continuity_loss()?;
-        let failure=continuity_loss.as_ref().map(|loss|loss.reason.clone()).or_else(||self.actor.failure());
+        let failure=continuity_loss.as_ref().map(|loss|loss.reason.clone()).or(actor_failure);
         let outcome=continuity_loss.as_ref().map(|loss|crate::agent::ActivityOutcome::Interrupted {reason:loss.reason.clone()}).or(outcome);
-        Ok(Resident {provider_process:self.actor.provider_process(),generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,continuity_loss,retained_runs:journal.retained_runs()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed})
+        Ok(Resident {provider_process,generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close,installed:self.installed,owns_work:owns_work||failure.is_some(),completed,idle,failure,confirmed_session,background_subagents,interrupt_subagents,account_reports,next_input:journal.next_input()?,continuity_loss,retained_runs:journal.retained_runs()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed})
     }
 
     fn published_sources(&self)->Vec<chat::Session> {
