@@ -825,9 +825,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 "the post-discard state could not be verified: {reason}; backup was preserved"
             ));
         }
-        let current_version = fs_safety::metadata_beneath(root, entry.path.as_path())
-            .ok()
-            .map(|metadata| metadata_version(&metadata));
+        let current_version = match fs_safety::metadata_beneath(root, entry.path.as_path()) {
+            Ok(metadata) => Some(metadata_version(&metadata)),
+            Err(cause) if cause.is_not_found() => None,
+            Err(cause) => {
+                return Err(format!(
+                    "Current source entry cannot be verified: {cause}; no entry was changed"
+                ));
+            }
+        };
         if current_version != entry.after_version {
             return Err("changed since discard; newer work was preserved".into());
         }

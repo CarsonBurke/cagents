@@ -848,8 +848,16 @@ pub(super) fn restore(
     context
         .validate_for_source(&owner.preimage.source_root())
         .map_err(error)?;
-    if fs_safety::metadata_beneath(parent, Path::new(name)).is_ok() {
-        return Err("A newer source entry exists; native Trash contents were preserved".into());
+    match fs_safety::metadata_beneath(parent, Path::new(name)) {
+        Ok(_) => {
+            return Err("A newer source entry exists; native Trash contents were preserved".into());
+        }
+        Err(cause) if cause.is_not_found() => {}
+        Err(cause) => {
+            return Err(format!(
+                "Source destination cannot be verified: {cause}; native Trash contents were preserved"
+            ));
+        }
     }
     let native_files = owner.files.clone();
     let native_name = owner.id.clone();
