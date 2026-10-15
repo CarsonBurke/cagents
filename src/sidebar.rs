@@ -20883,7 +20883,7 @@ pub(crate) mod tests {
             }
             match basis {
                 "missing-head" | "normal-unborn" => source.head_oid = None,
-                "changed-head" => source.head_oid = Some("b".repeat(40)),
+                "changed-head" => source.head_oid = Some("b".repeat(40).into_boxed_str()),
                 "missing-pin" => state.commit_draft.amend_head = None,
                 _ => {}
             }

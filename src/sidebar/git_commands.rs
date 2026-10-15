@@ -285,7 +285,7 @@ mod tests {
         let current_head = model.source_control.as_mut().unwrap().head_oid.take();
         assert!(!target.available(&model, &state, Command::GitCommit), "staged rows cannot authorize amend without HEAD");
         assert!(target.action(&model, &state, Command::GitCommit).is_none());
-        model.source_control.as_mut().unwrap().head_oid = Some("b".repeat(40));
+        model.source_control.as_mut().unwrap().head_oid = Some("b".repeat(40).into_boxed_str());
         assert!(!target.available(&model, &state, Command::GitCommit), "a known changed HEAD cannot authorize the pinned amend");
         assert!(target.action(&model, &state, Command::GitCommit).is_none());
         model.source_control.as_mut().unwrap().head_oid = current_head;
