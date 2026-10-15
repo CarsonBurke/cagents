@@ -27,6 +27,12 @@ impl Handle {
             Owner::Remote(remote) => remote.source_query(query),
         }
     }
+    pub(crate) fn changes_manifest(&self,query:chat::cache::changes::ManifestQuery)->Result<chat::cache::changes::Manifest,chat::cache::SourceError> {
+        match &self.0 {Owner::Local(local)=>local.changes_manifest(query),Owner::Remote(remote)=>remote.changes_manifest(query)}
+    }
+    pub(crate) fn change_patch(&self,query:chat::cache::changes::PatchQuery)->Result<chat::cache::changes::PatchPage,chat::cache::SourceError> {
+        match &self.0 {Owner::Local(local)=>local.change_patch(query),Owner::Remote(remote)=>remote.change_patch(query)}
+    }
     /// Exact authenticated helper metadata. Callers must compare the complete
     /// record against an installed host entry; this is never cleanup authority.
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {

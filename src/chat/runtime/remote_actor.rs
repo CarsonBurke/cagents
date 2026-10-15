@@ -1507,6 +1507,7 @@ struct Server {
     // A successful ownership handoff fences authorizing commands from the old
     // attachment. A newly authenticated attach may own the still-live actor.
     attachment_preserved: bool,
+    source_reads: Option<source_reads::Service>,
 }
 impl Server {
     fn start(startup: Startup, control: &UnixStream) -> Result<Self, String> {
@@ -1657,6 +1658,7 @@ impl Server {
             closed_snapshot: None,
             session_stopping: false,
             attachment_preserved: false,
+            source_reads: None,
         })
     }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
@@ -1854,6 +1856,7 @@ impl Server {
                 );
             }
             self.epoch = uuid::Uuid::new_v4();
+            if let Some(reads)=&self.source_reads {reads.invalidate();}
             self.attachment_preserved = false;
             self.proof = request.proof;
             if self.closed_snapshot.is_some() {
@@ -1883,9 +1886,8 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
-            "source_query" => {
-                let query=decode!(chat::cache::SourceQuery);
-                value!(self.actor.source_query(query))
+            "source_query" | "changes_manifest" | "change_patch" => {
+                Err("Original-source reads require the owned off-loop reader".into())
             }
             "execution_environment" => value!(self.environment.clone()),
             "restart" => {
@@ -2229,6 +2231,7 @@ impl Server {
             "retire" => {
                 self.check_retirement()?;
                 final_snapshot::publish_retirement(&self.identity, &self.proof)?;
+                if let Some(reads)=&self.source_reads {reads.invalidate();}
                 Ok(Value::Null)
             }
             _ => Err("Unknown retained actor method/version".into()),
@@ -2306,21 +2309,27 @@ impl Server {
             }
             match self.listener.accept() {
                 Ok((control, _)) => {
-                    let mut finished = false;
-                    let response = (|| {
-                        let request: Invocation = receive(&control, TIMEOUT)?;
-                        authorize(&control, &request.proof)?;
-                        let close = request.method == "retire";
-                        let result = self.invoke(request);
-                        finished = close && result.is_ok();
-                        result
+                    let request=(|| {
+                        let request:Invocation=receive(&control,TIMEOUT)?;
+                        authorize(&control,&request.proof)?;
+                        Ok::<_,String>(request)
                     })();
-                    // Authentication failures use the same result boundary. Only an
-                    // explicit retirement after durable semantic ACK exits the
-                    // helper; a lost provider-close reply retains its journal.
-                    let _ = send(&control, &response, TIMEOUT);
-                    if finished {
-                        break;
+                    match request {
+                        Ok(request) if source_reads::is_read(&request.method) => {
+                            // Disk/cache reads and their potentially backpressured
+                            // replies never occupy the lifecycle/control loop.
+                            if let Err((control,error))=self.dispatch_source_read(control,request) {
+                                let _=send(&control,&Err::<Value,_>(error),TIMEOUT);
+                            }
+                        }
+                        Ok(request) => {
+                            let retire=request.method=="retire";
+                            let response=self.invoke(request);
+                            let finished=retire && response.is_ok();
+                            let _=send(&control,&response,TIMEOUT);
+                            if finished {break;}
+                        }
+                        Err(error) => {let _=send(&control,&Err::<Value,_>(error),TIMEOUT);}
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2551,8 +2560,8 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Fixture {
-        server: Server,
+    pub(super) struct Fixture {
+        pub(super) server: Server,
         _root: tempfile::TempDir,
     }
     impl Drop for Fixture {
@@ -2560,7 +2569,7 @@ mod tests {
             let _ = self.server.actor.close();
         }
     }
-    fn resident_fixture() -> Fixture {
+    pub(super) fn resident_fixture() -> Fixture {
         use crate::chat::protocol::{Adapter, Step};
         struct Idle;
         impl Adapter for Idle {
@@ -2641,6 +2650,7 @@ mod tests {
                 closed_snapshot: None,
                 session_stopping: false,
                 attachment_preserved: false,
+                source_reads: None,
             },
             _root: root,
         }
