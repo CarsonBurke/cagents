@@ -98,11 +98,26 @@ pub(super) fn retirement_proved(
     identity: &ActorIdentity,
     proof: &HostSessionProof,
 ) -> Result<bool, String> {
-    if identity.record.holder.is_current() {
+    retirement_proved_inner(&identity.record, proof, Some(identity))
+}
+
+pub(super) fn retirement_proved_for_record(
+    record: &Record,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
+    retirement_proved_inner(record, proof, None)
+}
+
+fn retirement_proved_inner(
+    record: &Record,
+    proof: &HostSessionProof,
+    expected_identity: Option<&ActorIdentity>,
+) -> Result<bool, String> {
+    if record.holder.is_current() {
         return Ok(false);
     }
     let file =
-        match crate::secure_file::open_existing_private_file(&retirement_path(&identity.record)?) {
+        match crate::secure_file::open_existing_private_file(&retirement_path(record)?) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.to_string()),
@@ -115,16 +130,25 @@ pub(super) fn retirement_proved(
         return Err("Retained semantic retirement proof is oversized".into());
     }
     let receipt: Retirement = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if receipt.protocol != PROTOCOL
-        || !receipt.semantic_acknowledged
-        || &receipt.identity != identity
-        || &receipt.proof != proof
-    {
+    validate_retirement(&receipt, record, proof, expected_identity)?;
+    Ok(!registry::retirement_pending(record).map_err(|error| error.to_string())?)
+}
+
+fn validate_retirement(
+    receipt: &Retirement,
+    record: &Record,
+    proof: &HostSessionProof,
+    expected_identity: Option<&ActorIdentity>,
+) -> Result<(), String> {
+    if receipt.protocol != PROTOCOL || !receipt.semantic_acknowledged
+        || receipt.identity.instance.is_nil() || &receipt.identity.record != record
+        || expected_identity.is_some_and(|expected| expected != &receipt.identity)
+        || &receipt.proof != proof {
         return Err(
             "Retained semantic retirement receipt belongs to another actor or attachment".into(),
         );
     }
-    Ok(!registry::retirement_pending(&identity.record).map_err(|error| error.to_string())?)
+    Ok(())
 }
 pub(crate) fn remove(record: &Record) -> Result<(), String> {
     let path = path(record)?;
@@ -145,6 +169,44 @@ pub(crate) fn remove(record: &Record) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cold_retirement_validation_uses_exact_saved_record_and_proof_without_inventing_actor_id() {
+        let actor = RemoteActor::fixture();
+        let identity = actor.identity();
+        let proof = actor.0.proof.clone();
+        let make = || Retirement {protocol: PROTOCOL, semantic_acknowledged: true,
+            identity: identity.clone(), proof: proof.clone()};
+        assert!(validate_retirement(&make(), &identity.record, &proof, None).is_ok());
+        let mut changed = make();
+        changed.identity.record.holder.start += 1;
+        assert!(validate_retirement(&changed, &identity.record, &proof, None).is_err());
+        let mut changed = make();
+        changed.proof.host_incarnation = crate::model::HostIncarnation::new("another-attachment");
+        assert!(validate_retirement(&changed, &identity.record, &proof, None).is_err());
+        let mut changed = make();
+        changed.semantic_acknowledged = false;
+        assert!(validate_retirement(&changed, &identity.record, &proof, None).is_err());
+        let mut changed = make();
+        changed.protocol += 1;
+        assert!(validate_retirement(&changed, &identity.record, &proof, None).is_err());
+        let mut changed = make();
+        changed.identity.instance = uuid::Uuid::nil();
+        assert!(validate_retirement(&changed, &identity.record, &proof, None).is_err());
+        let mut expected = identity.clone();
+        expected.instance = uuid::Uuid::new_v4();
+        assert!(validate_retirement(&make(), &identity.record, &proof, Some(&expected)).is_err());
+    }
+
+    #[test]
+    fn still_running_helper_cannot_become_retired_from_a_read_only_request() {
+        let actor = RemoteActor::fixture();
+        let identity = actor.identity();
+        assert!(identity.record.holder.is_current());
+        // This returns before any global registry path is opened. A live
+        // helper's PID/start identity is never interpreted as cleanup proof.
+        assert!(!retirement_proved_for_record(&identity.record, &actor.0.proof).unwrap());
+    }
+
     #[test]
     fn final_publication_is_private_durable_and_bound_to_the_exact_actor() {
         use std::os::unix::fs::PermissionsExt;
