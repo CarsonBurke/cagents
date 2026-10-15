@@ -68,7 +68,7 @@ impl Store {
         // Only the caller's exact provider acceptance proof permits binding
         // a pre-first-session intent. A Session event alone cannot attribute
         // other unknown-session commands to this conversation.
-        self.bind_prepared(id,&session)?;
+        self.associate_command(id,&session)?;
         let command=self.prepared(id)?;
         let settings=command.settings.ok_or_else(||OriginalError::Unavailable("No fresh settings evidence is bound to this original dispatch".into()))?;
         let mut text=PendingText(self.restore_capture(command.text)?);
@@ -79,7 +79,10 @@ impl Store {
         text.0.retained=false;
         Ok(())
     }
-    fn bind_prepared(&mut self,id:&str,session:&str)->Result<(),OriginalError>{
+    /// Bind only an exact command owned by the confirming live actor. This is
+    /// lifecycle ownership, not user acceptance or authority to expose input.
+    pub(crate) fn associate_command(&mut self,id:&str,session:&str)->Result<(),OriginalError>{
+        if !valid_id(session){return Err(OriginalError::TooLarge);}
         let mut command=self.prepared(id)?;
         if command.expected_session.as_deref().is_some_and(|expected|expected!=session){return Err(OriginalError::Changed);}
         command.expected_session=Some(session.to_owned());

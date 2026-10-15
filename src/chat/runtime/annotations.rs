@@ -6,6 +6,7 @@ pub(super) struct Authority {
     scope:Result<LaunchAccountScope,String>,
     session:Option<String>,
     latest_proven:Option<String>,
+    unconfirmed_commands:Vec<String>,
     store:Option<annotations::storage::Store>,
     notice:Option<String>,
     retry_at:Option<std::time::Instant>,
@@ -13,7 +14,7 @@ pub(super) struct Authority {
     root:Option<std::path::PathBuf>,
 }
 impl Authority {
-    pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,latest_proven:None,store:None,notice:None,retry_at:None,#[cfg(test)] root:None}}
+    pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,latest_proven:None,unconfirmed_commands:Vec::new(),store:None,notice:None,retry_at:None,#[cfg(test)] root:None}}
     fn pending_store(&self)->Result<annotations::storage::Store,String>{
         let scope=self.scope.as_ref().map_err(Clone::clone)?;
         #[cfg(test)]
@@ -24,16 +25,19 @@ impl Authority {
     /// of attachment paths happens only after the complete durable publication.
     pub(super) fn prepare(&mut self,command:&mut crate::chat::Command,cwd:&std::path::Path)->Result<Option<String>,OriginalError>{
         let crate::chat::Command::Prompt{text,attachments,..}=command else{return Ok(None);};
+        if self.session.is_none() && self.unconfirmed_commands.len()>=64{return Err(OriginalError::TooLarge);}
         let mut pending=self.pending_store().map_err(OriginalError::Unavailable)?;
         let mut captured_text=pending.capture_text(text)?;
         let mut captures=attachments.iter().map(|attachment|pending.retain_attachment(&if attachment.path.is_absolute(){attachment.path.clone()}else{cwd.join(&attachment.path)})).collect::<Result<Vec<_>,_>>()?;
         let id=uuid::Uuid::new_v4().to_string();
         let prepared=pending.prepare_command(&id,self.session.as_deref(),&mut captured_text,&mut captures)?;
+        if self.session.is_none(){self.unconfirmed_commands.push(id.clone());}
         for (attachment,capture) in attachments.iter_mut().zip(prepared.attachments){attachment.path=capture.path;}
         Ok(Some(id))
     }
     pub(super) fn abandon(&mut self,id:&str)->Result<(),String>{
-        self.pending_store()?.abandon_command(id).map_err(|error|format!("{error:?}"))
+        self.pending_store()?.abandon_command(id).map_err(|error|format!("{error:?}"))?;
+        self.unconfirmed_commands.retain(|command|command!=id);Ok(())
     }
     pub(super) fn originals(&mut self,updates:Vec<annotations::OriginalUpdate>)->Option<String>{
         for update in updates {
@@ -81,6 +85,13 @@ impl Authority {
             }
         }
         let Some(store)=&mut self.store else{return None;};
+        // These IDs came from this exact actor's pre-dispatch capture. Session
+        // confirmation attributes ownership without inventing user acceptance.
+        while let Some(id)=self.unconfirmed_commands.last(){
+            let session=self.session.as_deref().expect("qualified store has session");
+            if let Err(error)=store.associate_command(id,session){return self.warning(format!("{error:?}"));}
+            self.unconfirmed_commands.pop();
+        }
         for update in updates {
             if update.session_id.as_ref()!=self.session.as_ref(){return self.warning("An approval belongs to a different or unconfirmed conversation".into());}
             if let Err(error)=store.approval(&update.key,&update.request_id,update.decision){return self.warning(error);}
@@ -249,6 +260,20 @@ mod tests {
         assert!(authority.originals(vec![OriginalUpdate::Accepted{command_id:id.clone(),session_id:"confirmed-session".into(),user_id:"actual-second-user".into(),turn_id:"actual-second-turn".into(),aliases:vec![]}]).is_some());
         assert_eq!(authority.pending_store().unwrap().prepared(&id).unwrap().expected_session.as_deref(),Some("confirmed-session"));
         authority.store.as_mut().unwrap().purge_for_test().unwrap();assert!(!path.exists());assert!(!pending_path.exists());
+    }
+
+    #[test]
+    fn first_confirmed_session_attributes_only_this_actors_unaccepted_intents_for_cold_purge(){
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
+        let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let storage=root.path().join("annotations");
+        let mut unrelated=annotations::storage::Store::pending_for_test(&storage,&scope).unwrap();let mut text=unrelated.capture_text("other actor unknown intent").unwrap();let other=unrelated.prepare_command("other-command",None,&mut text,&mut []).unwrap();drop(text);drop(unrelated);
+        let mut authority=Authority::new(Ok(scope.clone()));authority.root=Some(storage.clone());let mut command=Command::Prompt{text:"first operator input".into(),attachments:vec![],mode:crate::chat::PromptMode::Send};
+        let id=authority.prepare(&mut command,root.path()).unwrap().unwrap();let own=authority.pending_store().unwrap().prepared(&id).unwrap();assert_eq!(own.expected_session,None);
+        assert!(authority.apply(Some(&Some("actual-session".into())),vec![],&mut vec![]).is_none());
+        assert_eq!(authority.pending_store().unwrap().prepared(&id).unwrap().expected_session.as_deref(),Some("actual-session"));
+        assert!(matches!(authority.original(Some("unknown-user"),0,32),Err(OriginalError::Unavailable(_))),"Lifecycle attribution does not grant original acceptance");drop(authority);
+        let mut cold=annotations::storage::Store::for_test(&storage,&scope,"actual-session").unwrap();cold.purge_for_test().unwrap();assert!(!own.text.path.exists());assert!(other.text.path.exists());assert!(cold.prepared("other-command").is_ok());
     }
 
 }
