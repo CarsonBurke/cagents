@@ -57,7 +57,8 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     }
     let _cleanup = Cleanup { owner: identity.record.clone(), proof: active_proof.clone() };
     let registry = super::super::agent_execution::registry(&host).unwrap();
-    registry.lock().unwrap().bind_agent(accepted.agent.id, None, crate::agent_execution::HostedSession::Chat(host.lock().unwrap().chats[&id].session.clone())).unwrap();
+    let hosted_source = host.lock().unwrap().chats[&id].session.clone();
+    registry.lock().unwrap().bind_agent(accepted.agent.id, None, crate::agent_execution::HostedSession::Chat(hosted_source)).unwrap();
     handle.command_for_run(accepted.run.id, chat::Command::Prompt { text: "One exact slow turn".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap();
     wait_until(|| fs::read_to_string(root.join("produced")).unwrap_or_default().lines().count() >= 3, "provider never began its slow turn");
     assert_eq!(registry.lock().unwrap().agent_run(accepted.run.id).unwrap().state, State::Running);
@@ -102,7 +103,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, reason: &str) {
 fn install_provider(path: &Path) {
     fs::write(path, r#"#!/usr/bin/python3
 import json, os, pathlib, sys, time
-root=pathlib.Path(os.environ['CAGENTS_HOLDER_ROOT'])
+root=pathlib.Path(os.environ['HOME']).parent
 session=next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--session-id=')), 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
 def send(value): print(json.dumps(value),flush=True)
 for line in sys.stdin:
