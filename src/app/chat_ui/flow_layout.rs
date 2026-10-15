@@ -134,7 +134,11 @@ impl Cache {
             entries.logical.retain(|_, entry| entry.strong_count() != 0);
             entries.requests.retain(|_, entry| entry.strong_count() != 0);
         }
-        entries.logical.insert(identity, Rc::downgrade(&entry));
+        if let Some(previous) = entries.logical.insert(identity, Rc::downgrade(&entry)).and_then(|old|old.upgrade()) {
+            let previous = previous.borrow();
+            previous.cancelled.store(true, Ordering::Release);
+            entries.requests.remove(&previous.id);
+        }
         entries.requests.insert(entry.borrow().id, Rc::downgrade(&entry));
         entry
     }
