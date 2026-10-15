@@ -4,29 +4,43 @@ use super::worktree_dialog::WorktreeCreationSource;
 
 #[derive(Debug)]
 pub(super) struct PublishedSource {
-    generation: u64,
+    read_generation: u64,
+    logical_generation: u64,
     repository: PathBuf,
     source: WorktreeCreationSource,
 }
 
 impl Cagents {
-    /// Logical state only: filesystem validation belongs to the worker service.
-    pub(super) fn project_creation_source(&self, project: ProjectId) -> Option<WorktreeCreationSource> {
+    /// Internal refreshes retain their already-published physical actor even
+    /// while a replacement read is in flight. They never mint click authority.
+    pub(super) fn retained_project_creation_source(&self, project: ProjectId) -> Option<WorktreeCreationSource> {
         let row = self.sidebar_model.project(project)?;
         let published = self.project_ui.creation_sources.get(&project)?;
-        (row.kind == ProjectKind::Git && !row.reloading && row.unreachable.is_none()
-            && row.repository == published.repository
-            && row.creation_binding == Some(published.source.id())
-            && self.repository_generations.get(&project) == Some(&published.generation)
+        (row.repository == published.repository && row.creation_binding == Some(published.source.id())
             && published.source.is_available()).then(|| published.source.clone())
     }
 
-    pub(super) fn current_project_creation_source(&self, project: ProjectId, id: OperationId) -> bool {
-        self.project_creation_source(project).is_some_and(|source| source.id() == id)
+    /// New user intents additionally require a completed, current project read.
+    pub(super) fn project_creation_source(&self, project: ProjectId) -> Option<WorktreeCreationSource> {
+        let row = self.sidebar_model.project(project)?;
+        let published = self.project_ui.creation_sources.get(&project)?;
+        if row.kind != ProjectKind::Git || row.reloading || row.unreachable.is_some()
+            || self.repository_generations.get(&project) != Some(&published.read_generation) { return None; }
+        self.retained_project_creation_source(project)
     }
 
-    /// Called before a new project read, close or removal. Retained dialog and
-    /// worker clones are invalidated together, including an already running read.
+    /// Already admitted effects survive an unchanged automatic refresh.
+    pub(super) fn current_project_creation_source(&self, project: ProjectId, id: OperationId) -> bool {
+        self.retained_project_creation_source(project).is_some_and(|source| source.id() == id)
+    }
+
+    pub(super) fn project_creation_generation(&self, project: ProjectId) -> Option<u64> {
+        self.retained_project_creation_source(project)?;
+        Some(self.project_ui.creation_sources.get(&project)?.logical_generation)
+    }
+
+    /// Called on actual ownership replacement, close or removal. Retained
+    /// dialog and worker clones are invalidated together.
     pub(super) fn retire_project_creation_source(&mut self, project: ProjectId) {
         self.invalidate_project_worktree_creations(project);
         if let Some(published) = self.project_ui.creation_sources.remove(&project) {
@@ -43,6 +57,18 @@ impl Cagents {
             if let Some(source) = source { source.invalidate(); }
             return;
         }
+        // A verified refresh carries the SAME source. Keep its logical
+        // generation and all accepted workers; only its read counter advances.
+        if let (Some(incoming), Some(published)) = (source.as_ref(), self.project_ui.creation_sources.get_mut(&project)) {
+            if incoming.id() == published.source.id() && incoming.is_available() {
+                if let Some(row) = self.sidebar_model.projects.iter_mut().find(|row| row.id == project && row.repository == published.repository) {
+                    published.read_generation = generation;
+                    row.creation_binding = Some(incoming.id());
+                    row.creation_unavailable_reason = None;
+                    return;
+                }
+            }
+        }
         self.retire_project_creation_source(project);
         let Some(row) = self.sidebar_model.projects.iter_mut().find(|row| row.id == project) else {
             if let Some(source) = source { source.invalidate(); }
@@ -57,7 +83,8 @@ impl Cagents {
             row.creation_binding = Some(source.id());
             row.creation_unavailable_reason = None;
             self.project_ui.creation_sources.insert(project, PublishedSource {
-                generation, repository: row.repository.clone(), source,
+                read_generation: generation, logical_generation: generation,
+                repository: row.repository.clone(), source,
             });
         }
     }
