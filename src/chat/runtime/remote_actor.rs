@@ -5,6 +5,7 @@ pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
 pub(crate) mod final_snapshot;
 mod deadline_io;
+mod source_reads;
 use super::{LocalHandle, Rejection, Update};
 use crate::{
     chat::{
@@ -893,6 +894,19 @@ impl RemoteActor {
         )?;
         let response: Result<Value, String> = receive(&control, TIMEOUT)?;
         serde_json::from_value(response?).map_err(|error| error.to_string())
+    }
+    // Cache-read calls have one budget across connection and every partial
+    // frame transfer. Decode directly into the bounded typed reply.
+    fn call_until<T: DeserializeOwned>(
+        &self, method: &str, args: Value, deadline: Instant,
+    ) -> Result<T, String> {
+        let control=registry::connect_until(&self.0.socket,deadline).map_err(|error|error.to_string())?;
+        verify_peer(&control,&self.0.identity.record)?;
+        deadline_io::send_until(&control,&Invocation {
+            proof:self.0.proof.clone(),epoch:Some(self.0.epoch),method:method.into(),args,
+        },deadline)?;
+        let response:Result<T,String>=deadline_io::receive_until(&control,deadline)?;
+        response
     }
     pub fn enqueue(
         &self,
@@ -1869,6 +1883,10 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
+            "source_query" => {
+                let query=decode!(chat::cache::SourceQuery);
+                value!(self.actor.source_query(query))
+            }
             "execution_environment" => value!(self.environment.clone()),
             "restart" => {
                 if self.session_stopping {

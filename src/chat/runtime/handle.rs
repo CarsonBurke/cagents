@@ -16,6 +16,17 @@ enum Owner {
     Remote(RemoteActor),
 }
 impl Handle {
+    /// Read original ingestion bytes outside HostLock. The Store-issued epoch
+    /// remains authoritative across proxy and provider replacement.
+    pub(crate) fn source_query(
+        &self,
+        query: chat::cache::SourceQuery,
+    ) -> Result<chat::cache::SourcePage, chat::cache::SourceError> {
+        match &self.0 {
+            Owner::Local(local) => local.source_query(query),
+            Owner::Remote(remote) => remote.source_query(query),
+        }
+    }
     /// Exact authenticated helper metadata. Callers must compare the complete
     /// record against an installed host entry; this is never cleanup authority.
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
