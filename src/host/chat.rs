@@ -110,6 +110,10 @@ pub(super) struct TerminalHandoff {
 pub(super) const ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(300);
 
 impl TerminalHandoff {
+    pub(super) fn source(&self) -> &Session {
+        &self.source
+    }
+
     pub(super) fn new(
         source: Session,
         terminal: crate::model::TerminalSession,
@@ -417,6 +421,16 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let proof = state.proof().clone();
+    if let Update::AccountUsage {
+        report,
+        observed_at,
+    } = &update
+        && let (Some(signal), Some(record)) = (&state.account_routing, state.chats.get(&id))
+    {
+        if let Ok(scope) = record.handle.launch_account_scope() {
+            signal.record(scope, report.clone(), *observed_at);
+        }
+    }
     // A conversation that starts or settles may take the messages left for it.
     if matches!(
         &update,
@@ -1743,12 +1757,61 @@ impl Drop for AccountSwitchReservation {
     }
 }
 
+fn ensure_account_handoff_unowned(
+    state: &HostState,
+    source: &Session,
+    replacement: &Session,
+) -> Result<(), ProtocolError> {
+    let held = state.chats.iter().any(|(id, record)| {
+        let mut launch = record.session.launch.clone();
+        launch.session_id = record.handle.session_id();
+        *id != source.id
+            && record.handle.owns_work()
+            && same_conversation(&launch, &replacement.launch)
+    }) || state.chat_spawning.iter().any(|(id, pending)| {
+        *id != source.id && same_conversation(&pending.launch, &replacement.launch)
+    }) || state.chat_handoffs.iter().any(|(id, pending)| {
+        *id != source.id && same_conversation(&pending.source.launch, &replacement.launch)
+    }) || state.native_closing.iter().any(|(id, pending)| {
+        *id != source.id && same_conversation(&pending.source().launch, &replacement.launch)
+    });
+    if held {
+        return Err(error(
+            "This exact conversation has another live or unconfirmed owner; close it before changing accounts",
+        ));
+    }
+    if let Some(id) = replacement.launch.session_id.as_deref() {
+        for (&terminal_id, record) in &state.terminals {
+            if record.handle.is_completed() || terminal_id == source.id {
+                continue;
+            }
+            let hint = record
+                .session
+                .resume_hint
+                .as_deref()
+                .and_then(crate::model::agent_recovery::observed_launch_from_hint);
+            let recipe = hint.as_ref().unwrap_or(&record.session.launch);
+            if recipe
+                .arguments
+                .iter()
+                .any(|arg| arg == id || arg.split_once('=').is_some_and(|(_, value)| value == id))
+            {
+                return Err(error(format!(
+                    "The exact conversation is already owned by CLI terminal {terminal_id}; close it before changing accounts"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn recover_account(
     host: &SharedHost,
     client: ClientId,
     source: Session,
     replacement: Session,
     idle_generation: Option<u64>,
+    explicit: bool,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
 ) -> Result<ServerResponse, ProtocolError> {
     if !chat::is_account_recovery(&source, &replacement)
@@ -1760,25 +1823,44 @@ fn recover_account(
         ));
     }
     let automatic = idle_generation.is_some();
+    if explicit
+        && replacement
+            .launch
+            .recipe
+            .environment
+            .contains_key(crate::account::routing::AUTOMATIC_MARKER)
+    {
+        return Err(error(
+            "An explicitly selected account must pin the conversation",
+        ));
+    }
     match check_launch_account(&source.launch) {
         Err(failure) if failure.code == ProtocolErrorCode::AccountRemoved => {}
         Err(failure) => return Err(failure),
-        Ok(()) if automatic => {}
+        Ok(()) if automatic || explicit => {}
         Ok(()) => {
             return Err(error(
                 "The original account is available; retry the saved conversation normally",
             ));
         }
     }
+    // Check all other writers before touching either history or stopping the
+    // source. The final start guard is too late to protect a live target's files.
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_account_handoff_unowned(&state, &source, &replacement)?;
+    }
     let mut reservation = None;
+    let mut current_options = None;
     if let Some(generation) = idle_generation {
-        if source
-            .launch
-            .recipe
-            .environment
-            .get(crate::account::routing::AUTOMATIC_MARKER)
-            .map(String::as_str)
-            != Some("1")
+        if !explicit
+            && source
+                .launch
+                .recipe
+                .environment
+                .get(crate::account::routing::AUTOMATIC_MARKER)
+                .map(String::as_str)
+                != Some("1")
         {
             return Err(error("This conversation has an explicitly pinned account"));
         }
@@ -1809,9 +1891,20 @@ fn recover_account(
         // The actor checks this generation after every previously admitted
         // command. A UI snapshot alone cannot prove a timed-out turn is idle.
         crate::account::handoff::preflight(&source, &replacement).map_err(unavailable)?;
-        handle
-            .close_if_idle_for_resume(generation)
+        current_options = handle
+            .close_for_account_switch(generation)
             .map_err(unavailable)?;
+        if current_options.is_none() {
+            return Err(if explicit {
+                ProtocolError::new(
+                    ProtocolErrorCode::AccountSwitchBusy,
+                    "A newer turn is using the original account; the switch remains queued until it is idle.",
+                    false,
+                )
+            } else {
+                unavailable("The original conversation changed before the automatic account switch")
+            });
+        }
         crate::account::handoff::prepare(&source, &replacement).map_err(unavailable)?;
     }
     {
@@ -1826,10 +1919,9 @@ fn recover_account(
             ));
         }
         if (!automatic && state.chat_spawning.contains_key(&source.id))
-            || state
-                .chats
-                .get(&source.id)
-                .is_some_and(|record| record.handle.owns_work())
+            || state.chats.get(&source.id).is_some_and(|record| {
+                record.handle.owns_work() || (!automatic && !record.handle.is_completed())
+            })
             || state
                 .terminals
                 .get(&source.id)
@@ -1840,6 +1932,9 @@ fn recover_account(
                 "The original conversation still owns work; reconnect or close it before changing accounts",
             ));
         }
+    }
+    if !automatic {
+        crate::account::handoff::prepare(&source, &replacement).map_err(unavailable)?;
     }
     let id = replacement.id;
     // The checks above prove the candidate replaces the source, so it joins the
@@ -1871,7 +1966,7 @@ fn recover_account(
     start(
         host,
         client,
-        replacement,
+        replacement.clone(),
         None,
         false,
         None,
@@ -1892,6 +1987,16 @@ fn recover_account(
         || crate::daemon::termination_requested(),
     );
     let response = confirmation.map_err(unavailable).and_then(|()| {
+        if let Some(options) = &current_options {
+            handle
+                .restore_account_options(options, Instant::now() + Duration::from_secs(15), || {
+                    crate::daemon::termination_requested()
+                })
+                .map_err(unavailable)?;
+        }
+        handle
+            .account_switch_notice(&source.launch, &replacement.launch)
+            .map_err(unavailable)?;
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, id)?;
         if !record.handle.same_actor(&handle)
@@ -2017,10 +2122,35 @@ fn process_inner(
             }
             Ok(ServerResponse::ChatResumePrepared { session })
         }
+        ClientRequest::ChatAccountSwitchGeneration { source } => {
+            let handle = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(source.proof.as_ref(), state.proof())?;
+                let record = state.chats.get(&source.id).ok_or_else(|| {
+                    unavailable("The queued switch's original conversation is no longer hosted")
+                })?;
+                if record.session.launch.provider != source.launch.provider
+                    || record.session.launch.recipe != source.launch.recipe
+                    || record.handle.confirmed_session_id() != source.launch.session_id
+                    || record.paired_terminal.is_some()
+                    || record.returning_terminal
+                    || state.chat_handoffs.contains_key(&source.id)
+                    || state.chat_spawning.contains_key(&source.id)
+                {
+                    return Err(error(
+                        "The original conversation changed before the queued account switch",
+                    ));
+                }
+                record.handle.clone()
+            };
+            let generation = handle.account_switch_generation().map_err(unavailable)?;
+            Ok(ServerResponse::ChatAccountSwitchGeneration { generation })
+        }
         ClientRequest::ChatRecoverAccount {
             source,
             replacement,
             idle_generation,
+            explicit,
             execution_environment,
         } => recover_account(
             host,
@@ -2028,6 +2158,7 @@ fn process_inner(
             source,
             replacement,
             idle_generation,
+            explicit,
             execution_environment,
         ),
         ClientRequest::ChatPreview { session, source } => preview(host, session, source),
@@ -2366,7 +2497,11 @@ fn process_inner(
             // shuts down. The final confirmed snapshot wins over launch flags.
             let recipe = session
                 .launch
-                .terminal_recipe_with_current_options(snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref(), snapshot.permission_mode.as_deref())
+                .terminal_recipe_with_current_options(
+                    snapshot.selected_model.as_deref(),
+                    snapshot.reasoning.as_deref(),
+                    snapshot.permission_mode.as_deref(),
+                )
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
@@ -4012,13 +4147,31 @@ for line in sys.stdin:
     struct Echo(bool);
     #[test]
     fn automatic_handoff_fences_idle_state_and_confirms_the_same_conversation() {
+        handoff_contract(false);
+    }
+    #[test]
+    fn explicit_handoff_accepts_a_pinned_account_and_records_a_transcript_notice() {
+        handoff_contract(true);
+    }
+
+    fn handoff_contract(explicit: bool) {
         use std::os::unix::fs::PermissionsExt;
         struct Idle;
         impl Adapter for Idle {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step::default())
             }
-            fn command(&mut self, _: Command) -> Result<Step, String> {
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                if let Command::SetModel { model, reasoning } = command {
+                    return Ok(Step {
+                        events: vec![Event::Models {
+                            models: Vec::new(),
+                            selected: Some(model),
+                            reasoning,
+                        }],
+                        ..Step::default()
+                    });
+                }
                 Err("No work is issued by this fixture".into())
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
@@ -4036,14 +4189,18 @@ for line in sys.stdin:
         }
         let directory = tempfile::tempdir().unwrap();
         let cwd = directory.path().canonicalize().unwrap();
-        let provider = directory.path().join("claude");
+        let provider = directory.path().join(if explicit {
+            "provider-wrapper"
+        } else {
+            "claude"
+        });
         let conversation = "12345678-1234-4234-8234-123456789abc";
         std::fs::write(&provider, format!(r#"#!/bin/sh
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"{conversation}"}}'
 while IFS= read -r frame; do
     request=$(printf '%s' "$frame" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
     if [ -n "$request" ]; then
-        printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"commands":[],"models":[]}}}}}}\n' "$request"
+        printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"commands":[],"models":[{{"value":"competing-client-model","displayName":"Chosen model","supportedEffortLevels":["high"]}}]}}}}}}\n' "$request"
     fi
 done
 "#)).unwrap();
@@ -4077,7 +4234,7 @@ done
         let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
             proof.clone(),
         )));
-        let source = Session {
+        let mut source = Session {
             id: TerminalId::new(),
             owned_codex_listener: None,
             native_continuity: Default::default(),
@@ -4102,6 +4259,13 @@ done
                 },
             },
         };
+        if explicit {
+            source
+                .launch
+                .recipe
+                .environment
+                .remove(crate::account::routing::AUTOMATIC_MARKER);
+        }
         let mut process_recipe = source.launch.recipe.clone();
         process_recipe.program = "/bin/cat".into();
         let spec = ProcessSpec::from(&process_recipe);
@@ -4156,7 +4320,84 @@ done
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
-        let generation = handle.snapshot(None).unwrap().generation;
+        let mut generation = handle.snapshot(None).unwrap().generation;
+        // A second actor (or an admitted start) with this provider UUID must
+        // refuse before either copying into its home or stopping this actor.
+        let mut other = replacement.clone();
+        other.id = TerminalId::new();
+        {
+            let mut state = host.lock().unwrap();
+            state.chats.insert(
+                other.id,
+                Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: other.clone(),
+                    handle: handle.clone(),
+                    source_process: None,
+                    subscribers: BTreeMap::new(),
+                    observations: BTreeMap::new(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+        }
+        let failure = recover_account(
+            &host,
+            1,
+            source.clone(),
+            replacement.clone(),
+            Some(generation),
+            explicit,
+            Default::default(),
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .message
+                .contains("another live or unconfirmed owner")
+        );
+        assert!(!handle.is_completed());
+        assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+        {
+            let mut state = host.lock().unwrap();
+            state.chats.remove(&other.id);
+            state.chat_spawning.insert(other.id, other.clone());
+            assert!(ensure_account_handoff_unowned(&state, &source, &replacement).is_err());
+            state.chat_spawning.remove(&other.id);
+        }
+        if explicit {
+            let queried = handle.account_switch_generation().unwrap().unwrap();
+            handle
+                .command(Command::SetModel {
+                    model: "competing-client-model".into(),
+                    reasoning: Some("high".into()),
+                })
+                .unwrap();
+            generation = handle.account_switch_generation().unwrap().unwrap();
+            assert_ne!(
+                generation, queried,
+                "competing command must invalidate the queried generation"
+            );
+            let refusal = recover_account(
+                &host,
+                1,
+                source.clone(),
+                replacement.clone(),
+                Some(queried),
+                true,
+                Default::default(),
+            )
+            .unwrap_err();
+            assert_eq!(refusal.code, ProtocolErrorCode::AccountSwitchBusy);
+            assert!(
+                !handle.is_completed(),
+                "proved refusal cannot close the original actor"
+            );
+            assert!(host.lock().unwrap().chat_spawning.is_empty());
+            assert_eq!(std::fs::read(&transcript).unwrap(), b"{}\n");
+        }
         let mut pinned = source.clone();
         pinned
             .launch
@@ -4176,6 +4417,7 @@ done
                 pinned,
                 pinned_replacement,
                 Some(generation),
+                false,
                 Default::default()
             )
             .unwrap_err()
@@ -4189,6 +4431,7 @@ done
                 source.clone(),
                 replacement.clone(),
                 Some(generation + 1),
+                explicit,
                 Default::default()
             )
             .is_err()
@@ -4201,6 +4444,7 @@ done
             source.clone(),
             replacement.clone(),
             Some(generation),
+            explicit,
             Default::default(),
         )
         .unwrap();
@@ -4209,6 +4453,18 @@ done
         };
         assert_eq!(session.launch.session_id.as_deref(), Some(conversation));
         assert_eq!(snapshot.session_id.as_deref(), Some(conversation));
+        if explicit {
+            assert_eq!(
+                snapshot.selected_model.as_deref(),
+                Some("competing-client-model")
+            );
+            assert_eq!(snapshot.reasoning.as_deref(), Some("high"));
+            assert_eq!(
+                session.launch.recipe, replacement.launch.recipe,
+                "current controls must not mutate the issued launch descriptor"
+            );
+        }
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("Account switched") && text.contains(original_home.to_str().unwrap()) && text.contains(alternate_home.to_str().unwrap()))));
         assert_eq!(
             std::fs::read(
                 alternate_home

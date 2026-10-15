@@ -35,7 +35,35 @@ const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
+/// Current, actor-confirmed controls, separate from the immutable issued recipe.
+/// Codex can stage model/effort for the next prompt without persisting them yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountSwitchOptions {
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub permission_mode: Option<String>,
+    pub fast_mode: Option<bool>,
+    pub permissions: Option<super::PermissionSettings>,
+}
+impl AccountSwitchOptions {
+    fn capture(state: &Snapshot) -> Self {
+        Self {
+            model: state.selected_model.clone(),
+            reasoning: state.reasoning.clone(),
+            permission_mode: state.permission_mode.clone(),
+            fast_mode: state.fast_mode.as_ref().map(super::FastMode::enabled),
+            permissions: state.permissions.clone(),
+        }
+    }
+}
+
 enum ActorCommand {
+    AccountNotice(String),
+    AccountSwitchGeneration(crossbeam_channel::Sender<Option<u64>>),
+    CloseForAccountSwitch {
+        generation: u64,
+        admitted: crossbeam_channel::Sender<Option<AccountSwitchOptions>>,
+    },
     UpdateSource(
         super::Session,
         Option<crate::model::LaunchRecipe>,
@@ -546,6 +574,28 @@ impl Handle {
         }
         Ok(handle)
     }
+    pub(crate) fn account_switch_notice(
+        &self,
+        source: &super::Launch,
+        target: &super::Launch,
+    ) -> Result<(), String> {
+        let home = crate::account::home_variable(target.provider).unwrap_or_default();
+        let source = source
+            .recipe
+            .environment
+            .get(home)
+            .map(String::as_str)
+            .unwrap_or("system");
+        let target = target
+            .recipe
+            .environment
+            .get(home)
+            .map(String::as_str)
+            .unwrap_or("system");
+        // Account identifiers are non-secret metadata; never include credentials.
+        self.ownership_command(ActorCommand::AccountNotice(format!("Account switched from {source} to {target}. This is the same saved conversation; provider caches may be rebuilt.")))
+    }
+
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.submit_command(None, command).map_err(String::from)
     }
@@ -660,6 +710,125 @@ impl Handle {
         self.close_for_resume()
     }
 
+    /// None proves the close was refused before teardown or handoff effects.
+    /// Errors are uncertain and must never authorize an automatic retry.
+    pub(crate) fn close_for_account_switch(
+        &self,
+        generation: u64,
+    ) -> Result<Option<AccountSwitchOptions>, String> {
+        if matches!(
+            self.native_continuity(),
+            super::NativeContinuity::Durable { .. }
+        ) {
+            self.0.retain_cleanup_receipt.store(true, Ordering::Release);
+        }
+        let (admitted, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::CloseForAccountSwitch {
+            generation,
+            admitted,
+        })?;
+        let admitted = response.try_recv().map_err(|error| {
+            format!("Account-switch close admission was not acknowledged: {error}")
+        })?;
+        if admitted.is_some() {
+            self.close_for_resume()?;
+        }
+        Ok(admitted)
+    }
+
+    /// Restore controls only after exact-thread confirmation. No prompt is issued,
+    /// and the successor's published launch recipe remains the original contract.
+    pub(crate) fn restore_account_options(
+        &self,
+        options: &AccountSwitchOptions,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut model_sent = false;
+        let mut permission_sent = false;
+        let mut fast_sent = false;
+        let mut permissions_requested = false;
+        loop {
+            if cancelled() || self.is_completed() {
+                return Err("The account switch stopped before the current conversation options were confirmed".into());
+            }
+            if let Some(failure) = self.failure() {
+                return Err(failure);
+            }
+            let snapshot = self
+                .snapshot(None)
+                .ok_or("The account switch options are unavailable")?;
+            if snapshot.ready {
+                let model_matches = options.model.is_none()
+                    || (snapshot.selected_model == options.model
+                        && snapshot.reasoning == options.reasoning);
+                let permission_matches = options.permission_mode.is_none()
+                    || snapshot.permission_mode == options.permission_mode;
+                let fast_matches = options.fast_mode.is_none()
+                    || snapshot.fast_mode.as_ref().map(super::FastMode::enabled)
+                        == options.fast_mode;
+                // Account-owned inherited rules are never rewritten as session
+                // rules. If known permissions differ, refuse the seamless handoff
+                // rather than silently losing a restriction or granting access.
+                let permissions_match =
+                    options.permissions.is_none() || snapshot.permissions == options.permissions;
+                if model_matches && permission_matches && fast_matches && permissions_match {
+                    return Ok(());
+                }
+                if options.fast_mode == Some(false)
+                    && snapshot
+                        .fast_mode
+                        .as_ref()
+                        .is_some_and(super::FastMode::enabled)
+                {
+                    // A successor may restart with the issued recipe's fast tier.
+                    // Disable it and await confirmation before a non-fast model
+                    // can be selected. Enabling follows model restoration below.
+                    if !fast_sent {
+                        self.command(Command::SetFastMode { enabled: false })?;
+                        fast_sent = true;
+                    }
+                } else if !model_matches
+                    && !model_sent
+                    && snapshot
+                        .models
+                        .iter()
+                        .any(|model| Some(&model.id) == options.model.as_ref())
+                {
+                    self.command(Command::SetModel {
+                        model: options.model.clone().expect("a differing known model"),
+                        reasoning: options.reasoning.clone(),
+                    })?;
+                    model_sent = true;
+                } else if model_matches && !permission_matches && !permission_sent {
+                    self.command(Command::SetPermissionMode {
+                        mode: options
+                            .permission_mode
+                            .clone()
+                            .expect("a differing known permission mode"),
+                    })?;
+                    permission_sent = true;
+                } else if model_matches && permission_matches && !fast_matches && !fast_sent {
+                    self.command(Command::SetFastMode {
+                        enabled: options.fast_mode.expect("a differing known fast mode"),
+                    })?;
+                    fast_sent = true;
+                } else if model_matches
+                    && permission_matches
+                    && !permissions_match
+                    && !permissions_requested
+                {
+                    self.command(Command::RefreshPermissions)?;
+                    permissions_requested = true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("The alternate account could not confirm the current model, reasoning, permissions and speed settings; continue separately with an explicit choice".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Checks readiness on the actor after all previously queued commands.
     /// The caller must hold the host's exclusive control gate until checkpoint
     /// preparation finishes: a snapshot alone cannot fence a command whose
@@ -671,6 +840,15 @@ impl Handle {
         response
             .try_recv()
             .map_err(|error| format!("Provider update readiness was not acknowledged: {error}"))
+    }
+
+    /// An actor-ordered metadata barrier; never hydrates transcript history.
+    pub(crate) fn account_switch_generation(&self) -> Result<Option<u64>, String> {
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::AccountSwitchGeneration(reply))?;
+        response
+            .try_recv()
+            .map_err(|error| format!("Account-switch readiness was not acknowledged: {error}"))
     }
 
     pub(crate) fn interrupt_run(&self, run: crate::model::RunId) -> Result<(), String> {
@@ -1940,6 +2118,35 @@ impl Actor {
             }
             let (run, command) = match command {
                 ActorCommand::Provider { run, command } => (run, command),
+                ActorCommand::AccountSwitchGeneration(readiness) => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let generation = (self.update_readiness(&state) == UpdateReadiness::Idle
+                        && self.adapter.account_switch_ready()
+                        && state.queued_messages.is_empty())
+                    .then_some(state.generation);
+                    drop(state);
+                    let _ = readiness.send(generation);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                ActorCommand::AccountNotice(text) => {
+                    let result = self.step(Step {
+                        events: vec![Event::Item(Item {
+                            started_at: super::now_ms(),
+                            id: format!("cagents-account-switch-{}", uuid::Uuid::new_v4()),
+                            role: super::Role::System,
+                            content: ItemContent::Text {
+                                text,
+                                thinking: false,
+                                phase: Phase::Final,
+                            },
+                            at: super::now_ms(),
+                        })],
+                        ..Step::default()
+                    });
+                    let _ = reply.send(result);
+                    continue;
+                }
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
                         .native_holder
@@ -1987,6 +2194,23 @@ impl Actor {
                         }
                     }
                     (None, Command::Interrupt)
+                }
+                ActorCommand::CloseForAccountSwitch {
+                    generation,
+                    admitted,
+                } => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let idle = state.generation == generation
+                        && self.update_readiness(&state) == UpdateReadiness::Idle
+                        && self.adapter.account_switch_ready()
+                        && state.queued_messages.is_empty();
+                    if idle {
+                        self.stop.store(true, Ordering::Release);
+                    }
+                    let options = idle.then(|| AccountSwitchOptions::capture(&state));
+                    let _ = admitted.send(options);
+                    let _ = reply.send(Ok(()));
+                    continue;
                 }
                 ActorCommand::CloseIfIdle { generation } => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());

@@ -1534,6 +1534,15 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn account_switch_ready(&self) -> bool {
+        !self.controls.values().any(|request| {
+            matches!(
+                request["subtype"].as_str(),
+                Some("set_model" | "apply_flag_settings" | "set_permission_mode")
+            )
+        })
+    }
+
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -8237,12 +8246,17 @@ mod tests {
             selected: Some("old".into()),
             ..Claude::default()
         };
+        assert!(adapter.account_switch_ready());
         let step = adapter
             .command(Command::SetModel {
                 model: "sonnet".into(),
                 reasoning: Some("high".into()),
             })
             .unwrap();
+        assert!(
+            !adapter.account_switch_ready(),
+            "the selected model is not yet acknowledged"
+        );
         assert!(
             step.writes[0]["request"]
                 .get("_cagents_reasoning")
@@ -8259,6 +8273,10 @@ mod tests {
             json!({"subtype":"apply_flag_settings","settings":{"effortLevel":"high"}})
         );
         assert_eq!(adapter.reasoning, None);
+        assert!(
+            !adapter.account_switch_ready(),
+            "effort confirmation is still pending"
+        );
         adapter
             .receive(reply(
                 next.writes[0]["request_id"].as_str().unwrap(),
@@ -8266,6 +8284,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+        assert!(adapter.account_switch_ready());
     }
 
     #[test]

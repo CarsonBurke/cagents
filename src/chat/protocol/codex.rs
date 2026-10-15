@@ -367,6 +367,7 @@ fn create_inner(
             selection_dirty: false,
             service_tier: None,
             service_tier_revision: 0,
+            permission_pending: None,
             fast_models: Default::default(),
             effective_model: None,
             pricing: Default::default(),
@@ -427,6 +428,9 @@ enum Pending {
     /// wire announces that the figures a reader was looking at have moved.
     Compact,
     Other,
+    Permission {
+        mode: String,
+    },
     FastMode {
         enabled: bool,
         revision: u64,
@@ -509,6 +513,7 @@ struct Codex {
     selection_dirty: bool,
     service_tier: Option<String>,
     service_tier_revision: u64,
+    permission_pending: Option<String>,
     fast_models: std::collections::BTreeSet<String>,
     effective_model: Option<String>,
     pricing: chat::pricing::CostTracker,
@@ -1478,6 +1483,16 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn account_switch_ready(&self) -> bool {
+        self.permission_pending.is_none()
+            && !self.pending.values().any(|pending| {
+                matches!(
+                    pending,
+                    Pending::FastMode { .. } | Pending::Permission { .. }
+                )
+            })
+    }
+
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -1622,6 +1637,9 @@ impl Adapter for Codex {
                 if !self.direct_input || self.busy {
                     return Err("Codex permissions can be changed only on an idle, writable thread".into());
                 }
+                if self.permission_pending.is_some() {
+                    return Err("Wait for Codex to confirm the previous permission change".into());
+                }
                 let (approval, sandbox) = match mode.as_str() {
                     "yolo" => ("never", "dangerFullAccess"),
                     "workspaceWrite" => ("on-request", "workspaceWrite"),
@@ -1632,7 +1650,8 @@ impl Adapter for Codex {
                     "threadId": self.thread,
                     "approvalPolicy": approval,
                     "sandboxPolicy": {"type": sandbox},
-                }), Pending::Other)?;
+                }), Pending::Permission { mode: mode.clone() })?;
+                self.permission_pending = Some(mode);
             }
             Command::Compact => {
                 if !self.capabilities().compact || self.busy { return Err("Codex compaction requires an idle, writable thread".into()); }
@@ -1709,6 +1728,11 @@ impl Adapter for Codex {
                 self.history_loading = false;
             }
             if let Some(error) = frame.get("error") {
+                if let Pending::Permission { mode } = &pending
+                    && self.permission_pending.as_ref() == Some(mode)
+                {
+                    self.permission_pending = None;
+                }
                 if let Pending::LoginRecovery {
                     failure, revision, ..
                 } = &pending
@@ -2350,6 +2374,10 @@ impl Adapter for Codex {
                 Pending::ChildRpc { .. } => unreachable!("child responses routed above"),
                 // The child's own turn completion reports how it ended.
                 Pending::StopChild | Pending::Prediction => {}
+                Pending::Permission { .. } => {
+                    // A successful RPC only accepts the request. The settings
+                    // notification confirms the policy actually in effect.
+                }
                 Pending::Other => {
                     if result["thread"].is_object() {
                         self.thread_state(&result["thread"], &mut step)?;
@@ -2499,6 +2527,9 @@ impl Adapter for Codex {
                     &params["threadSettings"]["approvalPolicy"],
                     &params["threadSettings"]["sandboxPolicy"],
                 );
+                if mode == self.permission_pending.as_deref() {
+                    self.permission_pending = None;
+                }
                 step.events
                     .push(Event::PermissionMode(mode.map(str::to_owned)));
                 if !self.selection_dirty {
@@ -4268,6 +4299,7 @@ mod tests {
             selection_dirty: false,
             service_tier: None,
             service_tier_revision: 0,
+            permission_pending: None,
             fast_models: Default::default(),
             effective_model: None,
             pricing: Default::default(),
@@ -4972,6 +5004,186 @@ mod tests {
     }
 
     #[test]
+    fn rejected_permission_control_releases_the_account_switch_fence() {
+        let mut adapter = adapter();
+        let pending = adapter
+            .command(Command::SetPermissionMode {
+                mode: "readOnly".into(),
+            })
+            .unwrap();
+        assert!(!adapter.account_switch_ready());
+        let refused = adapter
+            .receive(json!({"id":pending.writes[0]["id"],
+            "error":{"code":-32602,"message":"Policy refuses this change"}}))
+            .unwrap();
+        assert!(
+            refused
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(
+            adapter.account_switch_ready(),
+            "a refused setting is no longer pending"
+        );
+    }
+
+    #[test]
+    fn account_switch_captures_unsent_model_and_effort_for_the_successors_next_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().to_path_buf(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = super::ProcessSpec::from(&recipe);
+        let original = adapter();
+        let mut initial = Step {
+            events: vec![
+                Event::Ready(true),
+                Event::Session {
+                    id: "thread-exact".into(),
+                    title: None,
+                },
+            ],
+            ..Step::default()
+        };
+        original.model_events(&mut initial);
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = chat::runtime::Handle::start(
+            spec,
+            Box::new(original),
+            initial,
+            store,
+            Some("thread-exact".into()),
+            |_| {},
+        )
+        .unwrap();
+        handle
+            .command(Command::SetModel {
+                model: "model".into(),
+                reasoning: Some("future-effort".into()),
+            })
+            .unwrap();
+        // No prompt or provider persistence occurs between this selection and
+        // the actor-ordered ownership fence.
+        let generation = handle.account_switch_generation().unwrap().unwrap();
+        let options = handle
+            .close_for_account_switch(generation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.model.as_deref(), Some("model"));
+        assert_eq!(options.reasoning.as_deref(), Some("future-effort"));
+        assert_eq!(options.fast_mode, Some(false));
+        // Its immutable issued launch still enables fast, so the successor
+        // begins on a fast-capable model before restoring the latest choice.
+        let mut successor = adapter();
+        successor.models.push(Model {
+            id: "fast-model".into(),
+            label: "Fast model".into(),
+            reasoning: Vec::new(),
+        });
+        successor.fast_models.insert("fast-model".into());
+        successor.selected = Some("fast-model".into());
+        successor.service_tier = Some("fast".into());
+        assert!(
+            successor
+                .command(Command::SetModel {
+                    model: "model".into(),
+                    reasoning: options.reasoning.clone()
+                })
+                .is_err(),
+            "the old tier prevents selecting the captured non-fast model"
+        );
+        let log = directory.path().join("successor-rpc.jsonl");
+        let mut recipe = recipe;
+        recipe.program = "/usr/bin/python3".into();
+        recipe.arguments = vec![
+            "-u".into(),
+            "-c".into(),
+            r#"import json,sys
+for line in sys.stdin:
+    frame=json.loads(line)
+    with open(sys.argv[1], 'a') as log: log.write(json.dumps(frame)+'\n')
+    result={'turn': {'id': 'successor-turn'}} if frame.get('method')=='turn/start' else {}
+    print(json.dumps({'id': frame['id'], 'result': result}), flush=True)
+"#
+            .into(),
+            log.to_string_lossy().into_owned(),
+        ];
+        let spec = super::ProcessSpec::from(&recipe);
+        let mut initial = Step {
+            events: vec![
+                Event::Ready(true),
+                Event::Session {
+                    id: "thread-exact".into(),
+                    title: None,
+                },
+            ],
+            ..Step::default()
+        };
+        successor.model_events(&mut initial);
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let successor = chat::runtime::Handle::start(
+            spec,
+            Box::new(successor),
+            initial,
+            store,
+            Some("thread-exact".into()),
+            |_| {},
+        )
+        .unwrap();
+        successor
+            .restore_account_options(
+                &options,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                || false,
+            )
+            .unwrap();
+        let restored = successor.snapshot(None).unwrap();
+        assert_eq!(restored.selected_model, options.model);
+        assert_eq!(restored.reasoning, options.reasoning);
+        assert!(!restored.fast_mode.unwrap().enabled());
+        let before_prompt = std::fs::read_to_string(&log).unwrap();
+        let writes: Vec<Value> = before_prompt
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            writes.len(),
+            1,
+            "restoring controls must not replay a prompt"
+        );
+        assert_eq!(writes[0]["method"], "thread/settings/update");
+        assert!(writes[0]["params"]["serviceTier"].is_null());
+        successor
+            .command(Command::Prompt {
+                text: "Only the new user message".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let turn = loop {
+            let written = std::fs::read_to_string(&log).unwrap();
+            if let Some(turn) = written
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|frame| frame["method"] == "turn/start")
+            {
+                break turn;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(turn["params"]["model"], "model");
+        assert_eq!(turn["params"]["effort"], "future-effort");
+        successor.close().unwrap();
+    }
+
+    #[test]
     fn metadata_refresh_preserves_the_model_selected_for_the_next_prompt() {
         let mut adapter = adapter();
         adapter.models.push(Model {
@@ -5112,6 +5324,7 @@ mod tests {
             let step = adapter
                 .command(Command::SetPermissionMode { mode: mode.into() })
                 .unwrap();
+            assert!(!adapter.account_switch_ready());
             assert_eq!(step.writes[0]["method"], "thread/settings/update");
             assert_eq!(step.writes[0]["params"]["approvalPolicy"], approval);
             assert_eq!(step.writes[0]["params"]["sandboxPolicy"]["type"], sandbox);
@@ -5124,12 +5337,17 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, Event::PermissionMode(_)))
             );
+            assert!(
+                !adapter.account_switch_ready(),
+                "request acknowledgement is not policy confirmation"
+            );
             let confirmed = adapter
                 .receive(json!({"method":"thread/settings/updated","params":{
                     "threadId":"thread-exact",
                     "threadSettings": {"approvalPolicy":approval,"sandboxPolicy":{"type":sandbox}}
                 }}))
                 .unwrap();
+            assert!(adapter.account_switch_ready());
             assert!(
                 confirmed
                     .events

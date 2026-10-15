@@ -217,6 +217,11 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Ownership transfer must wait for pending session-setting controls, even
+    /// when no user turn is running and transport bytes have already flushed.
+    fn account_switch_ready(&self) -> bool {
+        true
+    }
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.

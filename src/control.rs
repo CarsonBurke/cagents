@@ -824,6 +824,16 @@ impl ControlClient {
         }
     }
 
+    pub(crate) fn account_switch_generation(
+        &mut self,
+        source: crate::chat::Session,
+    ) -> Result<Option<u64>, ControlError> {
+        match self.request_strict(ClientRequest::ChatAccountSwitchGeneration { source })? {
+            ServerResponse::ChatAccountSwitchGeneration { generation } => Ok(generation),
+            response => Err(unexpected_response("account-switch readiness", &response)),
+        }
+    }
+
     pub fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, ControlError> {
         match self.request_strict(ClientRequest::ChatList)? {
             ServerResponse::ChatListed { sessions } => Ok(sessions),
@@ -1821,6 +1831,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
+        ServerResponse::ChatAccountSwitchGeneration { .. } => "chat_account_switch_generation",
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
@@ -2837,13 +2848,25 @@ pub enum StopReport {
     Failed { error: String },
 }
 
-pub(crate) fn terminal_spawn_recipe(cwd: PathBuf, argv: Vec<String>) -> Result<LaunchRecipe, AppError> {
+pub(crate) fn terminal_spawn_recipe(
+    cwd: PathBuf,
+    argv: Vec<String>,
+) -> Result<LaunchRecipe, AppError> {
     if argv.is_empty() {
-        let mut recipe = LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?;
-        if let Some(shell) = crate::device::shell() { recipe.program = shell.to_owned(); }
+        let mut recipe =
+            LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?;
+        if let Some(shell) = crate::device::shell() {
+            recipe.program = shell.to_owned();
+        }
         Ok(recipe)
     } else {
-        Ok(LaunchRecipe { unset_environment: Default::default(), program: argv[0].clone(), arguments: argv[1..].to_vec(), working_directory: cwd, environment: BTreeMap::new() })
+        Ok(LaunchRecipe {
+            unset_environment: Default::default(),
+            program: argv[0].clone(),
+            arguments: argv[1..].to_vec(),
+            working_directory: cwd,
+            environment: BTreeMap::new(),
+        })
     }
 }
 
