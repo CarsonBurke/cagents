@@ -139,6 +139,8 @@ pub enum FocusedPane {
     ChatPane,
     /// The native code editor.
     Editor,
+    /// Browser content may own a DOM text field. Preserve its editing chords.
+    Browser,
     /// A text control outside the focused pane (sidebar, inspector, find bar).
     TextInput,
     /// A non-text control outside a pane.
@@ -150,7 +152,7 @@ pub enum FocusedPane {
 
 impl FocusedPane {
     pub fn is_text_editing(self) -> bool {
-        matches!(self, Self::Editor | Self::Chat | Self::TextInput)
+        matches!(self, Self::Editor | Self::Chat | Self::TextInput | Self::Browser)
     }
 }
 
@@ -3187,6 +3189,7 @@ mod tests {
             FocusedPane::Editor,
             FocusedPane::Chat,
             FocusedPane::TextInput,
+            FocusedPane::Browser,
         ] {
             assert_eq!(global_shortcut(&redo, &shortcuts, focused), None);
             assert!(!is_global_shortcut_chord(

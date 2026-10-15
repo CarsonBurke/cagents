@@ -22,6 +22,12 @@ const EVENT_CAPACITY: usize = 128;
 const CRITICAL_EVENT_RESERVE: usize = 8;
 static EVENT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Default)]
+struct KeyboardInput {
+    held: Vec<(cosmic::iced::keyboard::key::Physical, BrowserInput)>,
+    released: Vec<cosmic::iced::keyboard::key::Physical>,
+}
+
 #[derive(Debug)]
 pub(crate) enum Command {
     Import(super::ImportRequest),
@@ -67,6 +73,8 @@ pub(crate) struct CommandMailbox {
     tx: Sender<Command>,
     rx: Receiver<Command>,
     coalesced: Mutex<CoalescedCommands>,
+    keyboard: Mutex<KeyboardInput>,
+    deferred_releases: Mutex<VecDeque<BrowserInput>>,
     wake_pending: AtomicBool,
     shutdown_requested: AtomicBool,
     /// Set by the engine once this card can never be serviced again: it was
@@ -82,6 +90,8 @@ impl CommandMailbox {
             tx,
             rx,
             coalesced: Mutex::new(CoalescedCommands::default()),
+            keyboard: Mutex::new(KeyboardInput::default()),
+            deferred_releases: Mutex::new(VecDeque::new()),
             wake_pending: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             engine_gone: AtomicBool::new(false),
@@ -94,7 +104,67 @@ impl CommandMailbox {
 
     pub(crate) fn send(&self, command: Command) -> Result<(), BrowserError> {
         self.check_live()?;
+        // A blur/eviction release is ordered after every previously admitted
+        // press, even when the bounded engine queue is full. A later press
+        // must never overtake that deferred release.
+        if matches!(&command, Command::Input(_)) {
+            let mut pending = self.deferred_releases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.refill_releases(&mut pending);
+            if !pending.is_empty() { return Err(BrowserError::CommandQueueFull); }
+            return self.tx.try_send(command).map_err(map_send_error);
+        }
         self.tx.try_send(command).map_err(map_send_error)
+    }
+
+    fn refill_releases(&self, pending: &mut VecDeque<BrowserInput>) {
+        while let Some(input) = pending.pop_front() {
+            match self.tx.try_send(Command::Input(input)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(Command::Input(input))) => { pending.push_front(input); break; }
+                Err(_) => { pending.clear(); break; }
+            }
+        }
+    }
+
+    /// Called after each engine receive, before admitting later UI input.
+    pub(crate) fn refill_deferred_releases(&self) {
+        let mut pending = self.deferred_releases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refill_releases(&mut pending);
+    }
+
+    pub(crate) fn press_key(&self, physical: cosmic::iced::keyboard::key::Physical,
+        press: BrowserInput, release: BrowserInput) -> Result<(), BrowserError> {
+        let mut keyboard = self.keyboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.send(Command::Input(press))?;
+        keyboard.released.retain(|key| *key != physical);
+        if !keyboard.held.iter().any(|(key, _)| *key == physical) {
+            keyboard.held.push((physical, release));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_key(&self, physical: cosmic::iced::keyboard::key::Physical,
+        release: BrowserInput) -> Result<bool, BrowserError> {
+        let mut keyboard = self.keyboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = keyboard.released.iter().position(|key| *key == physical) {
+            keyboard.released.swap_remove(index);
+            return Ok(true);
+        }
+        let Some(index) = keyboard.held.iter().position(|(key, _)| *key == physical) else { return Ok(false); };
+        self.send(Command::Input(release))?;
+        keyboard.held.swap_remove(index);
+        Ok(true)
+    }
+
+    pub(crate) fn release_pressed_keys(&self) {
+        let mut keyboard = self.keyboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if keyboard.held.is_empty() { return; }
+        let mut pending = self.deferred_releases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some((physical, release)) = keyboard.held.pop() {
+            pending.push_back(release);
+            if !keyboard.released.contains(&physical) { keyboard.released.push(physical); }
+        }
+        self.refill_releases(&mut pending);
     }
 
     pub(crate) fn update_coalesced(
@@ -494,6 +564,7 @@ impl BrowserHandle {
     }
 
     pub fn set_focused(&self, focused: bool) -> Result<(), BrowserError> {
+        if !focused { self.mailbox.release_pressed_keys(); }
         self.mailbox
             .update_coalesced(|state| state.focused = Some(focused))
     }
@@ -618,6 +689,33 @@ impl Drop for BrowserHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blur_releases_stay_after_admitted_presses_under_backpressure() {
+        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        use super::super::{ButtonState, input::iced_key};
+        let mailbox = CommandMailbox::new();
+        let physical = Physical::Code(Code::KeyA);
+        let key = keyboard::Key::Character("a".into());
+        let input = |state, repeat| iced_key(state, &key, physical,
+            keyboard::Location::Standard, keyboard::Modifiers::empty(), repeat, false);
+        mailbox.press_key(physical, input(ButtonState::Pressed, false), input(ButtonState::Released, false)).unwrap();
+        mailbox.press_key(physical, input(ButtonState::Pressed, true), input(ButtonState::Released, false)).unwrap();
+        for _ in 2..COMMAND_CAPACITY { mailbox.send(Command::Reload).unwrap(); }
+        mailbox.release_pressed_keys();
+        let other = Physical::Code(Code::KeyB);
+        assert!(matches!(mailbox.press_key(other, input(ButtonState::Pressed, false), input(ButtonState::Released, false)), Err(BrowserError::CommandQueueFull)));
+        assert!(!mailbox.release_key(other, input(ButtonState::Released, false)).unwrap());
+        let mut observed = Vec::new();
+        while let Ok(command) = mailbox.receiver().try_recv() {
+            mailbox.refill_deferred_releases();
+            if let Command::Input(input) = command { observed.push(input); }
+        }
+        assert_eq!(observed, vec![input(ButtonState::Pressed, false), input(ButtonState::Pressed, true), input(ButtonState::Released, false)]);
+        assert!(mailbox.release_key(physical, input(ButtonState::Released, false)).unwrap());
+        assert!(!mailbox.release_key(physical, input(ButtonState::Released, false)).unwrap());
+        assert!(mailbox.receiver().try_recv().is_err(), "physical release was already paired");
+    }
 
     #[test]
     fn resize_and_pointer_storms_are_coalesced() {

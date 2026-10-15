@@ -6,7 +6,7 @@ use cosmic::iced::{
         Clipboard, Layout, Shell, Widget,
         input_method::{self, InputMethod, Preedit, Purpose},
         layout, mouse, renderer,
-        widget::{Tree, tree},
+        widget::{Id, Operation, Tree, operation, tree},
     },
     keyboard,
     mouse::{Button, ScrollDelta},
@@ -23,6 +23,9 @@ use super::{
 #[derive(Default)]
 struct WidgetState {
     shortcut_keys: Vec<keyboard::key::Physical>,
+    keyboard_owner: Option<Arc<super::handle::CommandMailbox>>,
+    input_focused: bool,
+    window_unfocused: bool,
     focused: bool,
     focus_requested: bool,
     cursor_inside: bool,
@@ -34,6 +37,22 @@ struct WidgetState {
     last_presented: Option<bool>,
     geometry_presented: bool,
     preedit: Option<Preedit>,
+}
+
+impl operation::Focusable for WidgetState {
+    fn is_focused(&self) -> bool { self.input_focused }
+    fn focus(&mut self) {
+        self.input_focused = true;
+        // A parked tree may have been blurred through its runtime handle.
+        self.focused = false;
+    }
+    fn unfocus(&mut self) { self.input_focused = false; }
+}
+
+impl Drop for WidgetState {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.keyboard_owner { owner.release_pressed_keys(); }
+    }
 }
 
 /// Native geometry for one frame: the full buffer Servo renders, the clipped
@@ -115,11 +134,13 @@ fn native_placement(
 type ErrorMapper<Message> = dyn Fn(BrowserError) -> Message + Send + Sync + 'static;
 
 pub struct BrowserWidget<'a, Message> {
+    id: Option<Id>,
     handle: &'a BrowserHandle,
     ime: Option<InputMethodState>,
     scale_factor: f32,
     ui_scale: f32,
     model_focused: bool,
+    window_focused: bool,
     obscured: bool,
     virtual_offset: f32,
     on_focus: Option<Message>,
@@ -141,12 +162,14 @@ impl<'a, Message> std::fmt::Debug for BrowserWidget<'a, Message> {
 impl<'a, Message> BrowserWidget<'a, Message> {
     pub fn new(handle: &'a BrowserHandle) -> Self {
         Self {
+            id: None,
             handle,
             ime: None,
             scale_factor: 1.0,
             ui_scale: 1.0,
             virtual_offset: 0.0,
             model_focused: false,
+            window_focused: true,
             obscured: false,
             on_focus: None,
             on_shortcut: None,
@@ -157,6 +180,11 @@ impl<'a, Message> BrowserWidget<'a, Message> {
 
     pub fn scale_factor(mut self, scale_factor: f32) -> Self {
         self.scale_factor = scale_factor.max(0.01);
+        self
+    }
+
+    pub fn id(mut self, id: Id) -> Self {
+        self.id = Some(id);
         self
     }
 
@@ -191,6 +219,11 @@ impl<'a, Message> BrowserWidget<'a, Message> {
 
     pub fn model_focused(mut self, focused: bool) -> Self {
         self.model_focused = focused;
+        self
+    }
+
+    pub fn window_focused(mut self, focused: bool) -> Self {
+        self.window_focused = focused;
         self
     }
 
@@ -237,7 +270,10 @@ impl<'a, Message> BrowserWidget<'a, Message> {
     }
 
     fn synchronize_focus(&self, state: &mut WidgetState) -> Result<(), BrowserError> {
-        let focused = self.model_focused && !self.obscured;
+        if !self.model_focused {
+            state.input_focused = false;
+        }
+        let focused = self.owns_keyboard(state);
         if self.obscured {
             // A pointer press can request model focus one message before the
             // model grants it. Covering that pending request must release its
@@ -249,6 +285,12 @@ impl<'a, Message> BrowserWidget<'a, Message> {
         }
         if focused {
             state.focus_requested = false;
+        }
+        if !focused {
+            // A focused native field can consume the eventual physical key
+            // release. Pair every successfully admitted browser press before
+            // relinquishing its keyboard, and swallow that later release.
+            self.handle.mailbox.release_pressed_keys();
         }
         if state.focused == focused {
             return Ok(());
@@ -263,12 +305,30 @@ impl<'a, Message> BrowserWidget<'a, Message> {
         Ok(())
     }
 
+    fn owns_keyboard(&self, state: &WidgetState) -> bool {
+        self.model_focused && self.window_focused && state.input_focused
+            && !state.window_unfocused && !self.obscured
+    }
+
+    fn attach_keyboard(&self, state: &mut WidgetState) {
+        if state.keyboard_owner.as_ref().is_none_or(|owner| !Arc::ptr_eq(owner, &self.handle.mailbox)) {
+            if let Some(previous) = state.keyboard_owner.replace(self.handle.mailbox.clone()) {
+                previous.release_pressed_keys();
+            }
+            state.focused = false;
+            state.shortcut_keys.clear();
+            state.last_geometry = None;
+            state.last_presented = None;
+            state.last_scale_factor = None;
+        }
+    }
+
     fn device_point(&self, bounds: Rectangle, point: Point) -> super::DevicePoint {
         local_device_point(point.x, point.y, bounds.x, bounds.y, self.scale_factor)
     }
 
     fn request_ime(&self, state: &WidgetState, bounds: Rectangle, shell: &mut Shell<'_, Message>) {
-        let Some(ime) = self.ime.as_ref().filter(|_| state.focused) else {
+        let Some(ime) = self.ime.as_ref().filter(|_| state.focused && self.owns_keyboard(state)) else {
             shell.request_input_method(&InputMethod::<String>::Disabled);
             return;
         };
@@ -311,15 +371,34 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(WidgetState::default())
+        let mut state = WidgetState::default();
+        state.keyboard_owner = Some(self.handle.mailbox.clone());
+        tree::State::new(state)
     }
 
     fn diff(&mut self, tree: &mut Tree) {
         // Overlay widgets may stop forwarding events to their covered content.
         // Reconcile at tree construction, before that overlay is first drawn.
         let state = tree.state.downcast_mut::<WidgetState>();
+        self.attach_keyboard(state);
         let _ = self.synchronize_presentation(state);
         let _ = self.synchronize_focus(state);
+    }
+
+    fn id(&self) -> Option<Id> { self.id.clone() }
+
+    fn set_id(&mut self, id: Id) { self.id = Some(id); }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        _renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        if self.model_focused {
+            operation.focusable(self.id.as_ref(), layout.bounds(), tree.state.downcast_mut::<WidgetState>());
+        }
     }
 
     fn update(
@@ -335,6 +414,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
     ) {
         let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<WidgetState>();
+        self.attach_keyboard(state);
+        match event {
+            Event::Window(window::Event::Unfocused) => state.window_unfocused = true,
+            Event::Window(window::Event::Focused) => state.window_unfocused = false,
+            Event::Mouse(mouse::Event::ButtonPressed(_)) => {
+                state.input_focused = cursor.is_over(bounds) && cursor.is_over(*viewport);
+            }
+            Event::Touch(touch::Event::FingerPressed { position, .. }) => {
+                state.input_focused = bounds.contains(*position) && viewport.contains(*position);
+            }
+            _ => {}
+        }
         let native = native_placement(
             bounds,
             *viewport,
@@ -398,7 +489,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 self.send(BrowserInput::MouseLeave, shell);
             }
             Event::Mouse(cosmic::iced::mouse::Event::ButtonPressed(button)) => {
-                if let Some(position) = cursor.position_in(bounds) {
+                if cursor.is_over(*viewport) && let Some(position) = cursor.position_in(bounds) {
                     if !self.model_focused
                         && !state.focus_requested
                         && let Some(message) = self.on_focus.clone()
@@ -463,7 +554,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
             }
             Event::Touch(event) => {
                 let (touch_state, id, position) = match event {
-                    touch::Event::FingerPressed { id, position } if bounds.contains(*position) => {
+                    touch::Event::FingerPressed { id, position } if bounds.contains(*position) && viewport.contains(*position) => {
+                        if !self.model_focused && !state.focus_requested
+                            && let Some(message) = self.on_focus.clone() {
+                            state.focus_requested = true;
+                            shell.publish(message);
+                        }
                         state.touch_capture.insert(id.0);
                         (TouchState::Down, id.0, *position)
                     }
@@ -501,7 +597,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 modifiers,
                 repeat,
                 ..
-            }) if self.model_focused => {
+            }) if state.focused && self.owns_keyboard(state) => {
                 if let Some(message) = self.on_shortcut.as_ref().and_then(|callback| {
                     let Event::Keyboard(event) = event else {
                         return None;
@@ -515,8 +611,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                     shell.capture_event();
                     return;
                 }
-                self.send(
-                    iced_key(
+                let press = iced_key(
                         ButtonState::Pressed,
                         key,
                         *physical_key,
@@ -524,9 +619,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                         *modifiers,
                         *repeat,
                         state.preedit.is_some(),
-                    ),
-                    shell,
-                );
+                    );
+                match self.handle.mailbox.press_key(*physical_key, press, iced_key(
+                                ButtonState::Released, key, *physical_key, *location,
+                                *modifiers, false, state.preedit.is_some(),
+                            )) {
+                    Ok(()) => {}
+                    Err(error) => self.publish_error(error, shell),
+                }
                 shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::KeyReleased {
@@ -535,7 +635,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 location,
                 modifiers,
                 ..
-            }) if self.model_focused => {
+            }) => {
                 if let Some(index) = state
                     .shortcut_keys
                     .iter()
@@ -545,8 +645,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                     shell.capture_event();
                     return;
                 }
-                self.send(
-                    iced_key(
+                let release = iced_key(
                         ButtonState::Released,
                         key,
                         *physical_key,
@@ -554,12 +653,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                         *modifiers,
                         false,
                         state.preedit.is_some(),
-                    ),
-                    shell,
-                );
+                    );
+                match self.handle.mailbox.release_key(*physical_key, release) {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(error) => self.publish_error(error, shell),
+                }
                 shell.capture_event();
             }
-            Event::InputMethod(event) if self.model_focused => {
+            Event::InputMethod(event) if state.focused && self.owns_keyboard(state) => {
                 match event {
                     input_method::Event::Opened => {
                         state.preedit = Some(Preedit::new());
@@ -589,15 +691,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                     }
                 }
                 shell.capture_event();
-            }
-            Event::Window(window::Event::Unfocused) if state.focused => {
-                state.focused = false;
-                state.pointer_capture = 0;
-                state.touch_capture.clear();
-                state.preedit = None;
-                if let Err(error) = self.handle.set_focused(false) {
-                    self.publish_error(error, shell);
-                }
             }
             Event::Window(window::Event::RedrawRequested(_)) => {
                 self.request_ime(state, bounds, shell);
@@ -656,6 +749,106 @@ impl<'a, Message: Clone + 'a> From<BrowserWidget<'a, Message>> for Element<'a, M
 mod tests {
     use super::*;
     use cosmic::iced::advanced::renderer::Headless;
+
+    fn press(character: &str, code: keyboard::key::Code, modifiers: keyboard::Modifiers) -> Event {
+        let key = keyboard::Key::Character(character.into());
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(), modified_key: key,
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard, modifiers, text: None, repeat: false,
+        })
+    }
+
+    fn queued_input(handle: &BrowserHandle) -> Vec<BrowserInput> {
+        handle.mailbox.receiver().try_iter().filter_map(|command| match command {
+            super::super::handle::Command::Input(input) => Some(input),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn evicting_the_native_tree_releases_against_its_original_browser() {
+        use keyboard::key::{Code, Physical};
+        let original = BrowserHandle::fixture();
+        let replacement = BrowserHandle::fixture();
+        let browser = BrowserWidget::<()>::new(&original);
+        let tree = Tree::new(&browser as &dyn Widget<(), Theme, Renderer>);
+        let physical = Physical::Code(Code::KeyA);
+        let key = keyboard::Key::Character("a".into());
+        let input = |state| iced_key(state, &key, physical,
+            keyboard::Location::Standard, keyboard::Modifiers::empty(), false, false);
+        original.mailbox.press_key(physical, input(ButtonState::Pressed), input(ButtonState::Released)).unwrap();
+        drop(tree);
+        assert_eq!(queued_input(&original), vec![input(ButtonState::Pressed), input(ButtonState::Released)]);
+        assert!(queued_input(&replacement).is_empty());
+        assert!(original.mailbox.release_key(physical, input(ButtonState::Released)).unwrap());
+        assert!(queued_input(&original).is_empty());
+    }
+
+    #[test]
+    fn native_field_focus_withholds_ignored_keys_and_pairs_browser_releases() {
+        use cosmic::iced::advanced::widget::operation::focusable;
+        use keyboard::key::Code;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let handle = BrowserHandle::fixture();
+        let content = Id::new("browser.focus-content");
+        let address = Id::new("browser.focus-address");
+        let browser = BrowserWidget::<()>::new(&handle).id(content.clone()).model_focused(true);
+        let mut element: Element<'_, ()> = cosmic::widget::row::with_children(vec![
+            cosmic::widget::text_input("URL", "example.test").id(address.clone())
+                .on_input(|_| ()).width(200).into(),
+            browser.into(),
+        ]).into();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(600., 240.));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(viewport.size(), viewport.size()));
+        let mut messages = Vec::new();
+        let mut update = |element: &mut Element<'_, ()>, tree: &mut Tree, event: &Event| {
+            element.as_widget_mut().update(tree, event, Layout::new(&node),
+                mouse::Cursor::Unavailable, &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages), &viewport);
+        };
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+            &mut focusable::focus::<()>(content.clone()));
+        update(&mut element, &mut tree, &press("a", Code::KeyA, keyboard::Modifiers::empty()));
+        assert!(matches!(queued_input(&handle).as_slice(), [BrowserInput::Key { state: ButtonState::Pressed, code, .. }] if code == "KeyA"));
+
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+            &mut focusable::focus::<()>(address));
+        // The text input deliberately ignores these keys. Native browser
+        // ownership, rather than captured status, must prevent delivery.
+        for event in [press("f", Code::KeyF, keyboard::Modifiers::CTRL),
+            press("t", Code::KeyT, keyboard::Modifiers::CTRL),
+            press("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
+            Event::InputMethod(input_method::Event::Commit("address-only".into()))] {
+            update(&mut element, &mut tree, &event);
+        }
+        assert!(matches!(queued_input(&handle).as_slice(), [BrowserInput::Key { state: ButtonState::Released, code, .. }] if code == "KeyA"));
+        update(&mut element, &mut tree, &Event::Keyboard(keyboard::Event::KeyReleased {
+            key: keyboard::Key::Character("a".into()),
+            modified_key: keyboard::Key::Character("a".into()),
+            physical_key: keyboard::key::Physical::Code(Code::KeyA),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(),
+        }));
+        assert!(queued_input(&handle).is_empty(), "blur already paired the held key");
+
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+            &mut focusable::focus::<()>(content));
+        update(&mut element, &mut tree, &press("b", Code::KeyB, keyboard::Modifiers::empty()));
+        assert!(matches!(queued_input(&handle).as_slice(), [BrowserInput::Key { state: ButtonState::Pressed, code, .. }] if code == "KeyB"));
+        handle.mailbox.drain_coalesced();
+        update(&mut element, &mut tree, &Event::Window(window::Event::Unfocused));
+        assert_eq!(handle.mailbox.drain_coalesced().focused, Some(false));
+        assert!(matches!(queued_input(&handle).as_slice(), [BrowserInput::Key { state: ButtonState::Released, code, .. }] if code == "KeyB"));
+        update(&mut element, &mut tree, &press("x", Code::KeyX, keyboard::Modifiers::empty()));
+        assert!(queued_input(&handle).is_empty());
+        assert_eq!(handle.mailbox.drain_coalesced().focused, None,
+            "ordinary events must not reassert browser focus while the window is inactive");
+        update(&mut element, &mut tree, &Event::Window(window::Event::Focused));
+        assert_eq!(handle.mailbox.drain_coalesced().focused, Some(true));
+    }
 
     #[test]
     fn wheel_uses_current_visible_hit_without_requiring_a_previous_pointer_move() {
