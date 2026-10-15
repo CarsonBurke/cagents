@@ -49,6 +49,50 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())
 }
+const RECENT_OPERATIONS: usize = 2048;
+
+pub(super) fn migrate_history(db: &Connection) -> Result<(), String> {
+    let transaction = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    transaction.execute_batch("CREATE TABLE IF NOT EXISTS retired_view_panes(
+        scope TEXT NOT NULL REFERENCES shared_view_scopes(scope) ON DELETE CASCADE,
+        id TEXT NOT NULL, PRIMARY KEY(scope, id)
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS agents_open_by_recency ON agents(closed) WHERE closed=0;
+    INSERT OR IGNORE INTO retired_view_panes(scope, id)
+        SELECT shared_views.scope, retired.value FROM shared_views, json_each(shared_views.retired) AS retired;")
+        .map_err(|error| error.to_string())?;
+    let mut trimmed = false;
+    for mut view in all(&transaction)? {
+        if view.retired.len() > crate::workspace_model::views::RECENT_RETIRED_LIMIT {
+            view.retired.drain(..view.retired.len() - crate::workspace_model::views::RECENT_RETIRED_LIMIT);
+            view.revision = view.revision.checked_add(1).ok_or("view revision exhausted")?;
+            write(&transaction, &view)?;
+            trimmed = true;
+        }
+    }
+    compact_operations(&transaction)?;
+    if trimmed {
+        transaction.execute("UPDATE metadata SET sequence = sequence + 1 WHERE key = 0", []).map_err(|error| error.to_string())?;
+    }
+    transaction.pragma_update(None, "user_version", 13).map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn retired(db: &Connection, scope: &Scope, id: crate::model::CardId) -> Result<bool, String> {
+    db.query_row("SELECT EXISTS(SELECT 1 FROM retired_view_panes WHERE scope=?1 AND id=?2)",
+        params![key(scope)?, id.to_string()], |row| row.get(0)).map_err(|error| error.to_string())
+}
+fn retire(db: &Connection, scope: &Scope, id: crate::model::CardId) -> Result<(), String> {
+    db.execute("INSERT OR IGNORE INTO retired_view_panes(scope,id) VALUES (?1,?2)",
+        params![key(scope)?, id.to_string()]).map(drop).map_err(|error| error.to_string())
+}
+fn compact_operations(db: &Connection) -> Result<(), String> {
+    db.execute("DELETE FROM shared_view_edits WHERE rowid NOT IN
+        (SELECT rowid FROM shared_view_edits ORDER BY rowid DESC LIMIT ?1)", [RECENT_OPERATIONS])
+        .map(drop).map_err(|error| error.to_string())
+}
+
 fn key(scope: &Scope) -> Result<String, String> {
     serde_json::to_string(scope).map_err(|error| error.to_string())
 }
@@ -140,6 +184,7 @@ pub(super) fn apply(
             // Migration is additive, including old independent windows. Closed
             // IDs are applied first and prevent stale caches from resurrecting.
             for id in closed {
+                retire(transaction, scope, *id)?;
                 changed |= view.apply(&Change::Remove { id: *id })?;
                 transaction
                     .execute(
@@ -149,6 +194,7 @@ pub(super) fn apply(
                     .map_err(|error| error.to_string())?;
             }
             for pane in panes {
+                if retired(transaction, scope, pane.id)? { continue; }
                 if view.panes.iter().any(|existing| {
                     existing.id != pane.id
                         && crate::workspace_model::views::same_resource(&existing.kind, &pane.kind)
@@ -191,6 +237,8 @@ pub(super) fn apply(
                         register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         target.retired.retain(|retired| retired != id);
+                        transaction.execute("DELETE FROM retired_view_panes WHERE scope=?1 AND id=?2",
+                            params![key(destination)?, id.to_string()]).map_err(|error| error.to_string())?;
                         target.apply(&Change::Insert {
                             pane,
                             before: *before,
@@ -206,6 +254,7 @@ pub(super) fn apply(
                                 params![key(destination)?, id.to_string()],
                             )
                             .map_err(|error| error.to_string())?;
+                        retire(transaction, scope, *id)?;
                         view.apply(&Change::Remove { id: *id })?
                     } else {
                         false
@@ -217,6 +266,7 @@ pub(super) fn apply(
                     false
                 }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
+                    if retired(transaction, scope, pane.id)? { return Ok(false); }
                     if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
                         return Err(
                             "pane already belongs to another view; use an atomic transfer".into(),
@@ -228,6 +278,7 @@ pub(super) fn apply(
                     false
                 }
                 Change::Remove { id } => {
+                    retire(transaction, scope, *id)?;
                     transaction
                         .execute(
                             "DELETE FROM shared_view_panes WHERE id=?1 AND scope=?2",
@@ -244,6 +295,7 @@ pub(super) fn apply(
                     params![operation.to_string(), key(scope)?],
                 )
                 .map_err(|error| error.to_string())?;
+            compact_operations(transaction)?;
         }
         _ => unreachable!(),
     }
@@ -567,4 +619,72 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn ten_thousand_closes_bound_payloads_and_dedupe_without_losing_resurrection_guards() {
+        let (mut registry, _directory, channel, _) = setup();
+        seed(&mut registry, channel, vec![]);
+        let scope = Scope::Channel(channel);
+        let old = pane();
+        let transaction = registry.db.transaction().unwrap();
+        let mut revision = read(&transaction, &scope).unwrap().revision;
+        for index in 0..10_000 {
+            let pane = if index == 0 { old.clone() } else { pane() };
+            let id = pane.id;
+            assert!(apply(&transaction, &ModelEdit::ChangeView {
+                scope: scope.clone(), expected_revision: revision,
+                operation: Uuid::new_v4(), change: Change::Insert { pane, before: None },
+            }).unwrap());
+            revision += 1;
+            assert!(apply(&transaction, &ModelEdit::ChangeView {
+                scope: scope.clone(), expected_revision: revision,
+                operation: Uuid::new_v4(), change: Change::Remove { id },
+            }).unwrap());
+            revision += 1;
+        }
+        let view = read(&transaction, &scope).unwrap();
+        assert_eq!(view.retired.len(), crate::workspace_model::views::RECENT_RETIRED_LIMIT);
+        assert!(!view.retired.contains(&old.id));
+        let operations: usize = transaction.query_row("SELECT count(*) FROM shared_view_edits", [], |row| row.get(0)).unwrap();
+        assert!(operations <= RECENT_OPERATIONS);
+        assert!(retired(&transaction, &scope, old.id).unwrap());
+        assert!(!apply(&transaction, &ModelEdit::ChangeView {
+            scope: scope.clone(), expected_revision: revision,
+            operation: Uuid::new_v4(), change: Change::Insert { pane: old.clone(), before: None },
+        }).unwrap());
+        assert!(!apply(&transaction, &ModelEdit::SeedView {
+            scope: scope.clone(), panes: vec![old], closed: vec![],
+        }).unwrap());
+        assert!(read(&transaction, &scope).unwrap().panes.is_empty());
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn retirement_guard_allows_an_explicit_transfer_back() {
+        let (mut registry, _directory, a, b) = setup();
+        let pane = pane();
+        seed(&mut registry, a, vec![pane.clone()]);
+        for (source, destination) in [(a, b), (b, a)] {
+            let edit = edit(&mut registry, source, Change::Transfer {
+                id: pane.id, destination: Scope::Channel(destination), before: None,
+            });
+            registry.apply(&edit).unwrap();
+        }
+        assert_eq!(read(&registry.db, &Scope::Channel(a)).unwrap().panes, vec![pane]);
+    }
+
+    #[test]
+    fn legacy_retired_payload_compacts_but_keeps_every_guard_after_reopen() {
+        let (mut registry, directory, channel, _) = setup();
+        seed(&mut registry, channel, vec![]);
+        let scope = Scope::Channel(channel);
+        let retired_ids = (0..2000).map(|_| CardId::new()).collect::<Vec<_>>();
+        registry.db.execute("UPDATE shared_views SET retired=?1 WHERE scope=?2",
+            params![serde_json::to_string(&retired_ids).unwrap(), key(&scope).unwrap()]).unwrap();
+        registry.db.execute_batch("DROP TABLE retired_view_panes; PRAGMA user_version=12;").unwrap();
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(read(&registry.db, &scope).unwrap().retired.len(), crate::workspace_model::views::RECENT_RETIRED_LIMIT);
+        for id in retired_ids { assert!(retired(&registry.db, &scope, id).unwrap()); }
+    }
+
 }

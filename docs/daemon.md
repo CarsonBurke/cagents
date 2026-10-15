@@ -486,3 +486,26 @@ reviewed handoff before starting the replacement. Unlocked stale lease records
 do not block startup. Public staged-owner routing and explicit reviewed update
 handoffs keep their existing ownership checks; admission does not stop windows
 or hosted terminals automatically.
+
+## Workspace edit isolation
+
+Layout mutations use their own serialized SQLite connection. Waiting for the
+writer, committing with FULL durability, and hydrating the response model occur
+outside the global terminal-host mutex. Publication logs `host_lock_wait_us`
+and `host_lock_hold_us` at debug level. Model reads also use a coherent WAL
+snapshot outside that mutex; subscriptions register before their snapshot so
+concurrent execution/layout commits cannot fall into a read/subscribe gap.
+
+Views carry at most 256 recent retired pane IDs, backed by indexed per-scope
+resurrection guards for older IDs. The daemon retains at most 2048 view operation
+receipts; old revision checks and resurrection guards continue to reject stale
+inserts after receipt compaction. Explicit atomic transfers may bring a pane
+back to a previous scope. Active-agent listings use separate global and
+origin-specific indexed queries; historical execution receipts retain their
+idempotency and recovery evidence.
+
+Use `scripts/benchmark-terminal input --socket PATH` against a private matched
+daemon for a baseline, then add `--toggle-panes` to run committed pane
+insert/remove cycles from a second IPC client while measuring input latency.
+The report records the number of completed edit cycles. This probe measures
+input-to-snapshot latency; native presentation still needs a separate exercise.

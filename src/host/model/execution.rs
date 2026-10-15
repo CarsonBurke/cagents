@@ -11,6 +11,9 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+const AGENTS_FOR_ORIGIN: &str = "SELECT record FROM agents WHERE closed = 0 AND origin = ?1 ORDER BY rowid DESC LIMIT 1024";
+const ACTIVE_AGENTS: &str = "SELECT record FROM agents WHERE closed = 0 ORDER BY rowid DESC LIMIT 1024";
+
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     // Version zero is the existing unversioned project/channel registry.
     db.execute_batch(
@@ -943,18 +946,22 @@ impl Registry {
     }
 
     pub(crate) fn agents(&self, origin: Option<&Origin>) -> Result<Vec<Agent>, String> {
-        let origin = origin.map(encode).transpose()?;
-        let mut statement = self
-            .db
-            .prepare(
-                "SELECT record FROM agents WHERE closed = 0 AND (?1 IS NULL OR origin = ?1)
-             ORDER BY rowid DESC LIMIT 1024",
-            )
-            .map_err(|error| error.to_string())?;
-        let records = statement
-            .query_map([origin], |row| row.get::<_, String>(0))
-            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-            .map_err(|error| error.to_string())?;
+        // The optional-parameter OR prevented SQLite from seeking the origin
+        // index. These forms keep filtered listings proportional to that caller.
+        let records = match origin {
+            Some(origin) => {
+                let mut statement = self.db.prepare(AGENTS_FOR_ORIGIN)
+                    .map_err(|error| error.to_string())?;
+                statement.query_map([encode(origin)?], |row| row.get::<_, String>(0))
+                    .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?
+            }
+            None => {
+                let mut statement = self.db.prepare(ACTIVE_AGENTS)
+                    .map_err(|error| error.to_string())?;
+                statement.query_map([], |row| row.get::<_, String>(0))
+                    .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?
+            }
+        };
         records.iter().map(|record| decode(record)).collect()
     }
 
@@ -2189,4 +2196,19 @@ mod tests {
                 .contains("own")
         );
     }
+    #[test]
+    fn caller_filtered_agents_seek_the_origin_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let plan = registry.db.prepare(&format!("EXPLAIN QUERY PLAN {AGENTS_FOR_ORIGIN}"))
+            .unwrap().query_map(["fixture"], |row| row.get::<_, String>(3)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap().join("; ");
+        assert!(plan.contains("agents_by_origin"), "{plan}");
+        assert!(plan.contains("SEARCH"), "{plan}");
+        let global = registry.db.prepare(&format!("EXPLAIN QUERY PLAN {ACTIVE_AGENTS}"))
+            .unwrap().query_map([], |row| row.get::<_, String>(3)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap().join("; ");
+        assert!(global.contains("agents_open_by_recency"), "{global}");
+    }
+
 }
