@@ -51,9 +51,14 @@ fn body_mut(content: &mut ItemContent) -> Option<&mut String> {
 }
 impl ItemChange {
     pub(crate) fn between(previous: Option<&Item>, current: &Item) -> Self {
+        Self::between_known(previous, current, false)
+    }
+    /// `prefix_proven` is local Store evidence from validated append writes,
+    /// never a heuristic based on length, ID or tail bytes.
+    pub(crate) fn between_known(previous: Option<&Item>, current: &Item, prefix_proven: bool) -> Self {
         if let Some(previous) = previous
             && let (Some(old), Some(new)) = (body(&previous.content), body(&current.content))
-            && new.starts_with(old)
+            && (if prefix_proven { new.len() >= old.len() } else { new.starts_with(old) })
         {
             let content = match &current.content {
                 ItemContent::Text {

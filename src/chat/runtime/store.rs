@@ -1,6 +1,7 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
+mod append;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
@@ -71,6 +72,9 @@ pub(crate) struct Store {
     pub dirty: bool,
     /// Dirty identities are bounded even while the conversation is hidden.
     changed: Option<std::collections::HashSet<String>>,
+    appended: append::Changes,
+    #[cfg(test)]
+    field_bytes: std::cell::Cell<usize>,
     pub presented_generation: Option<u64>,
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
@@ -167,6 +171,9 @@ impl Store {
                 messages: None,
                 dirty: true,
                 changed: Some(Default::default()),
+                appended: Default::default(),
+                #[cfg(test)]
+                field_bytes: Default::default(),
                 presented_generation: None,
                 presentation: None,
                 presented_children: Default::default(),
@@ -703,7 +710,7 @@ impl Store {
                     .execute(update, params![id, delta.len(), metadata])
                     .map_err(|error| error.to_string())?;
                 transaction.commit().map_err(|error| error.to_string())?;
-                self.changed(&id);
+                self.append_changed(&id, field as usize, offset);
                 self.dirty = true;
             }
             Event::Item(item) => {
@@ -786,6 +793,7 @@ impl Store {
                 self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
+                    self.appended.remove(&id);
                     transaction
                         .execute("DELETE FROM items WHERE id=?1", [id])
                         .map_err(|e| e.to_string())?;
@@ -794,6 +802,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
+                self.appended.clear();
                 self.files_reset()?;
                 self.db
                     .execute("DELETE FROM items", [])
@@ -914,7 +923,7 @@ impl Store {
                 )
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
-            self.changed(id);
+            self.append_changed(id, 0, length as usize);
         }
         Ok(warning)
     }
@@ -971,6 +980,8 @@ impl Store {
         for row in rows {
             result.extend(row.map_err(|e| e.to_string())?);
         }
+        #[cfg(test)]
+        self.field_bytes.set(self.field_bytes.get() + result.len());
         Ok(result)
     }
     fn body(&self, id: &str, len0: usize, start: usize, end: usize) -> Result<Vec<u8>, String> {
@@ -1008,10 +1019,12 @@ impl Store {
         }
     }
     fn changed(&mut self, id: &str) {
+        self.appended.remove(id);
         if let Some(changed) = &mut self.changed {
             changed.insert(id.into());
             if changed.len() > WINDOW_ITEMS * 2 {
                 self.changed = None;
+                self.appended.clear();
             }
         }
     }
@@ -1029,6 +1042,7 @@ impl Store {
             .map(|item| (item.id.as_str(), item))
             .collect();
         let mut reused = std::collections::HashSet::new();
+        let mut proven = std::collections::HashSet::new();
         let records = {
             let query = if self.forward.is_some() {
                 "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
@@ -1140,10 +1154,14 @@ impl Store {
                 if part > 0 {
                     item.id = item_id.into_owned();
                 }
-                let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
-                    .map_err(|e| e.to_string())?;
-                let body1 = String::from_utf8(self.field(&id, 1, start1, end1)?)
-                    .map_err(|e| e.to_string())?;
+                let resident = old.get(item.id.as_str()).map(|item| item.as_ref());
+                let (body0, prefix0) = self.field_reusing(&id, 0, start0, end0, resident)?;
+                let (body1, prefix1) = self.field_reusing(&id, 1, start1, end1, resident)?;
+                if match &item.content {
+                    ItemContent::Text { .. } | ItemContent::Command { .. } => prefix0,
+                    ItemContent::Tool { .. } => prefix1,
+                    _ => false,
+                } { proven.insert(item.id.clone()); }
                 // An inline attachment is never paged: half a base64 payload renders as
                 // nothing, so it is restored whole or replaced by an explanation.
                 let attachment =
@@ -1316,9 +1334,9 @@ impl Store {
             .iter()
             .filter(|item| !reused.contains(&item.id))
             .map(|item| {
-                crate::chat::presentation::ItemChange::between(
+                crate::chat::presentation::ItemChange::between_known(
                     old.get(item.id.as_str()).map(|item| item.as_ref()),
-                    item,
+                    item, proven.contains(&item.id),
                 )
             })
             .collect();
@@ -1327,6 +1345,7 @@ impl Store {
         self.dirty = false;
         self.paging = false;
         self.changed = Some(Default::default());
+        self.appended.clear();
         Ok(Window {
             items,
             changes,
@@ -1578,6 +1597,51 @@ mod tests {
         assert!(
             matches!(&store.window().unwrap().items[0].content, ItemContent::Tool { output, .. } if output == "final replacement")
         );
+    }
+
+    #[test]
+    fn append_publication_reads_only_new_sqlite_bytes_with_exact_rewrite_fallback() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store.apply(Event::Item(history_item("live", &"x".repeat(64 * 1024)))).unwrap();
+        let mut previous = store.window().unwrap().items;
+        store.field_bytes.set(0);
+        store.apply(Event::TextDelta { id: "live".into(), role: Role::Assistant,
+            thinking: false, delta: "αβ".into() }).unwrap();
+        let appended = store.window_reusing(&mut previous).unwrap();
+        assert_eq!(store.field_bytes.get(), "αβ".len(), "resident prefix must not be reread from SQLite");
+        assert!(matches!(&appended.changes[0], crate::chat::presentation::ItemChange::Append { offset, suffix, .. }
+            if *offset == 64 * 1024 && suffix == "αβ"));
+        previous = appended.items;
+        store.field_bytes.set(0);
+        store.apply(Event::Item(history_item("live", &"z".repeat(64 * 1024 + 4)))).unwrap();
+        store.apply(Event::TextDelta { id: "live".into(), role: Role::Assistant,
+            thinking: false, delta: " tail".into() }).unwrap();
+        let rewritten = store.window_reusing(&mut previous).unwrap();
+        assert!(store.field_bytes.get() >= 64 * 1024 + 9,
+            "replacement followed by append cannot resurrect an invalid prefix proof");
+        assert!(matches!(&rewritten.changes[0], crate::chat::presentation::ItemChange::Replace(_)));
+        assert!(matches!(&rewritten.items[0].content, ItemContent::Text { text, .. }
+            if text.starts_with("zzzz") && text.ends_with(" tail")));
+    }
+
+    #[test]
+    fn megabyte_append_does_not_reread_completed_native_parts() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let source = "x".repeat(PART_BYTES * 8 + 2000);
+        store.apply(Event::Item(history_item("large", &source))).unwrap();
+        let mut previous = store.window().unwrap().items;
+        assert_eq!(previous.len(), 9);
+        store.field_bytes.set(0);
+        store.apply(Event::TextDelta { id: "large".into(), role: Role::Assistant,
+            thinking: false, delta: "尾".into() }).unwrap();
+        let window = store.window_reusing(&mut previous).unwrap();
+        assert!(store.field_bytes.get() < 4096, "only new canonical tail part and UTF-8 boundary probes are read: {}", store.field_bytes.get());
+        let actual = window.items.iter().map(|item| match &item.content {
+            ItemContent::Text { text, .. } => text.as_str(), _ => unreachable!(),
+        }).collect::<String>();
+        assert_eq!(actual, format!("{source}尾"));
+        assert_eq!(window.changes.iter().filter(|change| matches!(change,
+            crate::chat::presentation::ItemChange::Append { suffix, .. } if suffix.is_empty())).count(), 8);
     }
 
     #[test]
