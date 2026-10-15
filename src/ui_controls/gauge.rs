@@ -18,8 +18,7 @@ const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(125)
 
 // A newly mounted spinner may not have observed the window's last focus event.
 // Seed it from the main-window state rather than animating hidden new content.
-static ANIMATION_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ANIMATION_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn set_activity_animation_active(active: bool) {
     ANIMATION_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
@@ -564,7 +563,9 @@ mod tests {
         assert!(state.active);
         state.observe(&Event::Window(window::Event::Resized(Size::ZERO)));
         assert!(state.minimized);
-        state.observe(&Event::Window(window::Event::Resized(Size::new(640.0, 480.0))));
+        state.observe(&Event::Window(window::Event::Resized(Size::new(
+            640.0, 480.0,
+        ))));
         assert!(!state.minimized);
         assert!(state.active, "restoring a focused window resumes animation");
         assert!(SPINNER_FRAME >= Duration::from_millis(100));
@@ -592,8 +593,14 @@ mod tests {
             let mut shell = Shell::new(&mut messages);
             if let Some(event) = focus_event {
                 element.as_widget_mut().update(
-                    &mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
-                    &renderer, &mut clipboard::Null, &mut shell, &viewport,
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
                 );
             }
             element.as_widget_mut().update(
@@ -625,8 +632,11 @@ mod tests {
         let (hidden, frozen) = requested(Point::new(8.0, 900.0), None);
         assert_eq!(hidden, window::RedrawRequest::Wait);
         assert_eq!(frozen, Duration::ZERO, "the hidden arc advanced anyway");
-        for event in [window::Event::Unfocused, window::Event::Occluded(true),
-            window::Event::Resized(Size::ZERO)] {
+        for event in [
+            window::Event::Unfocused,
+            window::Event::Occluded(true),
+            window::Event::Resized(Size::ZERO),
+        ] {
             let (inactive, elapsed) = requested(Point::new(8.0, 8.0), Some(Event::Window(event)));
             assert_eq!(inactive, window::RedrawRequest::Wait);
             assert_eq!(elapsed, Duration::ZERO);

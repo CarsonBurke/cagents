@@ -443,13 +443,15 @@ mod tests {
                     .id(iced::widget::Id::new("chat-turn-regression"))
                     .into()
             };
-            let element = if fresh_frame { fresh(build()) } else { kept(1, build) };
+            let element = if fresh_frame {
+                fresh(build())
+            } else {
+                kept(1, build)
+            };
             // This follows the native runtime's take_all_named -> diff ->
             // restore -> layout sequence. The old forwarded ID panicked on
             // frame two when a stateless child displaced the wrapper's Memo.
-            let ui = UserInterface::build(
-                element, Size::new(400.0, 100.0), cache, &mut renderer,
-            );
+            let ui = UserInterface::build(element, Size::new(400.0, 100.0), cache, &mut renderer);
             cache = ui.into_cache();
         }
     }

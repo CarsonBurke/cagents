@@ -6,19 +6,16 @@
 use accesskit::{ActivationHandler, DeactivationHandler};
 use accesskit_atspi_common::{Adapter as AdapterImpl, AppContext, Event};
 #[cfg(not(feature = "tokio"))]
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 use atspi::proxy::bus::StatusProxy;
 #[cfg(not(feature = "tokio"))]
-use futures_util::{pin_mut as pin, select, FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, pin_mut as pin, select};
 use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
     thread,
 };
 #[cfg(feature = "tokio")]
-use tokio::{
-    pin, select,
-    sync::mpsc::{UnboundedReceiver as Receiver, UnboundedSender as Sender},
-};
+use tokio::{pin, select, sync::mpsc::UnboundedSender as Sender};
 #[cfg(feature = "tokio")]
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use zbus::{connection::Builder, Connection};
@@ -186,9 +183,13 @@ async fn wait_for_retry(
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let next = futures_lite::future::race(
-            async { retry_sleep(remaining).await; None },
+            async {
+                retry_sleep(remaining).await;
+                None
+            },
             async { Some(messages.next().await) },
-        ).await;
+        )
+        .await;
         match next {
             None => return true,
             Some(None) => return false,
@@ -221,7 +222,7 @@ async fn run_event_loop(
     let changes = status.receive_screen_reader_enabled_changed().await.fuse();
     pin!(changes);
 
-    let mut atspi_bus = None;
+    let mut atspi_bus: Option<Bus> = None;
     loop {
         let heartbeat = retry_sleep(std::time::Duration::from_secs(5));
         #[cfg(not(feature = "tokio"))]
@@ -347,7 +348,9 @@ mod retry_tests {
     #[test]
     fn refused_connection_schedules_bounded_retries() {
         let mut retry = Retry::default();
-        let delays = (0..10).map(|_| retry.next_delay().as_secs()).collect::<Vec<_>>();
+        let delays = (0..10)
+            .map(|_| retry.next_delay().as_secs())
+            .collect::<Vec<_>>();
         assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30, 30, 30]);
     }
 }
@@ -360,7 +363,10 @@ mod connection_tests {
     fn refused_bus_connection_returns_an_error_and_schedules_retry() {
         block_on(async {
             let connection = Builder::address("unix:path=/nonexistent/cagents-atspi-test-bus")
-                .unwrap().internal_executor(false).build().await;
+                .unwrap()
+                .internal_executor(false)
+                .build()
+                .await;
             assert!(connection.is_err());
             let mut retry = Retry::default();
             assert_eq!(retry.next_delay(), std::time::Duration::from_secs(1));

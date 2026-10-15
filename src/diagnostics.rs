@@ -1,5 +1,6 @@
 //! Private, bounded production evidence. Free-form application data cannot be
-//! passed to this API: messages, errors, payloads and paths stay outside records.
+//! passed to this API: messages, errors, payloads and application paths stay outside
+//! records. Panic locations retain only compiler-provided relative source paths.
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::CString,
@@ -230,20 +231,26 @@ pub fn record_panic(recovered: bool, location: Option<&std::panic::Location<'_>>
                 let path = Path::new(location.file());
                 let file = if path.is_absolute() {
                     let components = path.components().collect::<Vec<_>>();
-                    let relative = components.iter().position(|part| part.as_os_str() == "vendor")
+                    let relative = components
+                        .iter()
+                        .position(|part| part.as_os_str() == "vendor")
                         .or_else(|| components.iter().position(|part| part.as_os_str() == "src"));
-                    relative.map(|index| components[index..].iter().collect::<PathBuf>())
+                    relative
+                        .map(|index| components[index..].iter().collect::<PathBuf>())
                         .unwrap_or_else(|| path.file_name().unwrap_or_default().into())
                 } else {
                     path.to_owned()
                 };
-                append_global(&mut sink, Event::PanicLocation {
-                    file: file.to_string_lossy().into_owned(),
-                    line: location.line(),
-                    column: location.column(),
-                });
+                append_global(
+                    &mut sink,
+                    Event::PanicLocation {
+                        file: file.to_string_lossy().into_owned(),
+                        line: location.line(),
+                        column: location.column(),
+                    },
+                );
             }
-        },
+        }
         Err(std::sync::TryLockError::WouldBlock) => skipped(1),
         Err(std::sync::TryLockError::Poisoned(_)) => fail_sink(),
     }
@@ -1359,12 +1366,23 @@ mod process_tests {
         for mode in ["panic", "thread-panic"] {
             let root = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "diagnostics::process_tests::subprocess_fixture", "--nocapture"])
-                .env(TEST_STATE, root.path()).env(TEST_MODE, mode)
-                .env("XDG_STATE_HOME", root.path()).env("CAGENTS_LOCAL_DEBUG", "1")
-                .env_remove("RUST_BACKTRACE").output().unwrap();
+                .args([
+                    "--exact",
+                    "diagnostics::process_tests::subprocess_fixture",
+                    "--nocapture",
+                ])
+                .env(TEST_STATE, root.path())
+                .env(TEST_MODE, mode)
+                .env("XDG_STATE_HOME", root.path())
+                .env("CAGENTS_LOCAL_DEBUG", "1")
+                .env_remove("RUST_BACKTRACE")
+                .output()
+                .unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(stderr.contains("cagents panic backtrace:"), "{mode}: {stderr}");
+            assert!(
+                stderr.contains("cagents panic backtrace:"),
+                "{mode}: {stderr}"
+            );
             assert!(stderr.contains("subprocess_fixture"), "{mode}: {stderr}");
         }
     }

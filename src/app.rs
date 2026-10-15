@@ -4886,6 +4886,8 @@ pub struct Cagents {
     branch_ui: branch_ui::State,
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
+    #[cfg(test)]
+    resumed_focus_refreshes: u32,
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
@@ -12916,6 +12918,8 @@ impl Application for Cagents {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            #[cfg(test)]
+            resumed_focus_refreshes: 0,
             source_control_mutations: HashMap::new(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation(),
@@ -16155,6 +16159,10 @@ impl Application for Cagents {
                     self.reconcile_shared_views()
                 };
                 let resumed = if account_focus.is_some_and(|(_, regained)| regained) {
+                    #[cfg(test)]
+                    {
+                        self.resumed_focus_refreshes += 1;
+                    }
                     Task::batch([
                         self.update_update_ui(update_ui::Action::InspectInstallation),
                         self.update_review_requests(review_request_ui::Action::Tick),
@@ -16162,7 +16170,13 @@ impl Application for Cagents {
                 } else {
                     Task::none()
                 };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared, resumed])
+                Task::batch([
+                    refresh,
+                    self.flush_document_tone(),
+                    accounts,
+                    shared,
+                    resumed,
+                ])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -25217,6 +25231,8 @@ mod tests {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            #[cfg(test)]
+            resumed_focus_refreshes: 0,
             source_control_mutations: HashMap::new(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
@@ -26032,6 +26048,27 @@ mod tests {
         match action {
             iced::runtime::Action::Output(cosmic::Action::App(message)) => message,
             _ => panic!("task did not produce an application message"),
+        }
+    }
+
+    #[test]
+    fn focus_gain_requests_one_installation_and_review_refresh_bundle() {
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        app.refresh_ui.focused = false;
+        for (window, focused, expected) in [
+            (window::Id::unique(), true, 0),
+            (main, true, 1),
+            (main, true, 1),
+            (main, false, 1),
+            (main, false, 1),
+            (main, true, 2),
+        ] {
+            drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+                window, focused,
+            ))));
+            assert_eq!(app.resumed_focus_refreshes, expected);
         }
     }
 

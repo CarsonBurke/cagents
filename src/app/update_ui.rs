@@ -36,14 +36,19 @@ pub(super) struct State {
 fn installation_candidate(executable: &Path) -> bool {
     executable.parent().is_some_and(|bin| {
         bin.file_name().is_some_and(|name| name == "bin")
-            && bin.parent().and_then(Path::parent).and_then(Path::file_name)
+            && bin
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
                 .is_some_and(|name| name == "versions")
     })
 }
 
 fn installation_checks_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::current_exe().ok().is_some_and(|path| installation_candidate(&path))
+        std::env::current_exe()
+            .ok()
+            .is_some_and(|path| installation_candidate(&path))
     });
     *ENABLED
 }
@@ -991,13 +996,19 @@ mod tests {
 
     #[test]
     fn source_builds_have_no_installation_timer_or_inspection() {
-        assert!(!installation_candidate(Path::new("/repo/target/dev-runtime/cagents-ui")));
-        assert!(installation_candidate(Path::new("/app/versions/v1/bin/cagents-ui")));
+        assert!(!installation_candidate(Path::new(
+            "/repo/target/dev-runtime/cagents-ui"
+        )));
+        assert!(installation_candidate(Path::new(
+            "/app/versions/v1/bin/cagents-ui"
+        )));
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.settings.check_for_updates = false;
         for focused in [true, false] {
             app.refresh_ui.focused = focused;
-            assert!(iced::advanced::subscription::into_recipes(app.update_subscription()).is_empty());
+            assert!(
+                iced::advanced::subscription::into_recipes(app.update_subscription()).is_empty()
+            );
         }
         if !installation_checks_enabled() {
             drop(app.update_update_ui(Action::InspectInstallation));

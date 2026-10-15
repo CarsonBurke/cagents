@@ -316,7 +316,10 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
             previous(panic);
             // Local capture is explicit opt-in. Force a backtrace even when
             // RUST_BACKTRACE was absent before this thread's first panic.
-            eprintln!("cagents panic backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+            eprintln!(
+                "cagents panic backtrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
         }
         crate::runtime_state::finish_panic_report();
     }));

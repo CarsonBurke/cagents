@@ -1718,9 +1718,10 @@ async fn run_instance<P>(
             }
             #[cfg(feature = "a11y")]
             Event::AccessibilityEnabled(id, enabled) => {
-                events.push((Some(id), core::Event::Window(
-                    core::window::Event::AccessibilityEnabled(enabled),
-                )));
+                events.push((
+                    Some(id),
+                    core::Event::Window(core::window::Event::AccessibilityEnabled(enabled)),
+                ));
                 if enabled {
                     a11y_enabled.insert(id);
                     if let Some(window) = window_manager.get_mut(id) {
