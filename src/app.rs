@@ -2480,6 +2480,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::MovePaneToChannel { .. }
+        | Message::PaneDropToChannel { .. }
         | Message::TerminalReviewMode { .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
@@ -2624,6 +2626,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
+            | Message::MovePaneToChannel { .. }
+            | Message::PaneDropToChannel { .. }
             | Message::FocusCard(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
@@ -4058,6 +4062,15 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    MovePaneToChannel {
+        card: CardId,
+        channel: crate::model::ChannelId,
+    },
+    PaneDropToChannel {
+        generation: u64,
+        card: CardId,
+        channel: crate::model::ChannelId,
+    },
     TerminalReviewMode {
         card: CardId,
         terminal: crate::model::TerminalId,
@@ -7072,7 +7085,11 @@ impl Cagents {
         // A successful attachment completes hydration even when the provider
         // has not enriched the already-saved descriptor yet.
         self.lifecycle.remove(card);
-        if let Some(state) = self.card_state_mut(card) {
+        if self
+            .card_state(card)
+            .is_some_and(|state| state.residency != Residency::Hot)
+            && let Some(state) = self.card_state_mut(card)
+        {
             state.residency = Residency::Hot;
         }
         if unchanged {
@@ -14603,6 +14620,20 @@ impl Application for Cagents {
                 self.set_terminal_review_owner(None);
                 self.focus_workspace_card(id)
             }
+            Message::MovePaneToChannel { card, channel } => {
+                self.move_pane_to_channel(card, channel)
+            }
+            Message::PaneDropToChannel {
+                generation,
+                card,
+                channel,
+            } => {
+                if generation == self.workspace_view_generation {
+                    self.move_pane_to_channel(card, channel)
+                } else {
+                    Task::none()
+                }
+            }
             Message::TerminalReviewMode {
                 card,
                 terminal,
@@ -17360,6 +17391,21 @@ impl Application for Cagents {
         );
         let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
+        let surface = crate::reorder::channel_scope(
+            surface,
+            widget::Id::new("workspace.tabs"),
+            self.workspace_view_generation,
+            !self.workspace_inputs_blocked(),
+            |card, channel| {
+                self.workspace.order().any(|id| id == card)
+                    && self.can_move_pane_to_channel(card, channel)
+            },
+            |card, channel| Message::PaneDropToChannel {
+                generation: self.workspace_view_generation,
+                card,
+                channel,
+            },
+        );
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,

@@ -44,6 +44,7 @@ enum ActorCommand {
     Provider {
         run: Option<crate::model::RunId>,
         command: Command,
+        decline_only: bool,
     },
     CloseIfIdle {
         generation: u64,
@@ -525,13 +526,14 @@ impl Handle {
         Ok(handle)
     }
     pub fn command(&self, command: Command) -> Result<(), String> {
-        self.submit_command(None, command).map_err(String::from)
+        self.submit_command(None, command, false)
+            .map_err(String::from)
     }
 
     /// Like [`Self::command`], but tells a refusal, after which the command
     /// may be offered again, from a timeout, after which it may still run.
     pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
-        self.submit_command(None, command)
+        self.submit_command(None, command, false)
     }
 
     pub(crate) fn command_for_run(
@@ -539,7 +541,13 @@ impl Handle {
         run: crate::model::RunId,
         command: Command,
     ) -> Result<(), String> {
-        self.submit_command(Some(run), command)
+        self.submit_command(Some(run), command, false)
+            .map_err(String::from)
+    }
+
+    /// Resolve only a current refusal, checked by the provider actor itself.
+    pub(crate) fn decline_answer(&self, command: Command) -> Result<(), String> {
+        self.submit_command(None, command, true)
             .map_err(String::from)
     }
 
@@ -547,6 +555,7 @@ impl Handle {
         &self,
         run: Option<crate::model::RunId>,
         command: Command,
+        decline_only: bool,
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
@@ -590,7 +599,14 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
-            .try_send((ActorCommand::Provider { run, command }, reply))
+            .try_send((
+                ActorCommand::Provider {
+                    run,
+                    command,
+                    decline_only,
+                },
+                reply,
+            ))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
         response
@@ -1912,7 +1928,33 @@ impl Actor {
                 continue;
             }
             let (run, command) = match command {
-                ActorCommand::Provider { run, command } => (run, command),
+                ActorCommand::Provider {
+                    run,
+                    command,
+                    decline_only,
+                } => {
+                    if decline_only {
+                        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        let valid = match &command {
+                            Command::Answer {
+                                request_id, action, ..
+                            } => {
+                                state.requests.iter().any(|request| {
+                                    request.id == *request_id
+                                        && request.actions.iter().any(|choice| choice.id == *action)
+                                }) && self.adapter.answer_declines(request_id, action)
+                            }
+                            _ => false,
+                        };
+                        if !valid {
+                            let _ = reply.send(Err(
+                                "A settled run may only decline a current pending request".into(),
+                            ));
+                            continue;
+                        }
+                    }
+                    (run, command)
+                }
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
                         .native_holder
@@ -2038,7 +2080,9 @@ impl Actor {
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::UpdatePermissionSettings { .. } => true,
-                Command::Answer { action, .. } => !super::declines(action),
+                Command::Answer {
+                    request_id, action, ..
+                } => !self.adapter.answer_declines(request_id, action),
                 _ => false,
             };
             if authorizes_work
@@ -3207,6 +3251,7 @@ mod tests {
             .send((
                 ActorCommand::Provider {
                     run: None,
+                    decline_only: false,
                     command: Command::Prompt {
                         text: "accepted work".into(),
                         attachments: Vec::new(),
@@ -3500,6 +3545,7 @@ mod tests {
             .send((
                 ActorCommand::Provider {
                     run: None,
+                    decline_only: false,
                     command: Command::Compact,
                 },
                 reply,

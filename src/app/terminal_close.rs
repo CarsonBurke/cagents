@@ -87,6 +87,29 @@ impl Cagents {
         }
     }
 
+    /// An accepted removal owns its pane until cancellation or commit, even
+    /// while its asynchronous cleanup has no visible dialog.
+    pub(super) fn pane_close_owned(&self, card: CardId) -> bool {
+        self.workspace
+            .pending_close()
+            .is_some_and(|handoff| handoff.unmounting == card)
+            || self
+                .terminal_close
+                .as_ref()
+                .is_some_and(|intent| intent.card == card)
+            || self.terminal_close_pending(card)
+            || self
+                .queued_card_closes
+                .iter()
+                .any(|queued| queued.card == card)
+            || self.chat_close_owned(card)
+            || self
+                .dirty_repository_close
+                .as_ref()
+                .is_some_and(|close| close.card == card || close.remaining.contains(&card))
+            || self.chrome_ui.closing_group.contains(&card)
+    }
+
     pub(super) fn terminal_close_pending(&self, card: CardId) -> bool {
         self.terminal_close
             .as_ref()
@@ -145,6 +168,12 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        if self.pane_transfer_pending(card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane is moving to a channel. Wait for the move to finish before closing it.",
+            ));
+            return Task::none();
+        }
         if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
             if !self.terminal_close_attempts.insert(session.id) {
                 return Task::none();
