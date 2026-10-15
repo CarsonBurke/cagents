@@ -2256,7 +2256,17 @@ mod tests {
                 "an ended terminal grants no live adoption authority"
             );
             let incoming = std::mem::take(&mut app.workspace_model);
-            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming.clone())));
+            // An ended pane cannot use the eager live-agent adoption path.
+            // Its passive shared projection waits for the publisher's seed
+            // acknowledgements, just as an ordinary saved terminal does.
+            for view in &incoming.views {
+                drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                    scope: view.scope.clone(),
+                    operation: None,
+                    model: incoming.clone(),
+                }));
+            }
             assert!(
                 app.shared_views.blocked.is_empty(),
                 "a normal console exit must not block its channel"
