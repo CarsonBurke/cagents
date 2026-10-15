@@ -312,9 +312,10 @@ CLI agent launches and automation launches through the shared daemon policy.
 For a new native conversation, the selected device's daemon resolves its own
 saved executable, extra arguments and environment. The window sends the account
 identity and its chosen model, effort and permission mode. These conversation
-choices stay with an unsent draft across saves and restarts; starting the draft
-records the daemon's actual launch recipe. Changing execution preferences does
-not replace a saved or already issued conversation's recipe.
+choices stay with an unsent draft across saves and restarts. At its first start,
+the daemon resolves the current saved execution policy and records the actual
+launch recipe. Changing execution preferences does not replace an already
+issued conversation's recorded recipe.
 
 The Settings pane edits this window's local settings file. When connected to a
 remote device, its provider execution policy and terminal shell come from that
