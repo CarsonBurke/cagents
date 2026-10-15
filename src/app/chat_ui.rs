@@ -4797,13 +4797,18 @@ impl Cagents {
     }
 
     pub(super) fn mark_automation_archive(&mut self, card: CardId) {
-        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
-            && !matches!(runtime.connection, Connection::Archived)
-        {
-            runtime.connection = Connection::Archived;
-            runtime.archive_evicted = !runtime.archive_history_revoked;
-            if !runtime.visible.load(Ordering::Relaxed) {
-                runtime.release_transcript_presentation();
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            let revoked = runtime.archive_history_revoked
+                || self.chat_ui.archive_discovery.reader_revoked(card, runtime.session.id);
+            if !matches!(runtime.connection, Connection::Archived) {
+                runtime.connection = Connection::Archived;
+                runtime.archive_evicted = !revoked;
+                if !runtime.visible.load(Ordering::Relaxed) {
+                    runtime.release_transcript_presentation();
+                }
+            }
+            if revoked {
+                runtime.revoke_automation_archive_history();
             }
         }
     }
@@ -6602,6 +6607,8 @@ impl Cagents {
                     return Task::none();
                 }
                 let session = current.clone();
+                let history_revoked = self.chat_ui.archive_discovery
+                    .reader_revoked(target.card, session.id);
                 match result.as_ref() {
                     Ok(archive)
                         if self.durable.automation_archives.get(&target.card)
@@ -6630,6 +6637,9 @@ impl Cagents {
                             runtime.target = target;
                             runtime.session = session.clone();
                             runtime.connection = Connection::Archived;
+                            if history_revoked {
+                                runtime.revoke_automation_archive_history();
+                            }
                             runtime.visible.store(visible, Ordering::Relaxed);
                             runtime.archive_evicted = !visible && !runtime.archive_history_revoked;
                             runtime.install_snapshot(Arc::new(archive.snapshot.clone()), None);
@@ -6641,7 +6651,10 @@ impl Cagents {
                                 visible,
                                 self.settings.editor_syntax_theme,
                             );
-                            runtime.archive_evicted = !visible;
+                            if history_revoked {
+                                runtime.revoke_automation_archive_history();
+                            }
+                            runtime.archive_evicted = !visible && !runtime.archive_history_revoked;
                             runtime.install_snapshot(Arc::new(archive.snapshot.clone()), None);
                             self.cards
                                 .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
@@ -17786,4 +17799,29 @@ mod tests {
         assert_eq!(app.card_state(card).unwrap().kind, descriptor);
         assert_eq!(app.durable.automation_archives.get(&card), Some(&agent));
     }
+
+    #[test]
+    fn account_revoked_archive_identity_survives_runtime_replacement() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let original = chat_runtime(&app, card).session.clone();
+        app.remember_revoked_automation_readers([(card, original.id)]);
+        app.cards.insert(card, CardRuntime::Loading);
+        let target = app.chat_ui.next_target(card);
+        app.cards.insert(card, CardRuntime::Chat(Box::new(Runtime::new(
+            target, original.clone(), Connection::Archived, true,
+            app.settings.editor_syntax_theme,
+        ))));
+        app.mark_automation_archive(card);
+        assert!(chat_runtime(&app, card).archive_history_revoked);
+        assert!(chat_runtime(&app, card).snapshot.items.is_empty());
+        // A distinct native conversation under the same UI CardId is new
+        // intent. The old identity fence does not classify its account home.
+        let replacement = crate::model::TerminalId::new();
+        assert!(!app.chat_ui.archive_discovery.reader_revoked(card, replacement));
+        Arc::make_mut(&mut app.durable).cards.retain(|saved| saved.id != card);
+        app.remember_revoked_automation_readers([]);
+        assert!(!app.chat_ui.archive_discovery.reader_revoked(card, original.id));
+    }
+
 }

@@ -30,8 +30,14 @@ pub(super) struct State {
     completed: Option<Key>,
     probes: HashMap<CardId, Probe>,
     checked: HashMap<CardId, crate::model::TerminalId>,
+    /// A failed/replaced Runtime cannot resurrect an explicitly purged reader.
+    revoked_readers: HashMap<CardId, crate::model::TerminalId>,
 }
 impl State {
+    pub(super) fn reader_revoked(&self, card: CardId, session: crate::model::TerminalId) -> bool {
+        self.revoked_readers.get(&card) == Some(&session)
+    }
+
     pub(super) fn reconnected(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.completed = None;
@@ -40,6 +46,33 @@ impl State {
 }
 
 impl Cagents {
+    /// Called only for the account consumer's typed Revoke decisions. Keep a
+    /// narrow exact identity fence across Runtime failure/replacement, without
+    /// promoting recipe/account display metadata into account-home authority.
+    pub(super) fn remember_revoked_automation_readers(
+        &mut self,
+        readers: impl IntoIterator<Item = (CardId, crate::model::TerminalId)>,
+    ) {
+        let open = self.durable.cards.iter().filter_map(|card| {
+            if !card.existence.is_open() {
+                return None;
+            }
+            let session = match &card.kind {
+                CardKind::Chat(session) => session.id,
+                CardKind::Terminal(session) => session.id,
+                _ => return None,
+            };
+            Some((card.id, session))
+        }).collect::<HashMap<_, _>>();
+        let revoked = &mut self.chat_ui.archive_discovery.revoked_readers;
+        revoked.retain(|card, session| open.get(card) == Some(session));
+        for (card, session) in readers {
+            if open.get(&card) == Some(&session) {
+                revoked.insert(card, session);
+            }
+        }
+    }
+
     pub(super) fn startup_archive_probe_pending(&self, card: CardId) -> bool {
         self.card_state(card)
             .is_some_and(|state| self.startup_archive_probe_for_state(state))
