@@ -314,6 +314,57 @@ mod tests {
     }
 
     #[test]
+    fn two_message_route_selections_keep_the_latest_target_when_callbacks_arrive_reversed() {
+        use cagents::lsp::{LspRange, LspLanguage};
+        use cagents::settings::LanguageServerSettings;
+        use cosmic::iced::futures::StreamExt;
+        let root = tempfile::tempdir().unwrap();
+        for name in ["main.rs", "first.rs", "latest.rs"] {
+            std::fs::write(root.path().join(name), "a😀éX\n").unwrap();
+        }
+        let mut app = editor();
+        let card = open_file(&mut app, root.path(), "main.rs");
+        // Register a pending document snapshot without launching a server.
+        // Protocol response production is tested at the LSP boundary; this
+        // fixture tests the actual UI message admissions and worker callbacks.
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let entered = runtime.enter();
+        app.lsp = LspManager::new(vec![LanguageServerSettings { id: "fixture".into(), command: vec!["/bin/false".into()], ..Default::default() }]);
+        let doc = LspDocumentId(91);
+        assert_eq!(app.lsp.open(doc, &root.path().join("main.rs"), root.path(), LspLanguage { server_id: "fixture".into(), language_id: "rust".into() }, 7, "a😀éX\n"), LspStatus::Starting);
+        app.tab_mut(card).unwrap().runtime.set_lsp_document(Some(doc));
+        drop(app.update(Message::Repository(RepositoryAction::Language { card, action: EditorLspAction::References })));
+        let request = app.lsp_navigation.requests[&card].request;
+        let items = ["first.rs", "latest.rs"].into_iter().map(|name| LspLocation {
+            target: LspTarget::Workspace { path: root.path().join(name) },
+            range: LspRange::new(LspPosition::new(0, 4), LspPosition::new(0, 5)),
+            coordinates: LspCoordinates::Utf16,
+        }).collect();
+        drop(app.update(Message::Lsp(app.lsp.generation(), Some(LspEvent::Locations { doc, request, kind: LocationKind::References, items }))));
+        let first = app.update(Message::Navigation(Action::Select { card, request, index: 0 }));
+        let latest = app.update(Message::Navigation(Action::Select { card, request, index: 1 }));
+        drop(entered);
+        let collect_callback = |task| runtime.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::Navigation(Action::Resolved { .. }))) = action { return message; }
+            }
+            panic!("canonicalization did not return its callback");
+        });
+        let latest_callback = collect_callback(latest);
+        let first_callback = collect_callback(first);
+        let load_latest = app.update(latest_callback);
+        let target = app.active.unwrap();
+        assert_ne!(target, card);
+        drop(app.update(first_callback));
+        assert_eq!(app.active, Some(target));
+        run_tasks(&mut app, load_latest);
+        assert_eq!(app.tab(target).unwrap().runtime.source_tab_path(), Some(root.path().join("latest.rs")));
+        assert_eq!(app.tab(target).unwrap().runtime.cursor_position(), Some(LspPosition::new(0, 3)));
+        assert_eq!(app.tabs.len(), 2);
+    }
+
+    #[test]
     fn an_older_resolution_cannot_consume_the_latest_explicit_choice() {
         let mut app = editor();
         let card = CardId::new();
