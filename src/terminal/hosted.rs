@@ -821,6 +821,11 @@ impl HostedPublishedState {
             execution_instance: terminal.execution_instance,
         });
         binding.execution_instance == terminal.execution_instance
+            && binding.source.id == terminal.session.id
+            && binding.source.launch == terminal.session.launch
+            && binding.source.owned_codex_listener == terminal.session.owned_codex_listener
+            && binding.source.recovery_origin == terminal.session.recovery_origin
+            && binding.source.predecessor == terminal.session.predecessor
     }
 
     fn pin_proof(&self, proof: &HostSessionProof) -> bool {
@@ -1023,6 +1028,31 @@ impl HostedTerminalHandle {
         )
     }
 
+    /// A host-issued handoff already identifies its exact worker. Install that
+    /// binding before starting any IO task; there is no ID-only recovery.
+    pub fn connect_descriptor(
+        terminal: super::ipc::TerminalDescriptor, initially_visible: bool,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, HostedTerminalStartError> {
+        if terminal.execution_instance.is_nil()
+            || terminal.session.continuity.live_proof().is_none_or(|proof| !proof.is_complete())
+        { return Err(HostedTerminalStartError::InvalidProof); }
+        let socket = ensure_daemon_ready()?;
+        Self::connect_descriptor_at(socket, terminal, initially_visible, wake)
+    }
+    pub fn connect_descriptor_at(
+        socket: impl Into<PathBuf>, terminal: super::ipc::TerminalDescriptor,
+        initially_visible: bool, wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, HostedTerminalStartError> {
+        let proof = terminal.session.continuity.live_proof()
+            .filter(HostSessionProof::is_complete).ok_or(HostedTerminalStartError::InvalidProof)?;
+        if terminal.execution_instance.is_nil() { return Err(HostedTerminalStartError::InvalidProof); }
+        let id = terminal.session.id;
+        Self::start_seeded(socket.into(), id, ConnectionIntent::Attach, Some(proof), Arc::new(wake),
+            Some(HostedTerminalBinding { source: terminal.session, execution_instance: terminal.execution_instance }),
+            Some(initially_visible))
+    }
+
     pub fn attach_or_spawn(
         session: TerminalSession,
         options: impl Into<TerminalSpawnOptions>,
@@ -1058,6 +1088,18 @@ impl HostedTerminalHandle {
         expected_host: Option<HostSessionProof>,
         wake: Arc<WakeCallback>,
     ) -> Result<Self, HostedTerminalStartError> {
+        Self::start_seeded(socket, terminal_id, intent, expected_host, wake, None, None)
+    }
+
+    fn start_seeded(
+        socket: PathBuf,
+        terminal_id: TerminalId,
+        intent: ConnectionIntent,
+        expected_host: Option<HostSessionProof>,
+        wake: Arc<WakeCallback>,
+        binding: Option<HostedTerminalBinding>,
+        visible_override: Option<bool>,
+    ) -> Result<Self, HostedTerminalStartError> {
         if expected_host
             .as_ref()
             .is_some_and(|proof| !proof.is_complete())
@@ -1072,9 +1114,12 @@ impl HostedTerminalHandle {
         };
         let published = Arc::new(HostedPublishedState::new(
             expected_host,
-            initially_visible,
+            visible_override.unwrap_or(initially_visible),
             wake,
         ));
+        if let Some(binding) = binding {
+            published.worker_binding.set(binding).expect("fresh attachment binding");
+        }
         let stop = Arc::new(WorkerStop::default());
         let worker_stop = Arc::clone(&stop);
         let worker_published = Arc::clone(&published);
@@ -1927,11 +1972,13 @@ async fn serve_connection(
         proof: None,
         request: ClientRequest::Connect {
             expected_host: published.proof(),
-            resume: vec![ResumeCursor {
+            // A bound handle cannot let Connect install presentation on an
+            // ID-only successor before it receives a descriptor to reject.
+            resume: if published.worker_binding.get().is_some() { Vec::new() } else { vec![ResumeCursor {
                 terminal_id,
                 generation: published.snapshot_cursor(),
                 event_sequence: published.event_sequence.load(Ordering::Acquire),
-            }],
+            }] },
         },
     };
     let mut connect_codec = FrameCodec::new(MAX_FRAME_BYTES);
@@ -2081,16 +2128,13 @@ async fn serve_connection(
     if !attached {
         // Once accepted, this handle can only reattach its original worker.
         // Losing that worker must never replay the original spawn intent.
-        let attach_only = published.worker_binding.get().is_some();
-        let (kind, request) = match intent {
-            ConnectionIntent::Spawn(_) if attach_only => (
-                PendingRequest::Attach,
-                ClientRequest::Attach {
-                    terminal_id,
-                    after_generation: published.snapshot_cursor(),
-                    after_event_sequence: published.event_sequence.load(Ordering::Acquire),
-                },
-            ),
+        let (kind, request) = if let Some(binding) = published.worker_binding.get() {
+            (PendingRequest::Attach, ClientRequest::AttachTerminalSource {
+                source: binding.source.clone(), execution_instance: binding.execution_instance,
+                after_generation: published.snapshot_cursor(),
+                after_event_sequence: published.event_sequence.load(Ordering::Acquire),
+            })
+        } else { match intent {
             ConnectionIntent::Attach => (
                 PendingRequest::Attach,
                 ClientRequest::Attach {
@@ -2110,7 +2154,7 @@ async fn serve_connection(
                     },
                 )
             }
-        };
+        }};
         if send_request(
             connection.writer(),
             &proof,
@@ -4230,6 +4274,60 @@ mod tests {
                     .load(Ordering::Acquire),
                 if replacement { 0 } else { 1 }
             );
+        }
+    }
+
+    #[test]
+    fn returned_descriptor_pins_first_io_and_never_attaches_same_id_successor() {
+        for successor in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let socket = directory.path().join("handoff-attach.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let proof = proof("returned-worker");
+            let mut source = session();
+            source.continuity = crate::model::TerminalContinuity::Live {
+                host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            };
+            let mut descriptor = TerminalDescriptor::relaunchable(source.id, source.launch.clone(), None);
+            descriptor.session = source.clone();
+            descriptor.execution_instance = uuid::Uuid::new_v4();
+            descriptor.attached = true;
+            let handle = HostedTerminalHandle::connect_descriptor_at(socket, descriptor.clone(), false, |_| {}).unwrap();
+            assert_eq!(handle.execution_instance(), Some(descriptor.execution_instance), "binding exists before peer IO");
+            handle.input(b"queued only for original worker".to_vec()).unwrap();
+            let mut stream = accept_connection(&listener);
+            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(&connect.request, ClientRequest::Connect { expected_host: Some(expected), resume } if expected == &proof && resume.is_empty()), "Connect must not attach an ID-only successor");
+            write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(connect.request_id), proof: proof.clone(), message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: Vec::new() } } }).unwrap();
+            let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(&attach.request, ClientRequest::AttachTerminalSource { source: captured, execution_instance, .. }
+                if captured == &source && *execution_instance == descriptor.execution_instance));
+            let mut actual = descriptor.clone();
+            if successor { actual.execution_instance = uuid::Uuid::new_v4(); }
+            // A broadcast may precede Attached; it cannot inherit authority
+            // from the already seeded original descriptor on mismatch.
+            write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(), message: ServerMessage::Event { terminal_id: source.id, sequence: 1, event: WireTerminalEvent::TitleChanged("before-bound-attach".into()) } }).unwrap();
+            write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(attach.request_id), proof: proof.clone(), message: ServerMessage::Response { response: ServerResponse::Attached { terminal: actual } } }).unwrap();
+            let result = handle.wait_until_attached(Duration::from_secs(2));
+            assert_eq!(result.is_ok(), !successor);
+            assert_eq!(handle.execution_instance(), Some(descriptor.execution_instance));
+            if successor {
+                assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None,
+                    "successor must receive no queued input or presentation effects");
+                assert!(!handle.events().try_iter().any(|event| matches!(event, TerminalEvent::TitleChanged(_))));
+            } else {
+                let mut delivered = false;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !delivered {
+                    assert!(Instant::now() < deadline);
+                    let frame: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                    if let ClientRequest::Input { bytes, .. } = &frame.request {
+                        assert_eq!(bytes, b"queued only for original worker"); delivered = true;
+                    }
+                    write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(frame.request_id), proof: proof.clone(), message: ServerMessage::Response { response: ServerResponse::Accepted } }).unwrap();
+                }
+            }
         }
     }
 

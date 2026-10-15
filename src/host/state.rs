@@ -736,6 +736,26 @@ impl HostState {
         handles
     }
 
+    /// Validate before subscriptions, focus/visibility aggregation or replay
+    /// can touch a replacement worker with a reusable public terminal ID.
+    pub(crate) fn attach_source(
+        &mut self, client_id: ClientId, source: &TerminalSession,
+        execution_instance: uuid::Uuid,
+    ) -> Result<TerminalDescriptor, ProtocolError> {
+        crate::terminal_ipc::validate_proof(source.continuity.live_proof().as_ref(), self.proof())?;
+        let record = self.terminals.get(&source.id).ok_or_else(|| not_found(source.id))?;
+        if execution_instance.is_nil() || record.handle.execution_instance() != execution_instance
+            || record.session.launch != source.launch
+            || record.session.owned_codex_listener != source.owned_codex_listener
+            || record.session.recovery_origin != source.recovery_origin
+            || record.session.predecessor != source.predecessor
+        {
+            return Err(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
+                "The returned terminal worker changed before attachment; its replacement was not attached", false));
+        }
+        self.attach(client_id, source.id)
+    }
+
     pub(crate) fn attach(
         &mut self,
         client_id: ClientId,
@@ -4665,7 +4685,7 @@ mod tests {
         let mut state = test_host();
         let old_delivery = state.register_client(1);
         state.reserve_spawn(id).unwrap();
-        state
+        let issued = state
             .finish_spawn(1, source, original.clone(), false)
             .unwrap();
         state
@@ -4706,6 +4726,10 @@ mod tests {
             state.attach(1, id).is_err(),
             "an old connection cannot refresh its own stale subscription authority"
         );
+        state.register_client(3);
+        assert!(state.attach_source(3, &issued.session, issued.execution_instance).is_err());
+        assert!(!state.subscriptions.attached(3, id), "stale first attachment cannot create a successor subscription");
+        assert!(!state.subscriptions.viewports.contains_key(&(3, id)));
         let fresh_delivery = state.register_client(2);
         let descriptor = state.attach(2, id).unwrap();
         assert_eq!(

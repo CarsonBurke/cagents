@@ -5406,6 +5406,28 @@ impl Cagents {
         ])
     }
 
+    /// The operation already published this exact worker. Preserve its binding
+    /// before IO, and never recover/list/spawn by reusable terminal ID.
+    fn start_terminal_from_handoff(
+        &self, card: CardId, descriptor: crate::terminal_ipc::TerminalDescriptor, visible: bool,
+    ) -> Task<Message> {
+        self.begin_terminal_start(card);
+        let sender = self.terminal_wake_tx.clone();
+        let terminal = descriptor.session.id;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let session = descriptor.session.clone();
+                let handle = HostedTerminalHandle::connect_descriptor(descriptor, visible, move |wake| {
+                    let _ = sender.try_send(TerminalWakeup { card, generation: wake.generation });
+                }).map_err(|error| error.to_string())?;
+                handle.wait_until_attached(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(10))?;
+                Ok(StartedTerminal { handle: TerminalSurface::from(handle), session, spawned: false })
+            }).await.map_err(|error| format!("returned terminal attachment failed: {error}"))
+                .and_then(|result| result);
+            Message::TerminalStarted { card, terminal, result }
+        })
+    }
+
     fn start_terminal(
         &self,
         card: CardId,

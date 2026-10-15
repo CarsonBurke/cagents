@@ -36,6 +36,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
         | R::Attach { .. }
+        | R::AttachTerminalSource { .. }
         | R::Detach { .. }
         | R::SetVisibility { .. }
         | R::Hibernate { .. }
