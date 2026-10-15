@@ -2310,22 +2310,24 @@ pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, C
             continue;
         }
         let card = parse_id("migration card", &card)?;
-        let session = match kind.as_str() {
-            "terminal" => CardKind::Terminal(load_terminal_record(&transaction, card)?),
-            "chat" => CardKind::Chat(from_json(
-                "migration chat",
-                content.as_deref().ok_or_else(|| {
-                    StoreError::corrupt_row(
-                        format!("migration chat card {card}"),
-                        "missing session descriptor",
-                    )
-                })?,
-            )?),
-            _ => unreachable!("query restricts session kinds"),
-        };
+        let session=read_migration_session_at(&transaction,card,&kind,content.as_deref())?;
         sessions.push((card, session));
     }
     Ok(sessions)
+}
+
+/// Decode the exact row inside an existing read-only inspection transaction.
+/// Terminal ownership lives in normalized tables, not cards.content_json.
+/// The caller must read and validate this card's kind/existence in that same
+/// transaction; this helper never opens a store or changes its schema/state.
+pub(crate) fn read_migration_session_at(
+    connection:&Connection,card:CardId,kind:&str,content:Option<&str>,
+)->Result<CardKind>{
+    match kind {
+        "terminal"=>load_terminal_record(connection,card).map(CardKind::Terminal),
+        "chat"=>from_json("migration chat",content.ok_or_else(||StoreError::corrupt_row(format!("migration chat card {card}"),"missing session descriptor"))?).map(CardKind::Chat),
+        _=>Err(StoreError::InvalidState("Migration inspection requires a saved native or terminal pane".into())),
+    }
 }
 
 /// Read one consistent snapshot without migrating or writing another window's
