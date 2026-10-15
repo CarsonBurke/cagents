@@ -197,8 +197,8 @@ fn format_options(o:LspFormattingOptions)->lsp_types::FormattingOptions{lsp_type
 
 fn identifier(snapshot:&Snapshot,at:LspPosition)->Result<(LspRange,String),LspError>{
     snapshot.to_utf16(at)?;
-    let span=snapshot.line_span(at.line).ok_or(LspError::UnknownDocument(0))?;
-    let line=&snapshot.text[span];let chars:Vec<char>=line.chars().collect();let mut start=at.character as usize;let mut end=start;
+    let line=snapshot.line_content(at.line).ok_or_else(||snapshot.out_of_range(at.line,at.character))?;
+    let chars:Vec<char>=line.chars().collect();let mut start=at.character as usize;let mut end=start;
     let word=|c:char|c=='_'||c.is_alphanumeric();while start>0&&word(chars[start-1]){start-=1;}while end<chars.len()&&word(chars[end]){end+=1;}
     if start==end{return Err(LspError::Unsupported("cursor is not on an identifier".into()));}
     Ok((LspRange::new(LspPosition::new(at.line,start as u32),LspPosition::new(at.line,end as u32)),chars[start..end].iter().collect()))
