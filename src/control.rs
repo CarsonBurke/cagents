@@ -1013,19 +1013,29 @@ impl ControlClient {
 
     pub fn reconcile_terminal(&mut self, session: crate::model::TerminalSession) -> Result<TerminalDescriptor, ControlError> {
         let id = session.id;
-        match self.request_strict(ClientRequest::ReconcileTerminal { session })? {
-            ServerResponse::Spawned { terminal } if terminal.session.id == id => Ok(terminal),
-            response => Err(unexpected_response("authenticated terminal reconciliation", &response)),
-        }
+        let terminal = match self.request_attached(ClientRequest::ReconcileTerminal { session }, id)? {
+            ServerResponse::Spawned { terminal } if terminal.session.id == id => terminal,
+            response => return Err(unexpected_response("authenticated terminal reconciliation", &response)),
+        };
+        self.read_attachment_replay(id)?;
+        self.finish_attachment(id, Ok(terminal))
     }
 
     pub fn reconcile_terminal_close(
         &mut self, session: crate::model::TerminalSession, allow_active: bool,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         let id = session.id;
-        match self.request_with_deadline(ClientRequest::ReconcileTerminalClose { session, allow_active }, Instant::now() + CHAT_CLOSE_TIMEOUT)? {
-            ServerResponse::TerminalCloseChecked { terminal_id, outcome } if terminal_id == id => Ok(outcome),
-            response => Err(unexpected_response("reconciled terminal close", &response)),
+        let result = self.request_streaming_deadline(ClientRequest::ReconcileTerminalClose { session, allow_active }, Some(id), Instant::now() + CHAT_CLOSE_TIMEOUT)
+            .and_then(|response| match response {
+                ServerResponse::TerminalCloseChecked { terminal_id, outcome } if terminal_id == id => Ok(outcome),
+                response => Err(unexpected_response("reconciled terminal close", &response)),
+            });
+        let detached = self.detach(id);
+        match (result, detached) {
+            (Err(error), _) => Err(error),
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(terminal::ipc::TerminalCloseResult::Closed), Err(ControlError::Remote { code: ProtocolErrorCode::TerminalNotFound, .. })) => Ok(terminal::ipc::TerminalCloseResult::Closed),
+            (Ok(_), Err(error)) => Err(error),
         }
     }
 
@@ -1454,7 +1464,16 @@ impl ControlClient {
         request: ClientRequest,
         deadline: Instant,
     ) -> Result<ServerResponse, ControlError> {
-        let result = self.request_inner(request, None, Some(deadline));
+        self.request_streaming_deadline(request, None, deadline)
+    }
+
+    fn request_streaming_deadline(
+        &mut self,
+        request: ClientRequest,
+        streaming_terminal: Option<TerminalId>,
+        deadline: Instant,
+    ) -> Result<ServerResponse, ControlError> {
+        let result = self.request_inner(request, streaming_terminal, Some(deadline));
         let read_restored = self.restore_read_timeout();
         let write_restored = self
             .stream
