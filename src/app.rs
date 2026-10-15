@@ -7234,7 +7234,8 @@ impl Cagents {
     }
 
     fn pane_is_active(&self, card: CardId) -> bool {
-        self.refresh_ui.focused
+        self.exit.is_none()
+            && self.refresh_ui.focused
             && self.workspace.focused() == Some(card)
             && self.workspace_surfaces_visible()
             && !self.modal_is_open()
@@ -13152,6 +13153,9 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Preserve the existing dispatch layout while every return converges
+        // through the lightweight visibility/presence postlude below.
+        #[rustfmt::skip]
         let task = (|| {
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
