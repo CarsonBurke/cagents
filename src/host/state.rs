@@ -98,6 +98,7 @@ struct OutputObservation {
 #[derive(Default)]
 struct Subscriptions {
     viewports: BTreeMap<(ClientId, TerminalId), presentation::Viewport>,
+    worker_instances: BTreeMap<(ClientId, TerminalId), uuid::Uuid>,
     size_owners: BTreeMap<TerminalId, ClientId>,
     by_client: BTreeMap<ClientId, BTreeMap<TerminalId, TerminalVisibility>>,
     by_terminal: BTreeMap<TerminalId, BTreeMap<ClientId, TerminalVisibility>>,
@@ -143,6 +144,7 @@ impl Subscriptions {
                 self.by_terminal.remove(&terminal_id);
             }
         }
+        self.worker_instances.remove(&(client_id, terminal_id));
         self.viewports.remove(&(client_id, terminal_id));
         self.sent.remove(&(client_id, terminal_id));
         self.output.remove(&(client_id, terminal_id));
@@ -175,6 +177,8 @@ impl Subscriptions {
             .retain(|(sent_client, _), _| *sent_client != client_id);
         self.output.retain(|(client, _), _| *client != client_id);
         self.viewports.retain(|(client, _), _| *client != client_id);
+        self.worker_instances
+            .retain(|(client, _), _| *client != client_id);
         for terminal_id in terminals.keys() {
             if let Some(clients) = self.by_terminal.get_mut(terminal_id) {
                 clients.remove(&client_id);
@@ -198,6 +202,7 @@ impl Subscriptions {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     fn visibility(&self, terminal_id: TerminalId) -> TerminalVisibility {
         let mut effective = TerminalVisibility::Hibernated;
         let Some(clients) = self.by_terminal.get(&terminal_id) else {
@@ -599,23 +604,53 @@ impl HostState {
             scope,
             expected_revision,
             operation,
-            ..
+            change,
         } = &edit
         {
             let registry = self.registry()?;
-            if !registry
+            let seen = registry
                 .view_operation_seen(*operation)
-                .map_err(model_unavailable)?
-                && registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ViewConflict,
-                    "The workspace view changed; rebase this pane mutation on the current revision",
-                    true,
-                ));
+                .map_err(model_unavailable)?;
+            if !seen {
+                if let Some(reason) = registry
+                    .view_change_refusal(scope, change)
+                    .map_err(model_unavailable)?
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        reason,
+                        false,
+                    ));
+                }
+                if registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ViewConflict,
+                        "The workspace view changed; rebase this pane mutation on the current revision",
+                        true,
+                    ));
+                }
             }
         }
-        let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
+        let registry = self.registry()?;
+        let applied = registry.apply(&edit).map_err(|error| {
+            // An execution writer can close a view after the preflight read.
+            // apply has rolled back; inspect authoritative membership again
+            // rather than making the client retry a permanently invalid edit.
+            if let ModelEdit::ChangeView { scope, change, .. } = &edit {
+                match registry.view_change_refusal(scope, change) {
+                    Ok(Some(reason)) => {
+                        return ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            reason,
+                            false,
+                        );
+                    }
+                    Err(storage) => return model_unavailable(storage),
+                    Ok(None) => {}
+                }
+            }
+            model_unavailable(error)
+        })?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
         }
@@ -696,7 +731,13 @@ impl HostState {
             .subscriptions
             .by_client
             .get(&client_id)
-            .map(|terminals| terminals.keys().copied().collect::<Vec<_>>())
+            .map(|terminals| {
+                terminals
+                    .keys()
+                    .copied()
+                    .filter(|id| self.subscription_current(client_id, *id))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let handles = terminal_ids
             .iter()
@@ -709,7 +750,7 @@ impl HostState {
         self.subscriptions.disconnect(client_id);
         for terminal_id in terminal_ids {
             self.refresh_presentation_owner(terminal_id);
-            let visibility = self.subscriptions.visibility(terminal_id);
+            let visibility = self.current_visibility(terminal_id);
             if let Some(record) = self.terminals.get(&terminal_id) {
                 let _ = apply_visibility(&record.handle, visibility);
             }
@@ -735,12 +776,16 @@ impl HostState {
             .get(&terminal_id)
             .ok_or_else(|| not_found(terminal_id))?;
         if self.subscriptions.attached(client_id, terminal_id) {
+            self.attached_terminal(client_id, terminal_id)?;
             return self.descriptor(client_id, terminal_id);
         }
-        let old_visibility = self.subscriptions.visibility(terminal_id);
+        let old_visibility = self.current_visibility(terminal_id);
         self.subscriptions
             .attach(client_id, terminal_id, TerminalVisibility::Hidden);
-        let new_visibility = self.subscriptions.visibility(terminal_id);
+        self.subscriptions
+            .worker_instances
+            .insert((client_id, terminal_id), record.handle.execution_instance());
+        let new_visibility = self.current_visibility(terminal_id);
         if old_visibility != new_visibility
             && let Err(error) = apply_visibility(&record.handle, new_visibility)
         {
@@ -769,14 +814,30 @@ impl HostState {
         else {
             return Ok(());
         };
-        let old_visibility = self.subscriptions.visibility(terminal_id);
+        // Stale cleanup may forget its own attachment, but cannot apply
+        // visibility/focus/output changes to the same-ID successor.
+        if !self.subscription_current(client_id, terminal_id) {
+            self.subscriptions.detach(client_id, terminal_id);
+            return Ok(());
+        }
+        let old_worker = self
+            .subscriptions
+            .worker_instances
+            .get(&(client_id, terminal_id))
+            .copied();
+        let old_visibility = self.current_visibility(terminal_id);
         self.subscriptions.detach(client_id, terminal_id);
-        let new_visibility = self.subscriptions.visibility(terminal_id);
+        let new_visibility = self.current_visibility(terminal_id);
         if old_visibility != new_visibility
             && let Err(error) = apply_visibility(&record.handle, new_visibility)
         {
             self.subscriptions
                 .attach(client_id, terminal_id, old_requested);
+            if let Some(instance) = old_worker {
+                self.subscriptions
+                    .worker_instances
+                    .insert((client_id, terminal_id), instance);
+            }
             return Err(send_error(error));
         }
         self.refresh_presentation_owner(terminal_id);
@@ -790,6 +851,7 @@ impl HostState {
         terminal_id: TerminalId,
         requested: TerminalVisibility,
     ) -> Result<(), ProtocolError> {
+        self.attached_terminal(client_id, terminal_id)?;
         let record = self
             .terminals
             .get(&terminal_id)
@@ -807,10 +869,10 @@ impl HostState {
                 false,
             ));
         };
-        let old_visibility = self.subscriptions.visibility(terminal_id);
+        let old_visibility = self.current_visibility(terminal_id);
         self.subscriptions
             .set_visibility(client_id, terminal_id, requested);
-        let new_visibility = self.subscriptions.visibility(terminal_id);
+        let new_visibility = self.current_visibility(terminal_id);
         if old_visibility != new_visibility
             && let Err(error) = apply_visibility(&record.handle, new_visibility)
         {
@@ -840,6 +902,9 @@ impl HostState {
     }
 
     fn rearm_output(&mut self, client_id: ClientId, terminal_id: TerminalId) {
+        if !self.subscription_current(client_id, terminal_id) {
+            return;
+        }
         let Some(observation) = self.subscriptions.output.get_mut(&(client_id, terminal_id)) else {
             return;
         };
@@ -865,6 +930,7 @@ impl HostState {
             .is_some_and(|clients| {
                 clients.iter().any(|(client, visibility)| {
                     *visibility != TerminalVisibility::Visible
+                        && self.subscription_current(*client, terminal_id)
                         && self
                             .subscriptions
                             .output
@@ -909,7 +975,7 @@ impl HostState {
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
         self.descriptor_as(
-            self.subscriptions.attached(client_id, terminal_id),
+            self.subscription_current(client_id, terminal_id),
             terminal_id,
         )
     }
@@ -948,6 +1014,7 @@ impl HostState {
             }
         };
         Ok(TerminalDescriptor {
+            execution_instance: record.handle.execution_instance(),
             screen_lost_after_crash: record.screen_lost_after_crash,
             session,
             activity: record.handle.activity(),
@@ -1139,6 +1206,7 @@ impl HostState {
         initially_visible: bool,
     ) -> Result<TerminalDescriptor, ProtocolError> {
         let terminal_id = session.id;
+        let execution_instance = handle.execution_instance();
         self.cancel_spawn(terminal_id);
         if self.shutting_down {
             return Err(ProtocolError::new(
@@ -1177,8 +1245,47 @@ impl HostState {
         };
         self.subscriptions
             .attach(client_id, terminal_id, visibility);
+        self.subscriptions
+            .worker_instances
+            .insert((client_id, terminal_id), execution_instance);
         self.rearm_output(client_id, terminal_id);
         self.descriptor(client_id, terminal_id)
+    }
+
+    fn current_visibility(&self, id: TerminalId) -> TerminalVisibility {
+        let mut effective = TerminalVisibility::Hidden;
+        let mut any = false;
+        for (client, visibility) in self
+            .subscriptions
+            .by_terminal
+            .get(&id)
+            .into_iter()
+            .flat_map(|clients| clients.iter())
+        {
+            if !self.subscription_current(*client, id) {
+                continue;
+            }
+            if !any {
+                effective = TerminalVisibility::Hibernated;
+                any = true;
+            }
+            match visibility {
+                TerminalVisibility::Visible => return TerminalVisibility::Visible,
+                TerminalVisibility::Hidden => effective = TerminalVisibility::Hidden,
+                TerminalVisibility::Hibernated => {}
+            }
+        }
+        effective
+    }
+
+    fn subscription_current(&self, client: ClientId, id: TerminalId) -> bool {
+        self.terminals.get(&id).is_some_and(|record| {
+            self.subscriptions
+                .worker_instances
+                .get(&(client, id))
+                .copied()
+                == Some(record.handle.execution_instance())
+        })
     }
 
     fn attached_terminal(
@@ -1193,9 +1300,24 @@ impl HostState {
                 false,
             ));
         }
-        self.terminals
+        let record = self
+            .terminals
             .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))
+            .ok_or_else(|| not_found(terminal_id))?;
+        if self
+            .subscriptions
+            .worker_instances
+            .get(&(client_id, terminal_id))
+            .copied()
+            != Some(record.handle.execution_instance())
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ProofMismatch,
+                "The attached terminal worker changed; create a fresh attachment before sending controls",
+                false,
+            ));
+        }
+        Ok(record)
     }
 
     pub(crate) fn handle(
@@ -1295,17 +1417,7 @@ impl HostState {
         terminal_id: TerminalId,
         after_generation: u64,
     ) -> Result<Option<TerminalSnapshot>, ProtocolError> {
-        if !self.subscriptions.attached(client_id, terminal_id) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::PermissionDenied,
-                format!("client is not attached to terminal {terminal_id}"),
-                false,
-            ));
-        }
-        let record = self
-            .terminals
-            .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))?;
+        let record = self.attached_terminal(client_id, terminal_id)?;
         let snapshot = record.handle.snapshot();
         if snapshot.generation <= after_generation {
             return Ok(None);
@@ -2023,6 +2135,22 @@ fn prepare_upgrade_with_carry_policy(
             paired_codex,
         )
     };
+    // The caller holds exclusive control admission through commit, after
+    // which shutting_down refuses new input. Every carried worker must have
+    // delivered its accepted bytes to the original PTY before we may destroy
+    // its Rust queue, including the emergency preservation fallback.
+    for terminal in &carried {
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.descriptor(0, terminal.source.id)?.session != terminal.source {
+                return Err(upgrade_error(
+                    "A carried terminal changed before its input could be verified",
+                ));
+            }
+            state.terminals[&terminal.source.id].handle.clone()
+        };
+        handle.check_input_drained().map_err(upgrade_error)?;
+    }
     let store = discover().map_err(upgrade_error)?;
     if let Some(previous) = store.load().map_err(upgrade_error)?
         && (previous.proof != proof || previous.phase != Phase::Prepared)
@@ -3578,7 +3706,7 @@ fn start_terminal_view_owned(
         rows: options.rows,
         cell_width_px: options.cell_width_px,
         cell_height_px: options.cell_height_px,
-        max_scrollback: options.max_scrollback,
+        max_scrollback_bytes: options.max_scrollback_bytes,
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
@@ -3586,8 +3714,12 @@ fn start_terminal_view_owned(
         holder_recovery,
         ..TerminalConfig::default()
     };
+    let wake_instance = Arc::new(std::sync::OnceLock::<uuid::Uuid>::new());
+    let callback_instance = Arc::clone(&wake_instance);
     let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
-        broadcast_redraw(&weak, terminal_id, wake.generation);
+        if let Some(instance) = callback_instance.get() {
+            broadcast_redraw_from(&weak, terminal_id, wake.generation, Some(*instance));
+        }
     }) {
         Ok(handle) => handle,
         Err(error) => {
@@ -3602,11 +3734,13 @@ fn start_terminal_view_owned(
             ));
         }
     };
+    let instance = handle.execution_instance();
+    let _ = wake_instance.set(instance);
     let output_host = Arc::downgrade(shared);
-    handle
-        .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
+    handle.set_output_observer(move |sequence| {
+        broadcast_output_from(&output_host, terminal_id, sequence, Some(instance))
+    });
 
-    let event_rx = handle.events();
     let redraw_handle = handle.clone();
     let descriptor = {
         let mut state = shared
@@ -3674,44 +3808,20 @@ fn start_terminal_view_owned(
     );
     redraw_handle.set_agent_process_observer(move || activity_wake.notify());
     let event_host = Arc::downgrade(shared);
-    let archived_host = Arc::downgrade(shared);
-    redraw_handle.set_archived_event_observer(move |handle, event| {
-        record_event_from(&archived_host, terminal_id, event, Some(handle));
-    });
-    let completion_handle = redraw_handle.clone();
-    let event_thread = thread::Builder::new()
-        .name(format!("cagentsd-events-{terminal_id}"))
-        .spawn(move || {
-            while let Ok(event) = event_rx.recv() {
-                let completed = matches!(event, TerminalEvent::Completed { .. });
-                record_event_from(&event_host, terminal_id, event, Some(&completion_handle));
-                if completed {
-                    break;
-                }
-            }
-            // The final grid is captured after the exit event and may race a
-            // reveal queued just as the worker stops accepting commands.
-            // Notify only visible subscribers once teardown has preserved it.
-            broadcast_redraw(&event_host, terminal_id, completion_handle.generation());
-        });
-    if let Err(error) = event_thread {
-        let _ = redraw_handle.shutdown();
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state
-            .terminals
-            .get(&terminal_id)
-            .is_some_and(|record| record.handle.same_worker(&redraw_handle))
-        {
-            state.retire_terminal(terminal_id);
+    redraw_handle.set_event_observer(move |handle, event| {
+        let completed = matches!(event, TerminalEvent::Completed { .. });
+        record_event_from(&event_host, terminal_id, event, Some(handle));
+        if completed {
+            // Completion certifies the final grid, including a reveal queued
+            // just as the terminal stopped accepting parser commands.
+            broadcast_redraw_from(
+                &event_host,
+                terminal_id,
+                handle.generation(),
+                Some(handle.execution_instance()),
+            );
         }
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::Internal,
-            format!("could not start terminal event monitor: {error}"),
-            true,
-        ));
-    }
+    });
     Ok((descriptor, redraw_handle))
 }
 
@@ -3740,6 +3850,11 @@ pub(crate) fn send_error(error: TerminalSendError) -> ProtocolError {
             ProtocolErrorCode::TerminalUnavailable,
             "the terminal worker has closed",
             true,
+        ),
+        TerminalSendError::SelectionMoved => ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Output moved; select again",
+            false,
         ),
         TerminalSendError::PasteTooLarge(bytes) => ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
@@ -3775,7 +3890,7 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
         || !(1..=500).contains(&options.rows)
         || !(1..=4096).contains(&options.cell_width_px)
         || !(1..=4096).contains(&options.cell_height_px)
-        || options.max_scrollback > 1_000_000
+        || options.max_scrollback_bytes > 1024 * 1024 * 1024
     {
         return Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
@@ -3786,9 +3901,26 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
     Ok(())
 }
 
+#[cfg(test)]
 fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u64) {
+    broadcast_output_from(host, terminal_id, sequence, None);
+}
+fn broadcast_output_from(
+    host: &Weak<HostLock>,
+    terminal_id: TerminalId,
+    sequence: u64,
+    expected: Option<uuid::Uuid>,
+) {
     let Some(host) = host.upgrade() else { return };
     let mut state = host.lock().unwrap_or_else(|error| error.into_inner());
+    if expected.is_some_and(|instance| {
+        state
+            .terminals
+            .get(&terminal_id)
+            .is_none_or(|record| record.handle.execution_instance() != instance)
+    }) {
+        return;
+    }
     let HostState {
         proof,
         subscriptions,
@@ -3799,8 +3931,22 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
     let Some(subscribers) = subscriptions.by_terminal.get(&terminal_id) else {
         return;
     };
+    let Some(instance) = terminals
+        .get(&terminal_id)
+        .map(|record| record.handle.execution_instance())
+    else {
+        return;
+    };
     let mut needs_output = false;
     for (&client, &visibility) in subscribers {
+        if subscriptions
+            .worker_instances
+            .get(&(client, terminal_id))
+            .copied()
+            != Some(instance)
+        {
+            continue;
+        }
         if visibility == TerminalVisibility::Visible {
             continue;
         }
@@ -3851,26 +3997,46 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
 /// every delta chained to the previous delivery; an unapplicable delta is
 /// detected by `base_generation` and answered with a full repaint, so a client
 /// that misses a push still recovers.
+#[cfg(test)]
 fn broadcast_redraw(host: &Weak<HostLock>, terminal_id: TerminalId, generation: u64) {
+    broadcast_redraw_from(host, terminal_id, generation, None);
+}
+fn broadcast_redraw_from(
+    host: &Weak<HostLock>,
+    terminal_id: TerminalId,
+    generation: u64,
+    expected: Option<uuid::Uuid>,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
     let mut pending = Vec::new();
     {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if expected.is_some_and(|instance| {
+            state
+                .terminals
+                .get(&terminal_id)
+                .is_none_or(|record| record.handle.execution_instance() != instance)
+        }) {
+            return;
+        }
         let visible = state
             .subscriptions
             .by_terminal
             .get(&terminal_id)
             .into_iter()
             .flat_map(|clients| clients.iter())
-            .filter(|(_, visibility)| **visibility == TerminalVisibility::Visible)
+            .filter(|(client, visibility)| {
+                **visibility == TerminalVisibility::Visible
+                    && state.subscription_current(**client, terminal_id)
+            })
             .map(|(client_id, _)| *client_id)
             .collect::<Vec<_>>();
         if visible.is_empty() {
             // Serialize visibility commands with attachment/reveal changes.
             // Otherwise this Hide could overtake a newly attached UI's Reveal.
-            if state.subscriptions.visibility(terminal_id) == TerminalVisibility::Hidden
+            if state.current_visibility(terminal_id) == TerminalVisibility::Hidden
                 && let Some(record) = state.terminals.get(&terminal_id)
             {
                 let _ = record.handle.hide();
@@ -3953,7 +4119,12 @@ fn record_event_from(
     let wire_event = WireTerminalEvent::from(event);
     let (proof, sequence, deliveries) = {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let client_ids = state.subscriptions.clients(terminal_id);
+        let client_ids = state
+            .subscriptions
+            .clients(terminal_id)
+            .into_iter()
+            .filter(|client| state.subscription_current(*client, terminal_id))
+            .collect::<Vec<_>>();
         let proof = state.proof_handle();
         let Some(record) = state.terminals.get_mut(&terminal_id) else {
             return;
@@ -3988,7 +4159,9 @@ fn record_event_from(
         }
         if !matches!(
             wire_event,
-            WireTerminalEvent::ClipboardText { .. } | WireTerminalEvent::SearchResults { .. }
+            WireTerminalEvent::ClipboardWrite { .. }
+                | WireTerminalEvent::ClipboardText { .. }
+                | WireTerminalEvent::SearchResults { .. }
         ) {
             record.events.push_back((sequence, wire_event.clone()));
         }
@@ -4494,6 +4667,184 @@ mod tests {
             None,
             "activation is consumed once"
         );
+    }
+
+    #[test]
+    fn stale_subscription_cannot_route_input_or_presentation_to_same_id_successor() {
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/sleep".into(),
+            arguments: vec!["60".into()],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let id = TerminalId::new();
+        let source = TerminalSession {
+            id,
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let original = TerminalHandle::spawn(source.clone(), Default::default(), |_| {}).unwrap();
+        let successor = TerminalHandle::spawn(source.clone(), Default::default(), |_| {}).unwrap();
+        let mut state = test_host();
+        let old_delivery = state.register_client(1);
+        state.reserve_spawn(id).unwrap();
+        state
+            .finish_spawn(1, source, original.clone(), false)
+            .unwrap();
+        state
+            .set_visibility(1, id, TerminalVisibility::Visible)
+            .unwrap();
+        state
+            .resize_client(
+                1,
+                id,
+                crate::terminal::TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                },
+            )
+            .unwrap();
+        state.focus_client(1, id, true).unwrap();
+        state.terminals.get_mut(&id).unwrap().handle = successor.clone();
+        assert_ne!(
+            original.execution_instance(),
+            successor.execution_instance()
+        );
+        assert_eq!(
+            state.surface_handle(1, id).unwrap_err().code,
+            ProtocolErrorCode::ProofMismatch
+        );
+        assert_eq!(
+            state.history_handle(1, id).unwrap_err().code,
+            ProtocolErrorCode::ProofMismatch
+        );
+        assert!(
+            state
+                .set_visibility(1, id, TerminalVisibility::Visible)
+                .is_err()
+        );
+        assert!(
+            state.attach(1, id).is_err(),
+            "an old connection cannot refresh its own stale subscription authority"
+        );
+        let fresh_delivery = state.register_client(2);
+        let descriptor = state.attach(2, id).unwrap();
+        assert_eq!(
+            descriptor.execution_instance,
+            successor.execution_instance()
+        );
+        assert_eq!(
+            state.current_visibility(id),
+            TerminalVisibility::Hidden,
+            "stale visible client must not reveal successor"
+        );
+        state
+            .set_visibility(2, id, TerminalVisibility::Visible)
+            .unwrap();
+        state
+            .resize_client(
+                2,
+                id,
+                crate::terminal::TerminalSize {
+                    columns: 120,
+                    rows: 36,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state.subscriptions.size_owners.get(&id),
+            Some(&2),
+            "old focused viewport must not win current size ownership"
+        );
+        // A stale client's teardown cannot return the successor to connection
+        // cleanup, or change its presentation after a new owner has attached.
+        state.register_client(3);
+        state
+            .subscriptions
+            .attach(3, id, TerminalVisibility::Visible);
+        state
+            .subscriptions
+            .worker_instances
+            .insert((3, id), original.execution_instance());
+        state
+            .subscriptions
+            .viewports
+            .entry((3, id))
+            .or_default()
+            .focused = true;
+        state.detach(3, id).unwrap();
+        assert_eq!(state.subscriptions.size_owners.get(&id), Some(&2));
+        assert!(
+            state.unregister_client(1).is_empty(),
+            "stale connection cleanup must not retain successor handle"
+        );
+        assert!(!state.descriptor(1, id).unwrap().attached);
+        assert_eq!(state.subscriptions.size_owners.get(&id), Some(&2));
+        assert!(state.surface_handle(2, id).unwrap().same_worker(&successor));
+        assert!(
+            !successor.is_completed(),
+            "refusing stale input must preserve the new owner"
+        );
+        old_delivery.close_after_drain();
+        while old_delivery.pop().is_some() {}
+        // Fresh visibility also queued a redraw; retain only following events.
+        let shared = Arc::new(crate::host::state::HostLock::new(state));
+        record_event_from(
+            &Arc::downgrade(&shared),
+            id,
+            TerminalEvent::TitleChanged("STALE_OLD_WORKER".into()),
+            Some(&original),
+        );
+        broadcast_redraw_from(
+            &Arc::downgrade(&shared),
+            id,
+            999,
+            Some(original.execution_instance()),
+        );
+        broadcast_output_from(
+            &Arc::downgrade(&shared),
+            id,
+            999,
+            Some(original.execution_instance()),
+        );
+        record_event_from(
+            &Arc::downgrade(&shared),
+            id,
+            TerminalEvent::TitleChanged("successor-only".into()),
+            Some(&successor),
+        );
+        old_delivery.close_after_drain();
+        fresh_delivery.close_after_drain();
+        assert!(
+            old_delivery.pop().is_none(),
+            "new worker semantic payload must never inherit old subscription authority"
+        );
+        let mut titles = Vec::new();
+        while let Some(message) = fresh_delivery.pop() {
+            if let ServerMessage::Event {
+                event: WireTerminalEvent::TitleChanged { title },
+                ..
+            } = message.message
+            {
+                titles.push(title);
+            }
+        }
+        assert_eq!(titles, vec!["successor-only".to_owned()]);
+        original.shutdown().unwrap();
+        successor.shutdown().unwrap();
     }
 
     #[test]
@@ -5737,6 +6088,27 @@ for line in sys.stdin:
     fn redraw_delivery_excludes_hidden_and_hibernated_subscribers() {
         let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let terminal_id = TerminalId::new();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/sleep".into(),
+            arguments: vec!["60".into()],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let source = TerminalSession {
+            id: terminal_id,
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle = TerminalHandle::spawn(source.clone(), Default::default(), |_| {}).unwrap();
         let deliveries = {
             let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
             [
@@ -5757,6 +6129,17 @@ for line in sys.stdin:
             .collect::<Vec<_>>()
         };
 
+        {
+            let mut state = shared.lock().unwrap();
+            state.reserve_spawn(terminal_id).unwrap();
+            state.finish_spawn(1, source, handle.clone(), true).unwrap();
+            for client in [2, 3] {
+                state
+                    .subscriptions
+                    .worker_instances
+                    .insert((client, terminal_id), handle.execution_instance());
+            }
+        }
         broadcast_redraw(&Arc::downgrade(&shared), terminal_id, 7);
         for delivery in &deliveries {
             delivery.close_after_drain();
@@ -5767,6 +6150,7 @@ for line in sys.stdin:
         ));
         assert!(deliveries[1].pop().is_none());
         assert!(deliveries[2].pop().is_none());
+        handle.shutdown().unwrap();
     }
 
     /// A visible subscriber whose delta base the daemon already recorded must
@@ -6694,5 +7078,76 @@ for line in sys.stdin:
             subscriptions.visibility(terminal_id),
             TerminalVisibility::Hidden
         );
+    }
+    #[test]
+    fn osc52_writes_are_delivered_live_but_never_replayed_after_attachment() {
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            recovery_origin: None,
+            predecessor: None,
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let first = {
+            let mut state = shared.lock().unwrap();
+            let delivery = state.register_client(1);
+            state
+                .finish_spawn(1, session, handle.clone(), false)
+                .unwrap();
+            delivery
+        };
+        record_event(
+            &Arc::downgrade(&shared),
+            id,
+            TerminalEvent::ClipboardWrite {
+                primary: false,
+                text: "private clipboard text".into(),
+            },
+        );
+        let late = {
+            let mut state = shared.lock().unwrap();
+            let late = state.register_client(2);
+            state.attach(2, id).unwrap();
+            assert!(state.replay_events(id, 0).unwrap().is_empty());
+            late
+        };
+        record_event(&Arc::downgrade(&shared), id, TerminalEvent::Bell);
+        let replay = shared.lock().unwrap().replay_events(id, 0).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert!(matches!(replay[0].1, WireTerminalEvent::Bell));
+        for (delivery, expected) in [(first, 1), (late, 0)] {
+            delivery.close_after_drain();
+            let mut seen = 0;
+            while let Some(envelope) = delivery.pop() {
+                if matches!(
+                    envelope.message,
+                    ServerMessage::Event {
+                        event: WireTerminalEvent::ClipboardWrite { .. },
+                        ..
+                    }
+                ) {
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, expected);
+        }
+        handle.shutdown().unwrap();
     }
 }

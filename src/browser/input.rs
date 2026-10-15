@@ -87,11 +87,15 @@ pub(crate) fn iced_key(
     composing: bool,
 ) -> BrowserInput {
     let key = match key {
+        // Iced follows native platform naming; DOM keyboard events use Meta.
+        keyboard::Key::Named(keyboard::key::Named::Super) => "Meta".into(),
         keyboard::Key::Named(named) => format!("{named:?}"),
         keyboard::Key::Character(character) => character.to_string(),
         keyboard::Key::Unidentified => "Unidentified".into(),
     };
     let code = match physical {
+        keyboard::key::Physical::Code(keyboard::key::Code::SuperLeft) => "MetaLeft".into(),
+        keyboard::key::Physical::Code(keyboard::key::Code::SuperRight) => "MetaRight".into(),
         keyboard::key::Physical::Code(code) => format!("{code:?}"),
         keyboard::key::Physical::Unidentified(_) => "Unidentified".into(),
     };
@@ -277,6 +281,65 @@ mod tests {
                 assert_eq!(event.delta.mode, servo::WheelMode::DeltaPixel);
             }
             _ => panic!("wrong Servo event"),
+        }
+    }
+
+    #[test]
+    fn native_super_keys_keep_dom_meta_identity_on_press_and_release() {
+        use keyboard::key::{Code, Named, Physical};
+        for (code, location, expected_code, expected_location) in [
+            (
+                Code::SuperLeft,
+                keyboard::Location::Left,
+                keyboard_types::Code::MetaLeft,
+                keyboard_types::Location::Left,
+            ),
+            (
+                Code::SuperRight,
+                keyboard::Location::Right,
+                keyboard_types::Code::MetaRight,
+                keyboard_types::Location::Right,
+            ),
+        ] {
+            for (state, modifiers, expected_state) in [
+                (
+                    ButtonState::Pressed,
+                    keyboard::Modifiers::LOGO,
+                    keyboard_types::KeyState::Down,
+                ),
+                (
+                    ButtonState::Released,
+                    keyboard::Modifiers::empty(),
+                    keyboard_types::KeyState::Up,
+                ),
+            ] {
+                let mapped = to_servo(iced_key(
+                    state,
+                    &keyboard::Key::Named(Named::Super),
+                    Physical::Code(code),
+                    location,
+                    modifiers,
+                    false,
+                    false,
+                ));
+                let servo::InputEvent::Keyboard(event) = mapped else {
+                    panic!("keyboard event")
+                };
+                assert_eq!(
+                    event.event.key,
+                    keyboard_types::Key::Named(keyboard_types::NamedKey::Meta)
+                );
+                assert_eq!(event.event.code, expected_code);
+                assert_eq!(event.event.location, expected_location);
+                assert_eq!(event.event.state, expected_state);
+                assert_eq!(
+                    event
+                        .event
+                        .modifiers
+                        .contains(keyboard_types::Modifiers::META),
+                    state == ButtonState::Pressed
+                );
+            }
         }
     }
 

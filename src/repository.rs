@@ -7,7 +7,7 @@
 
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Read},
@@ -17,6 +17,15 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+mod authority;
+pub use authority::{WorktreeAuthority, WorktreeExecutor};
+mod creation_authority;
+mod browse_reveal;
+mod ignore_path;
+pub use browse_reveal::include as include_revealed_path;
+mod status_limit;
+mod operation_metadata;
 
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
@@ -44,6 +53,15 @@ pub(crate) use crate::process::{
 pub use crate::process::{
     CancellationToken, CommandSpec, FAILURE_DETAIL_LIMIT, ProcessExecutor, ProcessFailure,
     ProcessFailureKind, ProcessOutput, SystemProcessExecutor,
+};
+
+#[path = "repository_stash.rs"]
+mod stash_mutations;
+
+#[path = "repository_recovery.rs"]
+mod recovery;
+pub use recovery::{
+    DiscardRecovery, DiscardRecoveryEntry, RecoverableDiscard, SavedEntry, TrashReceipt,
 };
 
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
@@ -637,8 +655,10 @@ pub fn pull_request_refs(
 
 /// Independent source-control and file-browser demand. Neither collapsed changes
 /// nor background branch/HEAD checks need an untracked scan.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotOptions {
+    /// UI-only cap. Safety and full-group mutation reads remain uncapped.
+    pub status_limit: Option<usize>,
     pub untracked_changes: bool,
     pub untracked_files: bool,
 }
@@ -646,8 +666,240 @@ pub struct SnapshotOptions {
 impl Default for SnapshotOptions {
     fn default() -> Self {
         Self {
+            status_limit: None,
             untracked_changes: true,
             untracked_files: true,
+        }
+    }
+}
+
+/// One bound panel's cache. Dropping it on a binding change releases retained
+/// file lists and untracked measurements rather than keeping every visited tree.
+#[derive(Debug, Default)]
+pub struct SnapshotCache {
+    digest: Option<[u8; 32]>,
+    dirty: bool,
+    fsmonitor: Option<OsString>,
+    fsmonitor_checked: bool,
+    options: Option<SnapshotOptions>,
+    metadata: Option<(
+        WorkingFiles,
+        Vec<RemoteRecord>,
+        Vec<LocalRefRecord>,
+        Vec<RemoteRefRecord>,
+        Vec<RemoteHead>,
+    )>,
+    control_metadata: Option<ControlMetadata>,
+    lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
+    observed: BTreeMap<RepoPath, Option<FileIdentity>>,
+    browse_root: Option<FileIdentity>,
+    admin: BTreeMap<PathBuf, Option<FileIdentity>>,
+}
+
+#[derive(Debug, Clone)]
+struct ControlMetadata {
+    operation: Option<GitOperationState>,
+    stashes: Vec<StashEntry>,
+    last_fetch_unix_ms: Option<u64>,
+}
+
+/// Resolve administrative metadata locally, including linked worktree gitfiles.
+fn local_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let path = worktree.join(".git");
+    if path.is_dir() {
+        return Some(path);
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    let value = bytes.strip_prefix(b"gitdir: ")?;
+    let value = value.strip_suffix(b"\n").unwrap_or(value);
+    let value = value.strip_suffix(b"\r").unwrap_or(value);
+    use std::os::unix::ffi::OsStrExt;
+    let directory = Path::new(OsStr::from_bytes(value));
+    Some(if directory.is_absolute() {
+        directory.to_owned()
+    } else {
+        worktree.join(directory)
+    })
+}
+
+type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+/// Filesystem-only metadata observations keep the missed-event fallback
+/// authoritative without extra Git commands on an unchanged snapshot.
+fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+    let read_path = |path: &Path| -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= 4096).then_some(bytes)
+    };
+    let marker = worktree.join(".git");
+    let git_dir = if marker.is_dir() {
+        marker.clone()
+    } else {
+        let Some(bytes) = read_path(&marker) else {
+            return BTreeMap::new();
+        };
+        let Some(relative) = bytes.strip_prefix(b"gitdir: ") else {
+            return BTreeMap::new();
+        };
+        worktree.join(bytes_to_path(trim_one_line_ending(relative)))
+    };
+    let git_dir = fs::canonicalize(&git_dir).unwrap_or(git_dir);
+    let common = read_path(&git_dir.join("commondir"))
+        .map(|bytes| git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap_or_else(|| git_dir.clone());
+    let mut paths = BTreeMap::new();
+    for root in [&git_dir, &common] {
+        // Lock creation/removal changes directory times without changing Git
+        // state. For the admin roots only their directory identity matters.
+        let identity = fs::metadata(root).ok().map(|metadata| {
+            let (device, inode, ..) = file_identity(&metadata);
+            (device, inode, 0, 0, 0, 0, 0)
+        });
+        paths.insert(root.clone(), identity);
+    }
+    for name in [
+        "HEAD",
+        "index",
+        "commondir",
+        "config.worktree",
+        "FETCH_HEAD",
+        "MERGE_HEAD",
+        "MERGE_MSG",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-merge/message",
+        "rebase-merge/onto",
+        "rebase-apply",
+        "rebase-apply/final-commit",
+        "rebase-apply/onto",
+    ] {
+        let path = git_dir.join(name);
+        paths.insert(
+            path.clone(),
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+    }
+    for name in [
+        "config",
+        "packed-refs",
+        "info/exclude",
+        "refs/stash",
+        "logs/refs/stash",
+    ] {
+        let path = common.join(name);
+        paths.insert(
+            path.clone(),
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+    }
+    let mut pending = vec![common.join("refs"), git_dir.join("refs")];
+    while let Some(path) = pending.pop() {
+        if paths.contains_key(&path) {
+            continue;
+        }
+        // Child identities below detect real ref additions/removals. Ignore
+        // directory times, which also change for unpublished *.lock files.
+        let identity = fs::metadata(&path).ok().map(|metadata| {
+            let (device, inode, ..) = file_identity(&metadata);
+            (device, inode, 0, 0, 0, 0, 0)
+        });
+        paths.insert(path.clone(), identity);
+        if let Ok(entries) = fs::read_dir(&path) {
+            for entry in entries.flatten() {
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                {
+                    continue;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                } else {
+                    let path = entry.path();
+                    paths.insert(
+                        path.clone(),
+                        fs::symlink_metadata(path)
+                            .ok()
+                            .map(|metadata| file_identity(&metadata)),
+                    );
+                }
+            }
+        }
+    }
+    paths
+}
+
+impl SnapshotCache {
+    /// Ignored-folder expansion is independent of porcelain status. Observe
+    /// its directory membership too, so the slow fallback repairs missed events.
+    pub fn observe_browse(&mut self, worktree: &Path, files: &WorkingFiles) {
+        let Ok(root) = fs_safety::Root::open(worktree) else {
+            return;
+        };
+        self.browse_root = fs::symlink_metadata(worktree)
+            .ok()
+            .map(|metadata| file_identity(&metadata));
+        for path in files
+            .paths
+            .iter()
+            .chain(&files.ignored)
+            .chain(&files.directories)
+            .chain(&files.ignored_directories)
+        {
+            for ancestor in path.as_path().ancestors() {
+                let Ok(path) = RepoPath::parse(ancestor) else {
+                    continue;
+                };
+                if self.observed.contains_key(&path) {
+                    continue;
+                }
+                let metadata = fs_safety::metadata_beneath(&root, path.as_path())
+                    .ok()
+                    .map(|metadata| file_identity(&metadata));
+                self.observed.insert(path, metadata);
+            }
+        }
+    }
+
+    pub fn invalidate(&mut self, metadata: bool) {
+        self.dirty = true;
+        if metadata {
+            self.metadata = None;
+            self.control_metadata = None;
+            self.fsmonitor_checked = false;
         }
     }
 }
@@ -657,12 +909,15 @@ pub struct StatusSnapshot {
     /// This read deliberately skipped untracked files; zero is not authoritative.
     #[serde(default)]
     pub untracked_omitted: bool,
+    /// The listed entries are a lower bound, never a complete safety snapshot.
+    #[serde(default)]
+    pub listing_truncated: bool,
     pub head: HeadState,
     pub tracking: TrackingState,
     pub dirty: DirtyState,
-    /// Every changed path, one entry per area. `dirty` stays derived from the
-    /// same records so existing badges keep counting exactly what they did
-    /// before this field existed.
+    /// Every listed changed path, one entry per area. `dirty` is derived from
+    /// these same records. When `listing_truncated` is set, both are lower
+    /// bounds and must not authorize a destructive or whole-group operation.
     #[serde(default)]
     pub entries: Vec<ChangedPath>,
 }
@@ -839,9 +1094,15 @@ pub struct RefListing {
 /// The files one worktree offers, split by whether Git tracks them.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkingFiles {
+    /// A UI listing cap omitted paths; absence is not authoritative.
+    #[serde(default)]
+    pub listing_truncated: bool,
     /// Tracked and untracked paths together, excluding ignored ones,
     /// deduplicated and sorted: the file tree shows both.
     pub paths: Vec<RepoPath>,
+    /// Existing explicit directories, including a revealed empty parent.
+    #[serde(default)]
+    pub directories: Vec<RepoPath>,
     /// How many of `paths` Git tracks; the remainder are untracked. A count
     /// rather than a second list, because nothing needs the tracked paths on
     /// their own and duplicating the listing of a large worktree to answer one
@@ -857,9 +1118,188 @@ pub struct WorkingFiles {
     pub ignored_directory_errors: std::collections::BTreeMap<RepoPath, String>,
 }
 
+/// A sequenced operation in the worktree's administrative directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GitOperationKind {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl GitOperationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Merge => "Merge",
+            Self::Rebase => "Rebase",
+            Self::CherryPick => "Cherry-pick",
+            Self::Revert => "Revert",
+        }
+    }
+    fn command(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitOperationState {
+    pub kind: GitOperationKind,
+    pub incoming_ref: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashEntry {
+    pub reference: String,
+    pub oid: Oid,
+    pub message: String,
+}
+
+/// The HEAD state a rendered patch was prepared against. No commit is a real
+/// precondition for an unborn repository, rather than an absent guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHeadGuard {
+    Unborn,
+    Commit(Oid),
+}
+
+/// Commands share cancellation, ordering, failure output and refresh semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitOperation {
+    Fetch {
+        remote: String,
+        prune: bool,
+    },
+    Sync {
+        rebase: bool,
+    },
+    StashPush {
+        message: Option<String>,
+        include_untracked: bool,
+    },
+    StashApply {
+        reference: String,
+        expected_oid: Oid,
+        pop: bool,
+    },
+    StashDrop {
+        reference: String,
+        expected_oid: Oid,
+    },
+    ResolveConflict {
+        path: RepoPath,
+        ours: bool,
+    },
+    Continue {
+        kind: GitOperationKind,
+    },
+    Abort {
+        kind: GitOperationKind,
+    },
+    ApplyPatch {
+        patch: Arc<[u8]>,
+        cached: bool,
+        reverse: bool,
+        expected_head: Option<GitHeadGuard>,
+    },
+    RevertCommit {
+        oid: Oid,
+        mainline: Option<u32>,
+    },
+    CherryPick {
+        oid: Oid,
+        mainline: Option<u32>,
+    },
+    CreateBranch {
+        oid: Oid,
+        name: ValidatedBranchName,
+    },
+    IgnorePath {
+        path: RepoPath,
+    },
+}
+
+impl GitOperation {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Fetch { .. } => "Fetch",
+            Self::Sync { .. } => "Sync",
+            Self::StashPush { .. } => "Stash",
+            Self::StashApply { pop: true, .. } => "Pop stash",
+            Self::StashApply { .. } => "Apply stash",
+            Self::StashDrop { .. } => "Drop stash",
+            Self::ResolveConflict { .. } => "Resolve conflict",
+            Self::Continue { .. } => "Continue",
+            Self::Abort { .. } => "Abort",
+            Self::ApplyPatch { .. } => "Apply patch",
+            Self::RevertCommit { .. } => "Revert commit",
+            Self::CherryPick { .. } => "Cherry-pick",
+            Self::CreateBranch { .. } => "Create branch",
+            Self::IgnorePath { .. } => "Add to .gitignore",
+        }
+    }
+}
+
+/// Identity of the exact file contents presented in a marker confirmation.
+pub type ConflictMarkerVersion = (u64, u64, u64, i64, i64, i64, i64);
+
+/// Recognize complete or incomplete conflict marker blocks conservatively.
+pub fn has_conflict_markers(bytes: &[u8]) -> bool {
+    bytes.split(|byte| *byte == b'\n').any(|line| {
+        [b"<<<<<<<".as_slice(), b"|||||||", b"=======", b">>>>>>>"]
+            .iter()
+            .any(|marker| line.starts_with(marker))
+    })
+}
+
+/// Scan line prefixes in bounded chunks so even a very large conflicted file
+/// cannot hide markers beyond an editor preview limit or allocate a giant line.
+pub fn scan_conflict_markers(
+    reader: &mut impl Read,
+    cancellation: &CancellationToken,
+) -> io::Result<bool> {
+    let mut chunk = [0u8; 64 * 1024];
+    let mut prefix = [0u8; 7];
+    let mut used = 0;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "conflict marker scan cancelled",
+            ));
+        }
+        let length = reader.read(&mut chunk)?;
+        if length == 0 {
+            return Ok(false);
+        }
+        for byte in &chunk[..length] {
+            if *byte == b'\n' {
+                used = 0;
+            } else if used < prefix.len() {
+                prefix[used] = *byte;
+                used += 1;
+                if used == prefix.len() && has_conflict_markers(&prefix) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
 /// Everything the source-control surfaces need about one worktree in one shot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
+    #[serde(default)]
+    pub operation: Option<GitOperationState>,
+    #[serde(default)]
+    pub stashes: Vec<StashEntry>,
+    #[serde(default)]
+    pub last_fetch_unix_ms: Option<u64>,
     pub status: StatusSnapshot,
     pub files: WorkingFiles,
     pub remotes: Vec<RemoteRecord>,
@@ -953,6 +1393,14 @@ pub struct CommitSummary {
     pub body: String,
 }
 
+fn history_matches(commit: &CommitSummary, query: &str) -> bool {
+    commit.subject.to_lowercase().contains(query)
+        || commit.body.to_lowercase().contains(query)
+        || commit.author.name.to_lowercase().contains(query)
+        || commit.author.email.to_lowercase().contains(query)
+        || commit.oid.as_str().starts_with(query)
+}
+
 /// Which pair of trees a comparison is between.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "basis", rename_all = "snake_case")]
@@ -992,6 +1440,91 @@ impl DiffBasis {
             | Self::PullRequest { .. } => true,
         }
     }
+}
+
+/// An opaque, process-free observation of the metadata a live comparison
+/// depends on. Read it on a worker: even metadata operations can block on a
+/// network filesystem. Unrelated loose refs and unpublished lock files do not
+/// invalidate it, and symbolic ref traversal has a fixed depth limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryMetadataStamp(BTreeMap<PathBuf, Option<(u64, u64, u64, i64, i64, i64, i64)>>);
+
+pub fn repository_metadata_stamp(worktree: &Path, basis: &DiffBasis) -> io::Result<RepositoryMetadataStamp> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    type Identity = (u64, u64, u64, i64, i64, i64, i64);
+
+    fn observe(paths: &mut BTreeMap<PathBuf, Option<Identity>>, path: &Path, directory: bool) -> io::Result<()> {
+        let identity = match fs::metadata(path) {
+            Ok(meta) if directory => Some((meta.dev(), meta.ino(), 0, 0, 0, 0, 0)),
+            Ok(meta) => Some((meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        paths.insert(path.to_path_buf(), identity);
+        Ok(())
+    }
+
+    fn read_small(path: &Path) -> io::Result<Option<Vec<u8>>> {
+        let file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata is not a regular file")); }
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 { return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata exceeds 4 KiB")); }
+        Ok(Some(bytes))
+    }
+
+    fn reference(paths: &mut BTreeMap<PathBuf, Option<Identity>>, root: &Path, name: &Path) -> io::Result<()> {
+        let mut path = root.join(name);
+        for _ in 0..8 {
+            observe(paths, &path, false)?;
+            let Some(bytes) = read_small(&path)? else { return Ok(()); };
+            let Some(target) = trim_one_line_ending(&bytes).strip_prefix(b"ref: ") else { return Ok(()); };
+            let target = std::str::from_utf8(target).ok().and_then(|target| ValidatedRefName::parse(target).ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid symbolic Git ref"))?;
+            path = root.join(target.as_str());
+        }
+        Err(io::Error::new(io::ErrorKind::InvalidData, "Symbolic Git ref exceeds eight levels"))
+    }
+
+    let marker = worktree.join(".git");
+    let marker_meta = fs::metadata(&marker)?;
+    let git_dir = if marker_meta.is_dir() { marker.clone() } else {
+        let bytes = read_small(&marker)?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Missing Git directory marker"))?;
+        let path = trim_one_line_ending(&bytes).strip_prefix(b"gitdir: ")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid Git directory marker"))?;
+        worktree.join(bytes_to_path(path))
+    };
+    let git_dir = fs::canonicalize(git_dir)?;
+    let common = match read_small(&git_dir.join("commondir"))? {
+        Some(bytes) => fs::canonicalize(git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))?,
+        None => git_dir.clone(),
+    };
+    let mut paths = BTreeMap::new();
+    observe(&mut paths, worktree, true)?;
+    observe(&mut paths, &marker, marker_meta.is_dir())?;
+    for root in [&git_dir, &common] { observe(&mut paths, root, true)?; }
+    for name in ["index", "HEAD", "commondir", "config.worktree", "reftable/tables.list"] {
+        observe(&mut paths, &git_dir.join(name), false)?;
+    }
+    for name in ["packed-refs", "config", "reftable/tables.list"] {
+        observe(&mut paths, &common.join(name), false)?;
+    }
+    // HEAD itself belongs to this worktree; its ordinary symbolic target
+    // belongs to the common directory. Observe both roots for per-worktree refs.
+    if let Some(head) = read_small(&git_dir.join("HEAD"))?
+        && let Some(target) = trim_one_line_ending(&head).strip_prefix(b"ref: ") {
+        let target = std::str::from_utf8(target).ok().and_then(|target| ValidatedRefName::parse(target).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid symbolic HEAD"))?;
+        for root in [&git_dir, &common] { reference(&mut paths, root, Path::new(target.as_str()))?; }
+    }
+    if let DiffBasis::MergeBaseToHead { base_ref, .. } = basis {
+        for root in [&git_dir, &common] { reference(&mut paths, root, Path::new(base_ref.as_str()))?; }
+    }
+    Ok(RepositoryMetadataStamp(paths))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1064,6 +1597,11 @@ pub enum DiffContent {
         /// Human-readable side labels, e.g. `HEAD` and `Index`.
         old_label: String,
         new_label: String,
+        /// HEAD used by this comparison, including an explicitly unborn HEAD.
+        /// Index/worktree and immutable commit comparisons need no HEAD guard.
+        source_head: Option<GitHeadGuard>,
+        /// Git modes read alongside each side, not inferred from text presence.
+        modes: [Option<u32>; 2],
     },
     /// An unmerged path, read from index stages 1, 2 and 3 plus the worktree.
     /// A missing stage-0 blob is never reported as an empty added side.
@@ -1106,12 +1644,13 @@ impl PathSelection {
 /// selections cannot list a path twice.
 pub fn selection_pathspecs(selection: &[PathSelection]) -> Vec<RepoPath> {
     let mut paths = Vec::with_capacity(selection.len() * 2);
+    let mut seen = HashSet::new();
     for entry in selection {
         for path in [entry.old_path.as_ref(), Some(&entry.path)]
             .into_iter()
             .flatten()
         {
-            if !paths.contains(path) {
+            if seen.insert(path.clone()) {
                 paths.push(path.clone());
             }
         }
@@ -1322,7 +1861,14 @@ pub enum MutationFailure {
 impl fmt::Display for MutationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Process(failure) => write!(formatter, "{failure}"),
+            Self::Process(failure) => {
+                write!(formatter, "{failure}")?;
+                let output = failure.full_output();
+                if !output.is_empty() {
+                    write!(formatter, "\n\nGit output:\n{output}")?;
+                }
+                Ok(())
+            }
             Self::Path { path, reason } => write!(formatter, "{path}: {reason}"),
             Self::Rejected { reason } | Self::Reconciliation { reason } => {
                 formatter.write_str(reason)
@@ -1859,6 +2405,7 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
     };
     Ok(StatusSnapshot {
         untracked_omitted: false,
+        listing_truncated: false,
         head,
         tracking,
         dirty,
@@ -2689,33 +3236,35 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
 /// size comes from the same descriptor the bytes come from, and the read is
 /// bounded — so a classification and the read that acts on it cannot describe
 /// different objects.
-fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
-    let unreadable = |error: &dyn fmt::Display| DiffSide::Unreadable {
-        reason: error.to_string(),
-    };
-    let root = match fs_safety::Root::open(worktree) {
-        Ok(root) => root,
-        Err(error) => return unreadable(&error),
+fn read_worktree_side(root: &fs_safety::Root, path: &RepoPath) -> (DiffSide, Option<u32>) {
+    use std::os::unix::fs::PermissionsExt;
+    let unreadable = |error: &dyn fmt::Display| {
+        (
+            DiffSide::Unreadable {
+                reason: error.to_string(),
+            },
+            None,
+        )
     };
     let relative = path.as_path();
     let metadata = match fs_safety::metadata_beneath(&root, relative) {
         Ok(metadata) => metadata,
-        Err(error) if error.is_not_found() => return DiffSide::Absent,
+        Err(error) if error.is_not_found() => return (DiffSide::Absent, None),
         Err(error) => return unreadable(&error),
     };
     if metadata.file_type().is_symlink() {
         return match fs_safety::read_link_beneath(&root, relative) {
-            Ok(target) => DiffSide::Symlink { target },
+            Ok(target) => (DiffSide::Symlink { target }, Some(0o120000)),
             Err(error) => unreadable(&error),
         };
     }
     if !metadata.is_file() {
-        return DiffSide::NotRegularFile;
+        return (DiffSide::NotRegularFile, None);
     }
 
     let mut file = match fs_safety::open_beneath(&root, relative) {
         Ok(file) => file,
-        Err(error) if error.is_not_found() => return DiffSide::Absent,
+        Err(error) if error.is_not_found() => return (DiffSide::Absent, None),
         Err(error) => return unreadable(&error),
     };
     let opened = match fs_safety::metadata_of(&file) {
@@ -2723,14 +3272,22 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
         Err(error) => return unreadable(&error),
     };
     if !opened.is_file() {
-        return DiffSide::NotRegularFile;
+        return (DiffSide::NotRegularFile, None);
     }
+    let mode = Some(if opened.permissions().mode() & 0o100 != 0 {
+        0o100755
+    } else {
+        0o100644
+    });
     if opened.len() > MAX_DIFF_SIDE_BYTES {
-        return DiffSide::Oversize {
-            bytes: opened.len(),
-        };
+        return (
+            DiffSide::Oversize {
+                bytes: opened.len(),
+            },
+            mode,
+        );
     }
-    match fs_safety::read_bounded(&mut file, MAX_DIFF_SIDE_BYTES) {
+    let side = match fs_safety::read_bounded(&mut file, MAX_DIFF_SIDE_BYTES) {
         // `read_bounded` reads one byte past the limit precisely so that "at the
         // limit" and "over it" stay distinguishable. A file that grew after its
         // size was taken from the descriptor lands here.
@@ -2738,18 +3295,36 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
             bytes: bytes.len() as u64,
         },
         Ok(bytes) => classify_bytes(bytes),
-        Err(error) => unreadable(&error),
-    }
+        Err(error) => unreadable(&error).0,
+    };
+    (side, mode)
 }
 
 /// Measures untracked text without one Git process (or allocation) per file.
 /// The same descriptor-relative resolver and per-side limit as the diff reader
 /// apply; failed, changing, and budget-exhausted reads leave honest unknowns.
+#[cfg(test)]
 fn measure_untracked(
     worktree: &Path,
     entries: &mut [ChangedPath],
     cancellation: &CancellationToken,
 ) {
+    measure_untracked_cached(worktree, entries, cancellation, &mut BTreeMap::new());
+}
+
+fn measure_untracked_cached(
+    worktree: &Path,
+    entries: &mut [ChangedPath],
+    cancellation: &CancellationToken,
+    cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>,
+) {
+    let current = entries
+        .iter()
+        .filter(|entry| entry.area == ChangeArea::Untracked && !entry.submodule)
+        .take(MAX_UNTRACKED_STATUS_FILES)
+        .map(|entry| &entry.path)
+        .collect::<std::collections::BTreeSet<_>>();
+    cache.retain(|path, _| current.contains(path));
     let mut untracked = entries
         .iter_mut()
         .filter(|entry| entry.area == ChangeArea::Untracked && !entry.submodule)
@@ -2767,9 +3342,22 @@ fn measure_untracked(
         if cancellation.is_cancelled() || remaining == 0 {
             break;
         }
-        if let Some(lines) =
+        let identity = fs_safety::metadata_beneath(&root, entry.path.as_path())
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| file_identity(&metadata));
+        let cached = identity.and_then(|identity| {
+            cache
+                .get(&entry.path)
+                .filter(|(previous, _)| *previous == identity)
+                .map(|(_, lines)| *lines)
+        });
+        if let Some(lines) = cached.or_else(|| {
             untracked_line_count(&root, &entry.path, cancellation, &mut remaining, &mut bytes)
-        {
+        }) {
+            if let Some(identity) = identity {
+                cache.insert(entry.path.clone(), (identity, lines));
+            }
             entry.added_lines = Some(lines);
             entry.removed_lines = Some(0);
         }
@@ -3326,6 +3914,11 @@ pub enum RepositoryError {
 pub struct RepositoryService<E = SystemProcessExecutor> {
     git: PathBuf,
     executor: Arc<E>,
+    authority: Option<WorktreeAuthority>,
+    // Only a verified creation-journal handoff can use this original executor
+    // to construct a separately scoped destination service. It is never exposed
+    // through the public authority API or used for ordinary foreign commands.
+    creation_executor: Arc<dyn ProcessExecutor>,
 }
 
 impl RepositoryService<SystemProcessExecutor> {
@@ -3335,10 +3928,14 @@ impl RepositoryService<SystemProcessExecutor> {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
-    pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self {
+    pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self
+    where E: 'static
+    {
         Self {
             git: git.into(),
+            creation_executor: executor.clone(),
             executor,
+            authority: None,
         }
     }
 
@@ -3425,7 +4022,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         known_files: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<WorkingFiles, RepositoryError> {
-        let output = self.run_checked(
+        self.ignored_files_with_limit(worktree, known_files, None, cancellation)
+    }
+
+    pub fn ignored_files_with_limit(
+        &self,
+        worktree: &Path,
+        known_files: &[RepoPath],
+        limit: Option<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let (output, truncated) = self.listing_output(
             &self.git_read(
                 worktree,
                 [
@@ -3437,10 +4044,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     "-z",
                 ],
             ),
+            limit,
+            status_limit::Format::Files,
             cancellation,
         )?;
         let parsed = (|| {
-            let mut files = WorkingFiles::default();
+            let mut files = WorkingFiles {
+                listing_truncated: truncated,
+                ..WorkingFiles::default()
+            };
             for (record, field) in nul_fields(&output.stdout, "git ls-files --ignored")?
                 .into_iter()
                 .enumerate()
@@ -3497,6 +4109,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             files.ignored_directories.sort();
             files.ignored_directories.dedup();
         }
+        Ok(files)
+    }
+
+    /// Watch membership includes untracked directories, so later edits and
+    /// creations within them produce native events too.
+    pub fn watch_files(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let output = self.run_checked(&self.working_files_command(worktree), cancellation)?;
+        invalid_output(parse_working_files(&output.stdout), output)
+    }
+
+    /// A bounded read-only inventory prefix for watch planning. A truncated
+    /// prefix is not complete membership: callers must preserve root/admin
+    /// coverage and provide an explicit directory census or polling fallback.
+    pub fn watch_files_projection(
+        &self,
+        worktree: &Path,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let (output, truncated) = self.listing_output(
+            &self.working_files_command(worktree),
+            Some(limit.clamp(1, 100_000)),
+            status_limit::Format::Files,
+            cancellation,
+        )?;
+        let mut files = invalid_output(parse_working_files(&output.stdout), output)?;
+        files.listing_truncated = truncated;
         Ok(files)
     }
 
@@ -3690,6 +4333,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    pub fn ignore_path(
+        &self,
+        worktree: &Path,
+        path: &RepoPath,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
+        let _protection = crate::worktree_cleanup::protect(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        if cancellation.is_cancelled() {
+            return Err(process_failure(
+                &CommandSpec::new(&self.git),
+                ProcessFailureKind::Cancelled,
+                "termination requested before updating .gitignore",
+                false,
+            )
+            .into());
+        }
+        let root = self.captured_worktree_root(worktree)?;
+        ignore_path::add(&root, path).map_err(|error| ValidationError::Io(error).into())
+    }
+
     pub fn status(
         &self,
         worktree: &Path,
@@ -3719,6 +4383,81 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    fn listing_output(
+        &self,
+        command: &CommandSpec,
+        limit: Option<usize>,
+        format: status_limit::Format,
+        cancellation: &CancellationToken,
+    ) -> Result<(ProcessOutput, bool), RepositoryError> {
+        let command = if let Some(limit) = limit {
+            let physical_records = match format {
+                status_limit::Format::Status => limit.saturating_mul(2).saturating_add(16),
+                status_limit::Format::Numstat => limit.saturating_mul(3),
+                status_limit::Format::Files => limit,
+            };
+            command
+                .clone()
+                .output_limits(64 * 1024 * 1024, command.stderr_limit)
+                .stdout_record_limit(physical_records)
+        } else {
+            command.clone()
+        };
+        let mut output = self.run_checked(&command, cancellation)?;
+        let Some(limit) = limit else {
+            return Ok((output, false));
+        };
+        let (length, truncated) =
+            match status_limit::prefix(&output.stdout, limit, output.stdout_truncated, format) {
+                Ok((prefix, truncated)) => (prefix.len(), truncated),
+                Err(error) => {
+                    return Err(RepositoryError::InvalidGitOutput {
+                        error,
+                        process: output,
+                    });
+                }
+            };
+        output.stdout.truncate(length);
+        output.stdout_truncated = truncated;
+        Ok((output, truncated))
+    }
+
+    /// A bounded read-only status projection for sidebar/watch presentation.
+    /// Counts are lower bounds when `listing_truncated` is true. This result
+    /// must never authorize all-path mutations or deletion safety decisions;
+    /// those callers continue to use the complete `status` read.
+    pub fn status_projection(
+        &self,
+        worktree: &Path,
+        untracked: bool,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
+        self.status_listing(
+            worktree,
+            untracked,
+            Some(limit.clamp(1, 100_000)),
+            cancellation,
+        )
+    }
+
+    fn status_listing(
+        &self,
+        worktree: &Path,
+        untracked: bool,
+        limit: Option<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
+        let command = self.status_command_with_untracked(worktree, untracked);
+        let (output, truncated) =
+            self.listing_output(&command, limit, status_limit::Format::Status, cancellation)?;
+        let parsed = parse_status(&output.stdout);
+        let mut status = invalid_output(parsed, output)?;
+        status.untracked_omitted = !untracked;
+        status.listing_truncated = truncated;
+        Ok(status)
+    }
+
     /// Everything the source-control surfaces need about one worktree.
     pub fn snapshot(
         &self,
@@ -3736,38 +4475,606 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         options: SnapshotOptions,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, RepositoryError> {
-        let mut status =
-            self.status_with_untracked(worktree, options.untracked_changes, cancellation)?;
+        self.snapshot_cached(
+            worktree,
+            options,
+            cancellation,
+            &mut SnapshotCache::default(),
+        )
+        .map(|snapshot| snapshot.expect("a fresh cache always returns a snapshot"))
+    }
+
+    /// Only status runs for an unchanged refresh; callers invalidate content on
+    /// file events, since porcelain does not encode modified file contents.
+    pub fn snapshot_cached(
+        &self,
+        worktree: &Path,
+        options: SnapshotOptions,
+        cancellation: &CancellationToken,
+        cache: &mut SnapshotCache,
+    ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
+        let admin = snapshot_admin_fingerprint(worktree);
+        if !cache.admin.is_empty() && cache.admin != admin {
+            cache.invalidate(true);
+        }
+        if cache.options != Some(options) {
+            cache.invalidate(true);
+            cache.options = Some(options);
+        }
+        let git_dir = if let Some(authority) = &self.authority {
+            authority.validate()?;
+            Some(authority.private_metadata_path())
+        } else { local_git_dir(worktree) };
+        if !cache.fsmonitor_checked {
+            let mut command = self.git_read(
+                worktree,
+                ["config", "--show-scope", "--get", "core.fsmonitor"],
+            );
+            // `git config` never refreshes an index or invokes fsmonitor. Read
+            // its scope without the safety override that normal commands use.
+            remove_fsmonitor_override(&mut command);
+            let output = self.run(&command, cancellation)?;
+            cache.fsmonitor = if output.success {
+                trusted_fsmonitor(&output.stdout, worktree)
+            } else if output.exit_code == Some(1) {
+                None
+            } else {
+                return Err(git_failure(&command, output).into());
+            };
+            cache.fsmonitor_checked = true;
+        }
+        let (output, truncated) = self.listing_output(
+            &snapshot_fsmonitor(
+                self.status_command_with_untracked(worktree, options.untracked_changes),
+                cache.fsmonitor.as_deref(),
+            ),
+            options.status_limit,
+            status_limit::Format::Status,
+            cancellation,
+        )?;
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update([u8::from(truncated)]);
+        hasher.update(&output.stdout);
+        let digest: [u8; 32] = hasher.finalize().into();
+        if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some() {
+            let root = fs_safety::Root::open(worktree).ok();
+            let unchanged = cache.observed.iter().all(|(path, previous)| {
+                let current = root
+                    .as_ref()
+                    .and_then(|root| fs_safety::metadata_beneath(root, path.as_path()).ok())
+                    .map(|metadata| file_identity(&metadata));
+                current == *previous
+            });
+            let root_unchanged = !options.untracked_files
+                || fs::symlink_metadata(worktree)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+                    == cache.browse_root;
+            if unchanged && root_unchanged {
+                return Ok(None);
+            }
+        }
+        let mut status = invalid_output(parse_status(&output.stdout), output)?;
+        status.untracked_omitted = !options.untracked_changes;
+        status.listing_truncated = truncated;
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
-            let output = self.run_checked(&self.numstat_command(worktree, staged), cancellation)?;
-            let parsed = parse_numstat(&output.stdout);
-            let records = invalid_output(parsed, output)?;
+            let (output, _) = self.listing_output(
+                &snapshot_fsmonitor(
+                    self.numstat_command(worktree, staged),
+                    cache.fsmonitor.as_deref(),
+                ),
+                options.status_limit,
+                status_limit::Format::Numstat,
+                cancellation,
+            )?;
+            let records = invalid_output(parse_numstat(&output.stdout), output)?;
             merge_numstat(&mut status.entries, area, &records);
         }
-        measure_untracked(worktree, &mut status.entries, cancellation);
-
-        let files_command = if options.untracked_files {
-            self.working_files_command(worktree)
-        } else {
-            self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
-        };
-        let output = self.run_checked(&files_command, cancellation)?;
-        let parsed = parse_working_files(&output.stdout);
-        let files = invalid_output(parsed, output)?;
-
-        let remotes = self.remotes(worktree, cancellation)?;
-
-        let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
-        let parsed = parse_refs(&output.stdout);
-        let refs = invalid_output(parsed, output)?;
-
-        Ok(RepositorySnapshot {
+        measure_untracked_cached(
+            worktree,
+            &mut status.entries,
+            cancellation,
+            &mut cache.lines,
+        );
+        if options.untracked_files
+            && let Some((files, ..)) = cache.metadata.as_mut()
+        {
+            let (output, truncated) = self.listing_output(
+                &self.working_files_command(worktree),
+                options.status_limit,
+                status_limit::Format::Files,
+                cancellation,
+            )?;
+            *files = invalid_output(parse_working_files(&output.stdout), output)?;
+            files.listing_truncated = truncated;
+        }
+        if cache.metadata.is_none() {
+            let files_command = if options.untracked_files {
+                self.working_files_command(worktree)
+            } else {
+                self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
+            };
+            let (output, truncated) = self.listing_output(
+                &files_command,
+                options.status_limit,
+                status_limit::Format::Files,
+                cancellation,
+            )?;
+            let mut files = invalid_output(parse_working_files(&output.stdout), output)?;
+            files.listing_truncated = truncated;
+            let remotes = self.remotes(worktree, cancellation)?;
+            let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
+            let refs = invalid_output(parse_refs(&output.stdout), output)?;
+            cache.metadata = Some((files, remotes, refs.local, refs.remote, refs.remote_heads));
+        }
+        if cache.control_metadata.is_none() {
+            cache.control_metadata = Some(ControlMetadata {
+                operation: self.snapshot_operation_state(
+                    worktree,
+                    git_dir.as_deref(),
+                    cancellation,
+                )?,
+                stashes: self.stashes(worktree, cancellation)?,
+                last_fetch_unix_ms: git_dir
+                    .as_ref()
+                    .and_then(|directory| fs::metadata(directory.join("FETCH_HEAD")).ok())
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64),
+            });
+        }
+        let control = cache.control_metadata.as_ref().unwrap();
+        let (files, remotes, local_refs, remote_refs, remote_heads) =
+            cache.metadata.as_ref().unwrap();
+        let root = fs_safety::Root::open(worktree).ok();
+        cache.observed = status
+            .entries
+            .iter()
+            .map(|entry| {
+                let identity = root
+                    .as_ref()
+                    .and_then(|root| fs_safety::metadata_beneath(root, entry.path.as_path()).ok())
+                    .map(|metadata| file_identity(&metadata));
+                (entry.path.clone(), identity)
+            })
+            .collect();
+        cache.browse_root = options
+            .untracked_files
+            .then(|| {
+                fs::symlink_metadata(worktree)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+            })
+            .flatten();
+        cache.admin = admin;
+        cache.digest = Some(digest);
+        cache.dirty = false;
+        Ok(Some(RepositorySnapshot {
+            operation: control.operation.clone(),
+            stashes: control.stashes.clone(),
+            last_fetch_unix_ms: control.last_fetch_unix_ms,
             status,
-            files,
-            remotes,
-            local_refs: refs.local,
-            remote_refs: refs.remote,
-            remote_heads: refs.remote_heads,
+            files: files.clone(),
+            remotes: remotes.clone(),
+            local_refs: local_refs.clone(),
+            remote_refs: remote_refs.clone(),
+            remote_heads: remote_heads.clone(),
+        }))
+    }
+
+    /// Generated operation drafts follow Git's configured comment policy.
+    /// Explicitly authored composer messages keep their separate cleanup rules.
+    fn snapshot_operation_state(
+        &self,
+        worktree: &Path,
+        directory: Option<&Path>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GitOperationState>, RepositoryError> {
+        let mut state = directory.map(operation_metadata::read_operation_state).transpose()?.flatten();
+        if let Some(message) = state.as_ref().and_then(|state| state.message.as_ref()) {
+            let command = self
+                .git_read(worktree, ["stripspace", "--strip-comments"])
+                .stdin(message.as_bytes().to_vec());
+            let output = self.run_checked(&command, cancellation)?;
+            if let Some(state) = state.as_mut() {
+                state.message = Some(
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim_end_matches('\n')
+                        .to_owned(),
+                )
+                .filter(|message| !message.is_empty());
+            }
+        }
+        Ok(state)
+    }
+
+    pub fn operation_state(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GitOperationState>, RepositoryError> {
+        let directory = self.git_dir_for_io(worktree, cancellation)?;
+        operation_metadata::read_operation_state(&directory)
+    }
+
+    /// Row badges need only a best-effort kind; selected-panel reads use the
+    /// checked reader and report malformed or unavailable control metadata.
+    pub fn operation_state_from_git_dir(directory: &Path) -> Option<GitOperationState> {
+        operation_metadata::read_operation_state(directory).ok().flatten()
+    }
+
+    pub fn stashes(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<StashEntry>, RepositoryError> {
+        // NUL separators preserve subjects containing tabs, with a separate
+        // record terminator supplied by Git's -z option.
+        let output = self.run_checked(
+            &self.git_read(
+                worktree,
+                ["stash", "list", "-z", "--format=%gd%x00%H%x00%s"],
+            ),
+            cancellation,
+        )?;
+        let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for record in fields.chunks(3) {
+            if record.len() < 3 || record[0].is_empty() {
+                continue;
+            }
+            let reference = String::from_utf8_lossy(record[0]).into_owned();
+            let oid = Oid::parse_object(String::from_utf8_lossy(record[1]).into_owned()).map_err(
+                |error| RepositoryError::InvalidOutput {
+                    field: "stash object id",
+                    reason: error.to_string(),
+                },
+            )?;
+            entries.push(StashEntry {
+                reference,
+                oid,
+                message: String::from_utf8_lossy(record[2]).into_owned(),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Execute a non-path mutation under the same worktree lifetime protection
+    /// as commit/push. On failure the next snapshot reads any conflict state.
+    pub fn git_operation(
+        &self,
+        worktree: &Path,
+        operation: &GitOperation,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        let _protection = crate::worktree_cleanup::protect(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        if let GitOperation::ApplyPatch {
+            expected_head: Some(expected),
+            ..
+        } = operation
+        {
+            let expected = match expected {
+                GitHeadGuard::Unborn => None,
+                GitHeadGuard::Commit(oid) => Some(oid),
+            };
+            if self.resolve_head(worktree, cancellation)?.as_ref() != expected {
+                return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason: "HEAD changed after this patch was prepared; reload the diff before applying it".into() } });
+            }
+        }
+        let mut command = match operation {
+            GitOperation::Fetch { remote, prune } => {
+                self.checked_remote(worktree, remote, cancellation)?;
+                let mut command = self.git_mutation(worktree, ["fetch"]);
+                if *prune {
+                    command = command.arg("--prune");
+                }
+                command.arg("--").arg(remote)
+            }
+            GitOperation::Sync { rebase } => {
+                let pull = self
+                    .git_mutation(
+                        worktree,
+                        ["pull", if *rebase { "--rebase" } else { "--ff-only" }],
+                    )
+                    .without_timeout();
+                if let Some(outcome) = self.operation_failure(&pull, cancellation)? {
+                    return Ok(outcome);
+                }
+                let after_pull = (|| -> Result<MutationOutcome, RepositoryError> {
+                    // Resolve the exact upstream destination through the same
+                    // checked push path; never depend on push.default.
+                    let snapshot = self.snapshot(worktree, cancellation)?;
+                    let Some(reference) =
+                        snapshot.local_refs.iter().find(|reference| reference.head)
+                    else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "Sync requires a checked-out branch".into(),
+                            },
+                        });
+                    };
+                    let Some(upstream) = reference.upstream.as_ref() else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "Sync requires an upstream".into(),
+                            },
+                        });
+                    };
+                    let Some(remote_ref) = snapshot
+                        .remote_refs
+                        .iter()
+                        .find(|candidate| candidate.name == *upstream)
+                    else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "The upstream does not name a remote branch".into(),
+                            },
+                        });
+                    };
+                    let branch = ValidatedBranchName::parse(
+                        reference
+                            .name
+                            .as_str()
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(reference.name.as_str()),
+                    )?;
+                    Ok(
+                        match self.push(
+                            &PushRequest {
+                                worktree: worktree.to_owned(),
+                                branch,
+                                target: PushTarget::Upstream {
+                                    remote: remote_ref.remote.clone(),
+                                    remote_ref: remote_ref.name.clone(),
+                                },
+                            },
+                            cancellation,
+                        )? {
+                            PushOutcome::Pushed { .. } => {
+                                MutationOutcome::Applied { paths: Vec::new() }
+                            }
+                            PushOutcome::NotPushed { failure } => {
+                                MutationOutcome::PartiallyApplied {
+                                    paths: Vec::new(),
+                                    failures: vec![
+                                        MutationFailure::Reconciliation {
+                                            reason: "Pull completed, but the push did not complete"
+                                                .into(),
+                                        },
+                                        failure,
+                                    ],
+                                }
+                            }
+                            PushOutcome::OutcomeUnknown { failure } => {
+                                MutationOutcome::OutcomeUnknown { failure }
+                            }
+                        },
+                    )
+                })();
+                let completed = || MutationFailure::Reconciliation {
+                    reason: "Pull completed, but the push did not complete".into(),
+                };
+                return Ok(match after_pull {
+                    Ok(MutationOutcome::NotApplied { failure }) => {
+                        MutationOutcome::PartiallyApplied {
+                            paths: Vec::new(),
+                            failures: vec![completed(), failure],
+                        }
+                    }
+                    Ok(MutationOutcome::OutcomeUnknown { failure }) => {
+                        MutationOutcome::OutcomeUnknown {
+                            failure: MutationFailure::Reconciliation {
+                                reason: format!(
+                                    "Pull completed; the push outcome is unconfirmed: {failure}"
+                                ),
+                            },
+                        }
+                    }
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let failure = match error {
+                            RepositoryError::Process(failure) => MutationFailure::Process(failure),
+                            error => MutationFailure::Reconciliation {
+                                reason: format!("Could not prepare the push: {error}"),
+                            },
+                        };
+                        MutationOutcome::PartiallyApplied {
+                            paths: Vec::new(),
+                            failures: vec![completed(), failure],
+                        }
+                    }
+                });
+            }
+            GitOperation::StashPush {
+                message,
+                include_untracked,
+            } => {
+                let mut command = self.git_mutation(worktree, ["stash", "push"]);
+                if *include_untracked {
+                    command = command.arg("--include-untracked");
+                }
+                if let Some(message) = message {
+                    command = command.arg("--message").arg(message);
+                }
+                command
+            }
+            GitOperation::StashApply {
+                reference,
+                expected_oid,
+                pop,
+            } => {
+                let apply = self
+                    .git_mutation(worktree, ["stash", "apply", expected_oid.as_str()])
+                    .without_timeout();
+                if let Some(outcome) = self.operation_failure(&apply, cancellation)? {
+                    return Ok(outcome);
+                }
+                if *pop
+                    && let Err(failure) =
+                        self.drop_stash_at(worktree, reference, expected_oid, cancellation)
+                {
+                    let reason = match failure {
+                        stash_mutations::StashDropFailure::Refused(reason) => format!(
+                            "The selected stash was applied, but its entry was preserved: {reason}"
+                        ),
+                        stash_mutations::StashDropFailure::Uncertain(reason) => format!(
+                            "The selected stash was applied, but deletion is unconfirmed; check the stash list before retrying: {reason}"
+                        ),
+                    };
+                    return Ok(MutationOutcome::PartiallyApplied {
+                        paths: Vec::new(),
+                        failures: vec![MutationFailure::Reconciliation { reason }],
+                    });
+                }
+                return Ok(MutationOutcome::Applied { paths: Vec::new() });
+            }
+            GitOperation::StashDrop {
+                reference,
+                expected_oid,
+            } => {
+                return Ok(
+                    match self.drop_stash_at(worktree, reference, expected_oid, cancellation) {
+                        Ok(()) => MutationOutcome::Applied { paths: Vec::new() },
+                        Err(stash_mutations::StashDropFailure::Refused(reason)) => {
+                            MutationOutcome::NotApplied {
+                                failure: MutationFailure::Rejected { reason },
+                            }
+                        }
+                        Err(stash_mutations::StashDropFailure::Uncertain(reason)) => {
+                            MutationOutcome::OutcomeUnknown {
+                                failure: MutationFailure::Reconciliation { reason },
+                            }
+                        }
+                    },
+                );
+            }
+            GitOperation::ResolveConflict { path, ours } => {
+                let entries = self.index_entries(worktree, path, cancellation)?;
+                if !entries.iter().any(|entry| entry.stage > 0) {
+                    return Ok(MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected {
+                            reason: format!("{path} is no longer conflicted"),
+                        },
+                    });
+                }
+                if !entries
+                    .iter()
+                    .any(|entry| entry.stage == if *ours { 2 } else { 3 })
+                {
+                    // A modify/delete conflict has no blob on the chosen side.
+                    // Git's rm records that deletion as resolved.
+                    let command = self.git_pathspec_mutation(
+                        worktree,
+                        ["rm", "--force"],
+                        std::slice::from_ref(path),
+                    );
+                    if let Some(outcome) = self.operation_failure(&command, cancellation)? {
+                        return Ok(outcome);
+                    }
+                    return Ok(MutationOutcome::Applied {
+                        paths: vec![path.clone()],
+                    });
+                }
+                self.git_literal_mutation(
+                    worktree,
+                    [
+                        OsString::from("checkout"),
+                        OsString::from(if *ours { "--ours" } else { "--theirs" }),
+                        OsString::from("--"),
+                        path.as_os_str().to_owned(),
+                    ],
+                )
+            }
+            GitOperation::Continue { kind } => self
+                .git_mutation(worktree, [kind.command(), "--continue"])
+                .env("GIT_EDITOR", "true"),
+            GitOperation::Abort { kind } => {
+                self.git_mutation(worktree, [kind.command(), "--abort"])
+            }
+            GitOperation::ApplyPatch {
+                patch,
+                cached,
+                reverse,
+                ..
+            } => {
+                let mut command = self.git_mutation(worktree, ["apply", "--whitespace=nowarn"]);
+                if *cached {
+                    command = command.arg("--cached");
+                }
+                if *reverse {
+                    command = command.arg("--reverse");
+                }
+                command.arg("-").stdin(patch.to_vec())
+            }
+            GitOperation::RevertCommit { oid, mainline }
+            | GitOperation::CherryPick { oid, mainline } => {
+                if *mainline == Some(0) {
+                    return Ok(MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected {
+                            reason: "Choose a positive parent number for the merge commit".into(),
+                        },
+                    });
+                }
+                let mut command = self.git_mutation(
+                    worktree,
+                    [
+                        if matches!(operation, GitOperation::RevertCommit { .. }) {
+                            "revert"
+                        } else {
+                            "cherry-pick"
+                        },
+                        "--no-edit",
+                    ],
+                );
+                if let Some(parent) = mainline {
+                    command = command.arg("--mainline").arg(parent.to_string());
+                }
+                command.arg(oid.as_str())
+            }
+            GitOperation::CreateBranch { oid, name } => {
+                self.git_mutation(worktree, ["branch", "--", name.as_str(), oid.as_str()])
+            }
+            GitOperation::IgnorePath { path } => {
+                self.ignore_path(worktree, path, cancellation)?;
+                return Ok(MutationOutcome::Applied {
+                    paths: vec![path.clone()],
+                });
+            }
+        };
+        command = command.without_timeout();
+        if let Some(outcome) = self.operation_failure(&command, cancellation)? {
+            return Ok(outcome);
+        }
+        if let GitOperation::ResolveConflict { path, .. } = operation {
+            return self.stage(
+                &StageRequest {
+                    worktree: worktree.to_owned(),
+                    selection: vec![PathSelection::new(path.clone())],
+                },
+                cancellation,
+            );
+        }
+        Ok(MutationOutcome::Applied { paths: Vec::new() })
+    }
+
+    fn operation_failure(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MutationOutcome>, RepositoryError> {
+        Ok(match self.run(command, cancellation) {
+            Ok(output) if output.success => None,
+            Ok(output) => Some(MutationOutcome::OutcomeUnknown {
+                failure: git_failure(command, output).into(),
+            }),
+            Err(failure) if !failure.started => Some(MutationOutcome::NotApplied {
+                failure: failure.into(),
+            }),
+            Err(failure) => Some(MutationOutcome::OutcomeUnknown {
+                failure: failure.into(),
+            }),
         })
     }
 
@@ -3793,6 +5100,32 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         } else {
             Err(git_failure(&command, output).into())
         }
+    }
+
+    /// Read a pinned commit message for the amend composer without walking history.
+    pub fn commit_message(
+        &self,
+        worktree: &Path,
+        oid: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<String, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            [
+                "show",
+                "--no-patch",
+                "--no-notes",
+                "--no-show-signature",
+                "--format=format:%B",
+                oid.as_str(),
+                "--",
+            ],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        String::from_utf8(output.stdout).map_err(|error| RepositoryError::InvalidOutput {
+            field: "commit_message",
+            reason: error.to_string(),
+        })
     }
 
     /// The commit HEAD points at, or `None` on an unborn branch.
@@ -3868,31 +5201,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         self.git_literal_read(worktree, arguments)
     }
 
+    fn history_start(
+        &self,
+        request: &HistoryRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Oid>, RepositoryError> {
+        match &request.revision {
+            HistoryRevision::Head => self.resolve_head(&request.worktree, cancellation),
+            HistoryRevision::Object { oid } => Ok(Some(oid.clone())),
+            HistoryRevision::Reference { name } => self.resolve_optional_revision(&request.worktree, name.as_str(), cancellation),
+        }
+    }
+
     /// One page of history, newest first.
     pub fn history(
         &self,
         request: &HistoryRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<CommitSummary>, RepositoryError> {
-        let start = match &request.revision {
-            // Resolved before walking so that every page of one paging session
-            // is taken from the same starting commit, and so that an unborn
-            // branch is an empty history rather than a `git log` failure.
-            HistoryRevision::Head => match self.resolve_head(&request.worktree, cancellation)? {
-                Some(oid) => oid,
-                None => return Ok(Vec::new()),
-            },
-            HistoryRevision::Object { oid } => oid.clone(),
-            HistoryRevision::Reference { name } => {
-                match self.resolve_optional_revision(
-                    &request.worktree,
-                    name.as_str(),
-                    cancellation,
-                )? {
-                    Some(oid) => oid,
-                    None => return Ok(Vec::new()),
-                }
-            }
+        let Some(start) = self.history_start(request, cancellation)? else {
+            return Ok(Vec::new());
         };
         let command = self.history_command(
             &request.worktree,
@@ -3903,6 +5231,64 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_history(&output.stdout);
         invalid_output(parsed, output)
+    }
+
+    /// Resolve a pasted commit SHA even when another branch owns the commit.
+    /// Restrict this extra lookup to hexadecimal prefixes; ordinary queries
+    /// remain literal message/author text and never become revision syntax.
+    fn history_sha_match(
+        &self,
+        request: &HistoryRequest,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CommitSummary>, RepositoryError> {
+        if !(4..=64).contains(&query.len()) || !query.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let Some(oid) = self.resolve_optional_revision(&request.worktree, query, cancellation)? else { return Ok(None); };
+        if !oid.as_str().starts_with(query) { return Ok(None); }
+        let pinned = HistoryRequest { revision: HistoryRevision::Object { oid }, page: 0, ..request.clone() };
+        Ok(self.history(&pinned, cancellation)?.into_iter().next().filter(|commit| history_matches(commit, query)))
+    }
+
+    /// Literal, case-insensitive OR search across message, author and SHA prefix.
+    /// Walk bounded pages on the reader worker so matches can occur anywhere in history.
+    /// A pasted SHA can also name a commit on a sibling branch, allowing a
+    /// selected change to be cherry-picked into the current worktree.
+    pub fn filtered_history(
+        &self,
+        request: &HistoryRequest,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<CommitSummary>, RepositoryError> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() { return self.history(request, cancellation); }
+        let candidate = self.history_sha_match(request, &query, cancellation)?;
+        let candidate_oid = candidate.as_ref().map(|commit| commit.oid.clone());
+        let start = self.history_start(request, cancellation)?;
+        let mut walk = request.clone();
+        if let Some(start) = &start { walk.revision = HistoryRevision::Object { oid: start.clone() }; }
+        walk.page = 0;
+        let mut skip = u64::from(request.page) * u64::from(HISTORY_PAGE_SIZE);
+        let mut matches = Vec::new();
+        if let Some(candidate) = candidate {
+            if skip > 0 { skip -= 1; } else { matches.push(candidate); }
+        }
+        loop {
+            let commits = if start.is_some() { self.history(&walk, cancellation)? } else { Vec::new() };
+            let complete = commits.len() < HISTORY_PAGE_SIZE as usize;
+            for commit in commits {
+                if candidate_oid.as_ref() == Some(&commit.oid) { continue; }
+                if history_matches(&commit, &query) {
+                    if skip > 0 { skip -= 1; }
+                    else { matches.push(commit); }
+                    if matches.len() == HISTORY_PAGE_SIZE as usize { return Ok(matches); }
+                }
+            }
+            if complete { return Ok(matches); }
+            let Some(next) = walk.page.checked_add(1) else { return Ok(matches); };
+            walk.page = next;
+        }
     }
 
     /// The merge base of `base_ref` and HEAD, which is what a branch
@@ -4231,15 +5617,25 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<DiffContent, RepositoryError> {
         let worktree = request.worktree.as_path();
         let old_path = request.old_path.as_ref().unwrap_or(&request.path);
+        let comparison =
+            |old, new, old_label, new_label, source_head, modes| DiffContent::Comparison {
+                old,
+                new,
+                old_label,
+                new_label,
+                source_head,
+                modes,
+            };
         match &request.basis {
             DiffBasis::IndexToWorktree => {
+                // Retain before the Git read: an executor may finish against
+                // A and then its mutable pathname may be replaced by B. The
+                // filesystem side must keep the same captured root as Git.
+                let root = self.captured_worktree_root(worktree)?;
                 let stages = self.index_entries(worktree, old_path, cancellation)?;
-                let worktree_side = read_worktree_side(worktree, &request.path);
+                let (worktree_side, worktree_mode) = read_worktree_side(&root, &request.path);
                 let stage = |number: u8| stages.iter().find(|entry| entry.stage == number);
                 if stage(0).is_none() && (1..=3).any(|number| stage(number).is_some()) {
-                    // An unmerged path has no stage 0. Treating that absence as
-                    // an empty old side would claim the file was added, so the
-                    // three conflict stages are reported instead.
                     return Ok(DiffContent::Unmerged {
                         base: self.entry_side(worktree, stage(1), cancellation)?,
                         ours: self.entry_side(worktree, stage(2), cancellation)?,
@@ -4247,63 +5643,93 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         worktree: worktree_side,
                     });
                 }
-                Ok(DiffContent::Comparison {
-                    old: self.entry_side(worktree, stage(0), cancellation)?,
-                    new: worktree_side,
-                    old_label: "Index".into(),
-                    new_label: "Working tree".into(),
-                })
+                Ok(comparison(
+                    self.entry_side(worktree, stage(0), cancellation)?,
+                    worktree_side,
+                    "Index".into(),
+                    "Working tree".into(),
+                    None,
+                    [stage(0).map(|entry| entry.mode), worktree_mode],
+                ))
             }
             DiffBasis::HeadToIndex => {
-                let old = match self.resolve_head(worktree, cancellation)? {
-                    Some(head) => self.tree_side(worktree, &head, old_path, cancellation)?,
-                    None => DiffSide::Absent,
+                // Resolve once: metadata and bytes must refer to the same HEAD,
+                // even if another process commits while the blobs are read.
+                let head = self.resolve_head(worktree, cancellation)?;
+                let (old, old_mode) = match head.as_ref() {
+                    Some(head) => self.tree_side(worktree, head, old_path, cancellation)?,
+                    None => (DiffSide::Absent, None),
                 };
+                let source_head = Some(match head {
+                    Some(head) => GitHeadGuard::Commit(head),
+                    None => GitHeadGuard::Unborn,
+                });
                 let stages = self.index_entries(worktree, &request.path, cancellation)?;
                 let staged = stages.iter().find(|entry| entry.stage == 0);
-                Ok(DiffContent::Comparison {
+                Ok(comparison(
                     old,
-                    new: self.entry_side(worktree, staged, cancellation)?,
-                    old_label: "HEAD".into(),
-                    new_label: "Index".into(),
-                })
+                    self.entry_side(worktree, staged, cancellation)?,
+                    "HEAD".into(),
+                    "Index".into(),
+                    source_head,
+                    [old_mode, staged.map(|entry| entry.mode)],
+                ))
             }
             DiffBasis::MergeBaseToHead {
                 base_ref,
                 head,
                 merge_base,
-            } => Ok(DiffContent::Comparison {
-                old: self.tree_side(worktree, merge_base, old_path, cancellation)?,
-                new: self.tree_side(worktree, head, &request.path, cancellation)?,
-                old_label: format!("{} ({})", base_ref.short_name(), merge_base.short()),
-                new_label: format!("HEAD ({})", head.short()),
-            }),
-            DiffBasis::CommitToParent { oid, parent } => {
-                let old = match parent {
-                    Some(parent) => self.tree_side(worktree, parent, old_path, cancellation)?,
-                    None => DiffSide::Absent,
-                };
-                Ok(DiffContent::Comparison {
+            } => {
+                let (old, old_mode) =
+                    self.tree_side(worktree, merge_base, old_path, cancellation)?;
+                let (new, new_mode) =
+                    self.tree_side(worktree, head, &request.path, cancellation)?;
+                Ok(comparison(
                     old,
-                    new: self.tree_side(worktree, oid, &request.path, cancellation)?,
-                    old_label: match parent {
+                    new,
+                    format!("{} ({})", base_ref.short_name(), merge_base.short()),
+                    format!("HEAD ({})", head.short()),
+                    None,
+                    [old_mode, new_mode],
+                ))
+            }
+            DiffBasis::CommitToParent { oid, parent } => {
+                let (old, old_mode) = match parent {
+                    Some(parent) => self.tree_side(worktree, parent, old_path, cancellation)?,
+                    None => (DiffSide::Absent, None),
+                };
+                let (new, new_mode) = self.tree_side(worktree, oid, &request.path, cancellation)?;
+                Ok(comparison(
+                    old,
+                    new,
+                    match parent {
                         Some(parent) => parent.short().to_owned(),
                         None => "root commit".into(),
                     },
-                    new_label: oid.short().to_owned(),
-                })
+                    oid.short().to_owned(),
+                    None,
+                    [old_mode, new_mode],
+                ))
             }
             DiffBasis::PullRequest {
                 number,
                 base_ref,
                 head,
                 merge_base,
-            } => Ok(DiffContent::Comparison {
-                old: self.tree_side(worktree, merge_base, old_path, cancellation)?,
-                new: self.tree_side(worktree, head, &request.path, cancellation)?,
-                old_label: format!("{} ({})", base_ref.short_name(), merge_base.short()),
-                new_label: format!("#{number} ({})", head.short()),
-            }),
+            } => {
+                let (old, old_mode) =
+                    self.tree_side(worktree, merge_base, old_path, cancellation)?;
+                let (new, new_mode) =
+                    self.tree_side(worktree, head, &request.path, cancellation)?;
+                Ok(comparison(
+                    old,
+                    new,
+                    format!("{} ({})", base_ref.short_name(), merge_base.short()),
+                    format!("#{number} ({})", head.short()),
+                    None,
+                    [old_mode, new_mode],
+                ))
+            }
         }
     }
 
@@ -4353,7 +5779,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         revision: &Oid,
         path: &RepoPath,
         cancellation: &CancellationToken,
-    ) -> Result<DiffSide, RepositoryError> {
+    ) -> Result<(DiffSide, Option<u32>), RepositoryError> {
         let command = self.git_literal_read(
             worktree,
             [
@@ -4368,8 +5794,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let parsed = parse_tree_entries(&output.stdout);
         let entries = invalid_output(parsed, output)?;
         match entries.into_iter().find(|entry| entry.path == *path) {
-            Some(entry) => self.object_side(worktree, entry.mode, &entry.oid, cancellation),
-            None => Ok(DiffSide::Absent),
+            Some(entry) => self
+                .object_side(worktree, entry.mode, &entry.oid, cancellation)
+                .map(|side| (side, Some(entry.mode))),
+            None => Ok((DiffSide::Absent, None)),
         }
     }
 
@@ -4448,6 +5876,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(classify_bytes(bytes))
     }
 
+    fn git_pathspec_mutation<'a>(
+        &self,
+        worktree: &Path,
+        leading: impl IntoIterator<Item = &'a str>,
+        paths: &[RepoPath],
+    ) -> CommandSpec {
+        self.git_literal_mutation(worktree, leading)
+            .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
+            .stdin(pathspec_input(paths))
+    }
+
     /// The `git add` invocation for an already-resolved pathspec list.
     pub fn stage_command(
         &self,
@@ -4457,7 +5896,82 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if paths.is_empty() {
             return Err(ValidationError::EmptySelection);
         }
-        Ok(self.git_literal_mutation(worktree, pathspec_arguments(["add", "-A"], paths)))
+        Ok(self.git_pathspec_mutation(worktree, ["add", "-A"], paths))
+    }
+
+    /// Check the current unmerged index at queue execution, never at the time
+    /// a row was clicked. An explicit approval applies only to those exact
+    /// scanned file identities, so editing a waiting file requires a new answer.
+    pub fn check_stage_markers(
+        &self,
+        request: &StageRequest,
+        approved: &BTreeMap<RepoPath, ConflictMarkerVersion>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<BTreeMap<RepoPath, ConflictMarkerVersion>>, RepositoryError> {
+        use std::os::unix::fs::MetadataExt;
+        let command = self.git_read(&request.worktree, ["ls-files", "--unmerged", "-z"]);
+        let output = self.run_checked(&command, cancellation)?;
+        let entries = invalid_output(parse_index_entries(&output.stdout), output)?;
+        let mut conflicted = entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<HashSet<_>>();
+        conflicted.extend(approved.keys().cloned());
+        let paths = selection_pathspecs(&request.selection);
+        if !paths.iter().any(|path| conflicted.contains(path)) {
+            return Ok(None);
+        }
+        let root = self.captured_worktree_root(&request.worktree)?;
+        let version = |metadata: &fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let mut markers = BTreeMap::new();
+        for path in paths.into_iter().filter(|path| conflicted.contains(path)) {
+            let metadata = match fs_safety::metadata_beneath(&root, path.as_path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.is_not_found() => continue,
+                Err(error) => return Err(ValidationError::Io(error.to_string()).into()),
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let mut file = fs_safety::open_beneath(&root, path.as_path())
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let opened = file
+                .metadata()
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let remaining = scan_conflict_markers(&mut file, cancellation)
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let after = file
+                .metadata()
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let named = fs_safety::metadata_beneath(&root, path.as_path())
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            if version(&metadata) != version(&opened)
+                || version(&opened) != version(&after)
+                || version(&after) != version(&named)
+            {
+                return Err(ValidationError::Io(format!(
+                    "{path} changed while checking conflict markers; retry staging"
+                ))
+                .into());
+            }
+            if remaining {
+                markers.insert(path, version(&after));
+            }
+        }
+        Ok(markers
+            .iter()
+            .any(|(path, version)| approved.get(path) != Some(version))
+            .then_some(markers))
     }
 
     /// Stages the selected paths, including the deletion half of a rename the
@@ -4503,14 +6017,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         } else {
             self.indexed_paths(worktree, &sources, cancellation)?
         };
+        let indexed: HashSet<_> = indexed.into_iter().collect();
         let mut paths = Vec::with_capacity(selection.len() + indexed.len());
+        let mut seen = HashSet::new();
         for entry in selection {
             let source = entry
                 .old_path
                 .as_ref()
                 .filter(|source| indexed.contains(source));
             for path in [source, Some(&entry.path)].into_iter().flatten() {
-                if !paths.contains(path) {
+                if seen.insert(path.clone()) {
                     paths.push(path.clone());
                 }
             }
@@ -4536,14 +6052,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // while unstaging the rest. Refuse the whole request up front
             // when any selected path resolves to nothing git knows — the
             // index, or the HEAD tree for renamed-away sources.
-            let indexed = self.indexed_paths(&request.worktree, &paths, cancellation)?;
+            let indexed: HashSet<_> = self
+                .indexed_paths(&request.worktree, &paths, cancellation)?
+                .into_iter()
+                .collect();
             let unindexed: Vec<&RepoPath> = paths
                 .iter()
                 .filter(|path| !indexed.contains(path))
                 .collect();
             if !unindexed.is_empty() {
-                let in_head =
-                    self.head_tree_paths(&request.worktree, &head, &unindexed, cancellation)?;
+                let in_head: HashSet<_> = self
+                    .head_tree_paths(&request.worktree, &head, &unindexed, cancellation)?
+                    .into_iter()
+                    .collect();
                 if let Some(ghost) = unindexed.iter().find(|path| !in_head.contains(path)) {
                     return Ok(MutationOutcome::NotApplied {
                         failure: MutationFailure::Rejected {
@@ -4556,9 +6077,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // post-checkout hooks. Neither belongs in an index-only operation.
             // A path-limited reset never moves HEAD; --no-refresh also skips
             // the otherwise repository-wide stat refresh after updating it.
-            let command = self.git_literal_mutation(
+            let command = self.git_pathspec_mutation(
                 &request.worktree,
-                pathspec_arguments(["reset", "--no-refresh", "--quiet", head.as_str()], &paths),
+                ["reset", "--no-refresh", "--quiet", head.as_str()],
+                &paths,
             );
             return Ok(self.run_mutation(
                 &command,
@@ -4574,10 +6096,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if indexed.is_empty() {
             return Ok(MutationOutcome::Applied { paths: Vec::new() });
         }
-        let command = self.git_literal_mutation(
-            &request.worktree,
-            pathspec_arguments(["update-index", "--force-remove"], &indexed),
-        );
+        let command = self
+            .git_literal_mutation(
+                &request.worktree,
+                ["update-index", "--force-remove", "-z", "--stdin"],
+            )
+            .stdin(pathspec_input(&indexed));
         Ok(self.run_mutation(&command, indexed, MutationScope::AllOrNothing, cancellation))
     }
 
@@ -4589,16 +6113,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         paths: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<Vec<RepoPath>, RepositoryError> {
-        let mut arguments = vec![
-            OsString::from("ls-files"),
-            OsString::from("-z"),
-            OsString::from("--"),
-        ];
-        arguments.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
-        let command = self.git_literal_read(worktree, arguments);
+        // ls-files has no stdin pathspec support. Read the index once and
+        // filter by hashed membership; argv stays bounded for every selection.
+        let command = self.git_literal_read(worktree, ["ls-files", "-z"]);
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_path_list(&output.stdout, "git ls-files");
-        let listed = invalid_output(parsed, output)?;
+        let listed: HashSet<_> = invalid_output(parsed, output)?.into_iter().collect();
         Ok(paths
             .iter()
             .filter(|path| listed.contains(path))
@@ -4617,18 +6137,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         paths: &[&RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<Vec<RepoPath>, RepositoryError> {
-        let mut arguments = vec![
-            OsString::from("ls-tree"),
-            OsString::from("-z"),
-            OsString::from(revision.as_str()),
-            OsString::from("--"),
-        ];
-        arguments.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
-        let command = self.git_literal_read(worktree, arguments);
+        // ls-tree likewise lacks stdin pathspecs. A recursive listing plus
+        // membership filtering avoids both ARG_MAX and quadratic scans.
+        let command = self.git_literal_read(worktree, ["ls-tree", "-r", "-z", revision.as_str()]);
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_tree_entries(&output.stdout);
         let entries = invalid_output(parsed, output)?;
-        let listed: Vec<RepoPath> = entries.into_iter().map(|entry| entry.path).collect();
+        let listed: HashSet<RepoPath> = entries.into_iter().map(|entry| entry.path).collect();
         Ok(paths
             .iter()
             .filter(|path| listed.contains(*path))
@@ -4636,14 +6151,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .collect())
     }
 
-    /// Restores tracked paths from the index and deletes untracked files.
+    /// Saves tracked contents in Git, restores the index version, and moves
+    /// untracked entries to the system Trash.
     ///
-    /// This destroys work that exists nowhere else, so it refuses to run
-    /// without the caller's confirmation and never removes a directory.
+    /// Confirmation is required. Selected directories are refused; directories
+    /// emptied by removed files are pruned below the worktree root.
     pub fn discard(
         &self,
         request: &DiscardRequest,
         cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        self.discard_recoverable(request, cancellation)
+            .map(|result| result.outcome)
+    }
+
+    fn discard_mutation(
+        &self,
+        request: &DiscardRequest,
+        cancellation: &CancellationToken,
+        trashed: &mut Vec<TrashReceipt>,
+        captured_root: &fs_safety::Root,
+        captured_versions: &recovery::CaptureVersions,
     ) -> Result<MutationOutcome, RepositoryError> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
@@ -4659,8 +6187,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let tracked =
             self.matchable_pathspecs(&request.worktree, &request.tracked, cancellation)?;
         let mut untracked: Vec<RepoPath> = Vec::with_capacity(request.untracked.len());
+        let mut seen = HashSet::new();
         for path in &request.untracked {
-            if !untracked.contains(path) {
+            if seen.insert(path.clone()) {
                 untracked.push(path.clone());
             }
         }
@@ -4668,12 +6197,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection.into());
         }
 
+        if let Err(reason) =
+            recovery::verify_captured_versions(captured_root, captured_versions, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
+        }
         let mut applied = Vec::new();
         if !tracked.is_empty() {
-            let command = self.git_literal_mutation(
-                &request.worktree,
-                pathspec_arguments(["restore", "--worktree"], &tracked),
-            );
+            let command =
+                self.git_pathspec_mutation(&request.worktree, ["restore", "--worktree"], &tracked);
             // A `restore` that reports a refusal changed nothing, and one that
             // failed inside its write loop changed an amount only the user can
             // establish. Neither leaves a half of the request that this may
@@ -4711,7 +6245,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // tracking under the lock, before deleting any untracked file.
             let tracked_now = match self.indexed_paths(&request.worktree, &untracked, cancellation)
             {
-                Ok(paths) => paths,
+                Ok(paths) => paths.into_iter().collect::<HashSet<_>>(),
                 Err(error) => {
                     return discard_failures(
                         &untracked,
@@ -4719,7 +6253,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     );
                 }
             };
-            let root = match fs_safety::Root::open(&request.worktree) {
+            let root = match captured_root.try_clone() {
                 Ok(root) => root,
                 Err(error) => {
                     return discard_failures(
@@ -4728,6 +6262,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     );
                 }
             };
+            if let Err(reason) = recovery::verify_recovery_root(captured_root) {
+                return discard_failures(&untracked, reason);
+            }
             // A refused directory does not prevent independent selected files
             // being attempted. Cancellation or loss of the index lock ends the
             // remaining batch, whose paths are still known untouched.
@@ -4750,8 +6287,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     });
                     continue;
                 }
-                match delete_untracked(&root, path) {
-                    Ok(()) => applied.push(path.clone()),
+                match recovery::trash_untracked(&root, path) {
+                    Ok(receipt) => {
+                        if let Some(receipt) = receipt {
+                            if let Some(reason) = receipt.warning.as_ref() {
+                                failures.push(MutationFailure::Path {
+                                    path: path.clone(),
+                                    reason: reason.clone(),
+                                });
+                            }
+                            trashed.push(receipt);
+                        }
+                        applied.push(path.clone());
+                    }
                     Err(failure) => failures.push(failure),
                 }
             }
@@ -4786,6 +6334,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         let index = parse_path_line(&output.stdout, "index_path")?;
+        let index = self.captured_worktree_path(&index)?;
         GitFileLock::acquire(&index).map_err(|reason| ValidationError::Io(reason).into())
     }
 
@@ -4808,7 +6357,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 // such lines would be committed as empty.
                 ["commit", "--file=-", "--cleanup=whitespace"],
             )
-            .stdin(request.message.clone().into_bytes()))
+            .stdin(request.message.clone().into_bytes())
+            .without_timeout())
     }
 
     /// True when the index differs from HEAD.
@@ -4858,14 +6408,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let command = self.git_read(worktree, arguments);
         let output = self.run_checked(&command, cancellation)?;
-        Ok(output
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(bytes_to_path)
-            // `--git-path` answers relative to the working directory it ran
-            // in, which is the worktree.
-            .any(|path| worktree.join(path).exists()))
+        for path in output.stdout.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).map(bytes_to_path) {
+            // `--git-path` is relative to Git's scoped working directory.
+            if self.captured_worktree_path(&worktree.join(path))?.exists() { return Ok(true); }
+        }
+        Ok(false)
     }
 
     /// Commits the index, reconciling the outcome against HEAD.
@@ -4883,12 +6430,35 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         amend: bool,
         cancellation: &CancellationToken,
     ) -> Result<CommitOutcome, RepositoryError> {
+        self.commit_with_amend_expected(request, amend, None, cancellation)
+    }
+
+    /// Amend only the commit whose message the composer loaded. An earlier
+    /// queued commit or another writer must not redirect this amendment.
+    pub fn commit_amend_at(
+        &self,
+        request: &CommitRequest,
+        expected_head: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
+        self.commit_with_amend_expected(request, true, Some(expected_head), cancellation)
+    }
+
+    fn commit_with_amend_expected(
+        &self,
+        request: &CommitRequest,
+        amend: bool,
+        expected_head: Option<&Oid>,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
         let mut command = self.commit_command(request)?;
         if amend {
-            command = command.arg("--amend");
+            // A loaded message is already an existing commit's exact content.
+            // Whitespace cleanup would silently rewrite a verbatim original.
+            command = command.arg("--amend").arg("--cleanup=verbatim");
         }
         if !amend
             && !self.has_staged_changes(&request.worktree, cancellation)?
@@ -4901,6 +6471,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         }
         let before = self.resolve_head(&request.worktree, cancellation)?;
+        if let Some(expected) = expected_head
+            && before.as_ref() != Some(expected)
+        {
+            return Ok(CommitOutcome::NotCreated {
+                failure: MutationFailure::Rejected {
+                    reason: "HEAD changed since Amend was enabled. Toggle Amend again to load the current commit.".into(),
+                },
+            });
+        }
         let failure = match self.run(&command, cancellation) {
             Ok(output) if output.success => None,
             Ok(output) => Some(MutationFailure::from(git_failure(&command, output))),
@@ -5148,6 +6727,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // Force is never offered.
         arguments.push(push_refspec(&request.branch, destination).into());
         self.git_mutation(&request.worktree, arguments)
+            .without_timeout()
     }
 
     /// Pushes one branch, reconciling an uncertain outcome against the remote.
@@ -5257,6 +6837,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 MutationFailure::from(failure)
             }
         };
+        // Explicit cancellation must release the panel promptly. A new remote
+        // observation could hang on the very credential helper just cancelled;
+        // retain the uncertain result instead of starting another network call.
+        if cancellation.is_cancelled() {
+            return Ok(PushOutcome::OutcomeUnknown { failure });
+        }
         // The push may have completed at the remote before the local process
         // died, so the remote's own ref is consulted under a fresh token —
         // reconciliation has to run even when the original token is cancelled.
@@ -6041,6 +7627,70 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 }
 
+/// A repository may request Git's builtin monitor (boolean true), but it may
+/// not select a hook program. Programs explicitly configured by the user in
+/// global/system configuration may retain authority when their absolute
+/// executable is outside repository content and contains no shell syntax.
+fn trusted_fsmonitor(output: &[u8], worktree: &Path) -> Option<OsString> {
+    let text = std::str::from_utf8(output).ok()?.trim_end_matches('\n');
+    let (scope, value) = text.split_once('\t')?;
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(OsString::from("true")),
+        "false" | "no" | "off" | "0" | "" => None,
+        _ if matches!(scope, "global" | "system" | "command") => {
+            // Git interprets hook values as commands. Relative commands and
+            // shell syntax can select code supplied by the current checkout.
+            if !Path::new(value).is_absolute()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+            {
+                return None;
+            }
+            let executable = fs::canonicalize(value).ok()?;
+            let worktree = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+            if executable.starts_with(&worktree)
+                || executable
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| parent.join(".git").exists())
+            {
+                return None;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::metadata(&executable).ok()?;
+            (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .then(|| executable.into_os_string())
+        }
+        _ => None,
+    }
+}
+
+fn remove_fsmonitor_override(command: &mut CommandSpec) {
+    if let Some(index) = command
+        .arguments
+        .iter()
+        .position(|argument| argument == OsStr::new("core.fsmonitor=false"))
+    {
+        command.arguments.remove(index);
+        command.arguments.remove(index - 1);
+    }
+}
+
+fn snapshot_fsmonitor(mut command: CommandSpec, configured: Option<&OsStr>) -> CommandSpec {
+    if let Some(configured) = configured
+        && let Some(argument) = command
+            .arguments
+            .iter_mut()
+            .find(|argument| **argument == OsStr::new("core.fsmonitor=false"))
+    {
+        let mut value = OsString::from("core.fsmonitor=");
+        value.push(configured);
+        *argument = value;
+    }
+    command
+}
+
 /// The ten NUL-separated fields [`parse_history`] expects, in order.
 const HISTORY_FORMAT: &str = "%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%s%x00%b";
 
@@ -6127,6 +7777,18 @@ fn read_options(command: CommandSpec) -> CommandSpec {
         .env("GIT_OPTIONAL_LOCKS", "0")
 }
 
+/// NUL-delimited literal paths preserve arbitrary Unix names without argv limits.
+fn pathspec_input(paths: &[RepoPath]) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_os_str().as_bytes());
+        input.push(0);
+    }
+    input
+}
+
+#[cfg(test)]
 /// Subcommand arguments followed by `--` and the selected paths.
 fn pathspec_arguments<'a>(
     leading: impl IntoIterator<Item = &'a str>,
@@ -6586,6 +8248,57 @@ mod tests {
     use super::*;
     use std::{ffi::OsStr, sync::Mutex};
 
+    #[test]
+    fn comparison_metadata_stamp_tracks_only_relevant_refs_and_published_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let git = directory.path().join(".git");
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        fs::write(git.join("refs/heads/topic"), "old head\n").unwrap();
+        fs::write(git.join("refs/heads/main"), "old base\n").unwrap();
+        let basis = DiffBasis::MergeBaseToHead {
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: Oid::parse_object("1".repeat(40)).unwrap(),
+            merge_base: Oid::parse_object("2".repeat(40)).unwrap(),
+        };
+        let first = repository_metadata_stamp(directory.path(), &basis).unwrap();
+        fs::write(git.join("index.lock"), "unpublished").unwrap();
+        fs::write(git.join("refs/heads/topic.lock"), "unpublished").unwrap();
+        fs::write(git.join("refs/heads/irrelevant"), "not selected").unwrap();
+        assert_eq!(first, repository_metadata_stamp(directory.path(), &basis).unwrap());
+        fs::write(git.join("index"), "published index").unwrap();
+        let indexed = repository_metadata_stamp(directory.path(), &basis).unwrap();
+        assert_ne!(first, indexed);
+        fs::write(git.join("refs/heads/topic"), "new and longer head\n").unwrap();
+        let head = repository_metadata_stamp(directory.path(), &basis).unwrap();
+        assert_ne!(indexed, head);
+        fs::write(git.join("refs/heads/main"), "new and longer base\n").unwrap();
+        let base = repository_metadata_stamp(directory.path(), &basis).unwrap();
+        assert_ne!(head, base);
+        fs::write(git.join("packed-refs"), "packed data\n").unwrap();
+        assert_ne!(base, repository_metadata_stamp(directory.path(), &basis).unwrap());
+    }
+
+    #[test]
+    fn comparison_metadata_stamp_follows_linked_worktree_common_refs_and_bounds_symbolic_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        let common = directory.path().join("admin");
+        let git = common.join("worktrees/linked");
+        let root = directory.path().join("linked");
+        fs::create_dir_all(&git).unwrap();
+        fs::create_dir_all(common.join("refs/heads")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".git"), "gitdir: ../admin/worktrees/linked\n").unwrap();
+        fs::write(git.join("commondir"), "../..\n").unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        fs::write(common.join("refs/heads/topic"), "old\n").unwrap();
+        let first = repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap();
+        fs::write(common.join("refs/heads/topic"), "new longer\n").unwrap();
+        assert_ne!(first, repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap());
+        fs::write(common.join("refs/heads/topic"), "ref: refs/heads/topic\n").unwrap();
+        assert_eq!(repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
     #[derive(Default)]
     struct FakeExecutor {
         commands: Mutex<Vec<CommandSpec>>,
@@ -6607,19 +8320,428 @@ mod tests {
             command: &CommandSpec,
             _cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
+            if command
+                .arguments
+                .iter()
+                .any(|argument| argument == "hash-object")
+            {
+                return SystemProcessExecutor.execute(command, _cancellation);
+            }
             self.commands.lock().unwrap().push(command.clone());
             self.outputs.lock().unwrap().pop().unwrap()
         }
     }
 
+    #[test]
+    fn watch_projection_preserves_a_prefix_without_changing_complete_inventory_reads() {
+        let listing = b"H first.txt\0H second.txt\0";
+        let service = fake_service(vec![success(listing), success(listing)]);
+        let cancel = CancellationToken::new();
+        let prefix = service
+            .watch_files_projection(Path::new("/repo"), 1, &cancel)
+            .unwrap();
+        assert_eq!(prefix.paths, vec![path("first.txt")]);
+        assert_eq!(prefix.tracked_count, 1);
+        assert!(prefix.listing_truncated);
+        let complete = service.watch_files(Path::new("/repo"), &cancel).unwrap();
+        assert_eq!(complete.paths.len(), 2);
+        assert!(!complete.listing_truncated);
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands[0].stdout_record_limit, Some(1));
+        assert_eq!(commands[1].stdout_record_limit, None);
+    }
+
+    #[test]
+    fn ui_listing_cap_preserves_a_snapshot_when_status_exceeds_sixteen_megabytes() {
+        let mut stdout = b"# branch.head main\0# branch.oid (initial)\0".to_vec();
+        let path = "x".repeat(200);
+        for index in 0..90_000 {
+            stdout.extend_from_slice(format!("? {index}-{path}\0").as_bytes());
+        }
+        assert!(stdout.len() > 16 * 1024 * 1024);
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![success(&stdout)]));
+        let service = RepositoryService::new("git", executor.clone());
+        let status = service
+            .status_projection(Path::new("/repo"), true, 10_000, &CancellationToken::new())
+            .unwrap();
+        assert!(status.listing_truncated);
+        assert_eq!(status.entries.len(), 10_000);
+        let command = &executor.commands.lock().unwrap()[0];
+        assert_eq!(command.stdout_record_limit, Some(20_016));
+        assert_eq!(command.stdout_limit, 64 * 1024 * 1024);
+    }
+
     fn success(stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
         Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(0),
             signal: None,
             success: true,
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         })
+    }
+
+    #[test]
+    fn marker_scan_is_bounded_and_finds_markers_after_a_large_line() {
+        let mut reader = io::repeat(b'x')
+            .take(17 * 1024 * 1024)
+            .chain(io::Cursor::new(b"\n<<<<<<< incoming\n"));
+        assert!(scan_conflict_markers(&mut reader, &CancellationToken::new()).unwrap());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            scan_conflict_markers(&mut io::Cursor::new(b"safe"), &cancel)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn snapshot_fsmonitor_honours_user_configuration_without_trusting_repository_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+        let trusted = directory.path().join("monitor");
+        fs::write(&trusted, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&trusted, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            trusted_fsmonitor(b"local\ttrue\n", &worktree),
+            Some("true".into())
+        );
+        for scope in ["global", "system", "command"] {
+            let config = format!("{scope}\t{}\n", trusted.display());
+            assert_eq!(
+                trusted_fsmonitor(config.as_bytes(), &worktree),
+                Some(trusted.clone().into_os_string())
+            );
+        }
+        for config in [
+            "local\t./malicious-hook\n",
+            "worktree\t./malicious-hook\n",
+            "global\t./hooks/monitor\n",
+            "global\t/bin/true;./hook\n",
+            "local\tfalse\n",
+        ] {
+            assert_eq!(trusted_fsmonitor(config.as_bytes(), &worktree), None);
+        }
+        fs::create_dir(worktree.join(".git")).unwrap();
+        let untrusted = worktree.join("monitor");
+        fs::copy(&trusted, &untrusted).unwrap();
+        assert_eq!(
+            trusted_fsmonitor(
+                format!("global\t{}\n", untrusted.display()).as_bytes(),
+                &worktree
+            ),
+            None
+        );
+    }
+
+    fn snapshot_status(entries: &[u8]) -> Vec<u8> {
+        let mut status = b"# branch.oid (initial)\0# branch.head main\0".to_vec();
+        status.extend_from_slice(entries);
+        status
+    }
+
+    fn cached_snapshot_outputs(
+        entries: &[u8],
+        files: &[u8],
+    ) -> Vec<Result<ProcessOutput, ProcessFailure>> {
+        vec![
+            exit(1, b""), // no configured fsmonitor
+            success(&snapshot_status(entries)),
+            success(b""), // staged numstat
+            success(b""), // unstaged numstat
+            success(files),
+            exit(1, b""), // no remotes
+            success(b""), // no refs
+            success(b""), // no stashes (shared mutation API)
+        ]
+    }
+
+    #[test]
+    fn snapshot_cache_unchanged_reads_only_status_and_metadata_invalidation_rereads() {
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.push(success(&snapshot_status(b"")));
+        outputs.extend(cached_snapshot_outputs(b"", b""));
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::default();
+        let root = Path::new("/snapshot-cache-test");
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
+        cache.invalidate(true);
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 17);
+    }
+
+    #[test]
+    fn snapshot_cache_notices_truncation_even_when_the_retained_prefix_is_identical() {
+        let mut outputs = cached_snapshot_outputs(b"? first.txt\0", b"");
+        outputs.extend([
+            success(&snapshot_status(b"? first.txt\0? second.txt\0")),
+            success(b""),
+            success(b""),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor);
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::new();
+        let options = SnapshotOptions {
+            status_limit: Some(1),
+            untracked_changes: true,
+            untracked_files: false,
+        };
+        let first = git
+            .snapshot_cached(
+                Path::new("/snapshot-limit-test"),
+                options,
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status.entries.len(), 1);
+        assert!(!first.status.listing_truncated);
+        let next = git
+            .snapshot_cached(
+                Path::new("/snapshot-limit-test"),
+                options,
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .expect("a newly truncated snapshot must update its lower-bound notice");
+        assert_eq!(next.status.entries, first.status.entries);
+        assert!(next.status.listing_truncated);
+    }
+
+    #[test]
+    fn snapshot_cache_status_or_content_change_reuses_metadata() {
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        for _ in 0..2 {
+            outputs.extend([
+                success(&snapshot_status(b"? new.txt\0")),
+                success(b""),
+                success(b""),
+            ]);
+        }
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::default();
+        let root = Path::new("/snapshot-cache-test");
+        git.snapshot_cached(
+            root,
+            SnapshotOptions {
+                status_limit: None,
+                untracked_changes: true,
+                untracked_files: false,
+            },
+            &cancel,
+            &mut cache,
+        )
+        .unwrap();
+        let changed = git
+            .snapshot_cached(
+                root,
+                SnapshotOptions {
+                    status_limit: None,
+                    untracked_changes: true,
+                    untracked_files: false,
+                },
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.status.entries.len(), 1);
+        cache.invalidate(false);
+        assert!(
+            git.snapshot_cached(
+                root,
+                SnapshotOptions {
+                    status_limit: None,
+                    untracked_changes: true,
+                    untracked_files: false
+                },
+                &cancel,
+                &mut cache
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 14);
+    }
+
+    #[test]
+    fn snapshot_cache_fallback_detects_content_changes_with_identical_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("new.txt");
+        fs::write(&file, "abc\n").unwrap();
+        let mut outputs = cached_snapshot_outputs(b"? new.txt\0", b"? new.txt\0");
+        outputs.extend([
+            success(&snapshot_status(b"? new.txt\0")),
+            success(b""),
+            success(b""),
+            success(&snapshot_status(b"? new.txt\0")),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let options = SnapshotOptions {
+            status_limit: None,
+            untracked_changes: true,
+            untracked_files: false,
+        };
+        let cancel = CancellationToken::default();
+        let mut cache = SnapshotCache::default();
+        let first = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status.entries[0].added_lines, Some(1));
+        // Same size and same porcelain; only descriptor metadata detects this
+        // when the native event was lost.
+        fs::write(&file, "a\nb\n").unwrap();
+        fs::File::open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let second = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.status.entries[0].added_lines, Some(2));
+        assert!(
+            git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 12);
+    }
+
+    #[test]
+    fn snapshot_cache_browse_creation_refreshes_files_without_untracked_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.extend([
+            success(&snapshot_status(b"")),
+            success(b""),
+            success(b""),
+            success(b"? new.txt\0"),
+            success(&snapshot_status(b"")),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let options = SnapshotOptions {
+            status_limit: None,
+            untracked_changes: false,
+            untracked_files: true,
+        };
+        let cancel = CancellationToken::default();
+        let mut cache = SnapshotCache::default();
+        git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap();
+        fs::write(directory.path().join("new.txt"), "new\n").unwrap();
+        fs::File::open(directory.path())
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let next = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.files.paths, vec![path("new.txt")]);
+        assert!(
+            git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 13);
+    }
+
+    #[test]
+    fn snapshot_admin_fingerprint_tracks_refs_config_and_index_without_lock_noise() {
+        let directory = tempfile::tempdir().unwrap();
+        let gitdir = directory.path().join(".git");
+        fs::create_dir_all(gitdir.join("refs/heads/feature")).unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let first = snapshot_admin_fingerprint(directory.path());
+        fs::write(gitdir.join("index.lock"), "temporary").unwrap();
+        fs::remove_file(gitdir.join("index.lock")).unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::write(gitdir.join("refs/heads/main.lock"), "unpublished").unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::remove_file(gitdir.join("refs/heads/main.lock")).unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::write(
+            gitdir.join("config"),
+            "[remote \"origin\"]\nurl = example\n",
+        )
+        .unwrap();
+        let configured = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(first, configured);
+        fs::write(gitdir.join("index"), "new-index").unwrap();
+        let indexed = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(configured, indexed);
+        fs::write(gitdir.join("refs/heads/feature/new"), "oid\n").unwrap();
+        fs::File::open(gitdir.join("refs/heads/feature"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let created = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(indexed, created);
+        fs::write(gitdir.join("refs/heads/feature/new"), "updated-oid\n").unwrap();
+        assert_ne!(created, snapshot_admin_fingerprint(directory.path()));
+    }
+
+    #[test]
+    fn untracked_measurement_cache_invalidates_size_mtime_and_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("new.txt");
+        fs::write(&file, "one\n").unwrap();
+        let mut cache = BTreeMap::new();
+        let measure = |cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>| {
+            let mut entries = parse_status(&snapshot_status(b"? new.txt\0"))
+                .unwrap()
+                .entries;
+            measure_untracked_cached(
+                directory.path(),
+                &mut entries,
+                &CancellationToken::default(),
+                cache,
+            );
+            entries[0].added_lines.unwrap()
+        };
+        assert_eq!(measure(&mut cache), 1);
+        let original = cache[&path("new.txt")].0;
+        assert_eq!(measure(&mut cache), 1);
+        fs::write(&file, "one\ntwo\n").unwrap();
+        assert_eq!(measure(&mut cache), 2);
+        assert_ne!(cache[&path("new.txt")].0, original);
+        let second = cache[&path("new.txt")].0;
+        let replacement = directory.path().join("replacement");
+        fs::write(&replacement, "one two\n").unwrap();
+        fs::rename(replacement, &file).unwrap();
+        assert_eq!(measure(&mut cache), 1);
+        assert_ne!(cache[&path("new.txt")].0, second);
     }
 
     #[test]
@@ -6763,6 +8885,146 @@ mod tests {
         }
 
         #[test]
+        fn large_literal_pathspec_mutations_roundtrip_without_argv_limits() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            let names = [
+                "space name",
+                "line\nname",
+                "-leading",
+                "[glob]*",
+                ":(glob)magic",
+            ];
+            let selection: Vec<_> = names
+                .iter()
+                .map(|name| PathSelection {
+                    path: path(name),
+                    old_path: None,
+                })
+                .collect();
+            for name in names {
+                fs::write(root.join(name), "base").unwrap();
+            }
+            let service = service();
+            let cancel = CancellationToken::new();
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            git(root, &["commit", "-m", "initial"]);
+            for name in names {
+                fs::write(root.join(name), "changed").unwrap();
+            }
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .discard(
+                        &DiscardRequest {
+                            worktree: root.into(),
+                            tracked: selection,
+                            untracked: vec![],
+                            confirmed: true
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            for name in names {
+                assert_eq!(fs::read_to_string(root.join(name)).unwrap(), "base");
+            }
+
+            // 40k names exceed Linux ARG_MAX even before argv pointer overhead.
+            let mut selection = Vec::with_capacity(40_000);
+            for index in 0..40_000 {
+                let name = format!(
+                    "generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt"
+                );
+                fs::write(root.join(&name), "generated").unwrap();
+                selection.push(PathSelection {
+                    path: path(&name),
+                    old_path: None,
+                });
+            }
+            assert!(pathspec_input(&selection_pathspecs(&selection)).len() > 2_097_152);
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .discard(
+                        &DiscardRequest {
+                            worktree: root.into(),
+                            tracked: vec![],
+                            untracked: selection.into_iter().map(|entry| entry.path).collect(),
+                            confirmed: true
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(
+                !root
+                    .join("generated_component_file_with_an_extraordinarily_long_name_00000.txt")
+                    .exists()
+            );
+        }
+
+        #[test]
         fn ignored_file_listing_preserves_collapsed_folders_and_git_rules() {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
@@ -6871,6 +9133,7 @@ mod tests {
                 .snapshot_with_options(
                     root,
                     SnapshotOptions {
+                        status_limit: None,
                         untracked_changes: false,
                         untracked_files: false,
                     },
@@ -6915,6 +9178,72 @@ mod tests {
                 command
                     .arguments
                     .contains(&OsString::from("--untracked-files=no"))
+            );
+        }
+
+        #[test]
+        fn amend_message_reader_preserves_the_original_message_and_pins_its_commit() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            git(root, &["config", "user.name", "Fixture"]);
+            git(root, &["config", "user.email", "fixture@example.invalid"]);
+            fs::write(root.join("file.txt"), "first\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            git(
+                root,
+                &[
+                    "commit",
+                    "-m",
+                    "Original subject  \n\n\nMultiline body  \nSecond line\n\n",
+                    "--cleanup=verbatim",
+                ],
+            );
+            let cancel = CancellationToken::new();
+            let service = service();
+            let original = service.resolve_head(root, &cancel).unwrap().unwrap();
+            let message = service.commit_message(root, &original, &cancel).unwrap();
+            assert_eq!(
+                message,
+                "Original subject  \n\n\nMultiline body  \nSecond line\n\n"
+            );
+            fs::write(root.join("file.txt"), "second\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            let outcome = service
+                .commit_amend_at(
+                    &CommitRequest {
+                        worktree: root.to_path_buf(),
+                        message: message.clone(),
+                    },
+                    &original,
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(outcome, CommitOutcome::Created { .. }));
+            let amended = service.resolve_head(root, &cancel).unwrap().unwrap();
+            assert_ne!(amended, original);
+            let stale = service
+                .commit_amend_at(
+                    &CommitRequest {
+                        worktree: root.to_path_buf(),
+                        message: "Wrong target".into(),
+                    },
+                    &original,
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(stale, CommitOutcome::NotCreated { .. }));
+            assert_eq!(
+                service.resolve_head(root, &cancel).unwrap(),
+                Some(amended.clone())
+            );
+            assert_eq!(
+                service.commit_message(root, &amended, &cancel).unwrap(),
+                message
+            );
+            assert_eq!(
+                service.commit_message(root, &original, &cancel).unwrap(),
+                message
             );
         }
 
@@ -6971,6 +9300,49 @@ mod tests {
                     ..
                 }
             ));
+        }
+
+        #[test]
+        fn history_sha_search_finds_a_sibling_commit_for_cherry_pick_and_revert() {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("source");
+            let target = fixture.path().join("target");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("base.txt"), "baseline\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-m", "baseline"]);
+            git(&root, &["branch", "target"]);
+            fs::write(root.join("agent-change.txt"), "selected agent change\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-m", "Fix from another branch", "-m", "Multiline body for the selected change"]);
+            let service = service();
+            let cancel = CancellationToken::new();
+            let source = service.resolve_head(&root, &cancel).unwrap().unwrap();
+            let source_request = HistoryRequest { worktree: root.clone(), revision: HistoryRevision::Head, page: 0, path: None };
+            assert_eq!(service.filtered_history(&source_request, source.as_str(), &cancel).unwrap().len(), 1,
+                "a direct SHA lookup must not duplicate its normal HEAD-history match");
+            git(&root, &["worktree", "add", target.to_str().unwrap(), "target"]);
+            fs::write(target.join("target-only.txt"), "preserve target\n").unwrap();
+            git(&target, &["add", "."]);
+            git(&target, &["commit", "-m", "Independent target change"]);
+            let request = HistoryRequest { worktree: target.clone(), revision: HistoryRevision::Head, page: 0, path: None };
+            assert!(!service.history(&request, &cancel).unwrap().iter().any(|commit| commit.oid == source));
+            for query in [source.as_str(), &source.as_str()[..8]] {
+                let found = service.filtered_history(&request, query, &cancel).unwrap();
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].oid, source);
+                assert!(found[0].body.contains("Multiline body"));
+            }
+            assert!(matches!(service.git_operation(&target, &GitOperation::CherryPick { oid: source.clone(), mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert_eq!(fs::read(target.join("agent-change.txt")).unwrap(), b"selected agent change\n");
+            let picked = service.resolve_head(&target, &cancel).unwrap().unwrap();
+            assert_ne!(picked, source);
+            assert!(matches!(service.git_operation(&target, &GitOperation::RevertCommit { oid: picked, mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert!(!target.join("agent-change.txt").exists());
+            assert_eq!(fs::read(target.join("target-only.txt")).unwrap(), b"preserve target\n");
+            assert!(root.join("agent-change.txt").exists());
+            assert_eq!(service.filtered_history(&request, source.as_str(), &cancel).unwrap().len(), 1);
         }
 
         fn git(directory: &Path, arguments: &[&str]) {
@@ -7433,6 +9805,7 @@ mod tests {
 
     fn exit(code: i32, stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
         Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(code),
             signal: None,
             success: code == 0,
@@ -8029,6 +10402,9 @@ mod tests {
         // The join the two fields exist for: every branch of a remote that has
         // a pointer finds that remote's own pointer, and never another's.
         let snapshot = RepositorySnapshot {
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: StatusSnapshot::default(),
             files: WorkingFiles::default(),
             remotes: Vec::new(),
@@ -8179,9 +10555,8 @@ mod tests {
                 OsString::from("core.fsmonitor=false"),
                 OsString::from("add"),
                 OsString::from("-A"),
-                OsString::from("--"),
-                OsString::from(":(top)old.txt"),
-                OsString::from("new name.txt"),
+                OsString::from("--pathspec-from-file=-"),
+                OsString::from("--pathspec-file-nul"),
             ]
         );
         // A mutation must not disable optional locks: it needs the index lock.
@@ -8229,8 +10604,8 @@ mod tests {
         );
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(
-            commands[1].arguments.last(),
-            Some(&OsString::from("new name.txt"))
+            commands[1].stdin.as_deref(),
+            Some(b"new name.txt\0".as_slice())
         );
         assert!(
             !commands[1]
@@ -8360,6 +10735,57 @@ mod tests {
             Some(&OsString::from("src/main.rs"))
         );
         assert_eq!(HISTORY_FORMAT.matches("%x00").count() + 1, HISTORY_FIELDS);
+    }
+
+    #[test]
+    fn history_filter_searches_beyond_the_initial_page_without_interpreting_query_options() {
+        let record = |id: u8, subject: &str, author: &str| {
+            format!("{}\0\0{}\0author@example.invalid\01700000000 +0000\0Committer\0committer@example.invalid\01700000000 +0000\0{}\0\0", oid(id), author, subject).into_bytes()
+        };
+        let first = record(1, "ordinary subject", "Grace").repeat(HISTORY_PAGE_SIZE as usize);
+        let second = record(2, "A needle beyond page one", "Ada");
+        let service = fake_service(vec![success(&first), success(&second)]);
+        let request = HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Object { oid: oid(3) }, page: 0, path: None };
+        let found = service.filtered_history(&request, "NEEDLE", &CancellationToken::new()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].oid, oid(2));
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].arguments.contains(&OsString::from("--skip=0")));
+        assert!(commands[1].arguments.contains(&OsString::from("--skip=200")));
+        drop(commands);
+        let commit = &found[0];
+        assert!(history_matches(commit, "ada"));
+        assert!(history_matches(commit, &commit.oid.as_str()[..8]));
+        assert!(!history_matches(commit, "--all --author=*"));
+    }
+
+    #[test]
+    fn history_filter_resolves_head_once_for_a_consistent_search_walk() {
+        let record = format!("{}\0\0Ada\0ada@example.invalid\01700000000 +0000\0Ada\0ada@example.invalid\01700000000 +0000\0ordinary\0\0", oid(1)).into_bytes();
+        let first = record.repeat(HISTORY_PAGE_SIZE as usize);
+        let service = fake_service(vec![success(format!("{}\n", oid(3)).as_bytes()), success(&first), success(b"")]);
+        let found = service.filtered_history(&HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Head, page: 0, path: None }, "unmatched", &CancellationToken::new()).unwrap();
+        assert!(found.is_empty());
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 3);
+        assert!(commands[0].arguments.contains(&OsString::from("rev-parse")));
+        for command in &commands[1..] {
+            assert!(command.arguments.contains(&OsString::from(oid(3).as_str())));
+        }
+    }
+
+    #[test]
+    fn history_filter_pages_matching_results_and_keeps_message_author_or_sha_semantics() {
+        let record = |id: u8, author: &str, subject: &str| format!("{}\0\0{}\0author@example.invalid\01700000000 +0000\0Committer\0committer@example.invalid\01700000000 +0000\0{}\0body\0", oid(id), author, subject).into_bytes();
+        let first = record(1, "Ada", "ordinary").repeat(HISTORY_PAGE_SIZE as usize);
+        let second = record(2, "Grace", "Ada in the message");
+        let service = fake_service(vec![success(&first), success(&second)]);
+        let found = service.filtered_history(&HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Object { oid: oid(3) }, page: 1, path: None }, "ada", &CancellationToken::new()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].oid, oid(2));
+        assert!(history_matches(&found[0], "body"));
+        assert!(!history_matches(&found[0], "unmatched"));
     }
 
     #[test]
@@ -8552,7 +10978,10 @@ mod tests {
             }
         );
         assert!(!worktree.path().join("keep/file.txt").exists());
-        assert!(worktree.path().join("keep").is_dir());
+        assert!(
+            !worktree.path().join("keep").exists(),
+            "discard prunes the newly empty parent"
+        );
     }
 
     #[cfg(unix)]
@@ -8637,13 +11066,18 @@ mod tests {
             (0..=ROUNDS).map(|_| success(b"")).collect(),
         );
         for _ in 0..ROUNDS {
+            // Recoverable discard also prunes emptied parents, so recreate
+            // this fixture directory when a previous raced round removed it.
+            let _ = fs::create_dir(&parked_directory);
             let _ = fs::write(parked_directory.join("victim.txt"), b"inside");
-            let _ = fs::write(active.join("victim.txt"), b"inside");
+            // Never seed through the raced active name: it may currently
+            // be the link to the outside fixture itself.
             let _ = service.discard(&request, &CancellationToken::new());
             assert!(
                 hostage.exists(),
                 "discard followed a swapped ancestor out of the worktree"
             );
+            assert_eq!(fs::read(&hostage).unwrap(), b"outside");
         }
 
         stop.store(true, Ordering::Relaxed);
@@ -8653,6 +11087,14 @@ mod tests {
         // prepared entries where they started. This quiescent round proves the
         // deletion the loop above was racing really happens, rather than being
         // refused every time.
+        if let Ok(metadata) = fs::symlink_metadata(&active) {
+            if metadata.file_type().is_symlink() {
+                fs::remove_file(&active).unwrap();
+            } else {
+                fs::remove_dir_all(&active).unwrap();
+            }
+        }
+        fs::create_dir_all(&parked_directory).unwrap();
         fs::rename(&parked_directory, &active).unwrap();
         fs::write(active.join("victim.txt"), b"inside").unwrap();
         let outcome = service
@@ -9651,6 +12093,7 @@ mod tests {
                     success(b""),
                     success(format!("{endpoint}\n").as_bytes()),
                     Ok(ProcessOutput {
+                        stdout_truncated: false,
                         exit_code: Some(128),
                         signal: None,
                         success: false,
@@ -9840,6 +12283,8 @@ mod tests {
                 },
                 old_label: "Index".into(),
                 new_label: "Working tree".into(),
+                source_head: None,
+                modes: [None, Some(0o100644)],
             }
         );
     }
@@ -9904,7 +12349,7 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         let service = fake_service(vec![
             success(format!("{}\n", oid(9)).as_bytes()),
-            success(format!("100644 blob {}\told.txt\0", oid(1)).as_bytes()),
+            success(format!("100755 blob {}\told.txt\0", oid(1)).as_bytes()),
             success(format!("{} blob 4\nold\n\n", oid(1)).as_bytes()),
             success(format!("100644 {} 0\tnew.txt\0", oid(2)).as_bytes()),
             success(format!("{} blob 4\nnew\n\n", oid(2)).as_bytes()),
@@ -9944,13 +12389,84 @@ mod tests {
             DiffContent::Comparison {
                 old_label,
                 new_label,
+                source_head,
+                modes,
                 ..
             } => {
                 assert_eq!(old_label, "HEAD");
                 assert_eq!(new_label, "Index");
+                assert_eq!(source_head, Some(GitHeadGuard::Commit(oid(9))));
+                assert_eq!(modes, [Some(0o100755), Some(0o100644)]);
             }
             other => panic!("expected a comparison, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unborn_diff_metadata_keeps_an_explicit_head_guard() {
+        let mut unborn = success(b"").unwrap();
+        unborn.success = false;
+        unborn.exit_code = Some(1);
+        let service = fake_service(vec![
+            Ok(unborn),
+            success(format!("100755 {} 0\tnew.sh\0", oid(2)).as_bytes()),
+            success(format!("{} blob 4\nnew\n\n", oid(2)).as_bytes()),
+        ]);
+        let DiffContent::Comparison {
+            source_head,
+            modes,
+            old,
+            ..
+        } = service
+            .diff(
+                &DiffRequest {
+                    worktree: PathBuf::from("/repo"),
+                    basis: DiffBasis::HeadToIndex,
+                    path: path("new.sh"),
+                    old_path: None,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        else {
+            panic!("expected a text comparison");
+        };
+        assert_eq!(source_head, Some(GitHeadGuard::Unborn));
+        assert_eq!(modes, [None, Some(0o100755)]);
+        assert_eq!(old, DiffSide::Absent);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn worktree_diff_mode_comes_from_the_opened_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("new.sh");
+        fs::write(&target, "script\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let service = fake_service(vec![success(b"")]);
+        let DiffContent::Comparison {
+            modes,
+            source_head,
+            new,
+            ..
+        } = service
+            .diff(
+                &DiffRequest {
+                    worktree: root.path().into(),
+                    basis: DiffBasis::IndexToWorktree,
+                    path: path("new.sh"),
+                    old_path: None,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        else {
+            panic!("expected a text comparison");
+        };
+        assert_eq!(modes, [None, Some(0o100755)]);
+        assert_eq!(source_head, None);
+        assert_eq!(new.text(), Some("script\n"));
     }
 
     #[test]
@@ -10084,6 +12600,7 @@ mod tests {
         refs.extend_from_slice(oid(1).as_str().as_bytes());
         refs.extend_from_slice(b"\0\0\0*\n");
         let service = fake_service(vec![
+            exit(1, b""), // no configured fsmonitor
             success(&status),
             success(b"4\t1\tsrc/main.rs\0"),
             success(b""),
@@ -10091,6 +12608,7 @@ mod tests {
             // No remotes configured.
             exit(1, b""),
             success(&refs),
+            success(b""),
         ]);
         let snapshot = service
             .snapshot(worktree.path(), &CancellationToken::new())
@@ -10116,9 +12634,9 @@ mod tests {
         assert!(snapshot.remotes.is_empty());
         assert_eq!(snapshot.local_refs.len(), 1);
         let commands = service.executor.commands.lock().unwrap();
-        assert!(commands[1].arguments.contains(&OsString::from("--cached")));
-        assert!(!commands[2].arguments.contains(&OsString::from("--cached")));
-        assert_eq!(commands[3].arguments.last(), Some(&OsString::from("-z")));
+        assert!(commands[2].arguments.contains(&OsString::from("--cached")));
+        assert!(!commands[3].arguments.contains(&OsString::from("--cached")));
+        assert_eq!(commands[4].arguments.last(), Some(&OsString::from("-z")));
     }
 
     #[test]
@@ -10208,6 +12726,7 @@ mod tests {
         let mut status = status_headers();
         status.extend_from_slice(b"? new.txt\0");
         let service = fake_service(vec![
+            exit(1, b""), // no configured fsmonitor
             success(&status),
             success(b""),
             success(b""),
@@ -10215,6 +12734,7 @@ mod tests {
             // No remotes configured.
             exit(1, b""),
             success(b""),
+            success(b""), // stash list
         ]);
         let snapshot = service
             .snapshot(Path::new("/repo"), &CancellationToken::new())
@@ -10398,6 +12918,7 @@ mod tests {
             return;
         }
         let refusal = Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(128),
             signal: None,
             success: false,
@@ -10514,6 +13035,12 @@ struct WorktreeJournal {
     /// journals written before it was recorded.
     #[serde(default)]
     admin_dir: Option<PathBuf>,
+    #[serde(default)]
+    creation_authority: Option<creation_authority::CreationEvidence>,
+    #[serde(skip)]
+    live_creation: Option<Arc<creation_authority::CreationSession>>,
+    #[serde(skip)]
+    live_created: Option<Arc<creation_authority::VerifiedCreatedRoot>>,
     outcome: Option<WorktreeCreationOutcome>,
     warnings: Vec<ProcessFailure>,
     detail: String,
@@ -10719,6 +13246,36 @@ fn git_locks_present(common: &Path) -> io::Result<bool> {
 }
 
 impl WorktreeJournal {
+    fn restore_creation_authority(&mut self) -> Result<(), RepositoryError> {
+        if let Some(evidence) = &self.creation_authority {
+            if self.live_creation.as_ref().is_none_or(|scope|
+                evidence.has_published_destination() && !scope.has_destination()) {
+                self.live_creation = Some(creation_authority::CreationSession::restore(
+                    evidence, &self.request, &self.common_dir)?);
+            }
+            self.live_creation.as_ref().expect("authority restored").validate()?;
+        }
+        Ok(())
+    }
+
+    fn lease_io_path(&self) -> Result<PathBuf, RepositoryError> {
+        match &self.live_creation {
+            Some(scope) => scope.lease_path(self.request.operation_id),
+            None if self.creation_authority.is_some() => Err(ValidationError::Io(
+                "Creation authority must be restored before lease access".into()).into()),
+            None => Ok(self.lease_path.clone()),
+        }
+    }
+
+    fn common_io_path(&self) -> Result<PathBuf, RepositoryError> {
+        match &self.live_creation {
+            Some(scope) => scope.common_operand(),
+            None if self.creation_authority.is_some() => Err(ValidationError::Io(
+                "Creation authority must be restored before common-directory access".into()).into()),
+            None => Ok(self.common_dir.clone()),
+        }
+    }
+
     /// Whether this creation made `removed`; see
     /// [`release_deleted_worktree_creations`].
     fn created(&self, removed: &RemovedWorktree) -> bool {
@@ -10788,6 +13345,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         repository: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != repository { return Err(ValidationError::InvalidWorktree(repository.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.stable_common_metadata_path().to_owned());
+        }
         let output = self.run_checked(
             &self.git_read(
                 repository,
@@ -10796,7 +13358,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         Ok(
-            fs::canonicalize(parse_path_line(&output.stdout, "common_dir")?)
+            fs::canonicalize(self.captured_worktree_path(&parse_path_line(&output.stdout, "common_dir")?)?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?,
         )
     }
@@ -10808,6 +13370,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != worktree { return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.stable_private_metadata_path().to_owned());
+        }
         let output = self.run_checked(
             &self.git_read(
                 worktree,
@@ -10816,7 +13383,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         Ok(
-            fs::canonicalize(parse_path_line(&output.stdout, "git_dir")?)
+            fs::canonicalize(self.captured_worktree_path(&parse_path_line(&output.stdout, "git_dir")?)?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?,
         )
     }
@@ -10832,6 +13399,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         generation: u64,
         cancellation: &CancellationToken,
         progress: &async_channel::Sender<WorktreeProgressEvent>,
+    ) -> WorktreeOperationReport {
+        if let Some(authority) = &self.authority {
+            let captured = creation_authority::CreationSession::capture(authority, request);
+            match captured.and_then(|(scope, evidence)| {
+                self.journal_source_service(scope.clone()).map(|service| (service, scope, evidence))
+            }) {
+                Ok((service, scope, evidence)) => return service.create_worktree_journaled_inner(
+                    store, request, generation, cancellation, progress, Some((scope, evidence))),
+                Err(error) => {
+                    for stage in [WorktreeProgressStage::Validating, WorktreeProgressStage::Finished] {
+                        let _ = progress.try_send(WorktreeProgressEvent {
+                            operation_id: request.operation_id, generation, stage,
+                        });
+                    }
+                    return WorktreeOperationReport {
+                        operation_id: request.operation_id, generation, request: Some(request.clone()),
+                        state: WorktreeOperationState::MalformedPayload, outcome: None,
+                        detail: format!("The captured creation authority is unavailable; no creation was started: {error}"),
+                        created_at_unix_ms: operation_timestamp(),
+                    };
+                }
+            }
+        }
+        self.create_worktree_journaled_inner(store, request, generation, cancellation, progress, None)
+    }
+
+    #[cfg(feature = "ui")]
+    fn create_worktree_journaled_inner(
+        &self, store: &StateStore, request: &CreateWorktreeRequest, generation: u64,
+        cancellation: &CancellationToken, progress: &async_channel::Sender<WorktreeProgressEvent>,
+        captured: Option<(Arc<creation_authority::CreationSession>, creation_authority::CreationEvidence)>,
     ) -> WorktreeOperationReport {
         let created_at = operation_timestamp();
         let emit = |stage| {
@@ -10872,6 +13470,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return failure_report(WorktreeOperationState::MalformedPayload, error.to_string());
             }
         };
+        if let Some((scope, evidence)) = captured {
+            journal.creation_authority = Some(evidence);
+            journal.live_creation = Some(scope);
+        }
         let mut payload = match serde_json::to_value(&journal) {
             Ok(payload) => payload,
             Err(error) => {
@@ -10899,7 +13501,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return failure_report(state, error.to_string());
         }
         // From this commit onward every effect is recoverable through this row.
-        let lease = match worktree_lease(&journal.lease_path, true) {
+        let lease_path = match journal.lease_io_path() {
+            Ok(path) => path,
+            Err(error) => {
+                journal.state = WorktreeOperationState::OutcomeUnknown;
+                journal.detail = format!("Creation authority changed before lease acquisition: {error}");
+                return finish_worktree_journal(store, &journal, &payload, created_at, &emit);
+            }
+        };
+        let lease = match worktree_lease(&lease_path, true) {
             Ok(lease) => lease,
             Err(error) => {
                 journal.state = WorktreeOperationState::OutcomeUnknown;
@@ -11071,7 +13681,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
-            if git_locks_present(&journal.common_dir)
+            if git_locks_present(&journal.common_io_path()?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?
             {
                 return Err(ValidationError::Io(
@@ -11079,8 +13689,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
-            fs::create_dir_all(&journal.request.managed_root)
-                .map_err(|e| ValidationError::Io(e.to_string()))?;
+            if let Some(scope) = &journal.live_creation {
+                scope.ensure_managed_root()?;
+            } else {
+                fs::create_dir_all(&journal.request.managed_root)
+                    .map_err(|e| ValidationError::Io(e.to_string()))?;
+            }
             let plan = self.plan_worktree_creation(&journal.request)?;
             self.run_checked(&plan.validate_branch, cancellation)?;
             let branch = self.run(&plan.check_branch_absent, cancellation)?;
@@ -11113,9 +13727,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 }
                 self.create_worktree_command(&journal.request, &oid)?
             };
+            if let Some(scope) = journal.live_creation.clone() {
+                let published = scope.publish(journal.creation_authority.as_mut()
+                    .ok_or_else(|| ValidationError::Io("Missing durable creation authority".into()))?);
+                // Even if final name validation refused after publication,
+                // retain every known directory identity before returning.
+                journal.persist(store, &payload).map(|next| payload = next).map_err(|error| {
+                    journal_write_failed = true;
+                    ValidationError::Io(format!("journal write failed: {error}"))
+                })?;
+                published?;
+                let position = command.arguments.len().checked_sub(2)
+                    .ok_or(ValidationError::DestinationOutsideRoot)?;
+                command = scope.bind_destination_operand(command, position)?;
+            }
             command.inherited_lease = Some(lease.as_raw_fd());
             emit(WorktreeProgressStage::RunningGit);
             self.run_checked(&command, cancellation)?;
+            if let Some(scope) = journal.live_creation.clone() {
+                let registered = self.list_worktrees(&journal.request.repository, cancellation)?
+                    .into_iter().find(|record| record.path == journal.request.destination)
+                    .ok_or_else(|| ValidationError::Io("Git did not register the owned destination".into()))?;
+                journal.live_created = Some(scope.bind_created(
+                    journal.creation_authority.as_mut().ok_or_else(|| ValidationError::Io("Missing creation authority".into()))?,
+                    &journal.request, &registered, &oid)?);
+            }
             if journal
                 .existing_branch_oid
                 .as_ref()
@@ -11213,6 +13849,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 cancellation,
             )?
             .map(|oid| oid.to_string());
+        if self.authority.is_some() && existing_branch_oid.is_some()
+            && !(matches!(&request.base, BaseRevision::LocalBranch(branch) if branch == &request.branch)
+                && !request.track)
+        {
+            return Err(ValidationError::InvalidBranch(
+                "Captured worktree creation cannot yet advance an existing branch; choose an unused branch or reconcile the existing branch explicitly. No fetch or creation was started".into()
+            ).into());
+        }
         Ok(WorktreeJournal {
             version: 1,
             request,
@@ -11226,6 +13870,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             base_oid: None,
             existing_branch_oid,
             admin_dir: None,
+            creation_authority: None,
+            live_creation: None,
+            live_created: None,
             outcome: None,
             warnings: Vec::new(),
             detail: "Prepared durable worktree request".into(),
@@ -11233,8 +13880,34 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 
     fn settle_worktree_journal(&self, journal: &mut WorktreeJournal, lease_grace: Duration) {
+        if journal.creation_authority.is_some() {
+            let scoped = journal.restore_creation_authority().and_then(|()| {
+                self.journal_source_service(journal.live_creation.clone().expect("authority restored"))
+            });
+            match scoped {
+                Ok(service) => service.settle_worktree_journal_inner(journal, lease_grace),
+                Err(error) => {
+                    journal.outcome = None;
+                    journal.state = WorktreeOperationState::OutcomeUnknown;
+                    journal.detail = format!("The original creation authority is unavailable; no replacement was authorized: {error}");
+                }
+            }
+        } else {
+            self.settle_worktree_journal_inner(journal, lease_grace);
+        }
+    }
+
+    fn settle_worktree_journal_inner(&self, journal: &mut WorktreeJournal, lease_grace: Duration) {
         journal.outcome = None;
-        let evidence = worktree_lease_with_grace(&journal.lease_path, false, lease_grace);
+        let lease_path = match journal.lease_io_path() {
+            Ok(path) => path,
+            Err(error) => {
+                journal.state = WorktreeOperationState::OutcomeUnknown;
+                journal.detail = format!("Creation lease authority is unavailable: {error}");
+                return;
+            }
+        };
+        let evidence = worktree_lease_with_grace(&lease_path, false, lease_grace);
         let _lease = match evidence {
             Ok(lease) => {
                 if journal.lease_identity.is_some()
@@ -11258,7 +13931,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return;
             }
         };
-        match git_locks_present(&journal.common_dir) {
+        let common_io = match journal.common_io_path() {
+            Ok(path) => path,
+            Err(error) => {
+                journal.state = WorktreeOperationState::OutcomeUnknown;
+                journal.detail = format!("Creation metadata authority is unavailable: {error}");
+                return;
+            }
+        };
+        match git_locks_present(&common_io) {
             Ok(false) => {}
             result => {
                 journal.state = WorktreeOperationState::OutcomeUnknown;
@@ -11370,7 +14051,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// The created worktree's administrative directory, when the destination
     /// is evidently the worktree this journal created.
-    fn created_admin_dir(&self, journal: &WorktreeJournal) -> Option<PathBuf> {
+    fn created_admin_dir(&self, journal: &mut WorktreeJournal) -> Option<PathBuf> {
+        if journal.creation_authority.is_some() {
+            return self.created_journal_roots(journal).map(|(path, _, _)| path);
+        }
         let token = CancellationToken::new();
         let destination = &journal.request.destination;
         if fs::canonicalize(destination).ok().as_ref() != Some(destination) {
@@ -11414,11 +14098,42 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         clean.then_some(git_dir)
     }
 
+    /// Supplies the original roots to generation/setup/Linear settlement too;
+    /// no caller should rediscover new authority from the destination path.
+    fn created_journal_roots(&self, journal: &mut WorktreeJournal)
+        -> Option<(PathBuf, fs_safety::Root, fs_safety::Root)>
+    {
+        journal.restore_creation_authority().ok()?;
+        let scope = journal.live_creation.clone()?;
+        let registered = self.list_worktrees(&journal.request.repository, &CancellationToken::new()).ok()?
+            .into_iter().find(|record| record.path == journal.request.destination)?;
+        let created = scope.bind_created(journal.creation_authority.as_mut()?, &journal.request,
+            &registered, journal.base_oid.as_deref()?) .ok()?;
+        let (admin, checkout) = created.roots().ok()?;
+        if !journal.checkout_completed {
+            if !fs_safety::metadata_beneath(&admin, Path::new("index")).ok()?.is_file() {
+                return None;
+            }
+            let service = self.created_worktree_service(created.clone()).ok()?;
+            let output = service.run_checked(&service.git_read(&journal.request.destination,
+                ["status", "--porcelain=v2", "-z", "--untracked-files=all"]),
+                &CancellationToken::new()).ok()?;
+            if !output.stdout.is_empty() || output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                return None;
+            }
+        }
+        created.validate().ok()?;
+        let path = created.admin_path().to_owned();
+        journal.live_created = Some(created);
+        Some((path, admin, checkout))
+    }
+
     /// Only the original live request may clean up its own Git lock. Startup
     /// reconciliation deliberately never calls this mutating helper.
     fn unlock_created_worktree(&self, journal: &mut WorktreeJournal) {
         let cleanup = (|| -> Result<(), RepositoryError> {
-            let lease = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE)
+            let lease_path = journal.lease_io_path()?;
+            let lease = worktree_lease_with_grace(&lease_path, false, CLEANUP_GRACE)
                 .map_err(|error| ValidationError::Io(error.to_string()))?;
             if lease_file_identity(&lease).ok() != journal.lease_identity {
                 return Err(ValidationError::Io(
@@ -11450,6 +14165,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     journal.request.destination.as_os_str().to_owned(),
                 ],
             );
+            if let Some(scope) = &journal.live_creation {
+                let position = unlock.arguments.len().checked_sub(1)
+                    .ok_or(ValidationError::DestinationOutsideRoot)?;
+                unlock = scope.bind_destination_operand(unlock, position)?;
+            }
             unlock.inherited_lease = Some(lease.as_raw_fd());
             self.run_checked(&unlock, &CancellationToken::new())?;
             if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome {
@@ -11794,6 +14514,258 @@ mod worktree_journal_tests {
                 cancellation,
                 &sender,
             )
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_creation_settles_the_owned_child_and_persists_stable_authority() {
+        for existing in [false, true] {
+            let mut fixture = Fixture::new();
+            if existing {
+                fixture.git(&["branch", "feature", "main"]);
+                fixture.request.base = BaseRevision::LocalBranch(fixture.request.branch.clone());
+            }
+            let authority = WorktreeAuthority::capture(&fixture.request.repository).unwrap();
+            let scoped = fixture.service.with_worktree_authority(authority).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(),
+                b"committed content\n");
+            let journal = fixture.journal(fixture.request.operation_id);
+            assert!(serde_json::to_value(journal.creation_authority.as_ref().unwrap()).unwrap()["admin"].is_object());
+            let serialized = serde_json::to_string(&journal).unwrap();
+            assert!(!serialized.contains("/proc/"), "descriptor IO paths must not survive a restart");
+            assert!(!serialized.contains("/dev/fd/"));
+            assert_eq!(journal.common_dir, fixture.request.repository.join(".git"));
+            assert_eq!(journal.lease_path.parent(), Some(journal.common_dir.as_path()));
+            assert!(journal.live_creation.is_none(), "deserialization never invents a live scope");
+            let recovered = RepositoryService::system("git")
+                .rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, WorktreeOperationState::Created);
+            assert_eq!(fixture.git(&["rev-parse", "feature"]), fixture.git(&["rev-parse", "main"]));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_publication_failure_preserves_known_identity_for_restart() {
+        let fixture = Fixture::new();
+        let scoped = fixture.service.with_worktree_authority(
+            WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+        let (sender, _) = async_channel::bounded(8);
+        creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true));
+        let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+            7, &CancellationToken::new(), &sender);
+        creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(false));
+        assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{report:?}");
+        assert!(fixture.request.destination.is_dir());
+        assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none());
+        let mut journal = fixture.journal(fixture.request.operation_id);
+        let payload = serde_json::to_value(&journal).unwrap();
+        assert!(payload["creation_authority"]["checkout"].is_object());
+        assert!(payload["creation_authority"]["parent"].is_object());
+        assert!(journal.live_creation.is_none());
+        // Reconstruct only the originally published inode, never infer its
+        // ownership merely from the now-existing destination pathname.
+        journal.restore_creation_authority().unwrap();
+        let scope = journal.live_creation.as_ref().unwrap();
+        assert!(scope.has_destination());
+        let command = scope.bind_destination_operand(CommandSpec::new("git")
+            .arg(&fixture.request.destination), 0).unwrap();
+        let held = fs::metadata(Path::new(&command.arguments[0])).unwrap();
+        let named = fs::metadata(&fixture.request.destination).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+        let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+        assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown);
+        let mut replacement_journal = fixture.journal(fixture.request.operation_id);
+        fs::rename(&fixture.request.destination, fixture.directory.path().join("original-child")).unwrap();
+        fs::create_dir(&fixture.request.destination).unwrap();
+        fs::write(fixture.request.destination.join("keep"), b"foreign\n").unwrap();
+        assert!(replacement_journal.restore_creation_authority().is_err());
+        assert_eq!(fs::read(fixture.request.destination.join("keep")).unwrap(), b"foreign\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_existing_branch_advance_refuses_before_journal_or_directory_effects() {
+        let fixture = Fixture::new();
+        fixture.git(&["branch", "feature", "main"]);
+        let authority = WorktreeAuthority::capture(&fixture.request.repository).unwrap();
+        let scoped = fixture.service.with_worktree_authority(authority).unwrap();
+        let before = fixture.git(&["rev-parse", "feature"]);
+        let (sender, _) = async_channel::bounded(8);
+        let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+            7, &CancellationToken::new(), &sender);
+        assert_eq!(report.state, WorktreeOperationState::MalformedPayload, "{report:?}");
+        assert!(report.detail.contains("cannot yet advance an existing branch"));
+        assert!(!fixture.request.managed_root.exists());
+        assert!(fixture.store.journaled_worktree_operations().unwrap().is_empty());
+        assert_eq!(fixture.git(&["rev-parse", "feature"]), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReplaceAtCreation {
+        target: PathBuf,
+        parked: PathBuf,
+        destination: PathBuf,
+        seen: AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcessExecutor for ReplaceAtCreation {
+        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
+            -> Result<ProcessOutput, ProcessFailure>
+        {
+            if command.arguments.windows(2).any(|pair| pair[0] == "worktree" && pair[1] == "add")
+                && !self.seen.swap(true, Ordering::SeqCst)
+            {
+                // This is the innermost executor: all authority wrappers have
+                // already validated and issued the actual delayed command.
+                fs::rename(&self.target, &self.parked).unwrap();
+                fs::create_dir_all(&self.destination).unwrap();
+                fs::write(self.destination.join("foreign"), b"replacement work\n").unwrap();
+            }
+            SystemProcessExecutor.execute(command, token)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_creation_launch_delay_never_writes_replacement_directories() {
+        for replacement in ["source", "parent", "destination"] {
+            let fixture = Fixture::new();
+            let target = match replacement {
+                "source" => fixture.request.repository.clone(),
+                "parent" => fixture.request.managed_root.clone(),
+                _ => fixture.request.destination.clone(),
+            };
+            let parked = fixture.directory.path().join(format!("parked-{replacement}"));
+            let replacement_destination = if replacement == "source" { target.clone() }
+                else { fixture.request.destination.clone() };
+            let executor = Arc::new(ReplaceAtCreation { target, parked: parked.clone(),
+                destination: replacement_destination.clone(), seen: AtomicBool::new(false) });
+            let service = RepositoryService::new("git", executor.clone());
+            let scoped = service.with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert!(executor.seen.load(Ordering::SeqCst), "the test must reach the delayed Git effect");
+            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{replacement}: {report:?}");
+            assert_eq!(fs::read(replacement_destination.join("foreign")).unwrap(), b"replacement work\n");
+            assert!(!replacement_destination.join("tracked.txt").exists());
+            assert!(!replacement_destination.join(".git").exists());
+            let original = match replacement {
+                "parent" => parked.join("feature"),
+                "destination" => parked,
+                _ => fixture.request.destination.clone(),
+            };
+            assert_eq!(fs::read(original.join("tracked.txt")).unwrap(), b"committed content\n",
+                "the command must address only its retained destination");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AlterCreatedMetadata {
+        destination: PathBuf,
+        foreign: PathBuf,
+        alteration: &'static str,
+        seen: AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcessExecutor for AlterCreatedMetadata {
+        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
+            -> Result<ProcessOutput, ProcessFailure>
+        {
+            let output = SystemProcessExecutor.execute(command, token)?;
+            if output.success && command.arguments.windows(2)
+                .any(|pair| pair[0] == "worktree" && pair[1] == "add")
+                && !self.seen.swap(true, Ordering::SeqCst)
+            {
+                let locator = fs::read(self.destination.join(".git")).unwrap();
+                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                match self.alteration {
+                    "locator" => {
+                        fs::write(self.destination.join(".git"),
+                            format!("gitdir: {}\n", self.foreign.display())).unwrap();
+                    }
+                    "admin" => {
+                        fs::rename(&admin, admin.with_extension("original")).unwrap();
+                        fs::create_dir(&admin).unwrap();
+                        fs::write(admin.join("foreign"), b"foreign admin\n").unwrap();
+                    }
+                    "backlink" => fs::write(admin.join("gitdir"),
+                        format!("{}\n", self.foreign.join(".git").display())).unwrap(),
+                    "commondir" => fs::write(admin.join("commondir"),
+                        format!("{}\n", self.foreign.display())).unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_creation_never_grants_child_authority_after_metadata_substitution() {
+        for alteration in ["locator", "admin", "backlink", "commondir"] {
+            let fixture = Fixture::new();
+            let foreign = fixture.directory.path().join("foreign-metadata");
+            fs::create_dir(&foreign).unwrap();
+            fs::write(foreign.join("keep"), b"unrelated metadata\n").unwrap();
+            let executor = Arc::new(AlterCreatedMetadata { destination: fixture.request.destination.clone(),
+                foreign: foreign.clone(), alteration, seen: AtomicBool::new(false) });
+            let scoped = RepositoryService::new("git", executor.clone())
+                .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert!(executor.seen.load(Ordering::SeqCst));
+            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{alteration}: {report:?}");
+            assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"unrelated metadata\n");
+            assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1,
+                "no destination command may rediscover or modify substituted metadata");
+            if alteration == "admin" {
+                let locator = fs::read(fixture.request.destination.join(".git")).unwrap();
+                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                assert_eq!(fs::read(admin.join("foreign")).unwrap(), b"foreign admin\n");
+                assert_eq!(fs::read_dir(admin).unwrap().count(), 1);
+            }
+            let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown, "{alteration}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_cancellation_distinguishes_published_empty_child_from_completed_checkout() {
+        for after_exit in [false, true] {
+            let fixture = Fixture::new();
+            let token = CancellationToken::new();
+            let scoped = RepositoryService::new("git", Arc::new(CancelAtGit { after_exit }))
+                .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &token, &sender);
+            assert!(token.is_cancelled());
+            let expected = if after_exit { WorktreeOperationState::Created }
+                else { WorktreeOperationState::OutcomeUnknown };
+            assert_eq!(report.state, expected, "{after_exit}: {report:?}");
+            assert!(fixture.journal(fixture.request.operation_id).creation_authority
+                .as_ref().unwrap().has_published_destination());
+            let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, expected);
+            if after_exit {
+                assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(), b"committed content\n");
+            } else {
+                assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none(),
+                    "a published directory is a known partial effect, never a rollback claim");
+            }
         }
     }
 

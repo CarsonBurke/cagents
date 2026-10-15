@@ -103,7 +103,11 @@ pub trait EditBuffer {
 
 #[derive(Debug, Clone)]
 struct Transaction {
+    before_revision: u64,
+    after_revision: u64,
     changes: Vec<TextChange>,
+    /// File existence changes independently of text (an empty file is not absent).
+    presence: Option<((bool, u64), (bool, u64))>,
     /// The caret before the first change, restored by undo.
     before: Cursor,
     /// The caret after the last change, restored by redo.
@@ -136,6 +140,8 @@ pub enum Replay {
 /// One document's undo and redo stacks.
 #[derive(Debug)]
 pub struct History {
+    revision: u64,
+    next_revision: u64,
     undo: VecDeque<Transaction>,
     redo: Vec<Transaction>,
     /// Whether the newest undo step may still absorb the next keystroke.
@@ -153,8 +159,12 @@ impl Default for History {
 }
 
 impl History {
+    pub(crate) fn retained_bytes(&self) -> usize { self.bytes }
+
     fn with_limits(max_transactions: usize, max_bytes: usize) -> Self {
         Self {
+            revision: 0,
+            next_revision: 1,
             undo: VecDeque::new(),
             redo: Vec::new(),
             open: false,
@@ -162,6 +172,40 @@ impl History {
             max_transactions: max_transactions.max(1),
             max_bytes,
         }
+    }
+
+    /// Identifies this exact point in the undo graph, independent of stack
+    /// length, pruning and coalescing. Saving seals the active transaction.
+    pub fn revision(&self) -> u64 { self.revision }
+
+    /// Reserves an identity for an external disk baseline without claiming
+    /// that the current buffer or any existing undo state contains its bytes.
+    /// The caller may adopt it only after verifying the corresponding text.
+    pub fn reserve_revision(&mut self) -> u64 {
+        let reserved = self.next_revision;
+        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        reserved
+    }
+
+    fn advance_revision(&mut self) -> (u64, u64) {
+        let before = self.revision;
+        self.revision = self.reserve_revision();
+        (before, self.revision)
+    }
+
+    /// The caller verified that the current bytes equal a known prior state
+    /// (for example Discard edits restored the saved contents).
+    pub fn adopt_revision(&mut self, known: u64) {
+        if let Some(transaction) = self.undo.back_mut()
+            && transaction.after_revision == self.revision {
+            transaction.after_revision = known;
+        }
+        if let Some(transaction) = self.redo.last_mut()
+            && transaction.before_revision == self.revision {
+            transaction.before_revision = known;
+        }
+        self.revision = known;
+        self.seal();
     }
 
     pub fn can_undo(&self) -> bool {
@@ -183,6 +227,7 @@ impl History {
 
     /// Forgets everything.
     pub fn clear(&mut self) {
+        self.advance_revision();
         self.undo.clear();
         self.redo.clear();
         self.open = false;
@@ -204,12 +249,14 @@ impl History {
         now: Instant,
     ) {
         self.drop_redo();
+        let (before_revision, after_revision) = self.advance_revision();
         if self.open
             && let Some(last) = self.undo.back_mut()
         {
             let previous_bytes = last.bytes();
             if coalesce(last, &change, kind, now) {
                 self.bytes = self.bytes - previous_bytes + last.bytes();
+                last.after_revision = after_revision;
                 last.after = after;
                 last.last_edit = now;
                 self.enforce_limits();
@@ -218,8 +265,11 @@ impl History {
         }
         self.push(
             Transaction {
+                before_revision,
+                after_revision,
                 before,
                 changes: vec![change],
+                presence: None,
                 after,
                 kind,
                 last_edit: now,
@@ -241,13 +291,50 @@ impl History {
         after: Cursor,
         now: Instant,
     ) {
-        if changes.is_empty() {
+        self.record_group_with_presence(changes, before, after, now, None);
+    }
+
+    /// Records text and file existence as a single native Undo step. A pure
+    /// existence change still earns a transaction when the text is unchanged.
+    pub fn record_group_with_presence(
+        &mut self,
+        changes: Vec<TextChange>,
+        before: Cursor,
+        after: Cursor,
+        now: Instant,
+        presence: Option<(bool, bool)>,
+    ) {
+        self.record_group_with_presence_identities(
+            changes,
+            before,
+            after,
+            now,
+            presence.map(|(before, after)| ((before, 0), (after, 0))),
+        );
+    }
+
+    /// Existence history also owns the immutable restoration lineage. Text and
+    /// metadata intentions can change independently, including empty files.
+    pub fn record_group_with_presence_identities(
+        &mut self,
+        changes: Vec<TextChange>,
+        before: Cursor,
+        after: Cursor,
+        now: Instant,
+        presence: Option<((bool, u64), (bool, u64))>,
+    ) {
+        let presence = presence.filter(|(before, after)| before != after);
+        if changes.is_empty() && presence.is_none() {
             return;
         }
         self.drop_redo();
+        let (before_revision, after_revision) = self.advance_revision();
         self.push(
             Transaction {
+                before_revision,
+                after_revision,
                 changes,
+                presence,
                 before,
                 after,
                 kind: EditKind::Other,
@@ -255,6 +342,48 @@ impl History {
             },
             false,
         );
+    }
+
+    /// Attach existence to an edit which recreates an intentionally absent
+    /// document. Subsequent typing can still coalesce into that same gesture.
+    pub fn record_latest_presence(&mut self, before: bool, after: bool) {
+        self.record_latest_presence_identity((before, 0), (after, 0));
+    }
+
+    pub fn record_latest_presence_identity(&mut self, before: (bool, u64), after: (bool, u64)) {
+        if let Some(transaction) = self.undo.back_mut() {
+            let original = transaction.presence.map_or(before, |(before, _)| before);
+            transaction.presence = (original != after).then_some((original, after));
+        }
+    }
+
+    /// Expected and resulting existence for the next replay. Install only
+    /// after replay answers Applied.
+    pub fn replay_presence(&self, redo: bool) -> Option<(bool, bool)> {
+        self.replay_presence_identity(redo)
+            .map(|(before, after)| (before.0, after.0))
+    }
+
+    pub fn replay_presence_identity(&self, redo: bool) -> Option<((bool, u64), (bool, u64))> {
+        let presence = if redo {
+            self.redo.last()
+        } else {
+            self.undo.back()
+        }?
+        .presence?;
+        Some(if redo {
+            presence
+        } else {
+            (presence.1, presence.0)
+        })
+    }
+
+    pub fn retained_presence_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.undo
+            .iter()
+            .chain(self.redo.iter())
+            .filter_map(|transaction| transaction.presence)
+            .flat_map(|(before, after)| [before.1, after.1])
     }
 
     /// Reverts the newest step and restores the caret it started from.
@@ -275,6 +404,7 @@ impl History {
             }
         }
         buffer.set_cursor(transaction.before);
+        self.revision = transaction.before_revision;
         self.redo.push(transaction);
         Replay::Applied
     }
@@ -297,6 +427,7 @@ impl History {
             }
         }
         buffer.set_cursor(transaction.after);
+        self.revision = transaction.after_revision;
         self.undo.push_back(transaction);
         Replay::Applied
     }
@@ -556,6 +687,16 @@ impl Excerpt {
             .collect()
     }
 
+    /// Captures exactly one explicit server range while retaining the native
+    /// removed line boundaries. Every position must lie in this excerpt.
+    pub fn range_change(&self, start: Position, end: Position, replacement: &str) -> Option<TextChange> {
+        let (from, to) = (self.offset(start)?, self.offset(end)?);
+        let removed = self.text.get(from..to)?;
+        let inserted = Self::document(replacement);
+        Some(TextChange { start, removed: removed.to_owned(), inserted: replacement.to_owned(),
+            removed_breaks: self.slice_breaks(from, to), inserted_breaks: inserted.slice_breaks(0, replacement.len()) })
+    }
+
     /// The line an offset falls on, by index into `lines`.
     fn line_of(&self, offset: usize) -> usize {
         self.lines
@@ -704,6 +845,21 @@ mod tests {
         Position { line, column }
     }
 
+    #[test]
+    fn explicit_range_changes_preserve_adjacent_native_line_endings() {
+        let mut excerpt = Excerpt::new(10);
+        excerpt.push_line("a", "\n");
+        excerpt.push_line("", "\r");
+        excerpt.push_line("b", "");
+        let change = excerpt.range_change(at(10, 1), at(12, 0), "\r\n").unwrap();
+        assert_eq!(change.removed, "\n\r");
+        assert_eq!(change.removed_breaks, [1, 2]);
+        assert_eq!(change.inserted_breaks, [2]);
+        assert_eq!(change.removed_end(), at(12, 0));
+        assert_eq!(change.inserted_end(), at(11, 0));
+        assert!(excerpt.range_change(at(12, 1), at(10, 0), "").is_none());
+    }
+
     fn caret(line: usize, column: usize) -> Cursor {
         Cursor {
             position: at(line, column),
@@ -819,6 +975,103 @@ mod tests {
             steps += 1;
         }
         steps
+    }
+
+    #[test]
+    fn revisions_restore_saved_checkpoint_and_distinguish_branched_history() {
+        let mut history = History::default();
+        let mut model = Model::new("");
+        let now = Instant::now();
+        let initial = history.revision();
+        model.type_text(&mut history, "hello", now);
+        let saved = history.revision();
+        history.seal();
+        model.type_text(&mut history, "!", now);
+        let later = history.revision();
+        assert_ne!(saved, later);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(model.text, "hello");
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), later);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        model.type_text(&mut history, "?", now);
+        assert_ne!(history.revision(), later, "a branch cannot reuse a redo state identity");
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), initial);
+    }
+
+    #[test]
+    fn external_baseline_identity_does_not_alias_undo_or_future_edits() {
+        let mut history = History::default();
+        let mut model = Model::new("A");
+        let initial = history.revision();
+        let now = Instant::now();
+        model.edit(&mut history, 0, 1, "B", EditKind::Other, now);
+        let mine = history.revision();
+        let external = history.reserve_revision();
+        assert_eq!(history.revision(), mine, "Keep mine must retain the buffer's identity");
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "A");
+        assert_eq!(history.revision(), initial);
+        assert_ne!(history.revision(), external, "Undo to A is dirty against external disk C");
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "B");
+        assert_eq!(history.revision(), mine);
+        assert_ne!(history.revision(), external);
+        model.edit(&mut history, 0, 1, "C", EditKind::Other, now);
+        assert_ne!(history.revision(), external, "future edits cannot consume the reserved identity");
+        // A byte comparison now proves that this state equals disk C.
+        history.adopt_revision(external);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "B");
+        assert_ne!(history.revision(), external);
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "C");
+        assert_eq!(history.revision(), external);
+    }
+
+    #[test]
+    fn adopting_verified_saved_bytes_keeps_discard_and_undo_states_coherent() {
+        let mut history = History::default();
+        let mut model = Model::new("saved");
+        let saved = history.revision();
+        let now = Instant::now();
+        model.type_text(&mut history, "x", now);
+        let dirty = history.revision();
+        model.edit(&mut history, 0, 1, "", EditKind::Other, now);
+        assert_eq!(model.text, "saved");
+        history.adopt_revision(saved);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), dirty);
+        assert_eq!(model.text, "xsaved");
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(model.text, "saved");
+    }
+
+    #[test]
+    fn file_presence_only_revert_is_one_transaction_without_a_text_edit() {
+        let now = Instant::now();
+        let mut history = History::default();
+        let mut model = Model::new("");
+        history.record_group_with_presence(
+            vec![],
+            model.cursor,
+            model.cursor,
+            now,
+            Some((true, false)),
+        );
+        assert_eq!(history.replay_presence(false), Some((false, true)));
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert!(model.text.is_empty());
+        assert!(!history.can_undo());
+        assert_eq!(history.replay_presence(true), Some((true, false)));
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert!(model.text.is_empty());
     }
 
     #[test]

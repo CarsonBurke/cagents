@@ -11,6 +11,9 @@ pub(super) fn file_editor_id() -> widget::Id {
 
 /// Navigation presentation and device-owned row opening never need desktop Git or files.
 pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
+    if let SidebarAction::RunCommand { action, .. } = action {
+        return supports_sidebar_action(action);
+    }
     matches!(
         action,
         SidebarAction::ReorderMember { .. }
@@ -655,8 +658,7 @@ impl Cagents {
                         }
                         self.device_ui.panel = Panel::Files;
                         if linked {
-                            return iced::widget::operation::focus(file_editor_id())
-                                .map(cosmic::Action::App);
+                            return self.modal_focus(file_editor_id());
                         }
                     }
                     Ok(Reply::Text(text)) => {
@@ -909,6 +911,9 @@ impl Cagents {
         let action = |action| Message::Device(action);
         let button = |label: &str, value: Action| {
             let mut button = crate::ui_controls::button::secondary(label.to_owned());
+            if matches!(value, Action::Close) {
+                button = button.id(widget::Id::new("device.close"));
+            }
             if !state.busy {
                 button = button.on_press(action(value));
             }

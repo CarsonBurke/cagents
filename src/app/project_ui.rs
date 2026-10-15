@@ -12,12 +12,29 @@ struct AutomaticAttempt {
     at: Instant,
 }
 
+/// Independently stacked project confirmations. Feature additions extend this
+/// enum and the role-specific state/view/focus/dismiss helpers together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalRole {
+    WorktreeDelete,
+    ProjectRemove,
+}
+
+pub use super::modal_ui::Instance as ModalRequest;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModalTarget {
+    pub(super) role: ModalRole,
+    pub(super) request: ModalRequest,
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
     remove_dialog: Option<ProjectRemoval>,
+    next_safety_request: u64,
     /// A confirmed removal awaiting the daemon's shared-model answer.
     pub(super) removing: HashMap<PathBuf, Vec<PathBuf>>,
     /// Projects closed by the shared model but still settling their channels.
@@ -49,12 +66,46 @@ struct Deletion {
 }
 
 impl State {
+    fn next_modal_request(&mut self) -> u64 {
+        self.next_safety_request = self.next_safety_request.wrapping_add(1);
+        self.next_safety_request
+    }
+
+    pub(super) fn modal_target(&self, role: ModalRole) -> Option<ModalTarget> {
+        let request = match role {
+            ModalRole::WorktreeDelete => self.dialog.as_ref()?.request,
+            ModalRole::ProjectRemove => self.remove_dialog.as_ref()?.request,
+        };
+        Some(ModalTarget {
+            role,
+            request: ModalRequest::Counter(request),
+        })
+    }
+
     pub(super) fn is_reopening(&self, repository: &Path) -> bool {
         self.reopening.values().any(|path| path == repository)
     }
 
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.remove_dialog.is_some()
+        self.modal_roles().next().is_some()
+    }
+
+    pub(super) fn modal_roles(&self) -> impl Iterator<Item = ModalRole> {
+        [
+            self.dialog.as_ref().map(|_| ModalRole::WorktreeDelete),
+            self.remove_dialog
+                .as_ref()
+                .map(|_| ModalRole::ProjectRemove),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    pub(super) fn focus_target_for(&self, role: ModalRole) -> widget::Id {
+        widget::Id::new(match role {
+            ModalRole::WorktreeDelete => "dialog.project.close",
+            ModalRole::ProjectRemove => "dialog.project.remove.cancel",
+        })
     }
 
     fn running(&self) -> impl Iterator<Item = &Target> {
@@ -124,25 +175,17 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
-        if self.remove_dialog.is_some() {
-            return widget::Id::new("dialog.project.remove.confirm");
-        }
-        widget::Id::new(
-            if self
-                .dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.blocker.is_some())
-            {
-                "dialog.project.close"
-            } else {
-                "dialog.project.confirm"
-            },
-        )
+        self.focus_target_for(if self.remove_dialog.is_some() {
+            ModalRole::ProjectRemove
+        } else {
+            ModalRole::WorktreeDelete
+        })
     }
 }
 
 #[derive(Debug, Clone)]
 struct ProjectRemoval {
+    request: u64,
     project: ProjectId,
     repository: PathBuf,
     kind: ProjectKind,
@@ -154,6 +197,7 @@ struct ProjectRemoval {
 
 #[derive(Debug, Clone)]
 struct Dialog {
+    request: u64,
     target: Target,
     /// A pre-flight refusal: deletion cannot proceed, so the confirm button
     /// stays disabled until the user resolves it outside the dialog.
@@ -186,8 +230,8 @@ pub enum Action {
         command: ProjectCommand,
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
-    ConfirmDelete,
-    ConfirmRemove,
+    ConfirmDelete(u64),
+    ConfirmRemove(u64),
     RemovedProject {
         repository: PathBuf,
         result: Result<crate::workspace_model::WorkspaceModel, String>,
@@ -211,6 +255,7 @@ pub enum Action {
     },
     Finished(Result<(), String>),
     Dismiss,
+    DismissRole(ModalTarget),
 }
 
 impl Cagents {
@@ -815,7 +860,28 @@ impl Cagents {
         self.launch_editor(path, &editor_id)
     }
 
+    pub(super) fn open_file_in_editor_at(
+        &mut self,
+        path: PathBuf,
+        editor_id: String,
+        position: Option<(usize, usize)>,
+    ) -> Task<Message> {
+        if self.modal_is_open() {
+            return Task::none();
+        }
+        self.launch_editor_at(path, &editor_id, position)
+    }
+
     fn launch_editor(&mut self, path: PathBuf, editor_id: &str) -> Task<Message> {
+        self.launch_editor_at(path, editor_id, None)
+    }
+
+    fn launch_editor_at(
+        &mut self,
+        path: PathBuf,
+        editor_id: &str,
+        position: Option<(usize, usize)>,
+    ) -> Task<Message> {
         let Some(editor) = self
             .project_ui
             .editors
@@ -829,11 +895,12 @@ impl Cagents {
             return Task::none();
         };
         cosmic::task::future(async move {
-            let result =
-                tokio::task::spawn_blocking(move || crate::external_editor::launch(&editor, &path))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || {
+                crate::external_editor::launch_at(&editor, &path, position)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
             Message::ProjectUi(Action::Finished(result))
         })
     }
@@ -895,6 +962,33 @@ impl Cagents {
     }
 
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
+        let required_role = match action {
+            Action::ConfirmRemove(_) => Some(ModalRole::ProjectRemove),
+            Action::ConfirmDelete(_) => Some(ModalRole::WorktreeDelete),
+            Action::DismissRole(target) => Some(target.role),
+            _ => None,
+        };
+        if required_role
+            .is_some_and(|role| self.top_modal() != Some(modal_ui::Modal::Project(role)))
+        {
+            return Task::none();
+        }
+        let requested = match action {
+            Action::ConfirmRemove(request) => Some(ModalTarget {
+                role: ModalRole::ProjectRemove,
+                request: ModalRequest::Counter(request),
+            }),
+            Action::ConfirmDelete(request) => Some(ModalTarget {
+                role: ModalRole::WorktreeDelete,
+                request: ModalRequest::Counter(request),
+            }),
+            Action::DismissRole(target) => Some(target),
+            _ => None,
+        };
+        if requested.is_some_and(|target| self.project_ui.modal_target(target.role) != Some(target))
+        {
+            return Task::none();
+        }
         match action {
             Action::AwaitClosedProject(project, generation) => {
                 if self.project_ui.close_generation.get(&project) != Some(&generation) {
@@ -951,10 +1045,13 @@ impl Cagents {
                 Ok(editors) => {
                     let choices: Vec<_> =
                         editors.iter().map(|editor| editor.choice.clone()).collect();
-                    self.sidebar_model.external_editors = choices.clone();
+                    if self.sidebar_model.external_editors.as_ref() != choices.as_slice() {
+                        self.sidebar_model.external_editors = choices.into();
+                    }
                     for runtime in self.cards.values_mut() {
                         if let CardRuntime::Repository(runtime) = runtime {
-                            runtime.set_external_editors(choices.clone());
+                            runtime
+                                .set_external_editors(self.sidebar_model.external_editors.clone());
                         }
                     }
                     self.project_ui.editors = editors;
@@ -974,7 +1071,7 @@ impl Cagents {
                 worktree_id,
                 command,
             } => {
-                if self.modal_is_open() && !self.project_ui.modal_open() {
+                if self.modal_is_open() {
                     return Task::none();
                 }
                 let Some(target) = self.project_target(project_id, worktree_id) else {
@@ -1005,6 +1102,13 @@ impl Cagents {
                     return Task::none();
                 }
                 match command {
+                    ProjectCommand::MarkRead => {
+                        return worktree_id.map_or_else(Task::none, |worktree| {
+                            self.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+                                project_id, worktree,
+                            )))
+                        });
+                    }
                     ProjectCommand::CopyPath => {
                         return iced::clipboard::write(target.path.display().to_string());
                     }
@@ -1088,12 +1192,12 @@ impl Cagents {
                             .and_then(|id| self.project_ui.deletions.get(&id))
                             .and_then(|deletion| deletion.failure.clone());
                         self.project_ui.dialog = Some(Dialog {
+                            request: self.project_ui.next_modal_request(),
                             target,
                             blocker,
                             failure,
                         });
-                        return iced::widget::operation::focus(self.project_ui.focus_target())
-                            .map(cosmic::Action::App);
+                        return self.modal_focus(self.project_ui.focus_target());
                     }
                     ProjectCommand::Remove => {
                         let Some(project) = self.sidebar_model.project(project_id) else {
@@ -1107,6 +1211,7 @@ impl Cagents {
                         }
                         let worktrees = project_worktree_roots(project);
                         self.project_ui.remove_dialog = Some(ProjectRemoval {
+                            request: self.project_ui.next_modal_request(),
                             project: project_id,
                             repository: project.repository.clone(),
                             kind: project.kind,
@@ -1120,8 +1225,7 @@ impl Cagents {
                                 .count(),
                             project_sessions: ProjectSessionOwnership::default(),
                         });
-                        return iced::widget::operation::focus(self.project_ui.focus_target())
-                            .map(cosmic::Action::App);
+                        return self.modal_focus(self.project_ui.focus_target());
                     }
                     ProjectCommand::Reveal => {
                         self.project_ui.dialog = None;
@@ -1135,6 +1239,11 @@ impl Cagents {
                     }
                     ProjectCommand::NewChannel => {
                         self.project_ui.dialog = None;
+                        if worktree_id.is_some() {
+                            let select = self.select_worktree(target.path.clone(), false);
+                            let thread = self.new_native_thread_at(target.path);
+                            return Task::batch([select, thread]);
+                        }
                         return cosmic::task::message(Message::Sidebar(
                             SidebarAction::NewChannel { project_id },
                         ));
@@ -1172,24 +1281,14 @@ impl Cagents {
                     }
                 }
             }
+            Action::DismissRole(target) => return self.dismiss_project_modal(target.role),
             Action::Dismiss => {
-                self.project_ui.remove_dialog = None;
-                let dismissed = self.project_ui.dialog.take();
-                // Declining to run a failed deletion again is the answer to
-                // it, so its row stops asking.
-                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
-                    && self
-                        .project_ui
-                        .deletions
-                        .get(&id)
-                        .is_some_and(|deletion| deletion.failure.is_some())
-                {
-                    self.project_ui.deletions.remove(&id);
-                    self.sync_worktree_operation_rows();
-                }
-                return self.project_dialog_closed();
+                return match self.top_modal() {
+                    Some(modal_ui::Modal::Project(role)) => self.dismiss_project_modal(role),
+                    _ => Task::none(),
+                };
             }
-            Action::ConfirmRemove => {
+            Action::ConfirmRemove(_) => {
                 let Some(mut removal) = self.project_ui.remove_dialog.take() else {
                     return Task::none();
                 };
@@ -1262,7 +1361,7 @@ impl Cagents {
                     )));
                 }
             },
-            Action::ConfirmDelete => {
+            Action::ConfirmDelete(_) => {
                 let Some(dialog) = &self.project_ui.dialog else {
                     return Task::none();
                 };
@@ -1345,6 +1444,7 @@ impl Cagents {
                     return Task::batch([sweep, self.attach_next_restored_agent()]);
                 }
                 Ok(()) => {
+                    self.lsp.remove_worktree(&target.path);
                     if let Some(id) = target.worktree {
                         self.project_ui.deletions.remove(&id);
                     }
@@ -1581,7 +1681,7 @@ impl Cagents {
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
         });
         Task::batch([
-            iced::widget::operation::focus(focus).map(cosmic::Action::App),
+            self.modal_restore_focus(focus),
             self.lifecycle_sweep(),
             self.sync_chrome(),
         ])
@@ -1718,8 +1818,32 @@ impl Cagents {
         ))
     }
 
-    pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
-        if let Some(removal) = &self.project_ui.remove_dialog {
+    pub(super) fn dismiss_project_modal(&mut self, role: ModalRole) -> Task<Message> {
+        match role {
+            ModalRole::ProjectRemove => {
+                self.project_ui.remove_dialog = None;
+            }
+            ModalRole::WorktreeDelete => {
+                let dismissed = self.project_ui.dialog.take();
+                // Declining a failed deletion clears only that row's retry.
+                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
+                    && self
+                        .project_ui
+                        .deletions
+                        .get(&id)
+                        .is_some_and(|deletion| deletion.failure.is_some())
+                {
+                    self.project_ui.deletions.remove(&id);
+                    self.sync_worktree_operation_rows();
+                }
+            }
+        }
+        self.project_dialog_closed()
+    }
+
+    pub(super) fn project_dialog_view_for(&self, role: ModalRole) -> Option<Element<'_, Message>> {
+        if role == ModalRole::ProjectRemove {
+            let removal = self.project_ui.remove_dialog.as_ref()?;
             let detail = if removal.channels == 0 {
                 "No channels are attached to this project.".to_owned()
             } else {
@@ -1741,10 +1865,11 @@ impl Cagents {
                     }),
                     super::dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Cancel")
-                            .on_press(Message::ProjectUi(Action::Dismiss)),
+                            .id(widget::Id::new("dialog.project.remove.cancel"))
+                            .on_press(Message::ProjectUi(Action::DismissRole(self.project_ui.modal_target(ModalRole::ProjectRemove)?))),
                         crate::ui_controls::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
-                            .on_press(Message::ProjectUi(Action::ConfirmRemove)),
+                            .on_press(Message::ProjectUi(Action::ConfirmRemove(removal.request))),
                     ),
                 ])
                 .spacing(space::M),
@@ -1778,11 +1903,13 @@ impl Cagents {
         let confirm = dialog
             .blocker
             .is_none()
-            .then_some(Message::ProjectUi(Action::ConfirmDelete));
+            .then_some(Message::ProjectUi(Action::ConfirmDelete(dialog.request)));
         rows.push(super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.project.close"))
-                .on_press(Message::ProjectUi(Action::Dismiss)),
+                .on_press(Message::ProjectUi(Action::DismissRole(
+                    self.project_ui.modal_target(ModalRole::WorktreeDelete)?,
+                ))),
             crate::ui_controls::button::destructive(if dialog.failure.is_some() {
                 "Retry delete"
             } else {
@@ -2297,6 +2424,167 @@ mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
 
+    #[test]
+    fn project_modal_roles_cancel_only_the_top_payload_and_block_hidden_confirmation() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let target = Target {
+            project,
+            worktree: None,
+            repository: "/repo".into(),
+            path: "/repo/linked".into(),
+            label: "linked".into(),
+        };
+        app.project_ui.dialog = Some(Dialog {
+            request: 1,
+            target,
+            blocker: None,
+            failure: None,
+        });
+        app.project_ui.remove_dialog = Some(ProjectRemoval {
+            request: 2,
+            project,
+            repository: "/repo".into(),
+            kind: ProjectKind::Git,
+            name: "repo".into(),
+            worktrees: Vec::new(),
+            channels: 0,
+            project_sessions: ProjectSessionOwnership::default(),
+        });
+        let _ = app.finish_modal_update(Task::none());
+        assert_eq!(
+            app.top_modal(),
+            Some(modal_ui::Modal::Project(ModalRole::ProjectRemove))
+        );
+        assert!(
+            app.project_dialog_view_for(ModalRole::ProjectRemove)
+                .is_some()
+        );
+        let _ = app.handle_project_action(Action::ConfirmDelete(
+            app.project_ui.dialog.as_ref().unwrap().request,
+        ));
+        let _ = app.handle_project_action(Action::DismissRole(
+            app.project_ui
+                .modal_target(ModalRole::WorktreeDelete)
+                .unwrap(),
+        ));
+        assert!(
+            app.project_ui.remove_dialog.is_some(),
+            "a stale lower Cancel cannot dismiss the newer dialog"
+        );
+        assert!(
+            app.project_ui.dialog.is_some(),
+            "a hidden delete confirmation cannot run"
+        );
+        let _ = app.handle_project_action(Action::Dismiss);
+        let _ = app.finish_modal_update(Task::none());
+        assert!(app.project_ui.remove_dialog.is_none());
+        assert!(
+            app.project_ui.dialog.is_some(),
+            "cancel keeps the underlying dialog"
+        );
+        assert_eq!(
+            app.top_modal(),
+            Some(modal_ui::Modal::Project(ModalRole::WorktreeDelete))
+        );
+        assert!(
+            app.project_dialog_view_for(ModalRole::WorktreeDelete)
+                .is_some()
+        );
+        let _ = app.handle_project_action(Action::Dismiss);
+        assert!(!app.project_ui.modal_open());
+    }
+
+    #[test]
+    fn replacing_a_project_removal_rejects_old_buttons_and_focus_operations() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.project_ui.remove_dialog = Some(ProjectRemoval {
+            request: 10,
+            project: ProjectId::new(),
+            repository: "/repo".into(),
+            kind: ProjectKind::Git,
+            name: "repo".into(),
+            worktrees: Vec::new(),
+            channels: 0,
+            project_sessions: ProjectSessionOwnership::default(),
+        });
+        drop(app.finish_modal_update(Task::none()));
+        let old = app
+            .project_ui
+            .modal_target(ModalRole::ProjectRemove)
+            .unwrap();
+        let held_focus = app.modal_focus(widget::Id::new("dialog.project.remove.cancel"));
+        // Same role and project, but a different review of that project.
+        app.project_ui.remove_dialog.as_mut().unwrap().request = 11;
+        drop(app.finish_modal_update(Task::none()));
+        drop(app.handle_project_action(Action::ConfirmRemove(10)));
+        drop(app.handle_project_action(Action::DismissRole(old)));
+        assert_eq!(app.project_ui.remove_dialog.as_ref().unwrap().request, 11);
+        assert!(app.project_ui.removing.is_empty());
+        let current = widget::Id::new("dialog.project.remove.confirm");
+        let input = |id| -> Element<'_, Message> {
+            widget::text_input("", "")
+                .id(id)
+                .on_input(|_| Message::DismissStatus)
+                .into()
+        };
+        let content = widget::column::with_children(vec![
+            input(widget::Id::new("dialog.project.remove.cancel")),
+            input(current.clone()),
+        ])
+        .into();
+        let task = iced::widget::operation::focus(current.clone())
+            .map(cosmic::Action::App)
+            .chain(held_focus);
+        assert_eq!(
+            super::super::tests::focused_element(content, task),
+            Some(current)
+        );
+        let current = app
+            .project_ui
+            .modal_target(ModalRole::ProjectRemove)
+            .unwrap();
+        drop(app.handle_project_action(Action::DismissRole(current)));
+        assert!(app.project_ui.remove_dialog.is_none());
+    }
+
+    #[test]
+    fn queued_background_project_command_cannot_replace_a_visible_upper_dialog() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.project_ui.dialog = Some(Dialog {
+            request: 1,
+            target: Target {
+                project,
+                worktree: None,
+                repository: "/repo".into(),
+                path: "/repo/linked".into(),
+                label: "linked".into(),
+            },
+            blocker: None,
+            failure: None,
+        });
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: None,
+            command: ProjectCommand::Remove,
+        }));
+        assert!(app.project_ui.remove_dialog.is_none());
+        assert!(app.project_ui.dialog.is_some());
+        assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
+    }
+
     /// A window with session storage and one project at `repository` whose
     /// linked worktree is `linked`, both of them saved.
     fn deletable_app(
@@ -2338,6 +2626,54 @@ mod tests {
             .iter()
             .flat_map(|project| &project.worktrees)
             .find(|worktree| worktree.id == id)
+    }
+
+    #[test]
+    fn worktree_context_new_thread_uses_the_linked_worktree_directory() {
+        for registered in [false, true] {
+            let repository = tempfile::tempdir().unwrap();
+            let linked_directory = tempfile::tempdir().unwrap();
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.path().to_owned(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                linked_directory.path().to_owned(),
+                Some("feature/login".into()),
+            );
+            let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
+            if registered {
+                let row = sidebar::SelectionRow::Worktree(project, linked.id);
+                let region = crate::input_trace::KeyboardRegion::from(
+                    crate::workspace_widget::FocusedPane::SidebarRows,
+                );
+                let _event = app
+                    .input_trace
+                    .scoped_keyboard_focus(region, Some(sidebar::selection_row_focus_id(row)));
+                drop(app.run_workspace_command(
+                    crate::workspace_widget::GlobalShortcut::NewThread,
+                    keyboard::Modifiers::empty(),
+                ));
+            } else {
+                drop(app.handle_project_action(Action::Command {
+                    project_id: project,
+                    worktree_id: Some(linked.id),
+                    command: ProjectCommand::NewChannel,
+                }));
+            }
+            assert_eq!(
+                app.active_workspace.as_deref(),
+                Some(linked_directory.path())
+            );
+            assert!(
+                app.durable.channels.is_empty(),
+                "a worktree action opens a thread directly"
+            );
+            assert!(app.durable.cards.iter().any(|card| matches!(&card.kind,
+            CardKind::Chat(session) if session.launch.recipe.working_directory == linked_directory.path())));
+        }
     }
 
     #[test]
@@ -2446,7 +2782,9 @@ mod tests {
             command: ProjectCommand::Delete,
         });
         let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::ConfirmDelete(
+            app.project_ui.dialog.as_ref().unwrap().request,
+        ));
         assert!(app.project_ui.dialog.is_none());
         // A repository refresh that listed the worktree before Git removed it.
         app.session
@@ -2517,7 +2855,9 @@ mod tests {
             command: ProjectCommand::Delete,
         });
         let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::ConfirmDelete(
+            app.project_ui.dialog.as_ref().unwrap().request,
+        ));
         let _ = app.handle_project_action(Action::Deleted {
             target,
             result: Ok(()),
@@ -2555,7 +2895,9 @@ mod tests {
         };
 
         let _ = app.handle_project_action(delete.clone());
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::ConfirmDelete(
+            app.project_ui.dialog.as_ref().unwrap().request,
+        ));
         assert!(!app.modal_is_open());
         assert_eq!(row(&app, id).unwrap().deletion, Some(RowDeletion::Deleting));
 
@@ -2636,7 +2978,9 @@ mod tests {
             worktree_id: Some(id),
             command: ProjectCommand::Delete,
         });
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::ConfirmDelete(
+            app.project_ui.dialog.as_ref().unwrap().request,
+        ));
         assert_eq!(app.active_workspace.as_ref(), Some(&repository));
         assert!(
             app.window_update_blocker().is_some(),
@@ -3046,7 +3390,9 @@ mod tests {
             worktree_id: Some(id),
             command: ProjectCommand::Delete,
         });
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::ConfirmDelete(
+            app.project_ui.dialog.as_ref().unwrap().request,
+        ));
         loaded(&mut app, picked, picked_listing, true);
         assert_ne!(app.active_workspace.as_ref(), Some(&linked_path));
         assert_eq!(
@@ -3299,7 +3645,7 @@ mod tests {
                 "Uncommitted changes and unsaved editor changes in this worktree will be discarded."
             )
         );
-        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::ConfirmDelete(dialog.request)));
         assert!(app.project_ui.dialog.is_none());
         assert!(app.project_ui.is_deleting(linked.id));
     }

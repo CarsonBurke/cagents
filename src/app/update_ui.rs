@@ -266,9 +266,9 @@ impl Cagents {
         let preview = &confirmation.preview;
         let title: Element<'_, Message> =
             widget::selectable_text(format!("Update to {}?", preview.candidate.version))
-                .size(design::TEXT_TITLE)
+                .size(design::scaled_interface_size(design::TEXT_TITLE))
                 .line_height(iced::widget::text::LineHeight::Absolute(
-                    design::LINE_TITLE.into(),
+                    design::scaled_interface_size(design::LINE_TITLE).into(),
                 ))
                 .font(design::title_font())
                 .width(Length::Fill)
@@ -290,7 +290,8 @@ impl Cagents {
             if let Some(attention) = attention_summary(daemon) {
                 body.push(
                     widget::selectable_text(attention)
-                        .size(design::TEXT_BODY)
+                        .font(design::interface_font())
+                        .size(design::interface_size())
                         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                         .width(Length::Fill)
                         .class(cosmic::theme::Text::Custom(design::warning_text))
@@ -327,39 +328,33 @@ impl Cagents {
                 );
             }
         }
-        body.push(
-            widget::row::with_children(vec![
-                crate::ui_controls::button::quiet("Copy details")
-                    .id(widget::Id::new("update.copy"))
-                    .on_press(Message::UpdateUi(Action::CopyDetails))
-                    .into(),
-                iced::widget::Space::new().width(Length::Fill).into(),
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(widget::Id::new("update.cancel"))
-                    .on_press(Message::UpdateUi(Action::CancelApply))
-                    .into(),
-                crate::ui_controls::button::primary(
-                    if preview.daemon.as_ref().is_some_and(|daemon| {
-                        daemon
-                            .sessions
-                            .iter()
-                            .any(|session| session.disposition == Disposition::WaitsForIdle)
-                    }) {
-                        "Update when idle"
-                    } else {
-                        "Update and reopen"
-                    },
-                )
-                .id(widget::Id::new("update.confirm"))
-                .on_press_maybe((!blocked).then_some(Message::UpdateUi(Action::ConfirmApply(
-                    confirmation.nonce.clone(),
-                ))))
+        body.push(super::dialog_ui::confirmation_controls(vec![
+            crate::ui_controls::button::quiet("Copy details")
+                .id(widget::Id::new("update.copy"))
+                .on_press(Message::UpdateUi(Action::CopyDetails))
                 .into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(space::S)
+            crate::ui_controls::button::secondary("Cancel")
+                .id(widget::Id::new("update.cancel"))
+                .on_press(Message::UpdateUi(Action::CancelApply))
+                .into(),
+            crate::ui_controls::button::primary(
+                if preview.daemon.as_ref().is_some_and(|daemon| {
+                    daemon
+                        .sessions
+                        .iter()
+                        .any(|session| session.disposition == Disposition::WaitsForIdle)
+                }) {
+                    "Update when idle"
+                } else {
+                    "Update and reopen"
+                },
+            )
+            .id(widget::Id::new("update.confirm"))
+            .on_press_maybe((!blocked).then_some(Message::UpdateUi(Action::ConfirmApply(
+                confirmation.nonce.clone(),
+            ))))
             .into(),
-        );
+        ]));
         Some(dialog_ui::overlay(
             dialog_ui::surface(widget::column::with_children(body).spacing(space::L), 600.0),
             Some(Message::UpdateUi(Action::CancelApply)),
@@ -377,7 +372,7 @@ impl Cagents {
         use crate::update::impact::Disposition;
         let mut header = vec![
             widget::selectable_text(session.title.as_str())
-                .size(design::TEXT_HEADING)
+                .size(design::interface_size())
                 .font(design::heading_font())
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .width(Length::Fill)
@@ -442,7 +437,10 @@ impl Cagents {
     }
 
     pub(super) fn window_update_blocker(&self) -> Option<&'static str> {
-        if self.other_modal_is_open()
+        if self
+            .active_modals()
+            .iter()
+            .any(|modal| *modal != modal_ui::Modal::Update)
             || self.has_active_worktree_operations()
             || self.project_ui.deletion_running()
             || self.channel_ui.deletion_running()
@@ -763,7 +761,11 @@ impl Cagents {
                 }),
             Action::ReviewJob => {
                 self.update_ui.set_aside = None;
-                if !self.other_modal_is_open() {
+                if !self
+                    .active_modals()
+                    .iter()
+                    .any(|modal| *modal != modal_ui::Modal::Update)
+                {
                     self.update_ui.confirmation = self
                         .update_ui
                         .job
@@ -889,7 +891,10 @@ impl Cagents {
                                 ) && self.update_ui.submitted_confirmation.as_ref()
                                     != Some(&confirmation.nonce)
                                     && self.update_ui.set_aside.is_none()
-                                    && !self.other_modal_is_open()
+                                    && !self
+                                        .active_modals()
+                                        .iter()
+                                        .any(|modal| *modal != modal_ui::Modal::Update)
                             });
                         self.update_ui.job = Some(job);
                     }

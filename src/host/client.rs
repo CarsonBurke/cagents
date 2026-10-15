@@ -1,9 +1,8 @@
 use std::{
-    io::{self, Read},
+    io,
     net::Shutdown,
     os::unix::net::UnixStream,
     sync::{Arc, RwLock},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -14,7 +13,7 @@ use crate::{
         MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError,
         ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage,
         ServerResponse, ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot,
-        TerminalVisibility, WireTerminalEvent, read_frame_with_limit, validate_proof,
+        TerminalVisibility, WireTerminalEvent, validate_proof,
     },
 };
 
@@ -23,12 +22,19 @@ use super::{
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
 
+#[cfg(test)]
+use crate::terminal_ipc::read_frame_with_limit;
+#[cfg(test)]
+use std::{io::Read, thread};
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
 struct HandshakeReader<'a> {
     stream: &'a mut UnixStream,
     deadline: Instant,
 }
 
+#[cfg(test)]
 impl Read for HandshakeReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let timeout = remaining_handshake_timeout(self.deadline, Instant::now())?;
@@ -37,6 +43,7 @@ impl Read for HandshakeReader<'_> {
     }
 }
 
+#[cfg(test)]
 fn read_handshake_frame(
     stream: &mut UnixStream,
     deadline: Instant,
@@ -47,6 +54,7 @@ fn read_handshake_frame(
     )
 }
 
+#[cfg(test)]
 fn remaining_handshake_timeout(deadline: Instant, now: Instant) -> io::Result<Duration> {
     deadline
         .checked_duration_since(now)
@@ -65,32 +73,50 @@ struct Registration {
     host: SharedHost,
     client_id: ClientId,
     delivery: Arc<DeliveryQueue>,
+    retired: Option<Box<dyn FnOnce() + Send>>,
+    proof: HostSessionProof,
 }
 
 impl Registration {
-    fn new(host: SharedHost, client_id: ClientId) -> Self {
-        let delivery = host
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .register_client(client_id);
+    fn new(
+        host: SharedHost,
+        client_id: ClientId,
+        retired: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Self {
+        let (delivery, proof) = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            (state.register_client(client_id), state.proof().clone())
+        };
         Self {
             host,
             client_id,
             delivery,
+            retired,
+            proof,
         }
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        disconnect_client(&self.host, self.client_id);
+        super::deferred::disconnected_proof(&self.proof, self.client_id);
         self.delivery.close_after_drain();
+        let host = Arc::clone(&self.host);
+        let client_id = self.client_id;
+        let retired = self.retired.take();
+        crate::terminal::transport::retire(move || {
+            disconnect_client(&host, client_id);
+            if let Some(retired) = retired {
+                retired();
+            }
+        });
     }
 }
 
 type RequestHandler =
     fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome, ProtocolError>;
 
+#[cfg(test)]
 pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     serve_with(stream, client_id, host, process_request);
 }
@@ -116,48 +142,68 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
         .then_some(credentials.pid as u32)
 }
 
+#[cfg(test)]
 fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {
-    let registration = Registration::new(Arc::clone(&host), client_id);
-    if let Some(pid) = peer_pid(&stream) {
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .record_client_pid(client_id, pid);
-    }
-    let delivery = Arc::clone(&registration.delivery);
-    let Ok(writer_stream) = stream.try_clone() else {
-        return;
-    };
-    if writer_stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .is_err()
-    {
-        return;
-    }
-    let writer_delivery = Arc::clone(&delivery);
-    let writer = match thread::Builder::new()
-        .name(format!("cagentsd-writer-{client_id}"))
-        .spawn(move || writer_loop(writer_stream, writer_delivery))
-    {
-        Ok(writer) => writer,
-        Err(_) => {
-            delivery.abort("the client writer thread could not be started");
-            return;
-        }
-    };
+    let runtime = crate::terminal::transport::runtime().expect("test transport runtime");
+    runtime.block_on(serve_async(stream, client_id, host, handle, None));
+    runtime.block_on(crate::terminal::transport::flush_retired());
+}
 
-    let mut reader = stream;
-    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
-    let mut connected = false;
-    loop {
-        let frame = if connected {
-            codec.read::<ClientEnvelope>(&mut reader)
-        } else {
-            read_handshake_frame(&mut reader, handshake_deadline)
-        };
-        let Ok(Some(envelope)) = frame else {
-            break;
-        };
+pub(crate) fn spawn(
+    stream: UnixStream,
+    client_id: ClientId,
+    host: SharedHost,
+    retired: impl FnOnce() + Send + 'static,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    Ok(crate::terminal::transport::runtime()?.spawn(serve_async(
+        stream,
+        client_id,
+        host,
+        process_request,
+        Some(Box::new(retired)),
+    )))
+}
+
+fn request_class(request: &ClientRequest) -> crate::terminal::transport::WorkClass {
+    use crate::terminal::transport::WorkClass;
+    if super::deferred::is_deferred(request) {
+        return WorkClass::Input;
+    }
+    match request {
+        ClientRequest::Input { .. }
+        | ClientRequest::Paste { .. }
+        | ClientRequest::Key { .. }
+        | ClientRequest::Mouse { .. }
+        | ClientRequest::Focus { .. }
+        | ClientRequest::Scroll { .. }
+        | ClientRequest::Resize { .. }
+        | ClientRequest::SetTheme { .. }
+        | ClientRequest::SetVisibility { .. }
+        | ClientRequest::Hibernate { .. }
+        | ClientRequest::Resume { .. }
+        | ClientRequest::TerminalAcknowledge { .. }
+        | ClientRequest::AcknowledgeRedraw { .. }
+        | ClientRequest::Authenticate { .. }
+        | ClientRequest::BuildInfo => WorkClass::Input,
+        ClientRequest::Connect { .. }
+        | ClientRequest::Attach { .. }
+        | ClientRequest::Snapshot { .. } => WorkClass::Snapshot,
+        _ => WorkClass::Domain,
+    }
+}
+
+struct Session {
+    registration: Registration,
+    connected: bool,
+    handle: RequestHandler,
+}
+
+impl Session {
+    fn process(&mut self, envelope: ClientEnvelope) -> bool {
+        let host = &self.registration.host;
+        let client_id = self.registration.client_id;
+        let delivery = &self.registration.delivery;
+        let handle = self.handle;
         if envelope.version != PROTOCOL_VERSION {
             let error = ProtocolError::new(
                 ProtocolErrorCode::UnsupportedVersion,
@@ -168,10 +214,10 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 false,
             );
             let _ = push_error(&delivery, &host, envelope.request_id, error);
-            break;
+            return false;
         }
 
-        if !connected {
+        if !self.connected {
             let ClientRequest::Connect {
                 expected_host,
                 resume,
@@ -183,7 +229,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     false,
                 );
                 let _ = push_error(&delivery, &host, envelope.request_id, error);
-                break;
+                return false;
             };
             if resume.len() > MAX_RESUME_TERMINALS {
                 let error = ProtocolError::new(
@@ -194,24 +240,21 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     false,
                 );
                 let _ = push_error(&delivery, &host, envelope.request_id, error);
-                break;
+                return false;
             }
             let proof = current_proof(&host);
             if let Some(expected) = expected_host.as_ref()
                 && let Err(error) = validate_proof(Some(expected), &proof)
             {
                 let _ = push_error(&delivery, &host, envelope.request_id, error);
-                break;
+                return false;
             }
-            if reader.set_read_timeout(None).is_err() {
-                break;
-            }
-            connected = true;
+            self.connected = true;
             let (resumed, replay) = match prepare_resume(&host, client_id, resume) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let _ = push_error(&delivery, &host, envelope.request_id, error);
-                    break;
+                    return false;
                 }
             };
             if push_response(
@@ -225,7 +268,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
             )
             .is_err()
             {
-                break;
+                return false;
             }
             for message in replay {
                 if delivery
@@ -237,22 +280,42 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     })
                     .is_err()
                 {
-                    break;
+                    return false;
                 }
             }
-            continue;
+            return true;
         }
 
         if let Err(error) = validate_proof(envelope.proof.as_ref(), &current_proof(&host)) {
             let _ = push_error(&delivery, &host, envelope.request_id, error);
-            break;
+            return false;
         }
 
         let request_id = envelope.request_id;
         // A request that panics has released every guard it held by the time
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
-        let request = envelope.request;
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::deferred::try_defer(
+                &host,
+                client_id,
+                request_id,
+                delivery.clone(),
+                envelope.request,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "the daemon failed while admitting this provider control",
+                false,
+            ))
+        });
+        let request = match prepared {
+            Ok(Some(request)) => request,
+            Ok(None) => return true,
+            Err(error) => return push_error(&delivery, &host, request_id, error).is_ok(),
+        };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle(&host, client_id, request)
         }))
@@ -275,7 +338,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     crate::daemon::wake();
                 }
                 if response_failed {
-                    break;
+                    return false;
                 }
                 for message in extras {
                     if delivery
@@ -287,23 +350,162 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                         })
                         .is_err()
                     {
-                        break;
+                        return false;
                     }
                 }
             }
             Err(error) => {
                 if push_error(&delivery, &host, request_id, error).is_err() {
-                    break;
+                    return false;
                 }
             }
         }
+        true
     }
-
-    drop(registration);
-    let _ = writer.join();
 }
 
-fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
+async fn serve_async(
+    stream: UnixStream,
+    client_id: ClientId,
+    host: SharedHost,
+    handle: RequestHandler,
+    retired: Option<Box<dyn FnOnce() + Send>>,
+) {
+    use crate::terminal::transport;
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let pid = peer_pid(&stream);
+    let registration = transport::dispatch(transport::WorkClass::Input, move || {
+        let registration = Registration::new(Arc::clone(&host), client_id, retired);
+        if let Some(pid) = pid {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_client_pid(client_id, pid);
+        }
+        Session {
+            registration,
+            connected: false,
+            handle,
+        }
+    });
+    let mut session = match tokio::time::timeout_at(deadline, registration).await {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "could not register daemon client");
+            return;
+        }
+        Err(_) => return,
+    };
+    let socket = match tokio::io::unix::AsyncFd::new(stream) {
+        Ok(socket) => Arc::new(socket),
+        Err(_) => return,
+    };
+    let delivery = Arc::clone(&session.registration.delivery);
+    let write_socket = Arc::clone(&socket);
+    let writer_delivery = Arc::clone(&delivery);
+    let mut writer = transport::runtime()
+        .expect("initialized transport")
+        .spawn(async move {
+            writer_loop_async(write_socket, writer_delivery).await;
+        });
+    let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+    loop {
+        let frame = if session.connected {
+            transport::read::<ClientEnvelope>(&socket, &mut codec).await
+        } else {
+            match tokio::time::timeout_at(
+                deadline,
+                transport::read::<ClientEnvelope>(&socket, &mut codec),
+            )
+            .await
+            {
+                Ok(frame) => frame,
+                Err(_) => break,
+            }
+        };
+        let Ok(Some(envelope)) = frame else {
+            break;
+        };
+        let class = request_class(&envelope.request);
+        let result = transport::dispatch(class, move || {
+            let connected = session.process(envelope);
+            (session, connected)
+        })
+        .await;
+        match result {
+            Ok((next, connected)) => {
+                session = next;
+                if !connected {
+                    break;
+                }
+            }
+            Err(error) => {
+                delivery.abort(error);
+                return;
+            }
+        }
+    }
+    drop(session);
+    if tokio::time::timeout(Duration::from_secs(6), &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+        delivery.abort("client did not drain within its close deadline");
+    }
+    let _ = socket.get_ref().shutdown(Shutdown::Both);
+}
+
+async fn writer_loop_async(
+    socket: Arc<tokio::io::unix::AsyncFd<UnixStream>>,
+    delivery: Arc<DeliveryQueue>,
+) {
+    use crate::terminal::transport;
+    // Even cancellation or a panic must release the peer's reader.
+    struct Close(Arc<tokio::io::unix::AsyncFd<UnixStream>>);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            let _ = self.0.get_ref().shutdown(Shutdown::Both);
+        }
+    }
+    let _close = Close(Arc::clone(&socket));
+    let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+    while let Some(message) = delivery.pop_async().await {
+        let encoded = transport::dispatch(transport::WorkClass::Encode, move || {
+            let result = codec.encode(&message.wire());
+            (codec, result)
+        })
+        .await;
+        match encoded {
+            Ok((next, Ok(()))) => codec = next,
+            Ok((_, Err(error))) => {
+                delivery.abort(write_failure(&error));
+                break;
+            }
+            Err(error) => {
+                delivery.abort(error);
+                break;
+            }
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            transport::write(&socket, codec.encoded()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                delivery.abort(write_failure(&FrameError::Io(error)));
+                break;
+            }
+            Err(_) => {
+                delivery.abort("the client socket could not be written within its send timeout");
+                break;
+            }
+        }
+    }
+}
+
+pub(super) fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     // Never wait for admission while holding HostState: admitted operations
     // need to reacquire it after synchronous provider/PTY work.
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
@@ -686,6 +888,7 @@ pub(super) fn process_request(
         | ClientRequest::ChatAttach { .. }
         | ClientRequest::ChatDetach { .. }
         | ClientRequest::ChatCommand { .. }
+        | ClientRequest::ChatProviderExitOutput { .. }
         | ClientRequest::ChatVisibility { .. }
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
@@ -1346,6 +1549,7 @@ fn push_error(
         .map_err(|_| ())
 }
 
+#[cfg(test)]
 fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
     let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
     while let Some(message) = delivery.pop() {
@@ -1386,6 +1590,393 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn slow_domain_requests_cannot_occupy_input_or_response_encoding() {
+        static GATE: std::sync::OnceLock<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )> = std::sync::OnceLock::new();
+        fn handler(
+            host: &SharedHost,
+            client: ClientId,
+            request: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
+            match request {
+                ClientRequest::SendTestNotification => {
+                    let (entered, release) = GATE.get().unwrap();
+                    entered.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(3)).unwrap();
+                    Ok((ServerResponse::Accepted, Vec::new(), false))
+                }
+                ClientRequest::Input { bytes, .. } => {
+                    assert_eq!(bytes, b"ping");
+                    Ok((ServerResponse::Accepted, Vec::new(), false))
+                }
+                request => process_request(host, client, request),
+            }
+        }
+        crate::terminal::transport::initialize_host().unwrap();
+        let runtime = crate::terminal::transport::runtime().unwrap();
+        let (entered, observed) = crossbeam_channel::bounded(4);
+        let (release, waiting) = crossbeam_channel::bounded(4);
+        GATE.set((entered, waiting)).unwrap();
+        let (proof, host) = panic_test_host("slow-domain-transport");
+        let mut peers = Vec::new();
+        let mut tasks = Vec::new();
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        for client in 1..=5 {
+            let (mut peer, server) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            tasks.push(runtime.spawn(serve_async(
+                server,
+                client,
+                Arc::clone(&host),
+                handler,
+                None,
+            )));
+            codec
+                .write(
+                    &mut peer,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 1,
+                        proof: None,
+                        request: ClientRequest::Connect {
+                            expected_host: Some(proof.clone()),
+                            resume: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
+            let response: ServerEnvelope = codec.read(&mut peer).unwrap().unwrap();
+            assert!(matches!(
+                response.message,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
+            peers.push(peer);
+        }
+        for peer in &mut peers[..4] {
+            codec
+                .write(
+                    peer,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 2,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::SendTestNotification,
+                    },
+                )
+                .unwrap();
+        }
+        for _ in 0..4 {
+            observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        let started = Instant::now();
+        codec
+            .write(
+                &mut peers[4],
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 2,
+                    proof: Some(proof),
+                    request: ClientRequest::Input {
+                        terminal_id: TerminalId::new(),
+                        bytes: b"ping".to_vec(),
+                    },
+                },
+            )
+            .unwrap();
+        let response: ServerEnvelope = codec.read(&mut peers[4]).unwrap().unwrap();
+        assert!(matches!(
+            response.message,
+            ServerMessage::Response {
+                response: ServerResponse::Accepted
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "input/encoding waited for a slow domain request"
+        );
+        for _ in 0..4 {
+            release.send(()).unwrap();
+        }
+        for peer in &mut peers[..4] {
+            let _: ServerEnvelope = codec.read(peer).unwrap().unwrap();
+        }
+        drop(peers);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                crate::terminal::transport::flush_retired().await;
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn archiving_terminals_cannot_occupy_all_input_dispatch_workers() {
+        static ENTERED: std::sync::OnceLock<crossbeam_channel::Sender<TerminalId>> =
+            std::sync::OnceLock::new();
+        fn handler(
+            host: &SharedHost,
+            client: ClientId,
+            request: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
+            if let ClientRequest::Input { terminal_id, .. } = &request {
+                ENTERED.get().unwrap().send(*terminal_id).unwrap();
+            }
+            process_request(host, client, request)
+        }
+        fn reply(codec: &mut FrameCodec, peer: &mut UnixStream, request: u64) -> ServerMessage {
+            loop {
+                let envelope: ServerEnvelope = codec.read(peer).unwrap().unwrap();
+                if envelope.request_id == Some(request) {
+                    return envelope.message;
+                }
+            }
+        }
+        crate::terminal::transport::initialize_host().unwrap();
+        let runtime = crate::terminal::transport::runtime().unwrap();
+        let (entered, observed) = crossbeam_channel::bounded(3);
+        ENTERED.set(entered).unwrap();
+        let (proof, host) = panic_test_host("archive-input-isolation");
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let marker = directory.path().join("live-input");
+        let mut peers = Vec::new();
+        let mut tasks = Vec::new();
+        let mut handles = Vec::new();
+        let mut ids = Vec::new();
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        for client in 1..=3 {
+            let (mut peer, server) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_millis(750)))
+                .unwrap();
+            tasks.push(runtime.spawn(serve_async(
+                server,
+                client,
+                Arc::clone(&host),
+                handler,
+                None,
+            )));
+            codec
+                .write(
+                    &mut peer,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 1,
+                        proof: None,
+                        request: ClientRequest::Connect {
+                            expected_host: Some(proof.clone()),
+                            resume: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                reply(&mut codec, &mut peer, 1),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
+            let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+            recipe.program = "/bin/cat".into();
+            recipe.arguments.clear();
+            if client == 3 {
+                recipe.program = "/bin/sh".into();
+                recipe.arguments = vec![
+                    "-c".into(),
+                    "IFS= read -r line; printf '%s' \"$line\" > \"$1\"; exec /bin/cat".into(),
+                    "fixture".into(),
+                    marker.to_string_lossy().into_owned(),
+                ];
+            }
+            let source = crate::model::TerminalSession {
+                id: TerminalId::new(),
+                launch: recipe.clone(),
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                transcript_path: None,
+                resume_hint: None,
+                continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                    recipe,
+                    last_exit: None,
+                },
+            };
+            let handle =
+                crate::terminal::TerminalHandle::spawn(source.clone(), Default::default(), |_| {})
+                    .unwrap();
+            let mut state = host.lock().unwrap();
+            state.reserve_spawn(source.id).unwrap();
+            state
+                .finish_spawn(client, source.clone(), handle.clone(), true)
+                .unwrap();
+            drop(state);
+            ids.push(source.id);
+            handles.push(handle);
+            peers.push(peer);
+        }
+        handles[0].while_archive_preparing_for_test(|| {
+            handles[1].while_archive_preparing_for_test(|| {
+                for index in 0..2 {
+                    codec
+                        .write(
+                            &mut peers[index],
+                            &ClientEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: 2,
+                                proof: Some(proof.clone()),
+                                request: ClientRequest::Input {
+                                    terminal_id: ids[index],
+                                    bytes: b"not-admitted".to_vec(),
+                                },
+                            },
+                        )
+                        .unwrap();
+                }
+                let first = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+                let second = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_ne!(first, second);
+                assert!(ids[..2].contains(&first) && ids[..2].contains(&second));
+                let started = Instant::now();
+                codec
+                    .write(
+                        &mut peers[2],
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: 2,
+                            proof: Some(proof.clone()),
+                            request: ClientRequest::Input {
+                                terminal_id: ids[2],
+                                bytes: b"live-pty\n".to_vec(),
+                            },
+                        },
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    reply(&mut codec, &mut peers[2], 2),
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted
+                    }
+                ));
+                loop {
+                    if std::fs::read_to_string(&marker).is_ok_and(|text| text == "live-pty") {
+                        break;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_millis(750),
+                        "unrelated actual PTY input waited for archive preparation"
+                    );
+                    thread::yield_now();
+                }
+                assert!(started.elapsed() < Duration::from_millis(750));
+                for peer in &mut peers[..2] {
+                    let ServerMessage::Error(error) = reply(&mut codec, peer, 2) else {
+                        panic!("archiving input was incorrectly accepted")
+                    };
+                    assert_eq!(error.code, ProtocolErrorCode::QueueFull);
+                    assert!(error.retryable);
+                }
+            })
+        });
+        for handle in &handles {
+            handle.shutdown().unwrap();
+        }
+        drop(peers);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                crate::terminal::transport::flush_retired().await;
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn thirty_client_connections_add_no_os_threads() {
+        const FIXTURE: &str = "CAGENTS_TRANSPORT_THREAD_CENSUS";
+        if std::env::var_os(FIXTURE).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host::client::tests::thirty_client_connections_add_no_os_threads",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(FIXTURE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        crate::terminal::transport::initialize_host().unwrap();
+        let runtime = crate::terminal::transport::runtime().unwrap();
+        let count = || std::fs::read_dir("/proc/self/task").unwrap().count();
+        let idle = count();
+        let (proof, host) = panic_test_host("transport-census");
+        let mut peers = Vec::new();
+        let mut tasks = Vec::new();
+        for client_id in 1..=30 {
+            let (mut peer, server) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            tasks.push(spawn(server, client_id, Arc::clone(&host), || {}).unwrap());
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            codec
+                .write(
+                    &mut peer,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 1,
+                        proof: None,
+                        request: ClientRequest::Connect {
+                            expected_host: Some(proof.clone()),
+                            resume: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
+            let response: ServerEnvelope = codec.read(&mut peer).unwrap().unwrap();
+            assert!(matches!(
+                response.message,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
+            peers.push(peer);
+        }
+        let attached = count();
+        assert!(
+            attached <= idle,
+            "idle={idle}, thirty_connections={attached}"
+        );
+        println!("transport_thread_census idle={idle} thirty_connections={attached}");
+        drop(peers);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                crate::terminal::transport::flush_retired().await;
+            })
+            .await
+            .unwrap();
+        });
+        assert!(host.lock().unwrap().clients.is_empty());
+    }
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {
@@ -2188,6 +2779,239 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unanswered_controls_do_not_block_stop_on_the_same_framed_connection() {
+        use crate::{
+            agent::Provider,
+            chat::{
+                self, Command, Event,
+                protocol::{Adapter, ProcessSpec, Step},
+            },
+        };
+        use std::collections::BTreeMap;
+        struct Controls {
+            admitted: crossbeam_channel::Sender<()>,
+            acknowledgement: Option<String>,
+            next: u64,
+        }
+        impl Adapter for Controls {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                match command {
+                    Command::SetPermissionMode { .. } => {
+                        self.next += 1;
+                        self.acknowledgement = Some(format!("ignored-{}", self.next));
+                        self.admitted.send(()).unwrap();
+                        Ok(Step {
+                            writes: vec![serde_json::json!({"ignored":self.next})],
+                            ..Default::default()
+                        })
+                    }
+                    Command::Interrupt => Ok(Step {
+                        events: vec![Event::TurnFinished {
+                            key: None,
+                            outcome: crate::notifications::Kind::Cancelled,
+                        }],
+                        ..Default::default()
+                    }),
+                    _ => Err("Unexpected fixture command".into()),
+                }
+            }
+            fn command_ack(&mut self) -> Option<String> {
+                self.acknowledgement.take()
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        fn send(
+            stream: &mut UnixStream,
+            proof: &HostSessionProof,
+            request_id: u64,
+            request: ClientRequest,
+        ) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
+        }
+        struct Cleanup {
+            stream: UnixStream,
+            server: Option<thread::JoinHandle<()>>,
+            handle: chat::runtime::Handle,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.stream.shutdown(Shutdown::Both);
+                let _ = self.handle.close();
+                if let Some(server) = self.server.take() {
+                    let _ = server.join();
+                }
+            }
+        }
+        let (proof, host) = panic_test_host("same-stream-provider-controls");
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let (admitted, observed) = crossbeam_channel::bounded(64);
+        let mut initial = Step {
+            events: vec![Event::Ready(true), Event::TurnStarted],
+            ..Default::default()
+        };
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = chat::runtime::Handle::start(
+            spec,
+            Box::new(Controls {
+                admitted,
+                acknowledgement: None,
+                next: 0,
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let chat_id = TerminalId::new();
+        host.lock().unwrap().chats.insert(
+            chat_id,
+            super::super::chat::Record {
+                execution_instance: uuid::Uuid::nil(),
+                console_recipe: None,
+                paired_terminal: None,
+                session: chat::Session {
+                    native_continuity: Default::default(),
+                    owned_codex_listener: None,
+                    id: chat_id,
+                    launch: chat::Launch {
+                        provider: Provider::Claude,
+                        recipe,
+                        session_id: None,
+                    },
+                    proof: Some(proof.clone()),
+                    terminal: None,
+                },
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::from([(1, false)]),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let (mut stream, server_stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server_host = host.clone();
+        let _cleanup = Cleanup {
+            stream: stream.try_clone().unwrap(),
+            server: Some(thread::spawn(move || serve(server_stream, 1, server_host))),
+            handle: handle.clone(),
+        };
+        send(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: Some(proof.clone()),
+                resume: Vec::new(),
+            },
+        );
+        let mut reader = FrameCodec::new(MAX_FRAME_BYTES);
+        let connected = reader.read::<ServerEnvelope>(&mut stream).unwrap().unwrap();
+        assert_eq!(connected.request_id, Some(1));
+        assert!(matches!(
+            connected.message,
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. }
+            }
+        ));
+        for request_id in 2..=66 {
+            send(
+                &mut stream,
+                &proof,
+                request_id,
+                ClientRequest::ChatCommand {
+                    chat_id,
+                    command: Command::SetPermissionMode {
+                        mode: "manual".into(),
+                    },
+                },
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for _ in 0..64 {
+            observed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the connection blocked before admitting all bounded controls");
+        }
+        send(
+            &mut stream,
+            &proof,
+            67,
+            ClientRequest::ChatCommand {
+                chat_id,
+                command: Command::Interrupt,
+            },
+        );
+        let mut capacity_refusal = false;
+        loop {
+            let response = reader
+                .read::<ServerEnvelope>(&mut stream)
+                .expect("Stop must not wait for ignored control replies")
+                .unwrap();
+            assert_eq!(response.proof, proof);
+            match response.request_id {
+                Some(66) => {
+                    assert!(matches!(response.message, ServerMessage::Error(_)));
+                    capacity_refusal = true;
+                }
+                Some(67) => {
+                    assert!(matches!(
+                        response.message,
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted
+                        }
+                    ));
+                    break;
+                }
+                Some(id) => {
+                    panic!("unanswered ordinary request {id} unexpectedly replied before Stop")
+                }
+                None => {}
+            }
+        }
+        assert!(
+            capacity_refusal,
+            "the 65th normal control has an independent correlated refusal"
+        );
+        let snapshot = handle.snapshot(None).unwrap();
+        assert_eq!(
+            snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Cancelled)
+        );
+        assert!(snapshot.error.is_none());
+    }
+
     fn panic_test_host(name: &str) -> (HostSessionProof, SharedHost) {
         let proof = HostSessionProof {
             host_session_id: crate::model::HostSessionId::new(name),
@@ -2290,12 +3114,15 @@ mod tests {
         let (delivered, delivery) = std::sync::mpsc::channel();
         let client_host = Arc::clone(&host);
         let client = thread::spawn(move || {
-            let registration = Registration::new(client_host, 7);
+            let registration = Registration::new(client_host, 7, None);
             delivered.send(Arc::clone(&registration.delivery)).unwrap();
             panic!("fixture client failure");
         });
         let delivery = delivery.recv().unwrap();
         assert!(client.join().is_err());
+        crate::terminal::transport::runtime()
+            .unwrap()
+            .block_on(crate::terminal::transport::flush_retired());
         assert!(!host.lock().unwrap().clients.contains_key(&7));
         // The writer blocks here until the queue is closed, holding the socket.
         assert!(delivery.pop().is_none());
@@ -2407,6 +3234,147 @@ mod tests {
             .handle(1, terminal_id)
             .unwrap();
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn transfer_requests_refuse_invalid_membership_without_acknowledging_or_mutating_it() {
+        use crate::{
+            model::{
+                BootId, BrowserId, BrowserSession, CardId, CardKind, ChannelId, HostIncarnation,
+                HostSessionId,
+            },
+            workspace_model::{
+                ModelEdit,
+                views::{Change, Pane, Scope},
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        let other = directory.path().join("other");
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("transfer-session"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            }),
+        ));
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.install_model(
+                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            );
+            state.register_client(1);
+        }
+        let edit = |edit| process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit });
+        for path in [&repository, &other] {
+            std::fs::create_dir(path).unwrap();
+            edit(ModelEdit::OpenProject {
+                repository: path.clone(),
+                name: "project".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        }
+        let source = ChannelId::new();
+        let destination = ChannelId::new();
+        let foreign = ChannelId::new();
+        for (id, repository) in [
+            (source, repository.clone()),
+            (destination, repository),
+            (foreign, other),
+        ] {
+            edit(ModelEdit::CreateChannel {
+                id,
+                repository,
+                title: "channel".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        }
+        let pane = Pane {
+            id: CardId::new(),
+            title: "browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        edit(ModelEdit::SeedView {
+            scope: Scope::Channel(source),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+        let before = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .read_model()
+            .unwrap();
+        let revision = before
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .revision;
+        for (scope, id, to) in [
+            (Scope::Channel(ChannelId::new()), pane.id, destination),
+            (Scope::Channel(source), pane.id, ChannelId::new()),
+            (Scope::Channel(source), CardId::new(), destination),
+            (Scope::Channel(source), pane.id, foreign),
+            (Scope::Channel(source), CardId::new(), source),
+        ] {
+            let error = edit(ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer {
+                    id,
+                    destination: Scope::Channel(to),
+                    before: None,
+                },
+            })
+            .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            assert!(!error.retryable);
+            assert_eq!(
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .read_model()
+                    .unwrap(),
+                before
+            );
+        }
+        let valid = ModelEdit::ChangeView {
+            scope: Scope::Channel(source),
+            expected_revision: revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Transfer {
+                id: pane.id,
+                destination: Scope::Channel(destination),
+                before: None,
+            },
+        };
+        let moved = edit(valid.clone()).unwrap().0;
+        let ServerResponse::WorkspaceModel { model: moved } = moved else {
+            panic!("transfer must return its committed model")
+        };
+        let replayed = edit(valid).unwrap().0;
+        let ServerResponse::WorkspaceModel { model: replayed } = replayed else {
+            panic!("replay must return its committed model")
+        };
+        assert_eq!(
+            moved, replayed,
+            "successful replay must bypass the now-empty source pane check"
+        );
     }
 
     /// A shared-model edit reaches every window watching the model and never

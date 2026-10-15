@@ -22,7 +22,7 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
-pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+pub const MAX_TERMINAL_SCROLLBACK_MIB: usize = 1024;
 pub const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
 /// The longest terminal font family name, in bytes.
 pub const MAX_TERMINAL_FONT_FAMILY_BYTES: usize = 128;
@@ -232,9 +232,9 @@ impl LinkOpenGesture {
 /// process inside a card, except where the action's scope leaves it to a
 /// focused terminal (see `workspace_widget::ShortcutScope`).
 ///
-/// Workspace defaults include `Ctrl+W` to close a pane and `Alt+R` to cycle
-/// its width, including while a terminal has focus. These chords belong to
-/// the workspace rather than the program inside it. A default that changes
+/// The terminal-safe close default is `Ctrl+Shift+W`. Shell editing keys
+/// such as `Ctrl+F`, `Ctrl+T`, `Alt+R` and `Alt+1` remain terminal input;
+/// their workspace actions apply outside terminals. A default that changes
 /// bumps [`SHORTCUT_DEFAULTS_REVISION`] and records the chords it
 /// replaces in [`RETIRED_SHORTCUT_DEFAULTS`], so a file still holding them
 /// moves to the new ones.
@@ -252,6 +252,8 @@ pub struct KeyboardShortcuts {
     pub cycle_pane_width: Vec<String>,
     pub previous_workspace: Vec<String>,
     pub next_workspace: Vec<String>,
+    pub next_attention: Vec<String>,
+    pub previous_attention: Vec<String>,
     /// Flips the viewed mark on the file a review pane shows.
     pub review_toggle_viewed: Vec<String>,
     pub review_next_file: Vec<String>,
@@ -278,8 +280,191 @@ pub struct KeyboardShortcuts {
     pub focus_pane_7: Vec<String>,
     pub focus_pane_8: Vec<String>,
     pub focus_pane_9: Vec<String>,
+    pub focus_last_pane: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
+    pub new_browser: Vec<String>,
+    pub open_folder: Vec<String>,
+    pub new_worktree: Vec<String>,
+    pub close_other_panes: Vec<String>,
+    pub close_panes_to_right: Vec<String>,
+    pub copy_path: Vec<String>,
+    pub reveal_in_projects: Vec<String>,
+    pub fork_conversation: Vec<String>,
+    pub focus_sidebar_tree: Vec<String>,
+    pub restart_daemon: Vec<String>,
+    pub toggle_theme: Vec<String>,
+    pub resume_conversation: Vec<String>,
+    pub switch_pane: Vec<String>,
+    pub review_conversation_changes: Vec<String>,
+    pub focus_project_1: Vec<String>,
+    pub focus_project_2: Vec<String>,
+    pub focus_project_3: Vec<String>,
+    pub focus_project_4: Vec<String>,
+    pub focus_project_5: Vec<String>,
+    pub focus_project_6: Vec<String>,
+    pub focus_project_7: Vec<String>,
+    pub focus_project_8: Vec<String>,
+    pub focus_project_9: Vec<String>,
+    pub settings_general: Vec<String>,
+    pub settings_appearance: Vec<String>,
+    pub settings_terminal: Vec<String>,
+    pub settings_links: Vec<String>,
+    pub settings_keyboard: Vec<String>,
+    pub settings_native_chat: Vec<String>,
+    pub settings_editor: Vec<String>,
+    pub settings_accounts: Vec<String>,
+    pub settings_notifications: Vec<String>,
+    pub settings_about: Vec<String>,
+    pub move_pane_to_channel: Vec<String>,
+
+    pub diff_copy: Vec<String>,
+    pub diff_copy_old: Vec<String>,
+    pub diff_copy_new: Vec<String>,
+    pub diff_copy_patch: Vec<String>,
+    pub diff_copy_line_reference: Vec<String>,
+    pub diff_open_in_editor: Vec<String>,
+    pub diff_select_all: Vec<String>,
+
+    pub next_diagnostic: Vec<String>,
+    pub previous_diagnostic: Vec<String>,
+
+    pub end_conversation: Vec<String>,
+
+    pub editor_undo: Vec<String>,
+    pub editor_redo: Vec<String>,
+    pub editor_cut: Vec<String>,
+    pub editor_copy: Vec<String>,
+    pub editor_paste: Vec<String>,
+    pub editor_select_all: Vec<String>,
+
+    pub mark_all_read: Vec<String>,
+    pub search_in_project: Vec<String>,
+    pub clone_repository: Vec<String>,
+    pub copy_branch: Vec<String>,
+    pub open_or_create_pull_request: Vec<String>,
+    pub new_worktree_from_branch: Vec<String>,
+    pub move_project_up: Vec<String>,
+    pub move_project_down: Vec<String>,
+    pub reset_sidebar_order: Vec<String>,
+    pub reveal_in_file_manager: Vec<String>,
+    pub open_repository_url: Vec<String>,
+    pub open_in_external_editor: Vec<String>,
+    pub delete_worktree: Vec<String>,
+    pub remove_project: Vec<String>,
+    pub delete_selected_rows: Vec<String>,
+    pub rename_channel: Vec<String>,
+    pub mark_channel_read: Vec<String>,
+    pub delete_channel: Vec<String>,
+    pub mark_worktree_read: Vec<String>,
+    pub rename_file: Vec<String>,
+    pub duplicate_file: Vec<String>,
+    pub copy_relative_path: Vec<String>,
+    pub stage_selected_changes: Vec<String>,
+    pub unstage_selected_changes: Vec<String>,
+    pub discard_selected_changes: Vec<String>,
+    pub open_file: Vec<String>,
+    pub reveal_in_files: Vec<String>,
+    pub ignore_change_path: Vec<String>,
+    pub git_fetch: Vec<String>,
+    pub git_push: Vec<String>,
+    pub git_publish: Vec<String>,
+    pub git_sync: Vec<String>,
+    pub git_sync_rebase: Vec<String>,
+    pub git_stash: Vec<String>,
+    pub git_stash_untracked: Vec<String>,
+    pub git_stashes: Vec<String>,
+    pub git_apply_stash: Vec<String>,
+    pub git_pop_stash: Vec<String>,
+    pub git_drop_stash: Vec<String>,
+    pub git_commit: Vec<String>,
+    pub git_amend: Vec<String>,
+    pub git_refresh: Vec<String>,
+    pub git_abort: Vec<String>,
+    pub git_continue: Vec<String>,
+    pub git_output: Vec<String>,
+    pub git_accept_ours: Vec<String>,
+    pub git_accept_theirs: Vec<String>,
+    pub editor_complete: Vec<String>,
+    pub go_to_definition: Vec<String>,
+    pub find_references: Vec<String>,
+    pub show_hover: Vec<String>,
+    pub show_diagnostics: Vec<String>,
+    pub editor_save: Vec<String>,
+    pub editor_discard_edits: Vec<String>,
+    pub editor_edit: Vec<String>,
+    pub editor_preview: Vec<String>,
+    pub editor_diff: Vec<String>,
+    pub pdf_first_page: Vec<String>,
+    pub pdf_previous_page: Vec<String>,
+    pub pdf_next_page: Vec<String>,
+    pub pdf_last_page: Vec<String>,
+    pub pdf_zoom_out: Vec<String>,
+    pub pdf_zoom_in: Vec<String>,
+    pub pdf_fit: Vec<String>,
+    pub pdf_toggle_colors: Vec<String>,
+    pub diff_unified: Vec<String>,
+    pub diff_split: Vec<String>,
+    pub diff_ignore_whitespace: Vec<String>,
+    pub diff_working: Vec<String>,
+    pub diff_staged: Vec<String>,
+    pub diff_branch: Vec<String>,
+    pub diff_history: Vec<String>,
+    pub stage_file: Vec<String>,
+    pub unstage_file: Vec<String>,
+    pub stage_or_unstage_file: Vec<String>,
+    pub diff_revert: Vec<String>,
+    pub diff_retry: Vec<String>,
+    pub diff_stage_selection: Vec<String>,
+    pub diff_unstage_selection: Vec<String>,
+    pub diff_revert_selection: Vec<String>,
+    pub diff_stage_hunk: Vec<String>,
+    pub diff_unstage_hunk: Vec<String>,
+    pub diff_revert_hunk: Vec<String>,
+    pub browser_back: Vec<String>,
+    pub browser_forward: Vec<String>,
+    pub browser_reload: Vec<String>,
+    pub browser_stop: Vec<String>,
+    pub browser_address: Vec<String>,
+    pub browser_open_system: Vec<String>,
+    pub browser_import_logins: Vec<String>,
+    pub chat_send: Vec<String>,
+    pub chat_steer: Vec<String>,
+    pub chat_queue: Vec<String>,
+    pub chat_interrupt: Vec<String>,
+    pub chat_compact: Vec<String>,
+    pub chat_attach: Vec<String>,
+    pub chat_reasoning: Vec<String>,
+    pub chat_latest: Vec<String>,
+    pub chat_take_back_queued: Vec<String>,
+    pub chat_cancel_queued: Vec<String>,
+    pub chat_toggle_steering: Vec<String>,
+    pub chat_toggle_fast_mode: Vec<String>,
+    pub git_stage_all_unstaged: Vec<String>,
+    pub git_stage_all_untracked: Vec<String>,
+    pub git_stage_all_conflicts: Vec<String>,
+    pub git_unstage_all_staged: Vec<String>,
+    pub git_discard_all_unstaged: Vec<String>,
+    pub git_discard_all_untracked: Vec<String>,
+    pub editor_reload: Vec<String>,
+    pub editor_overwrite: Vec<String>,
+    pub editor_rename_symbol: Vec<String>,
+    pub editor_format_document: Vec<String>,
+    pub editor_format_selection: Vec<String>,
+    pub editor_code_actions: Vec<String>,
+    pub editor_signature_help: Vec<String>,
+    pub settings_open_file: Vec<String>,
+    pub settings_reveal_file: Vec<String>,
+    pub git_history_copy_sha: Vec<String>,
+    pub git_history_copy_message: Vec<String>,
+    pub git_history_new_worktree: Vec<String>,
+    pub git_history_create_branch: Vec<String>,
+    pub git_history_revert: Vec<String>,
+    pub git_history_cherry_pick: Vec<String>,
+
+    /// Serialized action names whose configured chords pass through to terminals.
+    pub terminal_passthrough_actions: Vec<String>,
+    pub terminal_review: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -288,7 +473,7 @@ impl Default for KeyboardShortcuts {
             new_terminal: vec!["Ctrl+Shift+T".to_owned()],
             new_channel: vec!["Ctrl+Shift+G".to_owned()],
             clone_pane: vec!["Ctrl+Shift+D".to_owned()],
-            close_focused_column: vec!["Ctrl+W".to_owned()],
+            close_focused_column: vec!["Ctrl+Shift+W".to_owned()],
             search_projects: vec!["Ctrl+Shift+F".to_owned()],
             find_in_pane: vec!["Ctrl+F".to_owned()],
             previous_column: vec!["Ctrl+PageUp".to_owned()],
@@ -296,12 +481,14 @@ impl Default for KeyboardShortcuts {
             cycle_pane_width: vec!["Alt+R".to_owned()],
             previous_workspace: vec!["Alt+Shift+Tab".to_owned(), "Ctrl+Alt+PageUp".to_owned()],
             next_workspace: vec!["Alt+Tab".to_owned(), "Ctrl+Alt+PageDown".to_owned()],
+            next_attention: vec!["Alt+A".to_owned()],
+            previous_attention: vec!["Alt+Shift+A".to_owned()],
             review_toggle_viewed: vec!["Alt+V".to_owned()],
             review_next_file: vec!["Alt+Down".to_owned()],
             review_previous_file: vec!["Alt+Up".to_owned()],
             review_next_unviewed: vec!["Alt+Shift+Down".to_owned()],
-            review_next_change: vec!["Alt+J".to_owned()],
-            review_previous_change: vec!["Alt+K".to_owned()],
+            review_next_change: vec!["Alt+J".to_owned(), "F7".to_owned()],
+            review_previous_change: vec!["Alt+K".to_owned(), "Shift+F7".to_owned()],
             command_palette: vec!["Ctrl+Shift+P".to_owned()],
             new_native_thread: vec!["Ctrl+T".to_owned(), "Ctrl+Shift+N".to_owned()],
             chat_permissions: vec!["Ctrl+Shift+O".to_owned()],
@@ -321,8 +508,207 @@ impl Default for KeyboardShortcuts {
             focus_pane_7: vec!["Alt+7".to_owned()],
             focus_pane_8: vec!["Alt+8".to_owned()],
             focus_pane_9: vec!["Alt+9".to_owned()],
+            focus_last_pane: vec!["Alt+0".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
+            terminal_review: vec!["Ctrl+Alt+Shift+R".into()],
             rename_pane: vec!["F2".to_owned()],
+            new_browser: Vec::new(),
+            open_folder: Vec::new(),
+            new_worktree: Vec::new(),
+            close_other_panes: Vec::new(),
+            close_panes_to_right: Vec::new(),
+            copy_path: Vec::new(),
+            reveal_in_projects: Vec::new(),
+            fork_conversation: Vec::new(),
+            focus_sidebar_tree: Vec::new(),
+            restart_daemon: Vec::new(),
+            toggle_theme: Vec::new(),
+            resume_conversation: Vec::new(),
+            switch_pane: Vec::new(),
+            review_conversation_changes: Vec::new(),
+            focus_project_1: Vec::new(),
+            focus_project_2: Vec::new(),
+            focus_project_3: Vec::new(),
+            focus_project_4: Vec::new(),
+            focus_project_5: Vec::new(),
+            focus_project_6: Vec::new(),
+            focus_project_7: Vec::new(),
+            focus_project_8: Vec::new(),
+            focus_project_9: Vec::new(),
+            settings_general: Vec::new(),
+            settings_appearance: Vec::new(),
+            settings_terminal: Vec::new(),
+            settings_links: Vec::new(),
+            settings_keyboard: Vec::new(),
+            settings_native_chat: Vec::new(),
+            settings_editor: Vec::new(),
+            settings_accounts: Vec::new(),
+            settings_notifications: Vec::new(),
+            settings_about: Vec::new(),
+            move_pane_to_channel: vec![],
+
+            diff_copy: vec!["Ctrl+C".into()],
+            diff_copy_old: vec![],
+            diff_copy_new: vec![],
+            diff_copy_patch: vec![],
+            diff_copy_line_reference: vec![],
+            diff_open_in_editor: vec![],
+            diff_select_all: vec!["Ctrl+A".into()],
+
+            next_diagnostic: vec!["F8".into()],
+            previous_diagnostic: vec!["Shift+F8".into()],
+
+            end_conversation: vec![],
+
+            editor_undo: vec!["Ctrl+Z".into()],
+            editor_redo: vec!["Ctrl+Shift+Z".into(), "Ctrl+Y".into()],
+            editor_cut: vec!["Ctrl+X".into()],
+            editor_copy: vec!["Ctrl+C".into()],
+            editor_paste: vec!["Ctrl+V".into()],
+            editor_select_all: vec!["Ctrl+A".into()],
+
+            mark_all_read: vec![],
+            search_in_project: vec!["Ctrl+Alt+F".into()],
+            clone_repository: vec![],
+            copy_branch: vec![],
+            open_or_create_pull_request: vec![],
+            new_worktree_from_branch: vec![],
+            move_project_up: vec![],
+            move_project_down: vec![],
+            reset_sidebar_order: vec![],
+            reveal_in_file_manager: vec![],
+            open_repository_url: vec![],
+            open_in_external_editor: vec![],
+            delete_worktree: vec![],
+            remove_project: vec![],
+            delete_selected_rows: vec![],
+            rename_channel: vec![],
+            mark_channel_read: vec![],
+            delete_channel: vec![],
+            mark_worktree_read: vec![],
+            rename_file: vec![],
+            duplicate_file: vec![],
+            copy_relative_path: vec![],
+            stage_selected_changes: vec![],
+            unstage_selected_changes: vec![],
+            discard_selected_changes: vec![],
+            open_file: vec![],
+            reveal_in_files: vec![],
+            ignore_change_path: vec![],
+            git_fetch: Vec::new(),
+            git_push: Vec::new(),
+            git_publish: Vec::new(),
+            git_sync: Vec::new(),
+            git_sync_rebase: Vec::new(),
+            git_stash: Vec::new(),
+            git_stash_untracked: Vec::new(),
+            git_stashes: Vec::new(),
+            git_apply_stash: Vec::new(),
+            git_pop_stash: Vec::new(),
+            git_drop_stash: Vec::new(),
+            git_commit: Vec::new(),
+            git_amend: Vec::new(),
+            git_refresh: Vec::new(),
+            git_abort: Vec::new(),
+            git_continue: Vec::new(),
+            git_output: Vec::new(),
+            git_accept_ours: Vec::new(),
+            git_accept_theirs: Vec::new(),
+            editor_complete: vec!["Ctrl+Space".into()],
+            go_to_definition: vec!["F12".into()],
+            find_references: vec!["Shift+F12".into()],
+            show_hover: Vec::new(),
+            show_diagnostics: Vec::new(),
+            editor_save: vec!["Ctrl+S".into()],
+            editor_discard_edits: Vec::new(),
+            editor_edit: Vec::new(),
+            editor_preview: Vec::new(),
+            editor_diff: Vec::new(),
+            pdf_first_page: Vec::new(),
+            pdf_previous_page: Vec::new(),
+            pdf_next_page: Vec::new(),
+            pdf_last_page: Vec::new(),
+            pdf_zoom_out: Vec::new(),
+            pdf_zoom_in: Vec::new(),
+            pdf_fit: Vec::new(),
+            pdf_toggle_colors: Vec::new(),
+            diff_unified: Vec::new(),
+            diff_split: Vec::new(),
+            diff_ignore_whitespace: Vec::new(),
+            diff_working: Vec::new(),
+            diff_staged: Vec::new(),
+            diff_branch: Vec::new(),
+            diff_history: Vec::new(),
+            stage_file: Vec::new(),
+            unstage_file: Vec::new(),
+            stage_or_unstage_file: vec!["Ctrl+Shift+S".into()],
+            diff_revert: Vec::new(),
+            diff_retry: Vec::new(),
+            diff_stage_selection: Vec::new(),
+            diff_unstage_selection: Vec::new(),
+            diff_revert_selection: Vec::new(),
+            diff_stage_hunk: Vec::new(),
+            diff_unstage_hunk: Vec::new(),
+            diff_revert_hunk: Vec::new(),
+            browser_back: vec!["Alt+Left".into()],
+            browser_forward: vec!["Alt+Right".into()],
+            browser_reload: vec!["Ctrl+R".into(), "F5".into()],
+            browser_stop: Vec::new(),
+            browser_address: vec!["Ctrl+L".into()],
+            browser_open_system: Vec::new(),
+            browser_import_logins: Vec::new(),
+            chat_send: Vec::new(),
+            chat_steer: Vec::new(),
+            chat_queue: Vec::new(),
+            chat_interrupt: Vec::new(),
+            chat_compact: Vec::new(),
+            chat_attach: Vec::new(),
+            chat_reasoning: Vec::new(),
+            chat_latest: vec!["Ctrl+End".into()],
+            chat_take_back_queued: Vec::new(),
+            chat_cancel_queued: Vec::new(),
+            chat_toggle_steering: Vec::new(),
+            chat_toggle_fast_mode: Vec::new(),
+            git_stage_all_unstaged: Vec::new(),
+            git_stage_all_untracked: Vec::new(),
+            git_stage_all_conflicts: Vec::new(),
+            git_unstage_all_staged: Vec::new(),
+            git_discard_all_unstaged: Vec::new(),
+            git_discard_all_untracked: Vec::new(),
+            editor_reload: Vec::new(),
+            editor_overwrite: Vec::new(),
+            editor_rename_symbol: vec!["F2".into()],
+            editor_format_document: vec!["Shift+Alt+F".into()],
+            editor_format_selection: Vec::new(),
+            editor_code_actions: vec!["Ctrl+.".into()],
+            editor_signature_help: vec!["Ctrl+Shift+Space".into()],
+            settings_open_file: Vec::new(),
+            settings_reveal_file: Vec::new(),
+            git_history_copy_sha: Vec::new(),
+            git_history_copy_message: Vec::new(),
+            git_history_new_worktree: Vec::new(),
+            git_history_create_branch: Vec::new(),
+            git_history_revert: Vec::new(),
+            git_history_cherry_pick: Vec::new(),
+
+            terminal_passthrough_actions: [
+                "rename_pane",
+                "new_native_thread",
+                "find_in_pane",
+                "cycle_pane_width",
+                "focus_pane_1",
+                "focus_pane_2",
+                "focus_pane_3",
+                "focus_pane_4",
+                "focus_pane_5",
+                "focus_pane_6",
+                "focus_pane_7",
+                "focus_pane_8",
+                "focus_pane_9",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }
     }
 }
@@ -331,8 +717,12 @@ impl Default for KeyboardShortcuts {
 pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
+    pub fn action_names() -> &'static [&'static str] {
+        &SHORTCUT_ACTIONS
+    }
+
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 38] {
+    pub fn actions(&self) -> [&Vec<String>; 215] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -345,6 +735,8 @@ impl KeyboardShortcuts {
             &self.cycle_pane_width,
             &self.previous_workspace,
             &self.next_workspace,
+            &self.next_attention,
+            &self.previous_attention,
             &self.review_toggle_viewed,
             &self.review_next_file,
             &self.review_previous_file,
@@ -370,9 +762,414 @@ impl KeyboardShortcuts {
             &self.focus_pane_7,
             &self.focus_pane_8,
             &self.focus_pane_9,
+            &self.focus_last_pane,
             &self.toggle_projects,
             &self.rename_pane,
+            &self.new_browser,
+            &self.open_folder,
+            &self.new_worktree,
+            &self.close_other_panes,
+            &self.close_panes_to_right,
+            &self.copy_path,
+            &self.reveal_in_projects,
+            &self.fork_conversation,
+            &self.focus_sidebar_tree,
+            &self.restart_daemon,
+            &self.toggle_theme,
+            &self.resume_conversation,
+            &self.switch_pane,
+            &self.review_conversation_changes,
+            &self.focus_project_1,
+            &self.focus_project_2,
+            &self.focus_project_3,
+            &self.focus_project_4,
+            &self.focus_project_5,
+            &self.focus_project_6,
+            &self.focus_project_7,
+            &self.focus_project_8,
+            &self.focus_project_9,
+            &self.settings_general,
+            &self.settings_appearance,
+            &self.settings_terminal,
+            &self.settings_links,
+            &self.settings_keyboard,
+            &self.settings_native_chat,
+            &self.settings_editor,
+            &self.settings_accounts,
+            &self.settings_notifications,
+            &self.settings_about,
+            &self.move_pane_to_channel,
+            &self.diff_copy,
+            &self.diff_copy_old,
+            &self.diff_copy_new,
+            &self.diff_copy_patch,
+            &self.diff_copy_line_reference,
+            &self.diff_open_in_editor,
+            &self.diff_select_all,
+            &self.next_diagnostic,
+            &self.previous_diagnostic,
+            &self.end_conversation,
+            &self.editor_undo,
+            &self.editor_redo,
+            &self.editor_cut,
+            &self.editor_copy,
+            &self.editor_paste,
+            &self.editor_select_all,
+            &self.mark_all_read,
+            &self.search_in_project,
+            &self.clone_repository,
+            &self.copy_branch,
+            &self.open_or_create_pull_request,
+            &self.new_worktree_from_branch,
+            &self.move_project_up,
+            &self.move_project_down,
+            &self.reset_sidebar_order,
+            &self.reveal_in_file_manager,
+            &self.open_repository_url,
+            &self.open_in_external_editor,
+            &self.delete_worktree,
+            &self.remove_project,
+            &self.delete_selected_rows,
+            &self.rename_channel,
+            &self.mark_channel_read,
+            &self.delete_channel,
+            &self.mark_worktree_read,
+            &self.rename_file,
+            &self.duplicate_file,
+            &self.copy_relative_path,
+            &self.stage_selected_changes,
+            &self.unstage_selected_changes,
+            &self.discard_selected_changes,
+            &self.open_file,
+            &self.reveal_in_files,
+            &self.ignore_change_path,
+            &self.git_fetch,
+            &self.git_push,
+            &self.git_publish,
+            &self.git_sync,
+            &self.git_sync_rebase,
+            &self.git_stash,
+            &self.git_stash_untracked,
+            &self.git_stashes,
+            &self.git_apply_stash,
+            &self.git_pop_stash,
+            &self.git_drop_stash,
+            &self.git_commit,
+            &self.git_amend,
+            &self.git_refresh,
+            &self.git_abort,
+            &self.git_continue,
+            &self.git_output,
+            &self.git_accept_ours,
+            &self.git_accept_theirs,
+            &self.editor_complete,
+            &self.go_to_definition,
+            &self.find_references,
+            &self.show_hover,
+            &self.show_diagnostics,
+            &self.editor_save,
+            &self.editor_discard_edits,
+            &self.editor_edit,
+            &self.editor_preview,
+            &self.editor_diff,
+            &self.pdf_first_page,
+            &self.pdf_previous_page,
+            &self.pdf_next_page,
+            &self.pdf_last_page,
+            &self.pdf_zoom_out,
+            &self.pdf_zoom_in,
+            &self.pdf_fit,
+            &self.pdf_toggle_colors,
+            &self.diff_unified,
+            &self.diff_split,
+            &self.diff_ignore_whitespace,
+            &self.diff_working,
+            &self.diff_staged,
+            &self.diff_branch,
+            &self.diff_history,
+            &self.stage_file,
+            &self.unstage_file,
+            &self.stage_or_unstage_file,
+            &self.diff_revert,
+            &self.diff_retry,
+            &self.diff_stage_selection,
+            &self.diff_unstage_selection,
+            &self.diff_revert_selection,
+            &self.diff_stage_hunk,
+            &self.diff_unstage_hunk,
+            &self.diff_revert_hunk,
+            &self.browser_back,
+            &self.browser_forward,
+            &self.browser_reload,
+            &self.browser_stop,
+            &self.browser_address,
+            &self.browser_open_system,
+            &self.browser_import_logins,
+            &self.chat_send,
+            &self.chat_steer,
+            &self.chat_queue,
+            &self.chat_interrupt,
+            &self.chat_compact,
+            &self.chat_attach,
+            &self.chat_reasoning,
+            &self.chat_latest,
+            &self.chat_take_back_queued,
+            &self.chat_cancel_queued,
+            &self.chat_toggle_steering,
+            &self.chat_toggle_fast_mode,
+            &self.git_stage_all_unstaged,
+            &self.git_stage_all_untracked,
+            &self.git_stage_all_conflicts,
+            &self.git_unstage_all_staged,
+            &self.git_discard_all_unstaged,
+            &self.git_discard_all_untracked,
+            &self.editor_reload,
+            &self.editor_overwrite,
+            &self.terminal_review,
+            &self.editor_rename_symbol,
+            &self.editor_format_document,
+            &self.editor_format_selection,
+            &self.editor_code_actions,
+            &self.editor_signature_help,
+            &self.settings_open_file,
+            &self.settings_reveal_file,
+            &self.git_history_copy_sha,
+            &self.git_history_copy_message,
+            &self.git_history_new_worktree,
+            &self.git_history_create_branch,
+            &self.git_history_revert,
+            &self.git_history_cherry_pick,
         ]
+    }
+
+    /// Replaces one registered action's chords; call the full validator before saving.
+    /// The same stable order as `actions`, used by record/reassign and reset.
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 215] {
+        [
+            &mut self.new_terminal,
+            &mut self.new_channel,
+            &mut self.clone_pane,
+            &mut self.close_focused_column,
+            &mut self.search_projects,
+            &mut self.find_in_pane,
+            &mut self.previous_column,
+            &mut self.next_column,
+            &mut self.cycle_pane_width,
+            &mut self.previous_workspace,
+            &mut self.next_workspace,
+            &mut self.next_attention,
+            &mut self.previous_attention,
+            &mut self.review_toggle_viewed,
+            &mut self.review_next_file,
+            &mut self.review_previous_file,
+            &mut self.review_next_unviewed,
+            &mut self.review_next_change,
+            &mut self.review_previous_change,
+            &mut self.command_palette,
+            &mut self.new_native_thread,
+            &mut self.chat_permissions,
+            &mut self.chat_model,
+            &mut self.chat_account,
+            &mut self.toggle_inspector,
+            &mut self.open_settings,
+            &mut self.move_pane_left,
+            &mut self.move_pane_right,
+            &mut self.reopen_pane,
+            &mut self.focus_pane_1,
+            &mut self.focus_pane_2,
+            &mut self.focus_pane_3,
+            &mut self.focus_pane_4,
+            &mut self.focus_pane_5,
+            &mut self.focus_pane_6,
+            &mut self.focus_pane_7,
+            &mut self.focus_pane_8,
+            &mut self.focus_pane_9,
+            &mut self.focus_last_pane,
+            &mut self.toggle_projects,
+            &mut self.rename_pane,
+            &mut self.new_browser,
+            &mut self.open_folder,
+            &mut self.new_worktree,
+            &mut self.close_other_panes,
+            &mut self.close_panes_to_right,
+            &mut self.copy_path,
+            &mut self.reveal_in_projects,
+            &mut self.fork_conversation,
+            &mut self.focus_sidebar_tree,
+            &mut self.restart_daemon,
+            &mut self.toggle_theme,
+            &mut self.resume_conversation,
+            &mut self.switch_pane,
+            &mut self.review_conversation_changes,
+            &mut self.focus_project_1,
+            &mut self.focus_project_2,
+            &mut self.focus_project_3,
+            &mut self.focus_project_4,
+            &mut self.focus_project_5,
+            &mut self.focus_project_6,
+            &mut self.focus_project_7,
+            &mut self.focus_project_8,
+            &mut self.focus_project_9,
+            &mut self.settings_general,
+            &mut self.settings_appearance,
+            &mut self.settings_terminal,
+            &mut self.settings_links,
+            &mut self.settings_keyboard,
+            &mut self.settings_native_chat,
+            &mut self.settings_editor,
+            &mut self.settings_accounts,
+            &mut self.settings_notifications,
+            &mut self.settings_about,
+            &mut self.move_pane_to_channel,
+            &mut self.diff_copy,
+            &mut self.diff_copy_old,
+            &mut self.diff_copy_new,
+            &mut self.diff_copy_patch,
+            &mut self.diff_copy_line_reference,
+            &mut self.diff_open_in_editor,
+            &mut self.diff_select_all,
+            &mut self.next_diagnostic,
+            &mut self.previous_diagnostic,
+            &mut self.end_conversation,
+            &mut self.editor_undo,
+            &mut self.editor_redo,
+            &mut self.editor_cut,
+            &mut self.editor_copy,
+            &mut self.editor_paste,
+            &mut self.editor_select_all,
+            &mut self.mark_all_read,
+            &mut self.search_in_project,
+            &mut self.clone_repository,
+            &mut self.copy_branch,
+            &mut self.open_or_create_pull_request,
+            &mut self.new_worktree_from_branch,
+            &mut self.move_project_up,
+            &mut self.move_project_down,
+            &mut self.reset_sidebar_order,
+            &mut self.reveal_in_file_manager,
+            &mut self.open_repository_url,
+            &mut self.open_in_external_editor,
+            &mut self.delete_worktree,
+            &mut self.remove_project,
+            &mut self.delete_selected_rows,
+            &mut self.rename_channel,
+            &mut self.mark_channel_read,
+            &mut self.delete_channel,
+            &mut self.mark_worktree_read,
+            &mut self.rename_file,
+            &mut self.duplicate_file,
+            &mut self.copy_relative_path,
+            &mut self.stage_selected_changes,
+            &mut self.unstage_selected_changes,
+            &mut self.discard_selected_changes,
+            &mut self.open_file,
+            &mut self.reveal_in_files,
+            &mut self.ignore_change_path,
+            &mut self.git_fetch,
+            &mut self.git_push,
+            &mut self.git_publish,
+            &mut self.git_sync,
+            &mut self.git_sync_rebase,
+            &mut self.git_stash,
+            &mut self.git_stash_untracked,
+            &mut self.git_stashes,
+            &mut self.git_apply_stash,
+            &mut self.git_pop_stash,
+            &mut self.git_drop_stash,
+            &mut self.git_commit,
+            &mut self.git_amend,
+            &mut self.git_refresh,
+            &mut self.git_abort,
+            &mut self.git_continue,
+            &mut self.git_output,
+            &mut self.git_accept_ours,
+            &mut self.git_accept_theirs,
+            &mut self.editor_complete,
+            &mut self.go_to_definition,
+            &mut self.find_references,
+            &mut self.show_hover,
+            &mut self.show_diagnostics,
+            &mut self.editor_save,
+            &mut self.editor_discard_edits,
+            &mut self.editor_edit,
+            &mut self.editor_preview,
+            &mut self.editor_diff,
+            &mut self.pdf_first_page,
+            &mut self.pdf_previous_page,
+            &mut self.pdf_next_page,
+            &mut self.pdf_last_page,
+            &mut self.pdf_zoom_out,
+            &mut self.pdf_zoom_in,
+            &mut self.pdf_fit,
+            &mut self.pdf_toggle_colors,
+            &mut self.diff_unified,
+            &mut self.diff_split,
+            &mut self.diff_ignore_whitespace,
+            &mut self.diff_working,
+            &mut self.diff_staged,
+            &mut self.diff_branch,
+            &mut self.diff_history,
+            &mut self.stage_file,
+            &mut self.unstage_file,
+            &mut self.stage_or_unstage_file,
+            &mut self.diff_revert,
+            &mut self.diff_retry,
+            &mut self.diff_stage_selection,
+            &mut self.diff_unstage_selection,
+            &mut self.diff_revert_selection,
+            &mut self.diff_stage_hunk,
+            &mut self.diff_unstage_hunk,
+            &mut self.diff_revert_hunk,
+            &mut self.browser_back,
+            &mut self.browser_forward,
+            &mut self.browser_reload,
+            &mut self.browser_stop,
+            &mut self.browser_address,
+            &mut self.browser_open_system,
+            &mut self.browser_import_logins,
+            &mut self.chat_send,
+            &mut self.chat_steer,
+            &mut self.chat_queue,
+            &mut self.chat_interrupt,
+            &mut self.chat_compact,
+            &mut self.chat_attach,
+            &mut self.chat_reasoning,
+            &mut self.chat_latest,
+            &mut self.chat_take_back_queued,
+            &mut self.chat_cancel_queued,
+            &mut self.chat_toggle_steering,
+            &mut self.chat_toggle_fast_mode,
+            &mut self.git_stage_all_unstaged,
+            &mut self.git_stage_all_untracked,
+            &mut self.git_stage_all_conflicts,
+            &mut self.git_unstage_all_staged,
+            &mut self.git_discard_all_unstaged,
+            &mut self.git_discard_all_untracked,
+            &mut self.editor_reload,
+            &mut self.editor_overwrite,
+            &mut self.terminal_review,
+            &mut self.editor_rename_symbol,
+            &mut self.editor_format_document,
+            &mut self.editor_format_selection,
+            &mut self.editor_code_actions,
+            &mut self.editor_signature_help,
+            &mut self.settings_open_file,
+            &mut self.settings_reveal_file,
+            &mut self.git_history_copy_sha,
+            &mut self.git_history_copy_message,
+            &mut self.git_history_new_worktree,
+            &mut self.git_history_create_branch,
+            &mut self.git_history_revert,
+            &mut self.git_history_cherry_pick,
+        ]
+    }
+
+    pub fn set_action(&mut self, index: usize, chords: Vec<String>) {
+        *self
+            .actions_mut()
+            .into_iter()
+            .nth(index)
+            .expect("known shortcut action") = chords;
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
@@ -403,10 +1200,18 @@ impl KeyboardShortcuts {
                     Ok(binding) => binding,
                     Err(error) => return fault(error, None),
                 };
-                if let Some(message) = withheld_from_the_card(binding) {
+                if let Some(message) = shortcut_chord_refusal_for(SHORTCUT_ACTIONS[index], binding)
+                {
                     return fault(message, None);
                 }
-                if let Some(&(_, owner)) = parsed.iter().find(|(other, _)| *other == binding) {
+                if let Some(&(_, owner)) = parsed.iter().find(|(other, owner)| {
+                    *other == binding
+                        && shortcut_binding_conflicts(
+                            SHORTCUT_ACTIONS[index],
+                            SHORTCUT_ACTIONS[*owner],
+                            binding,
+                        )
+                }) {
                     return fault("keyboard shortcuts must not conflict", Some(owner));
                 }
                 parsed.push((binding, index));
@@ -417,7 +1222,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 38] = [
+const SHORTCUT_ACTIONS: [&str; 215] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -429,6 +1234,8 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "cycle_pane_width",
     "previous_workspace",
     "next_workspace",
+    "next_attention",
+    "previous_attention",
     "review_toggle_viewed",
     "review_next_file",
     "review_previous_file",
@@ -454,8 +1261,183 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "focus_pane_7",
     "focus_pane_8",
     "focus_pane_9",
+    "focus_last_pane",
     "toggle_projects",
     "rename_pane",
+    "new_browser",
+    "open_folder",
+    "new_worktree",
+    "close_other_panes",
+    "close_panes_to_right",
+    "copy_path",
+    "reveal_in_projects",
+    "fork_conversation",
+    "focus_sidebar_tree",
+    "restart_daemon",
+    "toggle_theme",
+    "resume_conversation",
+    "switch_pane",
+    "review_conversation_changes",
+    "focus_project_1",
+    "focus_project_2",
+    "focus_project_3",
+    "focus_project_4",
+    "focus_project_5",
+    "focus_project_6",
+    "focus_project_7",
+    "focus_project_8",
+    "focus_project_9",
+    "settings_general",
+    "settings_appearance",
+    "settings_terminal",
+    "settings_links",
+    "settings_keyboard",
+    "settings_native_chat",
+    "settings_editor",
+    "settings_accounts",
+    "settings_notifications",
+    "settings_about",
+    "move_pane_to_channel",
+    "diff_copy",
+    "diff_copy_old",
+    "diff_copy_new",
+    "diff_copy_patch",
+    "diff_copy_line_reference",
+    "diff_open_in_editor",
+    "diff_select_all",
+    "next_diagnostic",
+    "previous_diagnostic",
+    "end_conversation",
+    "editor_undo",
+    "editor_redo",
+    "editor_cut",
+    "editor_copy",
+    "editor_paste",
+    "editor_select_all",
+    "mark_all_read",
+    "search_in_project",
+    "clone_repository",
+    "copy_branch",
+    "open_or_create_pull_request",
+    "new_worktree_from_branch",
+    "move_project_up",
+    "move_project_down",
+    "reset_sidebar_order",
+    "reveal_in_file_manager",
+    "open_repository_url",
+    "open_in_external_editor",
+    "delete_worktree",
+    "remove_project",
+    "delete_selected_rows",
+    "rename_channel",
+    "mark_channel_read",
+    "delete_channel",
+    "mark_worktree_read",
+    "rename_file",
+    "duplicate_file",
+    "copy_relative_path",
+    "stage_selected_changes",
+    "unstage_selected_changes",
+    "discard_selected_changes",
+    "open_file",
+    "reveal_in_files",
+    "ignore_change_path",
+    "git_fetch",
+    "git_push",
+    "git_publish",
+    "git_sync",
+    "git_sync_rebase",
+    "git_stash",
+    "git_stash_untracked",
+    "git_stashes",
+    "git_apply_stash",
+    "git_pop_stash",
+    "git_drop_stash",
+    "git_commit",
+    "git_amend",
+    "git_refresh",
+    "git_abort",
+    "git_continue",
+    "git_output",
+    "git_accept_ours",
+    "git_accept_theirs",
+    "editor_complete",
+    "go_to_definition",
+    "find_references",
+    "show_hover",
+    "show_diagnostics",
+    "editor_save",
+    "editor_discard_edits",
+    "editor_edit",
+    "editor_preview",
+    "editor_diff",
+    "pdf_first_page",
+    "pdf_previous_page",
+    "pdf_next_page",
+    "pdf_last_page",
+    "pdf_zoom_out",
+    "pdf_zoom_in",
+    "pdf_fit",
+    "pdf_toggle_colors",
+    "diff_unified",
+    "diff_split",
+    "diff_ignore_whitespace",
+    "diff_working",
+    "diff_staged",
+    "diff_branch",
+    "diff_history",
+    "stage_file",
+    "unstage_file",
+    "stage_or_unstage_file",
+    "diff_revert",
+    "diff_retry",
+    "diff_stage_selection",
+    "diff_unstage_selection",
+    "diff_revert_selection",
+    "diff_stage_hunk",
+    "diff_unstage_hunk",
+    "diff_revert_hunk",
+    "browser_back",
+    "browser_forward",
+    "browser_reload",
+    "browser_stop",
+    "browser_address",
+    "browser_open_system",
+    "browser_import_logins",
+    "chat_send",
+    "chat_steer",
+    "chat_queue",
+    "chat_interrupt",
+    "chat_compact",
+    "chat_attach",
+    "chat_reasoning",
+    "chat_latest",
+    "chat_take_back_queued",
+    "chat_cancel_queued",
+    "chat_toggle_steering",
+    "chat_toggle_fast_mode",
+    "git_stage_all_unstaged",
+    "git_stage_all_untracked",
+    "git_stage_all_conflicts",
+    "git_unstage_all_staged",
+    "git_discard_all_unstaged",
+    "git_discard_all_untracked",
+    "editor_reload",
+    "editor_overwrite",
+    "terminal_review",
+    "editor_rename_symbol",
+    "editor_format_document",
+    "editor_format_selection",
+    "editor_code_actions",
+    "editor_signature_help",
+    "settings_open_file",
+    "settings_reveal_file",
+    "git_history_copy_sha",
+    "git_history_copy_message",
+    "git_history_new_worktree",
+    "git_history_create_branch",
+    "git_history_revert",
+    "git_history_cherry_pick",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -464,6 +1446,271 @@ pub struct ShortcutFault {
     pub action: usize,
     pub conflicts_with: Option<usize>,
     pub error: SettingsError,
+}
+
+/// A chord handled directly by a native surface rather than the action table.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedShortcut {
+    pub label: &'static str,
+    pub chords: &'static [&'static str],
+    pub scope: &'static str,
+    pub refusal: &'static str,
+}
+
+pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
+    FixedShortcut {
+        label: "Cycle recent panes",
+        chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
+        scope: "Navigation",
+        refusal: "This chord is reserved for Cycle recent panes",
+    },
+    FixedShortcut {
+        label: "Increase font size",
+        chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Increase font size",
+    },
+    FixedShortcut {
+        label: "Decrease font size",
+        chords: &["Ctrl+-"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Decrease font size",
+    },
+    FixedShortcut {
+        label: "Reset font size",
+        chords: &["Ctrl+0"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Reset font size",
+    },
+    FixedShortcut {
+        label: "Copy terminal selection",
+        chords: &["Ctrl+Shift+C"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Copy terminal selection",
+    },
+    FixedShortcut {
+        label: "Paste into terminal",
+        chords: &["Ctrl+Shift+V"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Paste into terminal",
+    },
+];
+
+/// These chords remain valid workspace bindings outside text editing. They
+/// are shown as scoped conflicts, rather than rejecting a useful workspace
+/// default such as Reopen pane on the editor's Redo chord.
+pub const TEXT_EDITING_SHORTCUTS: &[FixedShortcut] = &[
+    FixedShortcut {
+        label: "Undo text edit",
+        chords: &["Ctrl+Z"],
+        scope: "Editor",
+        refusal: "Text inputs keep Undo; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Redo text edit",
+        chords: &["Ctrl+Shift+Z", "Ctrl+Y"],
+        scope: "Editor",
+        refusal: "Text inputs keep Redo; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Select all text",
+        chords: &["Ctrl+A"],
+        scope: "Editor",
+        refusal: "Text inputs keep Select all; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Copy / cut / paste text",
+        chords: &["Ctrl+C", "Ctrl+X", "Ctrl+V"],
+        scope: "Editor",
+        refusal: "Text inputs keep clipboard editing; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Find in text",
+        chords: &["Ctrl+F"],
+        scope: "Editor",
+        refusal: "Text inputs keep Find; other actions are available outside text editing",
+    },
+    FixedShortcut {
+        label: "Navigate / select to document end",
+        chords: &["Ctrl+End", "Ctrl+Shift+End"],
+        scope: "Editor",
+        refusal: "Text inputs keep document navigation; this action is available outside text editing",
+    },
+    FixedShortcut {
+        label: "Navigate / delete words",
+        chords: &[
+            "Ctrl+Left",
+            "Ctrl+Right",
+            "Ctrl+Shift+Left",
+            "Ctrl+Shift+Right",
+            "Ctrl+Backspace",
+            "Ctrl+Delete",
+            "Alt+Left",
+            "Alt+Right",
+            "Alt+Shift+Left",
+            "Alt+Shift+Right",
+            "Alt+Backspace",
+            "Alt+Delete",
+        ],
+        scope: "Editor",
+        refusal: "Text inputs keep word editing; this action is available outside text editing",
+    },
+];
+
+pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'static str> {
+    TEXT_EDITING_SHORTCUTS
+        .iter()
+        .find(|fixed| {
+            fixed
+                .chords
+                .iter()
+                .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
+        })
+        .map(|fixed| fixed.refusal)
+}
+
+/// Native code-buffer actions have a narrower scope than workspace actions.
+/// Ordinary text controls and shells keep their own editing commands.
+pub fn is_editor_command(action: &str) -> bool {
+    if matches!(action, "editor_rename_symbol" | "editor_format_document" | "editor_format_selection" | "editor_code_actions" | "editor_signature_help") { return true; }
+    matches!(
+        action,
+        "editor_undo"
+            | "editor_redo"
+            | "editor_cut"
+            | "editor_copy"
+            | "editor_paste"
+            | "editor_select_all"
+            | "next_diagnostic"
+            | "previous_diagnostic"
+            | "editor_complete"
+            | "go_to_definition"
+            | "find_references"
+            | "show_hover"
+            | "show_diagnostics"
+    )
+}
+
+pub fn text_editing_shortcut_conflict_for(
+    action: &str,
+    binding: ShortcutBinding,
+) -> Option<&'static str> {
+    if is_editor_command(action)
+        || (action == "find_in_pane" && parse_shortcut("Ctrl+F").ok() == Some(binding))
+        || (action == "chat_latest" && parse_shortcut("Ctrl+End").ok() == Some(binding))
+        || (action == "browser_back" && parse_shortcut("Alt+Left").ok() == Some(binding))
+        || (action == "browser_forward" && parse_shortcut("Alt+Right").ok() == Some(binding))
+    {
+        None
+    } else {
+        text_editing_shortcut_conflict(binding)
+    }
+}
+
+/// Review vocabulary also owns editing chords on a live working comparison.
+/// History bindings must therefore collide with it even though ordinary native
+/// editor commands are disjoint from immutable review surfaces.
+pub fn is_review_command(action: &str) -> bool {
+    if matches!(
+        action,
+        "diff_unified"
+            | "diff_split"
+            | "diff_ignore_whitespace"
+            | "diff_revert"
+            | "diff_retry"
+            | "diff_stage_selection"
+            | "diff_unstage_selection"
+            | "diff_revert_selection"
+            | "diff_stage_hunk"
+            | "diff_unstage_hunk"
+            | "diff_revert_hunk"
+    ) {
+        return true;
+    }
+    matches!(
+        action,
+        "review_toggle_viewed"
+            | "review_next_file"
+            | "review_previous_file"
+            | "review_next_unviewed"
+            | "review_next_change"
+            | "review_previous_change"
+            | "diff_copy"
+            | "diff_copy_old"
+            | "diff_copy_new"
+            | "diff_copy_patch"
+            | "diff_copy_line_reference"
+            | "diff_open_in_editor"
+            | "diff_select_all"
+    )
+}
+
+pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBinding) -> bool {
+    // Code buffers own their configured symbol rename before generic pane rename.
+    if matches!((left, right), ("editor_rename_symbol", "rename_pane") | ("rename_pane", "editor_rename_symbol")) { return false; }
+    if (matches!(left, "editor_undo" | "editor_redo") && is_review_command(right))
+        || (matches!(right, "editor_undo" | "editor_redo") && is_review_command(left))
+    {
+        return true;
+    }
+
+    // Native editing chords already suppress ordinary workspace bindings in
+    // an editable buffer; Reopen pane and Redo can therefore share CtrlShiftZ.
+    let editor_left = is_editor_command(left);
+    let editor_right = is_editor_command(right);
+    let outside = if editor_left { right } else { left };
+    !(editor_left != editor_right
+        && SHORTCUT_ACTIONS.contains(&outside)
+        && text_editing_shortcut_conflict_for(outside, binding).is_some())
+}
+
+pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
+    // Registered editor/repository commands never capture a terminal's flow
+    // control. Ctrl+S is an ordinary configurable chord in those scopes.
+    if (is_editor_command(action)
+        || matches!(
+            action,
+            "editor_save"
+                | "editor_discard_edits"
+                | "editor_edit"
+                | "editor_preview"
+                | "editor_diff"
+                | "editor_reload"
+                | "editor_overwrite"
+        ))
+        && parse_shortcut("Ctrl+S").ok() == Some(binding)
+    {
+        return None;
+    }
+    if (is_editor_command(action) && text_editing_shortcut_conflict(binding).is_some())
+        || (action == "diff_copy" && parse_shortcut("Ctrl+C").ok() == Some(binding))
+        || (action == "diff_select_all" && parse_shortcut("Ctrl+A").ok() == Some(binding))
+    {
+        None
+    } else {
+        shortcut_chord_refusal(binding)
+    }
+}
+
+/// The same refusal is used by the recorder, typed edits and file validation.
+pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> {
+    if let Some(reason) = withheld_from_the_card(binding) {
+        return Some(reason);
+    }
+    FIXED_SHORTCUTS
+        .iter()
+        .find(|fixed| {
+            fixed
+                .chords
+                .iter()
+                .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
+        })
+        .map(|fixed| fixed.refusal)
+}
+
+/// Legacy actions that must retain a route back to the workspace.
+pub fn shortcut_required(index: usize) -> bool {
+    !INTRODUCED_SHORTCUT_ACTIONS.contains(&SHORTCUT_ACTIONS[index])
 }
 
 /// Why a chord must not be bound, or `None` when binding it is safe.
@@ -537,8 +1784,10 @@ pub enum ShortcutKey {
     ArrowUp,
     ArrowDown,
     Tab,
+    Space,
     PageUp,
     PageDown,
+    End,
     Function(u8),
 }
 
@@ -579,10 +1828,14 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::ArrowDown)
             } else if token.eq_ignore_ascii_case("tab") {
                 Some(ShortcutKey::Tab)
+            } else if token.eq_ignore_ascii_case("space") {
+                Some(ShortcutKey::Space)
             } else if token.eq_ignore_ascii_case("pageup") {
                 Some(ShortcutKey::PageUp)
             } else if token.eq_ignore_ascii_case("pagedown") {
                 Some(ShortcutKey::PageDown)
+            } else if token.eq_ignore_ascii_case("end") {
+                Some(ShortcutKey::End)
             } else if token.eq_ignore_ascii_case("comma") {
                 Some(ShortcutKey::Character(','))
             } else if token.eq_ignore_ascii_case("plus") {
@@ -604,7 +1857,7 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                     }
                     _ => {
                         return Err(
-                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, PageUp, PageDown, or F1-F12 (use Comma and Plus for separator keys)",
+                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, Space, PageUp, PageDown, End, or F1-F12 (use Comma and Plus for separator keys)",
                         );
                     }
                 }
@@ -623,8 +1876,66 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     })
 }
 
-const fn default_terminal_scrollback_lines() -> usize {
+/// Canonical keys for searching bindings accepted with aliases, whitespace or
+/// reordered modifiers. Display text remains exactly as the user entered it.
+pub fn shortcut_search_keywords(value: &str) -> String {
+    parse_chords(value)
+        .iter()
+        .filter_map(|chord| parse_shortcut(chord).ok())
+        .map(|binding| {
+            let mut parts = Vec::new();
+            if binding.control {
+                parts.push("Ctrl".to_owned());
+            }
+            if binding.alt {
+                parts.push("Alt".to_owned());
+            }
+            if binding.logo {
+                parts.push("Super".to_owned());
+            }
+            if binding.shift {
+                parts.push("Shift".to_owned());
+            }
+            parts.push(match binding.key {
+                ShortcutKey::Character(',') => "Comma".into(),
+                ShortcutKey::Character('+') => "Plus".into(),
+                ShortcutKey::Character(character) => character.to_ascii_uppercase().to_string(),
+                ShortcutKey::ArrowLeft => "Left".into(),
+                ShortcutKey::ArrowRight => "Right".into(),
+                ShortcutKey::ArrowUp => "Up".into(),
+                ShortcutKey::ArrowDown => "Down".into(),
+                ShortcutKey::Tab => "Tab".into(),
+                ShortcutKey::Space => "Space".into(),
+                ShortcutKey::PageUp => "PageUp".into(),
+                ShortcutKey::PageDown => "PageDown".into(),
+                ShortcutKey::End => "End".into(),
+                ShortcutKey::Function(number) => format!("F{number}"),
+            });
+            parts.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+const fn default_interface_font_size() -> f32 {
+    13.0
+}
+const fn default_chat_font_size() -> f32 {
+    14.0
+}
+
+/// Previous line values are migrated at 1 KiB per requested line, rounded up
+/// to MiB. The old setting reached Ghostty as bytes, so this intentionally
+/// restores useful retention rather than preserving the broken tiny budget.
+const fn legacy_scrollback_mib(lines: usize) -> usize {
+    lines.saturating_add(1023) / 1024
+}
+
+const fn default_legacy_terminal_scrollback_lines() -> usize {
     10_000
+}
+
+const fn default_terminal_scrollback_mib() -> usize {
+    16
 }
 
 const fn default_terminal_scroll_size() -> usize {
@@ -642,6 +1953,10 @@ fn default_managed_worktree_directory() -> String {
 const fn default_focus_follows_mouse() -> bool {
     false
 }
+
+const fn default_editor_auto_close() -> bool { true }
+
+const fn default_editor_tab_width() -> u16 { 4 }
 
 const fn default_editor_auto_save() -> bool {
     true
@@ -668,6 +1983,10 @@ const fn default_chat_enter_sends() -> bool {
 
 const fn default_show_status_bar() -> bool {
     true
+}
+
+const fn default_git_status_limit() -> usize {
+    10_000
 }
 
 const fn default_show_worktree_changes_icons() -> bool {
@@ -783,6 +2102,24 @@ impl DefaultPane {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalClipboardWritePolicy {
+    Allow,
+    #[default]
+    Ask,
+    Deny,
+}
+impl TerminalClipboardWritePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Settings are forward compatible, because mixed builds share one file and an
 /// older one must neither refuse to start nor erase what a newer one wrote. A
 /// key this build does not know is ignored, and a value it cannot read - a
@@ -801,10 +2138,26 @@ pub struct AppSettings {
     pub app_theme: AppTheme,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// Empty uses the desktop interface font.
+    #[serde(default)]
+    pub interface_font_family: String,
+    #[serde(default = "default_interface_font_size")]
+    pub interface_font_size: f32,
+    /// Empty follows the interface family; code remains monospace.
+    #[serde(default)]
+    pub chat_font_family: String,
+    #[serde(default = "default_chat_font_size")]
+    pub chat_font_size: f32,
     #[serde(default = "default_terminal_line_height")]
     pub terminal_line_height: f32,
     #[serde(default = "default_terminal_scroll_speed")]
     pub terminal_scroll_speed: f32,
+    #[serde(default = "crate::terminal::default_scroll_to_bottom_on_input")]
+    pub terminal_scroll_to_bottom_on_input: bool,
+    #[serde(default)]
+    pub terminal_clipboard_write: TerminalClipboardWritePolicy,
+    #[serde(default)]
+    pub always_show_terminal_review_bar: bool,
     #[serde(default = "default_terminal_padding")]
     pub terminal_padding: f32,
     #[serde(default = "default_terminal_scroll_size")]
@@ -822,8 +2175,8 @@ pub struct AppSettings {
     pub sidebar_width: f32,
     pub inspector_width: f32,
     pub default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
-    pub terminal_scrollback_lines: usize,
+    #[serde(default = "default_terminal_scrollback_mib")]
+    pub terminal_scrollback_mib: usize,
     #[serde(default)]
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
@@ -838,6 +2191,9 @@ pub struct AppSettings {
     pub auto_delete_merged_worktrees: bool,
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
+    /// Maximum changed paths mounted in a source-control snapshot. Safety reads remain complete.
+    #[serde(default = "default_git_status_limit")]
+    pub git_status_limit: usize,
     #[serde(default)]
     pub default_worktree_pane: DefaultPane,
     #[serde(default)]
@@ -854,8 +2210,14 @@ pub struct AppSettings {
     pub browser_search_url: String,
     #[serde(default)]
     pub editor_wrap_lines: bool,
+    #[serde(default = "default_editor_tab_width")]
+    pub editor_tab_width: u16,
+    #[serde(default = "default_editor_auto_close")]
+    pub editor_auto_close: bool,
     #[serde(default = "default_diff_hide_unchanged")]
     pub diff_hide_unchanged: bool,
+    #[serde(default)]
+    pub diff_ignore_whitespace: bool,
     #[serde(default)]
     pub editor_syntax_theme: EditorSyntaxTheme,
     #[serde(default = "default_confirm_terminal_close")]
@@ -909,6 +2271,17 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// Seconds to keep a language server warm after its last document closes.
+    #[serde(default = "default_lsp_idle_timeout")]
+    pub lsp_idle_timeout_seconds: u64,
+    /// Maximum admitted servers; active documents are never evicted.
+    #[serde(default = "default_lsp_max_sessions")]
+    pub lsp_max_sessions: usize,
+    /// Palette entries selected most recently, newest first.
+    #[serde(default)]
+    pub palette_recents: Vec<String>,
+    #[serde(default)]
+    pub editor_replace_preserve_case: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -920,6 +2293,8 @@ pub struct AppSettings {
     /// header would read as a key inside that table.
     #[serde(default = "default_language_servers")]
     pub language_servers: Vec<LanguageServerSettings>,
+    #[serde(default)]
+    pub editor_find_options: EditorFindOptions,
     #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
@@ -929,6 +2304,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            palette_recents: Vec::new(),
             notifications: crate::notifications::Preferences::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             max_hot_cards: 6,
@@ -936,7 +2312,14 @@ impl Default for AppSettings {
             focus_follows_mouse: default_focus_follows_mouse(),
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
+            terminal_scroll_to_bottom_on_input: true,
+            terminal_clipboard_write: TerminalClipboardWritePolicy::Ask,
+            always_show_terminal_review_bar: false,
             ui_scale: default_ui_scale(),
+            interface_font_family: String::new(),
+            interface_font_size: default_interface_font_size(),
+            chat_font_family: String::new(),
+            chat_font_size: default_chat_font_size(),
             terminal_line_height: default_terminal_line_height(),
             terminal_padding: default_terminal_padding(),
             terminal_scroll_size: default_terminal_scroll_size(),
@@ -948,13 +2331,14 @@ impl Default for AppSettings {
             sidebar_width: layout_metrics::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: 0.5,
-            terminal_scrollback_lines: 10_000,
+            terminal_scrollback_mib: default_terminal_scrollback_mib(),
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
             pull_request_open_target: PullRequestOpenTarget::default(),
             managed_worktree_directory: default_managed_worktree_directory(),
             auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
+            git_status_limit: default_git_status_limit(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -963,7 +2347,10 @@ impl Default for AppSettings {
             confirm_multiline_paste: true,
             browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
+            editor_tab_width: default_editor_tab_width(),
+            editor_auto_close: default_editor_auto_close(),
             diff_hide_unchanged: default_diff_hide_unchanged(),
+            diff_ignore_whitespace: false,
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
@@ -976,10 +2363,30 @@ impl Default for AppSettings {
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
+            lsp_max_sessions: default_lsp_max_sessions(),
+            editor_find_options: EditorFindOptions::default(),
+            editor_replace_preserve_case: false,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+fn default_lsp_idle_timeout() -> u64 {
+    600
+}
+fn default_lsp_max_sessions() -> usize {
+    8
+}
+
+/// Persisted matching preferences shared by editor find surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFindOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -1002,6 +2409,22 @@ pub struct LanguageServerSettings {
     /// Relative marker names that identify a project root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "server_option_disabled")]
+    pub format_on_save: bool,
+    #[serde(default = "default_formatting_timeout", skip_serializing_if = "formatting_timeout_is_default")]
+    pub formatting_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "optional_json_absent")]
+    pub initialization_options: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub configuration: serde_json::Value,
+}
+
+fn server_option_disabled(value:&bool)->bool {!*value}
+fn default_formatting_timeout()->u64 {1000}
+fn formatting_timeout_is_default(value:&u64)->bool {*value == default_formatting_timeout()}
+fn optional_json_absent(value:&Option<serde_json::Value>)->bool {value.as_ref().is_none_or(serde_json::Value::is_null)}
+impl Default for LanguageServerSettings {
+    fn default()->Self {Self {id:String::new(),languages:Vec::new(),command:Vec::new(),root_markers:Vec::new(),format_on_save:false,formatting_timeout_ms:default_formatting_timeout(),initialization_options:None,configuration:serde_json::Value::Null}}
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -1027,6 +2450,7 @@ pub fn default_language_servers() -> Vec<LanguageServerSettings> {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
+            ..LanguageServerSettings::default()
         }
     }
 
@@ -1122,7 +2546,7 @@ struct V2TomlSettings {
     terminal_font_family: String,
     sidebar_width: f32,
     default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
+    #[serde(default = "default_legacy_terminal_scrollback_lines")]
     terminal_scrollback_lines: usize,
     #[serde(default)]
     link_open_destination: LinkOpenDestination,
@@ -1138,7 +2562,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 7;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1162,6 +2586,7 @@ struct RetiredShortcutDefault {
 /// Revision 3 adds the conventional new-tab chord to native threads.
 /// Revision 4 restores `Ctrl+W` to close a pane and `Alt+R` to cycle its width.
 /// Revision 5 separates project search from find in the focused pane.
+/// Revision 7 adds F7 aliases to hunk navigation without replacing custom chords.
 const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -1217,6 +2642,21 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         action: "search_projects",
         retired_in: 5,
         chords: &["Ctrl+F"],
+    },
+    RetiredShortcutDefault {
+        action: "close_focused_column",
+        retired_in: 6,
+        chords: &["Ctrl+W"],
+    },
+    RetiredShortcutDefault {
+        action: "review_next_change",
+        retired_in: 7,
+        chords: &["Alt+J"],
+    },
+    RetiredShortcutDefault {
+        action: "review_previous_change",
+        retired_in: 7,
+        chords: &["Alt+K"],
     },
 ];
 
@@ -1363,7 +2803,23 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
         return;
     }
     let defaults = default_chords(action);
-    let free = free_defaults(defaults.clone(), &bound_chords(shortcuts, &[]));
+    let free: Vec<_> = defaults
+        .iter()
+        .filter(|chord| {
+            parse_shortcut(chord).is_ok_and(|binding| {
+                !shortcuts.iter().any(|(other, chords)| {
+                    shortcut_binding_conflicts(action, other, binding)
+                        && chords.as_array().is_some_and(|chords| {
+                            chords
+                                .iter()
+                                .filter_map(toml::Value::as_str)
+                                .any(|chord| parse_shortcut(chord).ok() == Some(binding))
+                        })
+                })
+            })
+        })
+        .cloned()
+        .collect();
     if free != defaults {
         shortcuts.insert(action.into(), free.into());
     }
@@ -1371,7 +2827,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 210] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1394,17 +2850,194 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
     "focus_pane_7",
     "focus_pane_8",
     "focus_pane_9",
+    "focus_last_pane",
     "cycle_pane_width",
     "new_channel",
     "clone_pane",
     "previous_workspace",
     "next_workspace",
+    "next_attention",
+    "previous_attention",
     "review_toggle_viewed",
     "review_next_file",
     "review_previous_file",
     "review_next_unviewed",
     "review_next_change",
     "review_previous_change",
+    "new_browser",
+    "open_folder",
+    "new_worktree",
+    "close_other_panes",
+    "close_panes_to_right",
+    "copy_path",
+    "reveal_in_projects",
+    "fork_conversation",
+    "focus_sidebar_tree",
+    "restart_daemon",
+    "toggle_theme",
+    "resume_conversation",
+    "switch_pane",
+    "review_conversation_changes",
+    "focus_project_1",
+    "focus_project_2",
+    "focus_project_3",
+    "focus_project_4",
+    "focus_project_5",
+    "focus_project_6",
+    "focus_project_7",
+    "focus_project_8",
+    "focus_project_9",
+    "settings_general",
+    "settings_appearance",
+    "settings_terminal",
+    "settings_links",
+    "settings_keyboard",
+    "settings_native_chat",
+    "settings_editor",
+    "settings_accounts",
+    "settings_notifications",
+    "settings_about",
+    "move_pane_to_channel",
+    "diff_copy",
+    "diff_copy_old",
+    "diff_copy_new",
+    "diff_copy_patch",
+    "diff_copy_line_reference",
+    "diff_open_in_editor",
+    "diff_select_all",
+    "next_diagnostic",
+    "previous_diagnostic",
+    "end_conversation",
+    "editor_undo",
+    "editor_redo",
+    "editor_cut",
+    "editor_copy",
+    "editor_paste",
+    "editor_select_all",
+    "mark_all_read",
+    "search_in_project",
+    "clone_repository",
+    "copy_branch",
+    "open_or_create_pull_request",
+    "new_worktree_from_branch",
+    "move_project_up",
+    "move_project_down",
+    "reset_sidebar_order",
+    "reveal_in_file_manager",
+    "open_repository_url",
+    "open_in_external_editor",
+    "delete_worktree",
+    "remove_project",
+    "delete_selected_rows",
+    "rename_channel",
+    "mark_channel_read",
+    "delete_channel",
+    "mark_worktree_read",
+    "rename_file",
+    "duplicate_file",
+    "copy_relative_path",
+    "stage_selected_changes",
+    "unstage_selected_changes",
+    "discard_selected_changes",
+    "open_file",
+    "reveal_in_files",
+    "ignore_change_path",
+    "git_fetch",
+    "git_push",
+    "git_publish",
+    "git_sync",
+    "git_sync_rebase",
+    "git_stash",
+    "git_stash_untracked",
+    "git_stashes",
+    "git_apply_stash",
+    "git_pop_stash",
+    "git_drop_stash",
+    "git_commit",
+    "git_amend",
+    "git_refresh",
+    "git_abort",
+    "git_continue",
+    "git_output",
+    "git_accept_ours",
+    "git_accept_theirs",
+    "editor_complete",
+    "go_to_definition",
+    "find_references",
+    "show_hover",
+    "show_diagnostics",
+    "editor_save",
+    "editor_discard_edits",
+    "editor_edit",
+    "editor_preview",
+    "editor_diff",
+    "pdf_first_page",
+    "pdf_previous_page",
+    "pdf_next_page",
+    "pdf_last_page",
+    "pdf_zoom_out",
+    "pdf_zoom_in",
+    "pdf_fit",
+    "pdf_toggle_colors",
+    "diff_unified",
+    "diff_split",
+    "diff_ignore_whitespace",
+    "diff_working",
+    "diff_staged",
+    "diff_branch",
+    "diff_history",
+    "stage_file",
+    "unstage_file",
+    "stage_or_unstage_file",
+    "diff_revert",
+    "diff_retry",
+    "diff_stage_selection",
+    "diff_unstage_selection",
+    "diff_revert_selection",
+    "diff_stage_hunk",
+    "diff_unstage_hunk",
+    "diff_revert_hunk",
+    "browser_back",
+    "browser_forward",
+    "browser_reload",
+    "browser_stop",
+    "browser_address",
+    "browser_open_system",
+    "browser_import_logins",
+    "chat_send",
+    "chat_steer",
+    "chat_queue",
+    "chat_interrupt",
+    "chat_compact",
+    "chat_attach",
+    "chat_reasoning",
+    "chat_latest",
+    "chat_take_back_queued",
+    "chat_cancel_queued",
+    "chat_toggle_steering",
+    "chat_toggle_fast_mode",
+    "git_stage_all_unstaged",
+    "git_stage_all_untracked",
+    "git_stage_all_conflicts",
+    "git_unstage_all_staged",
+    "git_discard_all_unstaged",
+    "git_discard_all_untracked",
+    "editor_reload",
+    "editor_overwrite",
+    "terminal_review",
+    "editor_rename_symbol",
+    "editor_format_document",
+    "editor_format_selection",
+    "editor_code_actions",
+    "editor_signature_help",
+    "settings_open_file",
+    "settings_reveal_file",
+    "git_history_copy_sha",
+    "git_history_copy_message",
+    "git_history_new_worktree",
+    "git_history_create_branch",
+    "git_history_revert",
+    "git_history_cherry_pick",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -1546,7 +3179,7 @@ impl From<V2TomlSettings> for AppSettings {
             sidebar_width: previous.sidebar_width,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: previous.default_column_fraction,
-            terminal_scrollback_lines: previous.terminal_scrollback_lines,
+            terminal_scrollback_mib: legacy_scrollback_mib(previous.terminal_scrollback_lines),
             link_open_destination: previous.link_open_destination,
             link_open_gesture: previous.link_open_gesture,
             // A version-2 file predates language servers, so it can hold no
@@ -1589,6 +3222,34 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        for (family, reason) in [
+            (
+                &self.interface_font_family,
+                "interface_font_family must be a name of at most 128 bytes without control characters",
+            ),
+            (
+                &self.chat_font_family,
+                "chat_font_family must be a name of at most 128 bytes without control characters",
+            ),
+        ] {
+            if family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES
+                || family.chars().any(char::is_control)
+                || (!family.is_empty() && family.trim().is_empty())
+            {
+                return Err(SettingsError::Invalid(reason));
+            }
+        }
+        if !(10.0..=24.0).contains(&self.interface_font_size) {
+            return Err(SettingsError::Invalid(
+                "Interface font size must be between 10 and 24",
+            ));
+        }
+        if !(8.0..=40.0).contains(&self.chat_font_size) {
+            return Err(SettingsError::Invalid(
+                "Chat font size must be between 8 and 40",
+            ));
+        }
+        self.git_status_limit = self.git_status_limit.clamp(1, 100_000);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -1649,6 +3310,9 @@ impl AppSettings {
                 "terminal_font_size must be between 8 and 40",
             ));
         }
+        if !(1..=16).contains(&self.editor_tab_width) {
+            return Err(SettingsError::Invalid("editor_tab_width must be between 1 and 16".into()));
+        }
         if self
             .editor_font_size
             .is_some_and(|size| !(8.0..=40.0).contains(&size))
@@ -1701,9 +3365,9 @@ impl AppSettings {
                 "default_column_fraction must be between 0.25 and 1.0",
             ));
         }
-        if self.terminal_scrollback_lines > MAX_TERMINAL_SCROLLBACK_LINES {
+        if self.terminal_scrollback_mib > MAX_TERMINAL_SCROLLBACK_MIB {
             return Err(SettingsError::Invalid(
-                "terminal_scrollback_lines must be between 0 and 1000000",
+                "terminal_scrollback_mib must be between 0 and 1024",
             ));
         }
         if self.managed_worktree_directory.trim().is_empty()
@@ -1714,6 +3378,16 @@ impl AppSettings {
         {
             return Err(SettingsError::Invalid(
                 "managed_worktree_directory must be a nonempty path without control characters",
+            ));
+        }
+        if !(1..=64).contains(&self.lsp_max_sessions) {
+            return Err(SettingsError::Invalid(
+                "lsp_max_sessions must be between 1 and 64",
+            ));
+        }
+        if !(1..=604800).contains(&self.lsp_idle_timeout_seconds) {
+            return Err(SettingsError::Invalid(
+                "lsp_idle_timeout_seconds must be between 1 and 604800",
             ));
         }
         self.keyboard_shortcuts.validate()?;
@@ -1731,6 +3405,13 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
 
     for server in servers {
         let id = server.id.as_str();
+        if !(50..=10_000).contains(&server.formatting_timeout_ms) {
+            return Err(SettingsError::LanguageServer(format!("language server {id} formatting_timeout_ms must be between 50 and 10000")));
+        }
+        if server.initialization_options.as_ref().is_some_and(|value| serde_json::to_vec(value).map_or(true,|bytes| bytes.len() > 1024*1024))
+            || serde_json::to_vec(&server.configuration).map_or(true,|bytes| bytes.len() > 1024*1024) {
+            return Err(SettingsError::LanguageServer(format!("language server {id} configuration must fit within 1 MiB")));
+        }
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
                 "language_servers entry has an empty id".to_owned(),
@@ -1887,6 +3568,32 @@ pub fn save_merged(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
+    save_merged_observed_unlocked(path, base, desired).map(|_| ())
+}
+
+/// A save and its actual merged file contents, ordered while holding the file lock.
+#[derive(Clone, Debug)]
+pub struct SavedSettings {
+    pub settings: AppSettings,
+    pub reload_error: Option<String>,
+    pub observed_at: std::time::Instant,
+}
+
+pub fn save_merged_observed(
+    path: impl AsRef<Path>,
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<SavedSettings, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    save_merged_observed_unlocked(path, base, desired)
+}
+
+fn save_merged_observed_unlocked(
+    path: &Path,
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<SavedSettings, SettingsError> {
     let current = load_unlocked(path)?.settings;
     let mut current = toml::Value::try_from(current)?;
     merge_changed_fields(
@@ -1894,7 +3601,17 @@ pub fn save_merged(
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let settings = current.try_into::<AppSettings>()?.validate()?;
+    save_unlocked(path, &settings)?;
+    // Unknown values are preserved by saving. A known-but-invalid foreign
+    // value in another category must keep its banner after this save too.
+    let loaded = load_unlocked(path)?;
+    let reload_error = live_validation_error(&loaded);
+    Ok(SavedSettings {
+        settings: loaded.settings,
+        reload_error,
+        observed_at: std::time::Instant::now(),
+    })
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
@@ -1946,6 +3663,201 @@ fn load_unlocked(path: &Path) -> Result<Loaded, SettingsError> {
     }
 }
 
+/// Creates a documented, editable snapshot without replacing an existing file.
+pub fn ensure_file(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    reject_unsafe_destination(path)?;
+    if !path.exists() {
+        save_unlocked(path, settings)?;
+    }
+    Ok(())
+}
+
+/// Merge in-flight UI changes onto an externally edited configuration.
+pub fn merge_live(
+    base: &AppSettings,
+    desired: &AppSettings,
+    external: &AppSettings,
+) -> Result<AppSettings, SettingsError> {
+    let mut current = toml::Value::try_from(external)?;
+    merge_changed_fields(
+        &toml::Value::try_from(base)?,
+        &toml::Value::try_from(desired)?,
+        &mut current,
+    );
+    current.try_into::<AppSettings>()?.validate()
+}
+
+/// Live edits are atomic: a known setting that cannot be used rejects the whole
+/// edit, leaving the window's last working settings in force.
+pub fn load_live(path: impl AsRef<Path>) -> Result<AppSettings, String> {
+    load_live_observed(path).result
+}
+
+/// File reads may finish on a blocking thread in a different order from UI
+/// delivery. Stamp both valid and invalid snapshots inside the settings lock.
+#[derive(Clone, Debug)]
+pub struct LiveSettings {
+    pub result: Result<AppSettings, String>,
+    pub observed_at: std::time::Instant,
+}
+
+impl LiveSettings {
+    pub fn now(result: Result<AppSettings, String>) -> Self {
+        Self {
+            result,
+            observed_at: std::time::Instant::now(),
+        }
+    }
+}
+
+pub fn load_live_observed(path: impl AsRef<Path>) -> LiveSettings {
+    let path = path.as_ref();
+    let result = (|| {
+        let _lock = settings_lock(path).map_err(|error| error.to_string())?;
+        let result = load_unlocked(path)
+            .map_err(|error| error.to_string())
+            .and_then(|loaded| match live_validation_error(&loaded) {
+                Some(error) => Err(error),
+                None => Ok(loaded.settings),
+            });
+        Ok::<_, String>(LiveSettings::now(result))
+    })();
+    result.unwrap_or_else(|error| LiveSettings::now(Err(error)))
+}
+
+fn live_validation_error(loaded: &Loaded) -> Option<String> {
+    let errors: Vec<_> = loaded
+        .foreign
+        .iter()
+        .filter_map(|setting| match &setting.reason {
+            ForeignReason::UnknownKey => None,
+            ForeignReason::UnreadableValue(error) => Some(format!(
+                "settings.toml: “{}” is invalid ({error}).",
+                dotted(&setting.path)
+            )),
+        })
+        .collect();
+    (!errors.is_empty()).then(|| errors.join("\n"))
+}
+
+/// Save a byte-for-byte recovery copy before resetting any preferences.
+pub fn reset_with_backup(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+) -> Result<PathBuf, SettingsError> {
+    let mut keys: Vec<String> = written(settings)?
+        .as_table()
+        .expect("settings table")
+        .keys()
+        .cloned()
+        .collect();
+    keys.extend(
+        [
+            "custom_terminal_theme",
+            "editor_font_family",
+            "editor_font_size",
+        ]
+        .map(str::to_owned),
+    );
+    reset_keys_with_backup_inner(path, settings, &keys, true, None)
+}
+
+/// Reset selected top-level keys while keeping unrelated hand-written values.
+pub fn reset_keys_with_backup(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+    keys: &[String],
+) -> Result<PathBuf, SettingsError> {
+    reset_keys_with_backup_inner(path, settings, keys, false, Some(settings))
+}
+
+/// Reset one category while retaining local edits and unobserved disk changes
+/// outside its keys. The baseline, merge, backup and replacement share one lock.
+pub fn reset_keys_merged_with_backup(
+    path: impl AsRef<Path>,
+    base: &AppSettings,
+    desired: &AppSettings,
+    keys: &[String],
+) -> Result<PathBuf, SettingsError> {
+    reset_keys_with_backup_inner(path, desired, keys, false, Some(base))
+}
+
+fn reset_keys_with_backup_inner(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+    keys: &[String],
+    replace_future_schema: bool,
+    base: Option<&AppSettings>,
+) -> Result<PathBuf, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    if !path.exists() {
+        save_unlocked(path, settings)?;
+    }
+    let bytes = read_private_file(path)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut backup = tempfile::Builder::new()
+        .prefix(&format!("settings.toml.bak-{stamp}-"))
+        .tempfile_in(settings_parent(path)?)?;
+    backup
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    backup.write_all(&bytes)?;
+    backup.as_file().sync_all()?;
+    let (_, backup_path) = backup
+        .keep()
+        .map_err(|error| SettingsError::Io(error.error))?;
+    let merged;
+    let settings = if let Some(base) = base {
+        let mut current = toml::Value::try_from(load_unlocked(path)?.settings)?;
+        let desired = toml::Value::try_from(settings)?;
+        merge_changed_fields(&toml::Value::try_from(base)?, &desired, &mut current);
+        let table = current.as_table_mut().expect("settings table");
+        for key in keys {
+            if let Some(value) = desired.get(key.as_str()) {
+                table.insert(key.clone(), value.clone());
+            } else {
+                table.remove(key);
+            }
+        }
+        merged = current.try_into::<AppSettings>()?.validate()?;
+        &merged
+    } else {
+        settings
+    };
+    save_unlocked_for_keys(path, settings, keys, replace_future_schema)?;
+    Ok(backup_path)
+}
+
+/// Restore the original bytes, including comments, whitespace and unknown tables.
+pub fn restore_backup(
+    path: impl AsRef<Path>,
+    backup: impl AsRef<Path>,
+) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    let bytes = read_private_file(backup.as_ref())?;
+    reject_unsafe_destination(path)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".settings-undo-")
+        .tempfile_in(settings_parent(path)?)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| SettingsError::Io(error.error))?;
+    open_private_directory(settings_parent(path)?)?.sync_all()?;
+    Ok(())
+}
+
 pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
@@ -1953,6 +3865,15 @@ pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), Settin
 }
 
 fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
+    save_unlocked_for_keys(path, settings, &[], false)
+}
+
+fn save_unlocked_for_keys(
+    path: &Path,
+    settings: &AppSettings,
+    reset_keys: &[String],
+    replace_future_schema: bool,
+) -> Result<(), SettingsError> {
     let settings = settings.clone().validate()?;
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
@@ -1960,11 +3881,36 @@ fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsErro
     reject_unsafe_destination(path)?;
 
     let mut document = written(&settings)?;
+    let reset_values = document.clone();
     // Whatever a newer build wrote, and this one cannot represent, survives.
-    if let Some(current) = current_document(path)? {
-        keep_foreign_settings(&current, &mut document);
+    match current_document(path) {
+        Ok(Some(current)) => keep_foreign_settings(&current, &mut document),
+        Ok(None) => {}
+        Err(SettingsError::UnsupportedSchema(_)) if replace_future_schema => {}
+        Err(error) => return Err(error),
+    }
+    // Explicit reset overrides even a foreign/unreadable value whose decoded
+    // baseline was already the default. Other categories retain their values.
+    for key in reset_keys {
+        let table = document.as_table_mut().expect("settings table");
+        if let Some(value) = reset_values.get(key.as_str()) {
+            table.insert(key.clone(), value.clone());
+        } else {
+            table.remove(key);
+        }
     }
     let mut document = toml::to_string_pretty(&document)?;
+    if !path.exists() {
+        let defaults = toml::to_string_pretty(&AppSettings::default())?;
+        let reference = defaults
+            .lines()
+            .map(|line| format!("# {line}\n"))
+            .collect::<String>();
+        let (header, current) = document.split_once('\n').unwrap_or((&document, ""));
+        document = format!(
+            "{header}\n\n# Default values for reference (commented out).\n{reference}\n# Current settings; changes apply live in every window.\n{current}"
+        );
+    }
     if !document.ends_with('\n') {
         document.push('\n');
     }
@@ -2012,6 +3958,17 @@ fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
 /// preference. Its value represented lines per wheel notch, so it is the same
 /// setting; the old default of one is promoted to the new default of two.
 fn normalize_current(table: &mut toml::Table) {
+    if !table.contains_key("terminal_scrollback_mib")
+        && let Some(toml::Value::Integer(lines)) = table.get("terminal_scrollback_lines")
+        && let Ok(lines) = usize::try_from(*lines)
+    {
+        table.insert(
+            "terminal_scrollback_mib".into(),
+            toml::Value::Integer(legacy_scrollback_mib(lines) as i64),
+        );
+        table.remove("terminal_scrollback_lines");
+    }
+
     // Decoding moves it too; moving it first lets a setting set aside or
     // kept be found under the name this build writes.
     if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
@@ -2028,6 +3985,19 @@ fn normalize_current(table: &mut toml::Table) {
     if let Some(revision) = revision.filter(|revision| *revision < SHORTCUT_DEFAULTS_REVISION) {
         if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
             adopt_shortcut_defaults(shortcuts, revision, &[]);
+        }
+        if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts")
+            && !shortcuts.contains_key("terminal_passthrough_actions")
+            && shortcuts
+                .get("close_focused_column")
+                .and_then(parsed_chords)
+                .is_some_and(|chords| chords.contains(&parse_shortcut("Ctrl+W").unwrap()))
+        {
+            // Another customized action may own Ctrl+Shift+W. Preserve its
+            // chord and release the stranded old close default to the shell.
+            let mut passthrough = KeyboardShortcuts::default().terminal_passthrough_actions;
+            passthrough.push("close_focused_column".into());
+            shortcuts.insert("terminal_passthrough_actions".into(), passthrough.into());
         }
         table.insert(
             "shortcut_defaults_revision".to_owned(),
@@ -2292,7 +4262,10 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         foreign.extend(
             shortcuts
                 .keys()
-                .filter(|key| !SHORTCUT_ACTIONS.contains(&key.as_str()))
+                .filter(|key| {
+                    key.as_str() != "terminal_passthrough_actions"
+                        && !SHORTCUT_ACTIONS.contains(&key.as_str())
+                })
                 .map(|key| Foreign {
                     path: vec![
                         Segment::Key("keyboard_shortcuts".into()),
@@ -2813,6 +4786,199 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn language_server_editor_options_round_trip_and_validate() {
+        let mut settings=AppSettings::default();
+        settings.language_servers[0].format_on_save=true;
+        settings.language_servers[0].formatting_timeout_ms=750;
+        settings.language_servers[0].initialization_options=Some(serde_json::json!({"check":{"command":"clippy"}}));
+        settings.language_servers[0].configuration=serde_json::json!({"rust-analyzer":{"check":{"command":"clippy"}}});
+        let text=toml::to_string(&settings).unwrap();
+        let decoded:AppSettings=toml::from_str(&text).unwrap();
+        assert_eq!(decoded.language_servers,settings.language_servers);
+        assert!(decoded.validate().is_ok());
+        for timeout in [0,49,10001,u64::MAX] {
+            let mut settings=AppSettings::default();settings.language_servers[0].formatting_timeout_ms=timeout;
+            assert!(settings.validate().is_err());
+        }
+        let mut settings=AppSettings::default();settings.language_servers[0].initialization_options=Some(serde_json::json!({"large":"x".repeat(1024*1024)}));
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
+        for cap in [0, 65, usize::MAX] {
+            let settings = AppSettings {
+                lsp_max_sessions: cap,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+        for timeout in [0, 604801, u64::MAX] {
+            let settings = AppSettings {
+                lsp_idle_timeout_seconds: timeout,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn live_settings_merge_retains_unrelated_changes_and_reports_conflicts() {
+        let base = AppSettings::default();
+        let mut desired = base.clone();
+        desired.terminal_font_size = 20.0;
+        let mut external = base.clone();
+        external.terminal_font_family = "monospace".into();
+        let merged = merge_live(&base, &desired, &external).unwrap();
+        assert_eq!(merged.terminal_font_size, 20.0);
+        assert_eq!(merged.terminal_font_family, "monospace");
+        desired.keyboard_shortcuts.new_terminal = vec!["Ctrl+Alt+X".into()];
+        external.keyboard_shortcuts.new_native_thread = vec!["Ctrl+Alt+X".into()];
+        assert!(merge_live(&base, &desired, &external).is_err());
+    }
+
+    #[test]
+    fn settings_reset_replaces_invalid_known_values_without_erasing_other_categories() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("terminal_font_size = 14.0", "terminal_font_size = -5.0");
+        std::fs::write(
+            &path,
+            format!("{original}\n[future_preferences]\nkeep = true\n"),
+        )
+        .unwrap();
+        let error = load_live(&path).unwrap_err();
+        assert!(error.contains("terminal_font_size"));
+        assert!(!error.contains("default is in effect"));
+        reset_keys_with_backup(
+            &path,
+            &AppSettings::default(),
+            &["terminal_font_size".into()],
+        )
+        .unwrap();
+        assert!(load_live(&path).is_ok());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("[future_preferences]")
+        );
+    }
+
+    #[test]
+    fn selected_settings_reset_keeps_unobserved_known_values_outside_its_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let cached = AppSettings::default();
+        let mut external = cached.clone();
+        external.terminal_font_size = 18.0;
+        external.keyboard_shortcuts.command_palette.clear();
+        save(&path, &external).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let backup =
+            reset_keys_with_backup(&path, &cached, &["keyboard_shortcuts".into()]).unwrap();
+        let saved = load_live(&path).unwrap();
+        assert_eq!(saved.terminal_font_size, 18.0);
+        assert_eq!(saved.keyboard_shortcuts, cached.keyboard_shortcuts);
+        assert_eq!(std::fs::read(backup).unwrap(), before);
+    }
+
+    #[test]
+    fn explicit_settings_reset_can_recover_a_newer_schema_after_backing_it_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = "schema_version = 999\n[future_table]\nkeep = true\n";
+        std::fs::write(&path, original).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        assert!(load_live(path).is_ok());
+        assert_eq!(std::fs::read(backup).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn reset_backup_restores_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = format!(
+            "# My hand-written configuration\n{}\n[my_future_table]\nfoo = 'bar'\n",
+            fs::read_to_string(&path).unwrap()
+        );
+        fs::write(&path, original.as_bytes()).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original.as_bytes());
+        restore_backup(&path, backup).unwrap();
+        assert_eq!(fs::read(path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn documentation_lists_every_app_settings_key() {
+        let document = include_str!("../docs/configuration.md");
+        let mut settings = AppSettings::default();
+        settings.editor_font_family = Some("monospace".into());
+        settings.editor_font_size = Some(14.0);
+        settings.custom_terminal_theme = Some(crate::terminal::TerminalTheme::Dark.palette());
+        for key in toml::Value::try_from(settings)
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .keys()
+        {
+            assert!(
+                document.contains(&format!("`{key}`")),
+                "Missing settings documentation: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn editor_find_options_round_trip_with_disabled_language_servers() {
+        let settings = AppSettings {
+            language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions {
+                case_sensitive: true,
+                regex: true,
+                whole_word: true,
+            },
+            editor_replace_preserve_case: true,
+            ..AppSettings::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&serialized).unwrap();
+        assert!(restored.language_servers.is_empty());
+        assert_eq!(restored.editor_find_options, settings.editor_find_options);
+        assert!(restored.editor_replace_preserve_case);
+    }
+
+    #[test]
+    fn git_status_limit_defaults_and_clamps_to_bounded_range() {
+        assert_eq!(AppSettings::default().git_status_limit, 10_000);
+        let mut settings = AppSettings::default();
+        settings.git_status_limit = 0;
+        assert_eq!(settings.validate().unwrap().git_status_limit, 1);
+        let mut settings = AppSettings::default();
+        settings.git_status_limit = usize::MAX;
+        assert_eq!(settings.validate().unwrap().git_status_limit, 100_000);
+    }
+
+
+    #[test]
+    fn introduced_terminal_review_preserves_existing_custom_binding() {
+        let mut table = toml::Table::new();
+        table.insert(
+            "cycle_pane_width".into(),
+            toml::Value::Array(vec![toml::Value::String("Ctrl+Alt+Shift+R".into())]),
+        );
+        preserve_introduced_shortcuts(&mut table);
+        assert_eq!(
+            table["cycle_pane_width"].as_array().unwrap()[0].as_str(),
+            Some("Ctrl+Alt+Shift+R")
+        );
+        assert!(table["terminal_review"].as_array().unwrap().is_empty());
+    }
+    #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
         previous_schema
@@ -2919,6 +5085,18 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn palette_recents_default_for_old_settings_and_roundtrip_in_mru_order() {
+        let mut settings = AppSettings::default();
+        let mut old: toml::Table = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        old.remove("palette_recents");
+        let restored: AppSettings = toml::from_str(&toml::to_string(&old).unwrap()).unwrap();
+        assert!(restored.palette_recents.is_empty());
+        settings.palette_recents = vec!["command:new_worktree".into(), "pane:fixture".into()];
+        let restored: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.palette_recents, settings.palette_recents);
     }
 
     #[test]
@@ -3129,6 +5307,10 @@ mod tests {
             hibernation_delay_ms: 1_234,
             app_theme: AppTheme::Light,
             ui_scale: 1.2,
+            interface_font_family: "DejaVu Sans".into(),
+            interface_font_size: 16.0,
+            chat_font_family: "DejaVu Serif".into(),
+            chat_font_size: 19.0,
             terminal_line_height: 1.5,
             terminal_padding: 12.0,
             terminal_scroll_size: 4,
@@ -3421,6 +5603,50 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     #[test]
+    fn shell_safe_migration_releases_close_when_a_custom_chord_prevents_upgrading_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+        document.insert("shortcut_defaults_revision".into(), 5.into());
+        let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+        shortcuts.remove("terminal_passthrough_actions");
+        shortcuts.insert("close_focused_column".into(), vec!["Ctrl+W"].into());
+        shortcuts.insert("new_channel".into(), vec!["Ctrl+Shift+W"].into());
+        fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.keyboard_shortcuts.close_focused_column, ["Ctrl+W"]);
+        assert_eq!(loaded.keyboard_shortcuts.new_channel, ["Ctrl+Shift+W"]);
+        assert!(
+            loaded
+                .keyboard_shortcuts
+                .terminal_passthrough_actions
+                .iter()
+                .any(|name| name == "close_focused_column")
+        );
+    }
+
+    #[test]
+    fn shell_safe_close_migration_preserves_custom_chords() {
+        for (before, after) in [("Ctrl+W", "Ctrl+Shift+W"), ("Alt+X", "Alt+X")] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), 5.into());
+            document["keyboard_shortcuts"]
+                .as_table_mut()
+                .unwrap()
+                .insert("close_focused_column".into(), vec![before].into());
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.keyboard_shortcuts.close_focused_column, [after]);
+            assert_eq!(
+                loaded.shortcut_defaults_revision,
+                SHORTCUT_DEFAULTS_REVISION
+            );
+        }
+    }
+
+    #[test]
     fn separating_project_search_migrates_defaults_and_preserves_custom_chords() {
         for (search, occupied, expected_search, expected_find) in [
             (
@@ -3523,7 +5749,7 @@ next_column = ["Alt+W", "Alt+Right"]
         );
         assert_eq!(
             file["keyboard_shortcuts"]["close_focused_column"],
-            vec!["Ctrl+W"].into()
+            vec!["Ctrl+Shift+W"].into()
         );
         assert_eq!(load(&path).unwrap(), desired);
     }
@@ -3581,11 +5807,7 @@ next_column = ["Alt+W", "Alt+Right"]
                 shortcuts.insert("cycle_pane_width".into(), width.clone().into());
                 fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
                 let loaded = load(&path).unwrap();
-                let expected_close = if matches!(revision, 2 | 3) && close == ["Ctrl+Shift+W"] {
-                    vec!["Ctrl+W"]
-                } else {
-                    close
-                };
+                let expected_close = close;
                 let expected_width = if matches!(revision, 2 | 3) && width == ["Ctrl+Shift+R"] {
                     vec!["Alt+R"]
                 } else {
@@ -3672,7 +5894,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(shortcuts.next_column, ["Alt+W"]);
         assert!(shortcuts.cycle_pane_width.is_empty());
         assert_eq!(shortcuts.previous_column, ["Ctrl+PageUp"]);
-        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
 
         // Once upgraded, an old default chosen again is a choice too.
         let mut desired = loaded.clone();
@@ -3691,7 +5913,7 @@ next_column = ["Alt+W", "Alt+Right"]
         let loaded = load(&path).unwrap();
         let shortcuts = &loaded.keyboard_shortcuts;
         assert_eq!(shortcuts.clone_pane, ["Ctrl+Shift+D"]);
-        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
         assert_eq!(shortcuts.review_toggle_viewed, ["Ctrl+PageDown"]);
         assert_eq!(shortcuts.next_column, ["Alt+W", "Alt+Right"]);
         // The rest move.
@@ -3725,7 +5947,7 @@ new_thread = "Alt+Shift+G"
         .unwrap();
         let shortcuts = load(&path).unwrap().keyboard_shortcuts;
         assert_eq!(shortcuts.new_terminal, ["Ctrl+Shift+T"]);
-        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
         assert_eq!(shortcuts.search_projects, ["Ctrl+Shift+F"]);
         // A single string predates chord lists, when Alt+Q alone was the
         // default; a list holding it alone was a choice, since lists shipped
@@ -3977,6 +6199,7 @@ new_thread = "Alt+Shift+G"
             parse_shortcut("Ctrl+Shift+PageDown").unwrap().key,
             ShortcutKey::PageDown
         );
+        assert_eq!(parse_shortcut("Ctrl+End").unwrap().key, ShortcutKey::End);
         // Shift+PageUp scrolls a terminal's own scrollback.
         assert!(parse_shortcut("Shift+PageUp").is_err());
 
@@ -4029,8 +6252,40 @@ new_thread = "Alt+Shift+G"
         shortcuts.insert("new_terminal".into(), vec!["Alt+J"].into());
         shortcuts.insert("search_projects".into(), vec!["Alt+Shift+Down"].into());
         let migrated: AppSettings = value.try_into().unwrap();
-        assert!(migrated.keyboard_shortcuts.review_next_change.is_empty());
+        assert_eq!(migrated.keyboard_shortcuts.review_next_change, ["F7"]);
         assert!(migrated.keyboard_shortcuts.review_next_unviewed.is_empty());
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K", "Shift+F7"]
+        );
+        migrated.validate().unwrap();
+    }
+
+    #[test]
+    fn diff_hunk_alias_migration_preserves_custom_bindings_and_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let migrate = |settings: &AppSettings| {
+            fs::write(&path, toml::to_string(settings).unwrap()).unwrap();
+            load(&path).unwrap()
+        };
+        let mut previous = AppSettings::default();
+        previous.shortcut_defaults_revision = 6;
+        previous.keyboard_shortcuts.review_next_change = vec!["Alt+J".into()];
+        previous.keyboard_shortcuts.review_previous_change = vec!["Alt+K".into()];
+        let migrated = migrate(&previous);
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_next_change,
+            ["Alt+J", "F7"]
+        );
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K", "Shift+F7"]
+        );
+        previous.keyboard_shortcuts.review_next_change = vec!["Alt+L".into()];
+        previous.keyboard_shortcuts.new_terminal = vec!["Shift+F7".into()];
+        let migrated = migrate(&previous);
+        assert_eq!(migrated.keyboard_shortcuts.review_next_change, ["Alt+L"]);
         assert_eq!(
             migrated.keyboard_shortcuts.review_previous_change,
             ["Alt+K"]
@@ -4057,10 +6312,26 @@ new_thread = "Alt+Shift+G"
         // The gesture only reaches the child as a control character when Ctrl
         // is alone: the shifted and Alt forms send something else, or nothing,
         // and stay bindable.
-        for chord in ["Ctrl+Shift+C", "Ctrl+Alt+D", "Super+Z"] {
+        for chord in ["Ctrl+Shift+X", "Ctrl+Alt+D", "Super+Z"] {
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.new_terminal = vec![chord.to_owned()];
             assert!(settings.validate().is_ok(), "{chord} was refused");
+        }
+    }
+
+    #[test]
+    fn native_fixed_chords_refuse_conflicting_actions_by_name() {
+        for (chord, label) in [
+            ("Ctrl+Tab", "Cycle recent panes"),
+            ("Ctrl+=", "Increase font size"),
+            ("Ctrl+Shift+C", "Copy terminal selection"),
+        ] {
+            let mut settings = AppSettings::default();
+            settings.keyboard_shortcuts.new_terminal = vec![chord.into()];
+            assert!(
+                matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)),
+                "{chord}"
+            );
         }
     }
 
@@ -4076,14 +6347,36 @@ new_thread = "Alt+Shift+G"
     }
 
     #[test]
+    fn legacy_scrollback_lines_migrate_to_explicit_memory_budget() {
+        for (lines, mib) in [(0, 0), (1, 1), (10_000, 10), (1_000_000, 977)] {
+            let mut table = toml::Table::new();
+            table.insert(
+                "terminal_scrollback_lines".into(),
+                toml::Value::Integer(lines),
+            );
+            normalize_current(&mut table);
+            assert_eq!(table["terminal_scrollback_mib"].as_integer(), Some(mib));
+            assert!(!table.contains_key("terminal_scrollback_lines"));
+        }
+        let mut table = toml::Table::new();
+        table.insert(
+            "terminal_scrollback_lines".into(),
+            toml::Value::Integer(10_000),
+        );
+        table.insert("terminal_scrollback_mib".into(), toml::Value::Integer(32));
+        normalize_current(&mut table);
+        assert_eq!(table["terminal_scrollback_mib"].as_integer(), Some(32));
+    }
+
+    #[test]
     fn terminal_scrollback_is_bounded() {
         let at_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB,
             ..AppSettings::default()
         };
         assert!(at_limit.validate().is_ok());
         let above_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES + 1,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB + 1,
             ..AppSettings::default()
         };
         assert!(matches!(
@@ -4537,7 +6830,39 @@ new_thread = "Alt+Shift+G"
     #[test]
     fn shortcut_action_names_are_the_serialized_ones() {
         let table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
-        assert!(table.keys().eq(SHORTCUT_ACTIONS.iter()));
+        assert!(
+            table
+                .keys()
+                .filter(|name| name.as_str() != "terminal_passthrough_actions")
+                .eq(SHORTCUT_ACTIONS.iter())
+        );
+        // Distinct sentinels expose swapped actions even when both defaults
+        // are empty or coincidentally contain the same chord.
+        let mut sentinels = table.clone();
+        for (index, name) in KeyboardShortcuts::action_names().iter().enumerate() {
+            sentinels.insert((*name).into(), vec![format!("action-{index}")].into());
+        }
+        let shortcuts: KeyboardShortcuts = sentinels.clone().try_into().unwrap();
+        for (index, (name, chords)) in KeyboardShortcuts::action_names()
+            .iter()
+            .zip(shortcuts.actions())
+            .enumerate()
+        {
+            assert_eq!(
+                chords,
+                &vec![format!("action-{index}")],
+                "read action {name}"
+            );
+            let mut changed = shortcuts.clone();
+            changed.set_action(index, vec!["replacement".into()]);
+            let mut expected = sentinels.clone();
+            expected.insert((*name).into(), vec!["replacement"].into());
+            assert_eq!(
+                toml::Table::try_from(changed).unwrap(),
+                expected,
+                "write action {name}"
+            );
+        }
     }
 
     /// Each shortcut action this build cannot use falls back alone, however
@@ -4670,15 +6995,27 @@ new_thread = "Alt+Shift+G"
         desired.keyboard_shortcuts.search_projects = vec!["Ctrl+Shift+F".into(), "Alt+S".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         let file = saved(&path);
-        let bindings: Vec<ShortcutBinding> = file["keyboard_shortcuts"]
+        let bindings: Vec<(&str, ShortcutBinding)> = file["keyboard_shortcuts"]
             .as_table()
             .unwrap()
-            .values()
-            .flat_map(|chords| chords.as_array().unwrap())
-            .map(|chord| parse_shortcut(chord.as_str().unwrap()).unwrap())
+            .iter()
+            .filter(|(name, _)| name.as_str() != "terminal_passthrough_actions")
+            .flat_map(|(name, chords)| {
+                chords.as_array().unwrap().iter().map(move |chord| {
+                    (
+                        name.as_str(),
+                        parse_shortcut(chord.as_str().unwrap()).unwrap(),
+                    )
+                })
+            })
             .collect();
-        for (index, binding) in bindings.iter().enumerate() {
-            assert!(!bindings[..index].contains(binding), "{file:#?}");
+        for (index, (action, binding)) in bindings.iter().enumerate() {
+            assert!(
+                !bindings[..index].iter().any(|(previous, other)| {
+                    other == binding && shortcut_binding_conflicts(action, previous, *binding)
+                }),
+                "{file:#?}"
+            );
         }
         assert_eq!(load(&path).unwrap(), desired);
     }
@@ -4997,5 +7334,185 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+    #[test]
+    fn registered_editor_chords_preserve_workspace_scope_and_migrate_without_stealing() {
+        let shortcuts = KeyboardShortcuts::default();
+        assert!(shortcuts.fault().is_none());
+        let binding = parse_shortcut("Ctrl+Shift+Z").unwrap();
+        assert!(!shortcut_binding_conflicts(
+            "editor_redo",
+            "reopen_pane",
+            binding
+        ));
+        assert!(shortcut_binding_conflicts(
+            "editor_redo",
+            "editor_undo",
+            binding
+        ));
+        assert!(
+            shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+C").unwrap()).is_none()
+        );
+        assert!(
+            shortcut_chord_refusal_for("rename_pane", parse_shortcut("Ctrl+C").unwrap()).is_some()
+        );
+        assert!(
+            shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+S").unwrap()).is_none()
+        );
+        let mut sparse = toml::Table::new();
+        sparse.insert("reopen_pane".into(), vec!["Ctrl+Shift+Z"].into());
+        preserve_introduced_shortcuts(&mut sparse);
+        let decoded: KeyboardShortcuts = toml::Value::Table(sparse).try_into().unwrap();
+        assert_eq!(decoded.editor_redo, shortcuts.editor_redo);
+        assert_eq!(decoded.reopen_pane, shortcuts.reopen_pane);
+        assert!(decoded.fault().is_none());
+    }
+
+    #[test]
+    fn editor_chords_conflict_with_find_when_find_owns_the_editor_binding() {
+        let binding = parse_shortcut("Ctrl+F").unwrap();
+        assert!(shortcut_binding_conflicts(
+            "editor_redo",
+            "find_in_pane",
+            binding
+        ));
+        assert!(shortcut_binding_conflicts(
+            "find_in_pane",
+            "editor_redo",
+            binding
+        ));
+        assert!(text_editing_shortcut_conflict_for("find_in_pane", binding).is_none());
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.editor_redo = vec!["Ctrl+F".into()];
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some())
+        );
+        shortcuts.find_in_pane = vec!["Ctrl+Alt+G".into()];
+        assert!(shortcuts.fault().is_none());
+        shortcuts.next_diagnostic = vec!["Ctrl+Z".into()];
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some()),
+            "two native editor commands cannot share Undo"
+        );
+        assert!(
+            shortcut_binding_conflicts(
+                "editor_undo",
+                "future_editor_action",
+                parse_shortcut("Ctrl+Z").unwrap()
+            ),
+            "an unknown future scope is preserved conservatively"
+        );
+    }
+
+    #[test]
+    fn working_diff_history_conflicts_with_review_vocabulary_but_not_reopen() {
+        for history in ["editor_undo", "editor_redo"] {
+            for review in SHORTCUT_ACTIONS
+                .into_iter()
+                .filter(|action| is_review_command(action))
+            {
+                for chord in ["Ctrl+C", "Ctrl+Z", "Ctrl+Shift+Z", "Alt+F9"] {
+                    let binding = parse_shortcut(chord).unwrap();
+                    assert!(
+                        shortcut_binding_conflicts(history, review, binding),
+                        "{history}/{review}/{chord}"
+                    );
+                    assert!(
+                        shortcut_binding_conflicts(review, history, binding),
+                        "{review}/{history}/{chord}"
+                    );
+                }
+            }
+        }
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.editor_undo = vec!["Ctrl+C".into()];
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some())
+        );
+        shortcuts.diff_copy.clear();
+        assert!(shortcuts.fault().is_none());
+        assert!(!shortcut_binding_conflicts(
+            "editor_redo",
+            "reopen_pane",
+            parse_shortcut("Ctrl+Shift+Z").unwrap()
+        ));
+    }
+
+    #[test]
+    fn symbol_rename_defaults_migrate_without_unbinding_pane_rename() {
+        let mut raw = toml::Table::new();
+        raw.insert("rename_pane".into(), vec!["F2"].into());
+        preserve_introduced_shortcuts(&mut raw);
+        let shortcuts: KeyboardShortcuts = toml::Value::Table(raw).try_into().unwrap();
+        assert_eq!(shortcuts.rename_pane, ["F2"]);
+        assert_eq!(shortcuts.editor_rename_symbol, ["F2"]);
+        assert!(shortcuts.fault().is_none());
+        assert!(!shortcut_binding_conflicts("editor_rename_symbol", "rename_pane", parse_shortcut("F2").unwrap()));
+        assert!(shortcut_binding_conflicts("editor_code_actions", "rename_pane", parse_shortcut("F2").unwrap()), "only the deliberate symbol/pane rename precedence is shared");
+    }
+
+    #[test]
+    fn mutable_shortcut_order_matches_serialized_registry() {
+        for (index, name) in SHORTCUT_ACTIONS.iter().enumerate() {
+            let mut shortcuts = KeyboardShortcuts::default();
+            let chords = vec!["Ctrl+Alt+Shift+K".to_owned()];
+            shortcuts.set_action(index, chords.clone());
+            let serialized = toml::Value::try_from(&shortcuts).unwrap();
+            assert_eq!(
+                serialized.get(*name).unwrap().as_array().unwrap(),
+                &[toml::Value::String(chords[0].clone())]
+            );
+            assert_eq!(shortcuts.actions()[index], &chords);
+        }
+    }
+
+
+    #[test]
+    fn terminal_integration_settings_have_safe_backwards_compatible_defaults() {
+        let defaults = AppSettings::default();
+        assert!(!defaults.always_show_terminal_review_bar);
+        assert!(defaults.terminal_scroll_to_bottom_on_input);
+        assert_eq!(
+            defaults.terminal_clipboard_write,
+            TerminalClipboardWritePolicy::Ask
+        );
+        assert_eq!(
+            defaults.keyboard_shortcuts.terminal_review,
+            ["Ctrl+Alt+Shift+R"]
+        );
+        let mut text = toml::to_string(&defaults).unwrap();
+        text = text
+            .lines()
+            .filter(|line| {
+                !line.starts_with("always_show_terminal_review_bar =")
+                    && !line.starts_with("terminal_scroll_to_bottom_on_input =")
+                    && !line.starts_with("terminal_clipboard_write =")
+                    && !line.starts_with("terminal_review =")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(
+            old.always_show_terminal_review_bar,
+            defaults.always_show_terminal_review_bar
+        );
+        assert_eq!(
+            old.terminal_scroll_to_bottom_on_input,
+            defaults.terminal_scroll_to_bottom_on_input
+        );
+        assert_eq!(
+            old.terminal_clipboard_write,
+            defaults.terminal_clipboard_write
+        );
+        assert_eq!(
+            old.keyboard_shortcuts.terminal_review,
+            defaults.keyboard_shortcuts.terminal_review
+        );
     }
 }

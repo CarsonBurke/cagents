@@ -3,6 +3,10 @@
 use super::*;
 use crate::automations::{Proposal, ProposalState, Request, Response};
 
+pub(super) fn default_focus_id() -> widget::Id {
+    widget::Id::new("automation-approval.decline")
+}
+
 #[derive(Default)]
 pub(super) struct State {
     proposal: Option<Proposal>,
@@ -255,7 +259,7 @@ impl Cagents {
                 self.automation_approval.error = None;
                 self.automation_approval.restore_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
-                approval_focus(0)
+                self.modal_focus(approval_focus_id(0))
             }
             Action::Decide {
                 id,
@@ -344,18 +348,17 @@ impl Cagents {
                         if let Some(restore) = state.restore_keyboard_nav.take() {
                             self.core.set_keyboard_nav(restore);
                         }
-                        iced::widget::operation::focus(
+                        self.modal_restore_focus(
                             self.workspace
                                 .focused()
                                 .map(|card| self.card_keyboard_focus(card))
                                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
                         )
-                        .map(cosmic::Action::App)
                     }
                     Err(error) => {
                         state.error = Some(error.to_string());
                         state.focus = 0;
-                        approval_focus(0)
+                        self.modal_focus(approval_focus_id(0))
                     }
                 }
             }
@@ -381,7 +384,7 @@ impl Cagents {
         use keyboard::key::Named;
         if matches!(key, Named::Tab | Named::ArrowLeft | Named::ArrowRight) {
             self.automation_approval.focus = 1 - self.automation_approval.focus;
-            return Some(approval_focus(self.automation_approval.focus));
+            return Some(self.modal_focus(approval_focus_id(self.automation_approval.focus)));
         }
         if *key == Named::Escape
             || (*key == Named::Enter
@@ -487,13 +490,12 @@ impl Cagents {
     }
 }
 
-fn approval_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(if index == 0 {
+fn approval_focus_id(index: usize) -> widget::Id {
+    widget::Id::new(if index == 0 {
         "automation-approval.decline"
     } else {
         "automation-approval.approve"
-    }))
-    .map(cosmic::Action::App)
+    })
 }
 
 #[cfg(test)]
@@ -664,7 +666,7 @@ mod tests {
         assert_eq!(
             super::super::tests::focused_element(
                 app.automation_approval_dialog().unwrap(),
-                approval_focus(0)
+                app.modal_focus(approval_focus_id(0))
             ),
             Some(widget::Id::new("automation-approval.decline"))
         );

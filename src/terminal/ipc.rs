@@ -143,7 +143,8 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Version 78 carries terminal provider outcomes and readable exit diagnostics.
+pub const PROTOCOL_VERSION: u16 = 78;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -472,6 +473,12 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Read one bounded page from an opaque, immutable provider-exit log.
+    ChatProviderExitOutput {
+        chat_id: TerminalId,
+        log_id: String,
+        offset: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,7 +494,9 @@ pub struct TerminalSpawnOptions {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty scrollback page budget in bytes (allocated lazily).
+    #[serde(alias = "max_scrollback")]
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
 }
@@ -499,7 +508,7 @@ impl Default for TerminalSpawnOptions {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: 16 * 1024 * 1024,
             initially_visible: true,
             theme: TerminalTheme::default(),
         }
@@ -513,7 +522,7 @@ impl From<TerminalConfig> for TerminalSpawnOptions {
             rows: value.rows,
             cell_width_px: value.cell_width_px,
             cell_height_px: value.cell_height_px,
-            max_scrollback: value.max_scrollback,
+            max_scrollback_bytes: value.max_scrollback_bytes,
             initially_visible: value.initially_visible,
             theme: value.theme,
         }
@@ -565,6 +574,8 @@ pub enum TerminalScroll {
     Top,
     Bottom,
     Row(u64),
+    /// A search range is rebased against the terminal's current history origin.
+    Match(super::SearchMatch),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -643,6 +654,7 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         state: crate::agent::ActivityState,
         generation: u64,
+        outcome: Option<crate::agent::ActivityOutcome>,
     },
     /// A terminal some other client created, delivered only to a connection
     /// that subscribed with [`ClientRequest::WatchTerminals`].
@@ -779,6 +791,16 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
+    /// Raw pages preserve UTF-8 and ANSI sequences across frame boundaries;
+    /// the requesting client cleans the complete bounded output once.
+    ChatProviderExitOutput {
+        chat_id: TerminalId,
+        log_id: String,
+        offset: u64,
+        bytes: Vec<u8>,
+        next_offset: Option<u64>,
+        omitted: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,6 +925,10 @@ pub struct TerminalDescriptor {
     pub upgrade_sources: Vec<TerminalSession>,
     #[serde(default)]
     pub upgrade_relaunches: Vec<UpgradeRelaunch>,
+    /// Exact resident worker observed by this inventory result. Nil means no
+    /// live worker exists and cannot authorize a source-checked live close.
+    #[serde(default)]
+    pub execution_instance: uuid::Uuid,
 }
 
 /// Explicitly accepted resume-picker or fresh agent launches, bound to the
@@ -920,6 +946,7 @@ impl TerminalDescriptor {
         transcript_path: Option<PathBuf>,
     ) -> Self {
         Self {
+            execution_instance: uuid::Uuid::nil(),
             session: TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
@@ -1427,12 +1454,19 @@ pub enum WireTerminalEvent {
         matches: Vec<crate::terminal::SearchMatch>,
         truncated: bool,
     },
+    ClipboardWrite {
+        primary: bool,
+        text: String,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
     fn from(value: TerminalEvent) -> Self {
         match value {
             TerminalEvent::TitleChanged(title) => Self::TitleChanged { title },
+            TerminalEvent::ClipboardWrite { primary, text } => {
+                Self::ClipboardWrite { primary, text }
+            }
             TerminalEvent::ClipboardText { request, text } => Self::ClipboardText { request, text },
             TerminalEvent::SearchResults {
                 request,
@@ -1485,6 +1519,9 @@ impl From<WireTerminalEvent> for TerminalEvent {
     fn from(value: WireTerminalEvent) -> Self {
         match value {
             WireTerminalEvent::TitleChanged { title } => Self::TitleChanged(title),
+            WireTerminalEvent::ClipboardWrite { primary, text } => {
+                Self::ClipboardWrite { primary, text }
+            }
             WireTerminalEvent::ClipboardText { request, text } => {
                 Self::ClipboardText { request, text }
             }
@@ -1655,6 +1692,13 @@ impl FrameCodec {
         writer: &mut impl Write,
         value: &T,
     ) -> Result<(), FrameError> {
+        self.encode(value)?;
+        writer.write_all(&self.write_buffer)?;
+        writer.flush()?;
+        Ok(())
+    }
+    /// Prepares one bounded frame for nonblocking transports without copying it.
+    pub(crate) fn encode<T: Serialize>(&mut self, value: &T) -> Result<(), FrameError> {
         let started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
@@ -1664,9 +1708,11 @@ impl FrameCodec {
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_encode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = payload_length);
         }
-        writer.write_all(&self.write_buffer)?;
-        writer.flush()?;
         Ok(())
+    }
+
+    pub(crate) fn encoded(&self) -> &[u8] {
+        &self.write_buffer
     }
 }
 
@@ -1845,11 +1891,37 @@ pub fn validate_proof(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn holder_options_decode_the_legacy_scrollback_field() {
+        let mut legacy = serde_json::to_value(super::TerminalSpawnOptions::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("max_scrollback_bytes");
+        object.insert("max_scrollback".into(), serde_json::json!(10_000));
+        let options: super::TerminalSpawnOptions = serde_json::from_value(legacy).unwrap();
+        assert_eq!(options.max_scrollback_bytes, 10_000);
+    }
+
     use std::io::{Cursor, Read};
 
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn activity_ipc_preserves_failed_outcome_and_reason() {
+        let message = ServerMessage::ChatActivity {
+            chat_id: TerminalId::new(),
+            state: crate::agent::ActivityState::Idle,
+            generation: 42,
+            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "Provider exited with status 3".into() }),
+        };
+        let binary = postcard::to_stdvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&binary).unwrap();
+        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+        let json = serde_json::to_value(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+    }
 
     #[test]
     fn frame_codec_resumes_after_timeouts_inside_prefix_and_payload() {
@@ -1999,6 +2071,7 @@ mod tests {
         let next = RenderSnapshot {
             generation: 2,
             scroll: ScrollSnapshot {
+                history: Default::default(),
                 total: 100,
                 offset: 40,
                 len: 1,
@@ -2456,6 +2529,146 @@ mod tests {
             let error = validate_proof(supplied.as_ref(), &current).unwrap_err();
             assert_eq!(error.code, ProtocolErrorCode::ProofMismatch);
             assert!(!error.retryable);
+        }
+    }
+    #[test]
+    fn keypad_modifier_and_scroll_policy_round_trip_over_terminal_ipc() {
+        use super::super::{KeyAction, KeyInput, KeyModifiers, TerminalKey};
+        for key in [
+            TerminalKey::Unidentified,
+            TerminalKey::Backspace,
+            TerminalKey::Enter,
+            TerminalKey::Tab,
+            TerminalKey::Escape,
+            TerminalKey::Delete,
+            TerminalKey::Insert,
+            TerminalKey::Home,
+            TerminalKey::End,
+            TerminalKey::PageUp,
+            TerminalKey::PageDown,
+            TerminalKey::ArrowUp,
+            TerminalKey::ArrowDown,
+            TerminalKey::ArrowLeft,
+            TerminalKey::ArrowRight,
+            TerminalKey::Numpad0,
+            TerminalKey::Numpad1,
+            TerminalKey::Numpad2,
+            TerminalKey::Numpad3,
+            TerminalKey::Numpad4,
+            TerminalKey::Numpad5,
+            TerminalKey::Numpad6,
+            TerminalKey::Numpad7,
+            TerminalKey::Numpad8,
+            TerminalKey::Numpad9,
+            TerminalKey::NumpadAdd,
+            TerminalKey::NumpadBackspace,
+            TerminalKey::NumpadClear,
+            TerminalKey::NumpadClearEntry,
+            TerminalKey::NumpadComma,
+            TerminalKey::NumpadDecimal,
+            TerminalKey::NumpadDivide,
+            TerminalKey::NumpadEnter,
+            TerminalKey::NumpadEqual,
+            TerminalKey::NumpadMemoryAdd,
+            TerminalKey::NumpadMemoryClear,
+            TerminalKey::NumpadMemoryRecall,
+            TerminalKey::NumpadMemoryStore,
+            TerminalKey::NumpadMemorySubtract,
+            TerminalKey::NumpadMultiply,
+            TerminalKey::NumpadParenLeft,
+            TerminalKey::NumpadParenRight,
+            TerminalKey::NumpadSubtract,
+            TerminalKey::NumpadSeparator,
+            TerminalKey::NumpadUp,
+            TerminalKey::NumpadDown,
+            TerminalKey::NumpadRight,
+            TerminalKey::NumpadLeft,
+            TerminalKey::NumpadBegin,
+            TerminalKey::NumpadHome,
+            TerminalKey::NumpadEnd,
+            TerminalKey::NumpadInsert,
+            TerminalKey::NumpadDelete,
+            TerminalKey::NumpadPageUp,
+            TerminalKey::NumpadPageDown,
+            TerminalKey::AltLeft,
+            TerminalKey::AltRight,
+            TerminalKey::ControlLeft,
+            TerminalKey::ControlRight,
+            TerminalKey::SuperLeft,
+            TerminalKey::SuperRight,
+            TerminalKey::ShiftLeft,
+            TerminalKey::ShiftRight,
+            TerminalKey::CapsLock,
+            TerminalKey::NumLock,
+            TerminalKey::IntlBackslash,
+            TerminalKey::IntlRo,
+            TerminalKey::IntlYen,
+            TerminalKey::ContextMenu,
+            TerminalKey::Convert,
+            TerminalKey::KanaMode,
+            TerminalKey::NonConvert,
+            TerminalKey::Help,
+            TerminalKey::Fn,
+            TerminalKey::FnLock,
+            TerminalKey::PrintScreen,
+            TerminalKey::ScrollLock,
+            TerminalKey::Pause,
+            TerminalKey::BrowserBack,
+            TerminalKey::BrowserFavorites,
+            TerminalKey::BrowserForward,
+            TerminalKey::BrowserHome,
+            TerminalKey::BrowserRefresh,
+            TerminalKey::BrowserSearch,
+            TerminalKey::BrowserStop,
+            TerminalKey::Eject,
+            TerminalKey::LaunchApp1,
+            TerminalKey::LaunchApp2,
+            TerminalKey::LaunchMail,
+            TerminalKey::MediaPlayPause,
+            TerminalKey::MediaSelect,
+            TerminalKey::MediaStop,
+            TerminalKey::MediaTrackNext,
+            TerminalKey::MediaTrackPrevious,
+            TerminalKey::Power,
+            TerminalKey::Sleep,
+            TerminalKey::AudioVolumeDown,
+            TerminalKey::AudioVolumeMute,
+            TerminalKey::AudioVolumeUp,
+            TerminalKey::WakeUp,
+            TerminalKey::Copy,
+            TerminalKey::Cut,
+            TerminalKey::Paste,
+        ] {
+            let input = KeyInput {
+                action: KeyAction::Release,
+                key,
+                modifiers: KeyModifiers::default(),
+                text: None,
+                unshifted_codepoint: None,
+                scroll_to_bottom_on_input: false,
+            };
+            let encoded = postcard::to_allocvec(&input).unwrap();
+            assert_eq!(postcard::from_bytes::<KeyInput>(&encoded).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn decoded_clipboard_destinations_and_text_round_trip_over_terminal_ipc() {
+        for primary in [false, true] {
+            for text in ["", "hello", "界 é\n\0"] {
+                let event = WireTerminalEvent::ClipboardWrite {
+                    primary,
+                    text: text.to_owned(),
+                };
+                let bytes = postcard::to_allocvec(&event).unwrap();
+                assert_eq!(
+                    postcard::from_bytes::<WireTerminalEvent>(&bytes).unwrap(),
+                    event
+                );
+                assert!(
+                    matches!(TerminalEvent::from(event), TerminalEvent::ClipboardWrite { primary: actual, text: actual_text } if actual == primary && actual_text == text)
+                );
+            }
         }
     }
 }

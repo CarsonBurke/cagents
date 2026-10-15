@@ -5,6 +5,7 @@ use crate::daemon_health;
 pub(super) struct State {
     pub health: daemon_health::State,
     pub confirmation: bool,
+    pub requested_restart: bool,
     preparing: bool,
     restarting: bool,
     generation: u64,
@@ -17,6 +18,7 @@ pub(super) struct State {
 #[derive(Clone, Debug)]
 pub enum Action {
     Open,
+    OpenRequested,
     Cancel,
     Confirm,
     Prepared {
@@ -29,8 +31,9 @@ pub enum Action {
 impl Cagents {
     pub(super) fn update_daemon_health_ui(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Open
-                if self.daemon_health_ui.health.unavailable()
+            Action::Open | Action::OpenRequested
+                if (self.daemon_health_ui.health.unavailable()
+                    || matches!(action, Action::OpenRequested))
                     && !self.modal_is_open()
                     && !self.daemon_health_ui.restarting
                     && !crate::device::is_remote() =>
@@ -38,6 +41,7 @@ impl Cagents {
                 let state = &mut self.daemon_health_ui;
                 state.generation = state.generation.wrapping_add(1);
                 state.confirmation = true;
+                state.requested_restart = matches!(action, Action::OpenRequested);
                 state.preparing = true;
                 state.target = None;
                 state.error = None;
@@ -52,7 +56,7 @@ impl Cagents {
                         .and_then(|result| result.map(Arc::new).map_err(|error| error.to_string()));
                     Message::DaemonHealthUi(Action::Prepared { generation, target })
                 });
-                Task::batch([preparation, health_focus(0)])
+                Task::batch([preparation, self.modal_focus(health_focus_id(0))])
             }
             Action::Prepared { generation, target }
                 if self.daemon_health_ui.confirmation
@@ -64,8 +68,7 @@ impl Cagents {
                     Ok(target) => state.target = Some(target),
                     Err(error) => state.error = Some(error),
                 }
-                iced::widget::operation::focus(widget::Id::new("daemon-health.cancel"))
-                    .map(cosmic::Action::App)
+                self.modal_focus(widget::Id::new("daemon-health.cancel"))
             }
             Action::Cancel
                 if self.daemon_health_ui.confirmation && !self.daemon_health_ui.restarting =>
@@ -80,7 +83,8 @@ impl Cagents {
             Action::Confirm
                 if self.daemon_health_ui.confirmation
                     && !self.daemon_health_ui.restarting
-                    && self.daemon_health_ui.health.unavailable() =>
+                    && (self.daemon_health_ui.health.unavailable()
+                        || self.daemon_health_ui.requested_restart) =>
             {
                 let Some(target) = self.daemon_health_ui.target.take() else {
                     return Task::none();
@@ -113,7 +117,7 @@ impl Cagents {
                 }
                 if self.daemon_health_ui.confirmation {
                     self.daemon_health_ui.focus = 0;
-                    health_focus(0)
+                    self.modal_focus(health_focus_id(0))
                 } else {
                     self.daemon_health_restore_focus()
                 }
@@ -127,7 +131,7 @@ impl Cagents {
             .focused()
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-        iced::widget::operation::focus(target).map(cosmic::Action::App)
+        self.modal_restore_focus(target)
     }
     pub(super) fn adopt_daemon_health_keyboard_nav(&mut self, restore: bool) -> bool {
         if !self.daemon_health_ui.confirmation {
@@ -161,7 +165,8 @@ impl Cagents {
         if matches!(key, Named::Tab | Named::ArrowLeft | Named::ArrowRight) {
             let count = 1 + usize::from(
                 self.daemon_health_ui.target.is_some()
-                    && self.daemon_health_ui.health.unavailable(),
+                    && (self.daemon_health_ui.health.unavailable()
+                        || self.daemon_health_ui.requested_restart),
             );
             let backwards = modifiers.shift() || *key == Named::ArrowLeft;
             self.daemon_health_ui.focus = if backwards {
@@ -169,7 +174,7 @@ impl Cagents {
             } else {
                 (self.daemon_health_ui.focus + 1) % count
             };
-            return Some(health_focus(self.daemon_health_ui.focus));
+            return Some(self.modal_focus(health_focus_id(self.daemon_health_ui.focus)));
         }
         if *key == Named::Enter
             && !captured
@@ -239,8 +244,10 @@ impl Cagents {
             design::title(
                 if matches!(state.health, daemon_health::State::Incompatible { .. }) {
                     "Restart the incompatible daemon?"
-                } else {
+                } else if state.health.unavailable() {
                     "Restart the unresponsive daemon?"
+                } else {
+                    "Restart the daemon?"
                 },
             )
             .into(),
@@ -269,7 +276,9 @@ impl Cagents {
             crate::ui_controls::button::destructive("Restart daemon")
                 .id(widget::Id::new("daemon-health.confirm"))
                 .on_press_maybe(
-                    (state.target.is_some() && !state.restarting && state.health.unavailable())
+                    (state.target.is_some()
+                        && !state.restarting
+                        && (state.health.unavailable() || state.requested_restart))
                         .then_some(Message::DaemonHealthUi(Action::Confirm)),
                 ),
         ));
@@ -289,18 +298,18 @@ fn timestamp(time: std::time::SystemTime) -> String {
     unix_time_label(i64::try_from(millis).unwrap_or(i64::MAX))
 }
 
-fn health_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(if index == 1 {
+fn health_focus_id(index: usize) -> widget::Id {
+    widget::Id::new(if index == 1 {
         "daemon-health.confirm"
     } else {
         "daemon-health.cancel"
-    }))
-    .map(cosmic::Action::App)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::mouse;
     fn key(key: keyboard::key::Named) -> keyboard::Event {
         keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key.clone()),
@@ -312,6 +321,150 @@ mod tests {
             repeat: false,
         }
     }
+    #[test]
+    fn an_explicit_restart_request_keeps_confirmation_while_daemon_is_responsive() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.daemon_health_ui.health = daemon_health::State::Responsive;
+        drop(app.update_daemon_health_ui(Action::OpenRequested));
+        assert!(app.daemon_health_ui.confirmation);
+        drop(app.update(Message::DaemonHealth(daemon_health::State::Responsive)));
+        assert!(app.daemon_health_ui.confirmation);
+        drop(app.update_daemon_health_ui(Action::Confirm));
+        assert!(
+            !app.daemon_health_ui.restarting,
+            "unverified process ownership never restarts a daemon"
+        );
+        drop(app.update_daemon_health_ui(Action::Cancel));
+        assert!(!app.daemon_health_ui.confirmation);
+    }
+
+    #[test]
+    fn completed_lower_restart_cannot_restore_into_a_present_workspace_widget() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.daemon_health_ui.confirmation = true;
+        app.daemon_health_ui.restarting = true;
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        let current = widget::Id::new("dialog.reset-settings.confirm");
+        // Deliberately operate both surfaces: presence alone does not authorize
+        // a lower feature to move focus out of the surviving modal.
+        let root = app
+            .workspace
+            .focused()
+            .map(|card| app.card_keyboard_focus(card))
+            .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
+        let field = |id| -> Element<'_, Message> {
+            widget::text_input("", "")
+                .id(id)
+                .on_input(|_| Message::DismissStatus)
+                .into()
+        };
+        let content =
+            widget::column::with_children(vec![field(root), field(current.clone())]).into();
+        let feature = app.update_daemon_health_ui(Action::Finished(Ok(())));
+        assert!(!app.daemon_health_ui.confirmation);
+        assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
+        let completion = app.finish_modal_update(feature);
+        let task = iced::widget::operation::focus(current.clone())
+            .map(cosmic::Action::App)
+            .chain(completion);
+        assert_eq!(
+            super::super::tests::focused_element(content, task),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn lower_completion_cannot_enable_a_second_tab_owner_for_the_upper_dialog() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.finish_modal_update(Task::none()));
+        app.daemon_health_ui.confirmation = true;
+        app.daemon_health_ui.restarting = true;
+        app.daemon_health_ui.restore_keyboard_nav = Some(true);
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        app.settings_reset_focus_confirm = false;
+        app.core.set_keyboard_nav(false);
+        let opening = app.finish_modal_update(Task::none());
+        assert_eq!(
+            super::super::tests::focused_element(app.dialog().unwrap(), opening),
+            Some(widget::Id::new("dialog.reset-settings.cancel"))
+        );
+        drop(app.update(Message::DaemonHealthUi(Action::Finished(Ok(())))));
+        assert!(
+            app.core.keyboard_nav(),
+            "the lower feature restored the ordinary Cosmic subscription"
+        );
+        let renderer = super::super::tests::headless_renderer();
+        for (backwards, repeat, expected) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let mut event = key(keyboard::key::Named::Tab);
+            if let keyboard::Event::KeyPressed {
+                modifiers,
+                repeat: repeated,
+                ..
+            } = &mut event
+            {
+                *modifiers = if backwards {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                };
+                *repeated = repeat;
+            }
+            let captured = {
+                let mut dialog = app.dialog().unwrap();
+                let mut tree = Tree::new(&dialog);
+                let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
+                let node = dialog.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+                );
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                dialog.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Keyboard(event.clone()),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &bounds,
+                );
+                shell.is_event_captured()
+            };
+            assert!(
+                captured,
+                "Cosmic's ignored-key subscription must not receive this Tab, including repeats"
+            );
+            let task = app.update(Message::KeyEvent { event, captured });
+            assert_eq!(app.settings_reset_focus_confirm, expected);
+            if !repeat {
+                assert_eq!(
+                    super::super::tests::focused_element(app.dialog().unwrap(), task),
+                    Some(widget::Id::new(if expected {
+                        "dialog.reset-settings.confirm"
+                    } else {
+                        "dialog.reset-settings.cancel"
+                    }))
+                );
+            }
+        }
+        drop(app.update(Message::CancelResetSettings));
+        assert!(!app.modal_is_open());
+        assert!(
+            app.core.keyboard_nav(),
+            "the final pop restores the original workspace choice, not the upper dialog's suppressed restore flag"
+        );
+    }
+
     #[test]
     fn protocol_mismatch_offers_reviewed_restart_without_stopping_anything() {
         let mut app = super::super::tests::context_inspector_test_app(false);
