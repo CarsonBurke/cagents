@@ -4348,7 +4348,8 @@ impl RepositoryRuntime {
             }
             _ => false,
         };
-        available && (self.source_surface == SourceSurface::Editor || self.editable_working_diff())
+        available && !self.search_mode
+            && (self.source_surface == SourceSurface::Editor || self.editable_working_diff())
     }
 
     /// Undoes or redoes one step in the open buffer.
