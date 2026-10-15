@@ -1533,12 +1533,14 @@ fn preflight_inner(
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(holder) = self
-            .retained_native
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
+        let retained = match self.retained_native.try_lock() {
+            Ok(mut owner) => owner.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+            // The actor still owns this Arc/guard. Its existing owner remains
+            // responsible; final frontend destruction cannot wait for it.
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(holder) = retained {
             native_reconcile::retire_final(holder);
         }
         let _ = self
@@ -6923,12 +6925,15 @@ mod tests {
         handle.close().unwrap();
         let (worker, release, finished) = worker_blocked_in_tls_destruction();
         *handle.0.worker.lock().unwrap() = Some(worker);
+        let shared_native = handle.0.retained_native.clone();
+        let held_native = shared_native.lock().unwrap();
         let started = Instant::now();
         drop(handle);
         assert!(
             started.elapsed() < Duration::from_secs(1),
-            "destruction must not join a TLS destructor even if is_finished returned true"
+            "destruction must not join a TLS destructor or wait for actor-owned native metadata"
         );
+        drop(held_native);
         assert!(
             finished.try_recv().is_err(),
             "dropping the frontend is not proof that cleanup finished"
