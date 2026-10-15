@@ -6,7 +6,7 @@
 
 use crate::{
     fs_safety,
-    process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
+    process::{CancellationToken, ProcessExecutor, SystemProcessExecutor},
     repository::{GitFileLock, RepositoryService},
 };
 use serde::{Deserialize, Serialize};
@@ -157,16 +157,12 @@ fn git(
     cancel: &CancellationToken,
 ) -> Result<crate::process::ProcessOutput, SetupError> {
     check_cancel(cancel)?;
-    let spec = CommandSpec::new("git")
-        .cwd(primary)
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-        ])
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    // Share the repository service's invocation boundary: inherited Git
+    // redirection variables must never select another clone or index.
+    let spec = RepositoryService::system("git")
+        .git_base(primary, true)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args);
     SystemProcessExecutor.execute(&spec, cancel).map_err(error)
 }
 
@@ -388,7 +384,7 @@ pub fn prepare(
     let mut pending = found.iter().peekable();
     while pending.peek().is_some() {
         check_cancel(cancel)?;
-        let mut args: Vec<OsString> = ["--literal-pathspecs", "ls-files", "--cached", "-z", "--"]
+        let mut args: Vec<OsString> = ["ls-files", "--cached", "-z", "--"]
             .map(OsString::from)
             .into();
         let mut size = 0;
@@ -837,6 +833,59 @@ mod tests {
         );
         assert!(!fixture.destination.join("should-not-exist").exists());
         assert!(fixture.destination.join("tracked").exists());
+    }
+
+    #[test]
+    fn inherited_git_environment_cannot_redirect_setup() {
+        const CHILD_PRIMARY: &str = "CAGENTS_SETUP_TEST_PRIMARY";
+        const CHILD_DESTINATION: &str = "CAGENTS_SETUP_TEST_DESTINATION";
+        const MARKER: &str = "SETUP_ENV_BOUNDARY_VERIFIED";
+        if let Some(primary) = std::env::var_os(CHILD_PRIMARY) {
+            let primary = PathBuf::from(primary);
+            let destination = PathBuf::from(std::env::var_os(CHILD_DESTINATION).unwrap());
+            let plan = load(&primary).unwrap().unwrap();
+            let cancel = CancellationToken::new();
+            assert!(!is_trusted(&primary, &plan, &cancel).unwrap());
+            assert!(matches!(
+                prepare(&primary, &destination, &plan, false, &cancel),
+                Err(SetupError::TrustRequired)
+            ));
+            // Explicit approval here must update this clone, not inherited GIT_DIR.
+            trust(&primary, &plan, &cancel).unwrap();
+            let prepared = prepare(&primary, &destination, &plan, false, &cancel).unwrap();
+            assert_eq!(prepared.copied, [PathBuf::from(".env")]);
+            assert_eq!(prepared.skipped_paths[0].path, PathBuf::from("tracked"));
+            assert!(!destination.join("tracked").exists());
+            println!("{MARKER}");
+            return;
+        }
+        let fixture = Fixture::new();
+        let other = Fixture::new();
+        let config = "copy = ['.env', 'tracked']\nsetup = 'printf setup'";
+        fixture.config(config);
+        let other_plan = other.config(config);
+        trust(&other.primary, &other_plan, &CancellationToken::new()).unwrap();
+        fs::write(fixture.primary.join(".env"), "secret").unwrap();
+        fs::write(fixture.primary.join("tracked"), "must not restore deleted tracked file").unwrap();
+        fs::remove_file(fixture.destination.join("tracked")).unwrap();
+        // Isolate environment mutation in a subprocess so other parallel tests
+        // never inherit these intentionally hostile redirections.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree_setup::tests::inherited_git_environment_cannot_redirect_setup",
+                "--nocapture",
+            ])
+            .env(CHILD_PRIMARY, &fixture.primary)
+            .env(CHILD_DESTINATION, &fixture.destination)
+            .env("GIT_DIR", other.primary.join(".git"))
+            .env("GIT_WORK_TREE", &other.primary)
+            .env("GIT_COMMON_DIR", other.primary.join(".git"))
+            .env("GIT_INDEX_FILE", fixture._directory.path().join("missing-index"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains(MARKER));
     }
 
     #[test]
