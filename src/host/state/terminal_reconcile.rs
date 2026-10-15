@@ -11,8 +11,9 @@ fn issued_source(saved: &TerminalSession, requested: &TerminalSession) -> bool {
     if requested.continuity.live_proof().as_ref() != Some(&proof) { return false; }
     let mut candidate = saved.clone();
     candidate.continuity = requested.continuity.clone();
-    if &candidate == requested { return true; }
-    candidate.resume_hint = crate::model::agent_recovery::observed_hint_from_launch(&candidate.launch);
+    // Foreground-agent hints are observations of the same PTY, excluded from
+    // the existing cleanup digest too. They do not choose a resume recipe here.
+    candidate.resume_hint = requested.resume_hint.clone();
     &candidate == requested
 }
 
@@ -103,7 +104,9 @@ mod tests {
         let mut requested = saved.clone();
         requested.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
         assert!(issued_source(&saved, &requested));
-        for mutation in 0..6 {
+        requested.resume_hint = Some("observed-codex-thread-inside-original-shell".into());
+        assert!(issued_source(&saved, &requested), "a foreground observation does not change the original PTY owner");
+        for mutation in 0..8 {
             let mut forged = requested.clone();
             match mutation {
                 0 => forged.launch.program = "/unrelated/program".into(),
@@ -111,6 +114,8 @@ mod tests {
                 2 => forged.launch.working_directory = "/unrelated/cwd".into(),
                 3 => { forged.launch.environment.insert("ACCOUNT_HOME".into(), "/unrelated/account".into()); },
                 4 => forged.id = TerminalId::new(),
+                5 => { forged.launch.unset_environment.insert("ACCOUNT_HOME".into()); },
+                6 => forged.owned_codex_listener = Some(crate::chat::OwnedCodexListener { socket: "/unrelated/listener".into(), allocator: proof.clone() }),
                 _ => forged.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: crate::model::HostIncarnation::new("unissued-proof") },
             }
             assert!(!issued_source(&saved, &forged), "accepted mutation {mutation}");

@@ -1080,6 +1080,9 @@ fn close_hosted_terminal_source_at(path: &Path, terminal: TerminalId, proof: &Ho
         if let Some(source) = source {
             let mut current = descriptor.session.clone();
             current.continuity = source.continuity.clone();
+            // The same root shell can gain a foreground agent observation.
+            // Recipe, account, listener and every worker identity stay exact.
+            current.resume_hint = source.resume_hint.clone();
             if source.continuity.live_proof().as_ref() != Some(proof) || current != *source {
                 return Ok(CloseOutcome::Unreachable("The terminal's saved source changed. Its current process was preserved; reconnect before closing it.".into()));
             }
@@ -1134,6 +1137,7 @@ mod paired_close_regression {
                 descriptor.session.owned_codex_listener = Some(crate::chat::OwnedCodexListener { socket: "/private/native.sock".into(), allocator: proof.clone() });
             }
             let intent = CloseIntent { card: CardId::new(), terminal: id, proof: proof.clone(), completed_source: None, live_source: Some(descriptor.session.clone()), generation: 1, restore_card: None, pending: true, active: false, dont_ask_again: false, detail: None, focus: 0, restore_keyboard_nav: false };
+            descriptor.session.resume_hint = Some("new-foreground-observation".into());
             if stale_source { descriptor.session.launch.arguments.push("different-current-recipe".into()); }
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
