@@ -19,6 +19,12 @@ impl AdoptionFailures {
         self.0.is_empty()
     }
 
+    /// A known unresolved owner prevents logical removal. This is only a
+    /// conservative refusal signal; an ID never authorizes process cleanup.
+    pub(in crate::host) fn contains_id(&self, id: TerminalId) -> bool {
+        self.0.iter().any(|failure| failure.id == id)
+    }
+
     const LIMIT: usize = 128;
     const MESSAGE_BYTES: usize = 4096;
 

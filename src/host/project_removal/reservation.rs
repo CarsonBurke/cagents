@@ -299,6 +299,25 @@ pub(crate) fn reserve(
     reserved
         .sessions
         .extend(selected.iter().map(|selected| selected.source.id()));
+    // A missing installed actor is not proof that its retained provider died.
+    // Fail the entire roster before the first close; leave its saved pane and
+    // project reachable for explicit recovery/cleanup. Foreign pending owners
+    // remain outside this project's reservation.
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &reserved.sessions {
+            if state.native_adoption_failures.contains_id(*id)
+                || state.native_closing.contains_key(id)
+                || state.chat_handoffs.contains_key(id)
+                || state.chat_bindings.contains_key(id)
+                || (!state.chats.contains_key(id) && state.upgrade_chats.contains_key(id)) {
+                return Err(error(format!("Session {id} retains unresolved provider ownership or a pending handoff. Reconnect or close that pane explicitly, then retry. No project sessions were closed.")));
+            }
+        }
+        if state.execution_startups.iter().any(|(id,(source,_))| reserved.panes.contains(&CardId::from_uuid(id.as_uuid())) || reserved.qualifies(source)) {
+            return Err(error("An accepted session in this project still retains startup or cleanup ownership. Resolve its pane before removing the project; no sessions were closed."));
+        }
+    }
     let entries = entries(host);
     let token = uuid::Uuid::new_v4();
     {

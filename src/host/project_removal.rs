@@ -732,6 +732,30 @@ mod tests {
     }
 
     #[test]
+    fn known_unhosted_native_owner_refuses_before_healthy_close_and_foreign_owner_does_not() {
+        use crate::{agent::Provider, chat::{self, Launch}, upgrade::handoff::Chat};
+        for foreign in [false,true] {
+            let mut fixture = Fixture::new(); let healthy = fixture.spawn(crate::model::TerminalId::new());
+            let root = if foreign { let path=fixture._directory.path().join("foreign"); std::fs::create_dir(&path).unwrap(); path } else { fixture.root.clone() };
+            let thread=uuid::Uuid::new_v4().to_string();
+            let mut recipe=LaunchRecipe::shell(root.clone()).unwrap(); recipe.program="claude".into(); recipe.arguments=vec!["--resume".into(),thread.clone()];
+            let source = chat::Session { id:crate::model::TerminalId::new(), launch:Launch { provider:Provider::Claude,session_id:Some(thread),recipe },proof:Some(fixture.host.lock().unwrap().proof().clone()),terminal:None,native_continuity:Default::default(),owned_codex_listener:None };
+            {
+                let mut state=fixture.host.lock().unwrap();
+                if foreign { state.edit_model(1,ModelEdit::OpenProject {repository:root.clone(),checkout:None,primary_checkout:None,name:"Foreign".into(),kind:ProjectKind::Folder}).unwrap(); }
+                state.edit_model(1,ModelEdit::SeedView {scope:Scope::Worktree {repository:root.clone(),path:root.clone()},panes:vec![crate::workspace_model::views::Pane {id:crate::model::CardId::new(),title:"Retained native".into(),user_title:None,pending_terminal_start:false,width_fraction:0.5,kind:crate::model::CardKind::Chat(source.clone()),scope:Some(root.clone())}],closed:vec![]}).unwrap();
+                state.native_adoption_failures.remember_upgrade(&Chat {launch:source.launch.clone(),source:source.clone(),previous_sources:vec![]},"Retained provider history cannot be read");
+                assert!(!state.chats.contains_key(&source.id));
+            }
+            let result=fixture.request(fixture.expected.clone(),vec![healthy]);
+            if foreign { assert!(result.is_ok()); assert!(fixture.handles[0].is_completed()); }
+            else { assert!(result.unwrap_err().message.contains("unresolved provider ownership")); assert!(!fixture.handles[0].is_completed()); assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&fixture.root).is_some()); }
+            assert!(fixture.host.lock().unwrap().native_adoption_failures.contains_id(source.id),"the uncertain retained owner must remain reachable for its own explicit cleanup");
+            assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn unrelated_valid_source_refuses_the_entire_project_roster() {
         let mut fixture = Fixture::new();
         let own = fixture.spawn(crate::model::TerminalId::new());
