@@ -1137,7 +1137,8 @@ fn create_console_with_restart(
     }
     let mut retained_before = session.clone();
     retained_before.launch.session_id = handle.confirmed_session_id();
-    chat::protocol::align_resume_identity(&mut retained_before.launch)?;
+    // Published source argv is immutable; the thin console has its own exact
+    // launch. Retained helper aliases must never be rewritten into resume argv.
     retained_before.native_continuity = handle.native_continuity();
     let terminal = crate::model::TerminalSession {
         id: session.id,
