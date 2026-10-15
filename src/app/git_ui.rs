@@ -3449,6 +3449,57 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_repository_load_publishes_new_linked_merge_and_metadata_error() {
+        const TEST: &str = "app::git_ui::tests::duplicate_repository_load_publishes_new_linked_merge_and_metadata_error";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        use crate::repository::GitOperationKind;
+        for failed_metadata in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("repository");
+            let baseline = fixture(&root);
+            let key = ActiveWorktreeKey { project_id: ProjectId::new(),
+                worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+            let mut app = app_with_status_snapshot(baseline, &key);
+            let original = app.sidebar_model.projects[0].worktrees[0].clone();
+            let linked = directory.path().join("linked");
+            git(&root, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+            let binding = RepositoryService::system("git").discover(&linked, &CancellationToken::default()).unwrap();
+            fs::write(binding.git_dir.join("MERGE_HEAD"), fs::read(root.join(".git/refs/heads/main")).unwrap()).unwrap();
+            if failed_metadata { fs::write(binding.git_dir.join("MERGE_MSG"), [0xff]).unwrap(); }
+            else { fs::write(binding.git_dir.join("MERGE_MSG"), "Merge fixture\n").unwrap(); }
+            let provisional = ProjectId::new();
+            app.repository_generations.insert(provisional, 20);
+            let loaded = super::super::tests::task_app_message(app.repository_read_task(
+                linked.clone(), provisional, 20, false, Some(ProjectKind::Git)));
+            let id = match &loaded {
+                Message::RepositoryLoaded { result: Ok(loaded), .. } => {
+                    let (record, status) = loaded.worktrees.iter().find(|(record, _)| record.path == linked).unwrap();
+                    assert!(!status.as_ref().unwrap().dirty.is_dirty(), "clean index still has operation display state");
+                    assert_eq!(loaded.operations[&record.id].is_err(), failed_metadata);
+                    record.id
+                }
+                _ => panic!("actual duplicate loader did not complete"),
+            };
+            drop(app.update(loaded));
+            assert_eq!(app.sidebar_model.projects.len(), 1);
+            let project = &app.sidebar_model.projects[0];
+            assert_eq!(project.id, key.project_id);
+            assert_eq!(project.worktrees.iter().find(|row| row.id == key.worktree_id).unwrap(), &original);
+            let row = project.worktrees.iter().find(|row| row.id == id).unwrap();
+            assert!(row.status_error.is_none());
+            assert_eq!(row.operation_error.is_some(), failed_metadata);
+            if !failed_metadata {
+                assert_eq!(row.operation, Some(GitOperationKind::Merge));
+                assert!(row.status_tooltip_for_test().contains("Merge in progress"));
+            } else { assert!(row.status_tooltip_for_test().contains("operation metadata unavailable")); }
+            let entry = &app.refresh_ui.git.entries[&key.project_id];
+            assert_eq!(entry.generation, 9);
+            assert_eq!(entry.snapshot.worktrees.len(), 1, "duplicate presentation does not replace watcher ownership");
+            assert!(!app.repository_generations.contains_key(&provisional));
+        }
+    }
+
+    #[test]
     fn duplicate_repository_load_preserves_new_linked_row_status_error_detail() {
         const TEST: &str = "app::git_ui::tests::duplicate_repository_load_preserves_new_linked_row_status_error_detail";
         if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
