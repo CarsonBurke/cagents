@@ -24,7 +24,7 @@ fn isolated() -> bool {
     }
     let root = tempfile::Builder::new().prefix("cagents-paired-upgrade-")
         .tempdir_in("/var/tmp").unwrap().keep();
-    for name in ["home", "run", "data", "config", "cache"] {
+    for name in ["home", "run", "data", "config", "cache", "state"] {
         fs::create_dir(root.join(name)).unwrap();
         fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -36,6 +36,11 @@ fn isolated() -> bool {
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("CODEX_HOME").env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("PI_CODING_AGENT_DIR").env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE").env_remove("PI_CONFIG_DIR")
         .timeout(Duration::from_secs(60)).output_limits(128 * 1024, 128 * 1024);
     let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
     fs::write(root.join("stdout.log"), &output.stdout).unwrap();
@@ -158,11 +163,21 @@ fn run_pair(mode: &str) {
     fs::create_dir(&home).unwrap();
     let socket = cwd.join("codex.sock");
     let peer = Peer::start(&socket, home.clone(), cwd.clone());
+    // Select the complete fixture runtime configuration before publishing the
+    // terminal. Foreground observation includes these account/runtime fields;
+    // an omitted inherited HOME or PATH would itself be a genuine recipe drift.
+    let mut environment: BTreeMap<String, String> = [
+        "HOME", "PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+    ].into_iter().map(|name| (name.to_owned(), std::env::var(name).unwrap())).collect();
+    if let Some(path) = crate::agent_execution::bundled::matched_path(environment.get("PATH").map(String::as_str)) {
+        environment.insert("PATH".into(), path);
+    }
+    environment.insert("CODEX_HOME".into(), home.display().to_string());
     let fresh = LaunchRecipe {
         program: executable.to_string_lossy().into_owned(),
         arguments: vec!["--remote".into(), format!("unix://{}", socket.display())],
         working_directory: cwd.clone(),
-        environment: BTreeMap::from([("CODEX_HOME".into(), home.display().to_string())]),
+        environment,
         unset_environment: Default::default(),
     };
     let exact = crate::model::agent_recovery::bind_session(&fresh, ID).unwrap();
