@@ -49,6 +49,73 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())
 }
+/// Private durable provenance for a managed terminal pane whose ended
+/// presentation intentionally no longer contains a live attachment proof.
+/// Older ended panes are never backfilled from a terminal ID or launch recipe.
+pub(super) fn migrate_terminal_sources(db: &Connection) -> Result<(), String> {
+    let tx=rusqlite::Transaction::new_unchecked(db,rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+    let current:u32=tx.pragma_query_value(None,"user_version",|row| row.get(0)).map_err(|error| error.to_string())?;
+    if current<13 {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS shared_view_terminal_sources(
+            pane TEXT PRIMARY KEY REFERENCES shared_view_panes(id) ON DELETE CASCADE,
+            source TEXT NOT NULL, ended TEXT NOT NULL
+        ) STRICT; PRAGMA user_version=13;").map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn ended_terminal(session: &crate::model::TerminalSession) -> bool {
+    use crate::model::TerminalContinuity;
+    match &session.continuity {
+        TerminalContinuity::RelaunchAvailable { recipe,last_exit:Some(_) } => recipe==&session.launch,
+        TerminalContinuity::Exited { .. } => true,
+        _ => false,
+    }
+}
+
+/// Only presentation metadata may accompany the end or change afterward.
+/// Clone-and-compare conservatively keeps any future identity fields fixed too.
+fn same_terminal_identity(before: &crate::model::TerminalSession, after: &crate::model::TerminalSession) -> bool {
+    let mut expected=before.clone();
+    expected.continuity=after.continuity.clone();
+    expected.resume_hint=after.resume_hint.clone();
+    expected.transcript_path=after.transcript_path.clone();
+    expected==*after
+}
+
+fn terminal_source(db: &Connection, id: crate::model::CardId) -> Result<Option<(crate::model::TerminalSession,crate::model::TerminalSession)>,String> {
+    let raw:Option<(String,String)>=db.query_row("SELECT source,ended FROM shared_view_terminal_sources WHERE pane=?1",[id.to_string()],|row| Ok((row.get(0)?,row.get(1)?)))
+        .optional().map_err(|error| error.to_string())?;
+    raw.map(|(source,ended)| Ok((serde_json::from_str(&source).map_err(|error| error.to_string())?,serde_json::from_str(&ended).map_err(|error| error.to_string())?))).transpose()
+}
+fn write_terminal_source(db: &Connection, id: crate::model::CardId, source: &crate::model::TerminalSession, ended: &crate::model::TerminalSession) -> Result<(),String> {
+    db.execute("INSERT INTO shared_view_terminal_sources(pane,source,ended) VALUES(?1,?2,?3)
+        ON CONFLICT(pane) DO UPDATE SET source=excluded.source,ended=excluded.ended",
+        params![id.to_string(),serde_json::to_string(source).map_err(|error| error.to_string())?,serde_json::to_string(ended).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn update_terminal_source(db: &Connection,id:crate::model::CardId,claimed_before:&crate::model::CardKind,before:Option<&crate::model::CardKind>,after:Option<&crate::model::CardKind>) -> Result<(),String> {
+    use crate::model::CardKind;
+    if before==after { return Ok(()); }
+    if before==Some(claimed_before) {
+        if let (Some(CardKind::Terminal(before)),Some(CardKind::Terminal(after)))=(before,after) {
+            if same_terminal_identity(before,after) && ended_terminal(after) {
+                if before.continuity.live_proof().is_some_and(|proof| proof.is_complete()) {
+                    return write_terminal_source(db,id,before,after);
+                }
+                if before.continuity==after.continuity {
+                    if let Some((source,ended))=terminal_source(db,id)? {
+                        if ended==*before { return write_terminal_source(db,id,&source,after); }
+                    }
+                }
+            }
+        }
+    }
+    db.execute("DELETE FROM shared_view_terminal_sources WHERE pane=?1",[id.to_string()]).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn key(scope: &Scope) -> Result<String, String> {
     serde_json::to_string(scope).map_err(|error| error.to_string())
 }
@@ -144,9 +211,19 @@ pub(super) fn retire_agent(
             .console
             .as_ref()
             .is_some_and(|source| HostedSession::Terminal(source.clone()).same_process(&current));
-    if !retained {
-        return Ok(false);
-    }
+    let retained=if retained { true } else if let CardKind::Terminal(ended)=&pane.kind {
+        let original=agent.session.iter().filter_map(|source| match source { HostedSession::Terminal(session)=>Some(session),_=>None }).chain(agent.console.iter()).collect::<Vec<_>>();
+        if !ended_terminal(ended) || !original.iter().any(|source| source.id==ended.id && source.launch==ended.launch) { false }
+        else if let Some((source,recorded_ended))=terminal_source(db,id)? {
+            if &recorded_ended!=ended {
+                return Err("Cannot safely retire the ended managed terminal pane: its current descriptor has no exact retained generation proof".into());
+            }
+            original.iter().any(|retained| HostedSession::Terminal((**retained).clone()).same_process(&HostedSession::Terminal(source.clone())))
+        } else {
+            return Err("Cannot safely retire the ended managed terminal pane: historical generation proof is unavailable; the pane was retained and no retirement was guessed".into());
+        }
+    } else { false };
+    if !retained { return Ok(false); }
     view.apply(&Change::Remove { id })?;
     view.revision = view
         .revision
@@ -275,6 +352,13 @@ pub(super) fn apply(
                 }
                 Change::Update { pane, .. } if resource_owner(transaction, pane)?.is_some() => {
                     false
+                }
+                Change::Update { before,pane } => {
+                    let previous=view.panes.iter().find(|current| current.id==pane.id).map(|current| current.kind.clone());
+                    let changed=view.apply(change)?;
+                    let current=view.panes.iter().find(|current| current.id==pane.id).map(|current| &current.kind);
+                    update_terminal_source(transaction,pane.id,&before.kind,previous.as_ref(),current)?;
+                    changed
                 }
                 Change::Remove { id } => {
                     transaction
