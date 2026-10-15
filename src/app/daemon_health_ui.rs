@@ -341,6 +341,51 @@ mod tests {
     }
 
     #[test]
+    fn lower_completion_cannot_enable_a_second_tab_owner_for_the_upper_dialog() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.daemon_health_ui.confirmation = true;
+        app.daemon_health_ui.restarting = true;
+        app.daemon_health_ui.restore_keyboard_nav = Some(true);
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        app.settings_reset_focus_confirm = false;
+        app.core.set_keyboard_nav(false);
+        let opening = app.finish_modal_update(Task::none());
+        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), opening),
+            Some(widget::Id::new("dialog.reset-settings.cancel")));
+        drop(app.update(Message::DaemonHealthUi(Action::Finished(Ok(())))));
+        assert!(app.core.keyboard_nav(), "the lower feature restored the ordinary Cosmic subscription");
+        let renderer = super::super::tests::headless_renderer();
+        for (backwards, repeat, expected) in [(false, false, true), (true, false, false), (false, true, false)] {
+            let mut event = key(keyboard::key::Named::Tab);
+            if let keyboard::Event::KeyPressed { modifiers, repeat: repeated, .. } = &mut event {
+                *modifiers = if backwards { keyboard::Modifiers::SHIFT } else { keyboard::Modifiers::empty() };
+                *repeated = repeat;
+            }
+            let captured = {
+                let mut dialog = app.dialog().unwrap();
+                let mut tree = Tree::new(&dialog);
+                let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
+                let node = dialog.as_widget_mut().layout(&mut tree, &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, bounds.size()));
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                dialog.as_widget_mut().update(&mut tree, &iced::Event::Keyboard(event.clone()),
+                    Layout::new(&node), mouse::Cursor::Unavailable, &renderer, &mut clipboard::Null, &mut shell, &bounds);
+                shell.is_event_captured()
+            };
+            assert!(captured, "Cosmic's ignored-key subscription must not receive this Tab, including repeats");
+            let task = app.update(Message::KeyEvent { event, captured });
+            assert_eq!(app.settings_reset_focus_confirm, expected);
+            if !repeat {
+                assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task),
+                    Some(widget::Id::new(if expected { "dialog.reset-settings.confirm" } else { "dialog.reset-settings.cancel" })));
+            }
+        }
+    }
+
+    #[test]
     fn protocol_mismatch_offers_reviewed_restart_without_stopping_anything() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         drop(

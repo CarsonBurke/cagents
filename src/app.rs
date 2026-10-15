@@ -11778,16 +11778,6 @@ impl Cagents {
             .or_else(|| self.parked_chat_restart_blocker())
     }
 
-    fn primary_dirty_close_control(&self, card: CardId) -> DirtyCloseControl {
-        match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) if runtime.can_save() => DirtyCloseControl::Save,
-            Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes() => {
-                DirtyCloseControl::Discard
-            }
-            _ => DirtyCloseControl::Cancel,
-        }
-    }
-
     fn begin_dirty_close(
         &mut self,
         intent: DirtyCloseIntent,
@@ -11805,7 +11795,7 @@ impl Cagents {
         // while dirty-close is topmost; Cancel re-checks the live modal tree
         // and uses this only when none remains.
         let restore_card = self.workspace.focused();
-        let focused = self.primary_dirty_close_control(card);
+        let focused = DirtyCloseControl::Cancel;
         self.dirty_repository_close = Some(DirtyRepositoryClose {
             card,
             remaining: cards,
@@ -11836,7 +11826,7 @@ impl Cagents {
         if matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         {
             let card = close.card;
-            let focused = self.primary_dirty_close_control(card);
+            let focused = DirtyCloseControl::Cancel;
             close.focused = focused;
             self.dirty_repository_close = Some(close);
             return self.modal_focus(dirty_close_control_id(card, focused));
@@ -11844,7 +11834,7 @@ impl Cagents {
         if let Some(card) = close.next_unresolved(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         }) {
-            let focused = self.primary_dirty_close_control(card);
+            let focused = DirtyCloseControl::Cancel;
             close.focused = focused;
             self.dirty_repository_close = Some(close);
             return self.modal_focus(dirty_close_control_id(
@@ -16808,6 +16798,7 @@ impl Application for Cagents {
         ))
         })();
         dialog.map(|dialog| {
+            let dialog = if top.owns_tab() { crate::interaction::modal_tabs(dialog) } else { dialog };
             crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top))
         })
     }

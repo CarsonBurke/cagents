@@ -29,6 +29,13 @@ pub(super) enum Modal {
     Approval,
 }
 
+impl Modal {
+    pub(super) fn owns_tab(self) -> bool {
+        matches!(self, Self::Approval | Self::Recovery | Self::Health
+            | Self::SettingsReset | Self::TerminalClose | Self::DirtyClose)
+    }
+}
+
 /// Feature requests keep their original identity without lossy conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Instance {
@@ -920,6 +927,23 @@ mod tests {
             ),
             Some(fallback)
         );
+    }
+
+    #[test]
+    fn dirty_close_open_and_retry_keep_the_focused_control_on_cancel() {
+        let mut app = app();
+        let card = app.workspace.focused().unwrap();
+        let (runtime, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let opening = app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card]));
+        assert_eq!(app.dirty_repository_close.as_ref().unwrap().focused, DirtyCloseControl::Cancel);
+        let cancel = dirty_close_control_id(card, DirtyCloseControl::Cancel);
+        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), opening), Some(cancel.clone()));
+        // An unsuccessful save/close leaves the same confirmation present;
+        // resetting it must not silently move onto Save or Discard.
+        let retry = app.advance_dirty_close();
+        assert_eq!(app.dirty_repository_close.as_ref().unwrap().focused, DirtyCloseControl::Cancel);
+        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), retry), Some(cancel));
     }
 
     #[test]
