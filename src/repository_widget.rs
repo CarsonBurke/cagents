@@ -3055,7 +3055,7 @@ impl RepositoryRuntime {
     /// replacement and no-op touches are distinguished by the later hash.
     pub fn refresh_open_document(&mut self, card: CardId) -> Task<RepositoryAction> {
         let DocumentState::Editable(document) = &self.document else { return Task::none(); };
-        if document.active_save.is_some() || self.disk_poll.is_some() { return Task::none(); }
+        if self.is_read_only_source() || document.workspace_edit.is_some() || document.active_save.is_some() || self.disk_poll.is_some() { return Task::none(); }
         let source = document.source.clone();
         let identity = self.current_identity(card, document.path.clone());
         let worktree = identity.worktree.clone(); let path = identity.path.clone();
@@ -3075,7 +3075,9 @@ impl RepositoryRuntime {
             && !matches!(self.diff_basis, DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })
     }
 
-    pub fn observes_open_sources(&self) -> bool { self.has_editable_document() || self.has_live_comparison() }
+    pub fn observes_open_sources(&self) -> bool {
+        !self.is_read_only_source() && !self.workspace_edit_pending() && (self.has_editable_document() || self.has_live_comparison())
+    }
 
     /// Shared document and Git-metadata fallback for both editor frontends.
     /// Unchanged comparisons perform no Git commands or diff rebuilds.
@@ -3193,6 +3195,7 @@ impl RepositoryRuntime {
     }
 
     fn reload_disk_version(&mut self, card: CardId, version: crate::editor_reload::Version) -> Task<RepositoryAction> {
+        if self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
         let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
         let cursor = document.content.cursor(); let scroll = document.content.scroll_position();
         document.saved_text = version.text;
@@ -4306,6 +4309,11 @@ impl RepositoryRuntime {
         if plan.edits.is_empty() && plan.before != plan.after {
             changes.push(document.content.replacement_to_text(&plan.after).ok_or("This buffer cannot represent the server edit safely")?);
         }
+        // A read admitted before the transaction must not replace or configure
+        // the frozen buffer after publication. Its old callback has no slot.
+        document.external_check_pending = false;
+        self.disk_poll = None;
+        self.disk_stamp = None;
         document.workspace_edit = Some((ticket, changes));
         Ok(())
     }
@@ -5363,7 +5371,11 @@ impl RepositoryRuntime {
     }
 
     fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
-        if self.workspace_edit_pending() && matches!(&action, RepositoryAction::FileLoaded { .. }) { return Task::none(); }
+        if self.workspace_edit_pending() && matches!(&action,
+            RepositoryAction::FileLoaded { .. } | RepositoryAction::ConfiguredFileLoaded { .. }
+            | RepositoryAction::DiskMetadata { .. } | RepositoryAction::DiskLoaded { .. }
+            | RepositoryAction::DiskComparisonLoaded { .. } | RepositoryAction::KeepMine { .. }
+            | RepositoryAction::CompareDisk { .. }) { return Task::none(); }
         if matches!(
             &action,
             RepositoryAction::Save { .. }
