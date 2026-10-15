@@ -245,10 +245,10 @@ async fn run_event_loop(
                 if let Some(change) = change {
                     if change.get().await? {
                         atspi_bus = Some(Bus::new(&session_bus, executor).await?);
-                        if atspi_bus.is_some() {
-                            retry.attempts = 0;
-                        }
                     }
+                    // Disabled accessibility is a healthy connection too;
+                    // a later outage must start a fresh warning/backoff cycle.
+                    retry.attempts = 0;
                 } else {
                     return Err(zbus::Error::Failure("Accessibility status stream closed".into()));
                 }
