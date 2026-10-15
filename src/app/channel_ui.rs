@@ -896,7 +896,7 @@ impl Cagents {
                         continue;
                     };
                     has_panes = true;
-                    if allow_previews {
+                    if allow_previews && state.has_card_update(*id) {
                         let session = match &card.kind {
                             CardKind::Chat(session) => Some(session.id),
                             CardKind::Terminal(session) => Some(session.id),

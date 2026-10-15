@@ -252,7 +252,8 @@ fn settings_category_controls<'a>(
                         crate::settings_widgets::toggle_enabled(
                             label,
                             draft.notifications.get(field),
-                            field == Field::Enabled || draft.notifications.get(Field::Enabled),
+                            matches!(field, Field::Enabled | Field::MessagePreviews)
+                                || draft.notifications.get(Field::Enabled),
                             move |enabled| Message::SettingsChanged {
                                 field: SettingsField::Notifications(field),
                                 value: enabled.to_string(),

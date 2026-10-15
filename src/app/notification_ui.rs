@@ -98,6 +98,9 @@ impl State {
 
     pub(super) fn acknowledge(&mut self, id: uuid::Uuid) {
         if self.acknowledged.insert(id) {
+            // Explicit local reads must retire their excerpt immediately,
+            // including while the broker acknowledgement is disconnected.
+            self.previews.retain(|_, preview| preview.notice != id);
             self.changed(|pending| {
                 pending.acknowledged.insert(id);
             });
@@ -632,6 +635,60 @@ mod tests {
         notice.acknowledged = true;
         drop(app.update_notifications(Action::Snapshot(snapshot(notice))));
         assert!(!app.notification_ui.previews.contains_key(&session));
+    }
+
+    #[test]
+    fn notification_channel_preview_moves_to_unread_card_before_broker_reply() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = false;
+        app.settings.notifications.message_previews = true;
+        let first = app.durable.cards[0].clone();
+        let second = crate::app::tests::terminal_card_state();
+        let sessions = [card_session(&first).unwrap(), card_session(&second).unwrap()];
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project, RepositoryId::new(), "Fixture".into(), "/repo".into(),
+            Vec::new(), Vec::new(),
+        ));
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(second.clone());
+        durable.channels.push(ProjectChannel {
+            title_source: Default::default(), id: channel, project_id: project,
+            title: "Shared channel".into(), ordinal: 0, shared: false,
+            cards: vec![first.id, second.id], focused: Some(first.id),
+        });
+        let notices = sessions.into_iter().zip(["First unread result", "Second unread result"])
+            .map(|(session, text)| {
+                let mut event = crate::notifications::Event::session(
+                    session, Provider::Codex, "/repo".into(),
+                    crate::notifications::Evidence { key: text.into(), kind: crate::notifications::Kind::Succeeded },
+                );
+                event.content = Some(crate::notifications::Content {
+                    conversation: "Fixture conversation".into(), preview: text.into(), request: None,
+                });
+                crate::notifications::Notice {
+                    id: uuid::Uuid::new_v4(), event, delivered: true,
+                    acknowledged: false, window: None,
+                }
+            }).collect::<Vec<_>>();
+        let snapshot = Snapshot { notices, diagnostic: None };
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+        assert!(app.sidebar_model.projects[0].channels[0].tooltip_for_test().contains("First unread result"));
+        drop(app.mark_cards_read(vec![first.id]));
+        assert!(!app.sidebar_state.has_card_update(first.id));
+        assert!(app.sidebar_state.has_card_update(second.id));
+        assert!(!app.notification_ui.previews.contains_key(&sessions[0]));
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert!(row.tooltip_for_test().contains("Second unread result"));
+        assert!(!row.tooltip_for_test().contains("First unread result"));
+        // An older broker snapshot can arrive before the queued ACK commits.
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        assert!(!app.sidebar_state.has_card_update(first.id));
+        assert!(app.sidebar_state.has_card_update(second.id));
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert!(row.tooltip_for_test().contains("Second unread result"));
+        assert!(!row.tooltip_for_test().contains("First unread result"));
     }
 
     fn live_session(app: &mut Cagents) -> TerminalSession {
