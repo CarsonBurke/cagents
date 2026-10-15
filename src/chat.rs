@@ -486,6 +486,18 @@ pub enum NativeContinuity {
     Durable {
         provider_version: String,
     },
+    /// The exact Claude stream reducer, Store and pipes belong to a retained
+    /// actor. Its provider may not have published a session ID yet. This shape
+    /// never grants adoption authority; the host authenticates the helper.
+    RetainedClaudeActor {
+        protocol: u32,
+    },
+}
+
+impl NativeContinuity {
+    pub fn retains_provider(&self) -> bool {
+        matches!(self, Self::Durable { .. } | Self::RetainedClaudeActor { .. })
+    }
 }
 
 /// Account recovery changes only account selection. It never changes the
@@ -674,6 +686,13 @@ impl Session {
     pub fn has_valid_native_continuity(&self) -> bool {
         match &self.native_continuity {
             NativeContinuity::ReconnectOnly => true,
+            NativeContinuity::RetainedClaudeActor { protocol } => {
+                *protocol == 1
+                    && self.launch.provider == Provider::Claude
+                    && self.owned_codex_listener.is_none()
+                    && self.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete)
+                    && self.launch.session_id.as_ref().is_none_or(|id| uuid::Uuid::parse_str(id).is_ok())
+            }
             NativeContinuity::Durable { provider_version } => {
                 self.owns_codex_listener()
                     && self
@@ -700,7 +719,7 @@ impl Session {
         let (Some(old), Some(new)) = (&previous.terminal, &self.terminal) else {
             return false;
         };
-        matches!(previous.native_continuity, NativeContinuity::Durable { .. })
+        previous.native_continuity.retains_provider()
             && self.native_continuity == previous.native_continuity
             && self.has_valid_native_continuity()
             && previous
@@ -2114,6 +2133,36 @@ pub enum Event {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_claude_shape_is_typed_and_never_relaxes_codex_durability() {
+        use super::*;
+        let mut session = Session { id: crate::model::TerminalId::new(),
+            launch: Launch { provider: Provider::Claude, recipe: crate::model::LaunchRecipe {
+                program: "claude".into(), arguments: Vec::new(), working_directory: "/fixture".into(),
+                environment: Default::default(), unset_environment: Default::default(),
+            }, session_id: None }, terminal: None, owned_codex_listener: None,
+            proof: Some(crate::model::HostSessionProof { host_session_id: "host".into(), boot_id: "boot".into(), host_incarnation: "actor-owner".into() }),
+            native_continuity: NativeContinuity::RetainedClaudeActor { protocol: 1 } };
+        assert!(session.has_valid_native_continuity(), "an unnamed issued actor can persist before its first provider result");
+        assert!(!session.is_unstarted(), "an installed actor is never an empty draft");
+        assert_eq!(postcard::from_bytes::<Session>(&postcard::to_stdvec(&session).unwrap()).unwrap(), session);
+        session.launch.session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        assert!(session.has_valid_native_continuity());
+        for field in 0..5 {
+            let mut changed = session.clone();
+            match field {
+                0 => changed.proof = None,
+                1 => changed.proof.as_mut().unwrap().host_incarnation = "".into(),
+                2 => changed.launch.provider = Provider::Codex,
+                3 => changed.native_continuity = NativeContinuity::RetainedClaudeActor { protocol: 2 },
+                _ => changed.launch.session_id = Some("not-an-exact-claude-uuid".into()),
+            }
+            assert!(!changed.has_valid_native_continuity(), "changed retained actor shape field {field}");
+        }
+        session.native_continuity = NativeContinuity::Durable { provider_version: "claude-stream-json/actor-v1".into() };
+        assert!(!session.has_valid_native_continuity(), "Codex numeric listener contract remains separate");
+    }
+
     #[test]
     fn terminal_provider_outcomes_and_diagnostics_round_trip_without_losing_reason() {
         use crate::agent::ActivityOutcome;
