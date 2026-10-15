@@ -508,19 +508,8 @@ impl<'a> RowContext<'a> {
         let unified = runtime.diff_mode == DiffMode::Inline;
         let editable = matches!(runtime.document, DocumentState::Editable(_));
         let can_open = !runtime.is_saving() && (editable || !runtime.blocks_navigation());
-        let changed = runtime
-            .selected_diff_range()
-            .and_then(|range| {
-                runtime.diff_model().map(|model| match runtime.diff_mode {
-                    DiffMode::Inline => model.inline_rows.iter().enumerate().any(|(row, line)| {
-                        range.contains(&row) && line.kind != DiffRowKind::Context
-                    }),
-                    DiffMode::Split => model.split_rows.iter().enumerate().any(|(row, line)| {
-                        range.contains(&row) && line.kind != DiffRowKind::Context
-                    }),
-                })
-            })
-            .unwrap_or(false);
+        let changed = runtime.diff_interaction.selection.zip(runtime.diff_model())
+            .is_some_and(|(selection,model)| selection.has_changes(model));
         let Some(source) = runtime.diff_source_key() else {
             return content;
         };
