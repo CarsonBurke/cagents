@@ -50,7 +50,7 @@ pub(super) fn entry() -> Option<Result<(), String>> {
             .map_err(|_| "Cannot flush source inspection receipt".to_string())?;
         stdout
             .flush()
-            .map_err(|_| "Cannot flush source inspection receipt")
+            .map_err(|_| "Cannot flush source inspection receipt".to_string())
     })())
 }
 
