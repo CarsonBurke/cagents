@@ -127,7 +127,9 @@ impl Stream {
         // At most StringEscape -> Introducer -> Ground examines it again.
         loop {
             #[cfg(test)]
-            { self.steps += 1; }
+            {
+                self.steps += 1;
+            }
             match self.escape {
                 Escape::Ground => {
                     if character == '\x1b' {
@@ -144,7 +146,10 @@ impl Stream {
                         ']' | 'P' | 'X' | '^' | '_' => Escape::String,
                         '\x20'..='\x2f' => Escape::Intermediates,
                         '\x30'..='\x7e' => Escape::Ground,
-                        _ => { self.escape = Escape::Ground; continue; }
+                        _ => {
+                            self.escape = Escape::Ground;
+                            continue;
+                        }
                     };
                     return false;
                 }
@@ -154,23 +159,38 @@ impl Stream {
                         self.escape = Escape::CsiIntermediates;
                         return false;
                     }
-                    '\x40'..='\x7e' => { self.escape = Escape::Ground; return false; }
+                    '\x40'..='\x7e' => {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
                     _ => self.escape = Escape::Ground,
                 },
                 Escape::CsiIntermediates => match character {
                     '\x20'..='\x2f' => return false,
-                    '\x40'..='\x7e' => { self.escape = Escape::Ground; return false; }
+                    '\x40'..='\x7e' => {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
                     _ => self.escape = Escape::Ground,
                 },
                 Escape::Intermediates => match character {
                     '\x20'..='\x2f' => return false,
-                    '\x30'..='\x7e' => { self.escape = Escape::Ground; return false; }
+                    '\x30'..='\x7e' => {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
                     _ => self.escape = Escape::Ground,
                 },
                 Escape::String => match character {
-                    '\x07' => { self.escape = Escape::Ground; return false; }
+                    '\x07' => {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
                     '\n' => self.escape = Escape::Ground,
-                    '\x1b' => { self.escape = Escape::StringEscape; return false; }
+                    '\x1b' => {
+                        self.escape = Escape::StringEscape;
+                        return false;
+                    }
                     _ => return false,
                 },
                 Escape::StringEscape => {
@@ -400,14 +420,54 @@ mod tests {
         let parameters = "123456789;".repeat(1024);
         let intermediates = " ".repeat(8192);
         let cases = [
-            ("\x1b]", string_payload.as_str(), Escape::String, "\x1b\\visible"),
-            ("\x1bP", string_payload.as_str(), Escape::String, "\x07visible"),
-            ("\x1bX", string_payload.as_str(), Escape::String, "\nvisible"),
-            ("\x1b^", string_payload.as_str(), Escape::String, "\x1b\\visible"),
-            ("\x1b_", string_payload.as_str(), Escape::String, "\x07visible"),
-            ("\x1b[", parameters.as_str(), Escape::CsiParameters, "mvisible"),
-            ("\x1b[ ", intermediates.as_str(), Escape::CsiIntermediates, "mvisible"),
-            ("\x1b(", intermediates.as_str(), Escape::Intermediates, "Bvisible"),
+            (
+                "\x1b]",
+                string_payload.as_str(),
+                Escape::String,
+                "\x1b\\visible",
+            ),
+            (
+                "\x1bP",
+                string_payload.as_str(),
+                Escape::String,
+                "\x07visible",
+            ),
+            (
+                "\x1bX",
+                string_payload.as_str(),
+                Escape::String,
+                "\nvisible",
+            ),
+            (
+                "\x1b^",
+                string_payload.as_str(),
+                Escape::String,
+                "\x1b\\visible",
+            ),
+            (
+                "\x1b_",
+                string_payload.as_str(),
+                Escape::String,
+                "\x07visible",
+            ),
+            (
+                "\x1b[",
+                parameters.as_str(),
+                Escape::CsiParameters,
+                "mvisible",
+            ),
+            (
+                "\x1b[ ",
+                intermediates.as_str(),
+                Escape::CsiIntermediates,
+                "mvisible",
+            ),
+            (
+                "\x1b(",
+                intermediates.as_str(),
+                Escape::Intermediates,
+                "Bvisible",
+            ),
         ];
         for (prefix, payload, pending, terminator) in cases {
             let mut stream = Stream::default();
@@ -429,22 +489,42 @@ mod tests {
                 shown.push_str(&stream.push(character.encode_utf8(&mut encoded)));
                 characters += 1;
             }
-            assert_eq!(shown, if terminator.starts_with('\n') { "\nvisible" } else { "visible" });
+            assert_eq!(
+                shown,
+                if terminator.starts_with('\n') {
+                    "\nvisible"
+                } else {
+                    "visible"
+                }
+            );
             assert_eq!(stream.escape, Escape::Ground);
-            assert!(stream.steps <= 3 * characters,
-                "discarded payload must never be scanned again at a later delta");
+            assert!(
+                stream.steps <= 3 * characters,
+                "discarded payload must never be scanned again at a later delta"
+            );
         }
     }
 
     #[test]
     fn incomplete_grammar_recovers_like_whole_output_for_every_ascii_byte() {
-        for prefix in ["\x1b", "\x1b[12", "\x1b[ ", "\x1b(", "\x1b]hidden", "\x1b]hidden\x1b"] {
+        for prefix in [
+            "\x1b",
+            "\x1b[12",
+            "\x1b[ ",
+            "\x1b(",
+            "\x1b]hidden",
+            "\x1b]hidden\x1b",
+        ] {
             for byte in 0..=127u8 {
                 let tail = format!("{}tail\n", char::from(byte));
                 let expected = display(format!("{prefix}{tail}"));
                 let mut stream = Stream::default();
                 assert!(stream.push(prefix).is_empty());
-                assert_eq!(stream.push(&tail), expected, "prefix {prefix:?}, byte {byte}");
+                assert_eq!(
+                    stream.push(&tail),
+                    expected,
+                    "prefix {prefix:?}, byte {byte}"
+                );
             }
         }
     }
