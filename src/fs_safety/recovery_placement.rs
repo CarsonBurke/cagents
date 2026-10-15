@@ -225,14 +225,14 @@ mod tests {
 
     #[test]
     fn recovery_self_bind_mount_child() {
-        let Some(root) = std::env::var_os("CAGENTS_TEST_RECOVERY_BIND_ROOT") else { return; };
+        let Some(case_path) = std::env::var_os("CAGENTS_TEST_RECOVERY_BIND_ROOT") else { return; };
         // The helper may mount only in the two fresh namespaces created by its
         // owning unshare child, never in the caller's original namespace.
         let original_mount = std::env::var("CAGENTS_TEST_RECOVERY_MOUNT_NS").unwrap().parse::<u64>().unwrap();
         let original_user = std::env::var("CAGENTS_TEST_RECOVERY_USER_NS").unwrap().parse::<u64>().unwrap();
         assert_ne!(fs::metadata("/proc/self/ns/mnt").unwrap().ino(), original_mount);
         assert_ne!(fs::metadata("/proc/self/ns/user").unwrap().ino(), original_user);
-        let case_root = PathBuf::from(root);
+        let case_root = PathBuf::from(case_path);
         let cache = case_root.join("repo/cache");
         let target = cache.join("self");
         let source_name = c_path(&cache).unwrap();
