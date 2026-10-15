@@ -3416,6 +3416,13 @@ impl Application for Editor {
                     });
                     Task::batch([task, self.drain(card)])
                 }
+                Message::Repository(RepositoryAction::CapturedCommand { target, action }) => {
+                    let card = action.card();
+                    let action = self.tab(card).and_then(|tab| {
+                        tab.runtime.resolve_captured_command(&target, *action)
+                    });
+                    action.map_or_else(Task::none, |action| self.update(Message::Repository(action)))
+                }
                 Message::Repository(RepositoryAction::Review { card, action }) => {
                     self.handle_review(card, action)
                 }
@@ -8336,6 +8343,42 @@ mod tests {
         assert!(app.tab(id).is_some());
         assert!(app.tab_is_untitled(app.tab(id).unwrap()));
         assert!(app.pending_save_as.is_some());
+    }
+
+    #[test]
+    fn captured_native_stage_reaches_the_standalone_git_handler() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        let mut app = editor();
+        let card = open_real_git(&mut app, root, Some("tracked.txt"));
+        let tab = app.tab(card).unwrap();
+        let action = tab.runtime.diff_presentation_action(card, cagents::repository_widget::DiffPresentationCommand::StageFile).expect("working file is stageable");
+        let target = Arc::new(tab.runtime.command_target(card));
+        let task = app.update(Message::Repository(RepositoryAction::CapturedCommand { target, action: Box::new(action) }));
+        assert_eq!(app.tab(card).unwrap().mutation, Some(MutationKind::Stage));
+        run_tasks(&mut app, task);
+        assert!(app.tab(card).unwrap().mutation.is_none());
+        assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "tracked.txt");
+    }
+
+    #[test]
+    fn captured_native_save_reaches_the_standalone_save_as_handler() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let card = app.active.unwrap();
+        load_selected(&mut app, card);
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction {
+            card,
+            action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('x')),
+        })));
+        let tab = app.tab(card).unwrap();
+        let action = tab.runtime.editor_surface_command_action(card, cagents::repository_widget::EditorSurfaceCommand::Save).expect("dirty source can save");
+        let target = Arc::new(tab.runtime.command_target(card));
+        drop(app.update(Message::Repository(RepositoryAction::CapturedCommand { target, action: Box::new(action) })));
+        assert!(app.pending_save_as.is_some(), "captured Save dispatches through the host");
+        assert!(app.tab_is_untitled(app.tab(card).unwrap()));
     }
 
     #[test]

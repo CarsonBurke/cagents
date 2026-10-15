@@ -4377,9 +4377,34 @@ impl RepositoryRuntime {
                 self.editor_command_capabilities() & bit != 0
             }
             RepositoryAction::OpenExternal { editor_id, .. } => self.can_open_external() && self.external_editors.iter().any(|editor| editor.id == *editor_id),
+            RepositoryAction::Save { overwrite, .. } => self.can_save() && (!overwrite || matches!(&self.document, DocumentState::Editable(document) if document.conflict)),
+            RepositoryAction::Reload { .. } => !self.is_saving() && matches!(&self.document, DocumentState::Editable(document) if document.conflict || document.durability_warning.is_some()),
+            RepositoryAction::DiscardEdits { .. } => self.can_discard_edits(),
+            RepositoryAction::ApplyMarkdownMode { preview, .. } => self.can_apply_markdown_mode(*preview),
+            RepositoryAction::ApplySourceSurface { diff: true, .. } => self.can_show_diff(),
+            RepositoryAction::ApplySourceSurface { diff: false, .. } => matches!(self.editor_surface_command_action(card, EditorSurfaceCommand::Preview), Some(RepositoryAction::ApplySourceSurface { diff: false, .. })),
+            RepositoryAction::ApplyDiffMode { split, .. } => self.diff_presentation_available(if *split { DiffPresentationCommand::Split } else { DiffPresentationCommand::Unified }),
+            RepositoryAction::ToggleDiffWhitespace { .. } => self.diff_presentation_available(DiffPresentationCommand::IgnoreWhitespace),
+            RepositoryAction::ApplyDiffBasis { basis: DiffBasis::IndexToWorktree, .. } => self.diff_presentation_available(DiffPresentationCommand::Working),
+            RepositoryAction::ApplyDiffBasis { basis: DiffBasis::HeadToIndex, .. } => self.diff_presentation_available(DiffPresentationCommand::Staged),
+            RepositoryAction::SelectCommittedBasis { choice, .. } => self.diff_presentation_available(match choice { CommittedChoice::Branch => DiffPresentationCommand::Branch, CommittedChoice::LastCommit => DiffPresentationCommand::History }),
+            RepositoryAction::StageSelected { stage, .. } => self.diff_presentation_available(if *stage { DiffPresentationCommand::StageFile } else { DiffPresentationCommand::UnstageFile }),
+            RepositoryAction::RevertFile { .. } => matches!(self.diff_presentation_action(card, DiffPresentationCommand::Revert), Some(RepositoryAction::RevertFile { .. })),
+            RepositoryAction::RetryDiff { .. } => self.diff_presentation_available(DiffPresentationCommand::Retry),
+            RepositoryAction::PreviousChange { .. } => self.can_step_change(false),
+            RepositoryAction::NextChange { .. } => self.can_step_change(true),
             _ => false,
         };
         available.then_some(action)
+    }
+
+    /// Capture an emitted native control's current document. Availability probes
+    /// and keyboard dispatch keep using their allocation-free, bare actions.
+    fn capture_toolbar_action(&self, action: RepositoryAction) -> RepositoryAction {
+        RepositoryAction::CapturedCommand {
+            target: Arc::new(self.command_target(action.card())),
+            action: Box::new(action),
+        }
     }
 
     pub fn menu_identity(&self) -> RepositoryMenuIdentity {
@@ -9236,7 +9261,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             && (!editable || !editing)
             && (file_information || runtime.can_apply_markdown_mode(true)),
     )
-    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Preview));
+    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Preview).map(|action| runtime.capture_toolbar_action(action)));
     let preview = if editable {
         preview
     } else {
@@ -9244,7 +9269,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     };
     let edit = icon_button(Icon::Edit, "Edit file")
         .selected(editable && editing && runtime.can_apply_markdown_mode(false))
-        .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Edit));
+        .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Edit).map(|action| runtime.capture_toolbar_action(action)));
     let edit = if editable {
         edit.id(focus_restore_id(card))
     } else {
@@ -9257,7 +9282,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             icon_button(Icon::Diff, "View diff")
                 .selected(runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff())
                 .on_press_maybe(
-                    runtime.editor_surface_command_action(card, EditorSurfaceCommand::Diff),
+                    runtime.editor_surface_command_action(card, EditorSurfaceCommand::Diff).map(|action| runtime.capture_toolbar_action(action)),
                 )
                 .into(),
         ])];
@@ -9272,7 +9297,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 "Discard unsaved edits (Ctrl+Z restores them)",
             )
             .on_press_maybe(
-                runtime.editor_surface_command_action(card, EditorSurfaceCommand::DiscardEdits),
+                runtime.editor_surface_command_action(card, EditorSurfaceCommand::DiscardEdits).map(|action| runtime.capture_toolbar_action(action)),
             )
             .into(),
         );
@@ -9288,7 +9313,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 },
             )
             .selected(runtime.is_dirty())
-            .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Save))
+            .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Save).map(|action| runtime.capture_toolbar_action(action)))
             .into(),
         );
     }
@@ -9318,7 +9343,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                         label,
                     ),
                 )
-                .on_press_maybe(runtime.diff_presentation_action(card, command))
+                .on_press_maybe(runtime.diff_presentation_action(card, command).map(|action| runtime.capture_toolbar_action(action)))
                 .into(),
             );
         }
@@ -9374,7 +9399,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             icon(editor),
             format!("Open in {} · right-click for other editors", editor.name),
         )
-        .on_press_maybe(runtime.external_editor_command(card, Some(&editor.id)));
+        .on_press_maybe(runtime.external_editor_command(card, Some(&editor.id)).map(|action| runtime.capture_toolbar_action(action)));
         if runtime.is_saving() {
             secondary.push(button.into());
         } else {
@@ -9945,7 +9970,7 @@ fn editable_document_view<'a>(
             actions.push(
                 icon_button(Icon::Refresh, "Reload file from disk")
                     .on_press_maybe(
-                        runtime.editor_surface_command_action(card, EditorSurfaceCommand::Reload),
+                        runtime.editor_surface_command_action(card, EditorSurfaceCommand::Reload).map(|action| runtime.capture_toolbar_action(action)),
                     )
                     .into(),
             );
@@ -9953,13 +9978,13 @@ fn editable_document_view<'a>(
         if document.conflict {
             actions.push(
                 icon_button(Icon::Save, "Overwrite conflicting file on disk")
-                    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Overwrite))
+                    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Overwrite).map(|action| runtime.capture_toolbar_action(action)))
                     .into(),
             );
         } else if document.durability_warning.is_some() {
             actions.push(
                 icon_button(Icon::Save, "Retry save")
-                    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Save))
+                    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Save).map(|action| runtime.capture_toolbar_action(action)))
                     .into(),
             );
         }
@@ -10355,6 +10380,11 @@ fn registered_diff_control<'a>(
         || tooltip.to_string(),
         |command| registered_command_hint(runtime, command, &tooltip),
     );
+    let action = if command.is_some() {
+        action.map(|action| runtime.capture_toolbar_action(action))
+    } else {
+        action
+    };
     labelled_diff_control(label, tooltip, selected, action)
 }
 
@@ -10650,7 +10680,7 @@ fn diff_review_controls(
                     "Retry diff",
                 ),
             )
-            .on_press(action)
+            .on_press(runtime.capture_toolbar_action(action))
             .into(),
         ]));
     }
@@ -12953,9 +12983,13 @@ mod tests {
                 );
             }
             drop(toolbar);
-            let action = messages
+            let emitted = messages
                 .pop()
                 .expect("actual toolbar click emits its basis action");
+            let RepositoryAction::CapturedCommand { target, action } = emitted else {
+                panic!("native basis button must retain its document");
+            };
+            let action = runtime.resolve_captured_command(&target, *action).expect("unchanged basis target is current");
             assert!(messages.is_empty());
             match (&action, command) {
                 (
@@ -12990,6 +13024,106 @@ mod tests {
             }
             drop(runtime.update(action));
             assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        }
+    }
+
+    fn click_native_repository_control(
+        mut element: Element<'_, RepositoryAction>,
+        label: &str,
+    ) -> RepositoryAction {
+        use cosmic::iced::advanced::{Layout, Shell, layout, mouse, widget::Tree};
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(1600.0, 720.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let point = {
+            let accessible = element.as_widget().a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+            let button = accessible.root().iter().chain(accessible.children())
+                .find(|entry| entry.node().label().is_some_and(|name| name.starts_with(label)))
+                .unwrap_or_else(|| panic!("native control {label} is mounted"));
+            assert!(!button.node().is_disabled(), "{label} is enabled");
+            let bounds = button.node().bounds().unwrap();
+            iced::Point::new(((bounds.x0 + bounds.x1) / 2.0) as f32, ((bounds.y0 + bounds.y1) / 2.0) as f32)
+        };
+        let mut messages = Vec::new();
+        for event in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left), iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
+            element.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node), mouse::Cursor::Available(point), &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+        }
+        let action = messages.pop().expect("native click emits its action");
+        assert!(messages.is_empty());
+        action
+    }
+
+    #[test]
+    fn emitted_native_save_and_discard_cannot_target_a_replacement_dirty_document() {
+        let card = CardId::new();
+        for label in ["Save unsaved changes", "Discard unsaved edits"] {
+            let original = RepositoryRuntime::dirty_fixture(card);
+            let emitted = click_native_repository_control(selected_file_toolbar(card, &original).unwrap(), label);
+            let RepositoryAction::CapturedCommand { target, action } = emitted else { panic!("toolbar keeps its displayed source"); };
+            assert!(original.resolve_captured_command(&target, *action.clone()).is_some(), "unchanged control remains usable");
+            let mut replacement = RepositoryRuntime::dirty_fixture_at(card, "replacement.md".into());
+            let before = replacement.editor_text().unwrap();
+            assert!(replacement.resolve_captured_command(&target, *action.clone()).is_none());
+            drop(replacement.update(RepositoryAction::CapturedCommand { target, action }));
+            assert_eq!(replacement.editor_text().as_deref(), Some(before.as_str()));
+            assert!(replacement.is_dirty());
+            assert!(!replacement.is_saving());
+        }
+    }
+
+    #[test]
+    fn emitted_native_file_stage_and_primary_editor_keep_the_original_target() {
+        let card = CardId::new();
+        let (mut original, _) = RepositoryRuntime::open_fixture(card, "source.rs", "source\n");
+        original.selected.as_mut().unwrap().unstaged = true;
+        original.set_external_editors(vec![crate::sidebar::SidebarEditor { id: "chosen".into(), name: "Chosen".into(), icon: "editor".into() }]);
+        for label in ["Stage file changes", "Open in Chosen"] {
+            let emitted = click_native_repository_control(selected_file_toolbar(card, &original).unwrap(), label);
+            let RepositoryAction::CapturedCommand { target, action } = emitted else { panic!("native file action retains displayed source"); };
+            assert!(original.resolve_captured_command(&target, *action.clone()).is_some());
+            let replacement = RepositoryRuntime::dirty_fixture_at(card, "replacement.md".into());
+            assert!(replacement.resolve_captured_command(&target, *action).is_none());
+        }
+    }
+
+    #[test]
+    fn emitted_native_recovery_controls_revalidate_conflict_and_document() {
+        let card = CardId::new();
+        let mut original = RepositoryRuntime::dirty_fixture(card);
+        let DocumentState::Editable(document) = &mut original.document else { unreachable!() };
+        document.conflict = true;
+        document.error = Some("outside file changed".into());
+        for label in ["Reload file from disk", "Overwrite conflicting file on disk"] {
+            let DocumentState::Editable(document) = &original.document else { unreachable!() };
+            let emitted = click_native_repository_control(editable_document_view(card, &original, document), label);
+            let RepositoryAction::CapturedCommand { target, action } = emitted else { panic!("recovery keeps displayed source"); };
+            assert!(original.resolve_captured_command(&target, *action.clone()).is_some());
+            let replacement = RepositoryRuntime::dirty_fixture_at(card, "replacement.md".into());
+            assert!(replacement.resolve_captured_command(&target, *action.clone()).is_none());
+            let DocumentState::Editable(document) = &mut original.document else { unreachable!() };
+            document.conflict = false;
+            assert!(original.resolve_captured_command(&target, *action).is_none(), "repaired condition retires recovery command");
+            let DocumentState::Editable(document) = &mut original.document else { unreachable!() };
+            document.conflict = true;
+        }
+    }
+
+    #[test]
+    fn emitted_native_diff_controls_keep_model_and_document_authority() {
+        let card = CardId::new();
+        let (mut original, _) = diff_runtime(card);
+        load_fresh_diff(&mut original, card, two_change_model());
+        for label in ["Stage", "Revert", "Ignore whitespace", "Working", "Staged", "Branch", "History", "Unified", "Split", "Next"] {
+            let emitted = click_native_repository_control(selected_file_toolbar(card, &original).unwrap(), label);
+            let RepositoryAction::CapturedCommand { target, action } = emitted else { panic!("{label} retains displayed diff"); };
+            assert!(original.resolve_captured_command(&target, *action.clone()).is_some(), "{label} current positive");
+            let replacement = RepositoryRuntime::dirty_fixture_at(card, "replacement.md".into());
+            assert!(replacement.resolve_captured_command(&target, *action).is_none(), "{label} stale refusal");
         }
     }
 
