@@ -67,6 +67,10 @@ pub(crate) fn publish_actor_close(record:&Record,proof:&HostSessionProof,source:
     save(&path(record.terminal,&record.holder)?,&receipt)
 }
 
+pub(crate) fn actor_close_proved(record:&Record,proof:&HostSessionProof)->Result<bool,String> {
+    consume(record.terminal,&record.holder,true,|receipt|receipt.record==*record&&receipt.proof==*proof)
+}
+
 fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
     let parent = path
         .parent()

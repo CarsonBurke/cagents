@@ -52,6 +52,9 @@ enum ActorCommand {
     CloseIfIdle {
         generation: u64,
     },
+    CloseIfRevision {
+        revision: u64,
+    },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     Interrupt {
         run: Option<crate::model::RunId>,
@@ -116,6 +119,27 @@ pub(crate) enum Update {
 #[derive(Clone)]
 pub(super) struct LocalHandle(Arc<Inner>);
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CloseObservation {
+    pub actor_id: uuid::Uuid,
+    pub close_revision: u64,
+    pub turn_generation: u64,
+    pub activity: ActivityState,
+    pub ready: bool,
+    pub exited: bool,
+    pub completed: bool,
+    pub closing: bool,
+    pub owns_work: bool,
+    pub working_directory: std::path::PathBuf,
+}
+
+struct CloseState {
+    actor_id: uuid::Uuid,
+    revision: u64,
+    admitted_work: bool,
+    working_directory: std::path::PathBuf,
+}
+
 struct OwnedSocket(std::path::PathBuf);
 impl Drop for OwnedSocket {
     fn drop(&mut self) {
@@ -137,6 +161,7 @@ struct Inner {
     urgent_commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
+    close_state: Arc<Mutex<CloseState>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -302,6 +327,7 @@ impl LocalHandle {
             ..Snapshot::default()
         }));
         let visible = Arc::new(AtomicBool::new(false));
+        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,working_directory:spec.working_directory.clone()}));
         let observe_next = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
@@ -323,6 +349,7 @@ impl LocalHandle {
             urgent_commands,
             wake: Mutex::new(wake),
             state: state.clone(),
+            close_state: close_state.clone(),
             confirmed_session: confirmed_session.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
@@ -365,6 +392,7 @@ impl LocalHandle {
                     native_installed: native_installed.clone(),
                     adapter,
                     state,
+                    close_state,
                     confirmed_session,
                     store,
                     visible,
@@ -745,6 +773,26 @@ impl LocalHandle {
 
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
         self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
+        self.close()
+    }
+
+    /// Small resident census; never hydrates transcript windows or opens disk.
+    pub(crate) fn close_observation(&self) -> CloseObservation {
+        let owns_work=self.owns_work();
+        let state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
+        let close=self.0.close_state.lock().unwrap_or_else(|p|p.into_inner());
+        let activity=if (close.admitted_work || !state.queued.is_empty()) && !state.exited {ActivityState::Working} else {state.activity()};
+        CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready,exited:state.exited,completed:self.is_completed(),closing:self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire),owns_work,working_directory:close.working_directory.clone()}
+    }
+
+    /// The actor compares consent with all earlier admitted commands before
+    /// fencing further work. Call outside HostLock; joining may take time.
+    pub(crate) fn close_if_revision(&self, revision:u64) -> Result<(),String> {
+        if self.is_completed() {
+            if self.close_observation().close_revision!=revision {return Err("Provider work changed before conditional close".into());}
+        } else {
+            self.ownership_command(ActorCommand::CloseIfRevision {revision})?;
+        }
         self.close()
     }
 
@@ -1663,6 +1711,7 @@ struct Actor {
     native_installed: Arc<AtomicBool>,
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
+    close_state: Arc<Mutex<CloseState>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
@@ -1760,6 +1809,16 @@ impl TurnAttention {
     }
 }
 impl Actor {
+    /// Called only after a validated actor relocation succeeds. The resident
+    /// census follows the operational directory and old consent becomes stale.
+    fn record_execution_directory(&mut self,directory:&std::path::Path) {
+        let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+        let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+        if close.working_directory!=directory {
+            close.working_directory=directory.into();
+            close.revision=close.revision.saturating_add(1);
+        }
+    }
     fn capture_stderr(&mut self, bytes: &[u8]) {
         if let Some(log) = &mut self.stderr_log { log.push(bytes); }
         for byte in bytes {
@@ -2181,6 +2240,14 @@ impl Actor {
                     });
                     continue;
                 }
+                ActorCommand::CloseIfRevision {revision} => {
+                    let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+                    let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+                    let unchanged=close.revision==revision;
+                    if unchanged {self.stop.store(true,Ordering::Release);}
+                    let _=reply.send(if unchanged {Ok(())} else {Err("Provider work changed before conditional close".into())});
+                    continue;
+                }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let _ = readiness.send(self.update_readiness(&state));
@@ -2227,6 +2294,7 @@ impl Actor {
                 None
             };
             let starts_turn = matches!(&command, Command::Prompt { .. });
+            let starts_new_work=matches!(&command,Command::Prompt{..}|Command::Compact|Command::Slash{..}|Command::StartQueued{..}|Command::Branch{..});
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
@@ -2267,10 +2335,17 @@ impl Actor {
             match prepared {
                 Ok(step) => {
                     let acknowledgement = self.adapter.command_ack();
+                    let observed_boundary=step.events.iter().any(|event|matches!(event,Event::TurnStarted|Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}));
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;
                     }
                     let result = self.step(step);
+                    if result.is_ok() && authorizes_work {
+                        let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+                        let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+                        close.revision=close.revision.saturating_add(1);
+                        close.admitted_work |= starts_new_work && !observed_boundary;
+                    }
                     // Busy before the caller hears back, so whoever checks
                     // for an idle conversation next sees this turn.
                     let started = starts_turn && result.is_ok();
@@ -2531,6 +2606,11 @@ impl Actor {
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(&event,Event::TurnStarted|Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}|Event::Reset{..}) {
+            let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+            if matches!(&event,Event::TurnStarted) {close.revision=close.revision.saturating_add(1);close.admitted_work=false;}
+            if matches!(&event,Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}|Event::Reset{..}) {close.admitted_work=false;}
+        }
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_event(&mut state, &mut self.indices, event);
@@ -3663,6 +3743,53 @@ mod tests {
         assert!(state.outcome.is_none());assert_eq!(state.items[0].content.status(),Some(ToolStatus::Stopped));assert_eq!(state.subagents[0].status,ToolStatus::Stopped);
         finish_snapshot_work(&mut state,ToolStatus::Failed,true);
         assert_eq!(state.subagents[1].status,ToolStatus::Failed,"confirmed provider teardown settles all owned children");
+    }
+
+    #[test]
+    fn conditional_close_refuses_new_admitted_or_autonomous_work_but_allows_streaming() {
+        struct Consent;
+        impl Adapter for Consent {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String> {
+                let events=match command {
+                    Command::Prompt{..}=>Vec::new(),
+                    Command::SetFastMode{..}=>vec![Event::TextDelta{id:"stream".into(),role:Role::Assistant,thinking:false,delta:"more text".into()}],
+                    Command::SetModel{..}=>vec![Event::TurnStarted],
+                    Command::Interrupt=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled}],
+                    _=>return Err("Unexpected consent fixture command".into()),
+                };
+                Ok(Step{events,..Default::default()})
+            }
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(Consent),initial,store,None,|_|{}).unwrap();
+        until(&handle,|state|state.ready);
+        let consent=handle.close_observation();
+        assert_eq!(consent.working_directory,directory.path());
+        let accepted=handle.enqueue_command(Command::Prompt{text:"new work".into(),attachments:Vec::new(),mode:super::super::PromptMode::Send}).unwrap();
+        assert!(handle.close_if_revision(consent.close_revision).is_err(),"an earlier queued prompt must invalidate consent before its provider boundary arrives");
+        accepted.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        let admitted=handle.close_observation();
+        assert_eq!(admitted.actor_id,consent.actor_id);
+        assert_eq!(admitted.turn_generation,consent.turn_generation,"provider has not reported its boundary yet");
+        assert!(admitted.close_revision>consent.close_revision);
+        assert_eq!(admitted.activity,ActivityState::Working);
+        assert!(handle.close_if_revision(consent.close_revision).is_err());
+        assert!(!handle.close_observation().closing);
+        handle.command(Command::SetFastMode{enabled:true}).unwrap();
+        assert_eq!(handle.close_observation().close_revision,admitted.close_revision,"ordinary stream updates preserve consent for the same work");
+        handle.command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap();
+        let autonomous=handle.close_observation();
+        assert!(autonomous.close_revision>admitted.close_revision);
+        assert!(autonomous.turn_generation>admitted.turn_generation);
+        assert!(handle.close_if_revision(admitted.close_revision).is_err());
+        assert!(!handle.close_observation().closing);
+        handle.close_if_revision(autonomous.close_revision).unwrap();
+        assert!(handle.is_completed());
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub(crate) struct Resident {
     pub completed:bool,
     pub owns_work:bool,
     pub installed:bool,
+    pub close:super::CloseObservation,
     pub idle:bool,
     pub failure:Option<String>,
     pub confirmed_session:Option<String>,
@@ -130,7 +131,7 @@ impl RemoteActor {
         use crate::model::{BootId,HostSessionId,HostIncarnation,TerminalId};
         let process=Process::read(std::process::id() as i32).unwrap();
         let boot=BootId::new("fixture-boot");
-        let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,outbox_ack:0,changed:1};
+        let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,close:super::CloseObservation {actor_id:uuid::Uuid::new_v4(),close_revision:0,turn_generation:0,activity:crate::agent::ActivityState::Idle,ready:true,exited:false,completed:false,closing:false,owns_work:true,working_directory:PathBuf::from("/var/tmp")},idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,outbox_ack:0,changed:1};
         Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:Default::default(),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
     }
     #[cfg(test)]
@@ -346,7 +347,15 @@ impl RemoteActor {
         Ok(())
     }
     pub fn preserve(&self)->Result<(),String> {self.call::<()>("preserve",Value::Null)?;self.0.preserved.store(true,Ordering::Release);self.0.stop.store(true,Ordering::Release);Ok(())}
-    pub fn close(&self)->Result<(),String> {self.call::<()>("close",Value::Null)?;self.0.stop.store(true,Ordering::Release);Ok(())}
+    pub fn close_method(&self,method:&str,args:Value)->Result<(),String> {
+        if let Err(error)=self.call::<()>(method,args) {
+            if !chat::native_holder::actor_close_proved(&self.0.identity.record,&self.0.proof)? {return Err(error);}
+        }
+        self.0.stop.store(true,Ordering::Release);
+        {let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());let state=Arc::make_mut(&mut state);state.completed=true;state.owns_work=false;state.idle=false;state.ready=false;state.failure=None;state.close.completed=true;state.close.owns_work=false;state.close.closing=true;}
+        Ok(())
+    }
+    pub fn close(&self)->Result<(),String> {self.close_method("close",Value::Null)}
 }
 impl chat::protocol::LaunchCleanup for RemoteActor {
     fn cleanup(&self)->Result<chat::protocol::LaunchOutcome,String> {self.close()?;Ok(chat::protocol::LaunchOutcome::TeardownProved)}
@@ -421,10 +430,11 @@ impl Server {
         let socket_identity=(metadata.dev(),metadata.ino());
         listener.set_nonblocking(true).map_err(|error|error.to_string())?;
         let mut build=registry::BuildIdentity::current(Kind::Native);build.capabilities.push(CAPABILITY.into());
-        let identity=ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(build),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot,terminal:startup.source.id,holder:Process::read(std::process::id() as i32).map_err(|error|error.to_string())?,root:provider}};
+        let identity=ActorIdentity {instance:actor.close_observation().actor_id,record:Record {version:4,build:Some(build),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot,terminal:startup.source.id,holder:Process::read(std::process::id() as i32).map_err(|error|error.to_string())?,root:provider}};
         identity.record.create(&directory_path).map_err(|error|error.to_string())?;
         Ok(Self {actor,identity,source:startup.source,lineage:Vec::new(),proof,epoch:uuid::Uuid::new_v4(),installed:false,journal,changed,pending:Vec::new(),account_reports,environment,recovery_environment:startup.recovery_environment,listener,socket,socket_identity,_directory:directory})
     }
+    fn revision(&self)->u64 {self.changed.load(Ordering::Acquire).wrapping_add(self.actor.close_observation().close_revision)}
     fn resident(&self)->Result<Resident,String> {
         // Clone resident metadata only. Do not hydrate the Store or serialize
         // any growing parent/child tool body to service periodic observation.
@@ -433,7 +443,7 @@ impl Server {
         drop(state);
         let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
         let failure=journal.loss()?.or_else(||self.actor.failure());
-        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,changed:self.changed.load(Ordering::Acquire)})
+        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,changed:self.revision()})
     }
 
     fn attached(&self)->Result<Attached,String> {Ok(Attached {protocol:PROTOCOL,identity:self.identity.clone(),epoch:self.epoch,resident:self.resident()?,source:self.source.clone(),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()})}
@@ -460,7 +470,7 @@ impl Server {
         macro_rules! decode {($type:ty)=>{serde_json::from_value::<$type>(request.args).map_err(|error|error.to_string())?};}
         macro_rules! value {($expression:expr)=>{serde_json::to_value($expression).map_err(|error|error.to_string())};}
         match request.method.as_str() {
-            "state"=>{let (after,)=decode!((u64,));if after==self.changed.load(Ordering::Acquire) {Ok(Value::Null)}else {value!(Some(self.resident()?))}},
+            "state"=>{let (after,)=decode!((u64,));if after==self.revision() {Ok(Value::Null)}else {value!(Some(self.resident()?))}},
             "outbox"=>{let (after,)=decode!((u64,));value!(self.journal.lock().unwrap_or_else(|p|p.into_inner()).page(after)?)},
             "ack_outbox"=>{let (through,)=decode!((u64,));self.journal.lock().unwrap_or_else(|p|p.into_inner()).ack(through)?;Ok(Value::Null)},
             "input_receipt"=>{let (identity,)=decode!((InputIdentity,));value!(self.journal.lock().unwrap_or_else(|p|p.into_inner()).input(&identity)?)},
@@ -497,6 +507,7 @@ impl Server {
                 if source!=self.source {self.lineage.push(self.source.clone());self.source=source;}
                 Ok(Value::Null)
             },
+            "close_if_revision"=>{let (revision,)=decode!((u64,));self.actor.close_if_revision(revision)?;reap_orphans()?;self.publish_close()?;Ok(Value::Null)},
             "close_if_idle"=>{let (generation,)=decode!((u64,));self.actor.close_if_idle(generation)?;reap_orphans()?;self.publish_close()?;Ok(Value::Null)},
             "close"=>{self.actor.close()?;reap_orphans()?;self.publish_close()?;Ok(Value::Null)},
             _=>Err("Unknown retained actor method/version".into()),
@@ -514,7 +525,7 @@ impl Server {
                     let response=(|| {
                         let request:Invocation=receive(&control,TIMEOUT)?;
                         authorize(&control,&request.proof)?;
-                        let close=matches!(request.method.as_str(),"close"|"close_if_idle");
+                        let close=matches!(request.method.as_str(),"close"|"close_if_idle"|"close_if_revision");
                         let result=self.invoke(request);
                         finished=close&&result.is_ok();
                         result
