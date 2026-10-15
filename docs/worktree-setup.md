@@ -25,6 +25,14 @@ Directory traversal and copies refuse symbolic links and do not cross into neste
 Git checkouts, including other managed worktrees or the destination itself. Glob patterns support
 `*`, `?`, character classes and recursive `**` directory components.
 
+Copy output stays in an unnamed Linux file until publication from its retained
+descriptor. Filesystems must support `O_TMPFILE` and linking that inode through
+`/proc/self/fd`; unsupported operations fail explicitly, without a named temporary
+fallback. The anonymous inode is created in the retained checkout before any
+missing copy directories are created. A copy cannot cross to a different
+filesystem mounted beneath that checkout. Failures can leave newly created
+directories or earlier completed copies; preparation is not one atomic operation.
+
 Choose **Skip setup** for one creation, or use `cagents worktree create --no-setup`.
 Skipping bypasses both copies and commands. A failed or cancelled setup keeps the
 created worktree and any completed copies for inspection; it never automatically
