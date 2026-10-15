@@ -114,11 +114,18 @@ def observe_exec(cfg, manifest, ui):
         raise RuntimeError('profile UI left the admitted private data root')
     library = prepared['tools']['preload']
     loaded = False
-    for line in process.joinpath('maps').read_text().splitlines():
-        fields = line.split(maxsplit=5)
-        if len(fields) == 6 and fields[5] == library['path']:
-            major, minor = (int(part, 16) for part in fields[3].split(':'))
-            loaded |= (int(fields[4]), major, minor) == (library['inode'], library['device_major'], library['device_minor'])
+    deadline = min(time.monotonic_ns() + 3_000_000_000, prepared['deadline_monotonic_ns'])
+    # /proc/exe switches before ld.so necessarily maps LD_PRELOAD. Wait for the
+    # exact library inode without weakening the executable or PID/start fence.
+    while native.current(ui) and time.monotonic_ns() < deadline:
+        for line in process.joinpath('maps').read_text().splitlines():
+            fields = line.split(maxsplit=5)
+            if len(fields) == 6 and fields[5] == library['path']:
+                major, minor = (int(part, 16) for part in fields[3].split(':'))
+                loaded |= (int(fields[4]), major, minor) == (library['inode'], library['device_major'], library['device_minor'])
+        if loaded:
+            break
+        time.sleep(.01)
     if not loaded or not native.current(ui):
         raise RuntimeError('heaptrack preload or UI identity was not observed')
     native.atomic_json(directory / 'ui.json', {'ui': ui, 'source_sha': cfg['source_sha'],
