@@ -122,10 +122,8 @@ const PANEL_ROW_HEIGHT: f32 = design::DENSE_ROW_HEIGHT;
 /// is explicit - the section says how many rows it withheld and the quick
 /// filter narrows to them - rather than a silent truncation.
 pub(crate) const MAX_VISIBLE_FILE_ROWS: usize = 400;
-/// How many change rows one `Changes` group renders at once, bounded for the
-/// same reason as the file tree. "Stage all" and "Unstage all" act on exactly
-/// the rows that are visible, so the bound is never a hidden side effect.
-const MAX_VISIBLE_CHANGE_ROWS: usize = 200;
+/// Viewport rows plus a small overscan; bulk commands retain the entire group.
+const MAX_VISIBLE_CHANGE_ROWS: usize = crate::change_list::VIEW_ROWS + 2 * crate::change_list::OVERSCAN;
 /// How many open pull requests one listing asks `gh` for.
 ///
 /// Defined here, beside the only surfaces that render a number out of the
@@ -710,6 +708,7 @@ pub struct SidebarWorktree {
     pub locked: bool,
     pub dirty: Option<DirtyState>,
     pub untracked_omitted: bool,
+    pub listing_truncated: bool,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
@@ -734,7 +733,7 @@ impl SidebarWorktree {
     ) -> Self {
         let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
-        let status = status_summary(detached, locked, dirty.as_ref(), false, ahead, behind);
+        let status = status_summary(detached, locked, dirty.as_ref(), false, false, ahead, behind);
         let accessible_name = format!(
             "Open worktree {label}, {}, {status}",
             branch.as_deref().unwrap_or(&path_label)
@@ -769,6 +768,7 @@ impl SidebarWorktree {
             locked,
             dirty,
             untracked_omitted: false,
+            listing_truncated: false,
             ahead,
             behind,
             created_at_unix_ms: None,
@@ -813,6 +813,7 @@ impl SidebarWorktree {
             behind,
         );
         row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
+        row.listing_truncated = status.is_some_and(|status| status.listing_truncated);
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row
@@ -847,6 +848,7 @@ impl SidebarWorktree {
             _ => (None, None),
         };
         if self.untracked_omitted == status.untracked_omitted
+            && self.listing_truncated == status.listing_truncated
             && self.dirty.as_ref() == Some(&status.dirty)
             && self.ahead == ahead
             && self.behind == behind
@@ -855,6 +857,7 @@ impl SidebarWorktree {
         }
         self.dirty = Some(status.dirty.clone());
         self.untracked_omitted = status.untracked_omitted;
+        self.listing_truncated = status.listing_truncated;
         self.ahead = ahead;
         self.behind = behind;
         self.refresh_status_chrome();
@@ -924,8 +927,9 @@ impl SidebarWorktree {
                 .filter(|dirty| dirty.is_dirty())
                 .map(|dirty| {
                     format!(
-                        "{} {}changes",
+                        "{}{} {}changes",
                         dirty_count(dirty),
+                        if self.listing_truncated { "+" } else { "" },
                         if self.untracked_omitted {
                             "tracked "
                         } else {
@@ -939,6 +943,7 @@ impl SidebarWorktree {
             self.locked,
             self.dirty.as_ref(),
             self.untracked_omitted,
+            self.listing_truncated,
             self.ahead,
             self.behind,
         );
@@ -1588,13 +1593,6 @@ impl ChangeRow {
             .conflict
             .map(conflict_label)
             .unwrap_or_else(|| change_kind_label(entry.kind));
-        // Which end of the label the row may throw away, decided once.
-        //
-        // A repository path is elided from the front, because its tail is the
-        // file and `…/src/lib.rs` still names one; so is a rename, whose tail
-        // is the name the file now has. A file in the worktree root is nothing
-        // but its name and has no head to spare.
-        let ellipsize_start = entry.old_path.is_some() || label.contains('/');
         let chrome = ChangeRowChrome {
             accessible_name: if counts.is_empty() {
                 format!("{status} {label}")
@@ -1609,7 +1607,6 @@ impl ChangeRow {
             status: status.into_boxed_str(),
             counts_split: counts.find(' '),
             counts: counts.into_boxed_str(),
-            ellipsize_start,
             stage_id: stable_id(format!("panel.change.stage.{key}")),
             unstage_id: stable_id(format!("panel.change.unstage.{key}")),
             discard_id: stable_id(format!("panel.change.discard.{key}")),
@@ -1640,9 +1637,6 @@ struct ChangeRowChrome {
     status: Box<str>,
     counts: Box<str>,
     counts_split: Option<usize>,
-    /// True when the label's tail is what identifies it; see
-    /// [`ChangeRow::new`].
-    ellipsize_start: bool,
     stage_id: Id,
     unstage_id: Id,
     discard_id: Id,
@@ -1692,7 +1686,7 @@ impl ChangeGroup {
             .iter()
             .map(|row| row.entry.path.clone())
             .collect::<Vec<_>>();
-        let tree = file_rows(&paths);
+        let tree = change_file_rows(&paths);
         let mut path_order: Vec<usize> = (0..paths.len()).collect();
         path_order.sort_unstable_by(|left, right| paths[*left].cmp(&paths[*right]));
         Self {
@@ -1842,7 +1836,7 @@ impl BranchChangesModel {
             head: comparison.head,
             merge_base: comparison.merge_base,
             rows,
-            tree: file_rows(&paths),
+            tree: change_file_rows(&paths),
         }
     }
 }
@@ -1935,6 +1929,8 @@ pub struct SourceControlModel {
     /// states it; `None` for a clean worktree. A path both staged and
     /// unstaged is one changed file, not two.
     change_count_label: Option<Box<str>>,
+    change_limit_notice: Option<Box<str>>,
+    files_limited: bool,
     pub branch_changes: BranchChanges,
     pub history: Vec<CommitRow>,
     pub commit_changes: Option<CommitChanges>,
@@ -1961,6 +1957,23 @@ pub struct SourceControlModel {
 
 fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
     file_rows_from_tree(build_file_tree(paths))
+}
+
+fn change_file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
+    crate::change_list::compact_tree(build_file_tree(paths)).into_iter().map(|entry| {
+        let kind = if entry.directory { "folder" } else { "file" };
+        FileRow {
+            chrome: FileRowChrome {
+                folded: fold(&entry.path.display()),
+                accessible_name: format!("Open {kind} {}", entry.path.display()).into_boxed_str(),
+                label: entry.label.into_boxed_str(),
+            },
+            path: entry.path,
+            depth: entry.depth,
+            directory: entry.directory,
+            ignored: false,
+        }
+    }).collect()
 }
 
 fn file_rows_from_listing(files: &[crate::repository_widget::RepositoryFile]) -> Vec<FileRow> {
@@ -2086,6 +2099,8 @@ impl SourceControlModel {
             ignored_directory_errors: BTreeMap::new(),
             groups: Vec::new(),
             change_count_label: None,
+            change_limit_notice: None,
+            files_limited: false,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
             commit_changes: None,
@@ -2149,7 +2164,13 @@ impl SourceControlModel {
             .flat_map(|group| group.rows.iter().map(|row| &row.entry.path))
             .collect::<BTreeSet<_>>()
             .len();
-        let change_count_label = (changed_paths > 0).then(|| tab_count_label(changed_paths));
+        let change_count_label = (changed_paths > 0).then(|| {
+            if snapshot.status.listing_truncated { format!("{changed_paths}+").into_boxed_str() }
+            else { tab_count_label(changed_paths) }
+        });
+        let change_limit_notice = snapshot.status.listing_truncated.then(|| format!(
+            "{changed_paths}+ changes, showing first {changed_paths}. Increase Changes shown in Settings to list more."
+        ).into_boxed_str());
         let mut paths;
         let paths = if snapshot.files.ignored.is_empty() {
             &snapshot.files.paths
@@ -2223,6 +2244,8 @@ impl SourceControlModel {
             ignored_directory_errors: snapshot.files.ignored_directory_errors.clone(),
             groups,
             change_count_label,
+            change_limit_notice,
+            files_limited: snapshot.files.listing_truncated,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
             commit_changes: None,
@@ -2903,7 +2926,8 @@ pub struct SidebarState {
     expanded_directories: BTreeSet<RepoPath>,
     /// Change review starts open; only folders the user folded are stored.
     collapsed_change_directories: BTreeMap<ChangeTreeScope, BTreeSet<RepoPath>>,
-    change_pages: BTreeMap<ChangeTreeScope, usize>,
+    change_first_rows: BTreeMap<ChangeTreeScope, usize>,
+    change_scroll_epoch: u64,
     files_page: usize,
     publish: Option<PublishDraft>,
     discard: Option<DiscardConfirmation>,
@@ -2981,8 +3005,8 @@ impl SidebarState {
         None
     }
 
-    pub fn reveal_change_row(&mut self, source: &SourceControlModel, row: &ChangeSelectionRow) {
-        let Some(group) = source.group(row.area) else { return; };
+    pub fn reveal_change_row(&mut self, source: &SourceControlModel, row: &ChangeSelectionRow) -> Option<(Id, f32)> {
+        let group = source.group(row.area)?;
         let collapsed = self.collapsed_change_directories.get(&ChangeTreeScope::Area(row.area));
         let mut below = None;
         let mut position = 0;
@@ -2991,12 +3015,19 @@ impl SidebarState {
             if below.is_some_and(|depth| candidate.depth > depth) { continue; }
             below = None;
             if !candidate.directory && candidate.path == row.path {
-                self.change_pages.insert(ChangeTreeScope::Area(row.area), position / MAX_VISIBLE_CHANGE_ROWS);
-                break;
+                let scope = ChangeTreeScope::Area(row.area);
+                let current = self.change_first_rows.get(&scope).copied().unwrap_or(0);
+                let first = if position < current { position }
+                    else if position >= current.saturating_add(crate::change_list::VIEW_ROWS) {
+                        position + 1 - crate::change_list::VIEW_ROWS
+                    } else { current };
+                self.change_first_rows.insert(scope, first);
+                return Some((change_scroll_id(&source.key, scope, self.change_scroll_epoch), first as f32 * PANEL_ROW_HEIGHT));
             }
             position += 1;
             if self.change_list_mode != FileListMode::Flat && candidate.directory && collapsed.is_some_and(|paths| paths.contains(&candidate.path)) { below = Some(candidate.depth); }
         }
+        None
     }
 
     /// Navigation can point at another project while an editor remains active.
@@ -3391,7 +3422,8 @@ impl SidebarState {
         self.change_rows.clear();
         self.change_focus = None;
         self.reveal_file = None;
-        self.change_pages.clear();
+        self.change_first_rows.clear();
+        self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
         self.files_page = 0;
         // Every section is one worktree's change area now, not a view of the
         // panel, so none of their disclosures carry to the next worktree.
@@ -3488,7 +3520,6 @@ impl SidebarState {
                 }
             }
             SidebarAction::ToggleChangeDirectory { scope, path, .. } => {
-                self.change_pages.remove(scope);
                 let collapsed = self.collapsed_change_directories.entry(*scope).or_default();
                 if !collapsed.remove(path) {
                     collapsed.insert(path.clone());
@@ -3568,8 +3599,8 @@ impl SidebarState {
                     self.commit_draft.amend = *amend;
                 }
             }
-            SidebarAction::ChangePage { scope, page, .. } => {
-                self.change_pages.insert(*scope, *page);
+            SidebarAction::ChangeViewport { scope, first_row, .. } => {
+                self.change_first_rows.insert(*scope, *first_row);
             }
             SidebarAction::RequestDiscard { key, request } => {
                 self.discard = Some(DiscardConfirmation {
@@ -3690,10 +3721,10 @@ pub enum SidebarAction {
         area: ChangeArea,
         command: ChangeGroupCommand,
     },
-    ChangePage {
+    ChangeViewport {
         key: ActiveWorktreeKey,
         scope: ChangeTreeScope,
-        page: usize,
+        first_row: usize,
     },
     NavigateRow {
         row: SelectionRow,
@@ -8035,6 +8066,10 @@ fn files_section<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .into(),
+        if source.files_limited {
+            widget::container(design::caption("File listing capped. Increase Changes shown in Settings to list more."))
+                .padding([space::XS, space::S]).into()
+        } else { cosmic::iced::widget::Space::new().height(0).into() },
         if flat {
             cosmic::iced::widget::Space::new().height(0).into()
         } else {
@@ -8174,89 +8209,67 @@ fn visible_change_rows<'a>(
     collapsed: Option<&BTreeSet<RepoPath>>,
     flat: bool,
 ) -> (Vec<&'a FileRow>, usize) {
-    change_row_page(rows, collapsed, flat, 0)
+    change_viewport_rows(rows, collapsed, flat, 0)
 }
 
-/// Mount one bounded page, while retaining the complete change model.
-fn change_row_page<'a>(
+/// Construct only the rows near this group's scroll position.
+fn change_viewport_rows<'a>(
     rows: &'a [FileRow],
     collapsed: Option<&BTreeSet<RepoPath>>,
     flat: bool,
-    page: usize,
+    first: usize,
 ) -> (Vec<&'a FileRow>, usize) {
-    let mut visible = Vec::with_capacity(rows.len().min(MAX_VISIBLE_CHANGE_ROWS));
+    if !flat && collapsed.is_none_or(BTreeSet::is_empty) {
+        let range = crate::change_list::visible_range(rows.len(), first);
+        return (rows[range].iter().collect(), rows.len());
+    }
+    let mut visible = Vec::with_capacity(MAX_VISIBLE_CHANGE_ROWS);
+    let start = first.saturating_sub(crate::change_list::OVERSCAN);
+    let end = first.saturating_add(crate::change_list::VIEW_ROWS + crate::change_list::OVERSCAN);
     let mut count = 0;
     let mut skip_below = None;
     for row in rows {
-        if flat && row.directory {
-            continue;
-        }
+        if flat && row.directory { continue; }
         if let Some(depth) = skip_below {
-            if row.depth > depth {
-                continue;
-            }
+            if row.depth > depth { continue; }
             skip_below = None;
         }
-        if count >= page.saturating_mul(MAX_VISIBLE_CHANGE_ROWS)
-            && visible.len() < MAX_VISIBLE_CHANGE_ROWS
-        {
-            visible.push(row);
-        }
+        if (start..end).contains(&count) { visible.push(row); }
         count += 1;
-        if !flat && row.directory && collapsed.is_some_and(|paths| paths.contains(&row.path)) {
-            skip_below = Some(row.depth);
-        }
+        if !flat && row.directory && collapsed.is_some_and(|paths| paths.contains(&row.path)) { skip_below = Some(row.depth); }
     }
-    if visible.is_empty() && count > 0 && page > 0 {
-        return change_row_page(rows, collapsed, flat, (count - 1) / MAX_VISIBLE_CHANGE_ROWS);
-    }
+    let clamped = first.min(count.saturating_sub(crate::change_list::VIEW_ROWS));
+    if clamped != first { return change_viewport_rows(rows, collapsed, flat, clamped); }
     (visible, count)
 }
 
-fn change_pager<'a>(
+fn change_scroll_id(key: &ActiveWorktreeKey, scope: ChangeTreeScope, epoch: u64) -> Id {
+    stable_id(format!("changes.scroll.{}.{scope:?}.{epoch}", key.worktree_id))
+}
+
+fn virtual_changes<'a>(
     state: &SidebarState,
     key: &ActiveWorktreeKey,
     scope: ChangeTreeScope,
+    rows: Vec<crate::sticky_tree::Row<'a, SidebarAction>>,
     total: usize,
-    modal_open: bool,
+    _modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    if total <= MAX_VISIBLE_CHANGE_ROWS {
-        return cosmic::iced::widget::Space::new().height(0).into();
-    }
-    let last = total.saturating_sub(1) / MAX_VISIBLE_CHANGE_ROWS;
-    let page = state
-        .change_pages
-        .get(&scope)
-        .copied()
-        .unwrap_or(0)
-        .min(last);
-    let action = |target| {
-        gated(
-            SidebarAction::ChangePage {
-                key: key.clone(),
-                scope,
-                page: target,
-            },
-            modal_open,
-        )
-    };
-    widget::row::with_children(vec![
-        crate::ui_controls::button::secondary("Previous")
-            .on_press_maybe((page > 0).then(|| action(page - 1)).flatten())
-            .into(),
-        design::caption(format!(
-            "{}–{} of {total}",
-            page * MAX_VISIBLE_CHANGE_ROWS + 1,
-            ((page + 1) * MAX_VISIBLE_CHANGE_ROWS).min(total)
-        ))
-        .into(),
-        crate::ui_controls::button::secondary("Next")
-            .on_press_maybe((page < last).then(|| action(page + 1)).flatten())
-            .into(),
-    ])
-    .spacing(space::XS)
-    .align_y(Alignment::Center)
-    .into()
+    let range = crate::change_list::visible_range(total, state.change_first_rows.get(&scope).copied().unwrap_or(0));
+    let content = widget::column::with_children(vec![
+        widget::Space::new().height(range.start as f32 * PANEL_ROW_HEIGHT).into(),
+        crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT),
+        widget::Space::new().height(total.saturating_sub(range.end) as f32 * PANEL_ROW_HEIGHT).into(),
+    ]);
+    let key = key.clone();
+    widget::scrollable(content)
+        .id(change_scroll_id(&key, scope, state.change_scroll_epoch))
+        .on_scroll(move |viewport| SidebarAction::ChangeViewport { key: key.clone(), scope,
+            first_row: (viewport.absolute_offset().y / PANEL_ROW_HEIGHT).max(0.0) as usize })
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()))
+        .height(Length::Fixed((total.min(crate::change_list::VIEW_ROWS) as f32 * PANEL_ROW_HEIGHT).max(PANEL_ROW_HEIGHT)))
+        .width(Length::Fill)
+        .into()
 }
 
 /// The tree/flat switch for a list of changed files, as one action that
@@ -8292,6 +8305,9 @@ fn changes_section<'a>(
     let mut column = widget::column::with_capacity(source.groups().len() + 1).spacing(space::XS);
     if !state.change_rows.is_empty() {
         column = column.push(design::caption(format!("{} paths selected · Esc to clear", state.selected_change_count())));
+    }
+    if let Some(notice) = &source.change_limit_notice {
+        column = column.push(design::caption(notice.as_ref()));
     }
     if source.groups().iter().all(ChangeGroup::is_empty) {
         column = column.push(design::caption(
@@ -8429,11 +8445,11 @@ fn branch_changes_section<'a>(
     let flat = state.change_list_mode == FileListMode::Flat;
     let scope = ChangeTreeScope::Branch;
     let collapsed = state.collapsed_change_directories.get(&scope);
-    let (tree, total) = change_row_page(
+    let (tree, total) = change_viewport_rows(
         &branch.tree,
         collapsed,
         flat,
-        state.change_pages.get(&scope).copied().unwrap_or(0),
+        state.change_first_rows.get(&scope).copied().unwrap_or(0),
     );
     let mut rows = Vec::with_capacity(tree.len());
     for file in tree {
@@ -8451,7 +8467,9 @@ fn branch_changes_section<'a>(
                     file.depth,
                     widget::row::with_children(vec![
                         crate::file_icon::folder(!folded).into(),
-                        design::body(&*file.chrome.label).into(),
+                        design::body(&*file.chrome.label).width(Length::Fill)
+                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(EllipsizeHeightLimit::Lines(1))).into(),
                     ])
                     .spacing(space::XS)
                     .align_y(Alignment::Center),
@@ -8486,7 +8504,7 @@ fn branch_changes_section<'a>(
                     row.entry.path.file_name()
                 } else { Cow::Borrowed(&*row.label) })
                     .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1)))
+                    .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
                     .width(Length::Fill).into(),
                 semantic_caption(&*row.status, tone),
                 design::caption(&*row.counts).into(),
@@ -8503,10 +8521,7 @@ fn branch_changes_section<'a>(
             modal_open,
         ) });
     }
-    column = column.push(crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT));
-    column
-        .push(change_pager(state, &source.key, scope, total, modal_open))
-        .into()
+    column.push(virtual_changes(state, &source.key, scope, rows, total, modal_open)).into()
 }
 
 fn change_group_view<'a>(
@@ -8518,11 +8533,11 @@ fn change_group_view<'a>(
     let flat = state.change_list_mode == FileListMode::Flat;
     let scope = ChangeTreeScope::Area(group.area);
     let collapsed = state.collapsed_change_directories.get(&scope);
-    let (tree, total) = change_row_page(
+    let (tree, total) = change_viewport_rows(
         &group.tree,
         collapsed,
         flat,
-        state.change_pages.get(&scope).copied().unwrap_or(0),
+        state.change_first_rows.get(&scope).copied().unwrap_or(0),
     );
     // The disclosure header above this view already carries the group's name,
     // its count, and its commands; the body is only the rows.
@@ -8542,7 +8557,9 @@ fn change_group_view<'a>(
                     file.depth,
                     widget::row::with_children(vec![
                         crate::file_icon::folder(!folded).into(),
-                        design::body(&*file.chrome.label).into(),
+                        design::body(&*file.chrome.label).width(Length::Fill)
+                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(EllipsizeHeightLimit::Lines(1))).into(),
                     ])
                     .spacing(space::XS)
                     .align_y(Alignment::Center),
@@ -8571,10 +8588,7 @@ fn change_group_view<'a>(
             });
         }
     }
-    let mut column =
-        widget::column::with_children(vec![crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT)]);
-    column = column.push(change_pager(state, &source.key, scope, total, modal_open));
-    column.into()
+    virtual_changes(state, &source.key, scope, rows, total, modal_open)
 }
 
 fn change_row_view<'a>(
@@ -8653,11 +8667,7 @@ fn change_row_view<'a>(
                 Cow::Borrowed(&*chrome.label)
             })
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(if chrome.ellipsize_start {
-                cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1))
-            } else {
-                cosmic::iced::widget::text::Ellipsize::End(EllipsizeHeightLimit::Lines(1))
-            })
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
             .width(Length::Fill)
             .into(),
             widget::container(status)
@@ -8675,6 +8685,7 @@ fn change_row_view<'a>(
         selected,
         modal_open,
     );
+    let identity = crate::interaction::tooltip(identity, row.entry.path.display().into_owned());
     let identity = RowInteraction::change_row(identity, &source.key, ChangeSelectionRow { area, path: row.entry.path.clone() }, state, !modal_open);
     let identity = change_context_controls(identity, &source.key, row, modal_open);
     let commands = row_commands(source, area, row, modal_open).into_iter().map(|mut control| {
@@ -8775,8 +8786,9 @@ impl<'a> IconCommand<'a> {
 ///
 /// Which commands exist is a fact about the area: conflicts are staged to mark
 /// them resolved, there is no unstage for an unmerged path, and untracked paths
-/// have nothing to unstage from. An in-flight Git command disables the actions
-/// in place, because a second mutation against the same index would race the first.
+/// have nothing to unstage from. Stage and unstage intents are serialized by
+/// the worktree mutation queue; discard waits until the current command ends
+/// before presenting its explicit confirmation.
 fn group_commands<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
@@ -8851,26 +8863,22 @@ pub fn resolve_group_command(
     if group.is_empty() {
         return None;
     }
-    let selection = || group.rows().iter().map(ChangeRow::selection).collect();
+    resolve_group_selection(key, *area, *command, group.rows().iter().map(ChangeRow::selection).collect())
+}
+
+/// A full group read on the worker uses the same command/confirmation path as
+/// the ordinary snapshot. Listing limits never redefine an "all" action.
+pub fn resolve_group_selection(
+    key: &ActiveWorktreeKey,
+    area: ChangeArea,
+    command: ChangeGroupCommand,
+    selection: Vec<PathSelection>,
+) -> Option<SidebarAction> {
+    if selection.is_empty() { return None; }
     match command {
-        ChangeGroupCommand::Stage if *area != ChangeArea::Staged => Some(SidebarAction::Stage {
-            key: key.clone(),
-            selection: selection(),
-        }),
-        ChangeGroupCommand::Unstage if *area == ChangeArea::Staged => {
-            Some(SidebarAction::Unstage {
-                key: key.clone(),
-                selection: selection(),
-            })
-        }
-        ChangeGroupCommand::Discard
-            if matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked) =>
-        {
-            Some(SidebarAction::RequestDiscard {
-                key: key.clone(),
-                request: discard_request(key, *area, selection(), group),
-            })
-        }
+        ChangeGroupCommand::Stage if area != ChangeArea::Staged => Some(SidebarAction::Stage { key: key.clone(), selection }),
+        ChangeGroupCommand::Unstage if area == ChangeArea::Staged => Some(SidebarAction::Unstage { key: key.clone(), selection }),
+        ChangeGroupCommand::Discard if matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked) => Some(SidebarAction::RequestDiscard { key: key.clone(), request: discard_request(key, area, selection) }),
         _ => None,
     }
 }
@@ -9026,7 +9034,6 @@ fn discard_request(
     key: &ActiveWorktreeKey,
     area: ChangeArea,
     selection: Vec<PathSelection>,
-    _group: &ChangeGroup,
 ) -> DiscardRequest {
     match area {
         // Untracked paths exist nowhere but the worktree, so discarding them
@@ -9983,16 +9990,19 @@ fn status_summary(
     locked: bool,
     dirty: Option<&DirtyState>,
     untracked_omitted: bool,
+    listing_truncated: bool,
     ahead: Option<u64>,
     behind: Option<u64>,
 ) -> String {
     let mut parts = Vec::with_capacity(4);
     match dirty {
         Some(dirty) if dirty.is_dirty() => parts.push(format!(
-            "{} {}changes",
+            "{}{} {}changes",
             dirty_count(dirty),
+            if listing_truncated { "+" } else { "" },
             if untracked_omitted { "tracked " } else { "" }
         )),
+        Some(_) if listing_truncated => parts.push("change listing capped".to_owned()),
         Some(_) if untracked_omitted => parts.push("no tracked changes".to_owned()),
         Some(_) => parts.push("clean".to_owned()),
         None => parts.push("status unavailable".to_owned()),
@@ -12147,6 +12157,7 @@ pub(crate) mod tests {
                 prunable_reason: None,
             },
             Some(&StatusSnapshot {
+                listing_truncated: false,
                 untracked_omitted: false,
                 head: crate::repository::HeadState::Unknown,
                 tracking: TrackingState::NoUpstream,
@@ -16298,6 +16309,7 @@ pub(crate) mod tests {
             stashes: Vec::new(),
             last_fetch_unix_ms: None,
             status: StatusSnapshot {
+                listing_truncated: false,
                 untracked_omitted: false,
                 head: HeadState::Branch {
                     name: "main".into(),
@@ -16447,19 +16459,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn change_pages_reach_every_file_and_bulk_commands_cover_the_entire_group() {
+    fn change_viewports_reach_every_file_and_bulk_commands_cover_the_entire_group() {
         let paths: Vec<_> = (0..501)
             .map(|index| repo_path(&format!("file-{index:04}.rs")))
             .collect();
         let tree = file_rows(&paths);
         let mut visited = Vec::new();
-        for page in 0..3 {
-            let (rows, total) = change_row_page(&tree, None, true, page);
+        for first in (0..501).step_by(crate::change_list::VIEW_ROWS) {
+            let (rows, total) = change_viewport_rows(&tree, None, true, first);
             assert_eq!(total, 501);
             assert!(rows.len() <= MAX_VISIBLE_CHANGE_ROWS);
             visited.extend(rows.into_iter().map(|row| row.path.clone()));
         }
-        assert_eq!(visited, paths);
+        visited.dedup();
+        let visited = visited.into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(visited, paths.iter().cloned().collect());
         let mut source = source_control();
         let group = ChangeGroup::new(
             source.key.worktree_id,
@@ -16512,6 +16526,39 @@ pub(crate) mod tests {
         status.untracked_omitted = false;
         worktree.apply_status(&status);
         assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("1 changes"));
+    }
+
+    #[test]
+    fn fresh_full_group_selections_are_never_cut_to_the_display_limit() {
+        let selected = (0..40_000).map(|index| PathSelection::new(repo_path(&format!("src/m{index}.rs")))).collect::<Vec<_>>();
+        let last = selected.last().unwrap().path.clone();
+        let Some(SidebarAction::Stage { selection, .. }) = resolve_group_selection(&main_key(), ChangeArea::Unstaged, ChangeGroupCommand::Stage, selected.clone()) else { panic!("stage all"); };
+        assert_eq!(selection.len(), 40_000);
+        assert_eq!(selection.last().unwrap().path, last);
+        let Some(SidebarAction::RequestDiscard { request, .. }) = resolve_group_selection(&main_key(), ChangeArea::Untracked, ChangeGroupCommand::Discard, selected) else { panic!("discard all confirmation"); };
+        assert_eq!(request.untracked.len(), 40_000);
+        assert_eq!(request.untracked.last(), Some(&last));
+        assert!(!request.confirmed);
+    }
+
+    #[test]
+    fn capped_status_counts_stay_explicit_lower_bounds_until_a_complete_read() {
+        let mut worktree = SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
+        let mut status = StatusSnapshot::default();
+        status.dirty.unstaged = 10_000;
+        status.listing_truncated = true;
+        worktree.apply_status(&status);
+        assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("10000+ changes"));
+        assert!(worktree.chrome.tooltip.contains("10000+ changes"));
+        status.listing_truncated = false;
+        worktree.apply_status(&status);
+        assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("10000 changes"));
+        assert!(!worktree.chrome.tooltip.contains("10000+"));
+        status.dirty.unstaged = 0;
+        status.listing_truncated = true;
+        worktree.apply_status(&status);
+        assert!(worktree.chrome.tooltip.contains("change listing capped"));
+        assert!(!worktree.chrome.tooltip.contains("clean"));
     }
 
     #[test]

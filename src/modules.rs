@@ -42,6 +42,8 @@ pub mod diff_view;
 #[cfg(feature = "ui")]
 pub mod git_patch;
 #[cfg(feature = "ui")]
+pub(crate) mod change_list;
+#[cfg(feature = "ui")]
 pub mod document_link;
 #[cfg(feature = "ui")]
 pub mod document_render;

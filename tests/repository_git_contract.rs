@@ -3288,6 +3288,7 @@ fn discard_reports_restored_paths_when_untracked_classification_fails() {
             {
                 return match self.failure {
                     ReadFailure::Malformed => Ok(ProcessOutput {
+                        stdout_truncated: false,
                         exit_code: Some(0),
                         signal: None,
                         success: true,
@@ -4972,6 +4973,7 @@ fn snapshot_fallback_repairs_external_stash_and_clean_index_merge_state() {
     let cancel = CancellationToken::new();
     let mut cache = SnapshotCache::default();
     let options = SnapshotOptions {
+        status_limit: None,
         untracked_changes: false,
         untracked_files: false,
     };

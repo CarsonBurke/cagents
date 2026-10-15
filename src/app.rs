@@ -22,6 +22,7 @@ mod browser_host;
 mod file_ui;
 mod git_ui;
 mod git_patch_ui;
+mod git_group_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
@@ -2734,6 +2735,7 @@ pub enum SettingsField {
     TerminalCursorStyle,
     TerminalTheme,
     MaxHotCards,
+    GitStatusLimit,
     HibernationDelayMs,
     TerminalFontSize,
     TerminalFontFamily,
@@ -2868,6 +2870,7 @@ impl SettingsField {
             Self::TerminalCursorStyle => "Cursor shape",
             Self::TerminalTheme => "Color theme",
             Self::MaxHotCards => "Maximum hot panes",
+            Self::GitStatusLimit => "Changes shown",
             Self::HibernationDelayMs => "Hibernation delay (ms)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
@@ -2963,6 +2966,7 @@ impl SettingsField {
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
+            | Self::GitStatusLimit
             | Self::HibernationDelayMs
             | Self::ManagedWorktreeDirectory
             | Self::WorktreeSort
@@ -3141,6 +3145,7 @@ struct SettingsDraft {
     terminal_theme: String,
     has_custom_terminal_theme: bool,
     max_hot_cards: String,
+    git_status_limit: String,
     hibernation_delay_ms: String,
     terminal_font_size: String,
     terminal_font_family: String,
@@ -3195,6 +3200,7 @@ impl SettingsDraft {
             terminal_theme: settings.terminal_theme.id().into(),
             has_custom_terminal_theme: settings.custom_terminal_theme.is_some(),
             max_hot_cards: settings.max_hot_cards.to_string(),
+            git_status_limit: settings.git_status_limit.to_string(),
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
             terminal_font_family: settings.terminal_font_family.clone(),
@@ -3250,6 +3256,7 @@ impl SettingsDraft {
             SettingsField::TerminalTheme => self.terminal_theme = value,
             SettingsField::TerminalCursorStyle => self.terminal_cursor_style = value,
             SettingsField::MaxHotCards => self.max_hot_cards = value,
+            SettingsField::GitStatusLimit => self.git_status_limit = value,
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
             SettingsField::TerminalFontFamily => self.terminal_font_family = value,
@@ -3659,6 +3666,10 @@ fn settings_update(
             .parse::<f32>()
             .map(|value| next.terminal_scroll_speed = value)
             .map_err(|_| "Scroll speed must be a number.".to_owned()),
+        SettingsField::GitStatusLimit => value.parse::<usize>().ok()
+            .filter(|value| (1..=100_000).contains(value))
+            .ok_or_else(|| "Changes shown must be a whole number from 1 to 100000.".to_owned())
+            .map(|value| next.git_status_limit = value),
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
@@ -3971,6 +3982,13 @@ pub enum Message {
         key: ActiveWorktreeKey,
         request: u64,
         result: Result<Option<Box<(RepositorySnapshot, SourceControlModel)>>, String>,
+    },
+    SourceControlGroupSelection {
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        area: crate::repository::ChangeArea,
+        command: sidebar::ChangeGroupCommand,
+        result: Result<Vec<crate::repository::PathSelection>, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -4766,6 +4784,12 @@ impl WorkspaceDestination {
 #[derive(Debug, Clone)]
 enum QueuedGitMutation {
     Stage(Vec<crate::repository::PathSelection>),
+    /// Resolve an uncapped group only after all earlier worktree commands.
+    Area {
+        area: crate::repository::ChangeArea,
+        command: sidebar::ChangeGroupCommand,
+        preview: Vec<crate::repository::PathSelection>,
+    },
     StageApproved {
         selection: Vec<crate::repository::PathSelection>,
         approved: std::collections::BTreeMap<
@@ -4785,6 +4809,19 @@ impl QueuedGitMutation {
             Self::Unstage(_) => MutationKind::Unstage,
             Self::Discard(_) => MutationKind::Discard,
             Self::Operation(_) => MutationKind::Other,
+            Self::Area { command, .. } => match command {
+                sidebar::ChangeGroupCommand::Stage => MutationKind::Stage,
+                sidebar::ChangeGroupCommand::Unstage => MutationKind::Unstage,
+                sidebar::ChangeGroupCommand::Discard => MutationKind::Other,
+            },
+        }
+    }
+
+    fn optimistic_selection(&self) -> Option<&[crate::repository::PathSelection]> {
+        match self {
+            Self::Stage(selection) | Self::StageApproved { selection, .. } | Self::Unstage(selection) => Some(selection),
+            Self::Area { command: sidebar::ChangeGroupCommand::Stage | sidebar::ChangeGroupCommand::Unstage, preview, .. } => Some(preview),
+            _ => None,
         }
     }
 
@@ -11138,6 +11175,7 @@ impl Cagents {
         let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked)
             || self.context_tab == ContextTab::Files;
         let options = crate::repository::SnapshotOptions {
+            status_limit: Some(self.settings.git_status_limit),
             untracked_changes,
             untracked_files: self.context_tab == ContextTab::Files,
         };
@@ -11204,11 +11242,12 @@ impl Cagents {
                 let mut reveal_error = None;
                 if browse_files {
                     let ignored = service
-                        .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
+                        .ignored_files_with_limit(&worktree, &snapshot.files.paths, options.status_limit, &cancellation)
                         .map_err(|error| {
                             cache.invalidate(false);
                             error.to_string()
                         })?;
+                    snapshot.files.listing_truncated |= ignored.listing_truncated;
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
                     repository_widget::expand_ignored_directories(
@@ -11338,9 +11377,7 @@ impl Cagents {
         if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
             QueuedGitMutation::append(&mut active.pending, request.clone());
             if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                if let QueuedGitMutation::Stage(selection)
-                | QueuedGitMutation::StageApproved { selection, .. }
-                | QueuedGitMutation::Unstage(selection) = &request
+                if let Some(selection) = request.optimistic_selection()
                 {
                     source.optimistic_mutation(kind, selection);
                 }
@@ -11354,9 +11391,7 @@ impl Cagents {
             active.request = Some(request.clone());
         }
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
-            if let QueuedGitMutation::Stage(selection)
-            | QueuedGitMutation::StageApproved { selection, .. }
-            | QueuedGitMutation::Unstage(selection) = &request
+            if let Some(selection) = request.optimistic_selection()
             {
                 source.optimistic_mutation(kind, selection);
             }
@@ -11371,6 +11406,7 @@ impl Cagents {
         request: QueuedGitMutation,
     ) -> Task<Message> {
         let request = match request {
+            QueuedGitMutation::Area { area, command, .. } => return self.queued_group_task(key, operation, area, command),
             QueuedGitMutation::Stage(selection)
             | QueuedGitMutation::StageApproved { selection, .. } => {
                 let approved = self
@@ -11459,6 +11495,7 @@ impl Cagents {
                 QueuedGitMutation::Discard(request) => {
                     ("Discard", service.discard(&request, cancellation))
                 }
+                QueuedGitMutation::Area { .. } => unreachable!("group tasks are dispatched before ordinary mutations"),
                 QueuedGitMutation::Operation(operation) => (
                     operation.label(),
                     service.git_operation(&worktree, &operation, cancellation),
@@ -12945,6 +12982,11 @@ impl Cagents {
             }
         }
         let mut tasks = Vec::new();
+        if previous.git_status_limit != self.settings.git_status_limit
+            && let Some(key) = self.sidebar_state.active_worktree().cloned()
+        {
+            tasks.push(self.reload_source_control(&key));
+        }
         if previous.editor_font_family() != self.settings.editor_font_family()
             || previous.editor_font_size() != self.settings.editor_font_size()
         {
@@ -14678,7 +14720,8 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
-                if matches!(&action, SidebarAction::FilesPage { key, .. }
+                if matches!(&action, SidebarAction::ChangeViewport { key, .. }
+                    | SidebarAction::FilesPage { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. }
                     | SidebarAction::ToggleFilesFilter { key }
                     | SidebarAction::CommitMessageChanged { key, .. }
@@ -14709,8 +14752,7 @@ impl Application for Cagents {
                         let Some(resolved) = sidebar::resolve_change_command(source, &self.sidebar_state, key, &row, *command) else { return Task::none(); };
                         resolved
                     } else {
-                        let Some(resolved) = sidebar::resolve_group_command(source, &action) else { return Task::none(); };
-                        resolved
+                        action
                     }
                 } else {
                     action
@@ -14996,8 +15038,10 @@ impl Application for Cagents {
                         };
                         let target = order[next].clone();
                         self.sidebar_state.select_change_rows(target.clone(), if extend { sidebar::SelectionIntent::Range { extend: false } } else { sidebar::SelectionIntent::Navigate }, &order);
-                        self.sidebar_state.reveal_change_row(source, &target);
-                        iced::widget::operation::focus(sidebar::change_row_focus_id(&key, &target)).map(cosmic::Action::App)
+                        let scroll = self.sidebar_state.reveal_change_row(source, &target)
+                            .map(|(id, y)| iced::widget::operation::scroll_to(id, iced::widget::operation::AbsoluteOffset { x: 0.0, y }).map(cosmic::Action::App))
+                            .unwrap_or_else(Task::none);
+                        Task::batch([scroll, iced::widget::operation::focus(sidebar::change_row_focus_id(&key, &target)).map(cosmic::Action::App)])
                     }
                     SidebarAction::ClearChangeSelection { .. } | SidebarAction::InvokeChangeRows { .. } => Task::none(),
                     SidebarAction::OpenSettings => self.open_utility_card(CardKind::Settings),
@@ -15048,8 +15092,7 @@ impl Application for Cagents {
                     | SidebarAction::SetChangesTab { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::SetChangeListMode { .. }
-                    | SidebarAction::ChangePage { .. }
-                    | SidebarAction::ChangeGroup { .. }
+                    | SidebarAction::ChangeViewport { .. }
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
@@ -15125,6 +15168,7 @@ impl Application for Cagents {
                         }
                         Task::none()
                     }
+                    SidebarAction::ChangeGroup { key, area, command } => self.enqueue_change_group(key, area, command),
                     SidebarAction::Stage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Stage(selection)),
                     SidebarAction::Unstage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Unstage(selection)),
                     SidebarAction::ConfirmDiscard { key, request } => self.enqueue_git_mutation(key, QueuedGitMutation::Discard(request)),
@@ -17027,6 +17071,7 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::SourceControlGroupSelection { key, operation, area, command, result } => self.finish_group_selection(key, operation, area, command, result),
             Message::SourceControlReleased => Task::none(),
             Message::SourceControlLoaded {
                 key,
@@ -17212,11 +17257,7 @@ impl Application for Cagents {
                 let failed = report.is_some();
                 if !failed
                     && let Some(rollback) = mutation.rollback.as_mut()
-                    && let Some(
-                        QueuedGitMutation::Stage(selection)
-                        | QueuedGitMutation::StageApproved { selection, .. }
-                        | QueuedGitMutation::Unstage(selection),
-                    ) = mutation.request.as_ref()
+                    && let Some(selection) = mutation.request.as_ref().and_then(QueuedGitMutation::optimistic_selection)
                 {
                     rollback.optimistic_mutation(mutation.kind, selection);
                 }
@@ -17230,9 +17271,7 @@ impl Application for Cagents {
                 {
                     *source = rollback.clone();
                     for pending in &mutation.pending {
-                        if let QueuedGitMutation::Stage(selection)
-                        | QueuedGitMutation::StageApproved { selection, .. }
-                        | QueuedGitMutation::Unstage(selection) = pending
+                        if let Some(selection) = pending.optimistic_selection()
                         {
                             source.optimistic_mutation(pending.kind(), selection);
                         }
@@ -18676,6 +18715,7 @@ mod tests {
     #[test]
     fn mutation_error_mapping_keeps_full_hook_output() {
         let failure = crate::repository::ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(1),
             signal: None,
             success: false,

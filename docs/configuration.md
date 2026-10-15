@@ -165,6 +165,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `pull_request_open_target` | string | `"review"` | What opening a pull request in the sidebar does: `"review"` opens the in-app review pane, and `"link"` opens the pull request's web page as a link, using the settings above |
 | `managed_worktree_directory` | string | `"worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root |
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
+| `git_status_limit` | integer | `10000` | Maximum changed paths shown in each source-control snapshot; normalized to `1`–`100000`. Oversized listings show a notice. Safety checks and bulk group actions read complete status independently. |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
 | `editor_find_options.case_sensitive` | boolean | `false` | Match case in the native editor Find strip |
