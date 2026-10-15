@@ -3074,6 +3074,20 @@ fn project_output(
     client: &mut ControlClient,
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
+    project_output_with_activation(client, command, |repository| {
+        if !crate::device::is_remote() {
+            if let Err(error) = instance::activate_project(repository) {
+                tracing::debug!(%error, "project opened but window selection failed");
+            }
+        }
+    })
+}
+
+fn project_output_with_activation(
+    client: &mut ControlClient,
+    command: ResolvedProject,
+    activate: impl FnOnce(&Path),
+) -> Result<CommandOutput, AppError> {
     match command {
         ResolvedProject::Open {
             repository,
@@ -3106,11 +3120,7 @@ fn project_output(
             })?;
             // The model edit above establishes shared existence. Selection is
             // a separate, best-effort instruction to one existing window.
-            if !crate::device::is_remote() {
-                if let Err(error) = instance::activate_project(&repository) {
-                    tracing::debug!(%error, "project opened but window selection failed");
-                }
-            }
+            activate(&repository);
             let human = project_line(&project);
             Ok(CommandOutput {
                 command: "project.open",
@@ -4477,8 +4487,12 @@ mod tests {
         }
         .resolved()
         .unwrap();
-        let output = project_output(&mut client, resolved).unwrap();
+        let mut activated = Vec::new();
+        let output = project_output_with_activation(&mut client, resolved, |repository| {
+            activated.push(repository.to_path_buf());
+        }).unwrap();
         server.join().unwrap();
+        assert_eq!(activated, vec![expected.clone()], "the fixture records selection without notifying any real window");
         assert_eq!(output.command, "project.open");
         assert_eq!(output.data["project"]["ordinal"], json!(2));
         assert_eq!(output.data["project"]["name"], "Custom project label");
