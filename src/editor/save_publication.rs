@@ -135,18 +135,29 @@ struct FailedHolding {
 impl FailedHolding {
     fn retry(&mut self) -> Result<(), String> {
         match &mut self.directory {
-            FailedHoldingDirectory::Preparation(preparation) => preparation.retry_cleanup().map_err(|error|error.to_string())?,
+            FailedHoldingDirectory::Preparation(preparation) => preparation
+                .retry_cleanup()
+                .map_err(|error| error.to_string())?,
             FailedHoldingDirectory::Publication(publication) => {
-                publication.resolve_recovery().map_err(|error|error.to_string())?;
-                publication.cleanup_empty().map_err(|error|error.to_string())?;
+                publication
+                    .resolve_recovery()
+                    .map_err(|error| error.to_string())?;
+                publication
+                    .cleanup_empty()
+                    .map_err(|error| error.to_string())?;
             }
             FailedHoldingDirectory::Unverified(directory) => {
-                if directory.metadata().map_err(|error|error.to_string())?.nlink() != 0 {
+                if directory
+                    .metadata()
+                    .map_err(|error| error.to_string())?
+                    .nlink()
+                    != 0
+                {
                     return Err("Creation ownership remains unverified; the retained directory was not changed. Resolve the entry before retrying.".into());
                 }
             }
         }
-        fs_safety::sync_directory(&self.parent).map_err(|error|error.to_string())
+        fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())
     }
 }
 
@@ -175,8 +186,15 @@ impl Holding {
             Err(mut error) => {
                 let message = error.to_string();
                 if let Some(preparation) = error.take_recovery() {
-                    let description = format!("Private save preparation originally named {}", preparation.diagnostic_path().display());
-                    let mut state = FailedHolding { directory: FailedHoldingDirectory::Preparation(preparation), parent: retained_parent, _source: retained_source };
+                    let description = format!(
+                        "Private save preparation originally named {}",
+                        preparation.diagnostic_path().display()
+                    );
+                    let mut state = FailedHolding {
+                        directory: FailedHoldingDirectory::Preparation(preparation),
+                        parent: retained_parent,
+                        _source: retained_source,
+                    };
                     let authority = slot.retain(description, move || state.retry());
                     return Err(FileIoError::Recovery { message, authority });
                 }
@@ -185,40 +203,76 @@ impl Holding {
         };
         let publication = match creation {
             fs_safety::DirectoryCreation::Published(receipt) => receipt,
-            fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io(
-                "The private save holding directory already exists; it was left intact.".into())),
+            fs_safety::DirectoryCreation::Existing(_) => {
+                return Err(FileIoError::Io(
+                    "The private save holding directory already exists; it was left intact.".into(),
+                ));
+            }
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {
-                let message = format!("Private save holding ownership could not be established; no file was published: {reason}");
-                let description = format!("Unverified save directory originally named {}", directory.path().display());
-                let mut state = FailedHolding { directory: FailedHoldingDirectory::Unverified(directory), parent: retained_parent, _source: retained_source };
+                let message = format!(
+                    "Private save holding ownership could not be established; no file was published: {reason}"
+                );
+                let description = format!(
+                    "Unverified save directory originally named {}",
+                    directory.path().display()
+                );
+                let mut state = FailedHolding {
+                    directory: FailedHoldingDirectory::Unverified(directory),
+                    parent: retained_parent,
+                    _source: retained_source,
+                };
                 let authority = slot.retain(description, move || state.retry());
                 return Err(FileIoError::Recovery { message, authority });
             }
         };
         // Exact chmod is authorized only for Published's original held inode.
         let checked = (|| {
-            fs_safety::set_directory_permissions(publication.directory(), 0o700).map_err(io_error)?;
+            fs_safety::set_directory_permissions(publication.directory(), 0o700)
+                .map_err(io_error)?;
             let metadata = publication.directory().metadata().map_err(io_error)?;
             if metadata.mode() & 0o7777 != 0o700 || metadata.uid() != unsafe { libc::geteuid() } {
-                return Err(FileIoError::Io("The save holding directory is not private; it was preserved.".into()));
+                return Err(FileIoError::Io(
+                    "The save holding directory is not private; it was preserved.".into(),
+                ));
             }
-            if let Some(error) = publication.publication_error() { return Err(FileIoError::Io(error.into())); }
+            if let Some(error) = publication.publication_error() {
+                return Err(FileIoError::Io(error.into()));
+            }
             publication.directory().try_clone().map_err(io_error)
         })();
         let root = match checked {
             Ok(root) => root,
             Err(error) => {
-                let description = format!("Save holding originally named {}", publication.directory().path().display());
-                let mut state = FailedHolding { directory: FailedHoldingDirectory::Publication(publication), parent: retained_parent, _source: retained_source };
+                let description = format!(
+                    "Save holding originally named {}",
+                    publication.directory().path().display()
+                );
+                let mut state = FailedHolding {
+                    directory: FailedHoldingDirectory::Publication(publication),
+                    parent: retained_parent,
+                    _source: retained_source,
+                };
                 let authority = slot.retain(description, move || state.retry());
-                return Err(FileIoError::Recovery { message: error.to_string(), authority });
+                return Err(FileIoError::Recovery {
+                    message: error.to_string(),
+                    authority,
+                });
             }
         };
-        Ok(Self { root, parent: retained_parent, publication, slot: Some(slot), files: vec![retained_source] })
+        Ok(Self {
+            root,
+            parent: retained_parent,
+            publication,
+            slot: Some(slot),
+            files: vec![retained_source],
+        })
     }
     fn keep_file(&mut self, file: File) -> Result<File, FileIoError> {
         match file.try_clone() {
-            Ok(retained) => { self.files.push(retained); Ok(file) }
+            Ok(retained) => {
+                self.files.push(retained);
+                Ok(file)
+            }
             Err(error) => {
                 // Even descriptor exhaustion must not drop the actual newly
                 // created/acquired file before returning its recovery carrier.
@@ -232,21 +286,31 @@ impl Holding {
     }
     fn retain(mut self) -> RecoveryAuthority {
         let description = self.location();
-        let slot = self.slot.take().expect("a holding reserves recovery capacity before creation");
+        let slot = self
+            .slot
+            .take()
+            .expect("a holding reserves recovery capacity before creation");
         // A method receiver deliberately captures the WHOLE owned state.
         // Disjoint-field closure capture must not drop authenticated file FDs.
         slot.retain(description, move || self.retry_cleanup())
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
-        self.publication.resolve_recovery().map_err(|e|e.to_string())?;
+        self.publication
+            .resolve_recovery()
+            .map_err(|e| e.to_string())?;
         // Unknown/nonempty contents are preserved. A retry may clean up only
         // an empty exact original; it never deletes an arbitrary leaf or
         // overwrites a newer destination in pursuit of cleanup.
-        self.publication.cleanup_empty().map_err(|e|e.to_string())?;
-        fs_safety::sync_directory(&self.parent).map_err(|e|e.to_string())
+        self.publication
+            .cleanup_empty()
+            .map_err(|e| e.to_string())?;
+        fs_safety::sync_directory(&self.parent).map_err(|e| e.to_string())
     }
     fn location(&self) -> String {
-        format!("the held private directory originally named {}", self.root.path().display())
+        format!(
+            "the held private directory originally named {}",
+            self.root.path().display()
+        )
     }
 }
 
@@ -290,9 +354,22 @@ fn publish_with_hooks(
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
     let mut holding = Holding::create(parent, destination)?;
-    let result = publish_in_holding(&mut holding, parent, name, destination, bytes,
-        permissions, baseline, before_publish, after_acquire, after_publish, sync_parent);
-    if holding.publication.is_removed() { return result; }
+    let result = publish_in_holding(
+        &mut holding,
+        parent,
+        name,
+        destination,
+        bytes,
+        permissions,
+        baseline,
+        before_publish,
+        after_acquire,
+        after_publish,
+        sync_parent,
+    );
+    if holding.publication.is_removed() {
+        return result;
+    }
     // Publication cleanup may have acquired an unexpected entry. Preserve the
     // live receipt through the exact caller result, never only its old spelling.
     let authority = holding.retain();
@@ -300,14 +377,28 @@ fn publish_with_hooks(
         Err(error) => {
             let authority = if let Some(previous) = error.recovery_authority() {
                 authority.combine(previous.clone())
-            } else { authority };
-            Err(FileIoError::Recovery { message: error.to_string(), authority })
+            } else {
+                authority
+            };
+            Err(FileIoError::Recovery {
+                message: error.to_string(),
+                authority,
+            })
         }
         Ok(SaveDurability::Durable) => Ok(SaveDurability::Recovery {
-            error: "Save completed, but private recovery cleanup remains unresolved.".into(), authority }),
-        Ok(SaveDurability::Unconfirmed { error }) => Ok(SaveDurability::Recovery { error, authority }),
-        Ok(SaveDurability::Recovery { error, authority: previous }) =>
-            Ok(SaveDurability::Recovery { error, authority: authority.combine(previous) }),
+            error: "Save completed, but private recovery cleanup remains unresolved.".into(),
+            authority,
+        }),
+        Ok(SaveDurability::Unconfirmed { error }) => {
+            Ok(SaveDurability::Recovery { error, authority })
+        }
+        Ok(SaveDurability::Recovery {
+            error,
+            authority: previous,
+        }) => Ok(SaveDurability::Recovery {
+            error,
+            authority: authority.combine(previous),
+        }),
     }
 }
 
@@ -324,8 +415,7 @@ fn publish_in_holding(
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
-    let (temporary, temporary_name) = match fs_safety::create_temporary_in(&holding.root, 0o600)
-    {
+    let (temporary, temporary_name) = match fs_safety::create_temporary_in(&holding.root, 0o600) {
         Ok(value) => value,
         Err(error) => {
             let cleanup = holding.remove_empty(parent);
@@ -874,30 +964,53 @@ mod tests {
         drop(source);
         let private_path = holding.root.path().to_owned();
         let authority = holding.retain();
-        assert_eq!(descriptor_identity(descriptor), Some(expected), "the returned authority must own the authenticated file descriptor");
+        assert_eq!(
+            descriptor_identity(descriptor),
+            Some(expected),
+            "the returned authority must own the authenticated file descriptor"
+        );
         assert!(authority.retry().is_err());
-        assert_eq!(descriptor_identity(descriptor), Some(expected), "failed retry must retain all owned authority");
+        assert_eq!(
+            descriptor_identity(descriptor),
+            Some(expected),
+            "failed retry must retain all owned authority"
+        );
         fs::remove_file(private_path.join("unresolved")).unwrap();
         authority.retry().unwrap();
         assert!(authority.is_resolved());
         // Another parallel test may reuse the numeric FD. The fixture's
         // still-linked unique inode cannot be reused, so compare identity.
-        assert_ne!(descriptor_identity(descriptor), Some(expected), "actual resolution releases the captured file descriptor");
+        assert_ne!(
+            descriptor_identity(descriptor),
+            Some(expected),
+            "actual resolution releases the captured file descriptor"
+        );
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"base");
     }
 
     #[test]
     fn save_acquisition_recovery_retains_exact_holding_after_parent_replacement_until_resolution() {
         let (dir, root) = fixture();
-        let result = prepared_save(&root, |parent, _holding| {
-            fs::write(parent.path().join("file"), b"newer")
-        }, |_, _| Ok(())).unwrap_err();
-        let authority = result.recovery_authority().expect("unresolved acquired original must retain live authority").clone();
+        let result = prepared_save(
+            &root,
+            |parent, _holding| fs::write(parent.path().join("file"), b"newer"),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        let authority = result
+            .recovery_authority()
+            .expect("unresolved acquired original must retain live authority")
+            .clone();
         let held_path = holding(dir.path());
         assert_eq!(fs::read(held_path.join("previous")).unwrap(), b"base");
-        assert!(authority.retry().is_err(), "retry cannot delete nonempty recovery contents or replace newer work");
+        assert!(
+            authority.retry().is_err(),
+            "retry cannot delete nonempty recovery contents or replace newer work"
+        );
         assert!(!authority.is_resolved());
-        let parked = dir.path().with_extension(format!("parked-{}", uuid::Uuid::new_v4()));
+        let parked = dir
+            .path()
+            .with_extension(format!("parked-{}", uuid::Uuid::new_v4()));
         fs::rename(dir.path(), &parked).unwrap();
         fs::create_dir(dir.path()).unwrap();
         fs::write(dir.path().join("file"), b"replacement checkout").unwrap();
@@ -906,27 +1019,48 @@ mod tests {
         fs::write(dir.path().join(holding_name).join("foreign"), b"preserve").unwrap();
         // Explicit user resolution moves the retained original out. Retry then
         // cleans the exact original holding under the retained parent, never B.
-        fs::rename(parked.join(holding_name).join("previous"), parked.join("recovered-original")).unwrap();
+        fs::rename(
+            parked.join(holding_name).join("previous"),
+            parked.join("recovered-original"),
+        )
+        .unwrap();
         authority.retry().unwrap();
         assert!(authority.is_resolved());
-        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"replacement checkout");
-        assert_eq!(fs::read(dir.path().join(holding_name).join("foreign")).unwrap(), b"preserve");
+        assert_eq!(
+            fs::read(dir.path().join("file")).unwrap(),
+            b"replacement checkout"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(holding_name).join("foreign")).unwrap(),
+            b"preserve"
+        );
         assert_eq!(fs::read(parked.join("file")).unwrap(), b"newer");
-        assert_eq!(fs::read(parked.join("recovered-original")).unwrap(), b"base");
+        assert_eq!(
+            fs::read(parked.join("recovered-original")).unwrap(),
+            b"base"
+        );
         fs::remove_dir_all(parked).unwrap();
     }
 
     #[test]
     fn save_acquisition_committed_recovery_is_typed_and_never_reverts_published_bytes() {
         let (dir, root) = fixture();
-        let result = prepared_save(&root, |_, _| Ok(()), |_, private| {
-            fs::write(private.path().join("previous"), b"late")
-        }).unwrap();
-        let authority = result.recovery_authority().expect("committed cleanup failure needs retained authority");
+        let result = prepared_save(
+            &root,
+            |_, _| Ok(()),
+            |_, private| fs::write(private.path().join("previous"), b"late"),
+        )
+        .unwrap();
+        let authority = result
+            .recovery_authority()
+            .expect("committed cleanup failure needs retained authority");
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"mine");
         assert!(authority.retry().is_err());
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"mine");
-        assert_eq!(fs::read(holding(dir.path()).join("previous")).unwrap(), b"late");
+        assert_eq!(
+            fs::read(holding(dir.path()).join("previous")).unwrap(),
+            b"late"
+        );
         assert!(!authority.is_resolved());
     }
 
