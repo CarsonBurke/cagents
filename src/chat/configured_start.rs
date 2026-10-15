@@ -24,6 +24,14 @@ pub struct ConfiguredChatStart {
 }
 
 impl ConfiguredChatStart {
+    /// Typed draft metadata may describe only this never-issued conversation.
+    /// Account homes and execution policy are resolved later by the daemon.
+    pub fn matches_draft(&self, session: &super::Session) -> bool {
+        session.is_unstarted() && self.id == session.id
+            && self.provider == session.launch.provider
+            && self.working_directory == session.launch.recipe.working_directory
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let directory = self.working_directory.as_os_str().as_bytes();
         if self.id.as_uuid().is_nil()

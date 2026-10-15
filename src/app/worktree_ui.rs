@@ -190,6 +190,7 @@ fn scope_descriptor(
         // A projected strip is a view, never a place to file a card.
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
+        configured_chat_drafts: HashMap::new(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what

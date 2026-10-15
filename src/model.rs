@@ -1307,6 +1307,10 @@ pub struct WorkspaceState {
     /// Unsent native-chat composer text, keyed by the card that owns it.
     #[serde(default)]
     pub chat_drafts: HashMap<CardId, String>,
+    /// Explicit fresh choices, never executable/environment or issued authority.
+    /// Each entry belongs to one open, never-issued chat card.
+    #[serde(default)]
+    pub configured_chat_drafts: HashMap<CardId, crate::chat::ConfiguredChatStart>,
     /// Most recently visited workspace identities, newest first. Missing
     /// identities are pruned when navigation opens; this grants no ownership.
     #[serde(default)]
@@ -1346,6 +1350,7 @@ impl Default for WorkspaceState {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            configured_chat_drafts: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
