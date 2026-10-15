@@ -21,6 +21,7 @@ use std::{
 };
 
 mod original;
+mod history_origins;
 const MAX_PENDING: usize = 64;
 const MAX_TOOLS: usize = 512;
 const ATTACHMENTS: AttachmentRules = AttachmentRules::for_provider(Provider::Claude);
@@ -1105,7 +1106,15 @@ impl Claude {
         self.message_with_tools(frame, step, &HashMap::new(), false)
     }
     fn history_message(&mut self, record: &HistoryRecord, step: &mut Step) -> Result<(), String> {
-        self.message_with_tools(&record.frame, step, &record.tool_calls, true)
+        let start=step.events.len();
+        self.message_with_tools(&record.frame, step, &record.tool_calls, true)?;
+        if record["parent_tool_use_id"].is_null()
+            && let Some(account)=&record.account_origin
+            && let Some(session)=record["sessionId"].as_str() {
+            let origins=history_origins::events(account,session,&step.events[start..]);
+            step.events.extend(origins);
+        }
+        Ok(())
     }
     fn message_with_tools(
         &mut self,
@@ -1772,9 +1781,11 @@ impl Adapter for Claude {
             }
             let mut items = Vec::new();
             let mut children = Vec::new();
+            let mut origins = Vec::new();
             for event in history_step.events {
                 match event {
                     Event::Item(item) => items.push(item),
+                    Event::HistoryOrigins { .. } => origins.push(event),
                     Event::Subagent { .. }
                     | Event::SubagentItem { .. }
                     | Event::SubagentTextDelta { .. }
@@ -1782,6 +1793,7 @@ impl Adapter for Claude {
                     _ => {}
                 }
             }
+            step.events.extend(origins);
             step.events.push(Event::History {
                 items: settled(items),
                 has_earlier: history.offset > 0,
@@ -2025,24 +2037,12 @@ impl Adapter for Claude {
                         self.history_message(&frame, &mut step)?;
                     }
                     self.background_agents = running;
-                    let items = step
-                        .events
-                        .into_iter()
-                        .filter_map(|e| {
-                            if let Event::Item(i) = e {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    Ok(Step {
-                        events: vec![Event::History {
-                            items: settled(items),
-                            has_earlier,
-                        }],
-                        ..Step::default()
-                    })
+                    let mut items=Vec::new();let mut origins=Vec::new();
+                    for event in step.events {
+                        match event {Event::Item(item)=>items.push(item),Event::HistoryOrigins{..}=>origins.push(event),_=>{}}
+                    }
+                    origins.push(Event::History {items:settled(items),has_earlier});
+                    Ok(Step {events:origins,..Step::default()})
                 }
             }
         })();
@@ -4254,6 +4254,7 @@ fn sidecar_meta(path: &Path) -> Option<Value> {
 // index rather than retaining the full transcript. Never scan other sessions.
 struct History {
     file: File,
+    account_origin:Option<(crate::chat::turn_outcomes::HistoryAccountOrigin,u64,u64)>,
     chain: Vec<(u64, u64, usize)>,
     offset: usize,
     session_id: String,
@@ -4273,6 +4274,7 @@ type HistoryCalls = HashMap<usize, std::sync::Arc<Value>>;
 #[derive(Debug)]
 struct HistoryRecord {
     frame: Value,
+    account_origin:Option<crate::chat::turn_outcomes::HistoryAccountOrigin>,
     tool_calls: HistoryCalls,
 }
 impl std::ops::Deref for HistoryRecord {
@@ -4334,7 +4336,10 @@ impl History {
                 PathBuf::from(home).join(".claude")
             }
         };
-        let path = crate::agent::claude_transcript(&config, &cwd, id)?;
+        use std::os::unix::fs::MetadataExt;
+        let canonical_home=config.canonicalize().map_err(|error|error.to_string())?;
+        let before=std::fs::metadata(&canonical_home).map_err(|error|error.to_string())?;
+        let path = crate::agent::claude_transcript(&canonical_home, &cwd, id)?;
         let mut options = std::fs::OpenOptions::new();
         use std::os::unix::fs::OpenOptionsExt as _;
         options
@@ -4343,7 +4348,16 @@ impl History {
         let file = options
             .open(&path)
             .map_err(|e| format!("Cannot open exact Claude transcript: {e}"))?;
+        let file_metadata=file.metadata().map_err(|error|error.to_string())?;
         let mut history = Self::index(file, id)?;
+        let after=std::fs::metadata(&canonical_home).map_err(|error|error.to_string())?;
+        // A history project symlink outside the account may remain readable
+        // under the legacy history contract, but grants no account provenance.
+        if path.starts_with(&canonical_home) && before.is_dir() && after.is_dir()
+            && (before.dev(),before.ino())==(after.dev(),after.ino()) {
+            let account=crate::chat::turn_outcomes::HistoryAccountOrigin{provider:Provider::Claude,canonical_home,device:after.dev(),inode:after.ino()};
+            if account.validate().is_ok(){history.account_origin=Some((account,file_metadata.dev(),file_metadata.ino()));}
+        }
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
         Ok(history)
     }
@@ -4638,6 +4652,7 @@ impl History {
         let offset = chain.len();
         Ok(Self {
             file,
+            account_origin:None,
             chain,
             offset,
             session_id: id.into(),
@@ -4811,6 +4826,14 @@ impl History {
             .remove("supersedes");
         Ok(frame)
     }
+    fn qualified_account_origin(&self)->Option<crate::chat::turn_outcomes::HistoryAccountOrigin> {
+        use std::os::unix::fs::MetadataExt;
+        let (account,device,inode)=self.account_origin.as_ref()?;
+        let home=std::fs::symlink_metadata(&account.canonical_home).ok()?;
+        let file=self.file.metadata().ok()?;
+        (home.is_dir() && !home.file_type().is_symlink() && (home.dev(),home.ino())==(account.device,account.inode)
+            && file.is_file() && (file.dev(),file.ino())==(*device,*inode)).then(||account.clone())
+    }
     fn page(&mut self) -> Result<Vec<HistoryRecord>, String> {
         let mut start = self.offset;
         let mut total = 0;
@@ -4851,10 +4874,11 @@ impl History {
         for index in start..self.offset {
             let (offset, len, base) = self.chain[index];
             positions.insert(offset, result.len());
-            result.push(HistoryRecord {
-                frame: self.read_record(offset, len, base)?,
-                tool_calls: HashMap::new(),
-            });
+            let frame=self.read_record(offset,len,base)?;
+            let account_origin=if frame["sessionId"].as_str()==Some(self.session_id.as_str()) {
+                self.qualified_account_origin()
+            }else{None};
+            result.push(HistoryRecord {frame,account_origin,tool_calls:HashMap::new()});
         }
         let mut dependencies = std::collections::BTreeMap::<
             u64,
