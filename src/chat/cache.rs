@@ -1,5 +1,6 @@
 //! Bounded, requester-specific reads of original cached prose. Native display
 //! part IDs are aliases, never source IDs: callers retain the original key.
+pub mod raw;
 use serde::{Deserialize, Serialize};
 
 pub const PAGE_BYTES: usize = 256 * 1024;

@@ -2117,6 +2117,8 @@ pub enum Event {
         key: Option<String>,
         outcome: crate::notifications::Kind,
     },
+    /// Exact original call source, independently of its derived display item.
+    RawToolCapture(cache::raw::RawToolCapture),
 }
 
 #[cfg(test)]
