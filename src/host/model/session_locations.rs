@@ -292,4 +292,37 @@ mod tests {
         registry.bind_session_location(&source, None, fixture.path(), identity).unwrap();
         assert!(registry.model().unwrap().session_location_refusals.is_empty());
     }
+
+    #[test]
+    fn exact_bound_legacy_agent_acquires_its_first_policy_from_owned_process_proof() {
+        use crate::agent_execution::{Destination, Origin, Spec, Submit, Surface, Target};
+        let fixture = tempfile::tempdir().unwrap();
+        let old = fixture.path().join("old"); let moved = fixture.path().join("moved");
+        std::fs::create_dir(&old).unwrap();
+        let mut registry = Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
+        registry.apply(&ModelEdit::OpenProject { repository: old.clone(), name: "Legacy".into(), kind: ProjectKind::Folder }).unwrap();
+        let placement = crate::workspace_model::views::Scope::Worktree { repository: old.clone(), path: old.clone() };
+        registry.apply(&ModelEdit::SeedView { scope: placement.clone(), panes: Vec::new(), closed: Vec::new() }).unwrap();
+        let accepted = registry.submit_agent(&Origin::User, &Submit { name: None, destination: Destination::New(Spec { provider: Provider::Omp, account: None, target: Target { repository: old.clone(), directory: old.clone(), placement: Some(placement) }, surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None }), prompt: "fixture, no real provider".into(), idempotency_key: "legacy-locate".into() }, 1).unwrap();
+        let source = source(&old);
+        registry.claim_agent_dispatch(&accepted, 2).unwrap();
+        registry.reserve_agent_launch(accepted.agent.id, &source).unwrap();
+        registry.bind_agent(accepted.agent.id, None, source.clone()).unwrap();
+        registry.db.execute("UPDATE agent_policies SET directory=NULL WHERE agent=?1", [accepted.agent.id.to_string()]).unwrap();
+        assert!(registry.agent_directory(accepted.agent.id).unwrap().is_none());
+        struct Running(std::process::Child);
+        impl Drop for Running { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let child = Running(std::process::Command::new("/bin/sleep").arg("30").current_dir(&old).spawn().unwrap());
+        let process = Process::read(child.0.id() as i32).unwrap();
+        std::fs::rename(&old, &moved).unwrap();
+        let proof = crate::chat::runtime::DirectoryProof::capture_owned_process(&process, &moved, None).unwrap();
+        let movement = SessionMove { source: source.clone(), repository: moved.clone(), candidate: moved.clone(), proof: Ok((proof.identity, proof.process)) };
+        registry.apply_with_session_moves(&ModelEdit::RelocateProject { relocation: Relocation { repository: old.clone(), destination: moved.clone(), old_root: old, new_root: moved.clone() } }, &[movement]).unwrap();
+        assert_eq!(registry.agent_directory(accepted.agent.id).unwrap(), Some(proof.identity));
+        assert_eq!(registry.agent_execution_directory(accepted.agent.id).unwrap(), moved);
+        let agent = registry.agent(accepted.agent.id).unwrap();
+        assert_eq!(agent.spec, accepted.agent.spec);
+        assert_eq!(agent.session, Some(source));
+        assert!(registry.agent_location(agent.id).unwrap().blocked_directory.is_none());
+    }
 }
