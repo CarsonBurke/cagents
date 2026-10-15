@@ -609,14 +609,14 @@ fn metadata() -> Snapshot {
                 label: format!("Model {index}"),
                 reasoning: ["low", "medium", "high", "max"].map(String::from).into(),
             })
-            .collect(),
+            .collect::<Vec<_>>().into(),
         selected_model: Some("provider/model-7-20260101".into()),
         commands: (0..64)
             .map(|index| chat::SlashCommand {
                 name: format!("command-{index}"),
                 description: "Runs the project's command of this name with its arguments.".into(),
             })
-            .collect(),
+            .collect::<Vec<_>>().into(),
         skills: (0..160)
             .map(|index| chat::Skill {
                 name: format!("skill-{index}"),
@@ -625,7 +625,7 @@ fn metadata() -> Snapshot {
                     .into(),
                 invocation: format!("/skill-{index}"),
             })
-            .collect(),
+            .collect::<Vec<_>>().into(),
         plan: (0..8)
             .map(|index| chat::PlanStep {
                 text: format!("Step {index} of the plan the conversation is working to."),
@@ -671,6 +671,7 @@ fn a_refresh_of_a_full_window_with_metadata() {
         let update = chat::presentation::Presentation {
             base_generation: installed.generation,
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             metadata: Snapshot {
                 generation: installed.generation + 1,
                 ..pane.metadata.clone()

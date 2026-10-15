@@ -58,6 +58,7 @@ pub(crate) struct Store {
     file_keys: usize,
     applied_files: usize,
     pub(super) file_cwd: Option<PathBuf>,
+    pub(super) presented_catalogs: Option<crate::chat::presentation::Catalogs>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
     end: Option<Cursor>,
@@ -157,6 +158,7 @@ impl Store {
                 applied_files: 0,
                 file_cwd: None,
                 presented_file_changes: None,
+                presented_catalogs: None,
                 db,
                 directory: directory.clone(),
                 end: None,
@@ -1702,6 +1704,7 @@ mod tests {
         let earlier = store.window_reusing(&mut latest.items).unwrap();
         let replayed = crate::chat::presentation::Presentation {
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             children: Vec::new(),
             base_generation: 1,
             metadata: crate::chat::Snapshot {

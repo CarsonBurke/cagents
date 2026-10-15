@@ -10,11 +10,64 @@ pub struct Presentation {
     /// with every prose/tool delta. Full snapshots remain the resync boundary.
     #[serde(default)]
     pub file_changes_unchanged: bool,
+    /// Immutable provider catalogs may be retained across this exact revision.
+    #[serde(default)]
+    pub retained_catalogs: RetainedCatalogs,
     /// Everything except the parent transcript, whose items are updated below.
     pub metadata: Snapshot,
     pub order: Vec<String>,
     pub changes: Vec<ItemChange>,
     pub children: Vec<ChildUpdate>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedCatalogs {
+    pub models: bool,
+    pub commands: bool,
+    pub skills: bool,
+}
+
+/// Pointer identity is local immutable ownership evidence. Wire messages carry
+/// only retention flags, fenced by Presentation::base_generation.
+#[derive(Clone)]
+pub(crate) struct Catalogs {
+    models: std::sync::Arc<Vec<super::Model>>,
+    commands: std::sync::Arc<Vec<super::SlashCommand>>,
+    skills: std::sync::Arc<Vec<super::Skill>>,
+}
+impl Catalogs {
+    pub(crate) fn of(snapshot: &Snapshot) -> Self {
+        Self { models: snapshot.models.clone(), commands: snapshot.commands.clone(), skills: snapshot.skills.clone() }
+    }
+    pub(crate) fn same(&self, snapshot: &Snapshot) -> bool {
+        std::sync::Arc::ptr_eq(&self.models, &snapshot.models)
+            && std::sync::Arc::ptr_eq(&self.commands, &snapshot.commands)
+            && std::sync::Arc::ptr_eq(&self.skills, &snapshot.skills)
+    }
+    pub(crate) fn retain(&self, metadata: &mut Snapshot) -> RetainedCatalogs {
+        let retained = RetainedCatalogs {
+            models: std::sync::Arc::ptr_eq(&self.models, &metadata.models),
+            commands: std::sync::Arc::ptr_eq(&self.commands, &metadata.commands),
+            skills: std::sync::Arc::ptr_eq(&self.skills, &metadata.skills),
+        };
+        if retained.models { metadata.models = Default::default(); }
+        if retained.commands { metadata.commands = Default::default(); }
+        if retained.skills { metadata.skills = Default::default(); }
+        retained
+    }
+}
+impl RetainedCatalogs {
+    fn apply(self, metadata: &mut Snapshot, previous: &Snapshot) -> Result<(), &'static str> {
+        if (self.models && !metadata.models.is_empty())
+            || (self.commands && !metadata.commands.is_empty())
+            || (self.skills && !metadata.skills.is_empty()) {
+            return Err("Retained provider catalog carries replacement rows");
+        }
+        if self.models { metadata.models = previous.models.clone(); }
+        if self.commands { metadata.commands = previous.commands.clone(); }
+        if self.skills { metadata.skills = previous.skills.clone(); }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +248,7 @@ impl Presentation {
             return Err("Transcript revision mismatch");
         }
         let mut metadata = self.metadata;
+        self.retained_catalogs.apply(&mut metadata, previous)?;
         if self.file_changes_unchanged {
             if !metadata.file_changes.files.is_empty() {
                 return Err("Retained file summary carries replacement rows");
@@ -233,6 +287,57 @@ impl Presentation {
 mod tests {
     use super::*;
     #[test]
+    fn retained_catalogs_keep_local_ownership_and_bound_wire_payload() {
+        let previous = Snapshot {
+            generation: 1,
+            commands: (0..1000).map(|at| super::super::SlashCommand {
+                name: format!("command-{at}"), description: "catalog description".repeat(100),
+            }).collect::<Vec<_>>().into(),
+            skills: vec![super::super::Skill { name: "review".into(), description: "review changes".into(),
+                invocation: "$review".into() }].into(),
+            ..Default::default()
+        };
+        let mut metadata = previous.clone();
+        metadata.generation = 2;
+        let retained_catalogs = Catalogs::of(&previous).retain(&mut metadata);
+        let update = Presentation { base_generation: 1, file_changes_unchanged: false,
+            retained_catalogs, metadata, order: vec![], changes: vec![], children: vec![] };
+        let wire = serde_json::to_vec(&update).unwrap();
+        assert!(wire.len() < 4096, "unchanged catalog leaked into a body publication");
+        let decoded: Presentation = serde_json::from_slice(&wire).unwrap();
+        let installed = decoded.apply(&previous).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&previous.commands, &installed.commands));
+        assert!(std::sync::Arc::ptr_eq(&previous.skills, &installed.skills));
+        assert_eq!(installed.commands.len(), 1000);
+        // An explicit replacement by an empty catalog must not mean retention.
+        let mut metadata = installed.clone();
+        metadata.generation = 3;
+        metadata.commands = Default::default();
+        let retained_catalogs = Catalogs::of(&installed).retain(&mut metadata);
+        assert!(!retained_catalogs.commands);
+        let emptied = Presentation { base_generation: 2, file_changes_unchanged: false,
+            retained_catalogs, metadata, order: vec![], changes: vec![], children: vec![] }
+            .apply(&installed).unwrap();
+        assert!(emptied.commands.is_empty());
+    }
+
+    #[test]
+    fn retained_catalogs_reject_payload_and_wrong_revision() {
+        let previous = Snapshot { generation: 4, ..Default::default() };
+        let update = Presentation { base_generation: 4, file_changes_unchanged: false,
+            retained_catalogs: RetainedCatalogs { commands: true, ..Default::default() },
+            metadata: Snapshot { generation: 5, commands: vec![super::super::SlashCommand {
+                name: "forged".into(), description: String::new() }].into(), ..Default::default() },
+            order: vec![], changes: vec![], children: vec![] };
+        assert_eq!(update.apply(&previous).unwrap_err(), "Retained provider catalog carries replacement rows");
+        let update = Presentation { base_generation: 3, file_changes_unchanged: false,
+            retained_catalogs: RetainedCatalogs { commands: true, ..Default::default() },
+            metadata: Snapshot { generation: 5, ..Default::default() },
+            order: vec![], changes: vec![], children: vec![] };
+        assert_eq!(update.apply(&previous).unwrap_err(), "Transcript revision mismatch");
+    }
+
+    #[test]
     fn full_window_updates_share_payloads_with_the_retained_ui_snapshot() {
         let items: Vec<_> = (0..127)
             .map(|index| {
@@ -249,6 +354,7 @@ mod tests {
         let next = text("live", "hello tail");
         let update = Presentation {
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             base_generation: 1,
             metadata: Snapshot {
                 generation: 2,
@@ -328,6 +434,7 @@ mod tests {
         metadata.subagents[0].items.clear();
         let update = Presentation {
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             base_generation: 1,
             metadata,
             order: vec!["tool".into()],
@@ -382,6 +489,7 @@ mod tests {
         };
         snapshot = Presentation {
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             children: Vec::new(),
             base_generation: 4,
             metadata,
@@ -424,6 +532,7 @@ mod tests {
             assert!(
                 Presentation {
                     file_changes_unchanged: false,
+                    retained_catalogs: Default::default(),
                     children: Vec::new(),
                     base_generation: generation,
                     metadata: Snapshot {
@@ -460,6 +569,7 @@ mod tests {
         let update = Presentation {
             base_generation: 1,
             file_changes_unchanged: true,
+            retained_catalogs: Default::default(),
             metadata: Snapshot {
                 generation: 2,
                 ..Default::default()

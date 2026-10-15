@@ -2712,6 +2712,7 @@ mod tests {
         };
         let update = Presentation {
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             base_generation: 1,
             metadata: Snapshot {
                 sampled_at: Some(2000),
@@ -2799,6 +2800,7 @@ mod tests {
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let malformed = Presentation {
                 file_changes_unchanged: false,
+                retained_catalogs: Default::default(),
                 base_generation: 2,
                 metadata: Snapshot {
                     sampled_at: Some(999_999),
