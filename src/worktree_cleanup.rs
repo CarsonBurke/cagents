@@ -100,6 +100,13 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
     {
         return Err("Worktree repository changed".into());
     }
+    let admin = service.git_dir(&request.path, &cancellation)
+        .map_err(|error| error.to_string())?;
+    let checkout_root = crate::fs_safety::Root::open(&request.path).map_err(|error| error.to_string())?;
+    let admin_root = crate::fs_safety::Root::open(&admin).map_err(|error| error.to_string())?;
+    let common_root = crate::fs_safety::Root::open(&common).map_err(|error| error.to_string())?;
+    crate::worktree_branch::registered_heads::check_checkout_binding(
+        &checkout_root, &admin_root, &common_root, record)?;
     let source =
         crate::github::worktree_head_repository(&request.path, &request.branch, &cancellation)
             .ok_or("Worktree source repository is unknown")?;
@@ -717,6 +724,16 @@ mod tests {
         request.repository = repository.clone();
         request.path = worktree.clone();
         request.head_oid = git(&worktree, &["rev-parse", "HEAD"]);
+        checked_record(&request).unwrap();
+        let sibling = directory.path().join("sibling");
+        git(&repository, &["worktree", "add", "--quiet", "--detach", sibling.to_str().unwrap(), "HEAD"]);
+        let original_locator = std::fs::read(worktree.join(".git")).unwrap();
+        std::fs::write(worktree.join(".git"), std::fs::read(sibling.join(".git")).unwrap()).unwrap();
+        let refusal = PreparedRemoval::prepare(request.clone()).err()
+            .expect("automatic preparation must reject a sibling admin substituted for the selected checkout");
+        assert!(refusal.contains("backlink disagree"), "{refusal}");
+        assert!(worktree.exists() && sibling.exists());
+        std::fs::write(worktree.join(".git"), original_locator).unwrap();
         checked_record(&request).unwrap();
         std::fs::write(worktree.join(".env"), "private fixture secret").unwrap();
         let error = checked_record(&request).unwrap_err();
