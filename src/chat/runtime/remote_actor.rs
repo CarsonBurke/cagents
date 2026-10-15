@@ -801,6 +801,40 @@ mod tests {
         Fixture {server:Server {actor,identity,source,lineage:Vec::new(),execution_console:None,paired_holder:None,proof,epoch:uuid::Uuid::new_v4(),installed:true,journal:Arc::new(Mutex::new(Journal::open(&journal_directory).unwrap())),changed:Arc::new(std::sync::atomic::AtomicU64::new(1)),pending:Vec::new(),account_reports:Arc::new(Mutex::new(Vec::new())),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:BTreeMap::new(),listener,socket,socket_identity:(metadata.dev(),metadata.ino()),_directory:None,mailbox_seal:None},_root:root}
     }
     #[test]
+    fn explicit_restart_reuses_the_store_and_never_repeats_a_deduplicated_launch() {
+        let mut fixture=resident_fixture();let server=&mut fixture.server;
+        let old_process=server.actor.provider_process().unwrap();let old_close=server.actor.close_observation();
+        let store=server.actor.0.store.clone();
+        store.lock().unwrap().apply(chat::Event::Item(chat::Item {id:"partial".into(),role:chat::Role::Assistant,started_at:None,at:None,content:chat::ItemContent::Text {text:"answer before crash".into(),thinking:false,phase:Default::default()}})).unwrap();
+        server.actor.close().unwrap();
+        let id=uuid::Uuid::new_v4();
+        let script=r#"printf 'spawn\n' >> spawns
+while IFS= read -r frame; do
+  case "$frame" in
+    *'"type":"control_request"'*)
+      id=${frame#*'"request_id":"'}; id=${id%%'"'*}
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      ;;
+    *'"type":"user"'*) printf 'unexpected prompt\n' >> prompts ;;
+  esac
+done"#;
+        let payload=json!({"id":id,"source":server.source,"program":"/bin/sh","arguments":["-c",script],"environment":{},"working_directory":fixture._root.path(),"recovery_environment":{}});
+        let request:restart::Request=serde_json::from_value(payload.clone()).unwrap();
+        let receipt=server.restart(request).unwrap();
+        let restart::RestartState::Acknowledged(Ok(process))=receipt.state else {panic!("replacement did not acknowledge its exact process");};
+        let deadline=Instant::now()+Duration::from_secs(2);while !server.actor.0.state.lock().unwrap().ready {assert!(Instant::now()<deadline,"restarted fixture did not acknowledge initialization");thread::yield_now();}
+        assert_ne!(process,old_process);assert_eq!(server.identity.instance,old_close.actor_id);
+        assert!(Arc::ptr_eq(&store,&server.actor.0.store));
+        let window=store.lock().unwrap().window().unwrap();assert!(window.items.iter().any(|item|matches!(&item.content,chat::ItemContent::Text{text,..} if text=="answer before crash")));
+        assert!(server.actor.close_observation().close_revision>old_close.close_revision);
+        let repeated=server.restart(serde_json::from_value(payload.clone()).unwrap()).unwrap();
+        assert_eq!(repeated.state,restart::RestartState::Acknowledged(Ok(process)));
+        assert_eq!(std::fs::read_to_string(fixture._root.path().join("spawns")).unwrap(),"spawn\n");
+        assert!(!fixture._root.path().join("prompts").exists(),"restart never replays an accepted prompt");
+        let mut changed=payload;changed["arguments"]=json!(["-c","exit 0"]);
+        assert!(server.restart(serde_json::from_value(changed).unwrap()).is_err(),"same restart UUID cannot select a different launch");
+    }
+    #[test]
     fn concurrent_ready_publication_cannot_be_hidden_by_a_new_revision_on_old_metadata() {
         let mut fixture=resident_fixture();fixture.server.actor.0.state.lock().unwrap().ready=false;
         let first=fixture.server.resident_after_copy(|| {
