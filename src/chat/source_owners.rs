@@ -15,6 +15,23 @@ pub(crate) fn readers()->&'static Arc<tokio::sync::Semaphore> {
     READERS.get_or_init(||Arc::new(tokio::sync::Semaphore::new(2)))
 }
 
+static READER_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Allocated String capacity in the two readers, including a completed body
+/// awaiting admission. Shared `known` items remain counted only by Owners.
+#[derive(Default)]
+pub(crate) struct ReaderCapacity(std::sync::atomic::AtomicUsize);
+impl ReaderCapacity {
+    pub(crate) fn set(&self, bytes: usize) {
+        let old = self.0.swap(bytes, std::sync::atomic::Ordering::Relaxed);
+        if bytes >= old { READER_CAPACITY.fetch_add(bytes-old, std::sync::atomic::Ordering::Relaxed); }
+        else { READER_CAPACITY.fetch_sub(old-bytes, std::sync::atomic::Ordering::Relaxed); }
+    }
+}
+impl Drop for ReaderCapacity {
+    fn drop(&mut self) { self.set(0); }
+}
+pub(crate) fn reader_capacity()->usize { READER_CAPACITY.load(std::sync::atomic::Ordering::Relaxed) }
+
 /// A lease follows the actual immutable item through snapshots, parser caches
 /// and retained trees: weak owners disappear only when the last item owner is
 /// gone. Clearing a State cannot release a still-retained item's accounting.
