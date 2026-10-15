@@ -39,6 +39,21 @@ impl<E: ProcessExecutor> GitHubService<E> {
         Ok(failed_step_tails(&String::from_utf8_lossy(&output.stdout), LOG_LINES_PER_STEP))
     }
 
+    pub fn review_thread_hunks(&self, repository: &GitHubRepoKey, threads: &[String], cancellation: &CancellationToken) -> Result<Vec<String>, GitHubError> {
+        repository.validate()?;
+        let mut result=Vec::with_capacity(threads.len());
+        for chunk in threads.chunks(50) {
+            let names:Vec<_>=(0..chunk.len()).map(|index|format!("thread{index}")).collect();
+            let mut query=format!("query({}){{", names.iter().map(|name|format!("${name}:ID!")).collect::<Vec<_>>().join(","));
+            for (index,name) in names.iter().enumerate(){query.push_str(&format!("t{index}:node(id:${name}){{... on PullRequestReviewThread{{comments(first:1){{nodes{{diffHunk}}}}}}}}"));}
+            query.push('}');
+            let variables=names.iter().zip(chunk).map(|(name,id)|(name.as_str(),id.as_str().into())).collect();
+            let data=self.graphql(repository,&query,variables,cancellation)?;
+            for index in 0..chunk.len(){result.push(data.pointer(&format!("/t{index}/comments/nodes/0/diffHunk")).and_then(serde_json::Value::as_str).unwrap_or("(diff hunk unavailable)").to_owned());}
+        }
+        Ok(result)
+    }
+
     /// Hunks belong to review comments, which the inspector's lightweight
     /// discussion query does not otherwise need. Load them only on handoff.
     pub fn review_thread_hunk(&self, repository: &GitHubRepoKey, thread: &str,

@@ -4069,12 +4069,13 @@ impl Cagents {
                     || session.launch.recipe.working_directory == worktree)
         });
         let existing = candidates.max_by_key(|(index, card)| {
-            let at = match self.cards.get(&card.id) {
-                Some(CardRuntime::Chat(runtime)) => runtime.snapshot.items.iter()
-                    .filter_map(|item| item.at.or(item.started_at)).max().or(runtime.snapshot.finished_at).unwrap_or(0),
-                _ => 0,
+            let runtime = match self.cards.get(&card.id) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+                _ => self.chat_ui.parked.get(&card.id).map(Box::as_ref),
             };
-            (Some(card.id) == self.workspace.focused(), at, *index)
+            let at=runtime.map(|runtime|runtime.snapshot.items.iter()
+                .filter_map(|item| item.at.or(item.started_at)).max().or(runtime.snapshot.finished_at).unwrap_or(0)).unwrap_or(0);
+            (at, *index, Some(card.id) == self.workspace.focused())
         }).map(|(_, card)| card.id);
         let (card, open) = match existing {
             Some(card) => {
