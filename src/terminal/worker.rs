@@ -1507,6 +1507,29 @@ impl TerminalHandle {
                 .store(*visibility == Visibility::Visible, Ordering::Release);
             return Ok(());
         }
+        // Fast terminal controls share a bounded dispatcher. Waiting for a
+        // different terminal's final screen would occupy its input capacity;
+        // refuse admission so the caller can retry after archival completes.
+        if matches!(*phase, ArchivePhase::Preparing)
+            && matches!(
+                command,
+                Command::Interrupt(_)
+                    | Command::Input(_)
+                    | Command::Paste(..)
+                    | Command::Key(_)
+                    | Command::Mouse(_)
+                    | Command::Focus(_)
+                    | Command::Resize(_)
+                    | Command::Scroll(_)
+                    | Command::SetTheme(_)
+                    | Command::Hide
+                    | Command::Reveal
+                    | Command::Hibernate
+                    | Command::Restore { .. }
+            )
+        {
+            return Err(TerminalSendError::Full);
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while matches!(*phase, ArchivePhase::Preparing) {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -4817,6 +4840,40 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Live;
         handle.inner.published.archive_ready.notify_all();
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn archive_preparation_never_waits_on_fast_terminal_control_admission() {
+        let handle = TerminalHandle::spawn(
+            shell_session("exec /bin/cat"),
+            TerminalConfig::default(),
+            |_| {},
+        )
+        .unwrap();
+        *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Preparing;
+        let started = Instant::now();
+        for command in [
+            Command::Input(b"not-admitted".to_vec()),
+            Command::Interrupt(None),
+            Command::Paste("not-admitted".into(), PasteOrigin::Clipboard),
+            Command::Focus(true),
+            Command::Resize(TerminalSize { columns: 80, rows: 24, cell_width_px: 8, cell_height_px: 16 }),
+            Command::Scroll(ScrollCommand::Bottom),
+            Command::Hide,
+            Command::Reveal,
+            Command::Hibernate,
+            Command::Restore { visible: true },
+        ] {
+            assert_eq!(handle.try_command(command), Err(TerminalSendError::Full));
+        }
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(handle.inner.commands.is_empty(), "refused controls were not accepted");
+        assert!(!handle.inner.published.interrupt_requested.load(Ordering::Acquire));
+        *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Live;
+        handle.inner.published.archive_ready.notify_all();
+        handle.input(b"admitted-after-preparation\n").unwrap();
+        wait_for_text(&handle, "admitted-after-preparation");
         handle.shutdown().unwrap();
     }
 
