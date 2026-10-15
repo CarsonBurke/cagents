@@ -1871,10 +1871,9 @@ impl<Message> TerminalWidget<Message> {
             if let Some(pending) = pending { input.modifiers = state.released_during_review[pending].1; }
             input.action = KeyAction::Release;
             input.text = None;
-            match self.handle.key(input) {
+            match self.review_input_barrier.release(physical, &self.handle, input) {
                 Ok(()) => {
                     state.input_keys.swap_remove(index);
-                    self.review_input_barrier.paired(physical,&self.handle);
                     if let Some(pending) = pending { state.released_during_review.swap_remove(pending); }
                     if !state.released_on_blur.contains(&physical) { state.released_on_blur.push(physical); }
                 }
@@ -2735,13 +2734,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 );
                 input.key = map_key_location(input.key, key, *location);
                 input.scroll_to_bottom_on_input = self.scroll_to_bottom_on_input;
-                if !self.review_input_barrier.can_admit(*physical_key,&self.handle) {
-                    self.publish_error(TerminalSendError::Full,shell);
-                    shell.capture_event(); return;
-                }
-                match self.handle.key(input.clone()) {
+                match self.review_input_barrier.press(*physical_key, &self.handle, input.clone()) {
                     Ok(()) => {
-                        self.review_input_barrier.admitted(*physical_key,&self.handle,input.clone());
                         state.key_owner=Some((self.review_input_barrier.clone(),self.handle.clone()));
                         if let Some(index) = state.input_keys.iter().position(|(key, _)| key == physical_key) {
                             state.input_keys[index].1 = input;
@@ -2804,10 +2798,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 input.action = KeyAction::Release;
                 input.text = None;
                 input.modifiers = map_iced_modifiers(*modifiers);
-                match self.handle.key(input) {
+                match self.review_input_barrier.release(*physical_key, &self.handle, input) {
                     Ok(()) => {
                         state.input_keys.swap_remove(index);
-                        self.review_input_barrier.paired(*physical_key,&self.handle);
                         if state.input_keys.is_empty() { state.key_owner=None; }
                         shell.capture_event();
                     },
