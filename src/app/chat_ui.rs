@@ -16104,15 +16104,16 @@ mod tests {
         }
     }
 
-    /// A conversation an earlier version started for a chat nobody wrote in
-    /// was never named by its provider, so once its daemon is gone there is
-    /// nothing to resume: it reopens as a draft rather than as a failure.
+    /// A missing provider name does not prove an issued actor never accepted
+    /// input. Keep its exact source and unsent draft until explicit recovery.
     #[test]
-    fn a_never_named_conversation_whose_daemon_is_gone_reopens_as_a_draft() {
+    fn unnamed_issued_chat_keeps_its_identity_when_its_daemon_cannot_restore_it() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, None);
         let session = chat_runtime(&app, card).session.clone();
         assert!(!session.is_unstarted());
+        assert!(session.proof.is_some());
+        app.chat_runtime_mut(chat_runtime(&app, card).target).unwrap().replace_draft(text_editor::Content::with_text("Retain this unsent follow-up"));
         app.chat_forget(card);
         app.cards.insert(card, CardRuntime::Loading);
         let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
@@ -16122,21 +16123,13 @@ mod tests {
             target,
             Err(chat::StartFailure::fresh("fixture: daemon gone")),
         );
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.choosing());
-        assert_eq!(runtime.error, None, "nothing was lost, so nothing is said");
-        assert!(runtime.session.is_unstarted());
-        assert_eq!(
-            runtime.session.launch.recipe.arguments,
-            ["--remote", "unix://"]
-        );
-        assert!(!app.chat_offers_fresh_conversation(card));
-        retired(&mut app, card);
-        let CardKind::Chat(saved) = &app.card_state(card).unwrap().kind else {
-            panic!("the card is a chat");
-        };
-        assert!(saved.is_unstarted(), "the next launch opens it as a draft");
-        assert_eq!(saved.id, session.id);
+        assert!(matches!(app.cards.get(&card),Some(CardRuntime::Failed(_))));
+        assert_eq!(app.card_state(card).unwrap().kind,CardKind::Chat(session.clone()));
+        assert_eq!(saved(&app),CardKind::Chat(session.clone()),"ordinary persistence must retain the issued proof and recipe");
+        assert_eq!(app.chat_ui.drafts.get(&card).map(String::as_str),Some("Retain this unsent follow-up"));
+        assert!(!app.chat_start_pending(card));
+        assert!(app.chat_ui.retiring.iter().all(|target|target.card!=card),"failed automatic recovery must not retire the issued owner");
+        assert!(app.chat_offers_fresh_conversation(card),"a different conversation requires explicit user choice");
 
         // One converted from a CLI terminal may hold a conversation there,
         // so it asks, as before.
