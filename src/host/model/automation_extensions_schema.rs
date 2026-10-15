@@ -124,20 +124,29 @@ pub(super) fn validate(db:&Connection,current:u32)->Result<(),String> {
 /// The caller owns BEGIN IMMEDIATE and has already re-admitted the header and
 /// exact selected18 foundation. Stamp19 only with that same outer transaction.
 pub(super) fn apply(tx:&Transaction<'_>)->Result<(),String> {
+    apply_with_hook(tx, |_| Ok(()))
+}
+
+fn apply_with_hook(tx:&Transaction<'_>,mut after_step:impl FnMut(usize)->Result<(),String>)->Result<(),String> {
+    let mut step=0;
+    let mut completed=|| { let current=step;step+=1;after_step(current) };
     validate(tx,18)?;
     tx.execute_batch(r###"ALTER TABLE metadata ADD COLUMN automation_proposal_sequence INTEGER NOT NULL DEFAULT 0 CHECK(automation_proposal_sequence>=0); ALTER TABLE metadata ADD COLUMN automation_archive_sequence INTEGER NOT NULL DEFAULT 0 CHECK(automation_archive_sequence>=0);"###).map_err(|error|error.to_string())?;
+    completed()?;
     // Tables precede indexes/triggers; no observer can see a partial checkpoint.
     for &(kind,_,sql) in OBJECTS {
-        if kind=="table" {tx.execute_batch(sql).map_err(|error|error.to_string())?;}
+        if kind=="table" {tx.execute_batch(sql).map_err(|error|error.to_string())?;completed()?;}
     }
     tx.execute_batch(r###"INSERT INTO automation_report_usage(key) VALUES(0);"###).map_err(|error|error.to_string())?;
+    completed()?;
     // Preserve unresolved legacy helper authority, never infer process exit.
     tx.execute_batch(r###"INSERT OR IGNORE INTO automation_precheck_retirements(firing,revision,retired,notify)
         SELECT f.id,f.revision,0,json_extract(f.record,'$.state')='prechecking' FROM automation_firings f
         JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
         WHERE json_type(r.definition,'$.precheck')='object';"###).map_err(|error|error.to_string())?;
+    completed()?;
     for &(kind,_,sql) in OBJECTS {
-        if kind!="table" {tx.execute_batch(sql).map_err(|error|error.to_string())?;}
+        if kind!="table" {tx.execute_batch(sql).map_err(|error|error.to_string())?;completed()?;}
     }
     validate(tx,19)
 }
@@ -251,6 +260,29 @@ mod tests {
         let registry=Registry::at(&path).unwrap();
         assert_eq!(registry.db.query_row("SELECT phase,started_receipt FROM created_start_requirements WHERE session_id=?1",[&first],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?))).unwrap(),("retired".into(),None));
         assert_eq!(registry.db.query_row("SELECT count(*) FROM created_start_requirements",[],|row|row.get::<_,u64>(0)).unwrap(),2);
+    }
+
+    #[test]
+    fn registry19_every_extension_step_rolls_back_metadata_rows_and_checkpoint_atomically() {
+        // Metadata ALTERs, every table/index/trigger, usage seed and conservative
+        // precheck ownership copy all run under the same cumulative writer.
+        for fail_at in 0..OBJECTS.len()+3 {
+            let root=tempfile::tempdir().unwrap();let path=root.path().join("registry.sqlite3");
+            let registry=Registry::at(&path).unwrap();
+            discard_for_legacy_fixture(&registry.db);
+            registry.db.pragma_update(None,"user_version",18).unwrap();
+            registry.db.execute("INSERT INTO projects(repository,name,ordinal,kind) VALUES('/preserved','original authority',1,'folder')",[]).unwrap();
+            let before=schema::stored_contents(&registry.db);
+            let tx=registry.db.unchecked_transaction().unwrap();
+            let error=apply_with_hook(&tx,|step|if step==fail_at{Err("injected extension interruption".into())}else{Ok(())}).unwrap_err();
+            assert!(error.contains("injected extension interruption"),"step {fail_at}: {error}");
+            drop(tx);
+            assert_eq!(schema::stored_contents(&registry.db),before,"rollback step {fail_at}");
+            assert_eq!(registry.db.pragma_query_value(None,"user_version",|row|row.get::<_,u32>(0)).unwrap(),18);
+            schema::migrate(&registry.db).unwrap();
+            assert_eq!(registry.db.query_row("SELECT name FROM projects WHERE repository='/preserved'",[],|row|row.get::<_,String>(0)).unwrap(),"original authority");
+            assert_eq!(registry.db.pragma_query_value(None,"user_version",|row|row.get::<_,u32>(0)).unwrap(),19);
+        }
     }
 
 }
