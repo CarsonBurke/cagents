@@ -889,23 +889,15 @@ impl Renderer {
             Some(self.logical(Arc::from(""), 0)),
         );
         step::code_frame(
-            scroll::block(
-                widget::scrollable(
-                    widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
-                )
-                .direction(iced::widget::scrollable::Direction::Horizontal(
-                    design::scrollbar(),
-                ))
-                .id(scroll::block_id(
-                    self.target,
-                    self.reader_context.as_deref(),
-                    selection::logical_identity(&self.item, &self.path),
-                )),
-                self.reader_memory.clone(),
-                self.reader_context.clone(),
-                selection::logical_identity(&self.item, &self.path),
-                false,
-            ),
+            scroll::block(widget::scrollable(
+                widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16])
+                    .min_width(self.reader_memory.reader_width(self.reader_context.as_deref(),
+                        selection::logical_identity(&self.item, &self.path))),
+            )
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                design::scrollbar(),
+            )).id(scroll::block_id(self.target, self.reader_context.as_deref(), selection::logical_identity(&self.item, &self.path))), self.reader_memory.clone(), self.reader_context.clone(),
+                selection::logical_identity(&self.item, &self.path), false),
             Some(
                 language
                     .and_then(fence_language)

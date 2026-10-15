@@ -299,6 +299,8 @@ impl ToolText {
                 .is_some_and(|paint| paint.blocks.contains_key(&logical.identity))
         });
         let logical_id = logical.as_ref().map(|logical| logical.identity);
+        let previous_width = reader.as_ref().map_or(0.0, |(memory, context, identity)|
+            memory.reader_width(context.as_deref(), scroll::reader_key(*identity, scroll::ReaderAxis::Horizontal)));
         let body = widget::container(prose::code_text(
             self.text.clone(), spans, design::TEXT_BODY.into(), iced::Font::MONOSPACE,
             target, find, logical,
@@ -307,7 +309,8 @@ impl ToolText {
             step::GAP_S,
             step::GAP_M,
         ])))
-        .width(Length::Shrink);
+        .width(Length::Shrink)
+        .min_width(previous_width);
         let mut horizontal = widget::scrollable(body)
             .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
             .width(Length::Fill);
@@ -499,6 +502,61 @@ mod tests {
                 && glyph.y >= -1.0 && glyph.y + glyph.height <= node.size().height + 1.0),
                 "tail glyph must be accessible on both axes inside {:?}: {:?}", node.size(), tail.glyphs);
         }
+    }
+
+    #[test]
+    fn horizontal_bookmark_survives_wide_line_eviction_and_tree_remount() {
+        use iced::advanced::{Layout, layout, widget::{Operation, Tree, operation}};
+        struct Probe { horizontal: widget::Id, vertical: widget::Id, x: Option<f32>, y: Option<f32>,
+            observed: Option<(f32, f32)> }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn scrollable(&mut self, id: Option<&widget::Id>, _: iced::Rectangle, content: iced::Rectangle,
+                translation: iced::Vector, state: &mut dyn operation::Scrollable) {
+                if id == Some(&self.horizontal) {
+                    self.observed = Some((translation.x, content.width));
+                    if let Some(x) = self.x { state.scroll_to(iced::widget::scrollable::AbsoluteOffset { x: Some(x), y: None }); }
+                } else if id == Some(&self.vertical) && let Some(y) = self.y {
+                    state.scroll_to(iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(y) });
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let memory = scroll::Memory::default();
+        let block = ToolText::update(None, &format!("{}\n{}", "x".repeat(6000), "short line\n".repeat(1000)), Language::Plain);
+        let make = || block.view_logical_with_reader(crate::settings::EditorSyntaxTheme::Auto,
+            Some((120.0, false)), target, None, selectable_prose::Logical { identity: 42, start: 0 }, memory.clone(), None);
+        let probe = |x, y| Probe {
+            horizontal: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Horizontal)),
+            vertical: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Vertical)),
+            x, y, observed: None,
+        };
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 2000.0));
+        let mut element = make(); let mut tree = Tree::new(&element);
+        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(Some(10000.0), None));
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut read = probe(None, None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        let (x, width) = read.observed.unwrap();
+        assert!((x - 10000.0).abs() < 1.0 && width > 30000.0);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(None, Some(f32::MAX)));
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut read = probe(None, None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert_eq!(read.observed.unwrap(), (x, width), "short visible lines must not collapse measured horizontal travel");
+        drop(tree); drop(element);
+        let mut element = make(); let mut tree = Tree::new(&element);
+        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut read = probe(None, None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert_eq!(read.observed.unwrap(), (x, width), "cheap geometry restores x while the wide line is still evicted");
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut probe(None, Some(0.0)));
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut read = probe(None, None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert!((read.observed.unwrap().0 - x).abs() < 1.0, "returning to the wide line keeps the horizontal bookmark");
     }
 
     /// Output is opened at its last line and a patch at its first.

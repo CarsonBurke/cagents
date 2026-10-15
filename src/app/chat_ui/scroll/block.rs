@@ -9,6 +9,7 @@ pub(super) struct Saved {
     position: Point,
     at_end: bool,
     used: u64,
+    pub(super) content_width: f32,
 }
 #[derive(Default)]
 pub(super) struct Positions {
@@ -35,6 +36,7 @@ struct Block<'a> {
     memory: Memory,
     key: Key,
     bottom: bool,
+
 }
 struct Mounted(Option<Key>);
 struct Position {
@@ -79,11 +81,8 @@ impl Operation for Position {
                 self.changed = true;
             }
         }
-        self.saved = Some(Saved {
-            position: Point::new(translation.x, translation.y),
-            at_end: travel - translation.y <= 0.5,
-            used: 0,
-        });
+        self.saved = Some(Saved { position: Point::new(translation.x, translation.y),
+            at_end: travel - translation.y <= 0.5, used: 0, content_width: content.width });
     }
 }
 impl Block<'_> {
