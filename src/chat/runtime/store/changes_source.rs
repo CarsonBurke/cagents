@@ -82,6 +82,8 @@ impl Store {
         let previous:Option<(Option<Vec<u8>>,bool)>=self.db.query_row("SELECT fingerprint,indexed FROM changes_sources WHERE source=?1 AND item_id=?2",params![source,item.id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         if prepared.metadata.unavailable.is_some() || !matches!(previous,Some((Some(ref fingerprint),true)) if Some(fingerprint)==prepared.fingerprint.as_ref()) {return Ok(Some(prepared));}
         let ItemContent::Changes{changes,..}=&item.content else {unreachable!();};
+        let previous_files:usize=self.db.query_row("SELECT COUNT(*) FROM file_edits WHERE source=?1 AND item_id=?2",params![source,item.id],|row|row.get(0)).map_err(|error|error.to_string())?;
+        if previous_files!=changes.len() {return Ok(Some(prepared));}
         // The digest rejects ordinary rewrites cheaply. Equality is verified
         // against exact cached bytes before it can retain a read authority.
         for (index,file) in changes.iter().enumerate() {
@@ -357,6 +359,23 @@ mod tests {
             assert_eq!(current.epoch.revision,rewrite.epoch.revision);
             assert_ne!(current.epoch.incarnation,rewrite.epoch.incarnation);
             assert_eq!(replacement.change_patch(PatchQuery {expected_epoch:rewrite.epoch,until:rewrite.files[0].source_len,..stale}),Err(SourceError::Changed));
+        }
+    }
+
+    #[test]
+    fn matching_fingerprint_hint_cannot_hide_a_removed_trailing_file() {
+        for agent in [None,Some("child")] {
+            let mut store=Store::new().unwrap();
+            apply(&mut store,agent,item("same",&[("first.rs",PATCH),("second.rs",PATCH)]));
+            let original=manifest(&store,key(agent,"same"));
+            let shorter=item("same",&[("first.rs",PATCH)]);
+            let prepared=prepare(&shorter).unwrap();
+            store.db.execute("UPDATE changes_sources SET fingerprint=?3 WHERE source=?1 AND item_id=?2",params![owner(&original.source),"same",prepared.fingerprint]).unwrap();
+            apply(&mut store,agent,shorter);
+            let current=manifest(&store,key(agent,"same"));
+            assert_eq!(current.metadata.total_files,1);
+            assert_ne!(current.epoch,original.epoch);
+            assert_eq!(store.change_patch(PatchQuery {source:original.source,file_index:0,offset:0,limit:64,expected_epoch:original.epoch,until:original.files[0].source_len}),Err(SourceError::Changed));
         }
     }
 
