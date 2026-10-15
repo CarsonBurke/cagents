@@ -1759,6 +1759,13 @@ impl Cagents {
         command: Command,
         action: SidebarAction,
     ) -> Task<Message> {
+        if let SidebarAction::EndConversation(target) = &action {
+            if command != Command::EndConversation || self.modal_is_open()
+                || (crate::device::is_remote() && !device_ui::supports_sidebar_action(&action))
+                || (self.focused_repository_is_saving() && command.blocked_during_save())
+                || !self.pane_command_available(target.card(), command) { return Task::none(); }
+            return self.request_conversation_end(Arc::clone(target));
+        }
         let valid = !self.modal_is_open()
             && !(self.focused_repository_is_saving() && command.blocked_during_save())
             && sidebar::commands::CommandTarget::from_action(&action).is_some_and(|target| {

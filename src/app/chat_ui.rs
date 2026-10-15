@@ -4950,7 +4950,7 @@ impl Cagents {
     /// The conversation a chat card would return from, as current as the card
     /// knows it: the runtime's session carries the identity the provider has
     /// confirmed since the card was saved.
-    fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
+    pub(super) fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
         if let Some(runtime) = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(&**runtime),
             _ => self.chat_ui.parked.get(&card).map(|runtime| &**runtime),

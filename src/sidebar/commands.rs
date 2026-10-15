@@ -90,6 +90,7 @@ pub const fn history_command(command: Command) -> Option<HistoryCommand> {
 /// Only the template identity is shared with palette/shortcut registration.
 pub fn command_id(action: &SidebarAction) -> Option<Command> {
     Some(match action {
+        SidebarAction::EndConversation(_) => Command::EndConversation,
         SidebarAction::HistoryCommand { command, .. } => history_command_id(*command),
         SidebarAction::ProjectCommand {
             worktree_id,

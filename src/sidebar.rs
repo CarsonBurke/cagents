@@ -44,6 +44,8 @@ use row_interaction::RowInteraction;
 
 mod change_selection;
 pub mod commands;
+pub mod conversation;
+pub use conversation::ConversationEndTarget;
 pub mod git_commands;
 mod selection;
 pub use change_selection::Row as ChangeSelectionRow;
@@ -400,6 +402,7 @@ pub struct CachedDisplay {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarProject {
+    pub conversation_ends: conversation::Rows,
     pub id: ProjectId,
     pub repository_id: RepositoryId,
     pub name: String,
@@ -437,6 +440,7 @@ pub struct SidebarProject {
 /// its own `CardId`, so the two levels cannot be mistaken for one another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarChannel {
+    pub conversation_ends: conversation::Rows,
     pub id: ChannelId,
     pub title: String,
     pub selected: bool,
@@ -477,6 +481,7 @@ impl SidebarChannel {
             other => format!("{other} chats"),
         };
         Self {
+            conversation_ends: conversation::Rows::default(),
             id,
             selected,
             activity,
@@ -604,6 +609,7 @@ impl SidebarProject {
             }
         }
         Self {
+            conversation_ends: conversation::Rows::default(),
             id,
             repository_id,
             name,
@@ -869,6 +875,7 @@ impl Eq for SidebarEditors {}
 /// status snapshot. A missing status is represented rather than guessed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarWorktree {
+    pub conversation_ends: conversation::Rows,
     pub id: WorktreeId,
     pub path: PathBuf,
     pub branch: Option<String>,
@@ -942,6 +949,7 @@ impl SidebarWorktree {
         };
 
         Self {
+            conversation_ends: conversation::Rows::default(),
             id,
             path,
             branch,
@@ -4561,6 +4569,7 @@ impl SidebarState {
             | SidebarAction::MarkChannelRead(_)
             | SidebarAction::DeleteRow(_)
             | SidebarAction::DeleteSelectedRows
+            | SidebarAction::EndConversation(_)
             | SidebarAction::RunCommand { .. }
             | SidebarAction::RunChangeCommand { .. }
             | SidebarAction::RunChangeGroup { .. }
@@ -4595,6 +4604,7 @@ pub enum ChangeGroupCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    EndConversation(Arc<ConversationEndTarget>),
     RunChangeGroup {
         key: ActiveWorktreeKey,
         area: ChangeArea,
@@ -6477,7 +6487,7 @@ fn project_view<'a>(
         },
         disclosure,
     );
-    let header = context_controls(
+    let header = context_controls_with_conversations(
         header,
         project_id,
         None,
@@ -6491,6 +6501,7 @@ fn project_view<'a>(
             .rows
             .context_rows(SelectionRow::Project(project_id)),
         shortcuts,
+        entity.conversation_ends.clone(),
     );
     let header = RowInteraction::selectable(
         header,
@@ -6624,7 +6635,7 @@ fn compact_project<'a>(
             | Some(SidebarSelection::PullRequest { project_id, .. })
             if project_id == entity.id
     );
-    let header = context_controls(
+    let header = context_controls_with_conversations(
         project_identity_row(
             entity,
             selected,
@@ -6645,6 +6656,7 @@ fn compact_project<'a>(
             .rows
             .context_rows(SelectionRow::Project(entity.id)),
         shortcuts,
+        entity.conversation_ends.clone(),
     );
     let header = RowInteraction::selectable(
         header,
@@ -7117,7 +7129,7 @@ fn channel_view(
     );
     crate::reorder::channel_target(
         grid.mount(with_deletion_retry(
-            channel_context_controls(action, channel.id, inert, selection_rows, shortcuts),
+            channel_context_controls_with_conversations(action, channel.id, inert, selection_rows, shortcuts, channel.conversation_ends.clone()),
             deletion,
             compact,
             &channel.title,
@@ -7207,6 +7219,7 @@ fn menu_bindings<A: widget::menu::Action<Message = SidebarAction>>(
 /// A channel is the only navigation row whose contents exist nowhere else, so
 /// deleting one is destructive and the entry says so with an ellipsis: the
 /// application answers it with a confirmation rather than a removal.
+#[cfg(test)]
 fn channel_context_controls<'a>(
     content: impl Into<Element<'static, SidebarAction>>,
     channel_id: ChannelId,
@@ -7214,10 +7227,23 @@ fn channel_context_controls<'a>(
     selection_rows: Option<Arc<[SelectionRow]>>,
     shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'static, SidebarAction> {
+    channel_context_controls_with_conversations(content, channel_id, modal_open, selection_rows, shortcuts, conversation::Rows::default())
+}
+
+fn channel_context_controls_with_conversations<'a>(
+    content: impl Into<Element<'static, SidebarAction>>,
+    channel_id: ChannelId,
+    modal_open: bool,
+    selection_rows: Option<Arc<[SelectionRow]>>,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+    conversations: conversation::Rows,
+) -> Element<'static, SidebarAction> {
     use widget::menu::{Item, items};
     let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
-    let identity = (channel_id, MenuSelectionIdentity(selection_rows.clone()));
-    let Some(menu) = (!modal_open && selection_count.is_some()).then(|| {
+    let identity = (channel_id, MenuSelectionIdentity(selection_rows.clone()), conversations.identity());
+    if modal_open || selection_count.is_none() { return content.into(); }
+    let shortcuts = shortcuts.clone();
+    crate::interaction::context_menu_lazy_keyed(content, identity, move || {
         let mut entries = vec![Item::Button(
             match selection_count {
                 Some(count) if count > 1 => format!(
@@ -7261,14 +7287,13 @@ fn channel_context_controls<'a>(
                 Item::Button(_, _, action) => Some(action.clone()),
                 _ => None,
             }),
-            shortcuts,
+            &shortcuts,
             &[],
         );
-        items(&bindings, entries)
-    }) else {
-        return content.into();
-    };
-    crate::interaction::context_menu_keyed(content, identity, menu)
+        let mut menu = items(&bindings, entries);
+        if selection_count == Some(1) { conversation::append_menu(&mut menu, &conversations, &shortcuts); }
+        menu
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7585,7 +7610,7 @@ fn worktree_view<'a>(
         action
     };
     grid.mount(with_deletion_retry(
-        context_controls(
+        context_controls_with_conversations(
             action,
             project_id,
             Some(worktree.id),
@@ -7596,6 +7621,7 @@ fn worktree_view<'a>(
             editors,
             selection_rows,
             shortcuts,
+            worktree.conversation_ends.clone(),
         ),
         deletion,
         compact,
@@ -7704,6 +7730,7 @@ fn new_conversation_label(worktree_id: Option<WorktreeId>) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
@@ -7716,6 +7743,22 @@ fn context_controls<'a>(
     selection_rows: Option<Arc<[SelectionRow]>>,
     shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'a, SidebarAction> {
+    context_controls_with_conversations(content, project_id, worktree_id, modal_open, git, has_branch, github_ready, editors, selection_rows, shortcuts, conversation::Rows::default())
+}
+
+fn context_controls_with_conversations<'a>(
+    content: impl Into<Element<'a, SidebarAction>>,
+    project_id: ProjectId,
+    worktree_id: Option<WorktreeId>,
+    modal_open: bool,
+    git: bool,
+    has_branch: bool,
+    github_ready: bool,
+    editors: &SidebarEditors,
+    selection_rows: Option<Arc<[SelectionRow]>>,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
+    conversations: conversation::Rows,
+) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
     let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
     let editors = editors.clone();
@@ -7724,6 +7767,7 @@ fn context_controls<'a>(
         worktree_id,
         MenuSelectionIdentity(selection_rows.clone()),
         editors.generation(),
+        conversations.identity(),
     );
     let shortcuts = Arc::clone(shortcuts);
     if modal_open || selection_count.is_none() {
@@ -7883,7 +7927,9 @@ fn context_controls<'a>(
             &shortcuts,
             &editors,
         );
-        items(&bindings, entries)
+        let mut menu = items(&bindings, entries);
+        if selection_count == Some(1) { conversation::append_menu(&mut menu, &conversations, &shortcuts); }
+        menu
     })
 }
 

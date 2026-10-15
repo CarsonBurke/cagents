@@ -44,6 +44,7 @@ mod settings_ui;
 mod settings_watch;
 mod shared_views;
 mod sidebar_selection_ui;
+mod sidebar_conversations;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
@@ -18835,6 +18836,7 @@ impl Application for Cagents {
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
                     SidebarAction::RunCommand { .. } | SidebarAction::RunChangeCommand { .. } | SidebarAction::RunChangeGroup { .. } => unreachable!("registered commands are validated before dispatch"),
+                    SidebarAction::EndConversation(target) => self.request_conversation_end(target),
                     SidebarAction::DeleteRows(rows) => {
                         if rows.len() == 1 {
                             self.delete_sidebar_row(rows[0])
