@@ -88,4 +88,3 @@ impl Registry {
         Ok(true)
     }
 }
-
