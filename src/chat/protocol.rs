@@ -8,7 +8,7 @@ mod claude_edits;
 mod claude_permissions;
 pub mod codex;
 pub mod omp;
-mod terminal_output;
+pub(crate) use super::terminal_output;
 
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
@@ -217,6 +217,26 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Providers with redundant partial snapshots can avoid allocating them.
+    fn decode(&self, bytes: &[u8]) -> Result<Value, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+
+    /// Housekeeping must run even when a provider stops sending frames.
+    fn tick(&mut self) -> Step {
+        Step::default()
+    }
+    fn deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    /// A command may await provider confirmation without blocking its actor.
+    fn command_ack(&mut self) -> Option<String> {
+        None
+    }
+    fn control_replies(&mut self) -> Vec<(String, Result<(), String>)> {
+        Vec::new()
+    }
+
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.
@@ -309,4 +329,22 @@ mod launch_tests {
             LaunchOutcome::TeardownProved
         );
     }
+}
+
+/// A byte-bounded, terminal-safe preview of untrusted protocol text.
+pub(crate) fn preview(bytes: &[u8], limit: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut result = String::new();
+    for ch in text.chars() {
+        let escaped: String = if ch.is_control() {
+            ch.escape_default().collect()
+        } else {
+            ch.to_string()
+        };
+        if result.len() + escaped.len() > limit {
+            break;
+        }
+        result.push_str(&escaped);
+    }
+    result
 }

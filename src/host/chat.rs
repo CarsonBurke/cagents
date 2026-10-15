@@ -448,7 +448,11 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     };
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
-            Update::Activity { state, generation, outcome } => ServerMessage::ChatActivity {
+            Update::Activity {
+                state,
+                generation,
+                outcome,
+            } => ServerMessage::ChatActivity {
                 chat_id: id,
                 state: *state,
                 generation: *generation,
@@ -2174,6 +2178,15 @@ fn process_inner(
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
             Ok(ServerResponse::Detached)
+        }
+        ClientRequest::ChatProviderExitOutput { chat_id, log_id, offset } => {
+            let handle = {
+                let state = host.lock().unwrap_or_else(|p|p.into_inner());
+                attached(&state,client,chat_id)?.handle.clone()
+            };
+            // Disk reads never hold HostLock and remain available after exit.
+            let (bytes,next_offset,omitted)=handle.provider_exit_output(&log_id,offset).map_err(unavailable)?;
+            Ok(ServerResponse::ChatProviderExitOutput {chat_id,log_id,offset,bytes,next_offset,omitted})
         }
         ClientRequest::ChatCommand { chat_id, command } => {
             let handle = {

@@ -75,6 +75,7 @@ pub(crate) struct Store {
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
+    pending_input: Option<(String, usize, String)>,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
@@ -171,6 +172,7 @@ impl Store {
                 presentation: None,
                 presented_children: Default::default(),
                 pending_text: None,
+                pending_input: None,
             })
         })();
         if result.is_err() {
@@ -657,54 +659,60 @@ impl Store {
         {
             out.push(nonfatal(warning));
         }
-        match event {
-            Event::OutputDelta { id, offset, delta } => {
-                let cached: Option<(Vec<u8>, usize, usize)> = self
-                    .db
-                    .query_row(
-                        "SELECT metadata,len0,len1 FROM items WHERE id=?1",
-                        [&id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional()
-                    .map_err(|error| error.to_string())?;
-                let Some((metadata, len0, len1)) = cached else {
-                    // Oversized identities are deliberately refused by put_at
-                    // without terminating the provider. Their later appends
-                    // must preserve that same nonfatal cache boundary.
-                    out.push(nonfatal(format!(
-                        "Output for uncached provider item {} was not cached",
-                        brief(&id)
-                    )));
-                    return Ok(out);
-                };
-                let mut item: Item =
-                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
-                let (field, length) = match item.content {
-                    ItemContent::Command { .. } => (0, len0),
-                    ItemContent::Tool { .. } => (1, len1),
-                    _ => return Err("Output delta names a non-tool item".into()),
-                };
-                if length != offset {
-                    return Err("Output delta does not follow the cached output".into());
+        if let Event::InputDelta { id, offset, delta } = event {
+            if let Some((pending_id, pending_offset, pending)) = &self.pending_input {
+                if pending_id == &id && pending_offset.saturating_add(pending.len()) != offset {
+                    return Err("Input delta does not follow the cached input".into());
                 }
-                let at = observed_at();
-                item.started_at = item.started_at.or(item.at).or(at);
-                item.at = at;
-                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
-                let transaction = self.db.transaction().map_err(|error| error.to_string())?;
-                insert_body(&transaction, &id, field, offset as i64, &delta)?;
-                let update = if field == 0 {
-                    "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
-                } else {
-                    "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
-                };
-                transaction
-                    .execute(update, params![id, delta.len(), metadata])
-                    .map_err(|error| error.to_string())?;
-                transaction.commit().map_err(|error| error.to_string())?;
-                self.changed(&id);
-                self.dirty = true;
+            }
+            if self.pending_input.as_ref().is_some_and(|pending| {
+                pending.0 != id || pending.2.len().saturating_add(delta.len()) > 64 * 1024
+            }) {
+                if let Some(warning) = self.flush_input()? {
+                    out.push(nonfatal(warning));
+                }
+            }
+            if delta.len() > 64 * 1024 {
+                if let Some(warning) = self.append_body(&id, offset, &delta, true)? {
+                    out.push(nonfatal(warning));
+                }
+            } else if let Some(pending) = &mut self.pending_input {
+                pending.2.push_str(&delta);
+            } else {
+                let length: Option<usize> = self
+                    .db
+                    .query_row("SELECT len0 FROM items WHERE id=?1", [&id], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                match length {
+                    Some(length) if length != offset => {
+                        return Err("Input delta does not follow the cached input".into());
+                    }
+                    None => {
+                        out.push(nonfatal(format!(
+                            "Input for uncached provider item {} was not cached",
+                            brief(&id)
+                        )));
+                        return Ok(out);
+                    }
+                    _ => {}
+                }
+                self.pending_input = Some((id, offset, delta));
+            }
+            self.dirty = true;
+            return Ok(out);
+        }
+        if let Some(warning) = self.flush_input()? {
+            out.push(nonfatal(warning));
+        }
+        let input_delta = matches!(&event, Event::InputDelta { .. });
+        match event {
+            Event::InputDelta { id, offset, delta } | Event::OutputDelta { id, offset, delta } => {
+                if let Some(warning) = self.append_body(&id, offset, &delta, input_delta)? {
+                    out.push(nonfatal(warning));
+                }
             }
             Event::Item(item) => {
                 if let Some(warning) = self.put(item, false)? {
@@ -842,6 +850,72 @@ impl Store {
             }
         }
         Ok(out)
+    }
+    fn flush_input(&mut self) -> Result<Option<String>, String> {
+        match self.pending_input.take() {
+            Some((id, offset, delta)) => match self.append_body(&id, offset, &delta, true) {
+                Ok(warning) => Ok(warning),
+                Err(error) => {
+                    self.pending_input = Some((id, offset, delta));
+                    Err(error)
+                }
+            },
+            None => Ok(None),
+        }
+    }
+    fn append_body(
+        &mut self,
+        id: &str,
+        offset: usize,
+        delta: &str,
+        input_delta: bool,
+    ) -> Result<Option<String>, String> {
+        let cached: Option<(Vec<u8>, usize, usize)> = self
+            .db
+            .query_row(
+                "SELECT metadata,len0,len1 FROM items WHERE id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((metadata, len0, len1)) = cached else {
+            // Oversized identities are deliberately refused by put_at
+            // without terminating the provider. Their later appends
+            // must preserve that same nonfatal cache boundary.
+            return Ok(Some(format!(
+                "Output for uncached provider item {} was not cached",
+                brief(&id)
+            )));
+        };
+        let mut item: Item = postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
+        let (field, length) = match item.content {
+            ItemContent::Tool { .. } if input_delta => (0, len0),
+            ItemContent::Command { .. } if !input_delta => (0, len0),
+            ItemContent::Tool { .. } if !input_delta => (1, len1),
+            _ => return Err("Output delta names a non-tool item".into()),
+        };
+        if length != offset {
+            return Err("Output delta does not follow the cached output".into());
+        }
+        let at = observed_at();
+        item.started_at = item.started_at.or(item.at).or(at);
+        item.at = at;
+        let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
+        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        insert_body(&transaction, &id, field, offset as i64, &delta)?;
+        let update = if field == 0 {
+            "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
+        } else {
+            "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
+        };
+        transaction
+            .execute(update, params![id, delta.len(), metadata])
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.changed(&id);
+        self.dirty = true;
+        Ok(None)
     }
     fn flush_text(&mut self) -> Result<Option<String>, String> {
         match self.pending_text.take() {
@@ -1024,6 +1098,7 @@ impl Store {
         previous: &mut Vec<std::sync::Arc<Item>>,
     ) -> Result<Window, String> {
         let _ = self.flush_text()?;
+        let _ = self.flush_input()?;
         let old: std::collections::HashMap<_, _> = previous
             .iter()
             .map(|item| (item.id.as_str(), item))
@@ -1490,6 +1565,110 @@ mod tests {
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
     #[test]
+    fn one_megabyte_input_deltas_write_linear_bytes_and_hydrate_exactly() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut store = Store::at(directory.path().into()).unwrap();
+        let input = "x".repeat(1024 * 1024);
+        store
+            .apply(Event::Item(Item {
+                id: "large-input".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Tool {
+                    name: "Write".into(),
+                    input: String::new(),
+                    output: String::new(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+            }))
+            .unwrap();
+        for (index, chunk) in input.as_bytes().chunks(50).enumerate() {
+            store
+                .apply(Event::InputDelta {
+                    id: "large-input".into(),
+                    offset: index * 50,
+                    delta: String::from_utf8(chunk.to_vec()).unwrap(),
+                })
+                .unwrap();
+        }
+        store.flush_input().unwrap();
+        let (bytes, chunks): (usize, usize) = store
+            .db
+            .query_row(
+                "SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='large-input' AND field=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bytes, input.len());
+        assert!(
+            chunks < 100,
+            "deltas are batched, not separate SQLite transactions"
+        );
+        let read =
+            String::from_utf8(store.field("large-input", 0, 0, input.len()).unwrap()).unwrap();
+        assert_eq!(read, input);
+        let hydrated = store.window().unwrap();
+        assert!(hydrated.items.iter().all(
+            |item| matches!(&item.content, ItemContent::Tool { input, .. } if !input.is_empty())
+        ));
+    }
+
+    #[test]
+    #[ignore = "explicit disk-backed before/after performance measurement"]
+    fn benchmark_one_megabyte_tool_input_stream() {
+        fn written_bytes() -> u64 {
+            std::fs::read_to_string("/proc/self/io").unwrap().lines()
+                .find_map(|line| line.strip_prefix("wchar:").map(|value| value.trim().parse().unwrap())).unwrap()
+        }
+        for append in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut store = Store::at(directory.path().into()).unwrap();
+            let mut adapter = crate::chat::protocol::claude::fixture_adapter();
+            let stream = |event| serde_json::json!({"type":"stream_event","event":event});
+            for event in [
+                serde_json::json!({"type":"message_start","message":{"id":"bench-message"}}),
+                serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"bench","name":"Write","input":{}}}),
+            ] {
+                for event in adapter.receive(stream(event)).unwrap().events { store.apply(event).unwrap(); }
+            }
+            let mut item = Item { id:"bench".into(),role:Role::Assistant,started_at:None,at:None,
+                content:ItemContent::Tool {name:"Write".into(),input:String::new(),output:String::new(),status:crate::chat::ToolStatus::Running} };
+            let mut payload = serde_json::json!({"file_path":"fixture.txt","content":""});
+            let overhead = payload.to_string().len();
+            payload["content"] = serde_json::Value::String("x".repeat(1024*1024-overhead));
+            let source = payload.to_string();
+            assert_eq!(source.len(),1024*1024);
+            let io_before = written_bytes();
+            let started = std::time::Instant::now();
+            let mut submitted_bytes = 0usize;
+            for chunk in source.as_bytes().chunks(50) {
+                let delta = String::from_utf8(chunk.to_vec()).unwrap();
+                let step = adapter.receive(stream(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":delta}}))).unwrap();
+                for event in step.events {
+                    if append {
+                        if let Event::InputDelta { delta,.. } = &event { submitted_bytes += delta.len(); }
+                        store.apply(event).unwrap();
+                    } else if let Event::InputDelta { delta,.. } = event {
+                        let ItemContent::Tool { input,.. } = &mut item.content else { unreachable!() };
+                        input.push_str(&delta);
+                        submitted_bytes += input.len();
+                        // Reproduce the previous adapter's full-item publication.
+                        store.apply(Event::Item(item.clone())).unwrap();
+                    }
+                }
+            }
+            store.flush_input().unwrap();
+            let io_written = written_bytes()-io_before;
+            let (bytes,chunks):(usize,usize) = store.db.query_row("SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='bench' AND field=0",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(bytes,source.len());
+            println!("append={append} duration_ms={} body_bytes_submitted={submitted_bytes} syscall_write_bytes={io_written} final_body_bytes={bytes} final_chunks={chunks}",started.elapsed().as_millis());
+            if append { assert!(io_written <= 5 * 1024 * 1024,"append writes should stay within a small constant factor of input size"); }
+        }
+    }
+
+    #[test]
     fn output_for_an_uncacheable_identity_remains_nonfatal() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         let id = "x".repeat(METADATA_LIMIT + 1);
@@ -1520,6 +1699,65 @@ mod tests {
             .apply(Event::Item(history_item("later", "provider still alive")))
             .unwrap();
         assert_eq!(store.window().unwrap().items[0].id, "later");
+    }
+
+    #[test]
+    fn input_appends_preserve_existing_chunks_and_final_rewrites() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let item = Item {
+            id: "tool".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "shell".into(),
+                input: "α".into(),
+                output: "args".into(),
+                status: crate::chat::ToolStatus::Running,
+            },
+        };
+        store.apply(Event::Item(item.clone())).unwrap();
+        for offset in [2, 4, 6] {
+            store
+                .apply(Event::InputDelta {
+                    id: "tool".into(),
+                    offset,
+                    delta: "β".into(),
+                })
+                .unwrap();
+        }
+        assert!(
+            store
+                .apply(Event::InputDelta {
+                    id: "tool".into(),
+                    offset: 1,
+                    delta: "bad".into()
+                })
+                .is_err()
+        );
+        store.flush_input().unwrap();
+        let chunks: usize = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE id='tool' AND field=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunks, 2, "the original chunk survives each append");
+        let window = store.window().unwrap();
+        assert!(
+            matches!(&window.items[0].content, ItemContent::Tool { input, output, .. } if input == "αβββ" && output == "args")
+        );
+        let mut rewritten = item;
+        if let ItemContent::Tool { output, status, .. } = &mut rewritten.content {
+            *output = "final replacement".into();
+            *status = crate::chat::ToolStatus::Succeeded;
+        }
+        store.apply(Event::Item(rewritten)).unwrap();
+        assert!(
+            matches!(&store.window().unwrap().items[0].content, ItemContent::Tool { output, .. } if output == "final replacement")
+        );
     }
 
     #[test]

@@ -108,6 +108,7 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatProviderExitOutput { .. }
         }
     )
 }

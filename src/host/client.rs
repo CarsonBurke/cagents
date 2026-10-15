@@ -686,6 +686,7 @@ pub(super) fn process_request(
         | ClientRequest::ChatAttach { .. }
         | ClientRequest::ChatDetach { .. }
         | ClientRequest::ChatCommand { .. }
+        | ClientRequest::ChatProviderExitOutput { .. }
         | ClientRequest::ChatVisibility { .. }
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
