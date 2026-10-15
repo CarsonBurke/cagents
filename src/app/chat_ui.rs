@@ -342,6 +342,10 @@ impl Action {
                 | Self::ClearCopied(..)
                 | Self::DisarmInterrupt(..)
                 | Self::Files(..)
+                | Self::FindDebounced(..)
+                | Self::FindIndexed(..)
+                | Self::FindLocated(..)
+                | Self::FindFrame
                 | Self::Tick
                 | Self::AccountPicker(_, false)
                 | Self::CloseImage
@@ -7341,6 +7345,7 @@ impl Cagents {
                 }
             }
             Action::FindIndexed(target,generation,matches) => {
+                let may_reveal = !self.modal_is_open();
                 let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
                 if runtime.find.is_none() || runtime.find_generation.load(Ordering::Relaxed) != generation { return Task::none(); }
                 runtime.find_waiting = None;
@@ -7356,18 +7361,21 @@ impl Cagents {
                     runtime.find_turns = matches.turns.clone();
                     runtime.find_items = matches.items.clone();
                     runtime.update_find_paint();
-                    if runtime.find_auto_reveal && !runtime.find_matches.is_empty() {
+                    if !may_reveal {runtime.find_auto_reveal=false;}
+                    if may_reveal && runtime.find_auto_reveal && !runtime.find_matches.is_empty() {
                         runtime.find_auto_reveal = false;
                         return self.reveal_chat_find(target);
                     }
                 }
             }
             Action::FindLocated(target,generation,navigation,attempt,location) => {
+                let blocked = self.modal_is_open();
                 let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
                 if runtime.find_generation.load(Ordering::Relaxed) != generation
                     || runtime.find_navigation != navigation || runtime.find_locating != Some((generation,navigation,attempt)) {
                     return Task::none();
                 }
+                if blocked {runtime.find_locating=None;return Task::none();}
                 runtime.find_locating = location.filter(|location| !location.exact && attempt < 5)
                     .map(|_| (generation,navigation,attempt+1));
                 if let Some(location) = location {
@@ -7384,6 +7392,10 @@ impl Cagents {
                 }
             }
             Action::FindFrame => {
+                if self.modal_is_open() {
+                    for card in self.cards.values_mut() {if let CardRuntime::Chat(runtime)=card {runtime.find_locating=None;}}
+                    return Task::none();
+                }
                 let tasks = self.cards.values().filter_map(|card| {
                     let CardRuntime::Chat(runtime) = card else { return None; };
                     let (generation,navigation,attempt) = runtime.find_locating?;
@@ -10904,6 +10916,16 @@ mod tests {
                 runtime.find.as_deref().unwrap_or_default(),generation,&runtime.find_generation).map(|matches| find::Results::with_revisions(matches,&runtime.find_inputs(),runtime.find_scope_revision)).map(Arc::new)
         };
         drop(app.handle_chat_ui(Action::FindIndexed(target,generation,matches)));
+    }
+
+    #[test]
+    fn find_background_completions_settle_while_an_unrelated_modal_is_open() {
+        let target=Target {card:CardId::new(),generation:0};
+        assert!(Action::FindDebounced(target,1).allowed_while_modal());
+        assert!(Action::FindIndexed(target,1,None).allowed_while_modal());
+        assert!(Action::FindLocated(target,1,1,0,None).allowed_while_modal());
+        assert!(Action::FindFrame.allowed_while_modal());
+        assert!(!Action::FindNext(target,true).allowed_while_modal());
     }
 
     #[test]
