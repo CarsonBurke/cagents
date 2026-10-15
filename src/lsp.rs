@@ -60,7 +60,7 @@ use crate::repository::{SIGKILL, SIGTERM, TERMINATION_GRACE, signal_process_grou
 use crate::settings::LanguageServerSettings;
 
 mod features;
-pub use features::{LspChangeAnnotation,LspCapabilities,LspCodeAction,LspCommand,LspDocumentEdits,LspEditKind,LspFormattingOptions,LspMessageLevel,LspParameter,LspServerEditId,LspSignature,LspSignatureHelp,LspWorkspaceEdit};
+pub use features::{LspChangeAnnotation,LspCapabilities,LspCodeAction,LspCommand,LspDocumentEdits,LspEditKind,LspFormattingOptions,LspMessageLevel,LspParameter,LspServerEditId,LspServerEditLease,LspSignature,LspSignatureHelp,LspWorkspaceEdit};
 use features::RequestArgs;
 
 
