@@ -2,7 +2,7 @@
 //! socket; provider stdout and mutable reducer state never leave the helper.
 mod journal;
 pub(crate) mod restart;
-pub(crate) use restart::{RestartReceipt,RestartState};
+pub(crate) use restart::{RestartReceipt,RestartState,RestartFailure,RestartCleanup};
 pub(crate) mod final_snapshot;
 pub(crate) use journal::{InputIdentity,InputReceipt,InputState,OutboxEntry,ContinuityLoss};
 use journal::Journal;
