@@ -736,6 +736,7 @@ type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
 struct NumstatPolicy {
     attributes: Vec<PathBuf>,
     reusable: bool,
+    reconcile_unchanged: bool,
 }
 
 /// Only records actually returned by Git are authoritative. In particular,
@@ -4490,7 +4491,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         hasher.update(&output.stdout);
         let digest: [u8; 32] = hasher.finalize().into();
         let mut observations_fresh = false;
-        if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some() {
+        if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some()
+            && cache.numstat_policy.as_ref().is_none_or(|policy| !policy.reconcile_unchanged) {
             let root = fs_safety::Root::open(worktree).ok();
             let mut unchanged = true;
             // Keep the observation pass for a changed snapshot, rather than
@@ -4548,7 +4550,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         let dependency = worktree.join(parent).join(".gitattributes");
                         if cache.numstat_attributes.contains_key(&dependency) { break; }
                         if cache.numstat_attributes.len() + dependencies.len() >= 8192 {
-                            policy.reusable = false; break;
+                            policy.reusable = false;
+                            policy.reconcile_unchanged = true; break;
                         }
                         // Insert before visiting the next file, so common
                         // ancestors do not accumulate in the pending vector.
@@ -4650,9 +4653,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Reusing counts requires observing Git's attribute inputs. Drivers can
     /// depend on arbitrary external state, so keep their existing full reads.
     fn numstat_policy(&self, worktree: &Path, cancellation: &CancellationToken) -> Result<NumstatPolicy, RepositoryError> {
-        let mut policy = NumstatPolicy { attributes: Vec::new(), reusable: true };
+        let mut policy = NumstatPolicy { attributes: Vec::new(), reusable: true, reconcile_unchanged: false };
         for variable in ["GIT_ATTR_SYSTEM", "GIT_ATTR_GLOBAL"] {
             let output = self.run(&self.git_read(worktree, ["var", variable]), cancellation)?;
+            // Older Git cannot expose the installation's attribute paths.
+            // Retain its existing unchanged-digest contract, while declining
+            // incremental reuse whenever a changed snapshot needs counts.
             if !output.success { policy.reusable = false; continue; }
             let path = bytes_to_path(trim_one_line_ending(&output.stdout));
             if !path.as_os_str().is_empty() {
@@ -4669,13 +4675,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 if pair.len() != 2 || pair[0].is_empty() { continue; }
                 let mut record = pair[1].splitn(2, |byte| *byte == b'\n');
                 let key = record.next().unwrap_or_default();
-                let Some(value) = record.next() else { policy.reusable = false; continue; };
-                if key.starts_with(b"diff.") { policy.reusable = false; continue; }
-                let Some(origin) = pair[0].strip_prefix(b"file:") else { policy.reusable = false; continue; };
+                let Some(value) = record.next() else { policy.reusable = false; policy.reconcile_unchanged = true; continue; };
+                if key.starts_with(b"diff.") { policy.reusable = false; policy.reconcile_unchanged = true; continue; }
+                let Some(origin) = pair[0].strip_prefix(b"file:") else { policy.reusable = false; policy.reconcile_unchanged = true; continue; };
                 let origin = worktree.join(bytes_to_path(origin));
                 let include = bytes_to_path(value);
                 if value.starts_with(b"~") && !value.starts_with(b"~/") || value.starts_with(b"%(prefix)") {
-                    policy.reusable = false; continue;
+                    policy.reusable = false; policy.reconcile_unchanged = true; continue;
                 }
                 let include = if let Ok(home) = std::env::var("HOME") && let Ok(relative) = include.strip_prefix("~") {
                     PathBuf::from(home).join(relative)
@@ -4710,6 +4716,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         policy.attributes.dedup();
         if policy.attributes.len() > 8192 {
             policy.reusable = false;
+            policy.reconcile_unchanged = true;
             policy.attributes.truncate(8192);
         }
         Ok(policy)
@@ -9042,6 +9049,8 @@ mod tests {
             git(root, &["config", "diff.custom.textconv", "cat"]);
             service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
             assert!(!cache.numstat_policy.as_ref().unwrap().reusable, "custom drivers can depend on external inputs");
+            assert!(cache.numstat_policy.as_ref().unwrap().reconcile_unchanged);
+            assert!(service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().is_some(), "custom drivers retain conservative missed-input reconciliation");
         }
 
         #[test]
@@ -12593,6 +12602,7 @@ mod tests {
         let cancel = CancellationToken::new(); let mut cache = SnapshotCache::default();
         assert!(service.snapshot_cached(directory.path(), SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
         assert!(!cache.numstat_policy.as_ref().unwrap().reusable);
+        assert!(!cache.numstat_policy.as_ref().unwrap().reconcile_unchanged);
         let before = executor.commands.lock().unwrap().len();
         assert!(service.snapshot_cached(directory.path(), SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
         assert_eq!(executor.commands.lock().unwrap().len(), before + 1);
