@@ -2620,7 +2620,9 @@ impl Actor {
             _ => None,
         });
         let mut execution_events = Vec::new();
+        let mut source_reset = false;
         for mut event in step.events {
+            source_reset |= matches!(&event, Event::Reset { .. });
             if let Event::Error { message, .. } | Event::HistoryError(message) = &mut event {
                 *message = super::protocol::preview(message.as_bytes(), 1024);
             }
@@ -2665,6 +2667,9 @@ impl Actor {
             if let Some(message) = fatal {
                 return Err(message);
             }
+        }
+        if source_reset {
+            self.adapter.bind_item_reader(store::adapter_item_reader(&self.store));
         }
         // Every source item in this Step is now canonical, including items
         // that another block/result in the same frame refers back to.

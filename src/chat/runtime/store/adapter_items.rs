@@ -4,15 +4,19 @@ use super::*;
 use crate::chat::protocol::{CanonicalItemKey,CanonicalItemReader};
 use std::sync::{Arc,Mutex,Weak};
 const MAX_REHYDRATION:usize=64*1024*1024;
-struct Reader {store:Weak<Mutex<Store>>}
+struct Reader {store:Weak<Mutex<Store>>, generation:uuid::Uuid}
 impl CanonicalItemReader for Reader {
     fn read(&self,key:&CanonicalItemKey)->Result<Option<Item>,String> {
         let store=self.store.upgrade().ok_or("Original tool Store is no longer available")?;
-        let result=store.lock().unwrap_or_else(|p|p.into_inner()).adapter_item(key);
-        result
+        let mut store=store.lock().unwrap_or_else(|p|p.into_inner());
+        if store.canonical_generation!=self.generation {return Err("Original tool source was revoked by a conversation reset".into());}
+        store.adapter_item(key)
     }
 }
-pub(in crate::chat::runtime) fn reader(store:&Arc<Mutex<Store>>)->Arc<dyn CanonicalItemReader> {Arc::new(Reader {store:Arc::downgrade(store)})}
+pub(in crate::chat::runtime) fn reader(store:&Arc<Mutex<Store>>)->Arc<dyn CanonicalItemReader> {
+    let generation=store.lock().unwrap_or_else(|p|p.into_inner()).canonical_generation;
+    Arc::new(Reader {store:Arc::downgrade(store), generation})
+}
 impl Store {
     fn strict_adapter_field(&self,id:&str,field:i64,expected:usize)->Result<Vec<u8>,String> {
         if expected>MAX_REHYDRATION {return Err("Original tool source exceeds the bounded adapter read limit".into());}
@@ -79,7 +83,9 @@ mod tests {
         }
     }
     fn commit(store:&Arc<Mutex<Store>>,adapter:&mut dyn crate::chat::protocol::Adapter,step:crate::chat::protocol::Step) {
-        for event in step.events {store.lock().unwrap().apply(event).unwrap();}
+        let mut reset=false;
+        for event in step.events {reset|=matches!(&event,Event::Reset {..});store.lock().unwrap().apply(event).unwrap();}
+        if reset {adapter.bind_item_reader(reader(store));}
         adapter.committed();
     }
     #[test]
@@ -163,6 +169,20 @@ mod tests {
         commit(&store,adapter.as_mut(),step);
         let item=reader(&store).read(&CanonicalItemKey::new(None,"large-same-frame")).unwrap().unwrap();
         assert!(matches!(item.content,ItemContent::Changes {status:ToolStatus::Succeeded,..}));
+    }
+
+    #[test]
+    fn conversation_reset_revokes_old_reader_before_reusing_exact_item_identity() {
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));
+        let original=reader(&store);
+        let key=CanonicalItemKey::new(None,"reused");
+        let tool=|body:&str|Item {id:"reused".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"Opaque".into(),input:body.into(),output:String::new(),status:crate::chat::ToolStatus::Running}};
+        store.lock().unwrap().apply(Event::Item(tool("private old source"))).unwrap();
+        assert!(original.read(&key).unwrap().is_some());
+        store.lock().unwrap().apply(Event::Reset {reason:"provider reset".into()}).unwrap();
+        store.lock().unwrap().apply(Event::Item(tool("new source"))).unwrap();
+        assert!(original.read(&key).is_err(),"same Store and reused native ID cannot revive a revoked source reader");
+        assert!(matches!(reader(&store).read(&key).unwrap().unwrap().content,ItemContent::Tool {input,..} if input=="new source"));
     }
 
     #[test]

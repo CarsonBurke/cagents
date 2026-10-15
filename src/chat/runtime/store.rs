@@ -52,6 +52,8 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
+    /// A reset revokes every previously issued canonical source reader.
+    canonical_generation: uuid::Uuid,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -149,6 +151,7 @@ impl Store {
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
+                canonical_generation: uuid::Uuid::new_v4(),
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -815,6 +818,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
+                self.canonical_generation = uuid::Uuid::new_v4();
                 self.files_reset()?;
                 self.db
                     .execute("DELETE FROM items", [])
