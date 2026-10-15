@@ -6383,6 +6383,9 @@ impl RepositoryRuntime {
         if let Some((_, _, DiffState::Ready(_, layout))) = &mut self.stale_diff {
             layout.set_row_heights(typography.line_height, typography.fold_height());
         }
+        if let Some(DiffState::Ready(_, layout)) = &mut self.disk_comparison {
+            layout.set_row_heights(typography.line_height, typography.fold_height());
+        }
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         self.apply_diff_viewport(anchor);
     }
@@ -6736,10 +6739,15 @@ impl RepositoryRuntime {
                 if self.accepts_selected(&identity) && self.disk_comparison.is_some()
                     && matches!(&self.document, DocumentState::Editable(document) if document.revision == revision && document.external_version.as_ref().is_some_and(|disk| disk.content_hash == disk_hash)) {
                     self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
-                    self.disk_comparison = Some(DiffState::ready(match model {
-                        Some(model) => RenderedDiff::Text { model, old_label: "Disk".into(), new_label: "Unsaved buffer".into() },
+                    let mut state = DiffState::ready(match model {
+                        Some(model) => RenderedDiff::Text { model: Arc::new(model), old_label: "Disk".into(), new_label: "Unsaved buffer".into() },
                         None => RenderedDiff::Error("Could not compare the buffer and disk. Your edits have been kept.".into()),
-                    }));
+                    });
+                    if let DiffState::Ready(_, layout) = &mut state {
+                        let typography = self.diff_typography();
+                        layout.set_row_heights(typography.line_height, typography.fold_height());
+                    }
+                    self.disk_comparison = Some(state);
                 }
                 Task::none()
             }
@@ -16384,6 +16392,73 @@ mod tests {
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 1000.0)));
             assert!((node.size().height - typography.line_height).abs() < 0.1);
             fits_vertically(&node);
+        }
+    }
+
+    #[test]
+    fn disk_comparison_completion_and_zoom_keep_the_mounted_diff_geometry() {
+        let _typography_guard = crate::design::typography_test_guard();
+        crate::design::configure_typography("", 24.0, "", 14.0);
+        let renderer = headless_renderer();
+        let before = (0..80).map(|line| format!("line {line}\n")).collect::<String>();
+        let after = before.replace("line 40\n", "changed 40\n");
+        for (size, line_height) in [(8.0, 1.0), (14.0, 1.3), (40.0, 2.0)] {
+            let card = CardId::new();
+            let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.rs", &after);
+            drop(runtime.take_lsp_intents());
+            runtime.set_editor_font(Font::MONOSPACE, size);
+            runtime.set_line_height(line_height);
+            let DocumentState::Editable(document) = &mut runtime.document else { panic!("editor"); };
+            let revision = document.revision;
+            let disk_hash = blake3::hash(before.as_bytes());
+            document.external_version = Some(crate::editor_reload::Version {
+                text: before.clone(), content_hash: disk_hash, source: identity.path.clone(), markdown: false,
+                mapping: crate::editor_reload::LineMap::between(&after, &before), restoration: None,
+            });
+            // Record a real request, then deliver its deterministic worker result.
+            // Dropping the unpolled worker task starts no background process.
+            drop(runtime.update(RepositoryAction::CompareDisk { card }));
+            assert!(matches!(runtime.disk_comparison, Some(DiffState::Loading { .. })));
+            drop(runtime.update(RepositoryAction::DiskComparisonLoaded {
+                identity, revision, disk_hash, model: Some(crate::diff_view::build_diff(&before, &after)),
+            }));
+            assert!(matches!(runtime.disk_comparison, Some(DiffState::Ready(..))));
+
+            for zoom in [None, Some((40.0, 2.0)), Some((8.0, 1.0))] {
+                if let Some((size, height)) = zoom {
+                    runtime.set_editor_font(Font::MONOSPACE, size);
+                    runtime.set_line_height(height);
+                }
+                let typography = runtime.diff_typography();
+                let model = runtime.diff_model().unwrap();
+                let gutter = typography.gutter_width(model.row_count(DiffMode::Inline));
+                for mode in [DiffMode::Inline, DiffMode::Split] {
+                    runtime.diff_mode = mode;
+                    let model = runtime.diff_model().unwrap();
+                    let layout = runtime.diff_layout().unwrap();
+                    let folded = layout.folded(mode);
+                    let offsets = layout.rows(mode);
+                    let mut height = 0.0;
+                    for display in 0..folded.len() {
+                        let expected = match folded.row(display) {
+                            DisplayRow::Code(_) => typography.line_height,
+                            DisplayRow::Fold { fold, rows: hidden } => {
+                                let mut element = diff_fold_row(card, &runtime, model,
+                                    DiffFold { fold, hidden, discussions: 0 }, gutter, 1000.0);
+                                let mut tree = Tree::new(element.as_widget());
+                                let node = element.as_widget_mut().layout(&mut tree, &renderer,
+                                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 1000.0)));
+                                assert!((node.size().height - typography.fold_height()).abs() < 0.1);
+                                node.size().height
+                            }
+                        };
+                        assert!((offsets.offset(display) - height).abs() < 0.1);
+                        assert!((offsets.height(display) - expected).abs() < 0.1);
+                        height += expected;
+                    }
+                    assert!((offsets.total_height() - height).abs() < 0.1);
+                }
+            }
         }
     }
 
