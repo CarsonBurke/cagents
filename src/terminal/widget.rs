@@ -2872,6 +2872,30 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
+                // The physical press already chose its terminal owner. A
+                // later modifier change may resemble Copy/Paste/scrollback,
+                // but cannot turn that admitted press's release into a UI
+                // shortcut. Review/read-only barriers above still apply.
+                if let Some(index) = state.input_keys.iter().position(|(key, _)| key == physical_key) {
+                    let mut input = state.input_keys[index].1.clone();
+                    input.action = KeyAction::Release;
+                    input.text = None;
+                    input.modifiers = map_iced_modifiers(*modifiers);
+                    match self
+                        .review_input_barrier
+                        .release(*physical_key, &self.handle, input)
+                    {
+                        Ok(()) => {
+                            state.input_keys.swap_remove(index);
+                            if state.input_keys.is_empty() {
+                                state.key_owner = None;
+                            }
+                            shell.capture_event();
+                        }
+                        Err(error) => self.publish_error(error, shell),
+                    }
+                    return;
+                }
                 // The press was consumed here, so its release must be too: a
                 // child reading key releases may not see one half of a chord.
                 if state.escape_cleared && is_escape(key) {
@@ -2897,30 +2921,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 {
                     shell.capture_event();
                     return;
-                }
-                let Some(index) = state
-                    .input_keys
-                    .iter()
-                    .position(|(key, _)| key == physical_key)
-                else {
-                    return;
-                };
-                let mut input = state.input_keys[index].1.clone();
-                input.action = KeyAction::Release;
-                input.text = None;
-                input.modifiers = map_iced_modifiers(*modifiers);
-                match self
-                    .review_input_barrier
-                    .release(*physical_key, &self.handle, input)
-                {
-                    Ok(()) => {
-                        state.input_keys.swap_remove(index);
-                        if state.input_keys.is_empty() {
-                            state.key_owner = None;
-                        }
-                        shell.capture_event();
-                    }
-                    Err(error) => self.publish_error(error, shell),
                 }
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
