@@ -48,9 +48,11 @@ where F:FnMut(RawSourceQuery)->Fut,Fut:std::future::Future<Output=Result<RawSour
         }).await.map_err(|_|"Original call preparation stopped.".to_owned())
     }).await.map_err(|_|"The original call could not be read in time.".to_owned())?
 }
+static REVISIONS:AtomicU64=AtomicU64::new(1);
+fn next_revision()->u64 {REVISIONS.fetch_add(1,Ordering::Relaxed)}
 struct Loaded {record:ResidentRaw,view:tool_text::ToolText}
-struct Entry {part:RawSourcePart,opened:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
-impl Entry {fn new(part:RawSourcePart)->Self {Self {part,opened:false,attempt:None,loaded:None,restored:None,error:None}}}
+struct Entry {part:RawSourcePart,revision:u64,opened:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
+impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,attempt:None,loaded:None,restored:None,error:None}}}
 #[derive(Default)]
 pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,selected:Option<String>,revision:u64,restore_error:Option<String>}
 impl State {
@@ -91,12 +93,18 @@ impl State {
         entry.opened=!entry.opened;entry.error=None;
         if entry.opened {
             match eligible(&entry.part) {Ok(())=>{self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);},Err(error)=>entry.error=Some(error)}
-        } else {entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}entry.restored=None;}
-        self.revision=self.revision.wrapping_add(1);
+        } else {entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
+        entry.revision=next_revision();self.revision=self.revision.wrapping_add(1);
     }
     pub(super) fn revision(&self)->u64 {self.revision}
+    pub(super) fn item_revision(&self,item:&str)->u64 {
+        self.aliases.get(item).into_iter().flatten().filter_map(|key|self.entries.get(key)).map(|entry|entry.revision).max().unwrap_or(0)
+    }
     pub(super) fn render_ready(&mut self,ready:impl Fn(&tool_text::ToolText)->bool)->bool {
-        let changed=self.entries.values().filter_map(|entry|entry.loaded.as_ref()).any(|loaded|ready(&loaded.view));
+        let mut changed=false;
+        for entry in self.entries.values_mut() {
+            if entry.loaded.as_ref().is_some_and(|loaded|ready(&loaded.view)) {entry.revision=next_revision();changed=true;}
+        }
         if changed {self.revision=self.revision.wrapping_add(1);}changed
     }
     pub(super) fn retained_bytes(&self)->usize {self.entries.values().map(|entry|entry.loaded.as_ref().map_or(0,|loaded|loaded.view.text.len())+entry.restored.as_ref().map_or(0,|text|text.len())).sum()}
@@ -117,9 +125,9 @@ impl State {
         if let Err(error)=validation {retire(view);return Err(error);}
         for (text,proof) in view.calls {
             let key=Key {source:proof.source,field:proof.field};let entry=self.entries.get_mut(&key).expect("validated raw source");
-            entry.opened=true;entry.restored=Some(text);self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);
+            entry.opened=true;if let Some(old)=entry.restored.replace(text) {retire(old);}entry.revision=next_revision();self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);
         }
-        self.revision=self.revision.wrapping_add(1);Ok(())
+        self.restore_error=None;self.revision=self.revision.wrapping_add(1);Ok(())
     }
 }
 impl Drop for State {fn drop(&mut self) {self.clear();}}
@@ -178,7 +186,7 @@ pub(super) fn complete(runtime:&mut Runtime,source:SourceKey,field:RawSourceFiel
         Ok(pending)=>{retire(pending);entry.error=Some("The original call changed before it was displayed. Retry its current source.".into());}
         Err(error)=>entry.error=Some(error),
     }
-    state.revision=state.revision.wrapping_add(1);
+    entry.revision=next_revision();state.revision=state.revision.wrapping_add(1);
 }
 fn label(field:RawSourceField)->&'static str {match field {RawSourceField::ToolInput=>"Original tool input",RawSourceField::CommandCall=>"Original command details"}}
 fn representation(value:RawRepresentation)->&'static str {match value {RawRepresentation::StreamJson=>"Captured streamed JSON",RawRepresentation::CanonicalJson=>"Captured parsed input (JSON)",RawRepresentation::CommandMetadataJson=>"Captured command projection (JSON)"}}
@@ -214,7 +222,7 @@ fn retire_entry(mut entry:Entry) {
 }
 pub(super) fn restore(runtime:&mut Runtime,view:ResidentRawCalls) {
     sync(runtime);
-    if let Err(error)=runtime.raw_original.restore(view) {runtime.raw_original.restore_error=Some(error);}
+    if let Err(error)=runtime.raw_original.restore(view) {runtime.raw_original.restore_error=Some(error);for entry in runtime.raw_original.entries.values_mut() {entry.revision=next_revision();}}
 }
 fn retire(value:impl Send+'static) {
     type Retired=Box<dyn std::any::Any+Send>;
@@ -247,7 +255,7 @@ pub(super) fn copied(runtime:&mut Runtime,context:u64,proof:ResidentRaw,reply:Co
         || runtime.raw_original.entries.get(&key).is_none_or(|entry|!entry.opened || entry.loaded.as_ref().is_none_or(|loaded|loaded.record!=proof)) {return Task::none();}
     let Some(value)=reply.0.0.lock().unwrap_or_else(|error|error.into_inner()).take() else {return Task::none();};
     match value {Ok(output)=>{runtime.copied=Some((proof.source.source_id,Instant::now()));iced::clipboard::write(output.text).map(cosmic::Action::App)},
-        Err(error)=>{runtime.raw_original.entries.get_mut(&key).expect("current original").error=Some(error);Task::none()}}
+        Err(error)=>{let entry=runtime.raw_original.entries.get_mut(&key).expect("current original");entry.error=Some(error);entry.revision=next_revision();Task::none()}}
 }
 pub(super) fn toggle(runtime:&mut Runtime,item:&str,field:RawSourceField,reload:bool) {
     sync(runtime);
@@ -389,6 +397,15 @@ mod tests {
         let runtime=app.chat_runtime_mut(target).unwrap();let prose=runtime.snapshot.source_revision;
         Arc::make_mut(&mut runtime.snapshot).raw_source_parts.clear();sync(runtime);
         assert_eq!(runtime.snapshot.source_revision,prose);assert!(runtime.raw_original.entries.is_empty(),"Raw removal is authoritative independently of prose revision");
+    }
+    #[test]
+    fn original_disclosure_invalidates_only_its_own_scoped_item() {
+        let first=part("first");let mut second=part("second");second.source.source_id="second-original-root".into();second.item_id="second-visible-part".into();
+        let snapshot=Snapshot {raw_source_parts:vec![first.clone(),second.clone()],..Default::default()};let mut state=State::default();state.sync(&snapshot,None,None);
+        let first_before=state.item_revision(&first.item_id);let second_before=state.item_revision(&second.item_id);
+        state.toggle(&first.item_id,first.field);assert!(state.item_revision(&first.item_id)>first_before);
+        assert_eq!(state.item_revision(&second.item_id),second_before,"unrelated turns retain their presentation");
+        assert_eq!(state.item_revision(&first.source.source_id),state.item_revision(&first.item_id));
     }
     #[test]
     fn source_reader_and_retirement_payloads_require_safe_send() {
