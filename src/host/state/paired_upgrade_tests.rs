@@ -469,11 +469,20 @@ fn run_pair(mode: &str) {
         )
         .unwrap();
         let resolved = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
-        let attached = super::super::chat::process(
+        let stale = super::super::chat::process(
             &replacement,
             1,
             ClientRequest::ChatAttach {
                 session: source.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(stale.code, ProtocolErrorCode::ProofMismatch);
+        let attached = super::super::chat::process(
+            &replacement,
+            1,
+            ClientRequest::ChatAttach {
+                session: resolved.clone(),
             },
         )
         .unwrap();
