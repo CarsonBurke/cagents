@@ -1027,7 +1027,7 @@ fn parse_with<'a>(
             } if !metadata => {
                 if !spans.is_empty() {
                     let text = Text::new(spans.drain(..).collect());
-                    inline_items.borrow_mut().push(match inline_heading {
+                    RefCell::borrow_mut(&inline_items).push(match inline_heading {
                         Some(level) => Item::Heading(level, text),
                         None => Item::Paragraph(text),
                     });
@@ -1219,9 +1219,7 @@ fn parse_with<'a>(
                 let state = state.borrow_mut();
                 let _ = state.images.insert(url.clone());
 
-                inline_items
-                    .borrow_mut()
-                    .push(Item::Image { url, title, alt });
+                RefCell::borrow_mut(&inline_items).push(Item::Image { url, title, alt });
                 None
             }
             pulldown_cmark::TagEnd::CodeBlock if !metadata => {
