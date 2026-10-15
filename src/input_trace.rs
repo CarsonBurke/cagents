@@ -12,6 +12,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
 };
 
@@ -221,16 +222,12 @@ pub(crate) struct TextEditing;
 struct KeyboardFocus {
     focused: Option<(Option<cosmic::iced::widget::Id>, Rectangle)>,
     inputs: Vec<(Option<cosmic::iced::widget::Id>, Rectangle)>,
-    known_regions: Vec<(cosmic::iced::widget::Id, KeyboardRegion)>,
+    known_regions: HashMap<cosmic::iced::widget::Id, KeyboardRegion>,
     containers: Vec<(KeyboardRegion, Rectangle)>,
 }
 impl Operation for KeyboardFocus {
     fn container(&mut self, id: Option<&cosmic::iced::widget::Id>, bounds: Rectangle) {
-        if let Some((_, region)) = self
-            .known_regions
-            .iter()
-            .find(|(candidate, _)| Some(candidate) == id)
-        {
+        if let Some(region) = id.and_then(|id| self.known_regions.get(id)) {
             self.containers.push((*region, bounds));
         }
     }
@@ -366,7 +363,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             && let Some(regions) = &self.focus_regions
         {
             let mut focus = KeyboardFocus {
-                known_regions: regions.clone(),
+                known_regions: regions.iter().cloned().collect(),
                 ..KeyboardFocus::default()
             };
             self.content.as_widget_mut().operate(
@@ -563,7 +560,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
             && let Some(regions) = &self.focus_regions
         {
             let mut focus = KeyboardFocus {
-                known_regions: regions.clone(),
+                known_regions: regions.iter().cloned().collect(),
                 ..KeyboardFocus::default()
             };
             self.content
