@@ -468,11 +468,21 @@ pub enum ShortcutScope {
     Chat,
     /// Native editable code buffer only.
     Editor,
+    /// Undo/Redo in a native buffer or its mounted live working comparison.
+    EditorHistory,
     /// Repository content or its non-text pane controls, including local diff.
     Repository,
 }
 
 impl ShortcutScope {
+    pub fn is_native_editor(self) -> bool { matches!(self, Self::Editor | Self::EditorHistory) }
+
+    /// These scopes implement editing vocabulary on the actual content surface.
+    fn owns_editing_chord(self, focused: FocusedPane) -> bool {
+        (focused == FocusedPane::Editor && self.is_native_editor())
+            || (focused == FocusedPane::WorkingDiff && matches!(self, Self::EditorHistory | Self::Review))
+    }
+
     /// Whether an action of this scope acts, and so withholds its chord from
     /// the card, while `focused` has focus.
     pub fn applies_to(self, focused: FocusedPane) -> bool {
@@ -481,10 +491,11 @@ impl ShortcutScope {
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::OutsideTextInput => !focused.is_text_editing(),
             Self::Sidebar => matches!(focused, FocusedPane::SidebarRows | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges),
-            Self::Review => focused == FocusedPane::Review,
+            Self::Review => matches!(focused, FocusedPane::Review | FocusedPane::WorkingDiff),
             Self::Chat => matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane),
             Self::Editor => focused == FocusedPane::Editor,
-            Self::Repository => matches!(focused, FocusedPane::Editor | FocusedPane::Review | FocusedPane::RepositoryPane),
+            Self::EditorHistory => matches!(focused, FocusedPane::Editor | FocusedPane::WorkingDiff),
+            Self::Repository => matches!(focused, FocusedPane::Editor | FocusedPane::Review | FocusedPane::WorkingDiff | FocusedPane::RepositoryPane),
         }
     }
 }
@@ -499,8 +510,10 @@ pub enum FocusedPane {
     RepositoryPane,
     /// A terminal, which forwards the keys it is given to its process.
     Terminal,
-    /// A pull request review pane.
+    /// A pull request or immutable comparison pane.
     Review,
+    /// A mounted live index-to-working-buffer comparison.
+    WorkingDiff,
     /// The editable native chat composer.
     Chat,
     /// Non-text controls or transcript content inside a native chat pane.
@@ -518,7 +531,7 @@ pub enum FocusedPane {
 
 impl FocusedPane {
     pub fn is_text_editing(self) -> bool {
-        matches!(self, Self::Editor | Self::Chat | Self::TextInput)
+        matches!(self, Self::Editor | Self::WorkingDiff | Self::Chat | Self::TextInput)
     }
 }
 
@@ -614,7 +627,7 @@ impl ShortcutDescriptor {
             || matches!(self.action, GlobalShortcut::ResumeConversation | GlobalShortcut::NewThread)
         {
             "Chat"
-        } else if matches!(self.scope, ShortcutScope::Editor | ShortcutScope::Repository) {
+        } else if matches!(self.scope, ShortcutScope::Editor | ShortcutScope::EditorHistory | ShortcutScope::Repository) {
             "Editor"
         } else if self.scope == ShortcutScope::Review {
             "Review"
@@ -636,7 +649,7 @@ impl ShortcutDescriptor {
         if self.scope == ShortcutScope::Sidebar { return false; }
         // OutsideTerminal controls chord reservation; explicit palette
         // invocation remains available when the terminal has its own finder.
-        if matches!(self.scope, ShortcutScope::Chat | ShortcutScope::Review | ShortcutScope::Editor)
+        if matches!(self.scope, ShortcutScope::Chat | ShortcutScope::Review | ShortcutScope::Editor | ShortcutScope::EditorHistory)
             && !self.scope.applies_to(context.focused)
         {
             return false;
@@ -1234,13 +1247,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::EditorUndo,
         label: "Undo",
         repeatable: true,
-        scope: ShortcutScope::Editor,
+        scope: ShortcutScope::EditorHistory,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::EditorRedo,
         label: "Redo",
         repeatable: true,
-        scope: ShortcutScope::Editor,
+        scope: ShortcutScope::EditorHistory,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::EditorCut,
@@ -1822,7 +1835,7 @@ pub fn global_shortcut(
         return None;
     };
     let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts, focused)?;
-    if focused.is_text_editing() && descriptor.scope != ShortcutScope::Editor
+    if focused.is_text_editing() && !descriptor.scope.owns_editing_chord(focused)
         && text_editing_conflict(descriptor.action, key, *physical_key, *modifiers)
     {
         return None;
@@ -1853,7 +1866,7 @@ pub(crate) fn is_global_shortcut_chord(
     crate::tab_history::is_chord(key, modifiers)
         || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts, focused).is_some_and(
             |descriptor| {
-                descriptor.scope != ShortcutScope::Editor && !(focused.is_text_editing() && descriptor.scope != ShortcutScope::Editor
+                !(focused == FocusedPane::Editor && descriptor.scope.is_native_editor()) && !(focused.is_text_editing() && !descriptor.scope.owns_editing_chord(focused)
                     && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
                     && shortcut_applies(descriptor, focused, shortcuts)
             },
@@ -1970,7 +1983,7 @@ fn global_shortcut_descriptor(
 ) -> Option<&'static ShortcutDescriptor> {
     GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| {
         shortcut_applies(descriptor, focused, shortcuts)
-            && !(focused.is_text_editing() && descriptor.scope != ShortcutScope::Editor && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
+            && !(focused.is_text_editing() && !descriptor.scope.owns_editing_chord(focused) && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
             && shortcut_keys(descriptor.action, shortcuts).iter().any(|chord| {
                 parse_shortcut(chord).is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
             })
@@ -2044,7 +2057,7 @@ pub const fn editor_command_bit(command: GlobalShortcut) -> Option<u8> {
 /// the application sees the same captured event.
 pub fn editor_shortcut(key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: keyboard::Modifiers, shortcuts: &KeyboardShortcuts) -> Option<GlobalShortcut> {
     global_shortcut_descriptor(key, physical, modifiers, shortcuts, FocusedPane::Editor)
-        .filter(|descriptor| descriptor.scope == ShortcutScope::Editor).map(|descriptor| descriptor.action)
+        .filter(|descriptor| descriptor.scope.is_native_editor()).map(|descriptor| descriptor.action)
 }
 
 fn shortcut_matches(
@@ -6237,6 +6250,29 @@ mod tests {
     }
 
     #[test]
+    fn working_diff_history_owns_its_chords_without_stealing_immutable_review_reopen() {
+        use keyboard::key::Code;
+        let mut shortcuts = KeyboardShortcuts::default();
+        let undo = key_press("z", Code::KeyZ, keyboard::Modifiers::CTRL, false);
+        let redo = key_press("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, false);
+        assert_eq!(global_shortcut(&undo, &shortcuts, FocusedPane::WorkingDiff), Some(GlobalShortcut::EditorUndo));
+        assert_eq!(global_shortcut(&redo, &shortcuts, FocusedPane::WorkingDiff), Some(GlobalShortcut::EditorRedo));
+        assert_eq!(global_shortcut(&redo, &shortcuts, FocusedPane::Review), Some(GlobalShortcut::ReopenPane));
+        assert!(is_global_shortcut_chord(&keyboard::Key::Character("z".into()), keyboard::key::Physical::Code(Code::KeyZ), keyboard::Modifiers::CTRL, &shortcuts, FocusedPane::WorkingDiff));
+        assert!(!is_global_shortcut_chord(&keyboard::Key::Character("z".into()), keyboard::key::Physical::Code(Code::KeyZ), keyboard::Modifiers::CTRL, &shortcuts, FocusedPane::Editor));
+        assert_eq!(global_shortcut(&key_press("c", Code::KeyC, keyboard::Modifiers::CTRL, false), &shortcuts, FocusedPane::WorkingDiff), Some(GlobalShortcut::DiffCopy));
+        for focused in [FocusedPane::TextInput, FocusedPane::SidebarRows, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges, FocusedPane::Chat, FocusedPane::Terminal] {
+            assert_ne!(global_shortcut(&undo, &shortcuts, focused), Some(GlobalShortcut::EditorUndo));
+        }
+        shortcuts.editor_undo = vec!["Alt+F9".into()];
+        assert!(global_shortcut(&undo, &shortcuts, FocusedPane::WorkingDiff).is_none());
+        let mut context = CommandContext { focused: FocusedPane::WorkingDiff, editor_commands: 1, ..Default::default() };
+        assert!(shortcut_descriptor(GlobalShortcut::EditorUndo).available(&context));
+        context.editor_commands = 0;
+        assert!(!shortcut_descriptor(GlobalShortcut::EditorUndo).available(&context));
+    }
+
+    #[test]
     fn every_shortcut_descriptor_has_a_unique_configurable_binding() {
         let shortcuts = KeyboardShortcuts::default();
         assert!(shortcuts.fault().is_none(), "defaults obey binding scope and reservation policy");
@@ -6244,7 +6280,7 @@ mod tests {
         for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
             assert!(!descriptor.label.is_empty());
             assert!(identities.insert(descriptor.id()), "registered IDs are unique");
-            assert_eq!(descriptor.scope == ShortcutScope::Editor, crate::settings::is_editor_command(descriptor.id()), "native keyboard routing and configuration share the editor scope for {}", descriptor.id());
+            assert_eq!(descriptor.scope.is_native_editor(), crate::settings::is_editor_command(descriptor.id()), "native keyboard routing and configuration share the editor scope for {}", descriptor.id());
             let index = KeyboardShortcuts::action_names().iter().position(|id| *id == descriptor.id()).expect("every descriptor is configurable");
             let keys = shortcut_keys(descriptor.action, &shortcuts);
             assert_eq!(keys, shortcuts.actions()[index]);

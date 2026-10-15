@@ -7788,6 +7788,7 @@ impl Cagents {
             }
             Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::ChatPane,
             Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+            Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() && runtime.editor_history_surface_visible() => workspace_widget::FocusedPane::WorkingDiff,
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
@@ -18085,7 +18086,7 @@ impl Application for Cagents {
                     }
                 if !captured
                     && !self.workspace_inputs_blocked()
-                    && self.focused_pane() == workspace_widget::FocusedPane::Review
+                    && matches!(self.focused_pane(), workspace_widget::FocusedPane::Review | workspace_widget::FocusedPane::WorkingDiff)
                     && let Some(card) = self.workspace.focused()
                     && let Some(runtime) = match self.cards.get(&card) {
                         Some(CardRuntime::Repository(runtime)) => Some(runtime.as_ref()),
@@ -18336,7 +18337,7 @@ impl Application for Cagents {
                         return task;
                     }
                 if !captured
-                    && self.focused_pane() == workspace_widget::FocusedPane::Review
+                    && matches!(self.focused_pane(), workspace_widget::FocusedPane::Review | workspace_widget::FocusedPane::WorkingDiff)
                     && let keyboard::Event::KeyPressed {
                         key,
                         physical_key,
@@ -18364,7 +18365,7 @@ impl Application for Cagents {
                         self.focused_pane(),
                     ) {
                         Some(command) => {
-                            if captured && workspace_widget::shortcut_descriptor(command).scope == workspace_widget::ShortcutScope::Editor { return Task::none(); }
+                            if captured && self.focused_pane() == workspace_widget::FocusedPane::Editor && workspace_widget::shortcut_descriptor(command).scope.is_native_editor() { return Task::none(); }
                             let modifiers = match event {
                                 keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
                                 _ => keyboard::Modifiers::empty(),
@@ -19793,7 +19794,7 @@ impl Application for Cagents {
             let kind = self.pane_kind(card);
             let container_kind = if matches!(
                 kind,
-                workspace_widget::FocusedPane::Review | workspace_widget::FocusedPane::ChatPane
+                workspace_widget::FocusedPane::Review | workspace_widget::FocusedPane::WorkingDiff | workspace_widget::FocusedPane::ChatPane | workspace_widget::FocusedPane::RepositoryPane
             ) {
                 kind
             } else {

@@ -1187,6 +1187,7 @@ impl Cagents {
                 Some(CardRuntime::Terminal(_)) if state.is_some_and(|state| ended_terminal(Some(state)).is_none()) => workspace_widget::FocusedPane::Terminal,
                 Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
                 Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+                Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() && runtime.editor_history_surface_visible() => workspace_widget::FocusedPane::WorkingDiff,
                 Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => workspace_widget::FocusedPane::Review,
                 Some(CardRuntime::Repository(runtime)) if card.is_some_and(|card| runtime.editor_focus_target(card).is_some()) => workspace_widget::FocusedPane::Editor,
                 Some(CardRuntime::Repository(_)) => workspace_widget::FocusedPane::RepositoryPane,
@@ -2752,6 +2753,41 @@ mod tests {
     }
 
     #[test]
+    fn working_diff_history_uses_captured_owning_surface_and_current_capability() {
+        use workspace_widget::FocusedPane;
+        let make = || {
+            let mut app = settings_focus_fixture();
+            let card = app.workspace.focused().unwrap();
+            let runtime = RepositoryRuntime::working_history_fixture(card);
+            app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+            app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+            (app, card)
+        };
+        let press = |app: &mut Cagents, card, pane, shift, captured| {
+            drop(app.update(Message::RoutedKeyEvent { event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("z".into()), modified_key: keyboard::Key::Character("z".into()), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyZ), location: keyboard::Location::Standard,
+                modifiers: if shift { keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT } else { keyboard::Modifiers::CTRL }, text: None, repeat: false,
+            }, captured, region: crate::input_trace::KeyboardRegion { pane, card: Some(card) }, widget: None }));
+        };
+        for captured in [false, true] {
+            let (mut app, card) = make();
+            assert_eq!(app.pane_kind(card), FocusedPane::WorkingDiff);
+            assert!(app.command_available(Command::EditorUndo));
+            let changed = match app.cards.get(&card).unwrap() { CardRuntime::Repository(runtime) => runtime.editor_text().unwrap(), _ => unreachable!() };
+            press(&mut app, card, FocusedPane::WorkingDiff, false, captured);
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some("saved\n") && runtime.shows_diff()));
+            press(&mut app, card, FocusedPane::WorkingDiff, true, captured);
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some(changed.as_str())));
+        }
+        for pane in [FocusedPane::TextInput, FocusedPane::SidebarRows, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges, FocusedPane::Chat, FocusedPane::Terminal, FocusedPane::Editor] {
+            let (mut app, card) = make();
+            let changed = match app.cards.get(&card).unwrap() { CardRuntime::Repository(runtime) => runtime.editor_text().unwrap(), _ => unreachable!() };
+            press(&mut app, card, pane, false, true);
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some(changed.as_str())), "{pane:?} must not dispatch history to a background working diff");
+        }
+    }
+
+    #[test]
     fn configured_save_retires_old_chords_and_respects_actual_repository_focus() {
         use workspace_widget::FocusedPane;
         let make = || {
@@ -2769,7 +2805,7 @@ mod tests {
                 captured: true, region: crate::input_trace::KeyboardRegion { pane, card: Some(card) }, widget: None,
             }));
         };
-        for (pane, expected) in [(FocusedPane::RepositoryPane, true), (FocusedPane::Review, true), (FocusedPane::Editor, true), (FocusedPane::TextInput, false), (FocusedPane::SidebarRows, false), (FocusedPane::SidebarFiles, false), (FocusedPane::SidebarChanges, false), (FocusedPane::Terminal, false), (FocusedPane::Chat, false), (FocusedPane::ChatPane, false), (FocusedPane::OutsideWorkspace, false), (FocusedPane::Other, false)] {
+        for (pane, expected) in [(FocusedPane::RepositoryPane, true), (FocusedPane::Review, true), (FocusedPane::WorkingDiff, true), (FocusedPane::Editor, true), (FocusedPane::TextInput, false), (FocusedPane::SidebarRows, false), (FocusedPane::SidebarFiles, false), (FocusedPane::SidebarChanges, false), (FocusedPane::Terminal, false), (FocusedPane::Chat, false), (FocusedPane::ChatPane, false), (FocusedPane::OutsideWorkspace, false), (FocusedPane::Other, false)] {
             let (mut app, card) = make();
             assert!(app.command_available(Command::EditorSave));
             press(&mut app, card, pane, "s".into(), keyboard::key::Physical::Code(keyboard::key::Code::KeyS), keyboard::Modifiers::CTRL);

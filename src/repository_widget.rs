@@ -2453,14 +2453,29 @@ impl RepositoryRuntime {
         self.keyboard_shortcuts = shortcuts;
     }
 
+    /// History remains attached to the live native buffer while its working
+    /// comparison is mounted. Immutable/staged/PR comparisons never own it.
+    pub fn editor_history_surface_visible(&self) -> bool {
+        matches!(self.document, DocumentState::Editable(_))
+            && (self.source_surface == SourceSurface::Editor || (self.shows_diff() && self.editable_working_diff()))
+    }
+
+    pub fn can_step_editor_history(&self, redo: bool) -> bool {
+        if !self.editor_history_surface_visible() || self.search_mode || self.is_saving() { return false; }
+        match &self.document {
+            DocumentState::Editable(document) => if redo { document.history.can_redo() } else { document.history.can_undo() },
+            _ => false,
+        }
+    }
+
     /// Cached native-buffer capabilities used by menus, palette and shortcuts.
     pub fn editor_command_capabilities(&self) -> u8 {
-        if !self.editable_surface_visible() { return 0; }
-        let DocumentState::Editable(document) = &self.document else { return 0; };
+        let history = u8::from(self.can_step_editor_history(false)) | (u8::from(self.can_step_editor_history(true)) << 1);
+        if !self.editable_surface_visible() { return history; }
+        let DocumentState::Editable(document) = &self.document else { return history; };
         let selected = document.content.cursor().selection.is_some_and(|anchor| anchor != document.content.cursor().position);
         let writable = !self.search_mode && document.active_save.is_none();
-        u8::from(writable && document.history.can_undo())
-            | (u8::from(writable && document.history.can_redo()) << 1)
+        history
             | (u8::from(writable && selected) << 2)
             | (u8::from(selected) << 3)
             | (u8::from(writable) << 4)
@@ -2896,6 +2911,19 @@ impl RepositoryRuntime {
                 })
                 .collect(),
         );
+        runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn working_history_fixture(card: CardId) -> Self {
+        let (mut runtime, _) = Self::lsp_open_fixture(card, "saved\n");
+        runtime.set_auto_save(false);
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        let after = runtime.editor_text().unwrap();
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(RenderedDiff::Text {
+            model: Arc::new(crate::diff_view::build_diff("saved\n", &after)), old_label: "Index".into(), new_label: "Working tree".into(),
+        }));
         runtime
     }
 
@@ -4429,7 +4457,7 @@ impl RepositoryRuntime {
     /// Undoes or redoes one step in the open buffer.
     fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
         // A history step edits the mounted source buffer, including while Find is open.
-        if self.source_surface != SourceSurface::Editor {
+        if !self.can_step_editor_history(redo) {
             return Task::none();
         }
         let DocumentState::Editable(document) = &mut self.document else {
@@ -4441,7 +4469,8 @@ impl RepositoryRuntime {
         self.push_lsp_edits(edits);
         // Undo from the context menu leaves the keyboard on the menu; the
         // restored caret is only visible in a focused buffer.
-        Task::batch([self.markdown_task(card), self.focus_editor(card)])
+        let focus = if self.source_surface == SourceSurface::Editor { self.focus_editor(card) } else { Task::none() };
+        Task::batch([self.markdown_task(card), focus])
     }
 
     /// Reports a run of replacements, in the order they were applied, and
@@ -17895,6 +17924,32 @@ mod tests {
         assert!(matches!(runtime.external_editor_command(card, Some("chosen")), Some(RepositoryAction::OpenExternal { card: id, editor_id }) if id == card && editor_id == "chosen"));
         assert!(matches!(runtime.external_editor_command(card, None), Some(RepositoryAction::OpenExternal { editor_id, .. }) if editor_id == "first"));
         assert!(runtime.external_editor_command(card, Some("removed")).is_none());
+    }
+
+    #[test]
+    fn registered_working_diff_history_changes_only_its_live_buffer() {
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::working_history_fixture(card);
+        let changed = runtime.editor_text().unwrap();
+        assert!(runtime.editor_history_surface_visible());
+        assert!(runtime.can_step_editor_history(false));
+        assert_eq!(runtime.editor_command_capabilities() & !3, 0, "clipboard remains owned by diff selection");
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("saved\n"));
+        assert!(runtime.shows_diff(), "history must keep the working comparison mounted");
+        assert!(runtime.can_step_editor_history(true));
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some(changed.as_str()));
+        for basis in [DiffBasis::HeadToIndex, DiffBasis::CommitToParent { oid: fixture_oid(1), parent: Some(fixture_oid(2)) }] {
+            runtime.diff_basis = basis;
+            assert!(!runtime.editor_history_surface_visible());
+            assert_eq!(runtime.editor_command_capabilities() & 3, 0);
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some(changed.as_str()));
+        }
+        runtime.diff_basis = DiffBasis::IndexToWorktree;
+        runtime.set_search_mode(true);
+        assert!(!runtime.can_step_editor_history(false));
     }
 
     #[test]
