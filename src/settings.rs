@@ -1012,6 +1012,22 @@ pub struct LanguageServerSettings {
     /// Relative marker names that identify a project root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "server_option_disabled")]
+    pub format_on_save: bool,
+    #[serde(default = "default_formatting_timeout", skip_serializing_if = "formatting_timeout_is_default")]
+    pub formatting_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "optional_json_absent")]
+    pub initialization_options: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub configuration: serde_json::Value,
+}
+
+fn server_option_disabled(value:&bool)->bool {!*value}
+fn default_formatting_timeout()->u64 {1000}
+fn formatting_timeout_is_default(value:&u64)->bool {*value == default_formatting_timeout()}
+fn optional_json_absent(value:&Option<serde_json::Value>)->bool {value.as_ref().is_none_or(serde_json::Value::is_null)}
+impl Default for LanguageServerSettings {
+    fn default()->Self {Self {id:String::new(),languages:Vec::new(),command:Vec::new(),root_markers:Vec::new(),format_on_save:false,formatting_timeout_ms:default_formatting_timeout(),initialization_options:None,configuration:serde_json::Value::Null}}
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -1037,6 +1053,7 @@ pub fn default_language_servers() -> Vec<LanguageServerSettings> {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
+            ..LanguageServerSettings::default()
         }
     }
 
@@ -1751,6 +1768,13 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
 
     for server in servers {
         let id = server.id.as_str();
+        if !(50..=10_000).contains(&server.formatting_timeout_ms) {
+            return Err(SettingsError::LanguageServer(format!("language server {id} formatting_timeout_ms must be between 50 and 10000")));
+        }
+        if server.initialization_options.as_ref().is_some_and(|value| serde_json::to_vec(value).map_or(true,|bytes| bytes.len() > 1024*1024))
+            || serde_json::to_vec(&server.configuration).map_or(true,|bytes| bytes.len() > 1024*1024) {
+            return Err(SettingsError::LanguageServer(format!("language server {id} configuration must fit within 1 MiB")));
+        }
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
                 "language_servers entry has an empty id".to_owned(),
