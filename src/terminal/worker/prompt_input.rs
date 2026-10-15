@@ -9,9 +9,9 @@ use libghostty_vt::{
 /// Query the active screen, independently of the user's scrollback position.
 /// A primary prompt anchors the current command; continuations and cells to
 /// the right of a cursor moved back into the line must also be inspected.
-pub(super) fn has_prompt_input(terminal: &Terminal<'_, '_>) -> Result<bool, libghostty_vt::Error> {
+pub(super) fn has_prompt_input(terminal: &Terminal<'_, '_>) -> Result<Option<bool>, libghostty_vt::Error> {
     if terminal.active_screen()? == Screen::Alternate {
-        return Ok(false);
+        return Ok(None);
     }
     let columns = terminal.cols()?;
     let rows = terminal.rows()?;
@@ -29,6 +29,7 @@ pub(super) fn has_prompt_input(terminal: &Terminal<'_, '_>) -> Result<bool, libg
     }
     // A wrapped command can scroll its primary prompt out of the active
     // screen. Input semantics on its remaining cells still protect it.
+    let integrated = start.is_some();
     let start = start.unwrap_or(0);
     for y in start..rows {
         let reference = terminal.grid_ref(Point::Active(PointCoordinate {
@@ -43,11 +44,11 @@ pub(super) fn has_prompt_input(terminal: &Terminal<'_, '_>) -> Result<bool, libg
                 .grid_ref(Point::Active(PointCoordinate { x, y: u32::from(y) }))?
                 .cell()?;
             if cell.semantic_content()? == CellSemanticContent::Input && cell.has_text()? {
-                return Ok(true);
+                return Ok(Some(true));
             }
         }
     }
-    Ok(false)
+    Ok(integrated.then_some(false))
 }
 
 /// Runs after fish's configuration, preserving the user's prompt functions
@@ -60,10 +61,19 @@ mod tests {
     use libghostty_vt::TerminalOptions;
 
     #[test]
+    fn a_screen_without_prompt_markers_does_not_prove_empty_input() {
+        let mut terminal = Terminal::new(TerminalOptions { cols: 40, rows: 6, max_scrollback: 100 }).unwrap();
+        terminal.vt_write(b"prompt> ");
+        assert_eq!(has_prompt_input(&terminal).unwrap(), None);
+        terminal.vt_write(b"unfinished");
+        assert_eq!(has_prompt_input(&terminal).unwrap(), None);
+    }
+
+    #[test]
     fn a_command_taller_than_the_screen_keeps_input_protection() {
         let mut terminal = Terminal::new(TerminalOptions { cols: 8, rows: 3, max_scrollback: 100 }).unwrap();
         terminal.vt_write(b"\x1b]133;A\x07> \x1b]133;B\x07a long wrapped unsent command that scrolls the prompt away");
-        assert!(has_prompt_input(&terminal).unwrap());
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(true));
     }
 
     #[test]
@@ -75,11 +85,11 @@ mod tests {
         })
         .unwrap();
         terminal.vt_write(b"\x1b]133;A\x07prompt> \x1b]133;B\x07");
-        assert!(!has_prompt_input(&terminal).unwrap());
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(false));
         terminal.vt_write(b"echo valuable\x1b[5D");
-        assert!(has_prompt_input(&terminal).unwrap());
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(true));
         terminal.vt_write(b"\r\x1b[2K\x1b]133;A\x07prompt> \x1b]133;B\x07");
-        assert!(!has_prompt_input(&terminal).unwrap());
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(false));
     }
 
     #[test]
@@ -91,10 +101,10 @@ mod tests {
         })
         .unwrap();
         terminal.vt_write(b"\x1b]133;A\x07> \x1b]133;B\x07long wrapped command");
-        assert!(has_prompt_input(&terminal).unwrap());
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(true));
         terminal.vt_write(
             b"\x1b]133;C\x07\r\noutput\r\n\x1b]133;D;0\x07\x1b]133;A\x07> \x1b]133;B\x07",
         );
-        assert!(!has_prompt_input(&terminal).unwrap());
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(false));
     }
 }

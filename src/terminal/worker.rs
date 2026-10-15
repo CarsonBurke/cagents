@@ -2831,16 +2831,18 @@ impl Worker {
         if foreground <= 0 {
             return Err("Foreground process group unavailable".into());
         }
-        // Process-only policy deliberately permits terminating shell builtins.
-        // The original executable check still prevents an exec'd agent or
-        // command from inheriting an idle shell's authority.
+        // An idle process census alone cannot distinguish an empty shell
+        // prompt from an unfinished command or an in-shell builtin. Without
+        // prompt integration, require confirmation conservatively. The
+        // executable check also protects an exec'd command.
         let idle_shell = interactive_shell_launch(&self.launch) && root.original_executable();
         Ok((
             family.has_jobs()
                 || foreground != root.process.group
                 || !idle_shell
                 || prompt_input::has_prompt_input(&self.terminal)
-                    .map_err(|error| format!("Inspect terminal prompt: {error}"))?,
+                    .map_err(|error| format!("Inspect terminal prompt: {error}"))?
+                    .unwrap_or(true),
             family,
         ))
     }

@@ -925,7 +925,7 @@ the source for resumed history.
   `Ctrl+Shift+W` follow the same rule. An unfinished command also asks when
   the shell supplies OSC 133 prompt markers; interactive fish receives this
   integration automatically. Clearing that command restores an unconfirmed
-  idle close. Shells without prompt integration retain process-based checks. **Don't ask me again** turns confirmation off; Settings → **Confirm
+  idle close. Shells without prompt integration ask conservatively because an idle process alone cannot prove that the prompt is empty. **Don't ask me again** turns confirmation off; Settings → **Confirm
   closing active processes** turns it back on.
 - Every close, confirmed or not, first rechecks the terminal's identity with
   the daemon. If the daemon is unreachable, the pane is kept.
