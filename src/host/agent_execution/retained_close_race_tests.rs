@@ -254,14 +254,14 @@ fn combined_close_retained_lifecycle_reconciliation_defers_to_initializing_resta
 }
 
 #[test]
-fn combined_close_retained_lifecycle_reconciliation_holds_claim_through_cleanup() {
-    if owning_close_isolated("combined_close_retained_lifecycle_reconciliation_holds_claim_through_cleanup").is_some() { return; }
+fn combined_close_retained_lifecycle_reconciliation_holds_claim_across_completed_eligibility_gap() {
+    if owning_close_isolated("combined_close_retained_lifecycle_reconciliation_holds_claim_across_completed_eligibility_gap").is_some() { return; }
     let fixture = RetainedCloseRaceFixture::scheduled();
     assert!(matches!(fixture.agent.origin, Origin::Automation {..}));
     let store = registry(&fixture.host).unwrap();
     let (entered, entering) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel();
-    crate::host::chat::before_ordinary_close_receipt(move || {
+    after_reconciliation_eligibility(move || {
         entered.send(()).unwrap();
         released.recv_timeout(Duration::from_secs(10)).unwrap();
     });
@@ -275,7 +275,7 @@ fn combined_close_retained_lifecycle_reconciliation_holds_claim_through_cleanup(
     let attach = returned.recv_timeout(Duration::from_secs(2));
     let _ = release.send(()); fixture.release_restart();
     let closed = reconciling.join().unwrap(); attaching.join().unwrap();
-    assert!(reached.is_ok(), "reconciliation must reach receipt cleanup without recursively acquiring its own claim");
+    assert!(reached.is_ok(), "reconciliation must reach its actual completed eligibility observation before close effects");
     let error = attach.expect("restart must promptly refuse the reconciliation lifecycle claim").unwrap_err();
     assert!(error.message.contains("lifecycle transition"), "{error:?}");
     assert_eq!(closed.unwrap(), Reconciliation::Closed);
