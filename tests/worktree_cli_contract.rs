@@ -380,15 +380,22 @@ fn daemon_setup_recovery_refuses_a_direct_same_path_and_branch_replacement() {
 
 
 #[test]
-fn daemon_setup_review_selects_only_the_current_generation_after_service_recreation() {
+fn daemon_setup_review_selects_current_generation_with_a_stale_history_snapshot() {
     use cagents::{device_service,repository::WorktreeSetupIntent,worktree_control::{Operation,Reply}};
     let fixture=Fixture::new();let project=fixture.root.path().join("project");
     let path=fixture.create("recreated-setup");
     let old:WorktreeSetupIntent=serde_json::from_value(fixture.setup_intent(&path)).unwrap();
     let admin=fixture.git(&path,&["rev-parse","--absolute-git-dir"]);
-    fixture.git(&project,&["worktree","remove",path.to_str().unwrap()]);
+    fixture.cli(&["worktree","remove","recreated-setup"]);
     assert_eq!(fixture.create("recreated-setup"),path);
     assert_eq!(fixture.git(&path,&["rev-parse","--absolute-git-dir"]),admin);
+    // Normal removal retires its receipt, preventing duplicate active leases.
+    // Deliberately restore that old Applied history snapshot to exercise the
+    // recovery reader against an imported/stale row without weakening writes.
+    let journal=fixture.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("worktree-operations.sqlite3");
+    let connection=rusqlite::Connection::open(journal).unwrap();
+    assert_eq!(connection.execute("UPDATE pending_operations SET status='applied' WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?1 AND json_extract(payload_json,'$.request.setup_intent.run_id')=?2",rusqlite::params![path.to_str().unwrap(),old.run_id.unwrap().to_string()]).unwrap(),1);
+    drop(connection);
     let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
     let mut client=cagents::control::ControlClient::connect(&socket).unwrap();let repository=project.join(".git");
     let device_service::Reply::Worktree(Reply::SetupIntent {intent,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong setup metadata")};
