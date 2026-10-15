@@ -58,6 +58,14 @@ impl Cagents {
         Some(self.project_ui.creation_sources.get(&project)?.logical_generation)
     }
 
+    /// An explicit retry after a failed read may discover a new actor. Ordinary
+    /// automatic refreshes keep their original physical source and never rebind.
+    pub(super) fn prepare_project_source_retry(&mut self, project: ProjectId) {
+        if self.sidebar_model.project(project).is_some_and(|row| row.unreachable.is_some()) {
+            self.retire_project_creation_source(project);
+        }
+    }
+
     /// Called on actual ownership replacement, close or removal. Retained
     /// dialog and worker clones are invalidated together.
     pub(super) fn retire_project_creation_source(&mut self, project: ProjectId) {

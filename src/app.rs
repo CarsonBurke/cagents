@@ -19106,13 +19106,17 @@ impl Application for Cagents {
                         }
                         self.sidebar_model.data_state = SidebarDataState::Loading;
                         Task::batch(targets.into_iter().map(|(repository, id)| {
+                            self.prepare_project_source_retry(id);
                             self.repository_load_task(repository, Some(id), false)
                         }))
                     }
                     SidebarAction::RefreshProject {
                         project_id,
                         repository,
-                    } => self.repository_load_task(repository, Some(project_id), false),
+                    } => {
+                        self.prepare_project_source_retry(project_id);
+                        self.repository_load_task(repository, Some(project_id), false)
+                    },
                     SidebarAction::CreatePullRequest {
                         project_id,
                         worktree,
