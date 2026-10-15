@@ -11758,6 +11758,9 @@ mod worktree_journal_tests {
                 );
             };
             git(&["init", "-b", "main"]);
+            // No ambient template is copied; hook-specific contracts install
+            // their own private script for the actual service invocation.
+            fs::create_dir(repository.join(".git/hooks")).unwrap();
             fs::write(repository.join("tracked.txt"), b"committed content\n").unwrap();
             git(&["add", "tracked.txt"]);
             git(&[
