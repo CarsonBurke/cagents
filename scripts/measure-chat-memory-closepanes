@@ -13,6 +13,9 @@ retry with --attempt 2 --adoption-receipt PATH_TO_ATTEMPT1_JSONL, keeping all
 other arguments identical. Exact original adoption, process start identity,
 manifest hash and preserved control pane are revalidated; unknown missing panes
 never count as closed. Each attempt writes a new receipt without overwriting.
+For Niri supply --compositor-receipt and --session-state. For an admitted
+KWin/X11 holder supply --case and --control CASE/control-chat.py; every native
+action/capture stays inside that holder, with no inherited desktop fallback.
 This helper records ownership/close proof, not memory or presentation latency.
 """
 import argparse
@@ -124,13 +127,15 @@ def main():
     parser.add_argument("--keep-card", required=True)
     parser.add_argument("--ui-database", type=Path, required=True)
     parser.add_argument("--model-database", type=Path, required=True)
-    parser.add_argument("--compositor-receipt", type=Path, required=True)
-    parser.add_argument("--session-state", type=Path, required=True, help="private niri-harness SESSION.json")
+    desktop = parser.add_mutually_exclusive_group(required=True)
+    desktop.add_argument("--compositor-receipt", type=Path, help="pinned private Niri compositor receipt")
+    desktop.add_argument("--case", type=Path, help="explicit admitted private KWin/X11 CASE")
+    parser.add_argument("--control", type=Path, help="exact reviewed CASE/control-chat.py request client")
+    parser.add_argument("--session-state", type=Path, help="private niri-harness SESSION.json")
     parser.add_argument("--harness", type=Path, default=Path.home() / ".local/bin/niri-harness")
     args = parser.parse_args()
     root = args.root.resolve(strict=True)
     env = FIXTURE["fixture_environment"](root)
-    FIXTURE["validate_compositor"](root, env, args.compositor_receipt)
     keep = str(uuid.UUID(args.keep_card))
     ui_path = private_database(root, args.ui_database)
     model_path = private_database(root, args.model_database)
@@ -139,27 +144,34 @@ def main():
     if process.stat().st_uid != os.getuid() or process_env.get(b"XDG_DATA_HOME") != os.fsencode(root / "data") or (process / "exe").resolve().name != "cagents-ui":
         raise SystemExit("supply the actual private UI process")
     ticks = (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
-    session_path = args.session_state.resolve(strict=True)
-    session = json.loads(session_path.read_text())
-    compositor = json.loads(args.compositor_receipt.read_text())
-    display = Path(session["display"])
-    if not display.is_absolute():
-        display = Path(compositor["display"]).parent / display
-    if not session_path.is_relative_to(root) or not Path(session["root"]).resolve().is_relative_to(root) or str(session["pid"]) != str(compositor["pid"]) or str(display.resolve(strict=True)) != env["WAYLAND_DISPLAY"] or session_path.stem != session["name"]:
-        raise SystemExit("harness session must match the pinned private compositor")
-    compositor_socket(session["socket"], compositor["pid"])
-    # The installed harness ordinarily stores a relative wayland-N display.
-    # Our child changes XDG_RUNTIME_DIR; use an owned normalized copy so that
-    # harness input still reaches the exact socket verified above.
-    session["display"] = env["WAYLAND_DISPLAY"]
-    private_state = root / "close-harness-state"
-    private_state.mkdir(mode=0o700, exist_ok=True)
-    private_session = private_state / session_path.name
-    if private_session.exists() and json.loads(private_session.read_text()) != session:
-        raise SystemExit("refusing to replace a different private harness session")
-    private_session.write_text(json.dumps(session, indent=2) + "\n")
-    private_session.chmod(0o600)
-    env["NIRI_HARNESS_STATE"] = str(private_state)
+    if args.case:
+        if not args.control or args.session_state:
+            parser.error("KWin needs explicit --control and no Niri --session-state")
+    else:
+        if not args.session_state or args.control:
+            parser.error("Niri needs --session-state and no KWin --control")
+        FIXTURE["validate_compositor"](root, env, args.compositor_receipt)
+        session_path = args.session_state.resolve(strict=True)
+        session = json.loads(session_path.read_text())
+        compositor = json.loads(args.compositor_receipt.read_text())
+        display = Path(session["display"])
+        if not display.is_absolute():
+            display = Path(compositor["display"]).parent / display
+        if not session_path.is_relative_to(root) or not Path(session["root"]).resolve().is_relative_to(root) or str(session["pid"]) != str(compositor["pid"]) or str(display.resolve(strict=True)) != env["WAYLAND_DISPLAY"] or session_path.stem != session["name"]:
+            raise SystemExit("harness session must match the pinned private compositor")
+        compositor_socket(session["socket"], compositor["pid"])
+        # The installed harness ordinarily stores a relative wayland-N display.
+        # Our child changes XDG_RUNTIME_DIR; use an owned normalized copy so that
+        # harness input still reaches the exact socket verified above.
+        session["display"] = env["WAYLAND_DISPLAY"]
+        private_state = root / "close-harness-state"
+        private_state.mkdir(mode=0o700, exist_ok=True)
+        private_session = private_state / session_path.name
+        if private_session.exists() and json.loads(private_session.read_text()) != session:
+            raise SystemExit("refusing to replace a different private harness session")
+        private_session.write_text(json.dumps(session, indent=2) + "\n")
+        private_session.chmod(0o600)
+        env["NIRI_HARNESS_STATE"] = str(private_state)
     if args.attempt < 1 or args.cycle < 1:
         parser.error("cycle and attempt must be positive")
     manifest_bytes = (root / ("actors-cycle" + str(args.cycle) + ".json")).read_bytes()
@@ -199,7 +211,14 @@ def main():
             raise SystemExit("control pane unexpectedly closed")
         return value
 
+    kwin = None
+    if args.case:
+        module = runpy.run_path(str(Path(__file__).with_name("chat_memory_kwin.py")))
+        kwin = module["Adapter"](args.case, args.control, args.pid, ticks, receipt_path)
+
     def action(*command):
+        if kwin:
+            return kwin.action(*command)
         result = subprocess.run([str(args.harness.resolve(strict=True)), "--session", session["name"], "--json", *command],
                                 env=env, capture_output=True, text=True, timeout=60)
         value = json.loads(result.stdout) if result.returncode == 0 else None
@@ -212,6 +231,8 @@ def main():
     # Prove the compositor's focused window belongs to the exact private UI,
     # rather than accepting a matching title in a different application.
     def focused_ui(expected_actor=None):
+        if kwin:
+            return kwin.focused_ui(expected_actor)
         observation = action("observe", *([] if expected_actor else ["--no-text"]))
         window = observation["window"]
         windows = subprocess.run(["niri", "msg", "-j", "windows"], env={**env, "NIRI_SOCKET": session["socket"]},
