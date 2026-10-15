@@ -12534,13 +12534,14 @@ impl Cagents {
         {
             let font = crate::terminal::monospace_font(self.settings.editor_font_family());
             let size = self.settings.editor_font_size();
-            for runtime in self.cards.values_mut() {
+            for (&card,runtime) in self.cards.iter_mut() {
                 let runtime = match runtime {
                     CardRuntime::Repository(runtime) => runtime,
                     CardRuntime::PullRequests(pane) => &mut pane.runtime,
                     _ => continue,
                 };
                 runtime.set_editor_font(font,size);
+                tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
                 tasks.push(repository_task(runtime.restore_font_viewport()));
             }
         }
