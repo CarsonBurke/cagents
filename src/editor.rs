@@ -406,6 +406,13 @@ impl PartialEq for FileRootIdentity {
 }
 impl Eq for FileRootIdentity {}
 impl FileRootIdentity {
+    /// Called on the publication worker. A stale read receipt may still name
+    /// this held root, but its old pathname cannot authorize a new checkout.
+    pub(crate) fn validate_named(&self, worktree: &Path) -> Result<&Root, FileIoError> {
+        let named = Self::of(std::sync::Arc::new(worktree_root(worktree)?))?;
+        if &named != self { return Err(FileIoError::Io("The editor worktree was moved or replaced. Reopen the file before saving.".into())); }
+        Ok(&self._root)
+    }
     pub(crate) fn of(root: std::sync::Arc<Root>) -> Result<Self, FileIoError> {
         use std::os::unix::fs::MetadataExt;
         let metadata = root.metadata().map_err(io_error)?;

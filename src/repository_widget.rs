@@ -6405,7 +6405,7 @@ impl RepositoryRuntime {
                 return Task::none();
             }
         }
-        let (path, destination, text, disk_hash, revision, history_revision, snapshot_source, presence) = match &self.document {
+        let (path, destination, text, disk_hash, revision, history_revision, snapshot_source, presence, model_root) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
                     && document.active_save.is_none() && document.workspace_edit.is_none() =>
@@ -6428,6 +6428,7 @@ impl RepositoryRuntime {
                             .then(|| document.restorations.get(&document.presence_id).cloned())
                             .flatten(),
                     },
+                    document.undo_root.clone(),
                 )
             }
             _ => return Task::none(),
@@ -6464,14 +6465,13 @@ impl RepositoryRuntime {
         let saved_text = text.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                save_document_file(
-                    &worktree,
-                    &destination,
-                    &text,
-                    disk_hash,
-                    overwrite,
-                    presence,
-                )
+                if let Some(model_root) = model_root {
+                    let _protection = crate::worktree_cleanup::protect(&worktree).map_err(|error| FileIoError::Io(error.to_string()))?;
+                    let root = model_root.validate_named(&worktree)?;
+                    crate::editor::save_document_file_at(root, &destination, &text, disk_hash, overwrite, presence)
+                } else {
+                    save_document_file(&worktree, &destination, &text, disk_hash, overwrite, presence)
+                }
             })
             .await
             .map_err(|error| FileIoError::Io(format!("save worker failed: {error}")))
@@ -13932,6 +13932,31 @@ mod tests {
         let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
         assert_eq!(runtime.editor_text().as_deref(), Some("x"));
         assert!(!runtime.can_step_editor_history(false), "same bytes in a different checkout cannot adopt old metadata/history");
+        // Park the actual absent-file completion before replacing its root.
+        // The two captured read identities still match each other, so the
+        // subsequent save must independently prove its retained model root.
+        std::fs::write(root.join("b.rs"), "other\n").unwrap();
+        let identity = runtime.current_identity(card, "a.rs".into());
+        let DocumentState::Editable(document) = &runtime.document else { panic!() };
+        let revision = document.revision;
+        let change = document.content.replacement_to_text("").unwrap();
+        runtime.apply_diff_buffer_revert_with_presence(&identity, revision, Some(Arc::new(change)), false, Some(0o100644)).unwrap();
+        let task = runtime.request_save_inner(card, false, false); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "a.rs".into());
+        use cosmic::iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).unwrap();
+        let completion = loop { if let Some(iced::runtime::Action::Output(action)) = stream.next().await { break action; } };
+        assert!(matches!(&completion, RepositoryAction::ConfiguredFileLoaded { result: Ok(LoadedFile { content: FileContent::SavedAbsence, .. }), .. }));
+        std::fs::rename(&root, directory.path().join("second-retired")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        drop(runtime.update(completion));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("x"));
+        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        assert!(runtime.save_error().is_some());
+        assert!(!root.join("a.rs").exists(), "old Undo cannot recreate a file in the replacement checkout");
+        assert!(!directory.path().join("second-retired/a.rs").exists());
     }
 
     #[tokio::test]
