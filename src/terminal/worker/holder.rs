@@ -2055,7 +2055,14 @@ mod tests {
         let moved = root.path().join("moved");
         std::fs::create_dir(&old).unwrap();
         std::fs::write(old.join("marker"), "ORIGINAL_DIRECTORY\n").unwrap();
-        std::fs::write(old.join("probe"), "#!/bin/sh\npwd -P\ncat marker\nprintf 'PINNED_DONE\\n'\n").unwrap();
+        // The outer interpreter deliberately waits until spawn has returned
+        // before opening the anchored script. This makes an early FD drop a
+        // deterministic failure instead of relying on interpreter scheduling.
+        let interpreter = root.path().join("delayed-interpreter");
+        std::fs::write(&interpreter,
+            "#!/bin/sh\nprintf 'INTERPRETER_READY\\n'\nread latch\nexec /bin/sh \"$@\"\n").unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(old.join("probe"), format!("#!{}\npwd -P\ncat marker\nprintf 'PINNED_DONE\\n'\n", interpreter.display())).unwrap();
         std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700)).unwrap();
         let directory = std::sync::Arc::new(File::open(&old).unwrap());
         std::fs::rename(&old, &moved).unwrap();
@@ -2067,6 +2074,8 @@ mod tests {
         command.cwd(&old);
         let (exits, exited) = crossbeam_channel::bounded(1);
         let held = spawn_recoverable_at_directory(command, size(), exits, None, Some(directory)).unwrap();
+        read_until(&held.master, "INTERPRETER_READY");
+        std::io::Write::write_all(&mut File::from(held.master.duplicate().unwrap()), b"\n").unwrap();
         let output = read_until(&held.master, "PINNED_DONE");
         assert!(output.contains(moved.to_str().unwrap()), "{output}");
         assert!(output.contains("ORIGINAL_DIRECTORY"), "{output}");
