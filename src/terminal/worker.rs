@@ -449,6 +449,9 @@ struct PublishedState {
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
+    /// Published only from the actual authenticated helper handshake after
+    /// adoption commits. Older helpers cannot prove this Stop's family exit.
+    family_cleanup_capable: OnceLock<bool>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
     transcript_location: OnceLock<crate::transcript_location::ValidatedTranscript>,
@@ -530,6 +533,7 @@ impl PublishedState {
             shutdown_pidfd: OnceLock::new(),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
+            family_cleanup_capable: OnceLock::new(),
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
@@ -1423,6 +1427,9 @@ impl TerminalHandle {
         if order.handoff || matches!(*phase, ArchivePhase::Preparing) {
             return Err("Terminal ownership is changing; refresh before stopping it".into());
         }
+        if published.family_cleanup_capable.get() != Some(&true) {
+            return Err("This terminal holder cannot confirm whole-session cleanup; reattach or recover its original owner before stopping it".into());
+        }
         let (reply, result) = crossbeam_channel::bounded(1);
         if published.completed.load(Ordering::Acquire)
             || order.closing && matches!(*phase, ArchivePhase::Frozen { .. })
@@ -2307,6 +2314,7 @@ impl Worker {
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
         held.holder.commit_adoption()?;
+        let _ = published.family_cleanup_capable.set(held.holder.proves_family_on_exit());
         if let Some(record) = held.holder.record() {
             let _ = published.holder_identity.set(record.clone());
         }
@@ -2873,6 +2881,12 @@ impl Worker {
                 if self.published.execution_instance != instance {
                     let _ = reply.send(TerminalCloseResult::Unknown(
                         "The terminal worker was replaced".into(),
+                    ));
+                    return false;
+                }
+                if !self.holder.proves_family_on_exit() {
+                    let _ = reply.send(TerminalCloseResult::Unknown(
+                        "This terminal holder cannot prove whole-session cleanup; its original work was preserved".into(),
                     ));
                     return false;
                 }
