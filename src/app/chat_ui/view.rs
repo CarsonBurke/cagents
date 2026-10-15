@@ -4975,6 +4975,16 @@ mod tests {
             fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
                 self.0.push(text.to_owned());
             }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                    self.0.push(prose.plain.to_string());
+                }
+            }
         }
         let parent = chat::Item {
             id: "shared-thought".into(),
