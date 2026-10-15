@@ -132,6 +132,11 @@ impl Cagents {
     /// so native menus do not rebind on unrelated terminal wakes.
     pub(super) fn refresh_sidebar_conversations(&mut self) {
         let rows = self.capture_conversation_end_targets();
+        // Reuse the same proved location evidence as attention branch chips.
+        // Build both indexes once; a refused current location must not revive
+        // a historical launch-directory entry in an unrelated worktree menu.
+        let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
+        let cards: HashMap<_, _> = self.durable.cards.iter().map(|card| (card.id, card)).collect();
         let mut channels: HashMap<_, Vec<Entry>> = HashMap::new();
         let mut worktrees: HashMap<_, Vec<Entry>> = HashMap::new();
         // Loaded, exact scopes are navigable. Historical nested boundaries
@@ -159,8 +164,14 @@ impl Cagents {
                 // reinterpret a channel conversation as a worktree thread.
                 None
             } else {
-                row.target.issued.launch.recipe.working_directory.ancestors()
-                    .find(|root| roots.contains(*root)).and_then(|root| loaded.get(root).copied())
+                use crate::workspace_model::views::AttentionDirectory;
+                let directory = cards.get(&row.target.card).and_then(|card| match locations.directory(card) {
+                    AttentionDirectory::Verified(directory) => Some(directory),
+                    AttentionDirectory::Launch => Some(row.target.issued.launch.recipe.working_directory.as_path()),
+                    AttentionDirectory::Unavailable => None,
+                });
+                directory.and_then(|directory| directory.ancestors()
+                    .find(|root| roots.contains(*root)).and_then(|root| loaded.get(root).copied()))
             };
             if let Some(scope) = scope { worktrees.entry(scope.to_path_buf()).or_default().push(row); }
         }
@@ -326,6 +337,40 @@ mod tests {
         assert_eq!(rows[0].target.channel, Some(current));
         app.workspace_model.views[0].scope = Scope::Worktree { repository: directory.path().into(), path: directory.path().into() };
         assert!(app.capture_conversation_end_targets().is_empty(), "a shared worktree pane is not a channel conversation");
+    }
+
+    #[test]
+    fn sidebar_end_unfiled_refused_location_cannot_revive_a_historical_launch_menu() {
+        let (mut app, card, _channel, directory) = fixture();
+        Arc::make_mut(&mut app.durable).channels.clear();
+        let original = app.card_state(card).unwrap().clone();
+        app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
+            crate::model::WorktreeId::new(), directory.path().into(), Some("fixture".into())));
+        app.refresh_sidebar_conversations();
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].conversation_ends.entries().len(), 1,
+            "ordinary unpublished local chats retain legacy launch presentation");
+        // An orphan/refused location cannot be treated as execution evidence,
+        // nor silently fall back to the old launch spelling. The index owns
+        // current canonical/process validation; this tests its actual consumer.
+        app.workspace_model.agent_locations.push(crate::workspace_model::AgentLocation {
+            agent: crate::model::AgentId::from_uuid(card.as_uuid()), repository: directory.path().into(),
+            directory: directory.path().into(), blocked_directory: Some(directory.path().join("refused")),
+        });
+        app.refresh_sidebar_conversations();
+        assert!(app.sidebar_model.projects[0].worktrees[0].conversation_ends.entries().is_empty());
+        assert_eq!(app.card_state(card).unwrap().kind, original.kind, "presentation never rewrites the original recipe/source");
+        app.workspace_model.agent_locations.clear();
+        app.refresh_sidebar_conversations();
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].conversation_ends.entries().len(), 1);
+        // Explicit shared/durable filing remains exact display authority even
+        // when execution-location evidence is unavailable.
+        app.workspace_model.agent_locations.push(crate::workspace_model::AgentLocation {
+            agent: crate::model::AgentId::from_uuid(card.as_uuid()), repository: directory.path().into(),
+            directory: directory.path().into(), blocked_directory: Some(directory.path().join("refused")),
+        });
+        Arc::make_mut(&mut app.durable).card_scopes.insert(card, directory.path().into());
+        app.refresh_sidebar_conversations();
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].conversation_ends.entries().len(), 1);
     }
 
     #[test]
