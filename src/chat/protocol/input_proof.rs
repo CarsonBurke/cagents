@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 pub(crate) const MAX_PENDING: usize = 64;
 const MAX_RETIRED: usize = 128;
 pub(crate) const MAX_ID_BYTES: usize = 512;
-const MAX_ALIASES: usize = 64;
+pub(crate) const MAX_ALIASES: usize = 64;
 const MAX_ALIAS_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,4 +359,3 @@ impl CodexProofs {
         proof
     }
 }
-
