@@ -13384,6 +13384,13 @@ impl Application for Cagents {
         );
         // These messages update only time/paint state. They cannot change
         // workspace chrome, ownership, transcript probes or sidebar rows.
+        // Editing the draft/caret updates only the existing runtime's composer,
+        // completions and optional file lookup. Its later async reply remains
+        // conservative. Keep the normal focus/persistence tail, but do not
+        // invalidate every workspace/sidebar projection for each character.
+        let projection_neutral = matches!(&message, Message::ChatUi(
+            chat_ui::Action::Composer(..) | chat_ui::Action::ComposerCursor(..)
+        ));
         let terminal_wake = matches!(&message, Message::TerminalWake { .. });
         let mut light_update = match &message {
             Message::ChatUi(chat_ui::Action::Tick) => true,
@@ -16614,7 +16621,7 @@ impl Application for Cagents {
             // paint ticks still render; neither walks the workspace projection.
             return task;
         }
-        if !terminal_wake && !camera_only {
+        if !terminal_wake && !camera_only && !projection_neutral {
             self.update_tail.changed();
         }
         // `status` is the shell's write channel: ninety-odd call sites raise a
