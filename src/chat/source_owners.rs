@@ -183,11 +183,27 @@ pub(crate) struct ResidentRaw {
     pub epoch:SourceEpoch,
     pub source_len:usize,
     pub metadata:super::cache::raw::RawSourceMetadata,
+    /// Original namespace authority captured in the same owned read as bytes.
+    /// Missing legacy authority is unavailable; current metadata cannot retag it.
+    #[serde(default)]
+    pub authority:Option<super::cache::raw::RawSourceAuthority>,
 }
 impl ResidentRaw {
+    /// Immutable allocation shape plus relevant current namespace equality.
+    /// Caller must also prove live attachment/global and exact source metadata.
+    pub(crate) fn authority_matches(&self,parent:Option<super::cache::raw::RawSourceAuthority>,
+        child:Option<super::cache::raw::RawSourceAuthority>)->bool {
+        use super::cache::raw::RawSourceNamespace;
+        self.epoch.revision>0 && self.epoch.revision<=i64::MAX as u64
+            && self.authority.is_some_and(|proof|proof.matches_source(&self.source)
+                && proof.incarnation==self.epoch.incarnation && Some(proof)==match proof.namespace {
+                    RawSourceNamespace::Parent=>parent,RawSourceNamespace::Child=>child,
+                })
+    }
     fn valid(&self,text:&str)->bool {
         use super::cache::raw::{RawSourceField,RawRepresentation};
         !self.source.source_id.is_empty() && self.source_len==text.len() && text.len()<=SOURCE_BYTES
+            && self.authority_matches(self.authority,self.authority)
             && self.metadata.complete_call && !self.metadata.tool_name.is_empty()
             && matches!((self.field,self.metadata.representation),
                 (RawSourceField::ToolInput,RawRepresentation::StreamJson|RawRepresentation::CanonicalJson)
@@ -449,7 +465,56 @@ mod tests {
     fn raw_record(text:&str)->ResidentRaw {
         use super::super::cache::raw::{RawSourceField,RawSourceMetadata,RawRepresentation};
         ResidentRaw {source:SourceKey {agent_id:None,source_id:"opaque-original-call".into()},field:RawSourceField::ToolInput,
-            epoch:source_epoch(5),source_len:text.len(),metadata:RawSourceMetadata {tool_name:"Write".into(),representation:RawRepresentation::StreamJson,complete_call:true}}
+            epoch:source_epoch(5),source_len:text.len(),metadata:RawSourceMetadata {tool_name:"Write".into(),representation:RawRepresentation::StreamJson,complete_call:true},
+            authority:Some(super::super::cache::raw::RawSourceAuthority {incarnation:source_epoch(5).incarnation,generation:1,
+                namespace:super::super::cache::raw::RawSourceNamespace::Parent})}
+    }
+    #[test]
+    fn raw_authority_is_read_captured_and_same_allocation_cannot_be_relabelled() {
+        use super::super::cache::raw::RawSourceNamespace;
+        for namespace in [RawSourceNamespace::Parent,RawSourceNamespace::Child] {
+            let pool=Arc::new(Mutex::new(Owners::default()));let text:Arc<str>=Arc::from("exact original call");
+            let mut record=raw_record(&text);record.authority.as_mut().unwrap().namespace=namespace;
+            if namespace==RawSourceNamespace::Child {record.source.agent_id=Some("native-child".into());}
+            let proof=record.authority.unwrap();let opposite=super::super::cache::raw::RawSourceAuthority {
+                namespace:match namespace {RawSourceNamespace::Parent=>RawSourceNamespace::Child,RawSourceNamespace::Child=>RawSourceNamespace::Parent},
+                generation:99,..proof};
+            let current=|relevant|match namespace {RawSourceNamespace::Parent=>(relevant,Some(opposite)),RawSourceNamespace::Child=>(Some(opposite),relevant)};
+            let (parent,child)=current(Some(proof));assert!(record.valid(&text));assert!(record.authority_matches(parent,child));
+            assert!(record.authority_matches(record.authority,record.authority),"shape validation does not require the opposite namespace");
+            reserve_in(pool.clone(),text.len(),text.len()).unwrap().adopt_all(&[],&[],&[(text.clone(),record.clone())]).unwrap();
+            let next=super::super::cache::raw::RawSourceAuthority {generation:proof.generation+1,..proof};
+            let (parent,child)=current(Some(next));assert!(!record.authority_matches(parent,child));
+            let (parent,child)=current(None);assert!(!record.authority_matches(parent,child));
+            let mut relabelled=record.clone();relabelled.authority=Some(next);
+            assert_eq!(reserve_in(pool.clone(),text.len(),text.len()).unwrap().adopt_all(&[],&[],&[(text.clone(),relabelled)]),Err(ReserveError::InvalidPayload));
+            assert_eq!(pool.lock().unwrap().raw_provenance[&Owner::Raw(&text).id()],record);
+            assert_eq!(pool.lock().unwrap().reserved,0);
+            let queued=text.clone();let weak=Arc::downgrade(&text);drop(text);
+            assert!(weak.upgrade().is_some());assert_eq!(pool.lock().unwrap().bytes(),queued.len());
+            drop(queued);assert!(weak.upgrade().is_none());let mut state=pool.lock().unwrap();state.prune();assert_eq!(state.bytes(),0);assert!(state.raw_provenance.is_empty());
+        }
+    }
+    #[test]
+    fn raw_authority_shape_refuses_legacy_foreign_and_out_of_range_proofs() {
+        let record=raw_record("{}");let proof=record.authority.unwrap();
+        let mut boundary=record.clone();boundary.authority.as_mut().unwrap().generation=i64::MAX as u64;assert!(boundary.valid("{}"));
+        for change in 0..10 {
+            let mut invalid=record.clone();match change {
+                0=>invalid.authority=None,1=>invalid.authority.as_mut().unwrap().generation=0,
+                2=>invalid.authority.as_mut().unwrap().generation=i64::MAX as u64+1,
+                3=>invalid.authority.as_mut().unwrap().incarnation=uuid::Uuid::nil(),
+                4=>invalid.authority.as_mut().unwrap().incarnation=uuid::Uuid::from_u128(88),
+                5=>invalid.authority.as_mut().unwrap().namespace=super::super::cache::raw::RawSourceNamespace::Child,
+                6=>invalid.epoch.revision=0,7=>invalid.epoch.revision=i64::MAX as u64+1,
+                8=>invalid.source.source_id.clear(),_=>invalid.source.agent_id=Some(String::new()),
+            }
+            assert!(!invalid.valid("{}"),"invalid proof case {change}");
+            let pool=Arc::new(Mutex::new(Owners::default()));
+            assert_eq!(reserve_in(pool.clone(),2,2).unwrap().adopt_all(&[],&[],&[(Arc::from("{}"),invalid)]),Err(ReserveError::InvalidPayload));
+            assert_eq!(pool.lock().unwrap().reserved,0);assert_eq!(pool.lock().unwrap().bytes(),0);
+        }
+        assert_eq!(record.authority,Some(proof),"shape checks never update frozen provenance");
     }
     #[test]
     fn raw_call_adoption_tracks_exact_weak_owner_and_frozen_representation() {
