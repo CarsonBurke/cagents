@@ -244,8 +244,23 @@ impl<'a> ManagedDisplayIndex<'a> {
             return None;
         }
         if display.pane.is_none() {
-            // Initial display must not duplicate an alias of either the typed
-            // request or the primary surface selected by the daemon record.
+            // A secondary console can already be shown under an inventory
+            // alias even when the requested UUID selects the primary chat.
+            // Leave every owned typed alias to shared reconciliation before
+            // treating this actor as unpublished. Saved canonical panes above
+            // retain authority over their actual surface.
+            let canonical = CardId::from_uuid(agent.id.as_uuid());
+            for owner in agent.session.iter().chain(console.iter()) {
+                let resource = match owner {
+                    HostedSession::Chat(session) => (0, session.id),
+                    HostedSession::Terminal(session) => (1, session.id),
+                };
+                if self.resources.get(&resource).is_some_and(|cards| {
+                    cards.iter().any(|card| *card != canonical)
+                }) {
+                    return None;
+                }
+            }
             let primary = self.resolve_activation(agent, &session)?;
             if primary.scope != display.scope || primary.pane.is_some() {
                 return None;
@@ -1373,6 +1388,43 @@ mod managed_display_tests {
             HostedSession::Terminal(console_only.console.unwrap()),
             "only an actually absent primary permits the console-only legacy fallback"
         );
+    }
+
+    #[test]
+    fn attention_initial_activation_defers_aliases_of_either_shared_uuid_surface() {
+        let (agent, native, console) = fixture();
+        let requested = agent.session.as_ref().unwrap().id();
+        for (mut alias, canonical) in [
+            (native.clone(), console.clone()),
+            (console.clone(), native.clone()),
+        ] {
+            alias.id = CardId::new();
+            let mut model = super::super::WorkspaceModel {
+                views: vec![View {
+                    scope: agent.placement.clone(),
+                    revision: 1,
+                    panes: vec![alias],
+                    retired: vec![],
+                }],
+                ..Default::default()
+            };
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .activation_display(&agent, requested)
+                    .is_none(),
+                "an existing secondary alias cannot be treated as an unpublished actor"
+            );
+            model.views[0].panes.push(canonical.clone());
+            assert_eq!(
+                ManagedDisplayIndex::new(&model)
+                    .activation_display(&agent, requested)
+                    .unwrap()
+                    .display
+                    .pane,
+                Some(canonical),
+                "the exact canonical surface retains authority beside its counterpart alias"
+            );
+        }
     }
 
     #[test]

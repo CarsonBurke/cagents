@@ -1774,6 +1774,71 @@ mod tests {
     }
 
     #[test]
+    fn attention_console_alias_defers_fresh_chat_until_exact_shared_reconciliation() {
+        use crate::agent_execution::HostedSession;
+        use crate::workspace_model::views::{Pane, View};
+        let (mut app, mut agent) = scheduled_attention_fixture();
+        let console = agent.console.clone().unwrap();
+        let native = crate::chat::Session {
+            native_continuity: Default::default(),
+            id: console.id,
+            proof: console.continuity.live_proof(),
+            terminal: Some(console.clone()),
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: agent.spec.provider,
+                session_id: None,
+                recipe: console.launch.clone(),
+            },
+        };
+        agent.session = Some(HostedSession::Chat(native));
+        let canonical = CardId::from_uuid(agent.id.as_uuid());
+        let alias = CardId::new();
+        let original = agent.clone();
+        app.workspace_model.agents.push(agent);
+        app.workspace_model.views = vec![View {
+            scope: original.placement.clone(),
+            revision: 1,
+            panes: vec![Pane {
+                id: alias,
+                title: "Existing console".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 1.0,
+                scope: None,
+                kind: CardKind::Terminal(console.clone()),
+            }],
+            retired: vec![],
+        }];
+        drop(app.update_notifications(Action::Activated(Target::Session(console.id))));
+        assert!(app.durable.cards.is_empty());
+        assert_ne!(app.workspace.focused(), Some(canonical));
+        assert_eq!(app.notification_ui.session_activation, Some(console.id));
+        assert!(!app.chat_start_pending(canonical));
+        assert_eq!(app.workspace_model.agents[0], original);
+
+        // An actual shared alias migration publishes the canonical console.
+        // Retry must attach that saved surface rather than create the primary.
+        app.workspace_model.views[0].panes[0].id = canonical;
+        app.workspace_model.views[0].retired.push(alias);
+        app.workspace_model.views[0].revision += 1;
+        app.workspace_model.sequence += 1;
+        drop(app.retry_notification_activation());
+        assert_eq!(app.workspace.focused(), Some(canonical));
+        assert_eq!(
+            app.card_state(canonical).unwrap().kind,
+            CardKind::Terminal(console.clone())
+        );
+        assert_eq!(app.durable.cards.len(), 1);
+        assert!(!app.chat_start_pending(canonical));
+        assert!(app.notification_ui.session_activation.is_none());
+        assert_eq!(app.workspace_model.agents[0], original);
+        drop(app.update_notifications(Action::Activated(Target::Session(console.id))));
+        assert_eq!(app.durable.cards.len(), 1);
+        assert_eq!(app.workspace.focused(), Some(canonical));
+    }
+
+    #[test]
     fn attention_unmanaged_open_session_is_not_shadowed_by_its_retired_alias() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
