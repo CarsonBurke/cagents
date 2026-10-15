@@ -12922,6 +12922,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         repository: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != repository { return Err(ValidationError::InvalidWorktree(repository.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.common_metadata_path());
+        }
         let output = self.run_checked(
             &self.git_read(
                 repository,
@@ -12942,6 +12947,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != worktree { return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.private_metadata_path());
+        }
         let output = self.run_checked(
             &self.git_read(
                 worktree,
