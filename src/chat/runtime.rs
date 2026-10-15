@@ -5797,14 +5797,14 @@ mod tests {
     }
 
     #[test]
-    fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
+    fn consecutive_non_json_stdout_fails_with_a_bounded_preview() {
         let spec = ProcessSpec {
             execution: None,
             messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
-            arguments: vec!["not-json\\n".into()],
+            arguments: vec!["not-json\\n".repeat(8)],
             working_directory: std::env::temp_dir(),
             environment: BTreeMap::new(),
         };
@@ -5817,7 +5817,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("Unsupported provider stdout")
+                .contains("8 consecutive invalid protocol lines. Last output: not-json")
         );
         handle
             .close()

@@ -875,8 +875,8 @@ impl Residence {
 }
 
 /// One bounded ring, drained on the holder's existing poll loop. No per-agent
-/// reader thread or periodic wakeup is needed. Full raw stderr is opt-in disk
-/// debug output, just like the daemon's direct provider transport.
+/// reader thread or periodic wakeup is needed. Raw stderr is retained by default
+/// in the same private, bounded disk log as the direct provider transport.
 struct StderrCapture {
     reader: Option<std::process::ChildStderr>,
     tail: std::collections::VecDeque<u8>,
