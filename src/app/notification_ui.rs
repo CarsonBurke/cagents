@@ -827,17 +827,36 @@ impl Cagents {
     /// fences that fallback, including rejected/ambiguous canonical ownership.
     fn notification_attention_cards(&self) -> HashMap<TerminalId, Option<CardId>> {
         let mut cards = HashMap::new();
-        for card in self.durable.cards.iter().filter(|card| card.existence.is_open()) {
+        for card in self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+        {
             if let Some(session) = card_session(card) {
-                cards.entry(session).and_modify(|entry| *entry = None).or_insert(Some(card.id));
+                cards
+                    .entry(session)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(card.id));
             }
         }
         let mut owners = HashMap::new();
-        for agent in self.workspace_model.agents.iter().filter(|agent| !agent.closed) {
+        for agent in self
+            .workspace_model
+            .agents
+            .iter()
+            .filter(|agent| !agent.closed)
+        {
             let primary = agent.session.as_ref().map(|session| session.id());
             let console = agent.console.as_ref().map(|session| session.id);
-            for session in primary.into_iter().chain(console.filter(|session| Some(*session) != primary)) {
-                owners.entry(session).and_modify(|entry| *entry = None).or_insert(Some(agent));
+            for session in primary
+                .into_iter()
+                .chain(console.filter(|session| Some(*session) != primary))
+            {
+                owners
+                    .entry(session)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(agent));
             }
         }
         let index = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model);
@@ -845,10 +864,16 @@ impl Cagents {
             let canonical = owner.and_then(|agent| {
                 let resolved = self.resolved_agent_display(agent, session, &index)?;
                 let canonical = CardId::from_uuid(agent.id.as_uuid());
-                let card = self.card_state(canonical).filter(|card| card.existence.is_open())?;
+                let card = self
+                    .card_state(canonical)
+                    .filter(|card| card.existence.is_open())?;
                 let local = match &card.kind {
-                    CardKind::Chat(session) => crate::agent_execution::HostedSession::Chat(session.clone()),
-                    CardKind::Terminal(session) => crate::agent_execution::HostedSession::Terminal(session.clone()),
+                    CardKind::Chat(session) => {
+                        crate::agent_execution::HostedSession::Chat(session.clone())
+                    }
+                    CardKind::Terminal(session) => {
+                        crate::agent_execution::HostedSession::Terminal(session.clone())
+                    }
                     _ => return None,
                 };
                 resolved.session.same_process(&local).then_some(canonical)
@@ -2342,8 +2367,15 @@ mod tests {
             diagnostic: None,
             notices: vec![crate::notifications::Notice {
                 id: uuid::Uuid::new_v4(),
-                event: crate::notifications::Event::session(session, Provider::Claude, "/tmp".into(),
-                    crate::notifications::Evidence {key: "canonical-unread".into(), kind: crate::notifications::Kind::Waiting}),
+                event: crate::notifications::Event::session(
+                    session,
+                    Provider::Claude,
+                    "/tmp".into(),
+                    crate::notifications::Evidence {
+                        key: "canonical-unread".into(),
+                        kind: crate::notifications::Kind::Waiting,
+                    },
+                ),
                 delivered: true,
                 acknowledged: false,
                 window: None,
@@ -2370,8 +2402,15 @@ mod tests {
                     app.workspace_model.agents.push(duplicate);
                 }
                 1 => {
-                    let CardKind::Terminal(session) = &mut app.card_state_mut(canonical).unwrap().kind else {unreachable!()};
-                    if let TerminalContinuity::Live {host_incarnation, ..} = &mut session.continuity {
+                    let CardKind::Terminal(session) =
+                        &mut app.card_state_mut(canonical).unwrap().kind
+                    else {
+                        unreachable!()
+                    };
+                    if let TerminalContinuity::Live {
+                        host_incarnation, ..
+                    } = &mut session.continuity
+                    {
                         *host_incarnation = crate::model::HostIncarnation::new("replacement-host");
                     }
                 }
@@ -2387,9 +2426,18 @@ mod tests {
             let focused = app.workspace.focused();
             let count = app.cards.len();
             drop(app.update_notifications(Action::Snapshot(attention_snapshot(session))));
-            assert!(!app.sidebar_state.has_card_update(alias_id), "scenario{scenario}");
-            assert!(!app.sidebar_state.has_card_update(canonical), "scenario{scenario}");
-            assert!(Arc::ptr_eq(&before, &app.durable), "attribution cannot adopt or persist");
+            assert!(
+                !app.sidebar_state.has_card_update(alias_id),
+                "scenario{scenario}"
+            );
+            assert!(
+                !app.sidebar_state.has_card_update(canonical),
+                "scenario{scenario}"
+            );
+            assert!(
+                Arc::ptr_eq(&before, &app.durable),
+                "attribution cannot adopt or persist"
+            );
             assert_eq!(app.workspace_model, model);
             assert_eq!(app.workspace.focused(), focused);
             assert_eq!(app.cards.len(), count);
@@ -2412,7 +2460,10 @@ mod tests {
             let alias_id = alias.id;
             Arc::make_mut(&mut app.durable).cards.insert(0, alias);
             drop(app.update_notifications(Action::Snapshot(attention_snapshot(session))));
-            assert_eq!(app.sidebar_state.has_card_update(current.id), !duplicate_open);
+            assert_eq!(
+                app.sidebar_state.has_card_update(current.id),
+                !duplicate_open
+            );
             assert!(!app.sidebar_state.has_card_update(alias_id));
         }
     }
