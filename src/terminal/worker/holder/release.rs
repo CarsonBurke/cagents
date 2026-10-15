@@ -5,6 +5,9 @@ use super::{Duration, Holder, Instant};
 use std::sync::OnceLock;
 enum Task {
     Final(Holder),
+    StartAttempt(crate::terminal::TerminalStartAttempt),
+    #[cfg(test)]
+    Block { entered: crossbeam_channel::Sender<()>, release: crossbeam_channel::Receiver<()> },
     Completed {
         handle: super::super::TerminalHandle,
         deadline: Instant,
@@ -31,6 +34,12 @@ fn service() -> Result<&'static crossbeam_channel::Sender<Task>, String> {
                 while let Ok(task) = receiver.recv() {
                     let _wake = CompletionWake;
                     match task {
+                        #[cfg(test)]
+                        Task::Block { entered, release } => {
+                            let _ = entered.send(());
+                            let _ = release.recv_timeout(Duration::from_secs(10));
+                        }
+                        Task::StartAttempt(attempt) => attempt.reconcile_cleanup_owned(),
                         Task::Final(mut holder) => {
                             if let Err(error) = holder.close_until(Instant::now()+Duration::from_secs(5)) {
                                 tracing::warn!(%error,"Terminal family remains owned by its discoverable holder");
@@ -91,15 +100,21 @@ fn completed_until(
     Ok(result)
 }
 
+pub(super) fn start_attempt(attempt: crate::terminal::TerminalStartAttempt) -> Result<(), String> {
+    service()?.try_send(Task::StartAttempt(attempt))
+        .map_err(|_| "Terminal start cleanup capacity is busy; retain its exact attempt".to_owned())
+}
+
 pub(super) fn request(mut holder: Holder) {
     match service() {
         Ok(sender) => match sender.try_send(Task::Final(holder)) {
             Ok(()) => return,
             Err(error) => match error.into_inner() {
                 Task::Final(returned) => holder = returned,
-                Task::Completed { .. } => {
-                    unreachable!("only the submitted final holder can be returned")
-                }
+                Task::Completed { .. } => unreachable!("only the submitted final holder can be returned"),
+                Task::StartAttempt(_) => unreachable!("only the submitted final holder can be returned"),
+                #[cfg(test)]
+                Task::Block { .. } => unreachable!("only the submitted final holder can be returned"),
             },
         },
         Err(error) => tracing::warn!(%error,"Terminal cleanup service unavailable"),

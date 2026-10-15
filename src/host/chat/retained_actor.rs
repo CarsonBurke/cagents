@@ -293,6 +293,7 @@ pub(super) fn restore(
     requested: &Session,
     proof: &HostSessionProof,
     owner: crate::daemon::holder_registry::Record,
+    publication: &super::source_binding::Reservation,
 ) -> Result<ServerResponse, String> {
     super::super::session_locations::observer_registry(host)?;
     let inspection = Handle::inspect_remote(&owner, proof.clone())?;
@@ -438,7 +439,7 @@ pub(super) fn restore(
     state.publish_chat_observer(id, identity.instance, observer_registration.stamp());
     state
         .native_sources
-        .installed(id, record.execution_instance);
+        .install_reserved(publication, record.execution_instance).map_err(|error| error.message)?;
     let retired = state.chats.insert(id, record);
     state.upgrade_chats.insert(id, previous_sources);
     state.native_adoption_failures.clear(id);

@@ -45,6 +45,7 @@ fn digest(source: &TerminalSession) -> Result<[u8; 32], String> {
 
 /// Bounded private lineage captured from an authenticated spawn/adoption.
 /// Keep the digest rather than another copy of the issued recipe/environment.
+#[derive(Clone)]
 pub(crate) struct SourceReceipt {
     digest: [u8; 32],
     proof: HostSessionProof,

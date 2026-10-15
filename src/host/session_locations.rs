@@ -1404,6 +1404,110 @@ mod tests {
     }
 
     #[test]
+    fn return_capacity_refusal_precedes_flags_claim_close_and_terminal_start() {
+        let exact = std::thread::current().name().expect("named contract").to_owned();
+        if runtime::isolated_backend_contract(&exact) { return; }
+        let fixture = fixture(0);
+        let id = fixture.source.id;
+        fixture.host.lock().unwrap().register_client(1);
+        let expected = super::super::chat::source_binding::fixture_binding(&fixture.host, id);
+        let process = fixture.handle.provider_process().expect("real owned native provider");
+        assert!(process.is_current());
+        let reservations = fixture.host.lock().unwrap().native_sources.pin_capacity_for_test();
+        let error = super::super::chat::process(&fixture.host, 1,
+            ClientRequest::ChatReturnTerminal { chat_id: id, expected }).unwrap_err();
+        assert!(error.message.contains("capacity is reserved"), "{error:?}");
+        let state = fixture.host.lock().unwrap();
+        assert!(!state.chats[&id].returning_terminal, "capacity refusal cannot mark a return in progress");
+        assert!(state.terminals.is_empty());
+        assert!(!state.has_pending_terminal_spawn_for_test());
+        assert!(state.chat_handoffs.is_empty());
+        assert!(!fixture.handle.is_completed());
+        assert_eq!(fixture.handle.provider_process().as_ref(), Some(&process));
+        assert!(process.is_current(), "all-pinned admission cannot close the original process");
+        assert!(!fixture.old.join("handoff.marker").exists(), "no return CLI was launched");
+        drop(state);
+        drop(reservations);
+    }
+
+    #[test]
+    fn ordinary_return_retains_failed_start_through_capacity_pressure_until_exact_family_proof() {
+        let exact = std::thread::current().name().expect("named contract").to_owned();
+        if runtime::isolated_backend_contract(&exact) { return; }
+        use crate::terminal::TerminalStartDisposition as Disposition;
+        let fixture = fixture(0);
+        let id = fixture.source.id;
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, fixture.source.proof.as_ref().unwrap()).unwrap();
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.register_client(1);
+            state.enable_holder_recovery();
+        }
+        let expected = super::super::chat::source_binding::fixture_binding(&fixture.host, id);
+        // The original native child already execed cat. Only the returned PTY
+        // runs this private script, making every actual resume start observable.
+        std::fs::write(&fixture.source.launch.recipe.program,
+            "#!/bin/sh\nprintf '%s\n' \"$$\" >> return-spawns\nexec /bin/cat\n").unwrap();
+        let starts = |expected_count: usize| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let rows = std::fs::read_to_string(fixture.old.join("return-spawns")).unwrap_or_default();
+                let pids = rows.lines().map(|row| row.parse::<i32>().unwrap()).collect::<Vec<_>>();
+                if pids.len() >= expected_count { assert_eq!(pids.len(), expected_count); break pids; }
+                assert!(Instant::now() < deadline, "actual returned PTY did not start");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        fixture.host.lock().unwrap().native_sources.lose_next_return_start_reply_for_test();
+        let mut retained = None;
+        TerminalHandle::with_blocked_holder_cleanup_for_test(|| {
+            let error = super::super::chat::process(&fixture.host, 1,
+                ClientRequest::ChatReturnTerminal { chat_id: id, expected: expected.clone() }).unwrap_err();
+            assert!(error.message.contains("exited before startup completed"), "{error:?}");
+            let attempt = fixture.host.lock().unwrap().native_sources.return_attempt_for_test(id).unwrap();
+            assert_eq!(attempt.disposition(), Disposition::Unknown);
+            let record = attempt.holder_record().expect("exact original holder capability");
+            assert_eq!(record.terminal, attempt.terminal_id());
+            assert_eq!(starts(1), vec![record.root.pid]);
+            assert!(fixture.handle.is_completed(), "original native close preceded this exact start");
+            fixture.host.lock().unwrap().native_sources.pressure_for_test();
+            let refused = super::super::chat::process(&fixture.host, 1,
+                ClientRequest::ChatReturnTerminal { chat_id: id, expected: expected.clone() }).unwrap_err();
+            assert!(refused.message.contains("previous terminal start is unconfirmed"), "{refused:?}");
+            let same = fixture.host.lock().unwrap().native_sources.return_attempt_for_test(id).unwrap();
+            assert_eq!(same.id(), attempt.id());
+            assert_eq!(same.terminal_id(), attempt.terminal_id());
+            assert_eq!(same.worker_instance(), attempt.worker_instance());
+            assert_eq!(starts(1).len(), 1, "unknown cleanup cannot launch another resume PTY");
+            retained = Some((attempt, record));
+        });
+        let (attempt, record) = retained.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while attempt.retry_cleanup() != Disposition::FamilySettled {
+            assert!(Instant::now() < deadline, "exact retained family remains unconfirmed: {attempt:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!record.root.is_current() && !record.holder.is_current());
+        let response = super::super::chat::process(&fixture.host, 1,
+            ClientRequest::ChatReturnTerminal { chat_id: id, expected }).unwrap();
+        let ServerResponse::ChatTerminal { receipt, .. } = response else { panic!("expected full handoff receipt"); };
+        assert_eq!(receipt.terminal.session.id, attempt.terminal_id(), "positive cleanup releases only the attempt, retaining the target ID");
+        assert_ne!(Some(receipt.terminal.execution_instance), attempt.worker_instance());
+        let owner = fixture.host.lock().unwrap().terminals[&attempt.terminal_id()].handle.clone();
+        struct Close(TerminalHandle);
+        impl Drop for Close { fn drop(&mut self) { let _ = self.0.shutdown(); } }
+        let _close = Close(owner.clone());
+        assert_eq!(starts(2).len(), 2);
+        {
+            let state = fixture.host.lock().unwrap();
+            assert_eq!(state.terminals.len(), 1);
+            state.validate_terminal_handoff_receipt(&receipt).unwrap();
+        }
+        owner.shutdown().unwrap();
+    }
+
+    #[test]
     fn console_pair_claim_preserves_the_exact_operation_across_lost_disposition_reply() {
         let exact = std::thread::current()
             .name()
@@ -1491,6 +1595,9 @@ mod tests {
         };
         assert!(!fixture.handle.is_completed());
         assert!(!worker.is_completed());
+        // More than two full history windows cannot discard the only exact
+        // phase after the owner applied release but its reply was lost.
+        fixture.host.lock().unwrap().native_sources.pressure_for_test();
         let response = super::super::chat::process(
             &fixture.host,
             1,

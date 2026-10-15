@@ -59,9 +59,25 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
     if source.archive_report.is_some() {
         return Err("A saved automation report cannot authorize provider teardown".into());
     }
+    let transition = restart::transition_gate(host, source.id);
+    let _transition = match transition.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Err(
+            "This conversation already has a lifecycle transition in progress; retry its current pane".into()),
+    };
+    close_retained_under_transition(host, source)
+}
+
+/// Callers already retaining the exact chat lifecycle claim enter without
+/// reacquiring it. The claim spans original binding capture and final release.
+pub(super) fn close_retained_under_transition(host: &SharedHost, source: &Session) -> Result<(), String> {
     // Refuse a degraded installed store before even reconciling an exact
     // startup owner, adopting a holder or requesting provider teardown.
     super::super::agent_execution::retirement_registry(host)?;
+    if super::bound_close::close_unattempted(host, source)?.is_some() {
+        return Ok(());
+    }
     if retained_actor::reconcile_startup(host, source)? {
         return Ok(());
     }
@@ -83,8 +99,16 @@ pub(in crate::host) fn close_with_presentation(host: &SharedHost,
     close_retained_inner(host, source, false, Some((origin, target)))
 }
 
-fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
+pub(super) fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
     consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>) -> Result<(), String> {
+    close_retained_inner_then(host, source, restart, consent, || Ok(()))
+}
+
+/// Final positive disposition runs outside HostLock while the exact hosted and
+/// native cleanup owners are still retained. Any failure keeps both for retry.
+pub(super) fn close_retained_inner_then(host: &SharedHost, source: &Session, restart: bool,
+    consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>,
+    finish: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     if source.archive_report.is_some() {
         return Err("A saved automation report cannot authorize provider teardown".into());
     }
@@ -379,7 +403,7 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
             retire_closed_execution(host, source, pending.owner.record(), &proof, consent)?;
         }
         Ok(())
-    })();
+    })().and_then(|()| finish());
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     state.chat_spawning.remove(&source.id);
     state.inventory_generation += 1;
@@ -423,7 +447,7 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
 /// The caller may be an authenticated old alias, while the agent already
 /// retains the adopted descriptor. Authenticate and preflight the same CURRENT
 /// source set that retirement will use, before adoption or Release changes it.
-fn preflight_current_retirements(
+pub(super) fn preflight_current_retirements(
     host: &SharedHost,
     caller: &Session,
     owner: &registry::Record,
