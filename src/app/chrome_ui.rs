@@ -67,10 +67,12 @@ mod tests {
     fn tab_fixture(count: usize, width: f32) -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.context_inspector_open = false;
-        let cards = (0..count)
+        let cards: Vec<_> = (0..count)
             .map(|_| super::super::tests::terminal_card_state())
             .collect();
-        Arc::make_mut(&mut app.durable).cards = cards;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.focused = cards.first().map(|card| card.id);
+        durable.cards = cards;
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.workspace.resize_viewport(width);
         drop(app.sync_chrome());
@@ -702,8 +704,8 @@ mod tests {
             session.launch.program = "codex".into();
             card.title = title.into();
             drop(app.sync_chrome());
-            assert_eq!(app.card_chrome[&id].title, expected);
-            assert_eq!(app.core.window.header_title, expected);
+            assert_eq!(app.card_chrome[&id].title, format!("{expected} (1)"));
+            assert_eq!(app.core.window.header_title, format!("{expected} (1)"));
         }
         let custom = "[ ! ] Action Required documentation";
         app.chrome_ui.user_titles.insert(id, custom.into());

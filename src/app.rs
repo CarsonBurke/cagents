@@ -28031,6 +28031,7 @@ mod tests {
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         drop(app.sync_window_title());
         let header = app.core.window.header_title.clone();
+        let window_title = app.title(window::Id::RESERVED).to_owned();
         let card = app.workspace.focused().unwrap();
         app.sidebar_state.set_card_activity(
             card,
@@ -28039,11 +28040,16 @@ mod tests {
                 state: crate::agent::ActivityState::Waiting,
             },
         );
-        assert!(iced::runtime::task::into_stream(app.sync_window_title()).is_some());
+        drop(app.sync_window_title());
+        assert_eq!(
+            app.title(window::Id::RESERVED),
+            format!("(1) {window_title}")
+        );
         assert_eq!(app.window_waiting_count, 1);
         assert_eq!(app.core.window.header_title, header);
         app.sidebar_state.clear_agent_activity(card);
-        assert!(iced::runtime::task::into_stream(app.sync_window_title()).is_some());
+        drop(app.sync_window_title());
+        assert_eq!(app.title(window::Id::RESERVED), window_title);
         assert_eq!(app.window_waiting_count, 0);
     }
 
