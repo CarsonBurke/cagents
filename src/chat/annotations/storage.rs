@@ -145,6 +145,7 @@ impl Store {
     /// Locks make recovery safe against another actor's active capture.
     fn recover_pending(&self)->Result<(),String>{
         use std::os::fd::AsRawFd;
+        let _publication=crate::instance::owned_lock(&self.directory.join("capture-publication.lock"),libc::LOCK_EX).map_err(|e|e.to_string())?;
         let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let mut statement=transaction.prepare("SELECT path FROM retained_attachments WHERE accepted=0 LIMIT 256").map_err(|e|e.to_string())?;
         let paths=statement.query_map([],|row|row.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
@@ -179,11 +180,19 @@ impl Store {
         let extension=path.extension().and_then(|value|value.to_str()).filter(|value|!value.is_empty()&&value.len()<=16&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()));
         let name=format!("capture-{}{}",uuid::Uuid::new_v4(),extension.map(|value|format!(".{value}")).unwrap_or_default());
         let retained=self.directory.join(&name);
+        let mut created=false;
         let result=(||{
+            // Publish the durable pending row first. Recovery holds the same
+            // publication lock, so it cannot remove that row before the file
+            // exists and carries its own lifetime lease. Death at either cut
+            // point leaves an indexed, recoverable pending capture.
+            let publication=crate::instance::owned_lock(&self.directory.join("capture-publication.lock"),libc::LOCK_EX).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
+            if self.db.execute("INSERT INTO retained_attachments(path,bytes) SELECT ?1,?2 WHERE (SELECT count(*) FROM retained_attachments WHERE accepted=0)<32 AND (SELECT coalesce(sum(bytes),0) FROM retained_attachments WHERE accepted=0)+?2<=67108864",params![name,reserved_bytes]).map_err(storage_error)?!=1{return Err(OriginalError::TooLarge);}
             let mut output=fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&retained).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
+            created=true;
             // SAFETY: output owns this newly created regular file.
             if unsafe{libc::flock(output.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err(OriginalError::Unavailable(std::io::Error::last_os_error().to_string()));}
-            if self.db.execute("INSERT INTO retained_attachments(path,bytes) SELECT ?1,?2 WHERE (SELECT count(*) FROM retained_attachments WHERE accepted=0)<32 AND (SELECT coalesce(sum(bytes),0) FROM retained_attachments WHERE accepted=0)+?2<=67108864",params![name,reserved_bytes]).map_err(storage_error)?!=1{return Err(OriginalError::TooLarge);}
+            drop(publication);
             let mut hash=Sha256::new();let mut bytes=0u64;let mut chunk=[0u8;64*1024];
             loop {let count=input.read(&mut chunk).map_err(|e|OriginalError::Unavailable(e.to_string()))?;if count==0{break;}bytes=bytes.saturating_add(count as u64);if bytes>reserved_bytes{return Err(OriginalError::Changed);}hash.update(&chunk[..count]);output.write_all(&chunk[..count]).map_err(|e|OriginalError::Unavailable(e.to_string()))?;}
             if bytes!=reserved_bytes{return Err(OriginalError::Changed);}
@@ -191,7 +200,7 @@ impl Store {
             fs::File::open(&self.directory).and_then(|file|file.sync_all()).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
             Ok(PendingAttachment{attachment:OriginalAttachment{original_path:path.to_owned(),path:retained.clone(),bytes,sha256:hash.finalize().into()},_lease:output,accepted:false,reserved_bytes,pending_bytes:self.pending_bytes.clone()})
         })();
-        if result.is_err(){let _=fs::remove_file(retained);self.pending_bytes.fetch_sub(reserved_bytes,Ordering::AcqRel);}
+        if result.is_err(){if created{let _=fs::remove_file(retained);}self.pending_bytes.fetch_sub(reserved_bytes,Ordering::AcqRel);}
         result
     }
     /// Persist only after a provider acknowledgment binds this exact original
@@ -393,6 +402,19 @@ mod tests {
         let first=store.retain_attachment(&large).unwrap();let second=store.retain_attachment(&large).unwrap();
         assert!(matches!(store.retain_attachment(&path),Err(OriginalError::TooLarge)));drop(first);drop(second);
         assert!(store.retain_attachment(&path).is_ok());
+    }
+
+    #[test]
+    fn cold_recovery_handles_each_interrupted_publication_cut_without_unindexed_files(){
+        let root=tempfile::tempdir().unwrap();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
+        let store=Store::at(&annotations,&account,"session").unwrap();
+        // Durable row committed, process died before file creation.
+        store.db.execute("INSERT INTO retained_attachments VALUES('capture-before-file',0,4)",[]).unwrap();
+        // Durable row committed and file created, process died before lease.
+        store.db.execute("INSERT INTO retained_attachments VALUES('capture-before-lease',0,4)",[]).unwrap();
+        let orphan=store.directory.join("capture-before-lease");fs::write(&orphan,b"data").unwrap();fs::set_permissions(&orphan,fs::Permissions::from_mode(0o600)).unwrap();
+        drop(store);let restored=Store::at(&annotations,&account,"session").unwrap();
+        assert!(!orphan.exists());let pending:usize=restored.db.query_row("SELECT count(*) FROM retained_attachments WHERE accepted=0",[],|row|row.get(0)).unwrap();assert_eq!(pending,0);
     }
 
 }
