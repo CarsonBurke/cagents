@@ -542,6 +542,7 @@ pub enum RepositoryAction {
         card: CardId,
         editor_id: String,
     },
+    OpenWorkingFileLocation { identity:AsyncIdentity,line:usize },
     StageSelected {
         card: CardId,
         stage: bool,
@@ -730,7 +731,7 @@ pub enum ClipboardOp {
 impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
-            Self::SelectDiffRow { identity, .. } => identity.card,
+            Self::SelectDiffRow { identity, .. } | Self::OpenWorkingFileLocation { identity,.. } => identity.card,
             Self::EndDiffSelection { card }
             | Self::MoveDiffSelection { card, .. }
             | Self::ClearDiffSelection { card }
@@ -6170,7 +6171,7 @@ impl RepositoryRuntime {
                 }
                 self.expand_diff_fold(fold, expansion)
             }
-            RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } => {
+            RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } | RepositoryAction::OpenWorkingFileLocation { .. } => {
                 Task::none()
             }
             RepositoryAction::WorkingDiffDue { card, ticket } => {
@@ -6509,7 +6510,7 @@ impl RepositoryRuntime {
         basis: DiffBasis,
         old_path: Option<PathBuf>,
     ) -> Task<RepositoryAction> {
-        if self.mutation_refresh_pending && !basis.is_immutable() {
+        if !self.diff_surface_visible || (self.mutation_refresh_pending && !basis.is_immutable()) {
             return Task::none();
         }
         self.next_diff_request = self.next_diff_request.wrapping_add(1).max(1);
@@ -6584,6 +6585,21 @@ impl RepositoryRuntime {
         );
         let identity = self.next_identity(card, path);
         self.request_diff(identity, basis, old_path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diff_snapshot_fixture(card:CardId,path:&str,before:&str,after:&str)->(Self,AsyncIdentity) {
+        let (mut runtime,identity) = Self::open_fixture(card,path,after);
+        runtime.document = DocumentState::None;
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.set_diff_state(runtime.diff_basis.clone(),DiffState::ready(RenderedDiff::Text {
+            model:crate::diff_view::build_diff(before,after),old_label:"Before".into(),new_label:"After".into(),
+        }));
+        (runtime,identity)
+    }
+
+    pub(crate) fn diff_working_file_target(&self, identity:&AsyncIdentity)->Option<RepositoryView> {
+        (self.accepts_selected(identity) && self.shows_diff()).then(|| self.descriptor.clone())
     }
 
     /// Open a repository-relative location, even before the directory listing
