@@ -2403,7 +2403,11 @@ impl Actor {
         }
         if activity_changed || outcome_changed {
             self.activity_outcome = outcome.clone();
-            (self.notify)(Update::Activity { state: activity, generation, outcome });
+            (self.notify)(Update::Activity {
+                state: activity,
+                generation,
+                outcome,
+            });
         }
         if became_ready {
             (self.notify)(Update::Ready);
@@ -3055,31 +3059,64 @@ mod tests {
         struct ActivityFixture;
         impl Adapter for ActivityFixture {
             fn initialize(&mut self) -> Result<Step, String> {
-                Ok(Step { events: vec![Event::Ready(true)], ..Default::default() })
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
             }
-            fn command(&mut self, _: Command) -> Result<Step, String> { Ok(Step::default()) }
-            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        let spec = ProcessSpec { execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,
-            program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:BTreeMap::new() };
-        let mut adapter:Box<dyn Adapter> = Box::new(ActivityFixture);
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(ActivityFixture);
         let mut initial = adapter.initialize().unwrap();
-        let store = preflight(&spec,&mut initial).unwrap();
-        let (send,receive) = crossbeam_channel::unbounded();
-        let handle = Handle::start(spec,adapter,initial,store,None,move |update| { let _ = send.send(update); }).unwrap();
-        until(&handle,|snapshot| snapshot.ready);
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = send.send(update);
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
         receive.try_iter().for_each(drop);
-        for outcome in [crate::agent::ActivityOutcome::Failed { reason:"Provider exited with status 3".into() }, crate::agent::ActivityOutcome::Succeeded] {
+        for outcome in [
+            crate::agent::ActivityOutcome::Failed {
+                reason: "Provider exited with status 3".into(),
+            },
+            crate::agent::ActivityOutcome::Succeeded,
+        ] {
             {
                 let mut state = handle.0.state.lock().unwrap();
                 state.outcome = Some(outcome.clone());
                 state.generation += 1;
             }
             handle.command(Command::Compact).unwrap();
-            let updates = receive.try_iter().filter_map(|update| match update { Update::Activity { state,outcome,.. } => Some((state,outcome)), _ => None }).collect::<Vec<_>>();
-            assert_eq!(updates,vec![(ActivityState::Idle,Some(outcome))]);
+            let updates = receive
+                .try_iter()
+                .filter_map(|update| match update {
+                    Update::Activity { state, outcome, .. } => Some((state, outcome)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(updates, vec![(ActivityState::Idle, Some(outcome))]);
             handle.command(Command::Compact).unwrap();
-            assert!(!receive.try_iter().any(|update| matches!(update,Update::Activity { .. })));
+            assert!(
+                !receive
+                    .try_iter()
+                    .any(|update| matches!(update, Update::Activity { .. }))
+            );
         }
         handle.close().unwrap();
     }
