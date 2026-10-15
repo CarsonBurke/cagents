@@ -1016,6 +1016,13 @@ impl Handle {
             .map(|agent| agent.id.clone())
             .collect()
     }
+    /// A coherent resident naming projection. Never opens the transcript Store,
+    /// pages history or touches the filesystem; safe at host admission points.
+    pub(crate) fn conversation_title(&self) -> (Option<String>, Option<String>) {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        (state.session_id.clone(), state.title.clone())
+    }
+
     /// The provider-reported title, read without loading the transcript.
     pub(crate) fn title(&self) -> Option<String> {
         self.0
@@ -2583,9 +2590,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::Session { id, title } => {
             if state.session_id.as_deref() != Some(id.as_str()) {
                 state.prompt_suggestion = None;
+                state.title = title;
+            } else if title.is_some() {
+                // Identity-only frames carry no new naming information.
+                state.title = title;
             }
             state.session_id = Some(id);
-            state.title = title;
         }
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
@@ -3011,6 +3021,19 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_only_frames_preserve_a_name_until_actual_session_change_or_reset() {
+        let mut state = Snapshot::default(); let mut indices = BTreeMap::new();
+        apply_event(&mut state, &mut indices, Event::Session { id: "a".into(), title: Some("Bundle review".into()) });
+        apply_event(&mut state, &mut indices, Event::Session { id: "a".into(), title: None });
+        assert_eq!(state.title.as_deref(), Some("Bundle review"));
+        apply_event(&mut state, &mut indices, Event::Session { id: "b".into(), title: None });
+        assert!(state.title.is_none());
+        apply_event(&mut state, &mut indices, Event::Session { id: "b".into(), title: Some("New task".into()) });
+        apply_event(&mut state, &mut indices, Event::Reset { reason: "Reset".into() });
+        assert!(state.title.is_none());
+    }
+
     #[test]
     fn prompt_suggestion_metadata_cannot_survive_a_turn_session_or_process_boundary() {
         let mut state = Snapshot {

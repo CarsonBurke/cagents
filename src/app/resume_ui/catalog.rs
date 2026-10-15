@@ -313,8 +313,8 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
     let answer = |titles: Titles| Header {
         id,
         directory,
-        named: titles.named.is_some() || titles.summary.is_some(),
-        title: titles.named.or(titles.summary).or(prompt),
+        named: titles.named.is_some() || titles.generated.is_some() || titles.summary.is_some(),
+        title: titles.named.or(titles.generated).or(titles.summary).or(prompt),
     };
     // Codex keeps a conversation's name apart from it, in [`names`].
     if provider == Provider::Codex {
@@ -347,6 +347,7 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
 struct Titles {
     /// Set by the reader or the provider as the conversation's name.
     named: Option<String>,
+    generated: Option<String>,
     /// A provider's generated account of the conversation.
     summary: Option<String>,
 }
@@ -356,6 +357,7 @@ impl Titles {
         let label = |key: &str| value[key].as_str().and_then(crate::account::clean_label);
         match value["type"].as_str() {
             Some("custom-title") => self.named = label("customTitle").or(self.named.take()),
+            Some("ai-title") => self.generated = label("aiTitle").or(self.generated.take()),
             Some("title") => self.named = label("title").or(self.named.take()),
             Some("session_info") => self.named = label("name").or(self.named.take()),
             Some("summary") => self.summary = label("summary").or(self.summary.take()),
@@ -368,6 +370,7 @@ impl Titles {
 fn holds_title(line: &str) -> bool {
     [
         "\"custom-title\"",
+        "\"ai-title\"",
         "\"type\":\"title\"",
         "\"session_info\"",
         "\"type\":\"summary\"",
@@ -690,6 +693,23 @@ mod tests {
         assert!(header(Provider::Codex, &path).is_none());
         std::fs::write(&path, format!("{}\n", meta(parent, json!("cli")))).unwrap();
         assert_eq!(header(Provider::Codex, &path).unwrap().id, parent);
+    }
+
+    #[test]
+    fn claude_resume_uses_custom_then_generated_name_then_content_fallback() {
+        let directory = tempfile::tempdir().unwrap(); let path = directory.path().join("session.jsonl");
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let prompt = json!({"type":"user","sessionId":id,"cwd":"/project","message":{"content":"\"\n> Quoted old context\nReview bundle encryption and performance"}});
+        let ai = json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated encryption audit"});
+        std::fs::write(&path, format!("{prompt}\n{ai}\n")).unwrap();
+        let found = header(Provider::Claude, &path).unwrap();
+        assert_eq!(found.title.as_deref(), Some("Generated encryption audit")); assert!(found.named);
+        let custom = json!({"type":"custom-title","sessionId":id,"customTitle":"My bundle project"});
+        std::fs::write(&path, format!("{prompt}\n{custom}\n{ai}\n")).unwrap();
+        assert_eq!(header(Provider::Claude, &path).unwrap().title.as_deref(), Some("My bundle project"));
+        std::fs::write(&path, format!("{prompt}\n")).unwrap();
+        let found = header(Provider::Claude, &path).unwrap();
+        assert_eq!(found.title.as_deref(), Some("Review bundle encryption and performance")); assert!(!found.named);
     }
 
     #[test]

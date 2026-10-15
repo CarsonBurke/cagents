@@ -61,6 +61,7 @@ impl ClaudeTitles {
 struct Names {
     matched: bool,
     custom: Option<String>,
+    generated: Option<String>,
     summary: Option<String>,
 }
 impl Names {
@@ -97,6 +98,11 @@ impl Names {
                     self.custom = Some(title);
                 }
             }
+            Some("ai-title") => {
+                if let Some(title) = label("aiTitle") {
+                    self.generated = Some(title);
+                }
+            }
             Some("summary") => {
                 if let Some(title) = label("summary") {
                     self.summary = Some(title);
@@ -131,7 +137,7 @@ fn named_title(file: &mut File, id: &str, cwd: &Path) -> Option<String> {
     }
     names
         .matched
-        .then(|| names.custom.or(names.summary))
+        .then(|| names.custom.or(names.generated).or(names.summary))
         .flatten()
 }
 
@@ -165,6 +171,9 @@ mod tests {
             named_title(&mut file, &id, cwd).as_deref(),
             Some("Bundle encryption review")
         );
+        file.seek(SeekFrom::End(0)).unwrap();
+        append(&mut file, json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated bundle audit"}));
+        assert_eq!(named_title(&mut file, &id, cwd).as_deref(), Some("Generated bundle audit"));
         file.seek(SeekFrom::End(0)).unwrap();
         append(
             &mut file,

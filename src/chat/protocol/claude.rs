@@ -5124,6 +5124,11 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
+        writeln!(file, "{}", json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated encryption review"})).unwrap();
+        let generated = adapter.receive(json!({"type":"result","session_id":id})).unwrap();
+        assert!(generated.events.iter().any(|event| matches!(event,
+            Event::Session { title: Some(title), .. } if title == "Generated encryption review")));
+
         writeln!(
             file,
             "{}",

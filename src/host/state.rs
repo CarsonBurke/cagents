@@ -615,6 +615,29 @@ impl HostState {
                 ));
             }
         }
+        if let ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } = &edit {
+            let expected = self.registry()?.title_conversation(*id, *card, *expected_revision)
+                .map_err(model_unavailable)?;
+            let invalid = || ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                "The conversation's current name or source changed; refresh before suggesting a title", false);
+            let actual = self.chats.get(&expected.id).ok_or_else(invalid)?;
+            if expected.proof.as_ref() != Some(self.proof())
+                || actual.session.launch.provider != expected.launch.provider
+                || actual.session.launch.recipe != expected.launch.recipe {
+                return Err(invalid());
+            }
+            // Model mutations serialize under this HostLock. Read only resident
+            // metadata, not Store, snapshot/history or files. A later B edit
+            // cannot overtake this A admission; a delayed A sees B's current name.
+            let (session, current_title) = actual.handle.conversation_title();
+            if session.is_none() || session != expected.launch.session_id { return Err(invalid()); }
+            let current_title = current_title.as_deref().and_then(crate::workspace_model::channel_title);
+            match source {
+                crate::model::ChannelTitleSource::Provider if current_title.as_ref() == Some(title) => {},
+                crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {},
+                _ => return Err(invalid()),
+            }
+        }
         let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
@@ -4074,6 +4097,66 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn channel_title_admission_rejects_delayed_names_from_the_same_resident_actor() {
+        use crate::{chat::{self, Command, Event}, chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+            model::{CardId, CardKind, ChannelId, ChannelTitleSource, LaunchRecipe},
+            workspace_model::views::{Pane, Scope}};
+        const SESSION: &str = "12345678-1234-4234-8234-123456789abc";
+        struct Names(usize);
+        impl Adapter for Names {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step { events: vec![
+                Event::Session { id: SESSION.into(), title: Some("Initial bundle audit".into()) },
+                Event::Ready(true)], ..Default::default() }) }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                Ok(Step { events: vec![Event::Session { id: SESSION.into(), title: Some(
+                    if self.0 == 1 { "Encryption performance review" } else { "Final encryption audit" }.into()) }],
+                    ..Default::default() })
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_host();
+        state.install_model(super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap());
+        let recipe = LaunchRecipe { program: "claude".into(), arguments: Vec::new(),
+            working_directory: directory.path().into(), environment: Default::default(), unset_environment: Default::default() };
+        let mut spec = ProcessSpec::from(&recipe); spec.transport = TransportSpec::History;
+        let mut adapter = Names(0); let mut initial = adapter.initialize().unwrap();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.conversation_title().0.as_deref() != Some(SESSION) {
+            assert!(Instant::now() < deadline, "history worker did not publish its exact session");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let session = chat::Session { id: TerminalId::new(), proof: Some(state.proof().clone()), terminal: None,
+            native_continuity: Default::default(), owned_codex_listener: None,
+            launch: chat::Launch { provider: crate::agent::Provider::Claude, recipe, session_id: Some(SESSION.into()) } };
+        state.chats.insert(session.id, super::super::chat::Record { execution_instance: uuid::Uuid::new_v4(),
+            session: session.clone(), handle: handle.clone(), console_recipe: None, paired_terminal: None,
+            source_process: None, subscribers: BTreeMap::new(), observations: BTreeMap::new(),
+            completion_observed: false, returning_terminal: false });
+        let id = ChannelId::new(); let card = CardId::new();
+        state.edit_model(1, ModelEdit::OpenProject { repository: directory.path().into(), name: "project".into(), kind: Default::default() }).unwrap();
+        state.edit_model(1, ModelEdit::CreateChannel { id, repository: directory.path().into(), title: String::new(), title_source: Default::default() }).unwrap();
+        let model = state.edit_model(1, ModelEdit::SeedView { scope: Scope::Channel(id), closed: Vec::new(), panes: vec![Pane {
+            id: card, title: "Chat".into(), user_title: None, pending_terminal_start: false, width_fraction: 1.,
+            scope: Some(directory.path().into()), kind: CardKind::Chat(session), }] }).unwrap();
+        let revision = model.views[0].revision;
+        let suggest = |name: &str| ModelEdit::SuggestConversationTitle { id, card, expected_revision: revision,
+            title: name.into(), source: ChannelTitleSource::Provider };
+        state.edit_model(1, suggest("Initial bundle audit")).unwrap();
+        handle.command(Command::Compact).unwrap();
+        state.edit_model(2, suggest("Encryption performance review")).unwrap();
+        assert!(state.edit_model(1, suggest("Initial bundle audit")).is_err(), "delayed A must not replace accepted B at the same view revision");
+        assert_eq!(state.read_model().unwrap().channels[0].title, "Encryption performance review");
+        handle.command(Command::Compact).unwrap();
+        state.edit_model(1, suggest("Final encryption audit")).unwrap();
+        assert_eq!(state.read_model().unwrap().channels[0].title, "Final encryption audit");
+        handle.close().unwrap();
     }
 
     #[test]

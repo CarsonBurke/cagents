@@ -918,10 +918,9 @@ mod tests {
                 .apply(&suggest(b.id, revision, "Old view revision"))
                 .is_err()
         );
-        assert_eq!(
-            registry.model().unwrap().channels[0].title,
-            "Encryption and performance audit"
-        );
+        assert_eq!(registry.model().unwrap().channels[0].title, "");
+        assert!(registry.apply(&ModelEdit::SuggestConversationTitle { id, card: b.id, expected_revision: current,
+            title: "Review another task".into(), source: ChannelTitleSource::Prompt }).unwrap().changed);
         assert!(
             registry
                 .apply(&suggest(b.id, current, "New primary conversation"))
@@ -940,6 +939,10 @@ mod tests {
                 .unwrap()
                 .changed
         );
+        registry.apply(&ModelEdit::ChangeView { scope: Scope::Channel(id), expected_revision: current,
+            operation: Uuid::new_v4(), change: Change::Move { id: a.id, before: Some(b.id) } }).unwrap();
+        assert_eq!(registry.model().unwrap().channels[0].title, "My encrypted bundle project");
+
         drop(registry);
         let restored = Registry::at(&directory.path().join("model.sqlite3"))
             .unwrap()

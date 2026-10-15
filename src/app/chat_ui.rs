@@ -1350,6 +1350,7 @@ struct ChannelNameObservation {
     scanned: Option<(u64, usize, Option<String>)>,
     title: Option<(String, crate::model::ChannelTitleSource)>,
     pending: bool,
+    last_view: Option<(crate::model::ChannelId, u64)>,
 }
 impl ChannelNameObservation {
     fn observe(
@@ -5325,6 +5326,10 @@ impl Cagents {
         title: String,
         source: crate::model::ChannelTitleSource,
     ) {
+        let proof = self.workspace_model.views.iter().find_map(|view| match view.scope {
+            crate::workspace_model::views::Scope::Channel(id) if view.primary_chat() == Some(target.card) => Some((id, view.revision)),
+            _ => None,
+        });
         let settled = self.durable.channels.iter().any(|channel| {
             channel.cards.contains(&target.card)
                 && (channel.title_source == crate::model::ChannelTitleSource::Manual
@@ -5335,6 +5340,7 @@ impl Cagents {
             && let Some(observation) = self.chat_ui.channel_names.get_mut(&target)
         {
             observation.pending = false;
+            observation.last_view = proof;
         }
     }
 
@@ -5350,6 +5356,19 @@ impl Cagents {
         {
             if self.chat_runtime_mut(target).is_none() {
                 self.chat_ui.channel_names.remove(&target);
+            }
+        }
+        let proofs = self.workspace_model.views.iter().filter_map(|view| match view.scope {
+            crate::workspace_model::views::Scope::Channel(id) => view.primary_chat().map(|card| (card, (id, view.revision))),
+            _ => None,
+        }).collect::<HashMap<_, _>>();
+        // A refused original revision is never rewritten in the publisher.
+        // A newly accepted projection can make a fresh suggestion from the
+        // current runtime; unchanged proofs do not create a retry loop.
+        for (target, observation) in &mut self.chat_ui.channel_names {
+            if let Some(proof) = proofs.get(&target.card)
+                && observation.last_view != Some(*proof) {
+                observation.pending = true;
             }
         }
         let candidates = self

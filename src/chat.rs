@@ -1904,6 +1904,7 @@ pub enum Event {
     },
     Session {
         id: String,
+        /// Absent means no new name. A different session or Reset clears an old name.
         title: Option<String>,
     },
     Capabilities(Capabilities),
