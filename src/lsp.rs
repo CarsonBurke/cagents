@@ -253,12 +253,11 @@ pub fn diagnostic_preview(text: &str) -> std::borrow::Cow<'_, str> {
 /// related information and opaque server data rather than copying them.
 #[derive(Clone)]
 pub struct LspDiagnostic {
+    pub range: LspRange,
+    pub severity: LspSeverity,
     /// Original server metadata for code-action round trips. Shared across
     /// tabs; outgoing action requests replace its range with current mapped
     /// coordinates while preserving numeric codes and opaque data.
-    pub protocol: Option<Arc<lsp_types::Diagnostic>>,
-    pub range: LspRange,
-    pub severity: LspSeverity,
     pub protocol: Arc<lsp_types::Diagnostic>,
 }
 
@@ -420,48 +419,6 @@ fn shift_diagnostic_position(
     }
 }
 
-/// Retains standing diagnostics through a sequence of exact editor changes.
-/// Insertions at a diagnostic's beginning move it with the original text;
-/// insertions at its end stay outside the underline. Replaced portions clamp
-/// to the replacement rather than leaving ranges aimed at unrelated lines.
-pub fn shift_diagnostics(items: &mut [LspDiagnostic], edits: &[LspTextEdit]) {
-    for edit in edits {
-        let mut ending = edit.range.start;
-        for character in edit.new_text.chars() {
-            if character == '\n' {
-                ending.line = ending.line.saturating_add(1);
-                ending.character = 0;
-            } else {
-                ending.character = ending.character.saturating_add(1);
-            }
-        }
-        // CRLF's carriage return is not counted on its completed line. The
-        // final line contains no LF, so only its scalar count is used above.
-        for item in items.iter_mut() {
-            let point = item.range.start == item.range.end;
-            item.range.start = shift_diagnostic_position(item.range.start, edit.range, ending, true);
-            item.range.end = shift_diagnostic_position(item.range.end, edit.range, ending, point);
-            item.range.end = item.range.end.max(item.range.start);
-        }
-    }
-}
-
-fn shift_diagnostic_position(
-    at: LspPosition, old: LspRange, new_end: LspPosition, right: bool,
-) -> LspPosition {
-    if at < old.start { return at; }
-    if old.start == old.end && at == old.start {
-        return if right { new_end } else { old.start };
-    }
-    if at < old.end {
-        return if right { old.start } else { new_end };
-    }
-    if at.line == old.end.line {
-        LspPosition::new(new_end.line, new_end.character.saturating_add(at.character.saturating_sub(old.end.character)))
-    } else {
-        LspPosition::new(new_end.line.saturating_add(at.line.saturating_sub(old.end.line)), at.character)
-    }
-}
 
 /// Completion item kind, used only to pick an icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4728,35 +4685,6 @@ impl LspManager {
         }
     }
 
-    /// Records a transition produced by the native recorded-edit layer.
-    /// Its immutable source remains lazy for incremental synchronization.
-    pub fn change_snapshot(&mut self, doc:LspDocumentId, version:i32, edits:&[LspTextEdit], source:TextSnapshot) {
-        if let Some(pending) = self.pending_opens.get_mut(&doc) {
-            pending.version = version;
-            pending.text = Arc::new(Snapshot::from_native(version,source));
-            return;
-        }
-        let Some(reference) = self.documents.get(&doc).cloned() else {return;};
-        let (previous,snapshot) = match self.snapshots.record_native(&reference.uri,version,source) {
-            RecordOutcome::Recorded {previous,snapshot} => (previous,snapshot),
-            RecordOutcome::UnknownUri => return,
-            RecordOutcome::VersionExhausted => {
-                self.events.emit_now(LspEvent::DocumentDesynced {doc,version:i32::MAX,error:LspError::VersionExhausted});return;
-            }
-        };
-        let incremental = if previous.compatible_native().is_some() && !edits.is_empty() {
-            snapshot.compatible_native().and_then(|expected| {
-                let changes = native_incremental(&previous,edits,expected);
-                if changes.is_none() {
-                    self.events.emit_now(LspEvent::DocumentDesynced {doc,version:snapshot.version,error:LspError::InconsistentEdits});
-                }
-                changes
-            })
-        } else {None};
-        if let Some(session) = self.sessions.get(&reference.session) {
-            let _ = session.commands.send(SessionCommand::Change {uri:Arc::clone(&reference.uri),version:snapshot.version,incremental,full:snapshot});
-        }
-    }
 
     /// Reports that the document was written to disk.
     pub fn save(&mut self, doc: LspDocumentId, text: &str) {
@@ -4946,76 +4874,6 @@ impl LspManager {
         let _ = self.remove_captured_worktree(removal);
     }
 
-    /// Limits apply to future admissions; busy sessions are never evicted.
-    #[must_use]
-    pub fn with_lifecycle(mut self, idle_seconds: u64, session_cap: usize) -> Self {
-        self.idle_timeout = Duration::from_secs(idle_seconds.clamp(1, 604800));
-        self.session_cap = session_cap.clamp(1, 64);
-        self.process_slots = Arc::new(tokio::sync::Semaphore::new(self.session_cap));
-        self
-    }
-
-    /// Delays new processes until a replaced manager has reaped its servers.
-    /// Configuration changes remain asynchronous while preserving the cap
-    /// across the old and new managers' independent admission semaphores.
-    #[must_use]
-    pub fn after_shutdown(mut self,predecessor:impl Future<Output=()>+Send+'static)->Self {
-        self.launch_barrier=Some(Arc::new(LaunchBarrier{predecessor:Mutex::new(Some(Box::pin(predecessor))),ready:AtomicBool::new(false),changed:Notify::new()}));
-        self
-    }
-
-    /// Cached server RSS; reading this performs no filesystem I/O.
-    pub fn live_servers(&self) -> Vec<String> {
-        let mut servers: Vec<_> = self
-            .sessions
-            .iter()
-            .filter(|(_, handle)| {
-                !handle.retired.load(Ordering::Acquire) && !handle.commands.is_closed()
-            })
-            .map(|(key, handle)| {
-                let rss = handle.resident_bytes.load(Ordering::Relaxed);
-                let memory = if rss == 0 {
-                    "RSS pending".to_owned()
-                } else {
-                    format!("{:.1} MiB RSS", rss as f64 / (1024.0 * 1024.0))
-                };
-                format!("{} · {} · {}", key.server_id, key.root.display(), memory)
-            })
-            .collect();
-        servers.sort();
-        servers
-    }
-
-    pub fn lifecycle(&self) -> (u64, usize) {
-        (self.idle_timeout.as_secs(), self.session_cap)
-    }
-
-    /// Retire every server and pending document owned by a removed worktree.
-    /// Shutdown/exit and bounded process-group termination run asynchronously.
-    pub fn remove_worktree(&mut self, worktree: &Path) {
-        self.pending_opens
-            .retain(|_, pending| pending.worktree != worktree);
-        let documents: Vec<_> = self
-            .documents
-            .iter()
-            .filter(|(_, reference)| reference.worktree.as_ref() == worktree)
-            .map(|(doc, _)| *doc)
-            .collect();
-        let keys: Vec<_> = self
-            .sessions
-            .iter()
-            .filter(|(_, handle)| handle.worktree.as_ref() == worktree)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for doc in documents {
-            self.close(doc);
-        }
-        for key in keys {
-            if let Some(handle) = self.sessions.remove(&key) {
-                self.retire_handle(handle);
-            }
-        }
-    }
 
     pub fn request_completion(&mut self, doc: LspDocumentId, at: LspPosition) -> LspRequestId {
         self.request(doc, at, RequestKind::Completion)
