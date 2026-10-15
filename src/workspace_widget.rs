@@ -2090,7 +2090,7 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
 /// The strip mounts cards past its edges and scrolls them without clipping
 /// their drop targets, so a card scrolled half out of view would otherwise
 /// reach under the sidebar and take a drop aimed there.
-fn clip_drag_destinations(rectangles: &mut Vec<DndDestinationRectangle>, bounds: Rectangle) {
+pub(crate) fn clip_drag_destinations(rectangles: &mut Vec<DndDestinationRectangle>, bounds: Rectangle) {
     let (left, top) = (f64::from(bounds.x), f64::from(bounds.y));
     let (right, bottom) = (
         left + f64::from(bounds.width),
@@ -4716,3 +4716,7 @@ mod tests {
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
     }
 }
+
+#[cfg(test)]
+#[path = "widget_forwarding_test.rs"]
+pub(crate) mod forwarding_test;
