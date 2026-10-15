@@ -258,7 +258,7 @@ impl Charge {
             .clone()
             .try_acquire_many_owned(u32::try_from(units).map_err(|_| "Saved output is too large")?)
             .map_err(|_| {
-                "Saved output memory is busy; close another output panel and try again".to_owned()
+                "Saved output memory is busy; close an output panel or reconnect a stalled conversation, then retry".to_owned()
             })?;
         let current = lane().owned_capacity.fetch_add(capacity, Ordering::AcqRel) + capacity;
         lane().peak_capacity.fetch_max(current, Ordering::AcqRel);
@@ -577,6 +577,17 @@ impl ClientHandle {
         copy: bool,
         authority: DiagnosticAuthority,
     ) -> Result<DiagnosticReadRequest, String> {
+        // Each posted diagnostic request clones this authenticated proof.
+        // Bound its borrowed fields before admission/serialization, so the
+        // per-job metadata reservation covers those diagnostic-local clones.
+        let proof = &self.inner.proof;
+        if [
+            proof.host_session_id.as_str(),
+            proof.boot_id.as_str(),
+            proof.host_incarnation.as_str(),
+        ].into_iter().any(|field| field.len() > 256) {
+            return Err("Saved output is unavailable on this connection; reconnect the conversation".into());
+        }
         if log.bytes > provider_exit::MAX_OUTPUT_BYTES as u64
             || log.id.is_empty()
             || log.id.len() > 256
@@ -584,7 +595,7 @@ impl ClientHandle {
             return Err("The retained provider output is too large or unavailable".into());
         }
         let queued = lane().queued.clone().try_acquire_owned().map_err(|_| {
-            "Too many saved output requests; close another output panel and try again".to_owned()
+            "Too many saved output requests; close an output panel or reconnect a stalled conversation, then retry".to_owned()
         })?;
         let metadata = Charge::reserve_capacity(0)?;
         let log = super::super::ProviderExitLog {
@@ -1618,4 +1629,18 @@ mod tests {
         drop(request);
         wait_capacity(0);
     }
+#[test]
+fn oversized_existing_host_proof_refuses_before_diagnostic_admission_or_clone() {
+    let _guard=diagnostic_test_guard();wait_capacity(0);
+    let session=super::super::tests::omp_card(None,None);
+    let mut proof=super::super::tests::host_proof("diagnostic-proof");
+    proof.host_incarnation=crate::model::HostIncarnation::new("x".repeat(1024*1024));
+    let mut handle=ClientHandle::fixture(session,Snapshot::default());
+    Arc::get_mut(&mut handle.inner).unwrap().proof=proof;
+    let log=super::super::super::ProviderExitLog{id:"log".into(),bytes:4,omitted:0};
+    let before=diagnostic_resource_usage();
+    assert!(handle.diagnostic_request(CardId::new(),1,1,&log,false,true,Arc::new(||true)).is_err());
+    let after=diagnostic_resource_usage();assert_eq!(after.queued_owners,before.queued_owners);assert_eq!(after.weighted_capacity,before.weighted_capacity);assert_eq!(after.reserved_layout_capacity,0);
+}
+
 }
