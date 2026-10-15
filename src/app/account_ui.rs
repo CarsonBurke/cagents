@@ -211,12 +211,8 @@ impl State {
             return ProviderReadiness::MissingHome(id.clone());
         }
         if self.login_conflict(account).is_some()
-            || account.snapshot.as_ref().is_some_and(|snapshot| {
-                matches!(
-                    snapshot.status,
-                    UsageStatus::NeedsLogin | UsageStatus::Unavailable
-                )
-            })
+            || account.snapshot.as_ref().is_some_and(|snapshot|
+                snapshot.status == UsageStatus::NeedsLogin)
         {
             return ProviderReadiness::NeedsLogin(id.clone());
         }
@@ -5601,10 +5597,14 @@ mod tests {
         let account = state.account_mut(&id).unwrap();
         account.sign_in_terminal = None;
         account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
-        assert_eq!(
-            state.account_readiness(&id),
-            ProviderReadiness::Ready(id.clone())
-        );
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::Ready(id.clone()));
+        // Some authenticated plans do not expose usage. Missing quota data
+        // must not turn a valid login into an unusable first-chat draft.
+        state.account_mut(&id).unwrap().snapshot = Some(UsageSnapshot::state(UsageStatus::Unavailable, "Usage not reported for this plan", NOW));
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::Ready(id.clone()));
+        state.account_mut(&id).unwrap().identity = None;
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::NeedsLogin(id.clone()));
+        state.account_mut(&id).unwrap().identity = Some(Identity::default());
         // Completed async detection can mark a once-valid home absent without
         // erasing retained identity or history. Neither may imply readiness.
         state.account_mut(&id).unwrap().present = false;
