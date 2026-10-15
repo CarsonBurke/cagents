@@ -1035,7 +1035,10 @@ struct WidgetState {
     selection_reset: u64,
     pty_size: PtySize,
     input_focused: bool,
-    window_unfocused: bool,
+    /// Native events can precede the App's new window snapshot in one batch.
+    /// The next diff resets this override, including parked trees that missed
+    /// a native focus event while they were not mounted.
+    native_window_focused: Option<bool>,
     focused: bool,
     focus_requested: bool,
     pressed_buttons: u8,
@@ -1860,7 +1863,7 @@ impl<Message> TerminalWidget<Message> {
     }
 
     fn keyboard_focused(&self, state: &WidgetState) -> bool {
-        self.model_focused && self.window_focused && state.input_focused && !state.window_unfocused
+        self.model_focused && state.native_window_focused.unwrap_or(self.window_focused) && state.input_focused
     }
 
     fn flush_key_releases(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
@@ -2303,6 +2306,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
 
     fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<WidgetState>();
+        state.native_window_focused = None;
         if !self.model_focused {
             state.input_focused = false;
             state.preedit = None;
@@ -2393,10 +2397,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         }
         match event {
             Event::Window(window::Event::Unfocused) => {
-                state.window_unfocused = true;
+                state.native_window_focused = Some(false);
                 state.preedit = None;
             }
-            Event::Window(window::Event::Focused) => state.window_unfocused = false,
+            Event::Window(window::Event::Focused) => state.native_window_focused = Some(true),
             _ => {}
         }
         if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {

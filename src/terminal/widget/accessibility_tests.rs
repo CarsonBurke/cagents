@@ -1865,3 +1865,55 @@ fn bounded_window_exit_fences_unknown_delivery_without_killing_the_pty() {
         "no guessed late release may follow a failed original admission"
     );
 }
+
+
+#[test]
+fn native_focus_batch_overrides_stale_builder_and_next_diff_retires_the_override() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(&peer, "batched-focus", ReviewInputBarrier::default(), true, false);
+    widget.on_shortcut = None;
+    let mut tree = widget_tree(&widget);
+    // The inactive App snapshot is still installed while Iced dispatches
+    // Focused followed by the first physical key in the SAME widget batch.
+    widget.window_focused = false;
+    widget.diff(&mut tree);
+    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Focused));
+    for pressed in [true, false] {
+        dispatch(&mut widget, &mut tree, &renderer,
+            key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, pressed));
+    }
+    let keys: Vec<_> = peer.fence().into_iter().filter_map(|request| match request {
+        ClientRequest::Key {key, ..} => Some(key), _ => None,
+    }).collect();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].action, KeyAction::Press);
+    assert_eq!(keys[1].action, KeyAction::Release);
+    assert!(!widget.window_focused, "no App rebuild occurred between native focus and key");
+    // Conversely a native blur prevents input before the active builder has
+    // caught up. It does not erase the terminal's logical native focus.
+    widget.window_focused = true;
+    widget.diff(&mut tree);
+    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Unfocused));
+    dispatch(&mut widget, &mut tree, &renderer,
+        key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
+    assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key {..})));
+    assert!(operation::Focusable::is_focused(tree.state.downcast_ref::<WidgetState>()));
+    // A parked tree may miss Focused entirely. Its new builder is authoritative
+    // on remount, so the old native false must not keep suppressing input.
+    widget.window_focused = true;
+    widget.diff(&mut tree);
+    for pressed in [true, false] {
+        dispatch(&mut widget, &mut tree, &renderer,
+            key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, pressed));
+    }
+    assert_eq!(peer.fence().iter().filter(|request| matches!(request, ClientRequest::Key {..})).count(), 2);
+    // Equally, a parked tree's old native true cannot override a newer inactive
+    // App snapshot when it missed Unfocused.
+    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Focused));
+    widget.window_focused = false;
+    widget.diff(&mut tree);
+    dispatch(&mut widget, &mut tree, &renderer,
+        key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
+    assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key {..})));
+}
