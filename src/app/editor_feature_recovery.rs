@@ -49,17 +49,54 @@ impl Cagents {
         if let Some(CardRuntime::Repository(runtime)) = origin.and_then(|card| self.cards.get_mut(&card)) {
             runtime.retain_editor_recovery(authority.clone(), message.clone());
         }
+        self.retain_window_file_recovery(authority, scope.map(PathBuf::as_path), message);
+    }
+
+    /// Every typed file completion is retained before routing can discard a
+    /// stale card, UUID, selection, or a callback behind a modal/freeze barrier.
+    /// Captured worktree names restrict refusals only; retry uses the authority.
+    pub(super) fn retain_repository_action_recovery(&mut self, action: &RepositoryAction) {
+        use crate::editor::{FileIoError, SaveOutcome};
+        if self.editor_features.recovery.as_ref().is_some_and(|state|
+            state.pending.is_none() && state.authority.is_resolved()) {
+            self.editor_features.recovery = None;
+        }
+        let (identity, authority) = match action {
+            RepositoryAction::EditorFilePrepared { identity, preparation } =>
+                (identity, preparation.error().and_then(FileIoError::recovery_authority)),
+            RepositoryAction::EditorFileAdmitted { identity, admission } =>
+                (identity, admission.error().and_then(FileIoError::recovery_authority)),
+            RepositoryAction::SaveFinished { identity, result, .. } => (identity, match result {
+                Ok(SaveOutcome::Saved { durability, .. } | SaveOutcome::Absent { durability, .. }) => durability.recovery_authority(),
+                Err(error) => error.recovery_authority(),
+                _ => None,
+            }),
+            RepositoryAction::DiskLoaded { identity, result: Err(error), .. }
+            | RepositoryAction::FileLoaded { identity, result: Err(error) }
+            | RepositoryAction::ConfiguredFileLoaded { identity, result: Err(error), .. }
+            | RepositoryAction::BinaryPageLoaded { identity, result: Err(error), .. } =>
+                (identity, error.recovery_authority()),
+            _ => return,
+        };
+        let Some(authority) = authority.filter(|authority| !authority.is_resolved()) else { return; };
+        let scope = (!identity.worktree.as_os_str().is_empty()).then_some(identity.worktree.as_path());
+        self.retain_window_file_recovery(authority, scope,
+            format!("A file operation needs recovery before another disk mutation or closing this window. {}", authority.description()));
+    }
+
+    fn retain_window_file_recovery(&mut self, authority: &crate::editor::RecoveryAuthority,
+        scope: Option<&Path>, message: String) {
         let state = self.editor_features.recovery.get_or_insert_with(|| State {
             authority: authority.clone(), scopes: HashSet::new(), unknown_scope: false, pending: None, message: String::new(),
         });
         state.authority = state.authority.clone().combine(authority.clone());
         state.message = message.chars().take(4096).collect();
         match scope {
-            Some(scope) if state.scopes.len() < 32 || state.scopes.contains(scope) => { state.scopes.insert(scope.clone()); },
+            Some(scope) if state.scopes.len() < 32 || state.scopes.contains(scope) => { state.scopes.insert(scope.to_owned()); },
             _ => state.unknown_scope = true,
         }
         let cancel_all = state.unknown_scope;
-        self.cancel_git_for_file_recovery(if cancel_all { None } else { scope.map(PathBuf::as_path) });
+        self.cancel_git_for_file_recovery(if cancel_all { None } else { scope });
     }
     pub(super) fn start_publication_recovery(&mut self, authority: crate::editor::RecoveryAuthority) -> Task<Message> {
         let Some(state) = &mut self.editor_features.recovery else { return Task::none(); };

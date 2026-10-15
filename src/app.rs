@@ -2489,6 +2489,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::ConfiguredFileLoaded { .. }
+            | RepositoryAction::EditorFilePrepared { .. }
+            | RepositoryAction::EditorFileAdmitted { .. }
             | RepositoryAction::EditorRootRebound { .. }
             | RepositoryAction::DiskMetadata { .. }
             | RepositoryAction::ComparisonMetadata { .. }
@@ -18505,6 +18507,9 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::Repository(action) = &message {
+            self.retain_repository_action_recovery(action);
+        }
         // This precedes every specialized repository arm as well as the
         // generic reducer. Captured commands re-enter update after resolving.
         if let Message::Repository(action) = &message
