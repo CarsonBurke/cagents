@@ -1916,6 +1916,7 @@ pub struct SourceControlModel {
     pub stashes_expanded: bool,
     pub pending_stash_drop: Option<crate::repository::StashEntry>,
     pub pending_marker_stage: Option<Vec<PathSelection>>,
+    pub pending_marker_approval: BTreeMap<RepoPath, crate::repository::ConflictMarkerVersion>,
     pub staged_count: usize,
     pub files: Vec<FileRow>,
     pub ignored_directory_errors: BTreeMap<RepoPath, String>,
@@ -2069,6 +2070,7 @@ impl SourceControlModel {
             stashes_expanded: false,
             pending_stash_drop: None,
             pending_marker_stage: None,
+            pending_marker_approval: BTreeMap::new(),
             staged_count: 0,
             files: Vec::new(),
             ignored_directory_errors: BTreeMap::new(),
@@ -2208,6 +2210,7 @@ impl SourceControlModel {
             stashes_expanded: false,
             pending_stash_drop: None,
             pending_marker_stage: None,
+            pending_marker_approval: BTreeMap::new(),
             staged_count,
             files,
             ignored_directory_errors: snapshot.files.ignored_directory_errors.clone(),
@@ -2328,7 +2331,17 @@ impl SourceControlModel {
             let mut kept = Vec::new();
             for mut row in std::mem::take(&mut group.rows) {
                 if selected.contains(&row.entry.path) {
-                    row.entry.area = target;
+                    row.entry.area = if kind == MutationKind::Unstage
+                        && matches!(row.entry.kind, ChangeKind::Added | ChangeKind::Untracked)
+                    {
+                        row.entry.kind = ChangeKind::Untracked;
+                        ChangeArea::Untracked
+                    } else {
+                        if kind == MutationKind::Stage && row.entry.kind == ChangeKind::Untracked {
+                            row.entry.kind = ChangeKind::Added;
+                        }
+                        target
+                    };
                     row.entry.conflict = None;
                     let mut pending = ChangeRow::new(self.key.worktree_id, &row.entry);
                     pending.chrome.status = "Pending…".into();
@@ -2339,15 +2352,23 @@ impl SourceControlModel {
             }
             *group = ChangeGroup::new(self.key.worktree_id, group.area, kept);
         }
-        if let Some(group) = self.groups.iter_mut().find(|group| group.area == target) {
-            let moved_paths = moved
+        for group in &mut self.groups {
+            let additions = moved
+                .iter()
+                .filter(|row| row.entry.area == group.area)
+                .cloned()
+                .collect::<Vec<_>>();
+            if additions.is_empty() {
+                continue;
+            }
+            let moved_paths = additions
                 .iter()
                 .map(|row| row.entry.path.clone())
                 .collect::<BTreeSet<_>>();
             let mut rows = std::mem::take(&mut group.rows);
             rows.retain(|row| !moved_paths.contains(&row.entry.path));
-            rows.extend(moved);
-            *group = ChangeGroup::new(self.key.worktree_id, target, rows);
+            rows.extend(additions);
+            *group = ChangeGroup::new(self.key.worktree_id, group.area, rows);
         }
         self.staged_count = self
             .group(ChangeArea::Staged)
@@ -2410,6 +2431,7 @@ impl SourceControlModel {
         next.stashes_expanded = self.stashes_expanded;
         next.pending_stash_drop = self.pending_stash_drop.clone();
         next.pending_marker_stage = self.pending_marker_stage.clone();
+        next.pending_marker_approval = self.pending_marker_approval.clone();
         next.commit_changes = self.commit_changes.clone();
         // The loading placeholder between two snapshots has not read `HEAD`
         // yet, and that gap must not look like a `HEAD` that moved.
@@ -7151,18 +7173,23 @@ fn source_control_notices<'a>(
             .spacing(space::XS),
         );
     }
-    if let Some(selection) = source.pending_marker_stage.as_ref() {
-        let names = selection
-            .iter()
+    if source.pending_marker_stage.is_some() {
+        let names = source
+            .pending_marker_approval
+            .keys()
             .take(3)
-            .map(|entry| entry.path.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         notices = notices.push(design::caption(format!(
             "Conflict markers remain in {} selected file(s): {}{}. Stage anyway?",
-            selection.len(),
+            source.pending_marker_approval.len(),
             names,
-            if selection.len() > 3 { ", …" } else { "" }
+            if source.pending_marker_approval.len() > 3 {
+                ", …"
+            } else {
+                ""
+            }
         )));
 
         notices = notices.push(widget::row::with_children(vec![
@@ -11523,6 +11550,38 @@ pub(crate) mod tests {
         assert!(
             source
                 .group(ChangeArea::Staged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == selected.path && row.status_label() == "Pending…")
+        );
+    }
+
+    #[test]
+    fn optimistically_unstaging_a_new_file_returns_it_to_untracked() {
+        let mut source = SourceControlModel::ready(main_key(), &snapshot());
+        let selected = source.group(ChangeArea::Untracked).unwrap().rows()[0].selection();
+        source.optimistic_mutation(MutationKind::Stage, &[selected.clone()]);
+        assert!(
+            source
+                .group(ChangeArea::Staged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == selected.path && row.entry.kind == ChangeKind::Added)
+        );
+        source.optimistic_mutation(MutationKind::Unstage, &[selected.clone()]);
+        assert!(
+            !source
+                .group(ChangeArea::Staged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == selected.path)
+        );
+        assert!(
+            source
+                .group(ChangeArea::Untracked)
                 .unwrap()
                 .rows()
                 .iter()
