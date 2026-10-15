@@ -616,6 +616,13 @@ pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
     if !matches!(press.status, Status::Focused { .. }) {
         return None;
     }
+    if press.key == keyboard::Key::Named(keyboard::key::Named::Tab)
+        && !press.modifiers.command() && !press.modifiers.alt()
+    {
+        // This produces a binding even though Tab has no printable text. The
+        // focused editor captures it before Iced can traverse chrome focus.
+        return Some(Binding::Insert('\t'));
+    }
     if press.modifiers.command() && !press.modifiers.alt() && !press.modifiers.shift() {
         match press.key.as_ref() {
             keyboard::Key::Named(keyboard::key::Named::Delete) => {
@@ -921,6 +928,7 @@ where
     reveal_horizontal: bool,
     canvas_width: f32,
     wrapping: Wrapping,
+    indentation: crate::editor_indent::Indentation,
 }
 
 impl<R> Internal<R>
@@ -1011,11 +1019,20 @@ where
             reveal_horizontal: true,
             canvas_width: 0.0,
             wrapping: Wrapping::None,
+            indentation: crate::editor_indent::Indentation::default(),
         }))
     }
 
     /// Performs an [`Action`] on the [`Content`].
     pub fn perform(&mut self, mut action: Action) {
+        match action {
+            Action::Edit(Edit::Indent) => { self.indent(false); return; }
+            Action::Edit(Edit::Unindent) => { self.indent(true); return; }
+            Action::Edit(Edit::Enter) => { self.enter(); return; }
+            Action::Edit(Edit::Insert(closer @ ('}' | ')' | ']'))) if self.dedent_closer(closer) => return,
+            _ => {}
+        }
+
         match &action {
             Action::Edit(Edit::Paste(text)) if self.try_splice(text, None) => return,
             Action::Edit(Edit::Delete | Edit::Backspace)
@@ -1048,6 +1065,73 @@ where
         }
 
         internal.editor.perform(action);
+    }
+
+    pub fn configure_indentation(&mut self, indentation: crate::editor_indent::Indentation) {
+        let internal = self.0.get_mut();
+        internal.indentation = indentation;
+        internal.editor.set_tab_width(indentation.tab_width);
+    }
+
+    fn indent(&mut self, outdent: bool) {
+        let cursor = self.cursor();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let indentation = self.0.get_mut().indentation;
+        if !outdent && anchor.line == cursor.position.line {
+            self.perform(Action::Edit(Edit::Paste(Arc::new(indentation.unit()))));
+            return;
+        }
+        let first = cursor.position.line.min(anchor.line);
+        let mut last = cursor.position.line.max(anchor.line);
+        let high = if cursor.position.line >= anchor.line { cursor.position } else { anchor };
+        if last > first && high.column == 0 { last -= 1; }
+        let unit = indentation.unit();
+        let mut shifts = Vec::new();
+        for line in (first..=last).rev() {
+            let removed = if outdent { self.with_line(line, |text, _| indentation.outdent_bytes(text)).unwrap_or(0) } else { 0 };
+            if outdent && removed == 0 { continue; }
+            let start = Position { line, column: 0 };
+            self.replace_range_recorded(start, Position { line, column: removed }, if outdent { "" } else { &unit });
+            shifts.push((line, if outdent { -(removed as isize) } else { unit.len() as isize }));
+        }
+        let map = |mut position: Position| {
+            if let Some((_, shift)) = shifts.iter().find(|(line, _)| *line == position.line) {
+                position.column = position.column.saturating_add_signed(*shift);
+            }
+            position
+        };
+        self.set_cursor(Cursor { position: map(cursor.position), selection: cursor.selection.map(map) });
+    }
+
+    fn enter(&mut self) {
+        let cursor = self.cursor();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let start = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { anchor } else { cursor.position };
+        let indentation = self.0.get_mut().indentation;
+        let prefix = self.with_line(start.line, |line, _| {
+            let before = &line[..start.column.min(line.len())];
+            let leading: String = before.chars().take_while(|character| matches!(character, ' ' | '\t')).collect();
+            let mut result = leading;
+            if before.trim_end().ends_with(['{', '(', '[']) { result.push_str(&indentation.unit()); }
+            result
+        }).unwrap_or_default();
+        let ending = self.line_ending().unwrap_or(LineEnding::Lf);
+        self.perform(Action::Edit(Edit::Paste(Arc::new(format!("{}{prefix}", ending.as_str())))));
+    }
+
+    fn dedent_closer(&mut self, closer: char) -> bool {
+        let cursor = self.cursor();
+        if cursor.selection.is_some() { return false; }
+        let indentation = self.0.get_mut().indentation;
+        let remove = self.with_line(cursor.position.line, |line, _| {
+            let before = &line[..cursor.position.column.min(line.len())];
+            if before.is_empty() || !before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) { 0 } else { indentation.outdent_bytes(before) }
+        }).unwrap_or(0);
+        if remove == 0 { return false; }
+        // One replacement, so dedentation and the typed closer undo together.
+        let start = Position { line: cursor.position.line, column: cursor.position.column.saturating_sub(remove) };
+        self.replace_range_recorded(start, cursor.position, &closer.to_string());
+        true
     }
 
     /// Native multiline insertion and removal shift row vectors repeatedly.
@@ -1144,6 +1228,7 @@ where
         } else {
             internal.pending_edit_scroll.get_or_insert(previous_view);
         }
+        editor.set_tab_width(internal.indentation.tab_width);
         internal.editor = editor;
         internal.reset_highlighter = true;
         true
@@ -1971,7 +2056,9 @@ where
         // window focus also loses the key release that would clear Shift, so a
         // stale modifier must not survive it.
         match event {
-            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)
+                | keyboard::Event::KeyPressed { modifiers, .. }
+                | keyboard::Event::KeyReleased { modifiers, .. }) => {
                 state.modifiers = *modifiers;
             }
             Event::Window(window::Event::Unfocused) => {
@@ -2377,6 +2464,9 @@ where
                             }
                             Binding::SelectAll => {
                                 publish(Action::SelectAll);
+                            }
+                            Binding::Insert('\t') => {
+                                publish(Action::Edit(if state.modifiers.shift() { Edit::Unindent } else { Edit::Indent }));
                             }
                             Binding::Insert(c) => {
                                 publish(Action::Edit(Edit::Insert(c)));
@@ -4894,10 +4984,9 @@ mod tests {
                     history.seal();
                 }
                 let selection = content.cursor().selection;
-                // Unindent is left out: cosmic-text 0.19 underflows its caret
-                // when unindenting with the caret inside the indentation,
-                // and nothing in the application binds it.
-                let edit = match next(7) {
+                // Both directions run through our saturating line-prefix edit,
+                // including a caret inside indentation.
+                let edit = match next(8) {
                     0 | 1 => Edit::Insert(['a', ' ', 'é', '漢', '\t', 'z'][next(6)]),
                     2 => Edit::Enter,
                     3 => Edit::Backspace,
@@ -4905,7 +4994,8 @@ mod tests {
                     5 => Edit::Paste(Arc::new(
                         ["x", "two\nlines", "crlf\r\nend", "\n", "tab\t"][next(5)].to_owned(),
                     )),
-                    _ => Edit::Indent,
+                    6 => Edit::Indent,
+                    _ => Edit::Unindent,
                 };
                 let kind = match &edit {
                     Edit::Insert(_) | Edit::Enter => EditKind::Insert,
@@ -5171,6 +5261,73 @@ mod tests {
         assert_eq!(content.text(), "one\r\ntwo\n");
         assert!(content.replace(at, "e\r\ntw", "E", &[]));
         assert_eq!(content.text(), "onEo\n");
+    }
+
+    #[test]
+    fn tab_width_changes_native_layout_without_rewriting_text() {
+        let mut content: Content = Content::with_text("a\tb");
+        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 2, tab_width: 2 });
+        assert_eq!(content.0.borrow().editor.buffer().tab_width(), 2);
+        assert_eq!(content.text(), "a\tb");
+        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 8, tab_width: 8 });
+        assert_eq!(content.0.borrow().editor.buffer().tab_width(), 8);
+        assert_eq!(content.text(), "a\tb");
+    }
+
+    #[test]
+    fn tab_has_a_binding_only_in_the_focused_editor() {
+        for modifiers in [keyboard::Modifiers::empty(), keyboard::Modifiers::SHIFT] {
+            for focused in [true, false] {
+                let press = KeyPress {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab), modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab), modifiers, text: None,
+                    status: if focused { Status::Focused { is_hovered: false } } else { Status::Active },
+                };
+                assert_eq!(matches!(default_bindings::<()>(press), Some(Binding::Insert('\t'))), focused);
+            }
+        }
+    }
+
+    #[test]
+    fn indent_and_safe_unindent_restore_selected_lines_in_one_undo_step() {
+        use history::{EditKind, History, Replay};
+        let original = "  one\r\n  two\n  three";
+        for edit in [Edit::Indent, Edit::Unindent] {
+            let mut content: Content = Content::with_text(original);
+            content.configure_indentation(crate::editor_indent::Indentation { tabs: false, size: 2, tab_width: 2 });
+            content.set_cursor(Cursor { position: Position { line: 1, column: 4 }, selection: Some(Position { line: 0, column: 1 }) });
+            let recorded = content.perform_edit(edit).unwrap();
+            let mut history = History::default();
+            history.record(recorded.change, EditKind::Other, recorded.before, content.cursor(), Instant::now());
+            assert_eq!(history.undo(&mut content), Replay::Applied);
+            assert_eq!(content.text(), original);
+            assert_eq!(history.undo(&mut content), Replay::Empty);
+        }
+        let mut content: Content = Content::with_text("    x");
+        content.set_cursor(Cursor { position: Position { line: 0, column: 1 }, selection: None });
+        content.perform_edit(Edit::Unindent).unwrap();
+        assert_eq!(content.text(), "x");
+        assert_eq!(content.cursor().position.column, 0);
+    }
+
+    #[test]
+    fn enter_replaces_selection_and_keeps_bracket_aware_indentation() {
+        for opener in ['{', '(', '['] {
+            let original = format!("    {opener}");
+            let mut content: Content = Content::with_text(&original);
+            content.set_cursor(Cursor { position: Position { line: 0, column: original.len() }, selection: None });
+            content.perform_edit(Edit::Enter).unwrap();
+            assert_eq!(content.text(), format!("{original}\n        "));
+        }
+        let mut content: Content = Content::with_text("\tfoo selection");
+        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 4, tab_width: 8 });
+        content.set_cursor(Cursor { position: Position { line: 0, column: 14 }, selection: Some(Position { line: 0, column: 5 }) });
+        content.perform_edit(Edit::Enter).unwrap();
+        assert_eq!(content.text(), "\tfoo \n\t");
+        let mut content: Content = Content::with_text("        ");
+        content.set_cursor(Cursor { position: Position { line: 0, column: 8 }, selection: None });
+        content.perform_edit(Edit::Insert('}')).unwrap();
+        assert_eq!(content.text(), "    }");
     }
 
     #[test]
