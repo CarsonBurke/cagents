@@ -3864,7 +3864,14 @@ pub struct SafetyInspection {
 }
 
 impl SafetyInspection {
-    fn initial(mut client: crate::control::ControlClient, target: &Target) -> Result<Self, String> {
+    fn initial(
+        mut client: crate::control::ControlClient,
+        target: &Target,
+        device: Option<(String, String, String)>,
+    ) -> Result<Self, String> {
+        if device != stop_device_key() {
+            return Err("The selected device changed before inspection. Cancel and review again.".into());
+        }
         let reply = request_on_stop_client(&mut client,
             crate::worktree_control::Operation::InspectForSessionStop {
                 repository: target.repository.clone(), path: target.path.clone(),
@@ -3879,10 +3886,13 @@ impl SafetyInspection {
             crate::worktree_control::Operation::BusySessions {
                 repository: target.repository.clone(), path: target.path.clone(),
             })?)?;
+        if device != stop_device_key() {
+            return Err("The selected device changed during inspection. Cancel and review again.".into());
+        }
         let snapshot = Arc::new(snapshot);
         let authorization = StopAuthorization {
             connection: Arc::new(StopConnection {
-                client: std::sync::Mutex::new(client), device: stop_device_key(),
+                client: std::sync::Mutex::new(client), device,
                 #[cfg(test)]
                 fixture_peer: None,
             }),
@@ -4014,6 +4024,9 @@ fn safety_read_task(
     confirming: bool,
     original: Option<StopAuthorization>,
 ) -> Task<Message> {
+    // Capture before scheduling any connection or RPC work. Never relabel an
+    // already-open stream with selection observed after a blocking operation.
+    let device = stop_device_key();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             if confirming {
@@ -4027,9 +4040,15 @@ fn safety_read_task(
                 })?)?;
                 Ok(SafetyInspection { snapshot: Arc::new(snapshot), agents, authorization: None })
             } else {
+                if device != stop_device_key() {
+                    return Err("The selected device changed before connecting. Cancel and review again.".into());
+                }
                 let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
                 let client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                SafetyInspection::initial(client, &target)
+                // The selection is immutable after initialization in this
+                // process. A concurrent initialization must invalidate this
+                // opening, including one racing the transport connection.
+                SafetyInspection::initial(client, &target, device)
             }
         }).await.map_err(|error| error.to_string()).and_then(|result| result);
         Message::ProjectUi(Action::SafetyRead { request, confirming, result })
@@ -4236,7 +4255,7 @@ mod tests {
         let client = crate::control::ControlClient::from_stream(client_stream).unwrap();
         // This proves the real framed caller contract only. The separate host
         // fixture must prove physical pins; a fixture UUID is not that proof.
-        let mut inspection = SafetyInspection::initial(client, &target).unwrap();
+        let mut inspection = SafetyInspection::initial(client, &target, stop_device_key()).unwrap();
         Arc::get_mut(&mut inspection.authorization.as_mut().unwrap().connection).unwrap()
             .fixture_peer = Some(peer.join().unwrap());
         Ok(inspection)
@@ -4297,6 +4316,27 @@ mod tests {
             drop(inspection);
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn inspection_from_another_device_is_not_relabelled_on_delivery() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let target = Target { project: ProjectId::new(), worktree: Some(WorktreeId::new()), repository: "/cagents-fixture-no-such-repository".into(), path: "/cagents-fixture-no-such-repository/linked".into(), label: "fixture".into() };
+        drop(app.open_worktree_delete_dialog(target.clone()));
+        let mut inspection = fixture_safety_result(&app, Ok((clean_snapshot(), AgentCensus::default())), false).unwrap();
+        let connection = Arc::get_mut(&mut inspection.authorization.as_mut().unwrap().connection).unwrap();
+        // Keep the actual acquired connection/receipt, but model delivery after
+        // selection changed away from its captured endpoint. Do not mutate the
+        // process-wide OnceLock used by unrelated tests.
+        connection.device = Some(("other-device".into(), "other-host".into(), "cagents".into()));
+        assert_ne!(connection.device, stop_device_key());
+        let request = app.project_ui.dialog.as_ref().unwrap().request;
+        drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok(inspection) }));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert!(dialog.safety.is_none());
+        assert!(dialog.blocker.is_some());
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
+        assert!(!app.project_ui.is_deleting(target.worktree.unwrap()));
     }
 
     #[test]
