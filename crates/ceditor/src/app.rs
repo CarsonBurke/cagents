@@ -5612,7 +5612,7 @@ mod tests {
     use super::*;
     use cagents::repository_widget::AsyncIdentity;
 
-    pub(super) fn git(root: &Path, args: &[&str]) -> String {
+    pub(super) fn git_output(root: &Path, args: &[&str]) -> std::process::Output {
         let mut command = std::process::Command::new("git");
         for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) { command.env_remove(name); }
         let output = command.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -5624,7 +5624,11 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        output
+    }
+
+    pub(super) fn git(root: &Path, args: &[&str]) -> String {
+        String::from_utf8(git_output(root, args).stdout).unwrap().trim().to_owned()
     }
 
     pub(super) fn git_fixture() -> tempfile::TempDir {

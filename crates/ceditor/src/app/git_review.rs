@@ -333,7 +333,7 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::tests::{editor, git, git_fixture, open_real_git, run_tasks, sidebar_action};
+    use super::super::tests::{editor, git, git_output, git_fixture, open_real_git, run_tasks, sidebar_action};
 
     fn bound(app: &Editor, card: CardId) -> Origin {
         let key = app.tab(card).unwrap().navigation.active_worktree().unwrap();
@@ -346,6 +346,8 @@ mod tests {
         let message = "Original subject\n\nBody paragraph\n\n# literal message line\n";
         git(root, &["commit", "--amend", "--cleanup=verbatim", "-m", message]);
         let expected = git(root, &["log", "-1", "--format=%B"]);
+        let original_commit = git_output(root, &["cat-file", "commit", "HEAD"]).stdout;
+        let original_message = original_commit[original_commit.windows(2).position(|pair| pair == b"\n\n").unwrap() + 2..].to_vec();
         let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
         sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: "Previous subject\n\nPrevious body".into() });
         sidebar_action(&mut app, SidebarAction::AmendChanged { key: origin.key.clone(), amend: true });
@@ -359,6 +361,9 @@ mod tests {
         sidebar_action(&mut app, SidebarAction::Commit { key: origin.key, message: loaded, amend: true });
         assert!(app.notice.is_none(), "{:?}", app.notice);
         assert_eq!(git(root, &["log", "-1", "--format=%B"]), expected);
+        let amended_commit = git_output(root, &["cat-file", "commit", "HEAD"]).stdout;
+        let amended_message = &amended_commit[amended_commit.windows(2).position(|pair| pair == b"\n\n").unwrap() + 2..];
+        assert_eq!(amended_message, original_message, "untouched subject/body bytes survive the actual caller");
         assert_eq!(git(root, &["rev-list", "--count", "HEAD"]), "1");
         assert_eq!(git(root, &["show", "HEAD:tracked.txt"]), "amended contents");
     }
