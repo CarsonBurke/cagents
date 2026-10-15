@@ -273,6 +273,7 @@ fn discharge_pending(
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     pending.retain(|candidate| candidate != source);
+    if !failures.iter().any(|(id, _)| *id == source.id) { return Ok(()); }
     let digest: [u8;32] = Sha256::digest(serde_json::to_vec(source).map_err(|e|e.to_string())?).into();
     failures.retain(|(id, hashes)| *id != source.id || !hashes.contains(&digest));
     Ok(())
