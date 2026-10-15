@@ -620,8 +620,12 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     })
 }
 
-const fn default_interface_font_size() -> f32 { 13.0 }
-const fn default_chat_font_size() -> f32 { 14.0 }
+const fn default_interface_font_size() -> f32 {
+    13.0
+}
+const fn default_chat_font_size() -> f32 {
+    14.0
+}
 
 const fn default_terminal_scrollback_lines() -> usize {
     10_000
@@ -1601,16 +1605,32 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
-        for (family, reason) in [(&self.interface_font_family, "interface_font_family must be a name of at most 128 bytes without control characters"), (&self.chat_font_family, "chat_font_family must be a name of at most 128 bytes without control characters")] {
-            if family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES || family.chars().any(char::is_control) || (!family.is_empty() && family.trim().is_empty()) {
+        for (family, reason) in [
+            (
+                &self.interface_font_family,
+                "interface_font_family must be a name of at most 128 bytes without control characters",
+            ),
+            (
+                &self.chat_font_family,
+                "chat_font_family must be a name of at most 128 bytes without control characters",
+            ),
+        ] {
+            if family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES
+                || family.chars().any(char::is_control)
+                || (!family.is_empty() && family.trim().is_empty())
+            {
                 return Err(SettingsError::Invalid(reason));
             }
         }
         if !(10.0..=24.0).contains(&self.interface_font_size) {
-            return Err(SettingsError::Invalid("Interface font size must be between 10 and 24"));
+            return Err(SettingsError::Invalid(
+                "Interface font size must be between 10 and 24",
+            ));
         }
         if !(8.0..=40.0).contains(&self.chat_font_size) {
-            return Err(SettingsError::Invalid("Chat font size must be between 8 and 40"));
+            return Err(SettingsError::Invalid(
+                "Chat font size must be between 8 and 40",
+            ));
         }
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")

@@ -23,23 +23,57 @@ impl FontChoices {
 }
 
 fn missing_font_warning(family: &str, installed: &[String], fallback: &str) -> Option<String> {
-    (!family.trim().is_empty() && !installed.iter().any(|name| name.eq_ignore_ascii_case(family.trim()))).then(|| format!("Not installed; using {fallback}."))
+    (!family.trim().is_empty()
+        && !installed
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(family.trim())))
+    .then(|| format!("Not installed; using {fallback}."))
 }
 
-fn font_family_setting<'a>(family: &'a String, field: SettingsField, fonts: &'a FontChoices, invalid: &'a HashMap<SettingsField, String>) -> Setting<'a, Message> {
+fn font_family_setting<'a>(
+    family: &'a String,
+    field: SettingsField,
+    fonts: &'a FontChoices,
+    invalid: &'a HashMap<SettingsField, String>,
+) -> Setting<'a, Message> {
     let (state, monospace, placeholder, fallback) = match field {
-        SettingsField::TerminalFontFamily => (&fonts.terminal, true, "System monospace", "system monospace"),
-        SettingsField::EditorFontFamily => (&fonts.editor, true, "Follow terminal", "system monospace"),
-        SettingsField::InterfaceFontFamily => (&fonts.interface, false, "Desktop interface font", "the desktop interface font"),
-        SettingsField::ChatFontFamily => (&fonts.chat, false, "Follow interface", "the interface font"),
+        SettingsField::TerminalFontFamily => (
+            &fonts.terminal,
+            true,
+            "System monospace",
+            "system monospace",
+        ),
+        SettingsField::EditorFontFamily => {
+            (&fonts.editor, true, "Follow terminal", "system monospace")
+        }
+        SettingsField::InterfaceFontFamily => (
+            &fonts.interface,
+            false,
+            "Desktop interface font",
+            "the desktop interface font",
+        ),
+        SettingsField::ChatFontFamily => {
+            (&fonts.chat, false, "Follow interface", "the interface font")
+        }
         _ => unreachable!("font family field"),
     };
-    let control = widget::combo_box(state, placeholder, Some(family), move |value| Message::SettingsChanged { field, value })
-        .on_input(move |value| Message::SettingsDraftChanged { field, value })
-        .size(design::interface_size()).font(design::interface_font()).padding([4, 8]).menu_height(240);
+    let control = widget::combo_box(state, placeholder, Some(family), move |value| {
+        Message::SettingsChanged { field, value }
+    })
+    .on_input(move |value| Message::SettingsDraftChanged { field, value })
+    .size(design::interface_size())
+    .font(design::interface_font())
+    .padding([4, 8])
+    .menu_height(240);
     let mut children: Vec<Element<'a, Message>> = vec![control.into()];
     if let Some(warning) = missing_font_warning(family, installed_font_families(false), fallback) {
-        children.push(design::caption(warning).class(cosmic::theme::Text::Color(design::warning_color(&cosmic::theme::active()))).into());
+        children.push(
+            design::caption(warning)
+                .class(cosmic::theme::Text::Color(design::warning_color(
+                    &cosmic::theme::active(),
+                )))
+                .into(),
+        );
     }
     setting_field(field.label(), if monospace { "Choose an installed monospace family or type a family name. Leave blank to follow the default." } else { "Choose an installed family or type a family name. Leave blank to follow the default." }, widget::column::with_children(children).spacing(space::XS).into()).error(invalid.get(&field).map(String::as_str)).keywords(family)
 }
@@ -63,14 +97,26 @@ fn setting_input<'a>(
 
 fn number_setting_factor(field: SettingsField) -> f64 {
     match field {
-        SettingsField::UiScale | SettingsField::DefaultColumnFraction | SettingsField::DefaultNativePaneFraction | SettingsField::ChatContentFraction => 100.0,
+        SettingsField::UiScale
+        | SettingsField::DefaultColumnFraction
+        | SettingsField::DefaultNativePaneFraction
+        | SettingsField::ChatContentFraction => 100.0,
         SettingsField::HibernationDelayMs => 0.001,
         _ => 1.0,
     }
 }
 
 pub(super) fn number_setting_value(field: SettingsField, value: &str) -> String {
-    value.parse::<f64>().map(|number| if field == SettingsField::HibernationDelayMs { format!("{:.0}", number / number_setting_factor(field)) } else { format!("{}", number / number_setting_factor(field)) }).unwrap_or_else(|_| value.to_owned())
+    value
+        .parse::<f64>()
+        .map(|number| {
+            if field == SettingsField::HibernationDelayMs {
+                format!("{:.0}", number / number_setting_factor(field))
+            } else {
+                format!("{}", number / number_setting_factor(field))
+            }
+        })
+        .unwrap_or_else(|_| value.to_owned())
 }
 
 fn setting_stepper<'a>(
@@ -86,20 +132,43 @@ fn setting_stepper<'a>(
     invalid: &'a HashMap<SettingsField, String>,
     numeric_display: &'a HashMap<SettingsField, String>,
 ) -> Setting<'a, Message> {
-    let (min, max, step, default) = (f64::from(min), f64::from(max), f64::from(step), f64::from(default));
+    let (min, max, step, default) = (
+        f64::from(min),
+        f64::from(max),
+        f64::from(step),
+        f64::from(default),
+    );
     let current = value.parse::<f64>().unwrap_or(default).clamp(min, max);
     let change = |next: f64| Message::SettingsChanged {
         field,
-        value: if field == SettingsField::HibernationDelayMs { format!("{:.0}", next.clamp(min, max)) } else { format!("{:.3}", next.clamp(min, max)) },
+        value: if field == SettingsField::HibernationDelayMs {
+            format!("{:.0}", next.clamp(min, max))
+        } else {
+            format!("{:.3}", next.clamp(min, max))
+        },
     };
     let factor = number_setting_factor(field);
-    let unit = if factor == 100.0 { "%" } else if factor == 0.001 { " s" } else { unit };
-    let shown = numeric_display.get(&field).cloned().unwrap_or_else(|| value.parse::<f64>().map(|value| format!("{}", value * factor)).unwrap_or_else(|_| value.to_owned()));
+    let unit = if factor == 100.0 {
+        "%"
+    } else if factor == 0.001 {
+        " s"
+    } else {
+        unit
+    };
+    let shown = numeric_display.get(&field).cloned().unwrap_or_else(|| {
+        value
+            .parse::<f64>()
+            .map(|value| format!("{}", value * factor))
+            .unwrap_or_else(|_| value.to_owned())
+    });
     let control = widget::row::with_children(vec![
         crate::ui_controls::icon_button(Icon::Minus, format!("Decrease {label}"))
             .on_press_maybe((current > min).then(|| change(current - step)))
             .into(),
-        crate::ui_controls::field::text(label, shown).on_input(move |value| Message::SettingsNumberDraftChanged { field, value }).width(76).into(),
+        crate::ui_controls::field::text(label, shown)
+            .on_input(move |value| Message::SettingsNumberDraftChanged { field, value })
+            .width(76)
+            .into(),
         design::caption(unit).into(),
         crate::ui_controls::icon_button(Icon::Plus, format!("Increase {label}"))
             .on_press_maybe((current < max).then(|| change(current + step)))
@@ -471,7 +540,19 @@ fn settings_category_controls<'a>(
                 SettingsField::MaxHotCards,
                 invalid,
             );
-            let hibernation = setting_stepper("Hibernation delay", "Seconds to wait before an idle terminal is hibernated.", &draft.hibernation_delay_ms, SettingsField::HibernationDelayMs, 0.0, i64::MAX as f32, 1000.0, 30_000.0, " s", invalid, &draft.numeric_display);
+            let hibernation = setting_stepper(
+                "Hibernation delay",
+                "Seconds to wait before an idle terminal is hibernated.",
+                &draft.hibernation_delay_ms,
+                SettingsField::HibernationDelayMs,
+                0.0,
+                i64::MAX as f32,
+                1000.0,
+                30_000.0,
+                " s",
+                invalid,
+                &draft.numeric_display,
+            );
             vec![
                 settings_group(
                     "Worktrees",
@@ -499,8 +580,25 @@ fn settings_category_controls<'a>(
             "Native chat",
             "Message composition and conversation presentation.",
             vec![
-                font_family_setting(&draft.chat_font_family, SettingsField::ChatFontFamily, context.fonts, invalid),
-                setting_stepper("Chat font size", "Size of transcript messages and Markdown, including existing messages.", &draft.chat_font_size, SettingsField::ChatFontSize, 8.0, 40.0, 1.0, 14.0, " px", invalid, &draft.numeric_display),
+                font_family_setting(
+                    &draft.chat_font_family,
+                    SettingsField::ChatFontFamily,
+                    context.fonts,
+                    invalid,
+                ),
+                setting_stepper(
+                    "Chat font size",
+                    "Size of transcript messages and Markdown, including existing messages.",
+                    &draft.chat_font_size,
+                    SettingsField::ChatFontSize,
+                    8.0,
+                    40.0,
+                    1.0,
+                    14.0,
+                    " px",
+                    invalid,
+                    &draft.numeric_display,
+                ),
                 setting_field(
                     "Chat send key",
                     "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
@@ -535,7 +633,9 @@ fn settings_category_controls<'a>(
                     0.05,
                     0.5,
                     "",
-                 invalid, &draft.numeric_display),
+                    invalid,
+                    &draft.numeric_display,
+                ),
             ],
         )],
         SettingsCategory::Editor => vec![
@@ -543,8 +643,25 @@ fn settings_category_controls<'a>(
                 "Font",
                 "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal.",
                 vec![
-                    font_family_setting(&draft.editor_font_family, SettingsField::EditorFontFamily, context.fonts, invalid),
-                    setting_stepper("Editor font size", "8–40 logical pixels; blank follows the terminal.", &draft.editor_font_size, SettingsField::EditorFontSize, 8.0, 40.0, 1.0, 14.0, " px", invalid, &draft.numeric_display),
+                    font_family_setting(
+                        &draft.editor_font_family,
+                        SettingsField::EditorFontFamily,
+                        context.fonts,
+                        invalid,
+                    ),
+                    setting_stepper(
+                        "Editor font size",
+                        "8–40 logical pixels; blank follows the terminal.",
+                        &draft.editor_font_size,
+                        SettingsField::EditorFontSize,
+                        8.0,
+                        40.0,
+                        1.0,
+                        14.0,
+                        " px",
+                        invalid,
+                        &draft.numeric_display,
+                    ),
                 ],
             ),
             settings_group("Editor", "Shared native editor and diff preferences.", {
@@ -585,8 +702,25 @@ fn settings_category_controls<'a>(
                 "Interface",
                 "Make the workbench comfortable on your display. Changes apply immediately and are saved automatically.",
                 vec![
-                    font_family_setting(&draft.interface_font_family, SettingsField::InterfaceFontFamily, context.fonts, invalid),
-                    setting_stepper("Interface font size", "Size of workbench labels and controls.", &draft.interface_font_size, SettingsField::InterfaceFontSize, 10.0, 24.0, 1.0, 13.0, " px", invalid, &draft.numeric_display),
+                    font_family_setting(
+                        &draft.interface_font_family,
+                        SettingsField::InterfaceFontFamily,
+                        context.fonts,
+                        invalid,
+                    ),
+                    setting_stepper(
+                        "Interface font size",
+                        "Size of workbench labels and controls.",
+                        &draft.interface_font_size,
+                        SettingsField::InterfaceFontSize,
+                        10.0,
+                        24.0,
+                        1.0,
+                        13.0,
+                        " px",
+                        invalid,
+                        &draft.numeric_display,
+                    ),
                     setting_field(
                         "App theme",
                         "Colors for the entire application. Terminal and syntax palettes are independent.",
@@ -615,7 +749,9 @@ fn settings_category_controls<'a>(
                         0.05,
                         1.0,
                         "×",
-                     invalid, &draft.numeric_display),
+                        invalid,
+                        &draft.numeric_display,
+                    ),
                     setting_field(
                         "Status bar",
                         "A thin bar along the bottom of the window showing how much of each signed-in Claude Code, Codex and Omp account's usage limits is left.",
@@ -656,7 +792,9 @@ fn settings_category_controls<'a>(
                         0.05,
                         0.5,
                         "×",
-                     invalid, &draft.numeric_display),
+                        invalid,
+                        &draft.numeric_display,
+                    ),
                     setting_stepper(
                         "Native pane minimum width",
                         "Fraction of the workspace used by new native panes when sharing space. A lone pane fills the workspace; resize or cycle its width to override.",
@@ -667,7 +805,9 @@ fn settings_category_controls<'a>(
                         0.05,
                         0.5,
                         "",
-                     invalid, &draft.numeric_display),
+                        invalid,
+                        &draft.numeric_display,
+                    ),
                 ],
             ),
         ],
@@ -686,8 +826,15 @@ fn settings_category_controls<'a>(
                         1.0,
                         14.0,
                         " px",
-                     invalid, &draft.numeric_display),
-                    font_family_setting(&draft.terminal_font_family, SettingsField::TerminalFontFamily, context.fonts, invalid),
+                        invalid,
+                        &draft.numeric_display,
+                    ),
+                    font_family_setting(
+                        &draft.terminal_font_family,
+                        SettingsField::TerminalFontFamily,
+                        context.fonts,
+                        invalid,
+                    ),
                     setting_stepper(
                         "Line height",
                         "Space between text baselines, relative to font size.",
@@ -698,7 +845,9 @@ fn settings_category_controls<'a>(
                         0.05,
                         1.286,
                         "×",
-                     invalid, &draft.numeric_display),
+                        invalid,
+                        &draft.numeric_display,
+                    ),
                     setting_stepper(
                         "Inner padding",
                         "Breathing room between terminal text and the pane edge.",
@@ -709,7 +858,9 @@ fn settings_category_controls<'a>(
                         2.0,
                         8.0,
                         " px",
-                     invalid, &draft.numeric_display),
+                        invalid,
+                        &draft.numeric_display,
+                    ),
                     setting_input(
                         "1–10 lines per mouse-wheel notch. Use scroll speed for high-resolution wheel or trackpad input.",
                         &draft.terminal_scroll_size,
@@ -726,7 +877,9 @@ fn settings_category_controls<'a>(
                         0.25,
                         1.0,
                         "×",
-                     invalid, &draft.numeric_display),
+                        invalid,
+                        &draft.numeric_display,
+                    ),
                     terminal_theme_choice(&draft.terminal_theme, draft.has_custom_terminal_theme),
                     setting_field(
                         "Multiline paste",
@@ -1604,11 +1757,20 @@ mod typography_settings_tests {
         let family = "Cagents nonexistent test family 9D42";
         let warning = missing_font_warning(family, &[], "system monospace").unwrap();
         assert_eq!(warning, "Not installed; using system monospace.");
-        let SettingsDecision::Persist(settings) = settings_update(&AppSettings::default(), SettingsField::EditorFontFamily, family) else { panic!("missing fonts remain configurable"); };
+        let SettingsDecision::Persist(settings) = settings_update(
+            &AppSettings::default(),
+            SettingsField::EditorFontFamily,
+            family,
+        ) else {
+            panic!("missing fonts remain configurable");
+        };
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         settings::save(&path, &settings).unwrap();
-        assert_eq!(settings::load(&path).unwrap().editor_font_family.as_deref(), Some(family));
+        assert_eq!(
+            settings::load(&path).unwrap().editor_font_family.as_deref(),
+            Some(family)
+        );
         assert!(missing_font_warning("Example", &["example".into()], "system monospace").is_none());
     }
 
@@ -1617,8 +1779,16 @@ mod typography_settings_tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         for (field, sequence, stored) in [
             (SettingsField::TerminalLineHeight, ["1", "1.", "1.5"], "1.5"),
-            (SettingsField::ChatContentFraction, ["25", "25.", "25.5"], "0.255"),
-            (SettingsField::HibernationDelayMs, ["1", "1.", "1.5"], "1500"),
+            (
+                SettingsField::ChatContentFraction,
+                ["25", "25.", "25.5"],
+                "0.255",
+            ),
+            (
+                SettingsField::HibernationDelayMs,
+                ["1", "1.", "1.5"],
+                "1500",
+            ),
         ] {
             for value in sequence {
                 drop(app.queue_number_setting_input(field, value.into()));
@@ -1654,47 +1824,75 @@ mod typography_settings_tests {
             (SettingsField::HibernationDelayMs, "-1".into()),
             (SettingsField::MaxHotCards, "0".into()),
         ];
-        cases.extend([
-            SettingsField::AppTheme,
-            SettingsField::TerminalCursorStyle,
-            SettingsField::TerminalTheme,
-            SettingsField::WorktreeSort,
-            SettingsField::DefaultWorktreePane,
-            SettingsField::DefaultChannelPane,
-            SettingsField::LinkOpenDestination,
-            SettingsField::LinkOpenGesture,
-            SettingsField::PullRequestOpenTarget,
-            SettingsField::EditorAutoSave,
-            SettingsField::EditorWrapLines,
-            SettingsField::DiffHideUnchanged,
-            SettingsField::ChatEnterSends,
-            SettingsField::ChatExpandToolGroups,
-            SettingsField::ShowStatusBar,
-            SettingsField::ShowWorktreeChangesIcons,
-            SettingsField::AutoDeleteMergedWorktrees,
-            SettingsField::RelaunchAgentsOnUpgrade,
-            SettingsField::CheckForUpdates,
-            SettingsField::EditorSyntaxTheme,
-            SettingsField::ConfirmTerminalClose,
-            SettingsField::FocusFollowsMouse,
-            SettingsField::ConfirmMultilinePaste,
-            SettingsField::TerminalScrollSize,
-            SettingsField::TerminalScrollbackLines,
-        ].into_iter().map(|field| (field, "not a value".into())));
+        cases.extend(
+            [
+                SettingsField::AppTheme,
+                SettingsField::TerminalCursorStyle,
+                SettingsField::TerminalTheme,
+                SettingsField::WorktreeSort,
+                SettingsField::DefaultWorktreePane,
+                SettingsField::DefaultChannelPane,
+                SettingsField::LinkOpenDestination,
+                SettingsField::LinkOpenGesture,
+                SettingsField::PullRequestOpenTarget,
+                SettingsField::EditorAutoSave,
+                SettingsField::EditorWrapLines,
+                SettingsField::DiffHideUnchanged,
+                SettingsField::ChatEnterSends,
+                SettingsField::ChatExpandToolGroups,
+                SettingsField::ShowStatusBar,
+                SettingsField::ShowWorktreeChangesIcons,
+                SettingsField::AutoDeleteMergedWorktrees,
+                SettingsField::RelaunchAgentsOnUpgrade,
+                SettingsField::CheckForUpdates,
+                SettingsField::EditorSyntaxTheme,
+                SettingsField::ConfirmTerminalClose,
+                SettingsField::FocusFollowsMouse,
+                SettingsField::ConfirmMultilinePaste,
+                SettingsField::TerminalScrollSize,
+                SettingsField::TerminalScrollbackLines,
+            ]
+            .into_iter()
+            .map(|field| (field, "not a value".into())),
+        );
         cases.push((SettingsField::ManagedWorktreeDirectory, "".into()));
-        cases.extend([
-            crate::notifications::Field::Enabled, crate::notifications::Field::Success,
-            crate::notifications::Field::Failure, crate::notifications::Field::Waiting,
-            crate::notifications::Field::WhileFocused, crate::notifications::Field::ReviewRequests,
-        ].into_iter().map(|field| (SettingsField::Notifications(field), "not a value".into())));
-        for field in [SettingsField::EditorFontFamily, SettingsField::TerminalFontFamily, SettingsField::InterfaceFontFamily, SettingsField::ChatFontFamily] {
+        cases.extend(
+            [
+                crate::notifications::Field::Enabled,
+                crate::notifications::Field::Success,
+                crate::notifications::Field::Failure,
+                crate::notifications::Field::Waiting,
+                crate::notifications::Field::WhileFocused,
+                crate::notifications::Field::ReviewRequests,
+            ]
+            .into_iter()
+            .map(|field| (SettingsField::Notifications(field), "not a value".into())),
+        );
+        for field in [
+            SettingsField::EditorFontFamily,
+            SettingsField::TerminalFontFamily,
+            SettingsField::InterfaceFontFamily,
+            SettingsField::ChatFontFamily,
+        ] {
             cases.push((field, "F".repeat(129)));
         }
-        cases.extend(SettingsField::SHORTCUTS.into_iter().map(|field| (field, "Ctrl+".into())));
+        cases.extend(
+            SettingsField::SHORTCUTS
+                .into_iter()
+                .map(|field| (field, "Ctrl+".into())),
+        );
         for (field, raw) in cases {
-            let SettingsDecision::Invalid(message) = settings_update(&current, field, &raw) else { panic!("{field:?} should refuse {raw:?}"); };
+            let SettingsDecision::Invalid(message) = settings_update(&current, field, &raw) else {
+                panic!("{field:?} should refuse {raw:?}");
+            };
             assert!(!message.contains('_'), "{field:?}: {message}");
         }
-        assert_eq!(match settings_update(&current, SettingsField::EditorFontSize, "100") { SettingsDecision::Invalid(message) => message, _ => panic!("size") }, "Font size must be between 8 and 40.");
+        assert_eq!(
+            match settings_update(&current, SettingsField::EditorFontSize, "100") {
+                SettingsDecision::Invalid(message) => message,
+                _ => panic!("size"),
+            },
+            "Font size must be between 8 and 40."
+        );
     }
 }

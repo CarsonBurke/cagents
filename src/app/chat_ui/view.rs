@@ -1842,7 +1842,9 @@ impl Runtime {
         // which counting newlines could not see. The ceiling keeps a very
         // long paste from squeezing the transcript out, past which the editor
         // scrolls as before.
-        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT * design::chat_size() / design::TEXT_PROSE + 2.0 * COMPOSER_PADDING;
+        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT * design::chat_size()
+            / design::TEXT_PROSE
+            + 2.0 * COMPOSER_PADDING;
         let suggestion = if available && !transitioning {
             self.prompt_suggestion()
         } else {
@@ -1887,7 +1889,8 @@ impl Runtime {
             crate::ui_controls::field::editor("Message", &self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
-                .size(design::chat_size()).font(design::chat_font())
+                .size(design::chat_size())
+                .font(design::chat_font())
                 .height(Length::Shrink)
                 .max_height(composer_ceiling)
                 // The editor scrolls once the draft passes the ceiling, and
@@ -3030,7 +3033,13 @@ impl Runtime {
     fn turn_fingerprint_at(&self, turn: &turn::Turn, dark: bool, now: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        (self.target, dark, self.syntax_theme as u8, design::typography_revision()).hash(&mut hasher);
+        (
+            self.target,
+            dark,
+            self.syntax_theme as u8,
+            design::typography_revision(),
+        )
+            .hash(&mut hasher);
         (
             &turn.key,
             &turn.summary,

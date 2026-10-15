@@ -2572,7 +2572,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SettingsSearchChanged(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
-        | Message::SettingsNumberDraftChanged { .. }
+                | Message::SettingsNumberDraftChanged { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -2976,9 +2976,11 @@ impl SettingsField {
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
             | Self::FocusFollowsMouse => SettingsCategory::General,
-            Self::ChatFontFamily | Self::ChatFontSize | Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
-                SettingsCategory::NativeChat
-            }
+            Self::ChatFontFamily
+            | Self::ChatFontSize
+            | Self::ChatEnterSends
+            | Self::ChatExpandToolGroups
+            | Self::ChatContentFraction => SettingsCategory::NativeChat,
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::EditorAutoSave
             | Self::EditorWrapLines
@@ -3431,10 +3433,22 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
-        SettingsField::InterfaceFontFamily => { next.interface_font_family = value.into(); Ok(()) }
-        SettingsField::InterfaceFontSize => value.parse::<f32>().map(|size| next.interface_font_size = size).map_err(|_| "Enter a font size between 10 and 24.".into()),
-        SettingsField::ChatFontFamily => { next.chat_font_family = value.into(); Ok(()) }
-        SettingsField::ChatFontSize => value.parse::<f32>().map(|size| next.chat_font_size = size).map_err(|_| "Enter a font size between 8 and 40.".into()),
+        SettingsField::InterfaceFontFamily => {
+            next.interface_font_family = value.into();
+            Ok(())
+        }
+        SettingsField::InterfaceFontSize => value
+            .parse::<f32>()
+            .map(|size| next.interface_font_size = size)
+            .map_err(|_| "Enter a font size between 10 and 24.".into()),
+        SettingsField::ChatFontFamily => {
+            next.chat_font_family = value.into();
+            Ok(())
+        }
+        SettingsField::ChatFontSize => value
+            .parse::<f32>()
+            .map(|size| next.chat_font_size = size)
+            .map_err(|_| "Enter a font size between 8 and 40.".into()),
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -3661,7 +3675,8 @@ fn settings_update(
                     Ok(())
                 }
                 None => Err(
-                    "Choose a preset, or configure a custom terminal palette in the settings file.".into(),
+                    "Choose a preset, or configure a custom terminal palette in the settings file."
+                        .into(),
                 ),
             }
         }
@@ -3828,9 +3843,9 @@ fn settings_update(
     let next = match next.validate() {
         Ok(next) => next,
         Err(_) => {
-            return SettingsDecision::Invalid(
-                refusal(field, &attempted).unwrap_or_else(|| format!("Choose a valid value for {}.", field.label().to_lowercase())),
-            );
+            return SettingsDecision::Invalid(refusal(field, &attempted).unwrap_or_else(|| {
+                format!("Choose a valid value for {}.", field.label().to_lowercase())
+            }));
         }
     };
     if next == *current {
@@ -3859,16 +3874,35 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
             grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_LINES)
         ),
         SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
-        SettingsField::HibernationDelayMs => "Hibernation delay must be a non-negative number of seconds.".to_owned(),
+        SettingsField::HibernationDelayMs => {
+            "Hibernation delay must be a non-negative number of seconds.".to_owned()
+        }
         SettingsField::InterfaceFontSize => "Font size must be between 10 and 24.".to_owned(),
-        SettingsField::EditorFontSize | SettingsField::ChatFontSize | SettingsField::TerminalFontSize => "Font size must be between 8 and 40.".to_owned(),
-        SettingsField::EditorFontFamily | SettingsField::InterfaceFontFamily | SettingsField::ChatFontFamily => "Enter a font family name of at most 128 bytes, or leave it blank to use the default.".to_owned(),
-        SettingsField::BrowserSearchUrl => "Search URL must use HTTP or HTTPS and include {query}.".to_owned(),
+        SettingsField::EditorFontSize
+        | SettingsField::ChatFontSize
+        | SettingsField::TerminalFontSize => "Font size must be between 8 and 40.".to_owned(),
+        SettingsField::EditorFontFamily
+        | SettingsField::InterfaceFontFamily
+        | SettingsField::ChatFontFamily => {
+            "Enter a font family name of at most 128 bytes, or leave it blank to use the default."
+                .to_owned()
+        }
+        SettingsField::BrowserSearchUrl => {
+            "Search URL must use HTTP or HTTPS and include {query}.".to_owned()
+        }
         SettingsField::UiScale => "Interface scale must be between 80% and 150%.".to_owned(),
-        SettingsField::TerminalLineHeight => "Line height must be between 1 and 2 times the font size.".to_owned(),
-        SettingsField::TerminalPadding => "Inner padding must be between 0 and 24 pixels.".to_owned(),
-        SettingsField::TerminalScrollSpeed => "Scroll speed must be between 0.25 and 4 times the default.".to_owned(),
-        SettingsField::ChatContentFraction | SettingsField::DefaultNativePaneFraction | SettingsField::DefaultColumnFraction => "Width must be between 25% and 100%.".to_owned(),
+        SettingsField::TerminalLineHeight => {
+            "Line height must be between 1 and 2 times the font size.".to_owned()
+        }
+        SettingsField::TerminalPadding => {
+            "Inner padding must be between 0 and 24 pixels.".to_owned()
+        }
+        SettingsField::TerminalScrollSpeed => {
+            "Scroll speed must be between 0.25 and 4 times the default.".to_owned()
+        }
+        SettingsField::ChatContentFraction
+        | SettingsField::DefaultNativePaneFraction
+        | SettingsField::DefaultColumnFraction => "Width must be between 25% and 100%.".to_owned(),
         SettingsField::TerminalFontFamily
             if attempted.terminal_font_family.len() > settings::MAX_TERMINAL_FONT_FAMILY_BYTES =>
         {
@@ -3889,7 +3923,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
             format!("{label} must be a path without control characters.")
         }
         field => {
-            let action = SettingsField::SHORTCUTS.iter().position(|shortcut| *shortcut == field)?;
+            let action = SettingsField::SHORTCUTS
+                .iter()
+                .position(|shortcut| *shortcut == field)?;
             shortcut_refusal(action, &attempted.keyboard_shortcuts)?
         }
     })
@@ -17038,7 +17074,12 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        design::configure_typography(&self.settings.interface_font_family, self.settings.interface_font_size, &self.settings.chat_font_family, self.settings.chat_font_size);
+        design::configure_typography(
+            &self.settings.interface_font_family,
+            self.settings.interface_font_size,
+            &self.settings.chat_font_family,
+            self.settings.chat_font_size,
+        );
         let window_width = self.window_width;
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
