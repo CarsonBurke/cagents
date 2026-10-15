@@ -2363,11 +2363,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             state.preedit = None;
         }
         if self.model_focused {
-            operation.focusable(
-                self.id.as_ref(),
-                layout.bounds(),
-                tree.state.downcast_mut::<WidgetState>(),
-            );
+            let state = tree.state.downcast_mut::<WidgetState>();
+            let focus_id = self.id.as_ref().map(|parent| {
+                let mut a11y = state.a11y.borrow_mut();
+                a11y.bind(parent, self.review_attachment);
+                a11y.focus_id(parent)
+            });
+            operation.focusable(focus_id.as_ref(), layout.bounds(), state);
         }
     }
 

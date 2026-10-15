@@ -793,6 +793,37 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
 }
 
 #[test]
+fn scoped_native_root_and_stable_focus_handoff_share_the_operation_identity() {
+    #[derive(Default)]
+    struct Focused(Option<Id>);
+    impl Operation for Focused {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) { operate(self); }
+        fn focusable(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn operation::Focusable) {
+            if state.is_focused() { self.0 = id.cloned(); }
+        }
+    }
+    let peer = Peer::new();
+    let renderer = renderer();
+    for parent in [Id::new("stable-terminal-focus"), Id::unique()] {
+        let mut widget = widget(&peer, "unused-parent", ReviewInputBarrier::default(), true, false).id(parent.clone());
+        let mut tree = widget_tree(&widget);
+        operation::Focusable::unfocus(tree.state.downcast_mut::<WidgetState>());
+        let node = layout::Node::new(Size::new(640.0, 320.0));
+        let mut focus = operation::focus(parent);
+        widget.operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+        assert!(operation::Focusable::is_focused(tree.state.downcast_ref::<WidgetState>()));
+        let mut observed = Focused::default();
+        widget.operate(&mut tree, Layout::new(&node), &renderer, &mut observed);
+        let nodes = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        // Same matching contract as the actual iced-winit tree_update path:
+        // focused operation ID must match one of the emitted semantic nodes.
+        let observed = A11yId::from(observed.0.unwrap());
+        assert!(iced_accessibility::IdEq::eq(nodes.root()[0].id(), &observed));
+        assert!(!matches!(observed, A11yId::Widget(Id(cosmic::iced::id::Internal::Set(_)))));
+    }
+}
+
+#[test]
 fn native_actions_from_replaced_same_id_tree_cannot_enter_successor_review() {
     let old = Peer::new();
     let new = Peer::with_generation(old.surface().terminal_id(), uuid::Uuid::new_v4(), old.surface().host_proof().unwrap());
