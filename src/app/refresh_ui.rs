@@ -174,25 +174,34 @@ pub enum Action {
 impl Cagents {
     pub(super) fn refresh_subscription(&self) -> Subscription<Message> {
         let sidebar = if self.refresh_ui.focused && !self.modal_is_open() && !self.update_prepared {
-            cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::RefreshUi(Action::Tick))
-        } else { Subscription::none() };
+            cosmic::iced::time::every(Duration::from_secs(10))
+                .map(|_| Message::RefreshUi(Action::Tick))
+        } else {
+            Subscription::none()
+        };
         let documents = if !self.update_prepared && !crate::device::is_remote()
             && self.cards.values().any(|runtime| matches!(runtime, CardRuntime::Repository(runtime) if runtime.observes_open_sources())) {
             cosmic::iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshUi(Action::DocumentsTick))
         } else { Subscription::none() };
-        Subscription::batch([
-            sidebar,
-            documents,
-        ])
+        Subscription::batch([sidebar, documents])
     }
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
         if matches!(action, Action::DocumentsTick) {
-            if self.update_prepared || crate::device::is_remote() { return Task::none(); }
-            return Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| match runtime {
-                CardRuntime::Repository(runtime) => Some(repository_task(runtime.refresh_open_sources(card))),
-                _ => None,
-            }).collect::<Vec<_>>());
+            if self.update_prepared || crate::device::is_remote() {
+                return Task::none();
+            }
+            return Task::batch(
+                self.cards
+                    .iter_mut()
+                    .filter_map(|(&card, runtime)| match runtime {
+                        CardRuntime::Repository(runtime) => {
+                            Some(repository_task(runtime.refresh_open_sources(card)))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            );
         }
 
         let regained_focus = match action {
@@ -405,7 +414,9 @@ mod tests {
         while let Some(task) = pending.pop() {
             if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
                 while let Some(action) = stream.next().await {
-                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                        action
+                    {
                         pending.push(app.update(message));
                     }
                 }
@@ -418,15 +429,27 @@ mod tests {
         use crate::repository::{DiffBasis, Oid, RepoPath, ValidatedRefName};
         let root = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("git").current_dir(root.path()).args(args).output().unwrap();
-            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            let output = std::process::Command::new("git")
+                .current_dir(root.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             String::from_utf8(output.stdout).unwrap().trim().to_owned()
         };
         git(&["init", "-b", "main"]);
         git(&["config", "user.name", "Test"]);
         git(&["config", "user.email", "test@example.invalid"]);
         git(&["config", "commit.gpgsign", "false"]);
-        git(&["config", "core.hooksPath", root.path().join("hooks").to_str().unwrap()]);
+        git(&[
+            "config",
+            "core.hooksPath",
+            root.path().join("hooks").to_str().unwrap(),
+        ]);
         std::fs::write(root.path().join("file.rs"), "before\n").unwrap();
         git(&["add", "file.rs"]);
         git(&["commit", "-m", "Initial"]);
@@ -437,13 +460,31 @@ mod tests {
         git(&["commit", "-m", "Topic"]);
         let head = Oid::parse_object(git(&["rev-parse", "HEAD"])).unwrap();
         let card = CardId::new();
-        let mut runtime = RepositoryRuntime::new(crate::model::RepositoryView { project: ProjectId::new(), repository: root.path().to_path_buf(), worktree: root.path().to_path_buf(), selected_file: None });
-        let load = runtime.update(RepositoryAction::OpenCommittedFile { card, path: RepoPath::parse("file.rs").unwrap(), old_path: None, basis: DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: head.clone(), merge_base: before.clone() } });
+        let mut runtime = RepositoryRuntime::new(crate::model::RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+            selected_file: None,
+        });
+        let load = runtime.update(RepositoryAction::OpenCommittedFile {
+            card,
+            path: RepoPath::parse("file.rs").unwrap(),
+            old_path: None,
+            basis: DiffBasis::MergeBaseToHead {
+                base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+                head: head.clone(),
+                merge_base: before.clone(),
+            },
+        });
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.lsp = crate::lsp::LspManager::new(Vec::new());
         app.cards.clear();
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
-        assert!(app.sidebar_model.projects.is_empty(), "this fixture installs no native project watcher");
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        assert!(
+            app.sidebar_model.projects.is_empty(),
+            "this fixture installs no native project watcher"
+        );
         finish_source_tasks(&mut app, repository_task(load)).await;
         let task = app.update_refresh(Action::DocumentsTick);
         finish_source_tasks(&mut app, task).await;
@@ -452,9 +493,16 @@ mod tests {
         git(&["update-ref", "refs/heads/main", head.as_str()]);
         let task = app.update_refresh(Action::DocumentsTick);
         finish_source_tasks(&mut app, task).await;
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("repository remains mounted"); };
-        assert!(matches!(runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &head));
-        assert_eq!(std::fs::read_to_string(root.path().join("file.rs")).unwrap(), "topic one\ntopic two\n");
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            panic!("repository remains mounted");
+        };
+        assert!(
+            matches!(runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &head)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("file.rs")).unwrap(),
+            "topic one\ntopic two\n"
+        );
     }
 
     #[tokio::test]
@@ -462,13 +510,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("file.rs"), "before\n").unwrap();
         let card = CardId::new();
-        let mut runtime = RepositoryRuntime::new_directory(crate::model::RepositoryView { project: ProjectId::new(), repository: root.path().to_path_buf(), worktree: root.path().to_path_buf(), selected_file: None });
+        let mut runtime = RepositoryRuntime::new_directory(crate::model::RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+            selected_file: None,
+        });
         runtime.set_auto_save(false);
         let load = runtime.open_file_location(card, "file.rs".into(), 0, 0, 0);
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.lsp = crate::lsp::LspManager::new(Vec::new());
         app.cards.clear();
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
         finish_source_tasks(&mut app, repository_task(load)).await;
         app.refresh_ui.focused = false;
         app.settings_reset_confirm = true;
@@ -476,7 +530,9 @@ mod tests {
         std::fs::write(root.path().join("file.rs"), "outside\n").unwrap();
         let task = app.update_refresh(Action::DocumentsTick);
         finish_source_tasks(&mut app, task).await;
-        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.editor_text().as_deref() == Some("outside\n")));
+        assert!(
+            matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.editor_text().as_deref() == Some("outside\n"))
+        );
         assert!(!app.refresh_ui.focused);
         assert!(app.modal_is_open());
     }

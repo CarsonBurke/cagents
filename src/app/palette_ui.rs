@@ -358,25 +358,65 @@ impl Cagents {
         if let Some(card) = self.workspace.focused() {
             if let Some(doc) = self.lsp_document(card) {
                 let mut caps = self.lsp.capabilities(doc);
-                if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source()) {
-                    caps.rename = false; caps.format_document = false; caps.format_selection = false; caps.code_actions = false;
+                if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source())
+                {
+                    caps.rename = false;
+                    caps.format_document = false;
+                    caps.format_selection = false;
+                    caps.code_actions = false;
                 }
                 for (available, label, action) in [
-                    (caps.rename, "Rename symbol", repository_widget::EditorLspAction::Rename),
-                    (caps.format_document, "Format document", repository_widget::EditorLspAction::Format { selection: false }),
-                    (caps.format_selection, "Format selection", repository_widget::EditorLspAction::Format { selection: true }),
-                    (caps.code_actions, "Code actions", repository_widget::EditorLspAction::CodeActions),
-                    (caps.signature_help, "Show signature help", repository_widget::EditorLspAction::Signature),
+                    (
+                        caps.rename,
+                        "Rename symbol",
+                        repository_widget::EditorLspAction::Rename,
+                    ),
+                    (
+                        caps.format_document,
+                        "Format document",
+                        repository_widget::EditorLspAction::Format { selection: false },
+                    ),
+                    (
+                        caps.format_selection,
+                        "Format selection",
+                        repository_widget::EditorLspAction::Format { selection: true },
+                    ),
+                    (
+                        caps.code_actions,
+                        "Code actions",
+                        repository_widget::EditorLspAction::CodeActions,
+                    ),
+                    (
+                        caps.signature_help,
+                        "Show signature help",
+                        repository_widget::EditorLspAction::Signature,
+                    ),
                 ] {
-                    if available { entries.push((label.into(), String::new(), Message::Repository(RepositoryAction::Language { card, action }))); }
+                    if available {
+                        entries.push((
+                            label.into(),
+                            String::new(),
+                            Message::Repository(RepositoryAction::Language { card, action }),
+                        ));
+                    }
                 }
             }
         }
         if let Some(card) = self.workspace.focused()
             && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_focus_target(card).is_some())
         {
-            for (label, chord, forward) in [("Next diagnostic", "F8", true), ("Previous diagnostic", "Shift+F8", false)] {
-                entries.push((label.into(), chord.into(), Message::Repository(RepositoryAction::Language {card,action:repository_widget::EditorLspAction::Diagnostic(forward)})));
+            for (label, chord, forward) in [
+                ("Next diagnostic", "F8", true),
+                ("Previous diagnostic", "Shift+F8", false),
+            ] {
+                entries.push((
+                    label.into(),
+                    chord.into(),
+                    Message::Repository(RepositoryAction::Language {
+                        card,
+                        action: repository_widget::EditorLspAction::Diagnostic(forward),
+                    }),
+                ));
             }
         }
         entries.push((

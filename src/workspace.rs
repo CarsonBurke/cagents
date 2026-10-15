@@ -675,10 +675,14 @@ impl Workspace {
     }
 
     /// Monotonic focus intent, including switching away and back to a card.
-    pub fn focus_revision(&self) -> u64 { self.focus_revision }
+    pub fn focus_revision(&self) -> u64 {
+        self.focus_revision
+    }
 
     fn set_focused(&mut self, focused: Option<CardId>) {
-        if self.focused != focused { self.focus_revision = next_focus_revision(); }
+        if self.focused != focused {
+            self.focus_revision = next_focus_revision();
+        }
         self.focused = focused;
     }
 

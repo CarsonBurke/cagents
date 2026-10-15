@@ -1260,8 +1260,15 @@ fn location_fact(card: CardId, location: &LspLocation) -> Fact {
             coordinates: LspCoordinates::Utf16,
         }),
         (LspTarget::External { path }, coordinates) => Fact::new(
-            format!("Read-only source · line {line}"), path.display().to_string(),
-        ).activated(InspectorAction::JumpToLspLocation { card, path: path.clone(), at: location.range.start, coordinates }),
+            format!("Read-only source · line {line}"),
+            path.display().to_string(),
+        )
+        .activated(InspectorAction::JumpToLspLocation {
+            card,
+            path: path.clone(),
+            at: location.range.start,
+            coordinates,
+        }),
         (LspTarget::Uri { uri }, _) => Fact::new(
             "Not a file",
             format!("{uri}: this card cannot open a location that is not a file."),
@@ -2462,7 +2469,7 @@ mod tests {
             message: message.to_owned(),
             source: None,
             code: None,
-            protocol:None,
+            protocol: None,
         }
     }
 
@@ -2832,9 +2839,15 @@ mod tests {
         let model = lsp_model(&card, &lsp);
         let facts = &section(&model, "Definition").facts;
 
-        assert_eq!(facts[0].action, Some(InspectorAction::JumpToLspLocation {
-            card: card.id, path: "/usr/lib/std.rs".into(), at: LspPosition::new(7, 2), coordinates: LspCoordinates::Scalar,
-        }));
+        assert_eq!(
+            facts[0].action,
+            Some(InspectorAction::JumpToLspLocation {
+                card: card.id,
+                path: "/usr/lib/std.rs".into(),
+                at: LspPosition::new(7, 2),
+                coordinates: LspCoordinates::Scalar,
+            })
+        );
         assert!(facts[0].value.contains("/usr/lib/std.rs"), "{:?}", facts[0]);
         assert!(facts[0].label.contains("Read-only"), "{:?}", facts[0]);
     }

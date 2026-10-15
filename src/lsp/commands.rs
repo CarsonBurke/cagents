@@ -109,7 +109,14 @@ impl SessionCommand {
                             .sum::<usize>()
                     })
             }
-            Self::Request(request)=>request.args.queued_bytes()+request.observed_versions.keys().map(|uri|uri.as_str().len()+4).sum::<usize>(),
+            Self::Request(request) => {
+                request.args.queued_bytes()
+                    + request
+                        .observed_versions
+                        .keys()
+                        .map(|uri| uri.as_str().len() + 4)
+                        .sum::<usize>()
+            }
             _ => 0,
         }
     }
@@ -259,7 +266,7 @@ mod tests {
                 range_length: None,
                 text: "x".into(),
             }]),
-            full: Arc::new(Snapshot::new(version,text)),
+            full: Arc::new(Snapshot::new(version, text)),
         }
     }
 
@@ -315,7 +322,9 @@ mod tests {
                 kind: RequestKind::Hover,
                 position: lsp_types::Position::new(0, 0),
                 version: 1,
-                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: HashMap::new(),
+                args: RequestArgs::None,
+                timeout: Duration::from_secs(15),
+                observed_versions: HashMap::new(),
             }),
             SessionCommand::Close {
                 doc: LspDocumentId(1),
@@ -326,7 +335,7 @@ mod tests {
                 uri: Arc::clone(&uri),
                 language_id: "rust".into(),
                 version: 1,
-                text: Arc::new(Snapshot::new(1,Arc::from("opened"))),
+                text: Arc::new(Snapshot::new(1, Arc::from("opened"))),
             },
         ] {
             let (sender, _receiver) = channel();

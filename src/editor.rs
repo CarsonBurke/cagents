@@ -316,31 +316,61 @@ pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
 /// navigation. The caller mounts it as read-only; it never enters the save
 /// path. A parent-directory descriptor fences the bounded regular-file read.
 pub fn load_external_source(path: &Path) -> Result<LoadedFile, FileIoError> {
-    if !path.is_absolute() { return Err(FileIoError::InvalidRepositoryPath); }
-    let canonical = std::fs::canonicalize(path).map_err(|error| FileIoError::Io(error.to_string()))?;
-    let parent = canonical.parent().ok_or(FileIoError::InvalidRepositoryPath)?;
-    let name = canonical.file_name().ok_or(FileIoError::InvalidRepositoryPath)?;
-    let root = crate::fs_safety::Root::open(parent).map_err(|error| FileIoError::Io(error.to_string()))?;
-    let file = crate::fs_safety::open_beneath(&root, Path::new(name)).map_err(|error| FileIoError::Io(error.to_string()))?;
-    let metadata = file.metadata().map_err(|error| FileIoError::Io(error.to_string()))?;
-    let content = if !metadata.is_file() { FileContent::ReadOnly(ReadOnlyReason::NotRegularFile) }
-    else if metadata.len() > MAX_EDITABLE_FILE_BYTES {
-        FileContent::ReadOnly(ReadOnlyReason::Oversize { bytes: metadata.len(), limit: MAX_EDITABLE_FILE_BYTES, kind: OversizeKind::Editable })
+    if !path.is_absolute() {
+        return Err(FileIoError::InvalidRepositoryPath);
+    }
+    let canonical =
+        std::fs::canonicalize(path).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let parent = canonical
+        .parent()
+        .ok_or(FileIoError::InvalidRepositoryPath)?;
+    let name = canonical
+        .file_name()
+        .ok_or(FileIoError::InvalidRepositoryPath)?;
+    let root =
+        crate::fs_safety::Root::open(parent).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let file = crate::fs_safety::open_beneath(&root, Path::new(name))
+        .map_err(|error| FileIoError::Io(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| FileIoError::Io(error.to_string()))?;
+    let content = if !metadata.is_file() {
+        FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)
+    } else if metadata.len() > MAX_EDITABLE_FILE_BYTES {
+        FileContent::ReadOnly(ReadOnlyReason::Oversize {
+            bytes: metadata.len(),
+            limit: MAX_EDITABLE_FILE_BYTES,
+            kind: OversizeKind::Editable,
+        })
     } else {
         let mut bytes = Vec::new();
         use std::io::Read;
-        file.take(MAX_EDITABLE_FILE_BYTES + 1).read_to_end(&mut bytes).map_err(|error| FileIoError::Io(error.to_string()))?;
+        file.take(MAX_EDITABLE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| FileIoError::Io(error.to_string()))?;
         if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
-            FileContent::ReadOnly(ReadOnlyReason::Oversize { bytes: bytes.len() as u64, limit: MAX_EDITABLE_FILE_BYTES, kind: OversizeKind::Editable })
-        } else if bytes.contains(&0) { FileContent::ReadOnly(ReadOnlyReason::Binary) }
-        else {
+            FileContent::ReadOnly(ReadOnlyReason::Oversize {
+                bytes: bytes.len() as u64,
+                limit: MAX_EDITABLE_FILE_BYTES,
+                kind: OversizeKind::Editable,
+            })
+        } else if bytes.contains(&0) {
+            FileContent::ReadOnly(ReadOnlyReason::Binary)
+        } else {
             match String::from_utf8(bytes) {
-                Ok(text) => FileContent::Editable { content_hash: blake3::hash(text.as_bytes()), text, markdown: false },
+                Ok(text) => FileContent::Editable {
+                    content_hash: blake3::hash(text.as_bytes()),
+                    text,
+                    markdown: false,
+                },
                 Err(_) => FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8),
             }
         }
     };
-    Ok(LoadedFile { source: path.to_path_buf(), content })
+    Ok(LoadedFile {
+        source: path.to_path_buf(),
+        content,
+    })
 }
 
 /// Whether the open file begins with a PDF header, leaving it rewound.
@@ -986,7 +1016,15 @@ pub(crate) fn save_file_at(
 ) -> Result<SaveOutcome, FileIoError> {
     // The workspace planner retains its cleanup protection with this Root
     // from preparation through rollback, even if the directory is renamed.
-    save_file_at_with_hooks(root, relative_path, text, expected_disk_hash, overwrite, || Ok(()), fs_safety::sync_directory)
+    save_file_at_with_hooks(
+        root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        || Ok(()),
+        fs_safety::sync_directory,
+    )
 }
 
 fn save_file_with_hooks(
@@ -1000,7 +1038,15 @@ fn save_file_with_hooks(
 ) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(relative_path)?;
     let root = worktree_root(worktree)?;
-    save_file_at_with_hooks(&root, relative_path, text, expected_disk_hash, overwrite, before_publish, sync_parent)
+    save_file_at_with_hooks(
+        &root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        before_publish,
+        sync_parent,
+    )
 }
 
 fn save_file_at_with_hooks(
@@ -1068,12 +1114,17 @@ fn save_file_at_with_hooks(
 
 /// Recreates a document the user explicitly chose to save after deletion.
 /// Publication refuses any replacement that appeared meanwhile.
-pub fn save_missing_file(worktree: &Path, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
+pub fn save_missing_file(
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(path)?;
     let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     let root = worktree_root(worktree)?;
     let (parent, name) = fs_safety::open_parent_beneath(&root, path).map_err(resolve_error)?;
-    let (mut file, temporary) = fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
+    let (mut file, temporary) =
+        fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
     let result = (|| {
         file.write_all(text.as_bytes()).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
@@ -1085,9 +1136,14 @@ pub fn save_missing_file(worktree: &Path, path: &Path, text: &str) -> Result<Sav
     }
     let durability = match fs_safety::sync_directory(&parent) {
         Ok(()) => SaveDurability::Durable,
-        Err(error) => SaveDurability::Unconfirmed { error: error.to_string() },
+        Err(error) => SaveDurability::Unconfirmed {
+            error: error.to_string(),
+        },
     };
-    Ok(SaveOutcome::Saved { content_hash: blake3::hash(text.as_bytes()), durability })
+    Ok(SaveOutcome::Saved {
+        content_hash: blake3::hash(text.as_bytes()),
+        durability,
+    })
 }
 
 /// Writes `bytes` into a temporary sibling that carries the destination's
@@ -1318,15 +1374,29 @@ mod tests {
         fs::write(&source, "pub fn example() { /* λ */ }\n").unwrap();
         let loaded = load_external_source(&source).unwrap();
         assert_eq!(loaded.source, source);
-        assert!(matches!(loaded.content, FileContent::Editable { text, markdown: false, .. } if text.contains("λ")));
+        assert!(
+            matches!(loaded.content, FileContent::Editable { text, markdown: false, .. } if text.contains("λ"))
+        );
         fs::write(&source, b"binary\0bytes").unwrap();
-        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::Binary)));
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::Binary)
+        ));
         fs::write(&source, [0xff]).unwrap();
-        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)));
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
+        ));
         let file = fs::File::create(&source).unwrap();
         file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
-        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })));
-        assert!(matches!(load_external_source(directory.path()).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)));
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })
+        ));
+        assert!(matches!(
+            load_external_source(directory.path()).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)
+        ));
         assert!(load_external_source(Path::new("relative.rs")).is_err());
     }
 
@@ -1870,12 +1940,19 @@ mod tests {
 
     #[test]
     fn explicit_save_after_deletion_recreates_without_replacing_another_writer() {
-        let root = tempfile::tempdir().unwrap(); let path = Path::new("deleted.rs");
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("deleted.rs");
         let outcome = save_missing_file(root.path(), path, "kept buffer").unwrap();
         assert!(matches!(outcome, SaveOutcome::Saved { .. }));
-        assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), "kept buffer");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            "kept buffer"
+        );
         assert!(save_missing_file(root.path(), path, "another writer").is_err());
-        assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), "kept buffer");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            "kept buffer"
+        );
     }
 
     #[test]

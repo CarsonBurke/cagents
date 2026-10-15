@@ -19,8 +19,8 @@ use crate::file_manager::{self, open_system_url};
 #[cfg(feature = "integrated-browser")]
 mod browser_backend;
 mod browser_host;
-mod file_ui;
 mod editor_features;
+mod file_ui;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -3742,7 +3742,9 @@ impl SettingsDraft {
             }
             SettingsField::EditorAutoSave => self.editor_auto_save = previous.editor_auto_save,
             SettingsField::EditorWrapLines => self.editor_wrap_lines = previous.editor_wrap_lines,
-            SettingsField::EditorTabWidth => self.editor_tab_width = previous.editor_tab_width.clone(),
+            SettingsField::EditorTabWidth => {
+                self.editor_tab_width = previous.editor_tab_width.clone()
+            }
             SettingsField::EditorAutoClose => self.editor_auto_close = previous.editor_auto_close,
             SettingsField::DiffHideUnchanged => {
                 self.diff_hide_unchanged = previous.diff_hide_unchanged
@@ -4139,8 +4141,16 @@ fn settings_update(
         SettingsField::EditorSyntaxTheme => settings::EditorSyntaxTheme::from_key(value)
             .map(|theme| next.editor_syntax_theme = theme)
             .ok_or_else(|| "Choose one of the listed syntax themes.".to_owned()),
-        SettingsField::EditorAutoClose => value.parse::<bool>().map(|enabled| next.editor_auto_close = enabled).map_err(|_| "Choose whether brackets and quotes auto-close".to_owned()),
-        SettingsField::EditorTabWidth => value.parse::<u16>().ok().filter(|width| (1..=16).contains(width)).map(|width| next.editor_tab_width = width).ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
+        SettingsField::EditorAutoClose => value
+            .parse::<bool>()
+            .map(|enabled| next.editor_auto_close = enabled)
+            .map_err(|_| "Choose whether brackets and quotes auto-close".to_owned()),
+        SettingsField::EditorTabWidth => value
+            .parse::<u16>()
+            .ok()
+            .filter(|width| (1..=16).contains(width))
+            .map(|width| next.editor_tab_width = width)
+            .ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
         SettingsField::EditorWrapLines => value
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
@@ -10830,7 +10840,9 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
-        let location = crate::editor_navigation::parse_location(self.sidebar_state.files_query().trim()).map(|(_, line, column)| (line, column));
+        let location =
+            crate::editor_navigation::parse_location(self.sidebar_state.files_query().trim())
+                .map(|(_, line, column)| (line, column));
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
@@ -10866,7 +10878,7 @@ impl Cagents {
                         card,
                         path,
                         ignored,
-                    location,
+                        location,
                     });
                 }
                 task
@@ -10931,8 +10943,12 @@ impl Cagents {
                     // completion range or a hover span that predates a
                     // keystroke describes characters the buffer no longer has.
                     match text {
-                        repository_widget::LspChangeText::Text(text) => self.lsp.change(doc,version,&edits,&text),
-                        repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
+                        repository_widget::LspChangeText::Text(text) => {
+                            self.lsp.change(doc, version, &edits, &text)
+                        }
+                        repository_widget::LspChangeText::Snapshot(source) => {
+                            self.lsp.change_snapshot(doc, version, &edits, source)
+                        }
                     }
                     let synchronized_version = self.lsp.document_version(doc);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
@@ -11006,8 +11022,13 @@ impl Cagents {
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
         let status = match text {
-            repository_widget::LspChangeText::Text(text) => self.lsp.open(doc,path,worktree,language,version,text),
-            repository_widget::LspChangeText::Snapshot(source) => self.lsp.open_snapshot(doc,path,worktree,language,version,source.clone()),
+            repository_widget::LspChangeText::Text(text) => {
+                self.lsp.open(doc, path, worktree, language, version, text)
+            }
+            repository_widget::LspChangeText::Snapshot(source) => {
+                self.lsp
+                    .open_snapshot(doc, path, worktree, language, version, source.clone())
+            }
         };
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));
@@ -11059,10 +11080,16 @@ impl Cagents {
             // manager can place it against the text it actually indexes.
             LspCoordinates::Utf16 => {
                 let converted = if let Some(doc) = self.lsp_document(card) {
-                    self.lsp.scalar_position(doc, jump.at).map_err(|error| error.to_string())
+                    self.lsp
+                        .scalar_position(doc, jump.at)
+                        .map_err(|error| error.to_string())
                 } else {
                     match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime)) => runtime.scalar_position_for_utf16(jump.at).ok_or_else(|| "the target position is outside the source text".to_owned()),
+                        Some(CardRuntime::Repository(runtime)) => {
+                            runtime.scalar_position_for_utf16(jump.at).ok_or_else(|| {
+                                "the target position is outside the source text".to_owned()
+                            })
+                        }
                         _ => Err("the source buffer was closed".into()),
                     }
                 };
@@ -11080,7 +11107,11 @@ impl Cagents {
         };
         let focus = self.move_lsp_caret(card, at);
         self.complete_cross_card_jump(card);
-        if self.modal_is_open() || self.workspace.focused() != Some(card) { Task::none() } else { focus }
+        if self.modal_is_open() || self.workspace.focused() != Some(card) {
+            Task::none()
+        } else {
+            focus
+        }
     }
 
     /// Places the caret and gives the editor the keyboard.
@@ -11106,7 +11137,8 @@ impl Cagents {
     }
 
     fn definition_request_current(&self, card: CardId, origin: &EditorDefinitionRequest) -> bool {
-        !self.modal_is_open() && self.workspace.focused() == Some(card)
+        !self.modal_is_open()
+            && self.workspace.focused() == Some(card)
             && self.workspace.focus_revision() == origin.focus_revision
             && self.lsp_document(card) == Some(origin.doc)
             && self.lsp.document_version(origin.doc) == origin.version
@@ -11115,13 +11147,28 @@ impl Cagents {
     }
 
     fn retire_stale_definition_requests(&mut self) {
-        let stale = self.lsp_contexts.iter().filter_map(|(card, state)| state.editor_navigation.as_ref()
-            .filter(|origin| !self.definition_request_current(*card, origin)).map(|_| *card)).collect::<Vec<_>>();
-        for card in stale { if let Some(state) = self.lsp_contexts.get_mut(&card) { state.editor_navigation = None; } }
+        let stale = self
+            .lsp_contexts
+            .iter()
+            .filter_map(|(card, state)| {
+                state
+                    .editor_navigation
+                    .as_ref()
+                    .filter(|origin| !self.definition_request_current(*card, origin))
+                    .map(|_| *card)
+            })
+            .collect::<Vec<_>>();
+        for card in stale {
+            if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                state.editor_navigation = None;
+            }
+        }
     }
 
     fn update_lsp_message(&mut self, event: LspEvent) -> Task<Message> {
-        if let Some(task) = self.editor_feature_event(&event) { return task; }
+        if let Some(task) = self.editor_feature_event(&event) {
+            return task;
+        }
         let navigation = if let LspEvent::Locations {
             doc,
             kind: crate::lsp::LocationKind::Definition,
@@ -11132,9 +11179,17 @@ impl Cagents {
         {
             self.lsp_documents.get(doc).copied().and_then(|card| {
                 let state = self.lsp_contexts.get_mut(&card)?;
-                if !state.editor_navigation.as_ref().is_some_and(|origin| origin.request == *request && origin.doc == *doc) { return None; }
+                if !state
+                    .editor_navigation
+                    .as_ref()
+                    .is_some_and(|origin| origin.request == *request && origin.doc == *doc)
+                {
+                    return None;
+                }
                 let origin = state.editor_navigation.take()?;
-                if !self.definition_request_current(card, &origin) { return None; }
+                if !self.definition_request_current(card, &origin) {
+                    return None;
+                }
                 Some((card, items.clone()))
             })
         } else {
@@ -11143,7 +11198,8 @@ impl Cagents {
         self.apply_lsp_event(event);
         if let Some((card, locations)) = navigation {
             if locations.len() == 1
-                && let (crate::lsp::LspTarget::Workspace { path } | crate::lsp::LspTarget::External { path }) = &locations[0].target
+                && let (crate::lsp::LspTarget::Workspace { path }
+                | crate::lsp::LspTarget::External { path }) = &locations[0].target
             {
                 return self.jump_to_lsp_location(
                     card,
@@ -11186,7 +11242,7 @@ impl Cagents {
             | LspEvent::Status { doc, .. }
             | LspEvent::Progress { doc, .. }
             | LspEvent::RequestFailed { doc, .. }
-                        | LspEvent::PrepareRename { doc, .. }
+            | LspEvent::PrepareRename { doc, .. }
             | LspEvent::WorkspaceEdit { doc, .. }
             | LspEvent::CodeActions { doc, .. }
             | LspEvent::CodeActionResolved { doc, .. }
@@ -11213,14 +11269,14 @@ impl Cagents {
                 // status here instead of leaving a stale Ready indicator.
                 state.context.status = Some(self.lsp.status(doc));
             }
-            LspEvent::PrepareRename {..} |
-            LspEvent::WorkspaceEdit {..} |
-            LspEvent::CodeActions {..} |
-            LspEvent::CodeActionResolved {..} |
-            LspEvent::SignatureHelp {..} |
-            LspEvent::ServerMessage {..} |
-            LspEvent::CommandExecuted {..} |
-            LspEvent::ApplyWorkspaceEdit {..} => {},
+            LspEvent::PrepareRename { .. }
+            | LspEvent::WorkspaceEdit { .. }
+            | LspEvent::CodeActions { .. }
+            | LspEvent::CodeActionResolved { .. }
+            | LspEvent::SignatureHelp { .. }
+            | LspEvent::ServerMessage { .. }
+            | LspEvent::CommandExecuted { .. }
+            | LspEvent::ApplyWorkspaceEdit { .. } => {}
             LspEvent::Diagnostics { version, items, .. } => {
                 // A delayed publication must not erase the shifted standing
                 // set for a newer buffer revision.
@@ -11262,8 +11318,10 @@ impl Cagents {
             }
             LspEvent::Status { status, .. } => {
                 state.context.status = Some(status);
-                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.set_editor_code_action_support(self.lsp.capabilities(doc).code_actions); }
-            },
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.set_editor_code_action_support(self.lsp.capabilities(doc).code_actions);
+                }
+            }
             LspEvent::Progress { progress, .. } => {
                 // Progress is transient by definition, so it is shown in the
                 // notice slot the surface already has and cleared on `done`
@@ -11387,28 +11445,57 @@ impl Cagents {
     }
 
     fn capture_editor_location(&self, card: CardId) -> Option<crate::editor_locations::Location> {
-        let CardRuntime::Repository(runtime) = self.cards.get(&card)? else { return None; };
-        Some(crate::editor_locations::Location { card, source: runtime.source_tab_path()?, anchor: runtime.editor_navigation_anchor()? })
+        let CardRuntime::Repository(runtime) = self.cards.get(&card)? else {
+            return None;
+        };
+        Some(crate::editor_locations::Location {
+            card,
+            source: runtime.source_tab_path()?,
+            anchor: runtime.editor_navigation_anchor()?,
+        })
     }
 
     fn collect_editor_location_jump(&mut self, card: CardId) {
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
-            && let Some(origin) = runtime.take_location_jump_origin(card) {
-            self.editor_features.jump_origins.entry(card).or_insert(origin);
+            && let Some(origin) = runtime.take_location_jump_origin(card)
+        {
+            self.editor_features
+                .jump_origins
+                .entry(card)
+                .or_insert(origin);
         }
         self.complete_cross_card_jump(card);
     }
 
     fn complete_cross_card_jump(&mut self, card: CardId) {
-        if self.workspace.focused() != Some(card) || self.lsp_pending_jumps.contains_key(&card) || self.editor_features.history_restores.contains_key(&card) { return; }
-        let Some(target) = self.capture_editor_location(card) else { return; };
-        let Some(origin) = self.editor_features.jump_origins.remove(&card) else { return; };
-        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.take_location_jump_origin(card); }
-        self.editor_features.location_history.record_jump(origin, target);
+        if self.workspace.focused() != Some(card)
+            || self.lsp_pending_jumps.contains_key(&card)
+            || self.editor_features.history_restores.contains_key(&card)
+        {
+            return;
+        }
+        let Some(target) = self.capture_editor_location(card) else {
+            return;
+        };
+        let Some(origin) = self.editor_features.jump_origins.remove(&card) else {
+            return;
+        };
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+            runtime.take_location_jump_origin(card);
+        }
+        self.editor_features
+            .location_history
+            .record_jump(origin, target);
     }
 
-    fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
-        if self.workspace.focused() != Some(card) { return None; }
+    fn navigate_cross_card_location(
+        &mut self,
+        card: CardId,
+        forward: bool,
+    ) -> Option<Task<Message>> {
+        if self.workspace.focused() != Some(card) {
+            return None;
+        }
         self.collect_editor_location_jump(card);
         let from = self.capture_editor_location(card)?;
         self.editor_features.location_history.observe_origin(&from);
@@ -11420,57 +11507,119 @@ impl Cagents {
         let same_source = matches!(self.cards.get(&target.location.card), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&target.location.source) && runtime.editor_navigation_anchor().is_some());
         if !same_source {
             let (view, external) = match self.cards.get(&target.location.card)? {
-                CardRuntime::Repository(runtime) => (runtime.descriptor.clone(), !target.location.source.starts_with(&runtime.descriptor.worktree)),
+                CardRuntime::Repository(runtime) => (
+                    runtime.descriptor.clone(),
+                    !target
+                        .location
+                        .source
+                        .starts_with(&runtime.descriptor.worktree),
+                ),
                 _ => return None,
             };
             // Reopen as a dedicated source tab: an unrelated dirty buffer in
             // the old card is never replaced in order to satisfy history.
-            let task = self.open_lsp_source_tab(view, target.location.source.clone(), LspPosition::new(0, 0), LspCoordinates::Scalar, external, None);
+            let task = self.open_lsp_source_tab(
+                view,
+                target.location.source.clone(),
+                LspPosition::new(0, 0),
+                LspCoordinates::Scalar,
+                external,
+                None,
+            );
             let opened = self.workspace.focused()?;
-            if !matches!(self.cards.get(&opened), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&target.location.source)) { return Some(task); }
+            if !matches!(self.cards.get(&opened), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&target.location.source))
+            {
+                return Some(task);
+            }
             self.editor_features.jump_origins.remove(&opened);
-            self.editor_features.history_restores.insert(opened, (from, target));
+            self.editor_features
+                .history_restores
+                .insert(opened, (from, target));
             self.finish_editor_history_restore(opened);
             return Some(task);
         }
         let previous = match self.cards.get_mut(&target.location.card)? {
             CardRuntime::Repository(runtime) => {
                 let previous = runtime.editor_navigation_anchor()?;
-                if !runtime.restore_editor_navigation_anchor(target.location.anchor) { return None; }
+                if !runtime.restore_editor_navigation_anchor(target.location.anchor) {
+                    return None;
+                }
                 previous
             }
             _ => return None,
         };
         let Ok(update) = self.workspace.focus(target.location.card) else {
-            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&target.location.card) { runtime.restore_editor_navigation_anchor(previous); }
+            if let Some(CardRuntime::Repository(runtime)) =
+                self.cards.get_mut(&target.location.card)
+            {
+                runtime.restore_editor_navigation_anchor(previous);
+            }
             return None;
         };
         let from_card = from.card;
-        if !self.editor_features.location_history.navigate(from, &target) {
-            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&target.location.card) { runtime.restore_editor_navigation_anchor(previous); }
-            let rollback = self.workspace.focus(from_card).unwrap_or_else(|_| ViewportUpdate::unchanged());
+        if !self
+            .editor_features
+            .location_history
+            .navigate(from, &target)
+        {
+            if let Some(CardRuntime::Repository(runtime)) =
+                self.cards.get_mut(&target.location.card)
+            {
+                runtime.restore_editor_navigation_anchor(previous);
+            }
+            let rollback = self
+                .workspace
+                .focus(from_card)
+                .unwrap_or_else(|_| ViewportUpdate::unchanged());
             return Some(self.apply_viewport(rollback, true, false));
         }
-        let CardRuntime::Repository(runtime) = self.cards.get(&target.location.card)? else { return None; };
+        let CardRuntime::Repository(runtime) = self.cards.get(&target.location.card)? else {
+            return None;
+        };
         let focus = repository_task(runtime.focus_editor(target.location.card));
-        Some(Task::batch([focus, self.apply_viewport(update, true, false)]))
+        Some(Task::batch([
+            focus,
+            self.apply_viewport(update, true, false),
+        ]))
     }
 
     fn finish_editor_history_restore(&mut self, card: CardId) {
-        let Some((_, target)) = self.editor_features.history_restores.get(&card) else { return; };
-        if self.workspace.focused() != Some(card) || !self.editor_features.location_history.is_current_target(target) {
-            self.editor_features.history_restores.remove(&card); return;
+        let Some((_, target)) = self.editor_features.history_restores.get(&card) else {
+            return;
+        };
+        if self.workspace.focused() != Some(card)
+            || !self
+                .editor_features
+                .location_history
+                .is_current_target(target)
+        {
+            self.editor_features.history_restores.remove(&card);
+            return;
         }
-        if self.lsp_pending_jumps.contains_key(&card) { return; }
-        let Some(loaded) = self.capture_editor_location(card) else { return; };
-        if loaded.source != target.location.source { self.editor_features.history_restores.remove(&card); return; }
+        if self.lsp_pending_jumps.contains_key(&card) {
+            return;
+        }
+        let Some(loaded) = self.capture_editor_location(card) else {
+            return;
+        };
+        if loaded.source != target.location.source {
+            self.editor_features.history_restores.remove(&card);
+            return;
+        }
         let (from, target) = self.editor_features.history_restores.remove(&card).unwrap();
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
-            && runtime.restore_editor_navigation_anchor(target.location.anchor) {
+            && runtime.restore_editor_navigation_anchor(target.location.anchor)
+        {
             runtime.take_location_jump_origin(card);
-            if self.editor_features.location_history.navigate(from, &target)
-                && let Some(current) = self.capture_editor_location(card) {
-                self.editor_features.location_history.replace_current(current);
+            if self
+                .editor_features
+                .location_history
+                .navigate(from, &target)
+                && let Some(current) = self.capture_editor_location(card)
+            {
+                self.editor_features
+                    .location_history
+                    .replace_current(current);
             }
         }
         self.editor_features.jump_origins.remove(&card);
@@ -11483,34 +11632,73 @@ impl Cagents {
         at: LspPosition,
         coordinates: LspCoordinates,
     ) -> Task<Message> {
-        let open_path = self.capture_editor_location(card).map(|location| location.source);
+        let open_path = self
+            .capture_editor_location(card)
+            .map(|location| location.source);
         if open_path.as_ref() == Some(&path) {
             let moved = match self.cards.get_mut(&card) {
-                Some(CardRuntime::Repository(runtime)) => runtime.move_cursor_to_coordinates(at, coordinates),
+                Some(CardRuntime::Repository(runtime)) => {
+                    runtime.move_cursor_to_coordinates(at, coordinates)
+                }
                 _ => false,
             };
             if !moved {
-                self.status = Some(TransientNotice::warning("The source position is no longer valid"));
+                self.status = Some(TransientNotice::warning(
+                    "The source position is no longer valid",
+                ));
                 return Task::none();
             }
             self.collect_editor_location_jump(card);
-            return if self.modal_is_open() || self.workspace.focused() != Some(card) { Task::none() }
-                else { match self.cards.get(&card) { Some(CardRuntime::Repository(runtime)) => repository_task(runtime.focus_editor(card)), _ => Task::none() } };
+            return if self.modal_is_open() || self.workspace.focused() != Some(card) {
+                Task::none()
+            } else {
+                match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        repository_task(runtime.focus_editor(card))
+                    }
+                    _ => Task::none(),
+                }
+            };
         }
         let (view, read_only, dirty) = match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) => (runtime.descriptor.clone(), runtime.is_read_only_source(), runtime.blocks_navigation()),
+            Some(CardRuntime::Repository(runtime)) => (
+                runtime.descriptor.clone(),
+                runtime.is_read_only_source(),
+                runtime.blocks_navigation(),
+            ),
             _ => return Task::none(),
         };
-        let relative = path.strip_prefix(&view.worktree).ok().map(Path::to_path_buf);
+        let relative = path
+            .strip_prefix(&view.worktree)
+            .ok()
+            .map(Path::to_path_buf);
         if relative.is_none() || read_only || dirty {
             let origin = self.capture_editor_location(card);
-            return self.open_lsp_source_tab(view, path, at, coordinates, relative.is_none(), origin);
+            return self.open_lsp_source_tab(
+                view,
+                path,
+                at,
+                coordinates,
+                relative.is_none(),
+                origin,
+            );
         }
         let relative = relative.unwrap();
-        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.remember_jump_origin(); }
-        self.lsp_pending_jumps.insert(card, PendingLspJump { path, at, coordinates });
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+            runtime.remember_jump_origin();
+        }
+        self.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path,
+                at,
+                coordinates,
+            },
+        );
         match self.cards.get_mut(&card) {
-            Some(CardRuntime::Repository(runtime)) => repository_task(runtime.open_file_location(card, relative, at.line as usize, 0, 0)),
+            Some(CardRuntime::Repository(runtime)) => {
+                repository_task(runtime.open_file_location(card, relative, at.line as usize, 0, 0))
+            }
             _ => Task::none(),
         }
     }
@@ -11585,11 +11773,15 @@ impl Cagents {
         card: CardId,
         action: repository_widget::EditorLspAction,
     ) -> Task<Message> {
-        use repository_widget::EditorLspAction as Action;
         use editor_features::Action as Feature;
+        use repository_widget::EditorLspAction as Action;
         if let Action::CodeActionsAt(at) = &action {
             return match at {
-                Some(at) => { let focus = self.move_lsp_caret(card, *at); let request = self.update_editor_features(Feature::CodeActions(card)); Task::batch([focus, request]) },
+                Some(at) => {
+                    let focus = self.move_lsp_caret(card, *at);
+                    let request = self.update_editor_features(Feature::CodeActions(card));
+                    Task::batch([focus, request])
+                }
                 None => Task::none(),
             };
         }
@@ -11598,14 +11790,20 @@ impl Cagents {
             Action::RenameDraft(draft) => Some(Feature::RenameDraft(card, draft.clone())),
             Action::SubmitRename(value) => Some(Feature::SubmitRename(card, value.clone())),
             Action::CancelRename => Some(Feature::CancelRename(card)),
-            Action::Format { selection } => Some(Feature::Format { card, selection: *selection, save_after: false }),
+            Action::Format { selection } => Some(Feature::Format {
+                card,
+                selection: *selection,
+                save_after: false,
+            }),
             Action::CodeActions => Some(Feature::CodeActions(card)),
             Action::ChooseCodeAction(index) => Some(Feature::ChooseCodeAction(card, *index)),
             Action::Signature => Some(Feature::Signature(card, None)),
             Action::Dismiss => Some(Feature::Dismiss(card)),
             _ => None,
         };
-        if let Some(feature) = feature { return self.update_editor_features(feature); }
+        if let Some(feature) = feature {
+            return self.update_editor_features(feature);
+        }
         match action {
             Action::Complete => self.request_lsp(card, LspRequestKind::Completion),
             Action::CompleteAt { doc, version, at }
@@ -11644,15 +11842,25 @@ impl Cagents {
                     _ => None,
                 });
                 if let Some(at) = at {
-                    if self.modal_is_open() || self.workspace.focused() != Some(card) { return Task::none(); }
+                    if self.modal_is_open() || self.workspace.focused() != Some(card) {
+                        return Task::none();
+                    }
                     let (caret, selection) = match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime)) => (runtime.cursor_position(), runtime.editor_selection_range()),
+                        Some(CardRuntime::Repository(runtime)) => {
+                            (runtime.cursor_position(), runtime.editor_selection_range())
+                        }
                         _ => return Task::none(),
                     };
                     let request = self.lsp.request_definition(doc, at);
-                    self.lsp_contexts.entry(card).or_default().editor_navigation = Some(EditorDefinitionRequest {
-                        request, doc, version: self.lsp.document_version(doc), caret, selection, focus_revision: self.workspace.focus_revision(),
-                    });
+                    self.lsp_contexts.entry(card).or_default().editor_navigation =
+                        Some(EditorDefinitionRequest {
+                            request,
+                            doc,
+                            version: self.lsp.document_version(doc),
+                            caret,
+                            selection,
+                            focus_revision: self.workspace.focus_revision(),
+                        });
                 }
                 Task::none()
             }
@@ -11673,7 +11881,10 @@ impl Cagents {
                 }
                 task
             }
-            Action::Next(_) | Action::CodeActionNext(_) | Action::Diagnostic(_) | Action::Dismiss => {
+            Action::Next(_)
+            | Action::CodeActionNext(_)
+            | Action::Diagnostic(_)
+            | Action::Dismiss => {
                 if matches!(action, Action::Dismiss) {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
@@ -11688,7 +11899,16 @@ impl Cagents {
                 self.collect_editor_location_jump(card);
                 task
             }
-            Action::CompleteAt { .. } | Action::Rename | Action::RenameDraft(_) | Action::SubmitRename(_) | Action::CancelRename | Action::Format { .. } | Action::CodeActions | Action::CodeActionsAt(_) | Action::ChooseCodeAction(_) | Action::Signature => Task::none(),
+            Action::CompleteAt { .. }
+            | Action::Rename
+            | Action::RenameDraft(_)
+            | Action::SubmitRename(_)
+            | Action::CancelRename
+            | Action::Format { .. }
+            | Action::CodeActions
+            | Action::CodeActionsAt(_)
+            | Action::ChooseCodeAction(_)
+            | Action::Signature => Task::none(),
         }
     }
 
@@ -11701,7 +11921,12 @@ impl Cagents {
             .take()
             .expect("the pending open was just matched");
         if let Some((line, column)) = open.location {
-            return cosmic::task::message(Message::Repository(RepositoryAction::OpenLocation { card, path: open.path, line: line - 1, column: column - 1 }));
+            return cosmic::task::message(Message::Repository(RepositoryAction::OpenLocation {
+                card,
+                path: open.path,
+                line: line - 1,
+                column: column - 1,
+            }));
         }
         let action = if open.ignored {
             let Ok(path) = RepoPath::parse(&open.path) else {
@@ -12034,7 +12259,9 @@ impl Cagents {
     }
 
     fn other_modal_is_open(&self) -> bool {
-        self.editor_features.modal_open() || self.form_dialog_is_open() || self.modal_over_form_dialogs()
+        self.editor_features.modal_open()
+            || self.form_dialog_is_open()
+            || self.modal_over_form_dialogs()
     }
 
     /// The worktree and pull request dialogs: forms, whose focused field
@@ -12048,7 +12275,9 @@ impl Cagents {
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
-        if self.editor_features.modal_open() { return self.update_editor_features(editor_features::Action::CancelPreview); }
+        if self.editor_features.modal_open() {
+            return self.update_editor_features(editor_features::Action::CancelPreview);
+        }
         if self.automation_approval_open() {
             return self.cancel_automation_approval();
         }
@@ -12667,7 +12896,11 @@ impl Cagents {
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
-        if self.editor_features.publishing() { return Some("Wait for the workspace edit to finish applying before closing the window."); }
+        if self.editor_features.publishing() {
+            return Some(
+                "Wait for the workspace edit to finish applying before closing the window.",
+            );
+        }
         if let Some(blocker) = self.automation_ui.draft_close_blocker() {
             return Some(blocker);
         }
@@ -13504,7 +13737,10 @@ impl Cagents {
             self.settings.editor_wrap_lines,
             self.settings.editor_syntax_theme,
         );
-        if previous.editor_auto_close != self.settings.editor_auto_close || previous.editor_tab_width != self.settings.editor_tab_width || previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
+        if previous.editor_auto_close != self.settings.editor_auto_close
+            || previous.editor_tab_width != self.settings.editor_tab_width
+            || previous.editor_wrap_lines != wrap_lines
+            || previous.editor_syntax_theme != syntax_theme
         {
             for runtime in self.cards.values_mut() {
                 match runtime {
@@ -13516,8 +13752,10 @@ impl Cagents {
                     }
                     CardRuntime::PullRequests(pane) => {
                         pane.runtime.set_wrap_lines(wrap_lines);
-                        pane.runtime.set_editor_tab_width(self.settings.editor_tab_width);
-                        pane.runtime.set_editor_auto_close(self.settings.editor_auto_close);
+                        pane.runtime
+                            .set_editor_tab_width(self.settings.editor_tab_width);
+                        pane.runtime
+                            .set_editor_auto_close(self.settings.editor_auto_close);
                         pane.runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
@@ -13595,11 +13833,13 @@ impl Cagents {
         // `begin_shutdown` spawns the reap on the runtime the sessions run on,
         // so it survives if no new document is opened. New launches wait
         // for the same reap instead of overlapping a second admission cap.
-        let predecessor=self.lsp.begin_shutdown();
-        self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
-            self.settings.lsp_idle_timeout_seconds,
-            self.settings.lsp_max_sessions,
-        ).after_shutdown(predecessor);
+        let predecessor = self.lsp.begin_shutdown();
+        self.lsp = LspManager::new(self.settings.language_servers.clone())
+            .with_lifecycle(
+                self.settings.lsp_idle_timeout_seconds,
+                self.settings.lsp_max_sessions,
+            )
+            .after_shutdown(predecessor);
         self.lsp_contexts.clear();
         self.lsp_documents.clear();
         self.lsp_pending_jumps.clear();
@@ -14997,11 +15237,19 @@ impl Application for Cagents {
                 self.open_document_link(Some(card), &uri)
             }
             Message::Repository(RepositoryAction::NavigateLocation { card, forward }) => {
-                if self.modal_is_open() { return Task::none(); }
-                if let Some(task) = self.navigate_cross_card_location(card, forward) { return task; }
-                if self.editor_features.location_history.has_entries() { return Task::none(); }
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                if let Some(task) = self.navigate_cross_card_location(card, forward) {
+                    return task;
+                }
+                if self.editor_features.location_history.has_entries() {
+                    return Task::none();
+                }
                 match self.cards.get_mut(&card) {
-                    Some(CardRuntime::Repository(runtime)) => repository_task(runtime.update(RepositoryAction::NavigateLocation { card, forward })),
+                    Some(CardRuntime::Repository(runtime)) => repository_task(
+                        runtime.update(RepositoryAction::NavigateLocation { card, forward }),
+                    ),
                     _ => Task::none(),
                 }
             }
@@ -15038,7 +15286,14 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let selected = match self.cards.get(&card) {
-                    Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => runtime.selected_path().map(|path| (runtime.descriptor.worktree.join(path), runtime.editor_caret_for(&editor_id))),
+                    Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
+                        runtime.selected_path().map(|path| {
+                            (
+                                runtime.descriptor.worktree.join(path),
+                                runtime.editor_caret_for(&editor_id),
+                            )
+                        })
+                    }
                     _ => None,
                 };
                 selected.map_or_else(Task::none, |(path, caret)| {
@@ -15140,14 +15395,29 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
-                if matches!(&action, RepositoryAction::Save { overwrite: false, .. }) {
-                    if let Some(task) = self.maybe_format_before_save(card) { return task; }
+                if matches!(
+                    &action,
+                    RepositoryAction::Save {
+                        overwrite: false,
+                        ..
+                    }
+                ) {
+                    if let Some(task) = self.maybe_format_before_save(card) {
+                        return task;
+                    }
                 }
-                if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = &action {
+                if let RepositoryAction::AutoSaveDue {
+                    identity,
+                    revision,
+                    ticket,
+                } = &action
+                {
                     if self.format_on_save_enabled(card) {
                         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                             if runtime.take_auto_save_due(identity, *revision, *ticket) {
-                                return self.maybe_format_before_save(card).unwrap_or_else(Task::none);
+                                return self
+                                    .maybe_format_before_save(card)
+                                    .unwrap_or_else(Task::none);
                             }
                         }
                         return Task::none();
@@ -16255,19 +16525,25 @@ impl Application for Cagents {
                 result,
             } => self.completed_terminal_closed(card, session, result),
             Message::SaveAndCloseRepository(id) => {
-                if self.dirty_repository_close.as_ref().is_some_and(|close| close.card == id) {
-                    if let Some(task) = self.maybe_format_before_save(id) { return task; }
+                if self
+                    .dirty_repository_close
+                    .as_ref()
+                    .is_some_and(|close| close.card == id)
+                {
+                    if let Some(task) = self.maybe_format_before_save(id) {
+                        return task;
+                    }
                 }
                 match self.cards.get_mut(&id) {
-                Some(CardRuntime::Repository(runtime))
-                    if self
-                        .dirty_repository_close
-                        .as_ref()
-                        .is_some_and(|close| close.card == id) =>
-                {
-                    repository_task(runtime.request_save(id, false))
-                }
-                _ => Task::none(),
+                    Some(CardRuntime::Repository(runtime))
+                        if self
+                            .dirty_repository_close
+                            .as_ref()
+                            .is_some_and(|close| close.card == id) =>
+                    {
+                        repository_task(runtime.request_save(id, false))
+                    }
+                    _ => Task::none(),
                 }
             }
             Message::OverwriteAndCloseRepository(id) => match self.cards.get_mut(&id) {
@@ -16894,7 +17170,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
-                if let Some(task) = self.editor_feature_key_event(&event) { return task; }
+                if let Some(task) = self.editor_feature_key_event(&event) {
+                    return task;
+                }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
@@ -17120,11 +17398,15 @@ impl Application for Cagents {
                 // The dialog is an overlay, so it has already seen the
                 // keystroke by the time this runs, and what it does with one
                 // is its own affair.
-                if !captured && is_escape_press(&event)
+                if !captured
+                    && is_escape_press(&event)
                     && let Some(card) = self.workspace.focused()
                     && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
-                    && runtime.go_to_line_is_open() {
-                    return repository_task(runtime.update(RepositoryAction::CloseGoToLine { card }));
+                    && runtime.go_to_line_is_open()
+                {
+                    return repository_task(
+                        runtime.update(RepositoryAction::CloseGoToLine { card }),
+                    );
                 }
                 if self.workspace_inputs_blocked() {
                     return Task::none();
@@ -17977,7 +18259,9 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
-        if let Some(dialog) = self.editor_feature_dialog() { return Some(dialog); }
+        if let Some(dialog) = self.editor_feature_dialog() {
+            return Some(dialog);
+        }
         if let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);
         }
@@ -21374,26 +21658,44 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         let mut app = context_inspector_test_app(false);
-        app.settings_path = Some(path.clone()); app.settings_write_blocked = false;
-        app.settings.editor_tab_width = 8; app.settings.editor_auto_close = false;
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.editor_tab_width = 8;
+        app.settings.editor_auto_close = false;
         app.settings.terminal_padding = 12.0;
         app.save_settings_now().unwrap();
         app.settings_draft.terminal_font_size = "unfinished".into();
-        app.settings_invalid.insert(SettingsField::TerminalFontSize, "Enter a number".into());
+        app.settings_invalid
+            .insert(SettingsField::TerminalFontSize, "Enter a number".into());
         app.settings_draft.terminal_font_family = "Pending font".into();
-        app.settings_pending.insert(SettingsField::TerminalFontFamily, (9, "Pending font".into()));
+        app.settings_pending.insert(
+            SettingsField::TerminalFontFamily,
+            (9, "Pending font".into()),
+        );
         let reset = app.reset_settings_category(SettingsCategory::Editor);
         settle_settings_task(&mut app, reset);
         let saved = settings::load_live(&path).unwrap();
         for actual in [&app.settings, &saved] {
-            assert_eq!(actual.editor_tab_width, 4); assert!(actual.editor_auto_close);
+            assert_eq!(actual.editor_tab_width, 4);
+            assert!(actual.editor_auto_close);
             assert_eq!(actual.terminal_padding, 12.0);
         }
         assert_eq!(app.settings_draft.terminal_font_size, "unfinished");
         assert_eq!(app.settings_draft.terminal_font_family, "Pending font");
-        assert!(app.settings_invalid.contains_key(&SettingsField::TerminalFontSize));
-        assert!(app.settings_pending.contains_key(&SettingsField::TerminalFontFamily));
-        for field in [SettingsField::EditorTabWidth, SettingsField::EditorAutoClose] { assert!(SettingsField::PREFERENCES.contains(&field)); }
+        assert!(
+            app.settings_invalid
+                .contains_key(&SettingsField::TerminalFontSize)
+        );
+        assert!(
+            app.settings_pending
+                .contains_key(&SettingsField::TerminalFontFamily)
+        );
+        for field in [
+            SettingsField::EditorTabWidth,
+            SettingsField::EditorAutoClose,
+        ] {
+            assert!(SettingsField::PREFERENCES.contains(&field));
+        }
     }
 
     #[test]
@@ -21401,17 +21703,25 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         let mut app = context_inspector_test_app(false);
-        app.settings_path = Some(path.clone()); app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
         app.save_settings_now().unwrap();
         drop(app.queue_setting_input(SettingsField::EditorTabWidth, "unfinished".into()));
         drop(app.queue_setting_input(SettingsField::EditorAutoClose, "false".into()));
-        let mut external = settings::load_live(&path).unwrap(); external.show_status_bar = !external.show_status_bar;
+        let mut external = settings::load_live(&path).unwrap();
+        external.show_status_bar = !external.show_status_bar;
         settings::save(&path, &external).unwrap();
         drop(app.reload_settings(settings::load_live_observed(&path)));
         assert_eq!(app.settings_draft.editor_tab_width, "unfinished");
         assert!(!app.settings_draft.editor_auto_close);
-        assert!(app.settings_pending.contains_key(&SettingsField::EditorTabWidth));
-        assert!(app.settings_pending.contains_key(&SettingsField::EditorAutoClose));
+        assert!(
+            app.settings_pending
+                .contains_key(&SettingsField::EditorTabWidth)
+        );
+        assert!(
+            app.settings_pending
+                .contains_key(&SettingsField::EditorAutoClose)
+        );
         assert_eq!(app.settings.show_status_bar, external.show_status_bar);
     }
 
@@ -25889,7 +26199,7 @@ mod tests {
             message: message.into(),
             source: None,
             code: None,
-            protocol:None,
+            protocol: None,
         }
     }
 
@@ -25944,12 +26254,25 @@ mod tests {
     #[test]
     fn cross_card_source_history_restores_dirty_origin_and_readonly_target_native_anchors() {
         let (mut app, origin) = editing_repository_app();
-        let (mut origin_runtime, _) = RepositoryRuntime::open_fixture(origin, "origin.rs", "origin α\nsecond\n");
+        let (mut origin_runtime, _) =
+            RepositoryRuntime::open_fixture(origin, "origin.rs", "origin α\nsecond\n");
         origin_runtime.set_auto_save(false);
-        drop(origin_runtime.update(RepositoryAction::EditorAction { card: origin, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert('!')) }));
-        let origin_anchor = crate::model::EditorNavigation { caret: crate::model::EditorPosition { line: 1, column: 3 }, selection: Some(crate::model::EditorPosition { line: 0, column: 2 }), scroll_line: 1, scroll_vertical: 3.0, scroll_horizontal: 4.0 };
+        drop(origin_runtime.update(RepositoryAction::EditorAction {
+            card: origin,
+            action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert(
+                '!',
+            )),
+        }));
+        let origin_anchor = crate::model::EditorNavigation {
+            caret: crate::model::EditorPosition { line: 1, column: 3 },
+            selection: Some(crate::model::EditorPosition { line: 0, column: 2 }),
+            scroll_line: 1,
+            scroll_vertical: 3.0,
+            scroll_horizontal: 4.0,
+        };
         assert!(origin_runtime.restore_editor_navigation_anchor(origin_anchor));
-        app.cards.insert(origin, CardRuntime::Repository(Box::new(origin_runtime)));
+        app.cards
+            .insert(origin, CardRuntime::Repository(Box::new(origin_runtime)));
         let from = app.capture_editor_location(origin).unwrap();
         let target = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(target, "stdlib.rs", "a😀éX\n");
@@ -25957,72 +26280,185 @@ mod tests {
         assert!(runtime.move_cursor_to_coordinates(LspPosition::new(0, 4), LspCoordinates::Utf16));
         let target_anchor = runtime.editor_navigation_anchor().unwrap();
         let view = runtime.descriptor.clone();
-        app.cards.insert(target, CardRuntime::Repository(Box::new(runtime)));
-        Arc::make_mut(&mut app.durable).cards.push(CardState { id: target, generation: 0, title: "Std source".into(), width_fraction: 0.7, existence: Existence::Open, exposure: Exposure::Visible, residency: Residency::Hot, kind: CardKind::Repository(view) });
-        app.workspace.add_card(WorkspaceCard::new(target, "Std source", CardWidth::Fraction(0.7)).unwrap(), 1, true).unwrap();
+        app.cards
+            .insert(target, CardRuntime::Repository(Box::new(runtime)));
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: target,
+            generation: 0,
+            title: "Std source".into(),
+            width_fraction: 0.7,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+            kind: CardKind::Repository(view),
+        });
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(target, "Std source", CardWidth::Fraction(0.7)).unwrap(),
+                1,
+                true,
+            )
+            .unwrap();
         app.editor_features.jump_origins.insert(target, from);
         app.complete_cross_card_jump(target);
         // A more recent ordinary jump is in the same window sequence: Back
         // restores its local origin before crossing back to the dirty card.
-        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card: target })));
-        drop(app.update(Message::Repository(RepositoryAction::GoToLineChanged { card: target, value: "1:1".into() })));
-        drop(app.update(Message::Repository(RepositoryAction::SubmitGoToLine { card: target })));
-        assert_eq!(app.capture_editor_location(target).unwrap().anchor.caret.column, 0);
-        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::OpenGoToLine {
+                card: target,
+            })),
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::GoToLineChanged {
+                card: target,
+                value: "1:1".into(),
+            })),
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::SubmitGoToLine {
+                card: target,
+            })),
+        );
+        assert_eq!(
+            app.capture_editor_location(target)
+                .unwrap()
+                .anchor
+                .caret
+                .column,
+            0
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                card: target,
+                forward: false,
+            })),
+        );
         assert_eq!(app.workspace.focused(), Some(target));
-        assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
+        assert_eq!(
+            app.capture_editor_location(target).unwrap().anchor,
+            target_anchor
+        );
         // A pending transaction makes the target unavailable, without
         // consuming the history position. Cancelling it permits the same Back.
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) {
             let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
-            let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "origin.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
+            let plan = crate::editor_workspace_edit::DocumentPlan {
+                path,
+                relative: "origin.rs".into(),
+                before_hash: blake3::hash(snapshot.text.as_bytes()),
+                before: snapshot.text.clone(),
+                after: snapshot.text,
+                version: Some(snapshot.version),
+                protocol_version: None,
+                open: true,
+                open_paths: Vec::new(),
+                edits: Vec::new(),
+            };
             runtime.begin_workspace_edit(313, &plan).unwrap();
             assert!(runtime.is_saving());
         }
         assert!(app.navigate_cross_card_location(target, false).is_none());
         assert_eq!(app.workspace.focused(), Some(target));
-        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) { runtime.cancel_workspace_edit(313); }
-        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false })));
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) {
+            runtime.cancel_workspace_edit(313);
+        }
+        drop(
+            app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                card: target,
+                forward: false,
+            })),
+        );
         assert_eq!(app.workspace.focused(), Some(origin));
-        assert_eq!(app.capture_editor_location(origin).unwrap().anchor, origin_anchor);
-        assert!(matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty()));
-        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: origin, forward: true })));
+        assert_eq!(
+            app.capture_editor_location(origin).unwrap().anchor,
+            origin_anchor
+        );
+        assert!(
+            matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty())
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                card: origin,
+                forward: true,
+            })),
+        );
         assert_eq!(app.workspace.focused(), Some(target));
-        assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
-        assert!(matches!(app.cards.get(&target), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() && runtime.editor_text().as_deref() == Some("a😀éX\n")));
+        assert_eq!(
+            app.capture_editor_location(target).unwrap().anchor,
+            target_anchor
+        );
+        assert!(
+            matches!(app.cards.get(&target), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() && runtime.editor_text().as_deref() == Some("a😀éX\n"))
+        );
         // A retained runtime in another strip/channel is not a focus target.
         app.workspace.request_close(origin).unwrap();
         app.workspace.commit_close(origin).unwrap();
         assert!(app.cards.contains_key(&origin));
         assert!(app.navigate_cross_card_location(target, false).is_none());
         assert_eq!(app.workspace.focused(), Some(target));
-        assert_eq!(app.editor_features.location_history.peek(false, |_| true).unwrap().location.card, origin);
-        app.workspace.add_card(WorkspaceCard::new(origin, "Origin", CardWidth::Fraction(0.7)).unwrap(), 0, false).unwrap();
+        assert_eq!(
+            app.editor_features
+                .location_history
+                .peek(false, |_| true)
+                .unwrap()
+                .location
+                .card,
+            origin
+        );
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(origin, "Origin", CardWidth::Fraction(0.7)).unwrap(),
+                0,
+                false,
+            )
+            .unwrap();
         // Reusing the old card for another file never authorizes history to
         // replace its current buffer or restore an anchor from another source.
-        let (other, _) = RepositoryRuntime::open_fixture(origin, "unrelated.rs", "keep this buffer");
-        app.cards.insert(origin, CardRuntime::Repository(Box::new(other)));
+        let (other, _) =
+            RepositoryRuntime::open_fixture(origin, "unrelated.rs", "keep this buffer");
+        app.cards
+            .insert(origin, CardRuntime::Repository(Box::new(other)));
         assert!(app.navigate_cross_card_location(target, false).is_some());
         let reopened = app.workspace.focused().unwrap();
         assert_ne!(reopened, origin);
         assert_ne!(reopened, target);
-        assert!(matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some("keep this buffer")));
+        assert!(
+            matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some("keep this buffer"))
+        );
     }
 
     #[test]
     fn window_history_exhaustion_never_reenters_the_runtime_stack() {
         let (mut app, card) = editing_repository_app();
         let (runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "zero\none\ntwo\n");
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
         for line in ["2", "3"] {
             drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
-            drop(app.update(Message::Repository(RepositoryAction::GoToLineChanged { card, value: line.into() })));
-            drop(app.update(Message::Repository(RepositoryAction::SubmitGoToLine { card })));
+            drop(
+                app.update(Message::Repository(RepositoryAction::GoToLineChanged {
+                    card,
+                    value: line.into(),
+                })),
+            );
+            drop(
+                app.update(Message::Repository(RepositoryAction::SubmitGoToLine {
+                    card,
+                })),
+            );
         }
         for (forward, lines) in [(false, [1, 0, 0]), (true, [1, 2, 2])] {
             for line in lines {
-                drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card, forward })));
-                assert_eq!(app.capture_editor_location(card).unwrap().anchor.caret.line, line);
+                drop(
+                    app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                        card,
+                        forward,
+                    })),
+                );
+                assert_eq!(
+                    app.capture_editor_location(card).unwrap().anchor.caret.line,
+                    line
+                );
             }
         }
     }
@@ -26072,14 +26508,24 @@ mod tests {
         let path = PathBuf::from("/dependencies/std.rs");
         runtime.set_external_source(path.clone());
         let view = runtime.descriptor.clone();
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.lsp_contexts.remove(&card);
         let count = app.cards.len();
-        drop(app.open_lsp_source_tab(view, path, LspPosition::new(0, 4), LspCoordinates::Utf16, true, None));
+        drop(app.open_lsp_source_tab(
+            view,
+            path,
+            LspPosition::new(0, 4),
+            LspCoordinates::Utf16,
+            true,
+            None,
+        ));
         assert_eq!(app.cards.len(), count);
         assert_eq!(app.workspace.focused(), Some(card));
         assert!(!app.lsp_pending_jumps.contains_key(&card));
-        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(LspPosition::new(0, 3)) && runtime.is_read_only_source()));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(LspPosition::new(0, 3)) && runtime.is_read_only_source())
+        );
     }
 
     #[test]
@@ -26092,38 +26538,86 @@ mod tests {
             std::fs::write(&path, "fn main() {}\n").unwrap();
             std::fs::write(&target, "fn target() {}\n").unwrap();
             let (mut app, card) = editing_repository_app();
-            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", "fn main() {}\n");
-            runtime.descriptor.worktree = root.path().into(); runtime.descriptor.repository = root.path().into();
+            let (mut runtime, _) =
+                RepositoryRuntime::open_fixture(card, "main.rs", "fn main() {}\n");
+            runtime.descriptor.worktree = root.path().into();
+            runtime.descriptor.repository = root.path().into();
             runtime.set_lsp_document(Some(LspDocumentId(1)));
             drop(runtime.take_lsp_intents());
-            app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
             app.lsp = LspManager::new(AppSettings::default().language_servers);
             let language = app.lsp.language_for(&path).unwrap();
             // Discovery is not delivered: this is actual application request
             // admission and queue-delay fencing, with no server process.
-            app.lsp.open(LspDocumentId(1), &path, root.path(), language, 1, "fn main() {}\n");
-            drop(app.update(Message::Repository(RepositoryAction::Language { card, action: repository_widget::EditorLspAction::Definition(None) })));
-            let request = app.lsp_contexts[&card].editor_navigation.as_ref().unwrap().request;
+            app.lsp.open(
+                LspDocumentId(1),
+                &path,
+                root.path(),
+                language,
+                1,
+                "fn main() {}\n",
+            );
+            drop(app.update(Message::Repository(RepositoryAction::Language {
+                card,
+                action: repository_widget::EditorLspAction::Definition(None),
+            })));
+            let request = app.lsp_contexts[&card]
+                .editor_navigation
+                .as_ref()
+                .unwrap()
+                .request;
             let other = CardId::new();
-            let (runtime, _) = RepositoryRuntime::open_fixture(other, "other.rs", "keep focus here");
-            app.cards.insert(other, CardRuntime::Repository(Box::new(runtime)));
-            app.workspace.add_card(WorkspaceCard::new(other, "Other", CardWidth::Fraction(0.7)).unwrap(), app.workspace.cards().len(), false).unwrap();
+            let (runtime, _) =
+                RepositoryRuntime::open_fixture(other, "other.rs", "keep focus here");
+            app.cards
+                .insert(other, CardRuntime::Repository(Box::new(runtime)));
+            app.workspace
+                .add_card(
+                    WorkspaceCard::new(other, "Other", CardWidth::Fraction(0.7)).unwrap(),
+                    app.workspace.cards().len(),
+                    false,
+                )
+                .unwrap();
             match change {
                 "focus" | "away-back" => {
                     drop(app.update(Message::FocusCard(other)));
-                    if change == "away-back" { drop(app.update(Message::FocusCard(card))); }
+                    if change == "away-back" {
+                        drop(app.update(Message::FocusCard(card)));
+                    }
                 }
                 "caret-back" => {
-                    for motion in [repository_widget::text_editor::Motion::Right, repository_widget::text_editor::Motion::Left] {
-                        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Move(motion) })));
+                    for motion in [
+                        repository_widget::text_editor::Motion::Right,
+                        repository_widget::text_editor::Motion::Left,
+                    ] {
+                        drop(
+                            app.update(Message::Repository(RepositoryAction::EditorAction {
+                                card,
+                                action: repository_widget::EditorAction::Move(motion),
+                            })),
+                        );
                     }
                 }
                 "modal" => app.resume_ui.open = true,
                 _ => unreachable!(),
             }
-            let expected = app.workspace.focused(); let count = app.cards.len();
+            let expected = app.workspace.focused();
+            let count = app.cards.len();
             app.context_inspector_open = false;
-            drop(app.update(Message::Lsp(LspEvent::Locations { doc: LspDocumentId(1), request, kind: crate::lsp::LocationKind::Definition, items: vec![crate::lsp::LspLocation { target: crate::lsp::LspTarget::External { path: target }, range: crate::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)), coordinates: LspCoordinates::Utf16 }] })));
+            drop(app.update(Message::Lsp(LspEvent::Locations {
+                doc: LspDocumentId(1),
+                request,
+                kind: crate::lsp::LocationKind::Definition,
+                items: vec![crate::lsp::LspLocation {
+                    target: crate::lsp::LspTarget::External { path: target },
+                    range: crate::lsp::LspRange::new(
+                        LspPosition::new(0, 0),
+                        LspPosition::new(0, 1),
+                    ),
+                    coordinates: LspCoordinates::Utf16,
+                }],
+            })));
             assert_eq!(app.workspace.focused(), expected, "{change}");
             assert_eq!(app.cards.len(), count, "{change}");
             assert!(!app.context_inspector_open, "{change}");
@@ -26155,9 +26649,24 @@ mod tests {
         let doc = LspDocumentId(1);
         let request = crate::lsp::LspRequestId(1);
         app.lsp_documents.insert(doc, card);
-        app.workspace.add_card(WorkspaceCard::new(card, "Repository", CardWidth::Fraction(0.7)).unwrap(), app.workspace.cards().len(), true).unwrap();
-        let origin = EditorDefinitionRequest { request, doc, version: None, caret: None, selection: None, focus_revision: app.workspace.focus_revision() };
-        let state = lsp_state(&mut app, card); state.document = Some(doc); state.editor_navigation = Some(origin);
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(card, "Repository", CardWidth::Fraction(0.7)).unwrap(),
+                app.workspace.cards().len(),
+                true,
+            )
+            .unwrap();
+        let origin = EditorDefinitionRequest {
+            request,
+            doc,
+            version: None,
+            caret: None,
+            selection: None,
+            focus_revision: app.workspace.focus_revision(),
+        };
+        let state = lsp_state(&mut app, card);
+        state.document = Some(doc);
+        state.editor_navigation = Some(origin);
         app.context_tab = ContextTab::Files;
         app.context_inspector_open = false;
         let _ = app.update(Message::Lsp(LspEvent::Locations {
@@ -28705,9 +29214,13 @@ mod tests {
     #[test]
     fn save_matches_the_physical_key_on_non_latin_layouts() {
         let event = keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character("ы".into()), modified_key: keyboard::Key::Character("ы".into()),
+            key: keyboard::Key::Character("ы".into()),
+            modified_key: keyboard::Key::Character("ы".into()),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
-            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false,
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
         };
         assert!(is_save_press(&event));
     }

@@ -65,7 +65,9 @@ pub use snapshot::TextSnapshot;
 thread_local! { static TEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
-pub(crate) fn take_text_call_count() -> usize { TEXT_CALLS.with(|count| count.replace(0)) }
+pub(crate) fn take_text_call_count() -> usize {
+    TEXT_CALLS.with(|count| count.replace(0))
+}
 
 /// A diagnostic mapped once to the renderer's byte-addressed line positions.
 #[derive(Debug, Clone)]
@@ -425,21 +427,46 @@ where
     }
 
     fn code_action_line(&self, line: usize) -> bool {
-        self.on_code_action.is_some() && (self.code_action_available.is_some_and(|at| at.line == line) || self.code_action_lines.binary_search(&line).is_ok())
+        self.on_code_action.is_some()
+            && (self.code_action_available.is_some_and(|at| at.line == line)
+                || self.code_action_lines.binary_search(&line).is_ok())
     }
 
     fn code_action_hit(&self, bounds: Rectangle, point: Point) -> Option<Position> {
-        if self.on_code_action.is_none() || point.x < bounds.x || point.x > bounds.x + 16.0 { return None; }
+        if self.on_code_action.is_none() || point.x < bounds.x || point.x > bounds.x + 16.0 {
+            return None;
+        }
         let text_bounds = bounds.shrink(self.text_padding());
-        if point.y < text_bounds.y || point.y > text_bounds.y + text_bounds.height { return None; }
+        if point.y < text_bounds.y || point.y > text_bounds.y + text_bounds.height {
+            return None;
+        }
         let internal = self.content.0.borrow();
         let mut previous = None;
         for run in internal.editor.buffer().layout_runs() {
-            if previous == Some(run.line_i) { continue; }
+            if previous == Some(run.line_i) {
+                continue;
+            }
             previous = Some(run.line_i);
-            if self.code_action_line(run.line_i) && point.y >= text_bounds.y + run.line_top && point.y < text_bounds.y + run.line_top + run.line_height {
-                let column = self.diagnostics.iter().find(|diagnostic| diagnostic.start.line == run.line_i).map_or_else(|| self.code_action_available.filter(|at| at.line == run.line_i).map_or(0, |at| at.column), |diagnostic| diagnostic.start.column);
-                return Some(Position { line: run.line_i, column });
+            if self.code_action_line(run.line_i)
+                && point.y >= text_bounds.y + run.line_top
+                && point.y < text_bounds.y + run.line_top + run.line_height
+            {
+                let column = self
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.start.line == run.line_i)
+                    .map_or_else(
+                        || {
+                            self.code_action_available
+                                .filter(|at| at.line == run.line_i)
+                                .map_or(0, |at| at.column)
+                        },
+                        |diagnostic| diagnostic.start.column,
+                    );
+                return Some(Position {
+                    line: run.line_i,
+                    column,
+                });
             }
         }
         None
@@ -556,7 +583,12 @@ where
         Padding {
             left: self.padding.left
                 + self.line_digits as f32 * self.text_size.unwrap_or(Pixels(16.0)).0 * 0.7
-                + 16.0 + if self.on_code_action.is_some() { 14.0 } else { 0.0 },
+                + 16.0
+                + if self.on_code_action.is_some() {
+                    14.0
+                } else {
+                    0.0
+                },
             right: self.padding.right + crate::design::SCROLLBAR_GUTTER,
             ..self.padding
         }
@@ -679,7 +711,8 @@ pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
         return None;
     }
     if press.key == keyboard::Key::Named(keyboard::key::Named::Tab)
-        && !press.modifiers.command() && !press.modifiers.alt()
+        && !press.modifiers.command()
+        && !press.modifiers.alt()
     {
         // This produces a binding even though Tab has no printable text. The
         // focused editor captures it before Iced can traverse chrome focus.
@@ -1078,7 +1111,11 @@ where
         let count = editor.line_count();
         let snapshot = TextSnapshot::from_lines((0..count).map(|index| {
             let ending = editor.line(index).expect("native line exists").ending;
-            (editor.buffer().lines[index].text(), ending, terminator(ending, index + 1 == count))
+            (
+                editor.buffer().lines[index].text(),
+                ending,
+                terminator(ending, index + 1 == count),
+            )
         }));
         Self(RefCell::new(Internal {
             editor,
@@ -1105,21 +1142,44 @@ where
         let editing = matches!(action, Action::Edit(_));
         let window = (editing && self.0.borrow().snapshot_edit_depth == 0)
             .then(|| self.snapshot_edit_window());
-        if editing { self.0.get_mut().snapshot_edit_depth += 1; }
+        if editing {
+            self.0.get_mut().snapshot_edit_depth += 1;
+        }
         self.perform_native(action);
-        if editing { self.0.get_mut().snapshot_edit_depth -= 1; }
-        if let Some(window) = window { self.refresh_snapshot(window); }
+        if editing {
+            self.0.get_mut().snapshot_edit_depth -= 1;
+        }
+        if let Some(window) = window {
+            self.refresh_snapshot(window);
+        }
     }
 
     fn perform_native(&mut self, mut action: Action) {
-        if !matches!(action, Action::Scroll { .. }) { self.0.get_mut().cursor_metrics = None; }
-        if action.is_edit() { self.0.get_mut().bracket_match = None; }
+        if !matches!(action, Action::Scroll { .. }) {
+            self.0.get_mut().cursor_metrics = None;
+        }
+        if action.is_edit() {
+            self.0.get_mut().bracket_match = None;
+        }
         match action {
             Action::Edit(Edit::Insert(character)) if self.smart_insert(character) => return,
-            Action::Edit(Edit::Indent) => { self.indent(false); return; }
-            Action::Edit(Edit::Unindent) => { self.indent(true); return; }
-            Action::Edit(Edit::Enter) => { self.enter(); return; }
-            Action::Edit(Edit::Insert(closer @ ('}' | ')' | ']'))) if self.dedent_closer(closer) => return,
+            Action::Edit(Edit::Indent) => {
+                self.indent(false);
+                return;
+            }
+            Action::Edit(Edit::Unindent) => {
+                self.indent(true);
+                return;
+            }
+            Action::Edit(Edit::Enter) => {
+                self.enter();
+                return;
+            }
+            Action::Edit(Edit::Insert(closer @ ('}' | ')' | ']')))
+                if self.dedent_closer(closer) =>
+            {
+                return;
+            }
             _ => {}
         }
 
@@ -1157,53 +1217,106 @@ where
         internal.editor.perform(action);
     }
 
-    pub fn set_auto_close(&mut self, enabled: bool) { self.0.get_mut().auto_close = enabled; }
+    pub fn set_auto_close(&mut self, enabled: bool) {
+        self.0.get_mut().auto_close = enabled;
+    }
 
     /// Whole-buffer recovery keeps the file's editing preferences. Native
     /// content, snapshots and annotations are rebuilt together.
     pub fn reset_text(&mut self, text: &str) {
-        let (indentation, auto_close) = { let internal = self.0.borrow(); (internal.indentation, internal.auto_close) };
+        let (indentation, auto_close) = {
+            let internal = self.0.borrow();
+            (internal.indentation, internal.auto_close)
+        };
         *self = Self::with_text(text);
         self.configure_indentation(indentation);
         self.set_auto_close(auto_close);
     }
 
-
     /// Cached by caret/selection and invalidated by text edits. Large selected
     /// regions are counted without allocating a selected-text copy every frame.
     pub fn cursor_metrics(&self) -> (usize, usize, usize) {
-        let mut internal = self.0.borrow_mut(); let cursor = internal.editor.cursor();
-        if let Some((cached, metrics)) = internal.cursor_metrics && cached == cursor { return metrics; }
+        let mut internal = self.0.borrow_mut();
+        let cursor = internal.editor.cursor();
+        if let Some((cached, metrics)) = internal.cursor_metrics
+            && cached == cursor
+        {
+            return metrics;
+        }
         let lines = &internal.editor.buffer().lines;
-        let column = lines.get(cursor.position.line).map_or(0, |line| line.text()[..cursor.position.column.min(line.text().len())].chars().count());
-        let selected = internal.editor.selection_bounds().map_or(0, |(start, end)| {
-            let mut count = 0;
-            for line in start.line..=end.line {
-                if let Some(text) = lines.get(line) {
-                    let from = if line == start.line { start.column.min(text.text().len()) } else { 0 };
-                    let to = if line == end.line { end.column.min(text.text().len()) } else { text.text().len() };
-                    count += text.text()[from..to].chars().count();
-                    // Native copy normalizes every selected line separator to LF.
-                    if line < end.line { count += 1; }
-                }
-            }
-            count
+        let column = lines.get(cursor.position.line).map_or(0, |line| {
+            line.text()[..cursor.position.column.min(line.text().len())]
+                .chars()
+                .count()
         });
+        let selected = internal
+            .editor
+            .selection_bounds()
+            .map_or(0, |(start, end)| {
+                let mut count = 0;
+                for line in start.line..=end.line {
+                    if let Some(text) = lines.get(line) {
+                        let from = if line == start.line {
+                            start.column.min(text.text().len())
+                        } else {
+                            0
+                        };
+                        let to = if line == end.line {
+                            end.column.min(text.text().len())
+                        } else {
+                            text.text().len()
+                        };
+                        count += text.text()[from..to].chars().count();
+                        // Native copy normalizes every selected line separator to LF.
+                        if line < end.line {
+                            count += 1;
+                        }
+                    }
+                }
+                count
+            });
         let metrics = (cursor.position.line + 1, column + 1, selected);
-        internal.cursor_metrics = Some((cursor, metrics)); metrics
+        internal.cursor_metrics = Some((cursor, metrics));
+        metrics
     }
 
     pub fn matching_brackets(&self) -> Option<(Position, Position)> {
-        let mut internal = self.0.borrow_mut(); let cursor = internal.editor.cursor();
-        if let Some((cached, pair)) = internal.bracket_match && cached == cursor { return pair; }
+        let mut internal = self.0.borrow_mut();
+        let cursor = internal.editor.cursor();
+        if let Some((cached, pair)) = internal.bracket_match
+            && cached == cursor
+        {
+            return pair;
+        }
         let find = || {
-            if cursor.selection.is_some() { return None; }
+            if cursor.selection.is_some() {
+                return None;
+            }
             let lines = &internal.editor.buffer().lines;
-            let line = lines.get(cursor.position.line)?.text(); let column = cursor.position.column.min(line.len());
-            let candidate = line.get(column..)?.chars().next().filter(|character| "()[]{}".contains(*character)).map(|character| (column, character))
-                .or_else(|| line.get(..column)?.char_indices().next_back().filter(|(_, character)| "()[]{}".contains(*character)));
-            let (column, character) = candidate?; let first = Position { line: cursor.position.line, column };
-            let forward = match character { '(' | '[' | '{' => true, ')' | ']' | '}' => false, _ => return None };
+            let line = lines.get(cursor.position.line)?.text();
+            let column = cursor.position.column.min(line.len());
+            let candidate = line
+                .get(column..)?
+                .chars()
+                .next()
+                .filter(|character| "()[]{}".contains(*character))
+                .map(|character| (column, character))
+                .or_else(|| {
+                    line.get(..column)?
+                        .char_indices()
+                        .next_back()
+                        .filter(|(_, character)| "()[]{}".contains(*character))
+                });
+            let (column, character) = candidate?;
+            let first = Position {
+                line: cursor.position.line,
+                column,
+            };
+            let forward = match character {
+                '(' | '[' | '{' => true,
+                ')' | ']' | '}' => false,
+                _ => return None,
+            };
             // Scan in source order so multiline comment state is exact on both
             // sides of the caret. Keep only nesting positions, never source text.
             let mut stack = Vec::new();
@@ -1211,76 +1324,180 @@ where
             let mut budget = 8 * 1024 * 1024usize;
             let mut reached = false;
             for (line_index, line) in lines.iter().enumerate() {
-                if line.text().len() > budget { return None; }
+                if line.text().len() > budget {
+                    return None;
+                }
                 budget -= line.text().len();
                 let (tokens, end_block) = brackets::on_line(line.text(), block);
                 block = end_block;
                 for (column, token) in tokens {
-                    let position = Position { line: line_index, column };
-                    if position == first { reached = true; }
-                    if forward && !reached { continue; }
+                    let position = Position {
+                        line: line_index,
+                        column,
+                    };
+                    if position == first {
+                        reached = true;
+                    }
+                    if forward && !reached {
+                        continue;
+                    }
                     if matches!(token, '(' | '[' | '{') {
-                        if stack.len() >= 4096 { return None; }
+                        if stack.len() >= 4096 {
+                            return None;
+                        }
                         stack.push((token, position));
                     } else {
-                        let expected = match token { ')' => '(', ']' => '[', '}' => '{', _ => continue };
+                        let expected = match token {
+                            ')' => '(',
+                            ']' => '[',
+                            '}' => '{',
+                            _ => continue,
+                        };
                         let Some((opening, opening_position)) = stack.pop() else {
-                            if position == first { return None; }
+                            if position == first {
+                                return None;
+                            }
                             continue;
                         };
                         if opening != expected {
                             stack.clear();
-                            if reached { return None; }
+                            if reached {
+                                return None;
+                            }
                             continue;
                         }
-                        if !forward && position == first { return Some((opening_position, first)); }
-                        if forward && reached && stack.is_empty() { return Some((first, position)); }
+                        if !forward && position == first {
+                            return Some((opening_position, first));
+                        }
+                        if forward && reached && stack.is_empty() {
+                            return Some((first, position));
+                        }
                     }
                 }
-                if line_index == first.line && !reached { return None; }
-                if !forward && reached { return None; }
+                if line_index == first.line && !reached {
+                    return None;
+                }
+                if !forward && reached {
+                    return None;
+                }
             }
             None
         };
-        let pair = find(); internal.bracket_match = Some((cursor, pair)); pair
+        let pair = find();
+        internal.bracket_match = Some((cursor, pair));
+        pair
     }
 
     fn smart_insert(&mut self, character: char) -> bool {
-        if !self.0.get_mut().auto_close { return false; }
+        if !self.0.get_mut().auto_close {
+            return false;
+        }
         let cursor = self.cursor();
-        let next = self.with_line(cursor.position.line, |line, _| line.get(cursor.position.column..).and_then(|text| text.chars().next())).flatten();
-        if cursor.selection.is_none() && next == Some(character) && matches!(character, ')' | ']' | '}' | '\'' | '"') {
+        let next = self
+            .with_line(cursor.position.line, |line, _| {
+                line.get(cursor.position.column..)
+                    .and_then(|text| text.chars().next())
+            })
+            .flatten();
+        if cursor.selection.is_none()
+            && next == Some(character)
+            && matches!(character, ')' | ']' | '}' | '\'' | '"')
+        {
             // Type over an existing closer, still applying the blank-line
             // dedentation contract when a paired closer follows Enter.
             let remove = if ")]}".contains(character) {
                 let indentation = self.0.get_mut().indentation;
-                self.with_line(cursor.position.line, |line, _| { let before = &line[..cursor.position.column]; if before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) { indentation.outdent_bytes(before) } else { 0 } }).unwrap_or(0)
-            } else { 0 };
-            if remove > 0 { self.replace_range_recorded(Position { line: cursor.position.line, column: cursor.position.column - remove }, cursor.position, ""); }
-            self.set_cursor(Cursor { position: Position { line: cursor.position.line, column: cursor.position.column - remove + character.len_utf8() }, selection: None });
+                self.with_line(cursor.position.line, |line, _| {
+                    let before = &line[..cursor.position.column];
+                    if before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+                        indentation.outdent_bytes(before)
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0)
+            } else {
+                0
+            };
+            if remove > 0 {
+                self.replace_range_recorded(
+                    Position {
+                        line: cursor.position.line,
+                        column: cursor.position.column - remove,
+                    },
+                    cursor.position,
+                    "",
+                );
+            }
+            self.set_cursor(Cursor {
+                position: Position {
+                    line: cursor.position.line,
+                    column: cursor.position.column - remove + character.len_utf8(),
+                },
+                selection: None,
+            });
             return true;
         }
-        let closer = match character { '(' => ')', '[' => ']', '{' => '}', '\'' => '\'', '"' => '"', _ => return false };
-        let previous = self.with_line(cursor.position.line, |line, _| line.get(..cursor.position.column).and_then(|text| text.chars().next_back())).flatten();
-        if matches!(character, '\'' | '"') && previous.is_some_and(|previous| previous == '\\' || previous.is_alphanumeric()) { return false; }
-        if cursor.selection.is_none() && next.is_some_and(|next| next.is_alphanumeric()) { return false; }
+        let closer = match character {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '\'' => '\'',
+            '"' => '"',
+            _ => return false,
+        };
+        let previous = self
+            .with_line(cursor.position.line, |line, _| {
+                line.get(..cursor.position.column)
+                    .and_then(|text| text.chars().next_back())
+            })
+            .flatten();
+        if matches!(character, '\'' | '"')
+            && previous.is_some_and(|previous| previous == '\\' || previous.is_alphanumeric())
+        {
+            return false;
+        }
+        if cursor.selection.is_none() && next.is_some_and(|next| next.is_alphanumeric()) {
+            return false;
+        }
         let selected = self.selection().unwrap_or_default();
         let anchor = cursor.selection.unwrap_or(cursor.position);
-        let start = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { anchor } else { cursor.position };
-        let mut inserted = String::with_capacity(selected.len() + 2); inserted.push(character); inserted.push_str(&selected); inserted.push(closer);
+        let start = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column)
+        {
+            anchor
+        } else {
+            cursor.position
+        };
+        let mut inserted = String::with_capacity(selected.len() + 2);
+        inserted.push(character);
+        inserted.push_str(&selected);
+        inserted.push(closer);
         self.perform(Action::Edit(Edit::Paste(Arc::new(inserted))));
         let end = self.cursor().position;
-        self.set_cursor(Cursor { position: Position { line: end.line, column: end.column.saturating_sub(closer.len_utf8()) }, selection: cursor.selection.map(|_| Position { line: start.line, column: start.column + character.len_utf8() }) });
+        self.set_cursor(Cursor {
+            position: Position {
+                line: end.line,
+                column: end.column.saturating_sub(closer.len_utf8()),
+            },
+            selection: cursor.selection.map(|_| Position {
+                line: start.line,
+                column: start.column + character.len_utf8(),
+            }),
+        });
         true
     }
-    pub fn indentation(&self) -> crate::editor_indent::Indentation { self.0.borrow().indentation }
+    pub fn indentation(&self) -> crate::editor_indent::Indentation {
+        self.0.borrow().indentation
+    }
     pub fn configure_indentation(&mut self, indentation: crate::editor_indent::Indentation) {
         let internal = self.0.get_mut();
         internal.indentation = indentation;
         internal.editor.set_tab_width(indentation.tab_width);
     }
 
-    fn indent(&mut self, outdent: bool) { self.indent_recorded(outdent); }
+    fn indent(&mut self, outdent: bool) {
+        self.indent_recorded(outdent);
+    }
 
     /// Prefix-only changes keep a large selected block out of undo storage.
     pub fn indent_recorded(&mut self, outdent: bool) -> Vec<TextChange> {
@@ -1288,21 +1505,54 @@ where
         let anchor = cursor.selection.unwrap_or(cursor.position);
         let indentation = self.0.get_mut().indentation;
         if !outdent && anchor.line == cursor.position.line {
-            return self.perform_edit(Edit::Paste(Arc::new(indentation.unit()))).map(|recorded| recorded.change).into_iter().collect();
+            return self
+                .perform_edit(Edit::Paste(Arc::new(indentation.unit())))
+                .map(|recorded| recorded.change)
+                .into_iter()
+                .collect();
         }
         let first = cursor.position.line.min(anchor.line);
         let mut last = cursor.position.line.max(anchor.line);
-        let high = if cursor.position.line >= anchor.line { cursor.position } else { anchor };
-        if last > first && high.column == 0 { last -= 1; }
+        let high = if cursor.position.line >= anchor.line {
+            cursor.position
+        } else {
+            anchor
+        };
+        if last > first && high.column == 0 {
+            last -= 1;
+        }
         let unit = indentation.unit();
         let mut shifts = Vec::new();
         let mut changes = Vec::new();
         for line in (first..=last).rev() {
-            let removed = if outdent { self.with_line(line, |text, _| indentation.outdent_bytes(text)).unwrap_or(0) } else { 0 };
-            if outdent && removed == 0 { continue; }
+            let removed = if outdent {
+                self.with_line(line, |text, _| indentation.outdent_bytes(text))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if outdent && removed == 0 {
+                continue;
+            }
             let start = Position { line, column: 0 };
-            if let Some(change) = self.replace_range_recorded(start, Position { line, column: removed }, if outdent { "" } else { &unit }) { changes.push(change); }
-            shifts.push((line, if outdent { -(removed as isize) } else { unit.len() as isize }));
+            if let Some(change) = self.replace_range_recorded(
+                start,
+                Position {
+                    line,
+                    column: removed,
+                },
+                if outdent { "" } else { &unit },
+            ) {
+                changes.push(change);
+            }
+            shifts.push((
+                line,
+                if outdent {
+                    -(removed as isize)
+                } else {
+                    unit.len() as isize
+                },
+            ));
         }
         let map = |mut position: Position| {
             if let Some((_, shift)) = shifts.iter().find(|(line, _)| *line == position.line) {
@@ -1310,69 +1560,136 @@ where
             }
             position
         };
-        self.set_cursor(Cursor { position: map(cursor.position), selection: cursor.selection.map(map) });
+        self.set_cursor(Cursor {
+            position: map(cursor.position),
+            selection: cursor.selection.map(map),
+        });
         changes
     }
 
     fn enter(&mut self) {
         let cursor = self.cursor();
         let anchor = cursor.selection.unwrap_or(cursor.position);
-        let start = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { anchor } else { cursor.position };
+        let start = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column)
+        {
+            anchor
+        } else {
+            cursor.position
+        };
         let indentation = self.0.get_mut().indentation;
-        let (prefix, paired) = self.with_line(start.line, |line, _| {
-            let before = &line[..start.column.min(line.len())];
-            let leading: String = before.chars().take_while(|character| matches!(character, ' ' | '\t')).collect();
-            let opener = before.trim_end().chars().next_back();
-            let closer = match opener { Some('{') => Some('}'), Some('(') => Some(')'), Some('[') => Some(']'), _ => None };
-            let mut result = leading.clone();
-            if closer.is_some() { result.push_str(&indentation.unit()); }
-            let paired = cursor.selection.is_none() && closer.is_some() && line.get(start.column..).and_then(|rest| rest.chars().next()) == closer;
-            (result, paired.then_some(leading))
-        }).unwrap_or_default();
+        let (prefix, paired) = self
+            .with_line(start.line, |line, _| {
+                let before = &line[..start.column.min(line.len())];
+                let leading: String = before
+                    .chars()
+                    .take_while(|character| matches!(character, ' ' | '\t'))
+                    .collect();
+                let opener = before.trim_end().chars().next_back();
+                let closer = match opener {
+                    Some('{') => Some('}'),
+                    Some('(') => Some(')'),
+                    Some('[') => Some(']'),
+                    _ => None,
+                };
+                let mut result = leading.clone();
+                if closer.is_some() {
+                    result.push_str(&indentation.unit());
+                }
+                let paired = cursor.selection.is_none()
+                    && closer.is_some()
+                    && line
+                        .get(start.column..)
+                        .and_then(|rest| rest.chars().next())
+                        == closer;
+                (result, paired.then_some(leading))
+            })
+            .unwrap_or_default();
         let ending = self.line_ending().unwrap_or(LineEnding::Lf).as_str();
         let mut inserted = format!("{ending}{prefix}");
-        if let Some(leading) = &paired { inserted.push_str(ending); inserted.push_str(leading); }
+        if let Some(leading) = &paired {
+            inserted.push_str(ending);
+            inserted.push_str(leading);
+        }
         self.perform(Action::Edit(Edit::Paste(Arc::new(inserted))));
-        if paired.is_some() { self.set_cursor(Cursor { position: Position { line: start.line + 1, column: prefix.len() }, selection: None }); }
+        if paired.is_some() {
+            self.set_cursor(Cursor {
+                position: Position {
+                    line: start.line + 1,
+                    column: prefix.len(),
+                },
+                selection: None,
+            });
+        }
     }
 
     fn dedent_closer(&mut self, closer: char) -> bool {
         let cursor = self.cursor();
-        if cursor.selection.is_some() { return false; }
+        if cursor.selection.is_some() {
+            return false;
+        }
         let indentation = self.0.get_mut().indentation;
-        let remove = self.with_line(cursor.position.line, |line, _| {
-            let before = &line[..cursor.position.column.min(line.len())];
-            if before.is_empty() || !before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) { 0 } else { indentation.outdent_bytes(before) }
-        }).unwrap_or(0);
-        if remove == 0 { return false; }
+        let remove = self
+            .with_line(cursor.position.line, |line, _| {
+                let before = &line[..cursor.position.column.min(line.len())];
+                if before.is_empty() || !before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+                    0
+                } else {
+                    indentation.outdent_bytes(before)
+                }
+            })
+            .unwrap_or(0);
+        if remove == 0 {
+            return false;
+        }
         // One replacement, so dedentation and the typed closer undo together.
-        let start = Position { line: cursor.position.line, column: cursor.position.column.saturating_sub(remove) };
+        let start = Position {
+            line: cursor.position.line,
+            column: cursor.position.column.saturating_sub(remove),
+        };
         self.replace_range_recorded(start, cursor.position, &closer.to_string());
         true
     }
-    fn snapshot_edit_window(&self) -> (usize,usize,usize) {
+    fn snapshot_edit_window(&self) -> (usize, usize, usize) {
         let cursor = self.cursor();
         let anchor = cursor.selection.unwrap_or(cursor.position);
         let count = self.line_count();
-        (cursor.position.line.min(anchor.line).saturating_sub(1),
-            (cursor.position.line.max(anchor.line)+1).min(count.saturating_sub(1)), count)
+        (
+            cursor.position.line.min(anchor.line).saturating_sub(1),
+            (cursor.position.line.max(anchor.line) + 1).min(count.saturating_sub(1)),
+            count,
+        )
     }
 
-    fn refresh_snapshot(&mut self, (first,last,before_count): (usize,usize,usize)) {
+    fn refresh_snapshot(&mut self, (first, last, before_count): (usize, usize, usize)) {
         let internal = self.0.get_mut();
-        if internal.snapshot_edit_depth != 0 { return; }
+        if internal.snapshot_edit_depth != 0 {
+            return;
+        }
         let after_count = internal.editor.line_count();
-        let after_last = (last+after_count).saturating_sub(before_count).max(first).min(after_count.saturating_sub(1));
+        let after_last = (last + after_count)
+            .saturating_sub(before_count)
+            .max(first)
+            .min(after_count.saturating_sub(1));
         let editor = &internal.editor;
-        internal.snapshot.replace_lines(first, last+1, (first..=after_last).map(|index| {
-            let ending = editor.line(index).expect("native line exists").ending;
-            (editor.buffer().lines[index].text(), ending, terminator(ending,index+1 == after_count))
-        }));
+        internal.snapshot.replace_lines(
+            first,
+            last + 1,
+            (first..=after_last).map(|index| {
+                let ending = editor.line(index).expect("native line exists").ending;
+                (
+                    editor.buffer().lines[index].text(),
+                    ending,
+                    terminator(ending, index + 1 == after_count),
+                )
+            }),
+        );
     }
 
     /// Clone an immutable, Send snapshot in constant time. Its complete text
     /// is materialized once on whichever worker actually needs it.
-    pub fn text_snapshot(&self) -> TextSnapshot { self.0.borrow().snapshot.clone() }
+    pub fn text_snapshot(&self) -> TextSnapshot {
+        self.0.borrow().snapshot.clone()
+    }
 
     /// Native multiline insertion and removal shift row vectors repeatedly.
     /// Bound those operations; large splices rebuild from native fragments in
@@ -1615,7 +1932,9 @@ where
     ///
     /// This is a length, not a fingerprint: equal lengths do not imply equal
     /// text, so it can only rule a change *in*, never out.
-    pub fn text_len(&self) -> usize { self.0.borrow().snapshot.len() }
+    pub fn text_len(&self) -> usize {
+        self.0.borrow().snapshot.len()
+    }
 
     /// Returns an iterator of the text of the lines in the [`Content`].
     pub fn lines(&self) -> impl Iterator<Item = Line<'_>> {
@@ -1627,7 +1946,8 @@ where
 
     /// Returns the text of the [`Content`].
     pub fn text(&self) -> String {
-        #[cfg(test)] TEXT_CALLS.with(|count| count.set(count.get()+1));
+        #[cfg(test)]
+        TEXT_CALLS.with(|count| count.set(count.get() + 1));
         let internal = self.0.borrow();
         let count = internal.editor.line_count();
         let mut contents = String::new();
@@ -1705,9 +2025,21 @@ where
     pub fn selected_bounds(&self) -> Option<(Position, Position)> {
         let cursor = self.cursor();
         let anchor = cursor.selection?;
-        let span = self.selected_span(&self.excerpt(cursor.position.line.min(anchor.line), cursor.position.line.max(anchor.line)), cursor);
+        let span = self.selected_span(
+            &self.excerpt(
+                cursor.position.line.min(anchor.line),
+                cursor.position.line.max(anchor.line),
+            ),
+            cursor,
+        );
         let anchor = span.selection?;
-        Some(if (anchor.line, anchor.column) <= (span.position.line, span.position.column) { (anchor, span.position) } else { (span.position, anchor) })
+        Some(
+            if (anchor.line, anchor.column) <= (span.position.line, span.position.column) {
+                (anchor, span.position)
+            } else {
+                (span.position, anchor)
+            },
+        )
     }
 
     /// The caret with the exact span it has selected.
@@ -1871,13 +2203,22 @@ where
         for index in 0..count {
             let line = internal.editor.line(index)?;
             let end = start + line.text.len();
-            while let Some(&(output, offset)) = ordered.get(request).filter(|(_, offset)| *offset <= end) {
+            while let Some(&(output, offset)) =
+                ordered.get(request).filter(|(_, offset)| *offset <= end)
+            {
                 let column = offset.checked_sub(start)?;
-                if !line.text.is_char_boundary(column) { return None; }
-                positions[output] = Position { line: index, column };
+                if !line.text.is_char_boundary(column) {
+                    return None;
+                }
+                positions[output] = Position {
+                    line: index,
+                    column,
+                };
                 request += 1;
             }
-            if request == ordered.len() { return Some(positions); }
+            if request == ordered.len() {
+                return Some(positions);
+            }
             start = end + terminator(line.ending, index + 1 == count).len();
         }
         (request == ordered.len()).then_some(positions)
@@ -1885,8 +2226,14 @@ where
 
     /// Prepares an explicit range without widening distant edits into a
     /// whole-document history entry.
-    pub fn range_change(&self, start: Position, end: Position, replacement: &str) -> Option<TextChange> {
-        self.excerpt(start.line, end.line).range_change(start, end, replacement)
+    pub fn range_change(
+        &self,
+        start: Position,
+        end: Position,
+        replacement: &str,
+    ) -> Option<TextChange> {
+        self.excerpt(start.line, end.line)
+            .range_change(start, end, replacement)
     }
 
     pub fn replace_range_recorded(
@@ -2332,9 +2679,11 @@ where
         // window focus also loses the key release that would clear Shift, so a
         // stale modifier must not survive it.
         match event {
-            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)
+            Event::Keyboard(
+                keyboard::Event::ModifiersChanged(modifiers)
                 | keyboard::Event::KeyPressed { modifiers, .. }
-                | keyboard::Event::KeyReleased { modifiers, .. }) => {
+                | keyboard::Event::KeyReleased { modifiers, .. },
+            ) => {
                 state.modifiers = *modifiers;
             }
             Event::Window(window::Event::Unfocused) => {
@@ -2342,10 +2691,16 @@ where
             }
             _ => {}
         }
-        if let Event::Mouse(mouse::Event::ButtonPressed(button @ (mouse::Button::Back | mouse::Button::Forward))) = event
-            && cursor.is_over(layout.bounds()) && state.focus.is_some()
-            && let Some(callback) = &self.on_navigation {
-                shell.publish(callback(*button == mouse::Button::Forward)); shell.capture_event(); return;
+        if let Event::Mouse(mouse::Event::ButtonPressed(
+            button @ (mouse::Button::Back | mouse::Button::Forward),
+        )) = event
+            && cursor.is_over(layout.bounds())
+            && state.focus.is_some()
+            && let Some(callback) = &self.on_navigation
+        {
+            shell.publish(callback(*button == mouse::Button::Forward));
+            shell.capture_event();
+            return;
         }
         if !geometry.scrollable {
             state.scrollbar_grab = None;
@@ -2358,8 +2713,12 @@ where
         if self.popup.is_none() {
             state.popup_bounds = None;
         }
-        if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) {
-            if let Some(at) = pointer.and_then(|point| self.code_action_hit(layout.bounds(), point)) {
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        ) {
+            if let Some(at) = pointer.and_then(|point| self.code_action_hit(layout.bounds(), point))
+            {
                 shell.publish(self.on_code_action.as_ref().unwrap()(at));
                 shell.capture_event();
                 return;
@@ -2754,7 +3113,11 @@ where
                                 publish(Action::SelectAll);
                             }
                             Binding::Insert('\t') => {
-                                publish(Action::Edit(if state.modifiers.shift() { Edit::Unindent } else { Edit::Indent }));
+                                publish(Action::Edit(if state.modifiers.shift() {
+                                    Edit::Unindent
+                                } else {
+                                    Edit::Indent
+                                }));
                             }
                             Binding::Insert(c) => {
                                 publish(Action::Edit(Edit::Insert(c)));
@@ -2833,7 +3196,16 @@ where
     ) {
         let bounds = layout.bounds();
 
-        let brackets = if tree.state.downcast_ref::<State<Highlighter>>().focus.is_some() { self.content.matching_brackets() } else { None };
+        let brackets = if tree
+            .state
+            .downcast_ref::<State<Highlighter>>()
+            .focus
+            .is_some()
+        {
+            self.content.matching_brackets()
+        } else {
+            None
+        };
         let mut internal = self.content.0.borrow_mut();
         let state = tree.state.downcast_ref::<State<Highlighter>>();
 
@@ -2903,12 +3275,35 @@ where
         let horizontal = Vector::new(internal.horizontal_translation(), 0.0);
         for run in internal.editor.buffer().layout_runs() {
             if let Some((open, close)) = brackets {
-                for position in [open, close].into_iter().filter(|position| position.line == run.line_i) {
-                    for glyph in run.glyphs.iter().filter(|glyph| glyph.start <= position.column && glyph.end > position.column) {
-                        let rect = Rectangle::new(Point::new(text_bounds.x + horizontal.x + glyph.x, text_bounds.y + run.line_top), Size::new(glyph.w, run.line_height));
+                for position in [open, close]
+                    .into_iter()
+                    .filter(|position| position.line == run.line_i)
+                {
+                    for glyph in run.glyphs.iter().filter(|glyph| {
+                        glyph.start <= position.column && glyph.end > position.column
+                    }) {
+                        let rect = Rectangle::new(
+                            Point::new(
+                                text_bounds.x + horizontal.x + glyph.x,
+                                text_bounds.y + run.line_top,
+                            ),
+                            Size::new(glyph.w, run.line_height),
+                        );
                         if let Some(bounds) = text_bounds.intersection(&rect) {
-                            let mut wash = style.selection; wash.a *= 0.2;
-                            renderer.fill_quad(renderer::Quad { bounds, border: Border { width: 1.0, color: style.selection, ..Default::default() }, ..Default::default() }, wash);
+                            let mut wash = style.selection;
+                            wash.a *= 0.2;
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds,
+                                    border: Border {
+                                        width: 1.0,
+                                        color: style.selection,
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                },
+                                wash,
+                            );
                         }
                     }
                 }
@@ -3062,7 +3457,10 @@ where
                         ),
                         Size::new(4.0, 4.0),
                     );
-                    if let Some(bounds) = bounds.intersection(&dot).filter(|_| self.on_code_action.is_none()) {
+                    if let Some(bounds) = bounds
+                        .intersection(&dot)
+                        .filter(|_| self.on_code_action.is_none())
+                    {
                         renderer.fill_quad(
                             renderer::Quad {
                                 bounds,
@@ -3145,18 +3543,41 @@ where
             let color = crate::design::warning_color(&cosmic::theme::active());
             let mut previous = None;
             for run in internal.editor.buffer().layout_runs() {
-                if previous == Some(run.line_i) { continue; }
+                if previous == Some(run.line_i) {
+                    continue;
+                }
                 previous = Some(run.line_i);
-                if !self.code_action_line(run.line_i) { continue; }
+                if !self.code_action_line(run.line_i) {
+                    continue;
+                }
                 let x = bounds.x + 4.0;
                 let y = text_bounds.y + run.line_top + (run.line_height - 12.0) / 2.0;
                 for (rectangle, radius) in [
                     (Rectangle::new(Point::new(x, y), Size::new(8.0, 8.0)), 4.0),
-                    (Rectangle::new(Point::new(x + 2.0, y + 7.0), Size::new(4.0, 3.0)), 0.5),
-                    (Rectangle::new(Point::new(x + 3.0, y + 11.0), Size::new(2.0, 1.0)), 0.5),
+                    (
+                        Rectangle::new(Point::new(x + 2.0, y + 7.0), Size::new(4.0, 3.0)),
+                        0.5,
+                    ),
+                    (
+                        Rectangle::new(Point::new(x + 3.0, y + 11.0), Size::new(2.0, 1.0)),
+                        0.5,
+                    ),
                 ] {
-                    if let Some(bounds) = bounds.intersection(&rectangle).filter(|rectangle| rectangle.y >= text_bounds.y && rectangle.y + rectangle.height <= text_bounds.y + text_bounds.height) {
-                        renderer.fill_quad(renderer::Quad { bounds, border: Border { radius: radius.into(), ..Default::default() }, ..Default::default() }, color);
+                    if let Some(bounds) = bounds.intersection(&rectangle).filter(|rectangle| {
+                        rectangle.y >= text_bounds.y
+                            && rectangle.y + rectangle.height <= text_bounds.y + text_bounds.height
+                    }) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds,
+                                border: Border {
+                                    radius: radius.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            color,
+                        );
                     }
                 }
             }
@@ -3198,7 +3619,12 @@ where
         {
             return mouse::Interaction::default();
         }
-        if cursor.position().is_some_and(|point| self.code_action_hit(layout.bounds(), point).is_some()) { return mouse::Interaction::Pointer; }
+        if cursor
+            .position()
+            .is_some_and(|point| self.code_action_hit(layout.bounds(), point).is_some())
+        {
+            return mouse::Interaction::Pointer;
+        }
         let geometry = self.scroll_geometry(layout.bounds());
         let over_horizontal = geometry
             .horizontal
@@ -4904,40 +5330,103 @@ mod tests {
     #[test]
     fn explicit_offset_batch_preserves_order_and_refuses_unicode_or_ending_splits() {
         let content: Content = Content::with_text("é\r\n😀\n");
-        assert_eq!(content.positions_for_offsets(&[9, 0, 8, 4, 2]), Some(vec![Position { line: 2, column: 0 }, Position { line: 0, column: 0 }, Position { line: 1, column: 4 }, Position { line: 1, column: 0 }, Position { line: 0, column: 2 }]));
-        for offset in [1, 3, 5, 6, 7, 10] { assert!(content.positions_for_offsets(&[offset]).is_none(), "split or missing byte {offset}"); }
+        assert_eq!(
+            content.positions_for_offsets(&[9, 0, 8, 4, 2]),
+            Some(vec![
+                Position { line: 2, column: 0 },
+                Position { line: 0, column: 0 },
+                Position { line: 1, column: 4 },
+                Position { line: 1, column: 0 },
+                Position { line: 0, column: 2 }
+            ])
+        );
+        for offset in [1, 3, 5, 6, 7, 10] {
+            assert!(
+                content.positions_for_offsets(&[offset]).is_none(),
+                "split or missing byte {offset}"
+            );
+        }
         assert_eq!(content.positions_for_offsets(&[]), Some(Vec::new()));
     }
 
     #[test]
     fn code_action_lightbulb_uses_visible_native_rows_and_captures_only_its_gutter_click() {
         #[derive(Debug, PartialEq)]
-        enum Message { CodeAction(Position), Editor }
+        enum Message {
+            CodeAction(Position),
+            Editor,
+        }
         let renderer = headless_renderer();
-        let content: Content = Content::with_text(&format!("first\nsecond\n{}\nlast\n", "long wrapped source ".repeat(60)));
-        let diagnostics = [Diagnostic { start: Position { line: 2, column: 3 }, end: Position { line: 2, column: 7 }, severity: crate::lsp::LspSeverity::Error }];
+        let content: Content = Content::with_text(&format!(
+            "first\nsecond\n{}\nlast\n",
+            "long wrapped source ".repeat(60)
+        ));
+        let diagnostics = [Diagnostic {
+            start: Position { line: 2, column: 3 },
+            end: Position { line: 2, column: 7 },
+            severity: crate::lsp::LspSeverity::Error,
+        }];
         let mut editor: TextEditor<'_, highlighter::PlainText, Message> = TextEditor::new(&content)
-            .size(16.0).height(Length::Fill).wrapping(Wrapping::WordOrGlyph)
-            .diagnostics(&diagnostics).code_action_lines(&[2], None)
-            .on_code_action(Message::CodeAction).on_action(|_| Message::Editor);
-        let mut tree = widget::Tree::new(&editor as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+            .size(16.0)
+            .height(Length::Fill)
+            .wrapping(Wrapping::WordOrGlyph)
+            .diagnostics(&diagnostics)
+            .code_action_lines(&[2], None)
+            .on_code_action(Message::CodeAction)
+            .on_action(|_| Message::Editor);
+        let mut tree =
+            widget::Tree::new(&editor as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
         let viewport = Rectangle::new(Point::ORIGIN, Size::new(360.0, 220.0));
-        let node = editor.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()));
+        let node = editor.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
         let bounds = node.bounds();
         let text = bounds.shrink(editor.text_padding());
-        let rows = content.0.borrow().editor.buffer().layout_runs().filter(|run| run.line_i == 2).take(2)
-            .map(|run| text.y + run.line_top + run.line_height / 2.0).collect::<Vec<_>>();
+        let rows = content
+            .0
+            .borrow()
+            .editor
+            .buffer()
+            .layout_runs()
+            .filter(|run| run.line_i == 2)
+            .take(2)
+            .map(|run| text.y + run.line_top + run.line_height / 2.0)
+            .collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
         let point = Point::new(bounds.x + 8.0, rows[0]);
         let position = Position { line: 2, column: 3 };
         assert_eq!(editor.code_action_hit(bounds, point), Some(position));
-        assert_eq!(editor.code_action_hit(bounds, Point::new(bounds.x + 8.0, rows[1])), None, "wrapped continuations must not repeat the action button");
-        assert_eq!(editor.code_action_hit(bounds, Point::new(text.x + 20.0, rows[0])), None);
+        assert_eq!(
+            editor.code_action_hit(bounds, Point::new(bounds.x + 8.0, rows[1])),
+            None,
+            "wrapped continuations must not repeat the action button"
+        );
+        assert_eq!(
+            editor.code_action_hit(bounds, Point::new(text.x + 20.0, rows[0])),
+            None
+        );
         let mut published = Vec::new();
         let mut shell = Shell::new(&mut published);
-        editor.update(&mut tree, &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Layout::new(&node), mouse::Cursor::Available(point), &renderer, &mut clipboard::Null, &mut shell, &viewport);
+        editor.update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
         assert_eq!(published, [Message::CodeAction(position)]);
-        assert_eq!(content.text(), format!("first\nsecond\n{}\nlast\n", "long wrapped source ".repeat(60)));
+        assert_eq!(
+            content.text(),
+            format!(
+                "first\nsecond\n{}\nlast\n",
+                "long wrapped source ".repeat(60)
+            )
+        );
     }
 
     #[test]
@@ -5368,19 +5857,27 @@ mod tests {
                 if let Some(edit) = content.perform_edit(edit) {
                     history.record(edit.change, kind, edit.before, content.cursor(), now);
                 }
-                assert_eq!(content.text_snapshot().text().as_ref(), content.text(), "snapshot round {round} step {step}");
+                assert_eq!(
+                    content.text_snapshot().text().as_ref(),
+                    content.text(),
+                    "snapshot round {round} step {step}"
+                );
                 assert_eq!(content.text_len(), content.text().len());
             }
             let last = content.text();
             let last_lines = native_lines(&content);
-            while history.undo(&mut content) == Replay::Applied { assert_eq!(content.text_snapshot().text().as_ref(), content.text()); }
+            while history.undo(&mut content) == Replay::Applied {
+                assert_eq!(content.text_snapshot().text().as_ref(), content.text());
+            }
             assert_eq!(content.text(), original, "round {round}");
             assert_eq!(
                 native_lines(&content),
                 original_lines,
                 "native undo, round {round}"
             );
-            while history.redo(&mut content) == Replay::Applied { assert_eq!(content.text_snapshot().text().as_ref(), content.text()); }
+            while history.redo(&mut content) == Replay::Applied {
+                assert_eq!(content.text_snapshot().text().as_ref(), content.text());
+            }
             assert_eq!(content.text(), last, "round {round}");
             assert_eq!(
                 native_lines(&content),
@@ -5633,12 +6130,23 @@ mod tests {
             content.perform_edit(Edit::Insert(open)).unwrap();
             assert_eq!(content.text(), format!("{open}{close}"));
             assert_eq!(content.cursor().position.column, 1);
-            if open != '"' && open != '\'' { assert_eq!(content.matching_brackets(), Some((Position { line: 0, column: 0 }, Position { line: 0, column: 1 }))); }
+            if open != '"' && open != '\'' {
+                assert_eq!(
+                    content.matching_brackets(),
+                    Some((
+                        Position { line: 0, column: 0 },
+                        Position { line: 0, column: 1 }
+                    ))
+                );
+            }
             assert!(content.perform_edit(Edit::Insert(close)).is_none());
-            assert_eq!(content.text(), format!("{open}{close}")); assert_eq!(content.cursor().position.column, 2);
+            assert_eq!(content.text(), format!("{open}{close}"));
+            assert_eq!(content.cursor().position.column, 2);
         }
-        let mut content: Content = Content::new(); content.set_auto_close(false);
-        content.perform_edit(Edit::Insert('(')).unwrap(); assert_eq!(content.text(), "(");
+        let mut content: Content = Content::new();
+        content.set_auto_close(false);
+        content.perform_edit(Edit::Insert('(')).unwrap();
+        assert_eq!(content.text(), "(");
     }
 
     #[test]
@@ -5653,65 +6161,131 @@ mod tests {
     #[test]
     fn bracket_matching_keeps_multiline_comments_and_mixed_nesting_exact() {
         let mut content: Content = Content::with_text("fn f() {\n/*\n } ignored\n */\n [()]\n}");
-        content.set_cursor(Cursor { position: Position { line: 5, column: 1 }, selection: None });
-        assert_eq!(content.matching_brackets(), Some((Position { line: 0, column: 7 }, Position { line: 5, column: 0 })));
-        content.set_cursor(Cursor { position: Position { line: 2, column: 1 }, selection: None });
+        content.set_cursor(Cursor {
+            position: Position { line: 5, column: 1 },
+            selection: None,
+        });
+        assert_eq!(
+            content.matching_brackets(),
+            Some((
+                Position { line: 0, column: 7 },
+                Position { line: 5, column: 0 }
+            ))
+        );
+        content.set_cursor(Cursor {
+            position: Position { line: 2, column: 1 },
+            selection: None,
+        });
         assert_eq!(content.matching_brackets(), None);
-        let mut nested: Content = Content::with_text("fn a() {\n/* outer\n/* inner */\n}\n*/\nreal();\n}");
-        nested.set_cursor(Cursor { position: Position { line: 0, column: 7 }, selection: None });
-        assert_eq!(nested.matching_brackets(), Some((Position { line: 0, column: 7 }, Position { line: 6, column: 0 })));
-        nested.set_cursor(Cursor { position: Position { line: 3, column: 0 }, selection: None });
+        let mut nested: Content =
+            Content::with_text("fn a() {\n/* outer\n/* inner */\n}\n*/\nreal();\n}");
+        nested.set_cursor(Cursor {
+            position: Position { line: 0, column: 7 },
+            selection: None,
+        });
+        assert_eq!(
+            nested.matching_brackets(),
+            Some((
+                Position { line: 0, column: 7 },
+                Position { line: 6, column: 0 }
+            ))
+        );
+        nested.set_cursor(Cursor {
+            position: Position { line: 3, column: 0 },
+            selection: None,
+        });
         assert_eq!(nested.matching_brackets(), None);
         for source in [
             "fn a() {\nlet s = \"hello\n} world\";\nreal();\n}",
             "fn a() {\nlet s = r#\"hello \"\n} world\"#;\nreal();\n}",
         ] {
             let mut multiline: Content = Content::with_text(source);
-            multiline.set_cursor(Cursor { position: Position { line: 0, column: 7 }, selection: None });
-            assert_eq!(multiline.matching_brackets(), Some((Position { line: 0, column: 7 }, Position { line: 4, column: 0 })));
-            multiline.set_cursor(Cursor { position: Position { line: 2, column: 0 }, selection: None });
+            multiline.set_cursor(Cursor {
+                position: Position { line: 0, column: 7 },
+                selection: None,
+            });
+            assert_eq!(
+                multiline.matching_brackets(),
+                Some((
+                    Position { line: 0, column: 7 },
+                    Position { line: 4, column: 0 }
+                ))
+            );
+            multiline.set_cursor(Cursor {
+                position: Position { line: 2, column: 0 },
+                selection: None,
+            });
             assert_eq!(multiline.matching_brackets(), None);
         }
         let mut malformed: Content = Content::with_text("([)]");
-        malformed.set_cursor(Cursor { position: Position { line: 0, column: 0 }, selection: None });
+        malformed.set_cursor(Cursor {
+            position: Position { line: 0, column: 0 },
+            selection: None,
+        });
         assert_eq!(malformed.matching_brackets(), None);
     }
 
     #[test]
     fn cursor_metrics_count_unicode_and_selection_without_repeated_text_copies() {
         let mut content: Content = Content::with_text("aé\n漢x");
-        content.set_cursor(Cursor { position: Position { line: 1, column: 3 }, selection: Some(Position { line: 0, column: 1 }) });
+        content.set_cursor(Cursor {
+            position: Position { line: 1, column: 3 },
+            selection: Some(Position { line: 0, column: 1 }),
+        });
         assert_eq!(content.cursor_metrics(), (2, 2, 3));
         assert_eq!(content.cursor_metrics(), (2, 2, 3));
-        content.perform_edit(Edit::Insert('b')).unwrap(); assert_eq!(content.cursor_metrics().2, 0);
+        content.perform_edit(Edit::Insert('b')).unwrap();
+        assert_eq!(content.cursor_metrics().2, 0);
     }
 
     #[test]
     fn selected_character_counts_follow_expanded_native_word_and_line_extents() {
         for selection in [Action::SelectWord, Action::SelectLine] {
             let mut content: Content = Content::with_text("alpha beta\r\ngamma delta\n");
-            content.set_cursor(Cursor { position: Position { line: 0, column: 7 }, selection: None });
+            content.set_cursor(Cursor {
+                position: Position { line: 0, column: 7 },
+                selection: None,
+            });
             content.perform(selection);
-            assert_eq!(content.cursor_metrics().2, content.selection().unwrap().chars().count());
+            assert_eq!(
+                content.cursor_metrics().2,
+                content.selection().unwrap().chars().count()
+            );
             content.perform(Action::Select(Motion::DocumentEnd));
-            assert_eq!(content.cursor_metrics().2, content.selection().unwrap().chars().count());
+            assert_eq!(
+                content.cursor_metrics().2,
+                content.selection().unwrap().chars().count()
+            );
             // Selecting a different native kind at unchanged raw cursor/anchor
             // must not reuse metrics for the previous kind.
             content.perform(Action::SelectLine);
-            assert_eq!(content.cursor_metrics().2, content.selection().unwrap().chars().count());
+            assert_eq!(
+                content.cursor_metrics().2,
+                content.selection().unwrap().chars().count()
+            );
         }
     }
 
     #[test]
     fn tab_width_changes_native_layout_without_rewriting_text() {
         let mut content: Content = Content::with_text("a\tb");
-        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 2, tab_width: 2 });
+        content.configure_indentation(crate::editor_indent::Indentation {
+            tabs: true,
+            size: 2,
+            tab_width: 2,
+        });
         assert_eq!(content.0.borrow().editor.buffer().tab_width(), 2);
         assert_eq!(content.text(), "a\tb");
-        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 8, tab_width: 8 });
+        content.configure_indentation(crate::editor_indent::Indentation {
+            tabs: true,
+            size: 8,
+            tab_width: 8,
+        });
         assert_eq!(content.0.borrow().editor.buffer().tab_width(), 8);
         assert_eq!(content.text(), "a\tb");
-        content.perform_edit(Edit::Paste(Arc::new("row\n".repeat(256)))).unwrap();
+        content
+            .perform_edit(Edit::Paste(Arc::new("row\n".repeat(256))))
+            .unwrap();
         assert_eq!(content.0.borrow().editor.buffer().tab_width(), 8);
     }
 
@@ -5720,11 +6294,21 @@ mod tests {
         for modifiers in [keyboard::Modifiers::empty(), keyboard::Modifiers::SHIFT] {
             for focused in [true, false] {
                 let press = KeyPress {
-                    key: keyboard::Key::Named(keyboard::key::Named::Tab), modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab), modifiers, text: None,
-                    status: if focused { Status::Focused { is_hovered: false } } else { Status::Active },
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                    modifiers,
+                    text: None,
+                    status: if focused {
+                        Status::Focused { is_hovered: false }
+                    } else {
+                        Status::Active
+                    },
                 };
-                assert_eq!(matches!(default_bindings::<()>(press), Some(Binding::Insert('\t'))), focused);
+                assert_eq!(
+                    matches!(default_bindings::<()>(press), Some(Binding::Insert('\t'))),
+                    focused
+                );
             }
         }
     }
@@ -5735,17 +6319,33 @@ mod tests {
         let original = "  one\r\n  two\n  three";
         for edit in [Edit::Indent, Edit::Unindent] {
             let mut content: Content = Content::with_text(original);
-            content.configure_indentation(crate::editor_indent::Indentation { tabs: false, size: 2, tab_width: 2 });
-            content.set_cursor(Cursor { position: Position { line: 1, column: 4 }, selection: Some(Position { line: 0, column: 1 }) });
+            content.configure_indentation(crate::editor_indent::Indentation {
+                tabs: false,
+                size: 2,
+                tab_width: 2,
+            });
+            content.set_cursor(Cursor {
+                position: Position { line: 1, column: 4 },
+                selection: Some(Position { line: 0, column: 1 }),
+            });
             let recorded = content.perform_edit(edit).unwrap();
             let mut history = History::default();
-            history.record(recorded.change, EditKind::Other, recorded.before, content.cursor(), Instant::now());
+            history.record(
+                recorded.change,
+                EditKind::Other,
+                recorded.before,
+                content.cursor(),
+                Instant::now(),
+            );
             assert_eq!(history.undo(&mut content), Replay::Applied);
             assert_eq!(content.text(), original);
             assert_eq!(history.undo(&mut content), Replay::Empty);
         }
         let mut content: Content = Content::with_text("    x");
-        content.set_cursor(Cursor { position: Position { line: 0, column: 1 }, selection: None });
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 1 },
+            selection: None,
+        });
         content.perform_edit(Edit::Unindent).unwrap();
         assert_eq!(content.text(), "x");
         assert_eq!(content.cursor().position.column, 0);
@@ -5756,17 +6356,36 @@ mod tests {
         for opener in ['{', '(', '['] {
             let original = format!("    {opener}");
             let mut content: Content = Content::with_text(&original);
-            content.set_cursor(Cursor { position: Position { line: 0, column: original.len() }, selection: None });
+            content.set_cursor(Cursor {
+                position: Position {
+                    line: 0,
+                    column: original.len(),
+                },
+                selection: None,
+            });
             content.perform_edit(Edit::Enter).unwrap();
             assert_eq!(content.text(), format!("{original}\n        "));
         }
         let mut content: Content = Content::with_text("\tfoo selection");
-        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 4, tab_width: 8 });
-        content.set_cursor(Cursor { position: Position { line: 0, column: 14 }, selection: Some(Position { line: 0, column: 5 }) });
+        content.configure_indentation(crate::editor_indent::Indentation {
+            tabs: true,
+            size: 4,
+            tab_width: 8,
+        });
+        content.set_cursor(Cursor {
+            position: Position {
+                line: 0,
+                column: 14,
+            },
+            selection: Some(Position { line: 0, column: 5 }),
+        });
         content.perform_edit(Edit::Enter).unwrap();
         assert_eq!(content.text(), "\tfoo \n\t");
         let mut content: Content = Content::with_text("        ");
-        content.set_cursor(Cursor { position: Position { line: 0, column: 8 }, selection: None });
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 8 },
+            selection: None,
+        });
         content.perform_edit(Edit::Insert('}')).unwrap();
         assert_eq!(content.text(), "    }");
     }

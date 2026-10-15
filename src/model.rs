@@ -1164,7 +1164,11 @@ pub struct RepositoryNavigation {
     pub project: ProjectId,
     pub worktree: PathBuf,
     /// Explicit read-only dependency source for this window's local tab.
-    #[serde(default, with = "crate::selected_file_path", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "crate::selected_file_path",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub external_source: Option<PathBuf>,
     #[serde(with = "crate::selected_file_path")]
     pub selected_file: Option<PathBuf>,

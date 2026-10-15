@@ -1001,14 +1001,29 @@ impl DiffBasis {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryMetadataStamp(BTreeMap<PathBuf, Option<(u64, u64, u64, i64, i64, i64, i64)>>);
 
-pub fn repository_metadata_stamp(worktree: &Path, basis: &DiffBasis) -> io::Result<RepositoryMetadataStamp> {
+pub fn repository_metadata_stamp(
+    worktree: &Path,
+    basis: &DiffBasis,
+) -> io::Result<RepositoryMetadataStamp> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     type Identity = (u64, u64, u64, i64, i64, i64, i64);
 
-    fn observe(paths: &mut BTreeMap<PathBuf, Option<Identity>>, path: &Path, directory: bool) -> io::Result<()> {
+    fn observe(
+        paths: &mut BTreeMap<PathBuf, Option<Identity>>,
+        path: &Path,
+        directory: bool,
+    ) -> io::Result<()> {
         let identity = match fs::metadata(path) {
             Ok(meta) if directory => Some((meta.dev(), meta.ino(), 0, 0, 0, 0, 0)),
-            Ok(meta) => Some((meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())),
+            Ok(meta) => Some((
+                meta.dev(),
+                meta.ino(),
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec(),
+            )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
@@ -1017,37 +1032,73 @@ pub fn repository_metadata_stamp(worktree: &Path, basis: &DiffBasis) -> io::Resu
     }
 
     fn read_small(path: &Path) -> io::Result<Option<Vec<u8>>> {
-        let file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        if !file.metadata()?.is_file() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata is not a regular file")); }
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Git metadata is not a regular file",
+            ));
+        }
         let mut bytes = Vec::new();
         file.take(4097).read_to_end(&mut bytes)?;
-        if bytes.len() > 4096 { return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata exceeds 4 KiB")); }
+        if bytes.len() > 4096 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Git metadata exceeds 4 KiB",
+            ));
+        }
         Ok(Some(bytes))
     }
 
-    fn reference(paths: &mut BTreeMap<PathBuf, Option<Identity>>, root: &Path, name: &Path) -> io::Result<()> {
+    fn reference(
+        paths: &mut BTreeMap<PathBuf, Option<Identity>>,
+        root: &Path,
+        name: &Path,
+    ) -> io::Result<()> {
         let mut path = root.join(name);
         for _ in 0..8 {
             observe(paths, &path, false)?;
-            let Some(bytes) = read_small(&path)? else { return Ok(()); };
-            let Some(target) = trim_one_line_ending(&bytes).strip_prefix(b"ref: ") else { return Ok(()); };
-            let target = std::str::from_utf8(target).ok().and_then(|target| ValidatedRefName::parse(target).ok())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid symbolic Git ref"))?;
+            let Some(bytes) = read_small(&path)? else {
+                return Ok(());
+            };
+            let Some(target) = trim_one_line_ending(&bytes).strip_prefix(b"ref: ") else {
+                return Ok(());
+            };
+            let target = std::str::from_utf8(target)
+                .ok()
+                .and_then(|target| ValidatedRefName::parse(target).ok())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Invalid symbolic Git ref")
+                })?;
             path = root.join(target.as_str());
         }
-        Err(io::Error::new(io::ErrorKind::InvalidData, "Symbolic Git ref exceeds eight levels"))
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Symbolic Git ref exceeds eight levels",
+        ))
     }
 
     let marker = worktree.join(".git");
     let marker_meta = fs::metadata(&marker)?;
-    let git_dir = if marker_meta.is_dir() { marker.clone() } else {
-        let bytes = read_small(&marker)?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Missing Git directory marker"))?;
-        let path = trim_one_line_ending(&bytes).strip_prefix(b"gitdir: ")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid Git directory marker"))?;
+    let git_dir = if marker_meta.is_dir() {
+        marker.clone()
+    } else {
+        let bytes = read_small(&marker)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Missing Git directory marker")
+        })?;
+        let path = trim_one_line_ending(&bytes)
+            .strip_prefix(b"gitdir: ")
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Invalid Git directory marker")
+            })?;
         worktree.join(bytes_to_path(path))
     };
     let git_dir = fs::canonicalize(git_dir)?;
@@ -1058,8 +1109,16 @@ pub fn repository_metadata_stamp(worktree: &Path, basis: &DiffBasis) -> io::Resu
     let mut paths = BTreeMap::new();
     observe(&mut paths, worktree, true)?;
     observe(&mut paths, &marker, marker_meta.is_dir())?;
-    for root in [&git_dir, &common] { observe(&mut paths, root, true)?; }
-    for name in ["index", "HEAD", "commondir", "config.worktree", "reftable/tables.list"] {
+    for root in [&git_dir, &common] {
+        observe(&mut paths, root, true)?;
+    }
+    for name in [
+        "index",
+        "HEAD",
+        "commondir",
+        "config.worktree",
+        "reftable/tables.list",
+    ] {
         observe(&mut paths, &git_dir.join(name), false)?;
     }
     for name in ["packed-refs", "config", "reftable/tables.list"] {
@@ -1068,13 +1127,20 @@ pub fn repository_metadata_stamp(worktree: &Path, basis: &DiffBasis) -> io::Resu
     // HEAD itself belongs to this worktree; its ordinary symbolic target
     // belongs to the common directory. Observe both roots for per-worktree refs.
     if let Some(head) = read_small(&git_dir.join("HEAD"))?
-        && let Some(target) = trim_one_line_ending(&head).strip_prefix(b"ref: ") {
-        let target = std::str::from_utf8(target).ok().and_then(|target| ValidatedRefName::parse(target).ok())
+        && let Some(target) = trim_one_line_ending(&head).strip_prefix(b"ref: ")
+    {
+        let target = std::str::from_utf8(target)
+            .ok()
+            .and_then(|target| ValidatedRefName::parse(target).ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid symbolic HEAD"))?;
-        for root in [&git_dir, &common] { reference(&mut paths, root, Path::new(target.as_str()))?; }
+        for root in [&git_dir, &common] {
+            reference(&mut paths, root, Path::new(target.as_str()))?;
+        }
     }
     if let DiffBasis::MergeBaseToHead { base_ref, .. } = basis {
-        for root in [&git_dir, &common] { reference(&mut paths, root, Path::new(base_ref.as_str()))?; }
+        for root in [&git_dir, &common] {
+            reference(&mut paths, root, Path::new(base_ref.as_str()))?;
+        }
     }
     Ok(RepositoryMetadataStamp(paths))
 }
@@ -6688,7 +6754,10 @@ mod tests {
         fs::write(git.join("index.lock"), "unpublished").unwrap();
         fs::write(git.join("refs/heads/topic.lock"), "unpublished").unwrap();
         fs::write(git.join("refs/heads/irrelevant"), "not selected").unwrap();
-        assert_eq!(first, repository_metadata_stamp(directory.path(), &basis).unwrap());
+        assert_eq!(
+            first,
+            repository_metadata_stamp(directory.path(), &basis).unwrap()
+        );
         fs::write(git.join("index"), "published index").unwrap();
         let indexed = repository_metadata_stamp(directory.path(), &basis).unwrap();
         assert_ne!(first, indexed);
@@ -6699,7 +6768,10 @@ mod tests {
         let base = repository_metadata_stamp(directory.path(), &basis).unwrap();
         assert_ne!(head, base);
         fs::write(git.join("packed-refs"), "packed data\n").unwrap();
-        assert_ne!(base, repository_metadata_stamp(directory.path(), &basis).unwrap());
+        assert_ne!(
+            base,
+            repository_metadata_stamp(directory.path(), &basis).unwrap()
+        );
     }
 
     #[test]
@@ -6717,9 +6789,17 @@ mod tests {
         fs::write(common.join("refs/heads/topic"), "old\n").unwrap();
         let first = repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap();
         fs::write(common.join("refs/heads/topic"), "new longer\n").unwrap();
-        assert_ne!(first, repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap());
+        assert_ne!(
+            first,
+            repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap()
+        );
         fs::write(common.join("refs/heads/topic"), "ref: refs/heads/topic\n").unwrap();
-        assert_eq!(repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            repository_metadata_stamp(&root, &DiffBasis::HeadToIndex)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[derive(Default)]

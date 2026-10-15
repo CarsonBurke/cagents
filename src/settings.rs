@@ -814,9 +814,13 @@ const fn default_focus_follows_mouse() -> bool {
     false
 }
 
-const fn default_editor_auto_close() -> bool { true }
+const fn default_editor_auto_close() -> bool {
+    true
+}
 
-const fn default_editor_tab_width() -> u16 { 4 }
+const fn default_editor_tab_width() -> u16 {
+    4
+}
 
 const fn default_editor_auto_save() -> bool {
     true
@@ -1214,7 +1218,10 @@ pub struct LanguageServerSettings {
     pub root_markers: Vec<String>,
     #[serde(default, skip_serializing_if = "server_option_disabled")]
     pub format_on_save: bool,
-    #[serde(default = "default_formatting_timeout", skip_serializing_if = "formatting_timeout_is_default")]
+    #[serde(
+        default = "default_formatting_timeout",
+        skip_serializing_if = "formatting_timeout_is_default"
+    )]
     pub formatting_timeout_ms: u64,
     #[serde(default, skip_serializing_if = "optional_json_absent")]
     pub initialization_options: Option<serde_json::Value>,
@@ -1222,12 +1229,31 @@ pub struct LanguageServerSettings {
     pub configuration: serde_json::Value,
 }
 
-fn server_option_disabled(value:&bool)->bool {!*value}
-fn default_formatting_timeout()->u64 {1000}
-fn formatting_timeout_is_default(value:&u64)->bool {*value == default_formatting_timeout()}
-fn optional_json_absent(value:&Option<serde_json::Value>)->bool {value.as_ref().is_none_or(serde_json::Value::is_null)}
+fn server_option_disabled(value: &bool) -> bool {
+    !*value
+}
+fn default_formatting_timeout() -> u64 {
+    1000
+}
+fn formatting_timeout_is_default(value: &u64) -> bool {
+    *value == default_formatting_timeout()
+}
+fn optional_json_absent(value: &Option<serde_json::Value>) -> bool {
+    value.as_ref().is_none_or(serde_json::Value::is_null)
+}
 impl Default for LanguageServerSettings {
-    fn default()->Self {Self {id:String::new(),languages:Vec::new(),command:Vec::new(),root_markers:Vec::new(),format_on_save:false,formatting_timeout_ms:default_formatting_timeout(),initialization_options:None,configuration:serde_json::Value::Null}}
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            languages: Vec::new(),
+            command: Vec::new(),
+            root_markers: Vec::new(),
+            format_on_save: false,
+            formatting_timeout_ms: default_formatting_timeout(),
+            initialization_options: None,
+            configuration: serde_json::Value::Null,
+        }
+    }
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -1904,7 +1930,9 @@ impl AppSettings {
             ));
         }
         if !(1..=16).contains(&self.editor_tab_width) {
-            return Err(SettingsError::Invalid("editor_tab_width must be between 1 and 16".into()));
+            return Err(SettingsError::Invalid(
+                "editor_tab_width must be between 1 and 16".into(),
+            ));
         }
         if self
             .editor_font_size
@@ -1999,11 +2027,18 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
     for server in servers {
         let id = server.id.as_str();
         if !(50..=10_000).contains(&server.formatting_timeout_ms) {
-            return Err(SettingsError::LanguageServer(format!("language server {id} formatting_timeout_ms must be between 50 and 10000")));
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {id} formatting_timeout_ms must be between 50 and 10000"
+            )));
         }
-        if server.initialization_options.as_ref().is_some_and(|value| serde_json::to_vec(value).map_or(true,|bytes| bytes.len() > 1024*1024))
-            || serde_json::to_vec(&server.configuration).map_or(true,|bytes| bytes.len() > 1024*1024) {
-            return Err(SettingsError::LanguageServer(format!("language server {id} configuration must fit within 1 MiB")));
+        if server.initialization_options.as_ref().is_some_and(|value| {
+            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        }) || serde_json::to_vec(&server.configuration)
+            .map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {id} configuration must fit within 1 MiB"
+            )));
         }
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
@@ -3353,20 +3388,25 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 mod tests {
     #[test]
     fn language_server_editor_options_round_trip_and_validate() {
-        let mut settings=AppSettings::default();
-        settings.language_servers[0].format_on_save=true;
-        settings.language_servers[0].formatting_timeout_ms=750;
-        settings.language_servers[0].initialization_options=Some(serde_json::json!({"check":{"command":"clippy"}}));
-        settings.language_servers[0].configuration=serde_json::json!({"rust-analyzer":{"check":{"command":"clippy"}}});
-        let text=toml::to_string(&settings).unwrap();
-        let decoded:AppSettings=toml::from_str(&text).unwrap();
-        assert_eq!(decoded.language_servers,settings.language_servers);
+        let mut settings = AppSettings::default();
+        settings.language_servers[0].format_on_save = true;
+        settings.language_servers[0].formatting_timeout_ms = 750;
+        settings.language_servers[0].initialization_options =
+            Some(serde_json::json!({"check":{"command":"clippy"}}));
+        settings.language_servers[0].configuration =
+            serde_json::json!({"rust-analyzer":{"check":{"command":"clippy"}}});
+        let text = toml::to_string(&settings).unwrap();
+        let decoded: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(decoded.language_servers, settings.language_servers);
         assert!(decoded.validate().is_ok());
-        for timeout in [0,49,10001,u64::MAX] {
-            let mut settings=AppSettings::default();settings.language_servers[0].formatting_timeout_ms=timeout;
+        for timeout in [0, 49, 10001, u64::MAX] {
+            let mut settings = AppSettings::default();
+            settings.language_servers[0].formatting_timeout_ms = timeout;
             assert!(settings.validate().is_err());
         }
-        let mut settings=AppSettings::default();settings.language_servers[0].initialization_options=Some(serde_json::json!({"large":"x".repeat(1024*1024)}));
+        let mut settings = AppSettings::default();
+        settings.language_servers[0].initialization_options =
+            Some(serde_json::json!({"large":"x".repeat(1024*1024)}));
         assert!(settings.validate().is_err());
     }
 

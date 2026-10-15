@@ -45,8 +45,8 @@ const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
 const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
 mod checkout;
-mod notification_ui;
 mod lsp_navigation;
+mod notification_ui;
 
 #[derive(Clone)]
 pub struct Flags {
@@ -1347,7 +1347,11 @@ impl Editor {
                         .unwrap_or_else(|| tab.runtime.descriptor.worktree.clone())
                 })
                 .collect(),
-            active: self.tabs.iter().filter(|tab| !tab.runtime.is_read_only_source()).position(|tab| Some(tab.id) == self.active),
+            active: self
+                .tabs
+                .iter()
+                .filter(|tab| !tab.runtime.is_read_only_source())
+                .position(|tab| Some(tab.id) == self.active),
             sidebar_open: self.sidebar_open,
             expanded_directories,
         }
@@ -1420,7 +1424,12 @@ impl Editor {
         self.add_with_source(opened, focus, None)
     }
 
-    fn add_with_source(&mut self, opened: Opened, focus: bool, external: Option<PathBuf>) -> Task<Message> {
+    fn add_with_source(
+        &mut self,
+        opened: Opened,
+        focus: bool,
+        external: Option<PathBuf>,
+    ) -> Task<Message> {
         if let Some(file) = &opened.file {
             if let Some(owner) = self.file_owner(&opened.root.join(file)) {
                 if focus && !self.modal_open() {
@@ -1468,7 +1477,9 @@ impl Editor {
         } else {
             RepositoryRuntime::new_directory(descriptor)
         };
-        if let Some(path) = &external { runtime.set_external_source(path.clone()); }
+        if let Some(path) = &external {
+            runtime.set_external_source(path.clone());
+        }
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_editor_auto_close(self.settings.editor_auto_close);
@@ -1776,7 +1787,12 @@ impl Editor {
         self.request_file_at(id, path, None)
     }
 
-    fn request_file_at(&mut self, id: CardId, path: PathBuf, location: Option<(usize, usize)>) -> Task<Message> {
+    fn request_file_at(
+        &mut self,
+        id: CardId,
+        path: PathBuf,
+        location: Option<(usize, usize)>,
+    ) -> Task<Message> {
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         let location_epoch = self.selection_epoch;
         let Some(tab) = self.tab_mut(id) else {
@@ -1787,7 +1803,9 @@ impl Editor {
         if RepoPath::parse(&path).is_err() {
             return Task::none();
         }
-        if tab.runtime.blocks_navigation() && (location.is_none() || tab.runtime.selected_path() != Some(path.as_path())) {
+        if tab.runtime.blocks_navigation()
+            && (location.is_none() || tab.runtime.selected_path() != Some(path.as_path()))
+        {
             self.notice =
                 Some("Save or discard the current file before opening another file.".into());
             return Task::none();
@@ -1903,14 +1921,17 @@ impl Editor {
             .iter()
             .filter_map(|tab| {
                 let pending = tab.pending_file.as_ref()?;
-                (tab.files_loaded && (!tab.runtime.blocks_navigation() || (pending.location.is_some() && tab.runtime.selected_path() == Some(pending.path.as_path()))))
-                    .then(|| {
-                        pending
-                            .canonical
-                            .clone()
-                            .map(|canonical| (tab.id, canonical))
-                    })
-                    .flatten()
+                (tab.files_loaded
+                    && (!tab.runtime.blocks_navigation()
+                        || (pending.location.is_some()
+                            && tab.runtime.selected_path() == Some(pending.path.as_path()))))
+                .then(|| {
+                    pending
+                        .canonical
+                        .clone()
+                        .map(|canonical| (tab.id, canonical))
+                })
+                .flatten()
             })
             .collect();
         let untitled_dir = untitled_directory(&self.settings_path);
@@ -1918,22 +1939,44 @@ impl Editor {
         for (id, canonical) in pending {
             let owner = self.file_owner(&canonical);
             if let Some(owner) = owner.filter(|owner| *owner != id) {
-                let location = self.tab_mut(id).and_then(|tab| tab.pending_file.take()).and_then(|pending| pending.location.map(|at| (at, pending.location_epoch)));
+                let location = self
+                    .tab_mut(id)
+                    .and_then(|tab| tab.pending_file.take())
+                    .and_then(|pending| pending.location.map(|at| (at, pending.location_epoch)));
                 // A background initial open must not steal a later selection.
-                if self.active == Some(id) { self.active = Some(owner); }
+                if self.active == Some(id) {
+                    self.active = Some(owner);
+                }
                 if let Some(((line, column), epoch)) = location {
                     let foreground = self.active == Some(owner);
-                    if let Some(tab) = self.tab_mut(owner).filter(|tab| epoch >= tab.location_epoch) {
+                    if let Some(tab) = self
+                        .tab_mut(owner)
+                        .filter(|tab| epoch >= tab.location_epoch)
+                    {
                         tab.location_epoch = epoch;
-                        if let Some(pending) = tab.pending_file.as_mut().filter(|pending| pending.canonical.as_ref() == Some(&canonical)) {
+                        if let Some(pending) = tab
+                            .pending_file
+                            .as_mut()
+                            .filter(|pending| pending.canonical.as_ref() == Some(&canonical))
+                        {
                             // A reservation can still belong to an earlier
                             // buffer while its file list finishes loading.
                             pending.location = Some((line, column));
                             pending.location_epoch = epoch;
                         } else if tab.owned_file.as_ref() == Some(&canonical)
-                            && let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf) {
-                            let task = repository_task(tab.runtime.update(RepositoryAction::OpenLocation { card: owner, path, line, column }));
-                            if foreground { tasks.push(task); }
+                            && let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf)
+                        {
+                            let task = repository_task(tab.runtime.update(
+                                RepositoryAction::OpenLocation {
+                                    card: owner,
+                                    path,
+                                    line,
+                                    column,
+                                },
+                            ));
+                            if foreground {
+                                tasks.push(task);
+                            }
                         }
                     }
                 }
@@ -1946,10 +1989,21 @@ impl Editor {
                 continue;
             };
             if tab.owned_file.as_ref() == Some(&canonical) {
-                if let Some((line, column)) = pending.location.filter(|_| pending.location_epoch >= tab.location_epoch) {
+                if let Some((line, column)) = pending
+                    .location
+                    .filter(|_| pending.location_epoch >= tab.location_epoch)
+                {
                     tab.location_epoch = pending.location_epoch;
-                    let task = repository_task(tab.runtime.update(RepositoryAction::OpenLocation { card: id, path: pending.path, line, column }));
-                    if self.active == Some(id) { tasks.push(task); }
+                    let task =
+                        repository_task(tab.runtime.update(RepositoryAction::OpenLocation {
+                            card: id,
+                            path: pending.path,
+                            line,
+                            column,
+                        }));
+                    if self.active == Some(id) {
+                        tasks.push(task);
+                    }
                 }
                 continue;
             }
@@ -1968,9 +2022,20 @@ impl Editor {
                 file_name
             };
             tab.owned_file = Some(canonical);
-            let action = match pending.location.filter(|_| pending.location_epoch >= tab.location_epoch) {
-                Some((line, column)) => RepositoryAction::OpenLocation { card: id, path: pending.path, line, column },
-                None => RepositoryAction::OpenFile { card: id, path: pending.path },
+            let action = match pending
+                .location
+                .filter(|_| pending.location_epoch >= tab.location_epoch)
+            {
+                Some((line, column)) => RepositoryAction::OpenLocation {
+                    card: id,
+                    path: pending.path,
+                    line,
+                    column,
+                },
+                None => RepositoryAction::OpenFile {
+                    card: id,
+                    path: pending.path,
+                },
             };
             tasks.push(repository_task(tab.runtime.update(action)));
             tasks.push(self.drain(id));
@@ -2010,8 +2075,24 @@ impl Editor {
                         let doc = LspDocumentId(self.next_document);
                         self.next_document += 1;
                         let status = match text {
-                            repository_widget::LspChangeText::Text(text) => self.lsp.open(doc,&absolute_path,&worktree,language,version,&text),
-                            repository_widget::LspChangeText::Snapshot(source) => self.lsp.open_snapshot(doc,&absolute_path,&worktree,language,version,source),
+                            repository_widget::LspChangeText::Text(text) => self.lsp.open(
+                                doc,
+                                &absolute_path,
+                                &worktree,
+                                language,
+                                version,
+                                &text,
+                            ),
+                            repository_widget::LspChangeText::Snapshot(source) => {
+                                self.lsp.open_snapshot(
+                                    doc,
+                                    &absolute_path,
+                                    &worktree,
+                                    language,
+                                    version,
+                                    source,
+                                )
+                            }
                         };
                         if let Some(tab) = self.tab_mut(id) {
                             tab.runtime.set_lsp_document(Some(doc));
@@ -2027,15 +2108,22 @@ impl Editor {
                     self.lsp_navigation.resolving.remove(&id);
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
                         match text {
-                            cagents::repository_widget::LspChangeText::Text(text) => self.lsp.change(doc,version,&edits,&text),
-                            cagents::repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
+                            cagents::repository_widget::LspChangeText::Text(text) => {
+                                self.lsp.change(doc, version, &edits, &text)
+                            }
+                            cagents::repository_widget::LspChangeText::Snapshot(source) => {
+                                self.lsp.change_snapshot(doc, version, &edits, source)
+                            }
                         }
                     }
-                    let synchronized_version = self.tab(id).and_then(|tab| tab.runtime.lsp_document()).and_then(|doc| self.lsp.document_version(doc));
+                    let synchronized_version = self
+                        .tab(id)
+                        .and_then(|tab| tab.runtime.lsp_document())
+                        .and_then(|doc| self.lsp.document_version(doc));
                     if let Some(tab) = self.tab_mut(id) {
                         tab.completions.clear();
                         tab.hover = None;
-                        cagents::lsp::shift_diagnostics(&mut tab.diagnostics,&edits);
+                        cagents::lsp::shift_diagnostics(&mut tab.diagnostics, &edits);
                         tab.set_diagnostics(tab.diagnostics.clone(), synchronized_version);
                     }
                 }
@@ -2162,11 +2250,13 @@ impl Editor {
             }
             // Re-enabling assistance waits for these outgoing processes before
             // launching replacements under a new admission cap.
-            let predecessor=self.lsp.begin_shutdown();
-            self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
-                self.settings.lsp_idle_timeout_seconds,
-                self.settings.lsp_max_sessions,
-            ).after_shutdown(predecessor);
+            let predecessor = self.lsp.begin_shutdown();
+            self.lsp = LspManager::new(self.settings.language_servers.clone())
+                .with_lifecycle(
+                    self.settings.lsp_idle_timeout_seconds,
+                    self.settings.lsp_max_sessions,
+                )
+                .after_shutdown(predecessor);
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
@@ -2358,12 +2448,23 @@ impl Editor {
     }
 
     fn refresh_documents(&mut self) -> Task<Message> {
-        if !self.can_refresh_documents() { return Task::none(); }
-        Task::batch(self.tabs.iter_mut().map(|tab| repository_task(tab.runtime.refresh_open_sources(tab.id))).collect::<Vec<_>>())
+        if !self.can_refresh_documents() {
+            return Task::none();
+        }
+        Task::batch(
+            self.tabs
+                .iter_mut()
+                .map(|tab| repository_task(tab.runtime.refresh_open_sources(tab.id)))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn can_refresh_documents(&self) -> bool {
-        !self.exiting && self.tabs.iter().any(|tab| tab.runtime.observes_open_sources())
+        !self.exiting
+            && self
+                .tabs
+                .iter()
+                .any(|tab| tab.runtime.observes_open_sources())
     }
 
     fn refresh(&mut self, id: CardId) -> Task<Message> {
@@ -2628,7 +2729,9 @@ impl Editor {
     /// The rows the palette is showing, in display order.
     fn quick_open_results(&self) -> Vec<PathBuf> {
         let raw = self.quick_open_query.trim();
-        let query = repository_widget::parse_file_location(raw).map_or_else(|| raw.to_owned(), |(path, _, _)| path).to_ascii_lowercase();
+        let query = repository_widget::parse_file_location(raw)
+            .map_or_else(|| raw.to_owned(), |(path, _, _)| path)
+            .to_ascii_lowercase();
         self.current()
             .map(|tab| {
                 let candidates = self.quick_open_files.clone().unwrap_or_else(|| {
@@ -2685,7 +2788,8 @@ impl Editor {
         let root = tab.runtime.descriptor.worktree.clone();
         let token = CancellationToken::new();
         self.quick_open_cancel = token.clone();
-        let search_query = repository_widget::parse_file_location(query.trim()).map_or_else(|| query.clone(), |(path, _, _)| path);
+        let search_query = repository_widget::parse_file_location(query.trim())
+            .map_or_else(|| query.clone(), |(path, _, _)| path);
         cosmic::task::future(async move {
             // A recursive walk per keystroke queued concurrent 50k-entry scans
             // on the pool that also carries auto-save and file loads.
@@ -3486,13 +3590,29 @@ impl Application for Editor {
                     self.handle_review(card, action)
                 }
                 Message::Repository(RepositoryAction::NavigateLocation { card, forward }) => {
-                    if self.modal_open() { return Task::none(); }
-                    if let Some(task) = self.navigate_cross_card_location(card, forward) { return task; }
-                    if self.lsp_navigation.history.has_entries() { return Task::none(); }
-                    self.tab_mut(card).map_or_else(Task::none, |tab| repository_task(tab.runtime.update(RepositoryAction::NavigateLocation { card, forward })))
+                    if self.modal_open() {
+                        return Task::none();
+                    }
+                    if let Some(task) = self.navigate_cross_card_location(card, forward) {
+                        return task;
+                    }
+                    if self.lsp_navigation.history.has_entries() {
+                        return Task::none();
+                    }
+                    self.tab_mut(card).map_or_else(Task::none, |tab| {
+                        repository_task(
+                            tab.runtime
+                                .update(RepositoryAction::NavigateLocation { card, forward }),
+                        )
+                    })
                 }
                 Message::Navigation(action) => self.update_navigation(action),
-                Message::Repository(RepositoryAction::Language { card, action: action @ (repository_widget::EditorLspAction::Definition(_) | repository_widget::EditorLspAction::References) }) => self.request_navigation(card, action),
+                Message::Repository(RepositoryAction::Language {
+                    card,
+                    action:
+                        action @ (repository_widget::EditorLspAction::Definition(_)
+                        | repository_widget::EditorLspAction::References),
+                }) => self.request_navigation(card, action),
                 Message::Repository(action) => {
                     if let RepositoryAction::DiffAnnotations {
                         identity,
@@ -3602,8 +3722,11 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. } | RepositoryAction::ConfiguredFileLoaded { .. })
-                        && self.active == Some(id)
+                    let focus_loaded = matches!(
+                        action,
+                        RepositoryAction::FileLoaded { .. }
+                            | RepositoryAction::ConfiguredFileLoaded { .. }
+                    ) && self.active == Some(id)
                         && !self.modal_open();
                     let saved = matches!(action, RepositoryAction::SaveFinished { .. });
                     let back_to_files = matches!(action, RepositoryAction::BackToFiles { .. });
@@ -4152,8 +4275,10 @@ impl Application for Editor {
                     self.shortcut_draft = self.shortcuts.clone();
                     for tab in &mut self.tabs {
                         tab.runtime.set_auto_save(self.settings.editor_auto_save);
-                        tab.runtime.set_editor_auto_close(self.settings.editor_auto_close);
-                        tab.runtime.set_editor_tab_width(self.settings.editor_tab_width);
+                        tab.runtime
+                            .set_editor_auto_close(self.settings.editor_auto_close);
+                        tab.runtime
+                            .set_editor_tab_width(self.settings.editor_tab_width);
                         tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                         tab.runtime
                             .set_line_height(self.settings.terminal_line_height);
@@ -4288,11 +4413,15 @@ impl Application for Editor {
                     }
                 }
                 Message::OpenQuickFile(path) => {
-                    if !self.quick_open || !self.quick_open_results().contains(&path) { return Task::none(); }
+                    if !self.quick_open || !self.quick_open_results().contains(&path) {
+                        return Task::none();
+                    }
                     let Some(id) = self.active else {
                         return Task::none();
                     };
-                    let location = repository_widget::parse_file_location(self.quick_open_query.trim()).map(|(_, line, column)| (line - 1, column - 1));
+                    let location =
+                        repository_widget::parse_file_location(self.quick_open_query.trim())
+                            .map(|(_, line, column)| (line - 1, column - 1));
                     self.close_quick_open();
                     self.quick_open_query.clear();
                     self.request_file_at(id, path, location)
@@ -4419,7 +4548,9 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if let Some(event) = event {
-                        if let Some(task) = self.navigation_event(&event) { return Task::batch([task, self.lsp_next()]); }
+                        if let Some(task) = self.navigation_event(&event) {
+                            return Task::batch([task, self.lsp_next()]);
+                        }
                         if let LspEvent::RootDiscovered { doc, ticket, root } = event {
                             if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
                                 && let Some(error) = language_server_failure(status)
@@ -4442,15 +4573,15 @@ impl Application for Editor {
                             | LspEvent::Status { doc, .. }
                             | LspEvent::Progress { doc, .. }
                             | LspEvent::RequestFailed { doc, .. }
-                                        | LspEvent::PrepareRename { doc, .. }
-            | LspEvent::WorkspaceEdit { doc, .. }
-            | LspEvent::CodeActions { doc, .. }
-            | LspEvent::CodeActionResolved { doc, .. }
-            | LspEvent::SignatureHelp { doc, .. }
-            | LspEvent::ServerMessage { doc, .. }
-            | LspEvent::CommandExecuted { doc, .. }
-            | LspEvent::ApplyWorkspaceEdit { doc, .. }
-            | LspEvent::DocumentDesynced { doc, .. } => *doc,
+                            | LspEvent::PrepareRename { doc, .. }
+                            | LspEvent::WorkspaceEdit { doc, .. }
+                            | LspEvent::CodeActions { doc, .. }
+                            | LspEvent::CodeActionResolved { doc, .. }
+                            | LspEvent::SignatureHelp { doc, .. }
+                            | LspEvent::ServerMessage { doc, .. }
+                            | LspEvent::CommandExecuted { doc, .. }
+                            | LspEvent::ApplyWorkspaceEdit { doc, .. }
+                            | LspEvent::DocumentDesynced { doc, .. } => *doc,
                         };
                         let current_version = self.lsp.document_version(doc);
                         if let Some(tab) = self
@@ -4459,7 +4590,9 @@ impl Application for Editor {
                             .find(|tab| tab.runtime.lsp_document() == Some(doc))
                         {
                             match event {
-                                LspEvent::Diagnostics { items, version, .. } if current_version == Some(version) => {
+                                LspEvent::Diagnostics { items, version, .. }
+                                    if current_version == Some(version) =>
+                                {
                                     tab.set_diagnostics(items, Some(version));
                                 }
                                 LspEvent::Completion { items, .. } => tab.completions = items,
@@ -4635,7 +4768,9 @@ impl Application for Editor {
         };
         let documents = if self.can_refresh_documents() {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshDocuments)
-        } else { Subscription::none() };
+        } else {
+            Subscription::none()
+        };
         let frames = if self.sidebar_transition.is_some() {
             window::frames().map(|(_, now)| Message::Frame(now))
         } else {
@@ -4778,7 +4913,9 @@ impl Application for Editor {
                 )
                 .map(Message::Repository),
             );
-            if let Some(results) = self.navigation_results_view(tab.id) { editor.push(results); }
+            if let Some(results) = self.navigation_results_view(tab.id) {
+                editor.push(results);
+            }
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
                 let mut results = Vec::new();
                 for (index, item) in tab.completions.iter().enumerate() {
@@ -5094,10 +5231,13 @@ impl Application for Editor {
                 dialog_surface(
                     widget::column::with_children(vec![
                         widget::text::title3("Quick open").into(),
-                        widget::text_input("Search files or path:line:column", &self.quick_open_query)
-                            .id(widget::Id::new("ceditor.quick-open.query"))
-                            .on_input(Message::QuickOpenQueryChanged)
-                            .into(),
+                        widget::text_input(
+                            "Search files or path:line:column",
+                            &self.quick_open_query,
+                        )
+                        .id(widget::Id::new("ceditor.quick-open.query"))
+                        .on_input(Message::QuickOpenQueryChanged)
+                        .into(),
                         widget::scrollable(
                             widget::column::with_children(rows)
                                 .spacing(QUICK_OPEN_ROW_SPACING)
@@ -6491,17 +6631,46 @@ mod tests {
         app.settings.editor_auto_save = false;
         app.settings.editor_auto_close = false;
         app.settings.editor_tab_width = 8;
-        let task = app.add(Opened { root: root.into(), file: Some("empty.rs".into()), snapshot: None }, true);
+        let task = app.add(
+            Opened {
+                root: root.into(),
+                file: Some("empty.rs".into()),
+                snapshot: None,
+            },
+            true,
+        );
         run_tasks(&mut app, task);
         let card = app.active.unwrap();
-        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (8, true));
-        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('(')) })));
-        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some("("));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_formatting_options(),
+            (8, true)
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('(')),
+            })),
+        );
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("(")
+        );
         drop(app.update(Message::ResetSettings));
         drop(app.update(Message::ResetSettings));
-        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (4, true));
-        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('[')) })));
-        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some("([]"));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_formatting_options(),
+            (4, true)
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('[')),
+            })),
+        );
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("([]")
+        );
     }
 
     #[test]
@@ -6511,7 +6680,14 @@ mod tests {
         std::fs::create_dir(root.join("src")).unwrap();
         std::fs::write(root.join("src/app.rs"), "a😀ébcde\n".repeat(30_001)).unwrap();
         let mut app = configured(&directory);
-        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        let task = app.add(
+            Opened {
+                root: root.into(),
+                file: None,
+                snapshot: None,
+            },
+            true,
+        );
         run_tasks(&mut app, task);
         let file = app.active.unwrap();
         drop(app.update(Message::QuickOpen));
@@ -6520,7 +6696,13 @@ mod tests {
         assert_eq!(app.quick_open_results(), [PathBuf::from("src/app.rs")]);
         let open = app.update(Message::QuickOpenActivate);
         run_tasks(&mut app, open);
-        assert_eq!(app.tab(file).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29_999, character: 4 }));
+        assert_eq!(
+            app.tab(file).unwrap().runtime.cursor_position(),
+            Some(cagents::lsp::LspPosition {
+                line: 29_999,
+                character: 4
+            })
+        );
         assert!(!app.quick_open);
         assert!(app.tab(file).unwrap().pending_file.is_none());
 
@@ -6530,11 +6712,24 @@ mod tests {
         run_tasks(&mut app, search);
         let open = app.update(Message::QuickOpenActivate);
         run_tasks(&mut app, open);
-        assert_eq!(app.tab(file).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 119, character: 7 }));
+        assert_eq!(
+            app.tab(file).unwrap().runtime.cursor_position(),
+            Some(cagents::lsp::LspPosition {
+                line: 119,
+                character: 7
+            })
+        );
 
         // Selecting the same canonical file from another folder tab focuses
         // the existing owner and forwards the location rather than losing it.
-        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        let task = app.add(
+            Opened {
+                root: root.into(),
+                file: None,
+                snapshot: None,
+            },
+            true,
+        );
         run_tasks(&mut app, task);
         let folder = app.active.unwrap();
         assert_ne!(folder, file);
@@ -6544,7 +6739,13 @@ mod tests {
         let open = app.update(Message::QuickOpenActivate);
         run_tasks(&mut app, open);
         assert_eq!(app.active, Some(file));
-        assert_eq!(app.tab(file).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 41, character: 2 }));
+        assert_eq!(
+            app.tab(file).unwrap().runtime.cursor_position(),
+            Some(cagents::lsp::LspPosition {
+                line: 41,
+                character: 2
+            })
+        );
         assert!(app.tab(folder).unwrap().pending_file.is_none());
     }
 
@@ -6556,16 +6757,45 @@ mod tests {
             std::fs::write(root.join("foo.rs"), "a😀bcdef\n".repeat(30_001)).unwrap();
             std::fs::write(root.join("bar.rs"), "previous buffer\n").unwrap();
             let mut app = configured(&directory);
-            let task = app.add(Opened { root: root.into(), file: old_buffer.then(|| "bar.rs".into()), snapshot: None }, true);
+            let task = app.add(
+                Opened {
+                    root: root.into(),
+                    file: old_buffer.then(|| "bar.rs".into()),
+                    snapshot: None,
+                },
+                true,
+            );
             run_tasks(&mut app, task);
             let owner = app.active.unwrap();
             app.tab_mut(owner).unwrap().files_loaded = false;
             let reserve = app.request_file(owner, "foo.rs".into());
             run_tasks(&mut app, reserve);
-            assert_eq!(app.tab(owner).unwrap().pending_file.as_ref().unwrap().canonical.as_deref(), Some(root.join("foo.rs").as_path()));
-            let request = app.tab(owner).unwrap().pending_file.as_ref().unwrap().request;
+            assert_eq!(
+                app.tab(owner)
+                    .unwrap()
+                    .pending_file
+                    .as_ref()
+                    .unwrap()
+                    .canonical
+                    .as_deref(),
+                Some(root.join("foo.rs").as_path())
+            );
+            let request = app
+                .tab(owner)
+                .unwrap()
+                .pending_file
+                .as_ref()
+                .unwrap()
+                .request;
             let before = app.tab(owner).unwrap().runtime.cursor_position();
-            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            let task = app.add(
+                Opened {
+                    root: root.into(),
+                    file: None,
+                    snapshot: None,
+                },
+                true,
+            );
             run_tasks(&mut app, task);
             let folder = app.active.unwrap();
             assert_ne!(folder, owner);
@@ -6575,15 +6805,28 @@ mod tests {
             let open = app.update(Message::QuickOpenActivate);
             run_tasks(&mut app, open);
             assert_eq!(app.active, Some(owner));
-            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), before, "the previous buffer must not receive the new file's location");
+            assert_eq!(
+                app.tab(owner).unwrap().runtime.cursor_position(),
+                before,
+                "the previous buffer must not receive the new file's location"
+            );
             let pending = app.tab(owner).unwrap().pending_file.as_ref().unwrap();
             assert_eq!(pending.request, request);
             assert_eq!(pending.location, Some((29_999, 4)));
             app.tab_mut(owner).unwrap().files_loaded = true;
             let open = app.resume_pending_files();
             run_tasks(&mut app, open);
-            assert_eq!(app.tab(owner).unwrap().runtime.selected_path(), Some(Path::new("foo.rs")));
-            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29_999, character: 4 }));
+            assert_eq!(
+                app.tab(owner).unwrap().runtime.selected_path(),
+                Some(Path::new("foo.rs"))
+            );
+            assert_eq!(
+                app.tab(owner).unwrap().runtime.cursor_position(),
+                Some(cagents::lsp::LspPosition {
+                    line: 29_999,
+                    character: 4
+                })
+            );
         }
     }
 
@@ -6594,18 +6837,43 @@ mod tests {
             let root = directory.path();
             std::fs::write(root.join("foo.rs"), "abcdefgh\n".repeat(40)).unwrap();
             let mut app = configured(&directory);
-            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            let task = app.add(
+                Opened {
+                    root: root.into(),
+                    file: None,
+                    snapshot: None,
+                },
+                true,
+            );
             run_tasks(&mut app, task);
             let old_card = app.active.unwrap();
             let old = app.request_file_at(old_card, "foo.rs".into(), Some((9, 1)));
-            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            let task = app.add(
+                Opened {
+                    root: root.into(),
+                    file: None,
+                    snapshot: None,
+                },
+                true,
+            );
             run_tasks(&mut app, task);
             let new_card = app.active.unwrap();
             let new = app.request_file_at(new_card, "foo.rs".into(), Some((29, 4)));
-            if older_first { run_tasks(&mut app, old); run_tasks(&mut app, new); }
-            else { run_tasks(&mut app, new); run_tasks(&mut app, old); }
+            if older_first {
+                run_tasks(&mut app, old);
+                run_tasks(&mut app, new);
+            } else {
+                run_tasks(&mut app, new);
+                run_tasks(&mut app, old);
+            }
             let owner = app.file_owner(&root.join("foo.rs")).unwrap();
-            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29, character: 4 }));
+            assert_eq!(
+                app.tab(owner).unwrap().runtime.cursor_position(),
+                Some(cagents::lsp::LspPosition {
+                    line: 29,
+                    character: 4
+                })
+            );
             assert_eq!(app.active, Some(owner));
         }
     }
@@ -6617,7 +6885,14 @@ mod tests {
         std::fs::write(root.join("a.rs"), "first\n").unwrap();
         std::fs::write(root.join("b.rs"), "second\n").unwrap();
         let mut app = configured(&directory);
-        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        let task = app.add(
+            Opened {
+                root: root.into(),
+                file: None,
+                snapshot: None,
+            },
+            true,
+        );
         run_tasks(&mut app, task);
         let card = app.active.unwrap();
         drop(app.update(Message::QuickOpen));
@@ -6642,25 +6917,63 @@ mod tests {
         std::fs::write(root.join("b.rs"), "other file\n").unwrap();
         let mut app = configured(&directory);
         app.settings.editor_auto_save = false;
-        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        let task = app.add(
+            Opened {
+                root: root.into(),
+                file: None,
+                snapshot: None,
+            },
+            true,
+        );
         run_tasks(&mut app, task);
         let card = app.active.unwrap();
         let old = app.request_file_at(card, "a.rs".into(), Some((0, 5)));
         let latest = app.request_file_at(card, "a.rs".into(), Some((2, 1)));
         run_tasks(&mut app, old);
-        assert_eq!(app.tab(card).unwrap().pending_file.as_ref().unwrap().location, Some((2, 1)));
+        assert_eq!(
+            app.tab(card)
+                .unwrap()
+                .pending_file
+                .as_ref()
+                .unwrap()
+                .location,
+            Some((2, 1))
+        );
         run_tasks(&mut app, latest);
-        assert_eq!(app.tab(card).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 2, character: 1 }));
-        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('x')) })));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.cursor_position(),
+            Some(cagents::lsp::LspPosition {
+                line: 2,
+                character: 1
+            })
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('x')),
+            })),
+        );
         let dirty = app.tab(card).unwrap().runtime.editor_text().unwrap();
         let same = app.request_file_at(card, "a.rs".into(), Some((1, 2)));
         run_tasks(&mut app, same);
-        assert_eq!(app.tab(card).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 1, character: 2 }));
-        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some(dirty.as_str()));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.cursor_position(),
+            Some(cagents::lsp::LspPosition {
+                line: 1,
+                character: 2
+            })
+        );
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some(dirty.as_str())
+        );
         let other = app.request_file_at(card, "b.rs".into(), Some((0, 0)));
         run_tasks(&mut app, other);
         assert!(app.tab(card).unwrap().pending_file.is_none());
-        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some(dirty.as_str()));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some(dirty.as_str())
+        );
         assert!(app.notice.as_deref().unwrap().contains("Save or discard"));
     }
 
@@ -6886,49 +7199,99 @@ mod tests {
             code: None,
             protocol: None,
         };
-        let publish = |version, line| Message::Lsp(generation, Some(LspEvent::Diagnostics {
-            doc,
-            version,
-            items: vec![diagnostic(line)],
-        }));
-        let next = || Message::Repository(RepositoryAction::Language {
-            card: id,
-            action: EditorLspAction::Diagnostic(true),
-        });
+        let publish = |version, line| {
+            Message::Lsp(
+                generation,
+                Some(LspEvent::Diagnostics {
+                    doc,
+                    version,
+                    items: vec![diagnostic(line)],
+                }),
+            )
+        };
+        let next = || {
+            Message::Repository(RepositoryAction::Language {
+                card: id,
+                action: EditorLspAction::Diagnostic(true),
+            })
+        };
         drop(app.update(publish(1, 2)));
-        assert!(app.tab(id).unwrap().runtime.diagnostic_navigation_available());
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
         drop(app.update(next()));
-        assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), Some(LspPosition::new(2, 0)));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(2, 0))
+        );
 
-        app.tab_mut(id).unwrap().runtime.move_cursor_to(LspPosition::new(0, 0));
-        drop(app.update(Message::Repository(RepositoryAction::EditorAction {
-            card: id,
-            action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
-                Arc::new("// before\n".into()),
-            )),
-        })));
+        app.tab_mut(id)
+            .unwrap()
+            .runtime
+            .move_cursor_to(LspPosition::new(0, 0));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("// before\n".into()),
+                )),
+            })),
+        );
         assert_eq!(app.lsp.document_version(doc), Some(2));
-        assert_eq!(app.tab(id).unwrap().diagnostics[0].range.start, LspPosition::new(3, 0));
+        assert_eq!(
+            app.tab(id).unwrap().diagnostics[0].range.start,
+            LspPosition::new(3, 0)
+        );
         drop(app.update(next()));
-        assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), Some(LspPosition::new(3, 0)));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(3, 0))
+        );
 
         drop(app.update(publish(1, 0)));
-        assert_eq!(app.tab(id).unwrap().diagnostics[0].range.start, LspPosition::new(3, 0));
+        assert_eq!(
+            app.tab(id).unwrap().diagnostics[0].range.start,
+            LspPosition::new(3, 0)
+        );
         drop(app.update(publish(2, 1)));
         drop(app.update(next()));
-        assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), Some(LspPosition::new(1, 0)));
-        drop(app.update(Message::Lsp(generation, Some(LspEvent::DocumentDesynced {
-            doc,
-            version: 2,
-            error: LspError::InconsistentEdits,
-        }))));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(1, 0))
+        );
+        drop(app.update(Message::Lsp(
+            generation,
+            Some(LspEvent::DocumentDesynced {
+                doc,
+                version: 2,
+                error: LspError::InconsistentEdits,
+            }),
+        )));
         assert!(app.tab(id).unwrap().diagnostics.is_empty());
-        assert!(!app.tab(id).unwrap().runtime.diagnostic_navigation_available());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
         drop(app.update(publish(2, 1)));
-        assert!(app.tab(id).unwrap().runtime.diagnostic_navigation_available());
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
         app.close_document(id);
         assert!(app.tab(id).unwrap().diagnostics.is_empty());
-        assert!(!app.tab(id).unwrap().runtime.diagnostic_navigation_available());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
     }
 
     #[test]
@@ -7875,24 +8238,53 @@ mod tests {
         let mut app = editor();
         let card = open_real_git(&mut app, root, Some("tracked.txt"));
         app.window_focused = true;
-        let task = app.update(Message::Repository(RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::HeadToIndex }));
+        let task = app.update(Message::Repository(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: DiffBasis::HeadToIndex,
+        }));
         run_tasks(&mut app, task);
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
-        assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(1));
+        assert_eq!(
+            app.tab(card)
+                .unwrap()
+                .runtime
+                .inspector_context()
+                .diff_additions,
+            Some(1)
+        );
         let input = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(input.path(), "staged one\nstaged two\nstaged three\n").unwrap();
         let blob = git(root, &["hash-object", "-w", input.path().to_str().unwrap()]);
-        git(root, &["update-index", "--cacheinfo", "100644", &blob, "tracked.txt"]);
+        git(
+            root,
+            &[
+                "update-index",
+                "--cacheinfo",
+                "100644",
+                &blob,
+                "tracked.txt",
+            ],
+        );
         app.window_focused = false;
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
         let tab = app.tab(card).unwrap();
         assert_eq!(tab.runtime.inspector_context().diff_additions, Some(3));
-        assert_eq!(tab.runtime.editor_text().as_deref(), Some("working stays\n"));
+        assert_eq!(
+            tab.runtime.editor_text().as_deref(),
+            Some("working stays\n")
+        );
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
-        assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(3));
+        assert_eq!(
+            app.tab(card)
+                .unwrap()
+                .runtime
+                .inspector_context()
+                .diff_additions,
+            Some(3)
+        );
     }
 
     #[test]
@@ -7907,34 +8299,70 @@ mod tests {
         git(root, &["commit", "-m", "Topic"]);
         let head = Oid::parse_object(git(root, &["rev-parse", "HEAD"])).unwrap();
         let reference = ValidatedRefName::parse("refs/heads/main").unwrap();
-        let live = DiffBasis::MergeBaseToHead { base_ref: reference.clone(), head: head.clone(), merge_base: initial.clone() };
+        let live = DiffBasis::MergeBaseToHead {
+            base_ref: reference.clone(),
+            head: head.clone(),
+            merge_base: initial.clone(),
+        };
         let mut app = editor();
         let card = open_real_git(&mut app, root, Some("tracked.txt"));
         app.window_focused = true;
-        let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile { card, path: RepoPath::parse("tracked.txt").unwrap(), old_path: None, basis: live }));
+        let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile {
+            card,
+            path: RepoPath::parse("tracked.txt").unwrap(),
+            old_path: None,
+            basis: live,
+        }));
         run_tasks(&mut app, task);
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
-        assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &initial));
+        assert!(
+            matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &initial)
+        );
         app.window_focused = false;
         app.settings_open = true;
         git(root, &["update-ref", "refs/heads/main", head.as_str()]);
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
-        assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &head));
+        assert!(
+            matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &head)
+        );
         app.settings_open = false;
-        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "topic one\ntopic two\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "topic one\ntopic two\n"
+        );
         for basis in [
-            DiffBasis::CommitToParent { oid: head.clone(), parent: Some(initial.clone()) },
-            DiffBasis::PullRequest { number: 1, base_ref: reference, head: head.clone(), merge_base: initial.clone() },
+            DiffBasis::CommitToParent {
+                oid: head.clone(),
+                parent: Some(initial.clone()),
+            },
+            DiffBasis::PullRequest {
+                number: 1,
+                base_ref: reference,
+                head: head.clone(),
+                merge_base: initial.clone(),
+            },
         ] {
-            let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile { card, path: RepoPath::parse("tracked.txt").unwrap(), old_path: None, basis: basis.clone() }));
+            let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile {
+                card,
+                path: RepoPath::parse("tracked.txt").unwrap(),
+                old_path: None,
+                basis: basis.clone(),
+            }));
             run_tasks(&mut app, task);
             git(root, &["update-ref", "refs/heads/main", initial.as_str()]);
             let task = app.update(Message::RefreshDocuments);
             run_tasks(&mut app, task);
             assert_eq!(app.tab(card).unwrap().runtime.selected_diff_basis(), &basis);
-            assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(2));
+            assert_eq!(
+                app.tab(card)
+                    .unwrap()
+                    .runtime
+                    .inspector_context()
+                    .diff_additions,
+                Some(2)
+            );
         }
     }
 
@@ -7951,9 +8379,12 @@ mod tests {
         load_selected(&mut app, a);
         let b = add(&mut app, root.to_str().unwrap(), Some("b.rs"));
         load_selected(&mut app, b);
-        drop(app.update(Message::Repository(RepositoryAction::EditorAction {
-            card: b, action: EditorAction::Edit(EditorEdit::Insert('x')),
-        })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: b,
+                action: EditorAction::Edit(EditorEdit::Insert('x')),
+            })),
+        );
         let dirty = app.tab(b).unwrap().runtime.editor_text().unwrap();
         std::fs::write(root.join("a.rs"), "outside a\n").unwrap();
         std::fs::write(root.join("b.rs"), "outside b\n").unwrap();
@@ -7962,21 +8393,41 @@ mod tests {
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
         assert_eq!(app.active, Some(b));
-        assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some("outside a\n"));
-        assert_eq!(app.tab(b).unwrap().runtime.editor_text().as_deref(), Some(dirty.as_str()));
-        assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "outside b\n");
+        assert_eq!(
+            app.tab(a).unwrap().runtime.editor_text().as_deref(),
+            Some("outside a\n")
+        );
+        assert_eq!(
+            app.tab(b).unwrap().runtime.editor_text().as_deref(),
+            Some(dirty.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).unwrap(),
+            "outside b\n"
+        );
         app.settings_open = false;
         drop(app.update(Message::Repository(RepositoryAction::Undo { card: a })));
-        assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some("before a\n"));
+        assert_eq!(
+            app.tab(a).unwrap().runtime.editor_text().as_deref(),
+            Some("before a\n")
+        );
     }
 
     #[test]
     fn a_modal_refuses_editor_input_but_never_an_async_completion() {
         let card = CardId::new();
-        assert!(repository_action_allowed_while_modal(&RepositoryAction::DiskMetadata {
-            identity: AsyncIdentity { card, worktree: "/fixture".into(), path: "a.rs".into(), generation: 1 },
-            ticket: 1, result: Err("fixture".into()),
-        }));
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::DiskMetadata {
+                identity: AsyncIdentity {
+                    card,
+                    worktree: "/fixture".into(),
+                    path: "a.rs".into(),
+                    generation: 1
+                },
+                ticket: 1,
+                result: Err("fixture".into()),
+            }
+        ));
         assert!(repository_action_allowed_while_modal(
             &RepositoryAction::FindLoaded {
                 card,

@@ -230,9 +230,23 @@ mod tests {
         assert_eq!(column_for_prefix("emacs", prefix), 8);
         for editor in ["code", "codium", "cursor"] {
             assert_eq!(column_for_prefix(editor, prefix), 9);
-            assert_eq!(arguments(editor, Path::new("/repo/unicode.rs"), Some((120, column_for_prefix(editor, prefix))))[1], "/repo/unicode.rs:120:9");
+            assert_eq!(
+                arguments(
+                    editor,
+                    Path::new("/repo/unicode.rs"),
+                    Some((120, column_for_prefix(editor, prefix)))
+                )[1],
+                "/repo/unicode.rs:120:9"
+            );
         }
-        assert_eq!(arguments("zed", Path::new("/repo/unicode.rs"), Some((120, column_for_prefix("zed", prefix))))[1], "/repo/unicode.rs:120:8");
+        assert_eq!(
+            arguments(
+                "zed",
+                Path::new("/repo/unicode.rs"),
+                Some((120, column_for_prefix("zed", prefix)))
+            )[1],
+            "/repo/unicode.rs:120:8"
+        );
     }
 
     #[test]

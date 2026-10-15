@@ -132,8 +132,14 @@ fn number_setting_current(value: &str, default: f64, min: f64, max: f64) -> f64 
 }
 
 fn number_setting_serialized(field: SettingsField, number: f64) -> String {
-    if matches!(field, SettingsField::HibernationDelayMs | SettingsField::EditorTabWidth) { format!("{number:.0}") }
-    else { format!("{number:.3}") }
+    if matches!(
+        field,
+        SettingsField::HibernationDelayMs | SettingsField::EditorTabWidth
+    ) {
+        format!("{number:.0}")
+    } else {
+        format!("{number:.3}")
+    }
 }
 
 fn number_setting_reset(field: SettingsField, value: &str, default: f64) -> Option<Message> {
@@ -172,8 +178,14 @@ fn setting_stepper<'a>(
         f64::from(default),
     );
     let current = if field == SettingsField::EditorTabWidth {
-        value.parse::<u16>().map(f64::from).unwrap_or(default).clamp(min, max)
-    } else { number_setting_current(value, default, min, max) };
+        value
+            .parse::<u16>()
+            .map(f64::from)
+            .unwrap_or(default)
+            .clamp(min, max)
+    } else {
+        number_setting_current(value, default, min, max)
+    };
     let change = |next: f64| Message::SettingsChanged {
         field,
         value: number_setting_serialized(field, next.clamp(min, max)),
@@ -212,7 +224,10 @@ fn setting_stepper<'a>(
     .align_y(Alignment::Center)
     .width(Length::Shrink)
     .into();
-    setting_field(label, detail, control).error(invalid.get(&field).map(String::as_str)).keywords(field.config_key()).keywords(value)
+    setting_field(label, detail, control)
+        .error(invalid.get(&field).map(String::as_str))
+        .keywords(field.config_key())
+        .keywords(value)
 }
 
 fn settings_choice<'a>(
@@ -1857,13 +1872,25 @@ mod typography_settings_tests {
         for width in [1_u16, 4, 8, 16] {
             let value = number_setting_serialized(field, f64::from(width));
             assert_eq!(value.parse::<u16>().unwrap(), width);
-            assert!(!matches!(settings_update(&settings, field, &value), SettingsDecision::Invalid(_)));
+            assert!(!matches!(
+                settings_update(&settings, field, &value),
+                SettingsDecision::Invalid(_)
+            ));
         }
-        let Some(Message::SettingsChanged { field, value }) = number_setting_reset(field, "8", 4.0) else { panic!("tab width reset"); };
+        let Some(Message::SettingsChanged { field, value }) = number_setting_reset(field, "8", 4.0)
+        else {
+            panic!("tab width reset");
+        };
         assert_eq!(value, "4");
-        assert!(!matches!(settings_update(&settings, field, &value), SettingsDecision::Invalid(_)));
+        assert!(!matches!(
+            settings_update(&settings, field, &value),
+            SettingsDecision::Invalid(_)
+        ));
         assert_eq!(number_setting_value(field, "4."), "4");
-        assert!(matches!(settings_update(&settings, field, &number_setting_value(field, "4.5")), SettingsDecision::Invalid(_)));
+        assert!(matches!(
+            settings_update(&settings, field, &number_setting_value(field, "4.5")),
+            SettingsDecision::Invalid(_)
+        ));
     }
 
     #[test]
