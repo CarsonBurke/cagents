@@ -16567,7 +16567,7 @@ impl Application for Cagents {
                     if let Some(source) = self.sidebar_model.source_control.as_mut() {
                         source.set_reloading(false);
                     }
-                    return self.reload_pending_source_control();
+                    return self.reload_pending_source_control(&key);
                 }
                 let (snapshot, mut next) = match result {
                     Ok(read) => {
@@ -16575,7 +16575,7 @@ impl Application for Cagents {
                             *read.prepared.expect("unchanged reads returned above");
                         (Some(snapshot), model)
                     }
-                    Err(error) => (None, SourceControlModel::failed(key, error.message)),
+                    Err(error) => (None, SourceControlModel::failed(key.clone(), error.message)),
                 };
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
@@ -16591,7 +16591,7 @@ impl Application for Cagents {
                         Task::none()
                     }
                 };
-                Task::batch([task, self.reload_pending_source_control()])
+                Task::batch([task, self.reload_pending_source_control(&key)])
             }
             Message::SourceControlHistory {
                 generation,
