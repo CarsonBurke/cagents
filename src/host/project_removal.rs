@@ -588,6 +588,14 @@ mod tests {
         let held=hold_final_commit(&fixture.host,b.operation);
         assert!(matches!(operation_reply(&fixture.host,b.clone()),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::PendingCommit,..}));
         let (_,original_b)=reservation::retained_operation(&fixture.host,b.operation).unwrap();
+        {
+            let registry=super::super::agent_execution::registry(&fixture.host).unwrap();
+            let entries=fixture.host.lock().unwrap().project_removals.clone();
+            assert!(reservation::restore_operations(&registry.lock().unwrap(),&entries).is_err(),"reinstall cannot duplicate a live original owner under its different reservation token");
+            assert_eq!(entries.lock().unwrap().len(),1);
+            let (_,preserved)=reservation::retained_operation(&fixture.host,b.operation).unwrap();
+            assert!(Arc::ptr_eq(&original_b,&preserved));
+        }
         fixture.host.lock().unwrap().project_operation_before_commit=None;drop(held);
         let a=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:fixture.expected.clone(),action:ProjectOperationAction::Remove{sessions:vec![selected]}};
         let operation=a.operation;

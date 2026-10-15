@@ -230,6 +230,12 @@ pub(super) fn retained_operation(host:&SharedHost,operation:uuid::Uuid)->Option<
 pub(super) fn restore_operations(registry:&super::super::model::Registry,entries:&Reservations)->Result<(),String> {
     let pending=registry.pending_project_operations()?;
     let mut entries=entries.lock().unwrap_or_else(|p|p.into_inner());
+    // Live leases use a random reservation token, whereas restored leases use
+    // the operation UUID. Compare the actual operation owner, not map keys,
+    // before inserting anything; never replace live pins with a Lost copy.
+    if pending.iter().any(|row|entries.values().any(|scope|scope.operation.lock().unwrap_or_else(|p|p.into_inner()).as_ref().is_some_and(|owner|owner.operation==row.operation))) {
+        return Err("A project operation already has original custody; restart-negative restoration cannot replace or duplicate it".into());
+    }
     for obligation in pending {
         let saved=obligation.scope.as_ref().ok_or("Pending operation has no negative scope")?;
         let operation=Arc::new(super::custody::Operation::lost(&obligation,saved)?);
