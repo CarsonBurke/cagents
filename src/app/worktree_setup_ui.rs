@@ -246,9 +246,9 @@ impl Cagents {
             let worktree = destination.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let result = preparation(intent.clone(), &destination, operation, &token)?;
-                // Copy-only completion is durable before the UI can report it.
+                // Copy completion is durable before any shell is published.
                 // Shell completion is evidenced by its exact marked terminal.
-                if result.command.is_none() && !result.skipped {
+                if !result.skipped {
                     let store = store.ok_or("The setup journal is unavailable")?;
                     let mut complete = intent.clone();
                     complete.copy_done = true;
