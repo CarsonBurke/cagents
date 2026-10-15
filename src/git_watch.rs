@@ -1010,28 +1010,40 @@ pub(crate) mod tests {
     /// Fixture commands must not inherit a caller's repository, injected
     /// configuration, template or hooks. Production policy tests use their own
     /// commands and are deliberately unaffected by this test-only isolation.
-    pub(crate) fn isolated_fixture_command(mut command: crate::repository::CommandSpec) -> crate::repository::CommandSpec {
-        let names = std::env::vars_os().map(|(name, _)| name)
-            .chain(command.environment.keys().cloned()).collect::<BTreeSet<_>>();
+    pub(crate) fn isolated_fixture_command(
+        mut command: crate::repository::CommandSpec,
+    ) -> crate::repository::CommandSpec {
+        let names = std::env::vars_os()
+            .map(|(name, _)| name)
+            .chain(command.environment.keys().cloned())
+            .collect::<BTreeSet<_>>();
         for name in names {
             if name.as_encoded_bytes().starts_with(b"GIT_") {
                 command.environment.remove(&name);
                 command = command.env_remove(name);
             }
         }
-        command.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .timeout(Duration::from_secs(30))
     }
 
-    pub(crate) fn run_fixture_command(mut command: crate::repository::CommandSpec) -> crate::repository::ProcessOutput {
+    pub(crate) fn run_fixture_command(
+        mut command: crate::repository::CommandSpec,
+    ) -> crate::repository::ProcessOutput {
         use crate::repository::ProcessExecutor;
         command.stdout_limit = 64 * 1024;
         command.stderr_limit = 64 * 1024;
-        let output = crate::repository::SystemProcessExecutor.execute(&command, &CancellationToken::default())
+        let output = crate::repository::SystemProcessExecutor
+            .execute(&command, &CancellationToken::default())
             .expect("bounded isolated fixture command runs");
-        assert!(output.success, "fixture command failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.success,
+            "fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         output
     }
 
@@ -1041,7 +1053,9 @@ pub(crate) mod tests {
     pub(crate) fn fixture_isolated(test: &str) -> bool {
         const CHILD: &str = "CAGENTS_TEST_GIT_WATCH_FIXTURE";
         if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
-            for (name, value) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
+            for (name, value) in
+                std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_"))
+            {
                 let expected = match name.to_str() {
                     Some("GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM") => "/dev/null",
                     Some("GIT_CONFIG_NOSYSTEM") => "1",
@@ -1052,13 +1066,15 @@ pub(crate) mod tests {
             return true;
         }
         let command = crate::repository::CommandSpec::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"]).env(CHILD, test);
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, test);
         let output = run_fixture_command(isolated_fixture_command(command));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
-            "the owned child must run exactly its fixture test");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "the owned child must run exactly its fixture test"
+        );
         false
     }
-
 
     fn project(root: &Path) -> Project {
         let first = root.join("first");

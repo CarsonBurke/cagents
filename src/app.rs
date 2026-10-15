@@ -4002,10 +4002,17 @@ pub struct SourceControlReadFailure {
     status_read: Option<u64>,
 }
 impl From<String> for SourceControlReadFailure {
-    fn from(message: String) -> Self { Self { message, status_read: None } }
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            status_read: None,
+        }
+    }
 }
 impl From<&str> for SourceControlReadFailure {
-    fn from(message: &str) -> Self { message.to_owned().into() }
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -11354,7 +11361,11 @@ impl Cagents {
                 Ok(read)
             })
             .await
-            .map_err(|error| SourceControlReadFailure::from(format!("source-control reader join failed: {error}")))
+            .map_err(|error| {
+                SourceControlReadFailure::from(format!(
+                    "source-control reader join failed: {error}"
+                ))
+            })
             .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
@@ -16843,12 +16854,24 @@ impl Application for Cagents {
                         worktree.apply_operation(read.operation);
                     }
                 }
-                if let Err(failure) = &result && let Some(read) = failure.status_read {
+                if let Err(failure) = &result
+                    && let Some(read) = failure.status_read
+                {
                     let display_error: String = failure.message.chars().take(512).collect();
-                    if self.refresh_ui.git.accept_bound_status_error(&key, &display_error, read)
-                        && let Some(worktree) = self.sidebar_model.projects.iter_mut()
+                    if self
+                        .refresh_ui
+                        .git
+                        .accept_bound_status_error(&key, &display_error, read)
+                        && let Some(worktree) = self
+                            .sidebar_model
+                            .projects
+                            .iter_mut()
                             .find(|project| project.id == key.project_id)
-                            .and_then(|project| project.worktrees.iter_mut().find(|row| row.id == key.worktree_id && row.path == key.canonical_path))
+                            .and_then(|project| {
+                                project.worktrees.iter_mut().find(|row| {
+                                    row.id == key.worktree_id && row.path == key.canonical_path
+                                })
+                            })
                     {
                         worktree.apply_status_error(Some(&display_error));
                     }

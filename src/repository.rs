@@ -882,7 +882,9 @@ impl SnapshotCache {
     /// Classification for the CURRENT snapshot_cached attempt only. A metadata,
     /// config or Files failure must not be presented as a failed status read.
     /// Display recovery only; this flag never authorizes a mutation.
-    pub fn status_attempt_failed(&self) -> bool { self.status_attempt_failed }
+    pub fn status_attempt_failed(&self) -> bool {
+        self.status_attempt_failed
+    }
 
     /// Tiny display facts proven by the last successful cached read, including
     /// an unchanged read. Never use this projection as mutation authority.
@@ -4549,13 +4551,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             };
             cache.fsmonitor_checked = true;
         }
-        let output = self.run_checked(
-            &snapshot_fsmonitor(
-                self.status_command_with_untracked(worktree, options.untracked_changes),
-                cache.fsmonitor.as_deref(),
-            ),
-            cancellation,
-        ).inspect_err(|_| cache.status_attempt_failed = true)?;
+        let output = self
+            .run_checked(
+                &snapshot_fsmonitor(
+                    self.status_command_with_untracked(worktree, options.untracked_changes),
+                    cache.fsmonitor.as_deref(),
+                ),
+                cancellation,
+            )
+            .inspect_err(|_| cache.status_attempt_failed = true)?;
         use sha2::Digest;
         let digest: [u8; 32] = sha2::Sha256::digest(&output.stdout).into();
         if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some() {
@@ -8567,22 +8571,48 @@ mod tests {
 
     #[test]
     fn snapshot_cache_distinguishes_status_failures_from_later_or_prepass_errors() {
-        let options = SnapshotOptions { untracked_changes: true, untracked_files: false };
-        let failure = || Ok(ProcessOutput { exit_code: Some(128), signal: None, success: false,
-            stdout: Vec::new(), stderr: b"fixture failure".to_vec() });
+        let options = SnapshotOptions {
+            untracked_changes: true,
+            untracked_files: false,
+        };
+        let failure = || {
+            Ok(ProcessOutput {
+                exit_code: Some(128),
+                signal: None,
+                success: false,
+                stdout: Vec::new(),
+                stderr: b"fixture failure".to_vec(),
+            })
+        };
         let valid = b"# branch.oid (initial)\0# branch.head main\0";
         for (checked, outputs, expected) in [
             (false, vec![failure()], false), // config prepass, before status
-            (true, vec![failure()], true), // actual status command
+            (true, vec![failure()], true),   // actual status command
             (true, vec![success(b"invalid status\0")], true), // status parser
             (true, vec![success(valid), failure()], false), // numstat, after status
         ] {
             let executor = Arc::new(FakeExecutor::with_outputs(outputs));
             let git = RepositoryService::new("git", executor);
-            let mut cache = SnapshotCache { options: Some(options), fsmonitor_checked: checked,
-                status_attempt_failed: true, ..Default::default() };
-            assert!(git.snapshot_cached(Path::new("/snapshot-status-failure"), options, &CancellationToken::new(), &mut cache).is_err());
-            assert_eq!(cache.status_attempt_failed(), expected, "classification must reset before every attempt, not leak an older failure");
+            let mut cache = SnapshotCache {
+                options: Some(options),
+                fsmonitor_checked: checked,
+                status_attempt_failed: true,
+                ..Default::default()
+            };
+            assert!(
+                git.snapshot_cached(
+                    Path::new("/snapshot-status-failure"),
+                    options,
+                    &CancellationToken::new(),
+                    &mut cache
+                )
+                .is_err()
+            );
+            assert_eq!(
+                cache.status_attempt_failed(),
+                expected,
+                "classification must reset before every attempt, not leak an older failure"
+            );
         }
     }
 
