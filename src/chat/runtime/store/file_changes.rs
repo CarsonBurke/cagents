@@ -133,7 +133,10 @@ impl Store {
         sign: i64,
     ) -> Result<(), String> {
         let succeeded = i64::from(status == ToolStatus::Succeeded);
-        let pending = i64::from(status == ToolStatus::Running);
+        let pending = i64::from(matches!(
+            status,
+            ToolStatus::Running | ToolStatus::AwaitingApproval
+        ));
         let failed = i64::from(succeeded == 0 && pending == 0);
         let before:Option<(i64,i64,Option<String>)>=self.db.query_row("SELECT succeeded,succeeded+pending+failed,resolved FROM file_totals WHERE source=?1 AND path=?2",params![source,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
         let (old_succeeded, old_count, resolved) =

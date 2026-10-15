@@ -3,10 +3,14 @@
 use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
+pub mod annotations;
 #[cfg(feature = "ui")]
 pub mod coordination;
+pub mod original;
 pub mod presentation;
 pub mod pricing;
+
+pub const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -223,16 +227,41 @@ impl Launch {
         }
         Some(recipe)
     }
+    /// Carry provider-confirmed conversation choices back to its CLI recipe.
+    pub(crate) fn terminal_recipe_with_current_options(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+        permission: Option<&str>,
+    ) -> Option<LaunchRecipe> {
+        let mut recipe = self.terminal_recipe_with_permission_mode(permission)?;
+        // A provider can omit a capability or its selected value. In that
+        // case retain the recorded choice instead of inventing an Automatic change.
+        crate::settings::AgentLaunchSettings::default().append_options(
+            self.provider,
+            &mut recipe.arguments,
+            crate::settings::agents::LaunchDefaults {
+                model,
+                effort,
+                permission_mode: (self.provider != Provider::Claude)
+                    .then_some(permission)
+                    .flatten(),
+            },
+        );
+        Some(recipe)
+    }
+
     /// Return to the CLI using the current provider-confirmed identity, not a
     /// stale ID from the original argv before a native /clear or session switch.
     pub fn terminal_recipe(&self) -> Option<LaunchRecipe> {
         let id = self.session_id.as_deref()?;
         if id.len() != 36
             || uuid::Uuid::parse_str(id).is_err()
-            || std::path::Path::new(&self.recipe.program)
+            || (std::path::Path::new(&self.recipe.program)
                 .file_name()?
                 .to_str()?
                 != self.provider.executable()
+                && !std::path::Path::new(&self.recipe.program).is_absolute())
         {
             return None;
         }
@@ -255,7 +284,7 @@ impl Launch {
         }
         self.provider.append_resume(&mut arguments, id.into());
         recipe.arguments = arguments;
-        crate::model::agent_recovery::resume_recipe(&recipe)
+        crate::model::agent_recovery::resume_recipe_for_provider(&recipe, self.provider)
     }
 }
 
@@ -370,6 +399,14 @@ impl From<&str> for StartFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
+}
+
+/// File bytes to dispatch, with an optional non-authoritative display label.
+/// The display path is never opened, resolved, or used for account authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedAttachment {
+    pub path: std::path::PathBuf,
+    pub display_path: Option<std::path::PathBuf>,
 }
 
 /// The file extensions every provider's image input recognises.
@@ -865,6 +902,9 @@ impl PromptSuggestion {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Exact source cache lifetime, including Reset followed by the same session.
+    #[serde(default)]
+    pub source_incarnation: Option<uuid::Uuid>,
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
     /// advance this with their monotonic clock instead of comparing timestamps
     /// from two machines. Absent only in older data and synthetic snapshots.
@@ -876,6 +916,10 @@ pub struct Snapshot {
     /// and autonomous turns, even when publications coalesce the idle state.
     #[serde(default)]
     pub turn_generation: u64,
+    /// Daemon source-clock time at the observed turn boundary. Kept in resident
+    /// metadata so a first attachment can time work whose prompt is paged out.
+    #[serde(default)]
+    pub turn_started_at: Option<u64>,
     /// Daemon wall-clock time when a provider-confirmed turn and its delegated
     /// work finished. Historical imports without an observed turn have no time.
     #[serde(default)]
@@ -900,6 +944,11 @@ pub struct Snapshot {
     pub skills: Vec<Skill>,
     pub usage: Usage,
     pub busy: bool,
+    /// Exact-original restoration is separate from provider activity and timing.
+    #[serde(default)]
+    pub original_retry_pending: bool,
+    #[serde(default)]
+    pub original_retry_diagnostic: Option<String>,
     pub detail: String,
     pub session_id: Option<String>,
     #[serde(default)]
@@ -950,6 +999,10 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Actor-local eligibility revision for exact originals. It changes when
+    /// authority/acceptance/latest changes, independently of presentation noise.
+    #[serde(default)]
+    pub original_revision: u64,
 }
 
 /// When a provider takes a message it is holding.
@@ -1217,11 +1270,46 @@ pub enum Command {
         cursor: Option<FilePatchCursor>,
         revision: u64,
     },
+    /// Read only an immutable, provider-confirmed original command.
+    LoadOriginal {
+        user_id: Option<String>,
+        expected_session: Option<String>,
+        offset: usize,
+        limit: usize,
+    },
+    /// Retry only the exact current original. The actor reloads private input
+    /// and verifies its identity; caller-provided text is never dispatched.
+    PromptOriginal {
+        source_incarnation: Option<uuid::Uuid>,
+        session_id: String,
+        original: annotations::OriginalPrompt,
+        turn_generation: u64,
+    },
+    /// Send new intent while preserving attachment display names from Edit.
+    /// Only `path` supplies bytes; `display_path` is presentation metadata.
+    PromptNamed {
+        text: String,
+        attachments: Vec<NamedAttachment>,
+        mode: PromptMode,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
     pub field: String,
     pub values: Vec<String>,
+}
+
+impl Answer {
+    /// An optional denial redirect, carried through the existing structured
+    /// answer transport. This field is not a provider question answer.
+    pub const DENIAL_INSTRUCTIONS: &str = "__cagents_denial_instructions";
+
+    pub fn denial_instructions(text: String) -> Self {
+        Self {
+            field: Self::DENIAL_INSTRUCTIONS.into(),
+            values: vec![text],
+        }
+    }
 }
 
 /// Permission metadata supplied by the provider, without unrelated settings
@@ -1315,6 +1403,8 @@ pub enum ToolStatus {
     /// Ended before it finished because it was asked to stop: cancelled by
     /// the user, or interrupted with the work that started it.
     Stopped,
+    /// The tool has been proposed and cannot run until the user answers.
+    AwaitingApproval,
 }
 
 /// What a shell command was actually for.
@@ -1637,6 +1727,15 @@ impl ItemContent {
         }
     }
 
+    pub fn set_status(&mut self, value: ToolStatus) {
+        match self {
+            Self::Command { status, .. }
+            | Self::Changes { status, .. }
+            | Self::Tool { status, .. } => *status = value,
+            _ => {}
+        }
+    }
+
     pub fn status(&self) -> Option<ToolStatus> {
         match self {
             Self::Command { status, .. }
@@ -1683,7 +1782,8 @@ pub struct Field {
 /// What the provider is asking the reader to do, independent of its RPC envelope.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestKind {
-    /// Authorize a tool action or additional permissions. Never submit on Enter.
+    /// Authorize a tool action or additional permissions. Requires an explicit
+    /// decision; card shortcuts are active only after the user focuses it.
     #[default]
     Approval,
     /// Answer an ordinary question, including a yes/no confirmation.
@@ -1798,6 +1898,9 @@ pub struct Capabilities {
     /// background, rather than only the turn and the work inside it.
     #[serde(default)]
     pub interrupt_stops_background: bool,
+    /// Backend can restore exact original settings as part of guarded Retry.
+    #[serde(default)]
+    pub original_retry: bool,
 }
 /// Provider-confirmed speed setting, independent of model reasoning effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2150,6 +2253,38 @@ mod tests {
     }
 
     #[test]
+    fn terminal_handoff_keeps_configured_wrapper_and_exact_provider_identity() {
+        let launch = Launch {
+            provider: Provider::Claude,
+            recipe: LaunchRecipe {
+                program: "/home/example/bin/claude-wrapper".into(),
+                arguments: vec!["--model".into(), "fixture-model".into()],
+                working_directory: "/project".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: Some("d1714898-6c54-4727-8113-0d5b9db7aeb9".into()),
+        };
+        let recipe = launch
+            .terminal_recipe()
+            .expect("typed native provider supports its configured wrapper");
+        assert_eq!(recipe.program, launch.recipe.program);
+        assert_eq!(
+            recipe.arguments,
+            [
+                "--model",
+                "fixture-model",
+                "--resume",
+                "d1714898-6c54-4727-8113-0d5b9db7aeb9"
+            ]
+        );
+        assert!(
+            crate::model::agent_recovery::resume_recipe(&recipe).is_none(),
+            "untyped arbitrary commands must remain unrecognized"
+        );
+    }
+
+    #[test]
     fn terminal_handoff_uses_confirmed_claude_permissions_without_changing_identity() {
         let launch = Launch {
             provider: Provider::Claude,
@@ -2193,6 +2328,30 @@ mod tests {
         );
         assert_eq!(
             launch.terminal_recipe_with_permission_mode(None),
+            launch.terminal_recipe()
+        );
+        let updated = launch
+            .terminal_recipe_with_current_options(
+                Some("conversation-model"),
+                Some("high"),
+                Some("plan"),
+            )
+            .unwrap();
+        assert!(
+            updated
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "conversation-model"])
+        );
+        assert!(
+            updated
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--effort", "high"])
+        );
+        assert!(!updated.arguments.iter().any(|argument| argument == "opus"));
+        assert_eq!(
+            launch.terminal_recipe_with_current_options(None, None, None),
             launch.terminal_recipe()
         );
     }
@@ -2586,6 +2745,36 @@ pub(crate) fn fresh_session(
     working_directory: std::path::PathBuf,
     account: &crate::account::Account,
 ) -> Result<Session, String> {
+    let settings = crate::settings::default_path()
+        .map_err(|error| error.to_string())
+        .and_then(|path| crate::settings::load(path).map_err(|error| error.to_string()))?;
+    let configuration = settings
+        .agents
+        .get(crate::settings::agents::provider_key(provider))
+        .cloned()
+        .unwrap_or_default();
+    fresh_session_configured(
+        provider,
+        id,
+        working_directory,
+        account,
+        &configuration,
+        Default::default(),
+    )
+}
+
+/// One launch policy shared by native drafts, CLI runs and automations. All
+/// explicit per-conversation choices override provider defaults exactly once.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn fresh_session_configured(
+    provider: Provider,
+    id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf,
+    account: &crate::account::Account,
+    configuration: &crate::settings::AgentLaunchSettings,
+    overrides: crate::settings::agents::LaunchDefaults<'_>,
+) -> Result<Session, String> {
+    configuration.validate(provider)?;
     let mut recipe = LaunchRecipe {
         unset_environment: account
             .credential_overrides()
@@ -2597,6 +2786,7 @@ pub(crate) fn fresh_session(
         working_directory,
         environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
     };
+    configuration.apply_launch(&mut recipe);
     if account.provider == provider
         && !(crate::device::is_remote()
             && matches!(account.home, crate::account::AccountHome::System))
@@ -2635,11 +2825,15 @@ pub(crate) fn fresh_session(
             // logins follow the current global default; independent homes
             // retain their own. Explicit environment choices and project
             // settings remain under Claude's own handling.
-            if let Some(mode) = claude_configured_default_mode(&recipe) {
+            if configuration.permission_mode.is_none()
+                && overrides.permission_mode.is_none()
+                && let Some(mode) = claude_configured_default_mode(&recipe)
+            {
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
             }
         }
     }
+    configuration.append_options(provider, &mut recipe.arguments, overrides);
     Ok(Session {
         native_continuity: Default::default(),
         owned_codex_listener: None,

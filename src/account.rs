@@ -43,6 +43,8 @@ pub mod registry;
 pub mod remote;
 pub mod routing;
 pub mod schedule;
+#[cfg(feature = "host")]
+pub(crate) mod scope;
 
 /// A used fraction past which an account is reported as approaching its
 /// limit. It is the same point past which the shell draws a budget in its

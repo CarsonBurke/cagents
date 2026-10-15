@@ -1,0 +1,1505 @@
+//! Exact accepted input is fetched independently from the visible transcript.
+//! Eligibility and Retry keep metadata only; Edit reads text on explicit intent.
+use super::*;
+use chat::annotations::{OriginalError, OriginalPage, OriginalPrompt};
+
+static NEXT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Context {
+    target: Target,
+    actor: usize,
+    session: String,
+    turn: u64,
+    original_revision: u64,
+    source_incarnation: Option<uuid::Uuid>,
+    latest_visible_user: Option<String>,
+}
+impl Context {
+    fn current(runtime: &Runtime) -> Option<Self> {
+        Some(Self {
+            target: runtime.target,
+            actor: Arc::as_ptr(runtime.handle()?) as usize,
+            session: runtime.snapshot.session_id.clone()?,
+            turn: runtime.snapshot.turn_generation,
+            original_revision: runtime.snapshot.original_revision,
+            source_incarnation: runtime.snapshot.source_incarnation,
+            latest_visible_user: turn_actions::latest_user(&runtime.snapshot)
+                .map(|item| item.id.clone()),
+        })
+    }
+}
+
+#[derive(Clone)]
+enum Purpose {
+    Metadata,
+    Edit { branch: Option<String> },
+}
+#[derive(Clone)]
+struct Query {
+    target: Target,
+    id: u64,
+    context: Context,
+    user: Option<String>,
+    purpose: Purpose,
+    handle: Arc<ClientHandle>,
+}
+#[derive(Default)]
+pub(super) struct State {
+    context: Option<Context>,
+    metadata: Option<OriginalPrompt>,
+    account_hint: Option<AccountId>,
+    query: Option<Query>,
+    attempted: bool,
+}
+impl State {
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+    pub(super) fn current_user(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .map(|original| original.user_id.as_str())
+    }
+    pub(super) fn metadata_bytes(&self) -> usize {
+        self.metadata.as_ref().map_or(0, |original| {
+            let setting = |value: &chat::annotations::Setting<String>| match value {
+                chat::annotations::Setting::Value(value) => value.len(),
+                _ => 0,
+            };
+            original.user_id.len()
+                + original.turn_id.len()
+                + setting(&original.settings.model)
+                + setting(&original.settings.reasoning)
+                + setting(&original.settings.permission)
+                + original
+                    .attachments
+                    .iter()
+                    .map(|attachment| {
+                        attachment.path.as_os_str().len()
+                            + attachment.original_path.as_os_str().len()
+                            + 32
+                    })
+                    .sum::<usize>()
+        })
+    }
+    pub(super) fn loading(&self) -> bool {
+        self.query.is_some()
+    }
+    pub(super) fn editing(&self) -> bool {
+        self.query
+            .as_ref()
+            .is_some_and(|query| matches!(query.purpose, Purpose::Edit { .. }))
+    }
+    #[cfg(test)]
+    pub(super) fn query_id_for_test(&self) -> u64 {
+        self.query.as_ref().expect("production query staged").id
+    }
+    fn begin(
+        &mut self,
+        target: Target,
+        context: Context,
+        handle: Arc<ClientHandle>,
+        user: Option<String>,
+        purpose: Purpose,
+    ) {
+        self.query = Some(Query {
+            target,
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            context,
+            user,
+            purpose,
+            handle,
+        });
+    }
+    fn accept(&mut self, target: Target, id: u64, context: &Context) -> Option<Query> {
+        if self.context.as_ref() != Some(context)
+            || self.query.as_ref().is_none_or(|query| {
+                query.target != target || query.id != id || &query.context != context
+            })
+        {
+            return None;
+        }
+        self.query.take()
+    }
+    fn metadata(&mut self, context: &Context, page: OriginalPage) -> bool {
+        let valid = page.source_incarnation == context.source_incarnation
+            && page.session_id == context.session
+            && page.offset == 0
+            && page.next_offset == page.text.len()
+            && page.text.len() <= 4
+            && page.next_offset <= page.original.text_bytes
+            && page.complete == (page.next_offset == page.original.text_bytes)
+            && page.original.text_bytes <= chat::annotations::ORIGINAL_TEXT_BYTES
+            && !page.original.user_id.is_empty();
+        if valid {
+            self.metadata = Some(page.original);
+        }
+        valid
+    }
+}
+
+pub(super) enum Value {
+    Metadata(OriginalPage),
+    Text(chat::original::OriginalText),
+}
+struct Output {
+    value: Result<Value, OriginalError>,
+    // Bound completed full-input replies as well as concurrent assembly.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+#[derive(Clone)]
+pub struct Reply(Arc<Mutex<Option<Output>>>);
+impl std::fmt::Debug for Reply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OriginalPromptReply")
+    }
+}
+#[cfg(test)]
+impl Reply {
+    pub(super) fn fixture(value: Result<Value, OriginalError>) -> Self {
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        Self(Arc::new(Mutex::new(Some(Output {
+            value,
+            _permit: permit,
+        }))))
+    }
+}
+
+#[derive(Clone)]
+struct Job {
+    query: Query,
+    account_hint: Option<AccountId>,
+    account_epoch: u64,
+}
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        self.query.target == other.query.target
+            && self.query.id == other.query.id
+            && self.account_hint == other.account_hint
+            && self.account_epoch == other.account_epoch
+    }
+}
+impl Eq for Job {}
+impl std::hash::Hash for Job {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use std::hash::Hash;
+        std::any::TypeId::of::<Self>().hash(state);
+        self.query.target.hash(state);
+        self.query.id.hash(state);
+        self.account_hint.hash(state);
+        self.account_epoch.hash(state);
+    }
+}
+pub(super) fn readers() -> &'static Arc<tokio::sync::Semaphore> {
+    static READERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    READERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+}
+fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
+    let job = job.clone();
+    Box::pin(iced::futures::stream::once(async move {
+        let permit = readers()
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("original readers remain open");
+        let query = job.query;
+        let value = match query.purpose {
+            Purpose::Metadata => query
+                .handle
+                .original_prompt(None, Some(&query.context.session), 0, 4)
+                .await
+                .map(Value::Metadata),
+            _ => query
+                .handle
+                .original_text(query.user.as_deref(), Some(&query.context.session))
+                .await
+                .map(Value::Text),
+        };
+        action(Action::OriginalReady(
+            query.target,
+            query.id,
+            job.account_hint,
+            job.account_epoch,
+            Reply(Arc::new(Mutex::new(Some(Output {
+                value,
+                _permit: permit,
+            })))),
+        ))
+    }))
+}
+
+pub(super) fn cleanup_answer(answer: &str) -> bool {
+    matches!(answer, "deny" | "decline" | "reject" | "cancel" | "abort")
+}
+
+impl Runtime {
+    /// Restoration holds provider input until the actor has verified readback.
+    /// Navigation and cancellation remain available even when native busy is false.
+    pub(super) fn original_restore_allows(&self, command: &Command) -> bool {
+        !self.snapshot.original_retry_pending
+            || matches!(
+                command,
+                Command::Interrupt
+                    | Command::Refresh
+                    | Command::LoadEarlier
+                    | Command::LoadLater
+                    | Command::StopSubagent { .. }
+                    | Command::RemoveQueued { .. }
+                    | Command::DismissPermissionDenial { .. }
+            )
+            || matches!(command, Command::Answer {action,..} if cleanup_answer(action))
+    }
+    fn revoke_originals(&mut self) {
+        self.recovery.originals.clear();
+        self.recovery.plain_copy.clear();
+        self.recovery.submitted = None;
+        if self
+            .recovery
+            .branch_draft
+            .as_ref()
+            .is_some_and(|prompt| prompt.origin_backend)
+        {
+            self.recovery.branch_draft = None;
+        }
+        if self
+            .recovery
+            .prepared_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.origin_backend)
+        {
+            self.recovery.prepared_prompt = None;
+        }
+        self.recovery.commands.clear();
+        self.recovery.inflight = None;
+        self.recovery.replay_settings = None;
+        // The actual unsent composer and its chips remain user intent.
+        self.recovery.attachment_labels.retain(|path, _| {
+            self.attachments
+                .iter()
+                .any(|attachment| &attachment.path == path)
+        });
+    }
+    pub(super) fn prompt_attachment_names(&self, command: Command) -> Command {
+        match command {
+            Command::Prompt {
+                text,
+                attachments,
+                mode,
+            } if attachments.iter().any(|attachment| {
+                self.recovery
+                    .attachment_labels
+                    .contains_key(&attachment.path)
+            }) =>
+            {
+                Command::PromptNamed {
+                    text,
+                    mode,
+                    attachments: attachments
+                        .into_iter()
+                        .map(|attachment| chat::NamedAttachment {
+                            display_path: self
+                                .recovery
+                                .attachment_labels
+                                .get(&attachment.path)
+                                .cloned(),
+                            path: attachment.path,
+                        })
+                        .collect(),
+                }
+            }
+            command => command,
+        }
+    }
+    fn original_metadata_available(&self) -> bool {
+        self.snapshot.ready
+            && !self.snapshot.busy
+            && !self.snapshot.original_retry_pending
+            && !self.snapshot.waiting
+            && self.snapshot.requests.is_empty()
+            && self.snapshot.read_only_reason.is_none()
+            && self.pending.is_none()
+            && self.queued.is_none()
+            && self.selected_subagent.is_none()
+    }
+    pub(super) fn sync_original(&mut self) {
+        if !self.visible.load(Ordering::Relaxed) || self.disconnected || self.snapshot.exited {
+            self.recovery.originals.clear();
+            return;
+        }
+        let Some(context) = Context::current(self) else {
+            self.recovery.originals.clear();
+            return;
+        };
+        if self.recovery.originals.context.as_ref() != Some(&context) {
+            self.recovery.originals.clear();
+            self.recovery.originals.context = Some(context.clone());
+        }
+        // An idle prefetch can already exist when an approval or restoration
+        // arrives without changing the accepted-input Context. Withdraw that
+        // metadata probe, then rearm it when the same context becomes idle.
+        let eligible = self.original_metadata_available();
+        if !eligible {
+            if self
+                .recovery
+                .originals
+                .query
+                .as_ref()
+                .is_some_and(|query| matches!(query.purpose, Purpose::Metadata))
+            {
+                self.recovery.originals.query = None;
+                self.recovery.originals.attempted = false;
+            }
+            return;
+        }
+        if !self.recovery.originals.attempted
+            && self.recovery.originals.query.is_none()
+            && let Some(handle) = self.handle().cloned()
+        {
+            self.recovery.originals.attempted = true;
+            self.recovery
+                .originals
+                .begin(self.target, context, handle, None, Purpose::Metadata);
+        }
+    }
+    /// Logical metadata payload only. Full input text is counted separately
+    /// by recovery_retained_bytes; these values are not allocator/RSS estimates.
+    pub(super) fn original_metadata_bytes(&self) -> usize {
+        self.recovery.originals.metadata_bytes()
+    }
+    pub(super) fn original_retry_user(&self) -> Option<&str> {
+        (!self.snapshot.original_retry_pending
+            && self.snapshot.capabilities.original_retry
+            && self
+                .recovery
+                .originals
+                .metadata
+                .as_ref()
+                .is_some_and(|original| original.settings.is_exact())
+            && self.recovery.originals.context.as_ref() == Context::current(self).as_ref()
+            && !self.recovery.originals.loading())
+        .then(|| self.recovery.originals.current_user())
+        .flatten()
+    }
+}
+
+impl Cagents {
+    pub(super) fn original_subscription(&self, runtime: &Runtime) -> Option<Subscription<Message>> {
+        if !runtime.visible.load(Ordering::Relaxed) {
+            return None;
+        }
+        let query = runtime.recovery.originals.query.clone()?;
+        if matches!(query.purpose, Purpose::Metadata) && !runtime.original_metadata_available() {
+            return None;
+        }
+        // Registry identity is only an invalidation hint. It grants no read
+        // authority: the daemon independently validates the physical scope.
+        let account_hint = self.chat_account(
+            runtime.session.launch.provider,
+            &runtime.session.launch.recipe,
+        );
+        let account_epoch = self.chat_ui.original_epoch;
+        Some(Subscription::run_with(
+            Job {
+                query,
+                account_hint,
+                account_epoch,
+            },
+            stream,
+        ))
+    }
+    /// Called for DeleteFiles intent even if physical deletion partly fails.
+    /// Archive/Move do not call this. Registry IDs only invalidate cached UI
+    /// lineage; they are never annotation read authority.
+    pub(in crate::app) fn invalidate_originals_for_account(&mut self, _id: &AccountId) {
+        // An archived/unregistered alias can share physical authority with a
+        // different filing. Conservatively invalidate all small metadata and
+        // still-origin-derived stashes; actual edited composers are user intent.
+        self.chat_ui.original_epoch = self.chat_ui.original_epoch.wrapping_add(1);
+        for card in self.cards.values_mut() {
+            if let CardRuntime::Chat(runtime) = card {
+                runtime.revoke_originals();
+            }
+        }
+        for runtime in self.chat_ui.parked.values_mut() {
+            runtime.revoke_originals();
+        }
+        self.chat_ui
+            .recovery_drafts
+            .retain(|_, prompt| !prompt.origin_backend);
+    }
+    pub(super) fn begin_original_retry(&mut self, target: Target, user: &str) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.refresh();
+        if !runtime.recovery_available()
+            || runtime.original_retry_user() != Some(user)
+            || runtime.recovery.retried.as_ref()
+                == Some(&(runtime.snapshot.turn_generation, user.into()))
+        {
+            return Task::none();
+        }
+        let Some(original) = runtime.recovery.originals.metadata.clone() else {
+            return Task::none();
+        };
+        let Some(context) = Context::current(runtime) else {
+            return Task::none();
+        };
+        let generation = runtime.snapshot.turn_generation;
+        runtime.recovery.retried = Some((generation, user.into()));
+        // The actor atomically revalidates current/latest identity, exact
+        // metadata and immutable attachment hashes before restoring settings
+        // and dispatching. No UI-trusted text or ordinary setter chain.
+        self.chat_send(
+            target,
+            Command::PromptOriginal {
+                source_incarnation: context.source_incarnation,
+                session_id: context.session,
+                original,
+                turn_generation: generation,
+            },
+            false,
+        )
+    }
+    pub(super) fn begin_original_edit(&mut self, target: Target, id: &str) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.refresh();
+        if !runtime.recovery_available()
+            || !runtime.recovery_composer_empty()
+            || runtime.recovery.originals.editing()
+        {
+            return Task::none();
+        }
+        let Some(item) = runtime
+            .snapshot
+            .items
+            .iter()
+            .find(|item| item.id == id && item.role == chat::Role::User)
+        else {
+            return Task::none();
+        };
+        let branch = if runtime.session.launch.provider == Provider::Claude {
+            None
+        } else {
+            let Some(branch) = turn_actions::branch_point(
+                runtime.session.launch.provider,
+                &runtime.snapshot,
+                item,
+            ) else {
+                return Task::none();
+            };
+            Some(branch)
+        };
+        let Some(context) = Context::current(runtime) else {
+            return Task::none();
+        };
+        let Some(handle) = runtime.handle().cloned() else {
+            return Task::none();
+        };
+        runtime.recovery.originals.begin(
+            target,
+            context,
+            handle,
+            Some(id.into()),
+            Purpose::Edit { branch },
+        );
+        Task::none()
+    }
+    pub(super) fn original_ready(
+        &mut self,
+        target: Target,
+        id: u64,
+        account_hint: Option<AccountId>,
+        account_epoch: u64,
+        reply: Reply,
+    ) -> Task<Message> {
+        let current_epoch = self.chat_ui.original_epoch;
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.refresh();
+        let Some(context) = Context::current(runtime) else {
+            return Task::none();
+        };
+        let Some(query) = runtime.recovery.originals.accept(target, id, &context) else {
+            return Task::none();
+        };
+        let Some(output) = reply
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        else {
+            return Task::none();
+        };
+        if current_epoch != account_epoch {
+            runtime.recovery.originals.clear();
+            runtime.sync_original();
+            return Task::none();
+        }
+        runtime.recovery.originals.account_hint = account_hint;
+        let value = match output.value {
+            Ok(value) => value,
+            Err(OriginalError::Unavailable(_)) => {
+                // Only a retained complete local submission proves that this
+                // fallback has the entire input. A visible first transport part
+                // can be incomplete even when its siblings are off the page.
+                // Current snapshot settings never establish Retry eligibility.
+                if let Purpose::Edit { branch } = &query.purpose
+                    && let Some(mut prompt) = query.user.as_deref().and_then(|id| {
+                        runtime
+                            .recovery
+                            .submitted
+                            .as_ref()
+                            .filter(|prompt| prompt.user_id.as_deref() == Some(id))
+                            .cloned()
+                    })
+                {
+                    // Once restored from submitted history this is origin data,
+                    // even though the original send began as user intent.
+                    prompt.origin_backend = true;
+                    return self.finish_original_edit(
+                        target,
+                        prompt,
+                        branch.clone(),
+                        context.session,
+                    );
+                }
+                if !matches!(query.purpose, Purpose::Metadata) {
+                    runtime.recovery.notice =
+                        Some("The complete original prompt is unavailable for this turn.".into());
+                }
+                return Task::none();
+            }
+            Err(_) => {
+                if !matches!(query.purpose, Purpose::Metadata) {
+                    runtime.recovery.notice =
+                        Some("The original prompt changed or could not be read. Try again.".into());
+                }
+                return Task::none();
+            }
+        };
+        match (query.purpose, value) {
+            (Purpose::Metadata, Value::Metadata(page)) => {
+                if runtime.recovery.originals.metadata(&context, page) {
+                    runtime.recovery.submitted = None;
+                }
+                Task::none()
+            }
+            (Purpose::Edit { branch }, Value::Text(original)) => {
+                if original.source_incarnation != context.source_incarnation
+                    || original.session_id != context.session
+                    || !runtime.recovery_available()
+                {
+                    return Task::none();
+                }
+                let Some(mut prompt) =
+                    turn_actions::Prompt::from_original(original, &runtime.snapshot)
+                else {
+                    return Task::none();
+                };
+                prompt.account_hint = runtime.recovery.originals.account_hint.clone();
+                self.finish_original_edit(target, prompt, branch, context.session)
+            }
+            _ => Task::none(),
+        }
+    }
+    fn finish_original_edit(
+        &mut self,
+        target: Target,
+        prompt: turn_actions::Prompt,
+        branch: Option<String>,
+        session: String,
+    ) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if !runtime.recovery_available()
+            || runtime.snapshot.session_id.as_deref() != Some(session.as_str())
+        {
+            return Task::none();
+        }
+        if let Some(branch) = branch {
+            if !runtime
+                .snapshot
+                .branch_points
+                .iter()
+                .any(|point| point.id == branch)
+            {
+                return Task::none();
+            }
+            runtime.recovery.submitted = None;
+            runtime.recovery.prepared_prompt = None;
+            runtime.recovery.branch_draft = Some(prompt);
+            runtime.recovery.branch_session = Some(session);
+            runtime.fork_requested = runtime.session.launch.provider == Provider::Codex;
+            self.chat_send(target, Command::Branch { id: Some(branch) }, false)
+        } else {
+            runtime.recovery.submitted = None;
+            runtime.recovery.prepared_prompt = None;
+            runtime.load_recovery_prompt(
+                prompt,
+                "Editing this prompt sends a new turn in this Claude conversation.",
+            );
+            iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                .map(cosmic::Action::App)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn original(user: &str, text: &str) -> OriginalPrompt {
+        use chat::annotations::{OriginalSettings, Setting};
+        OriginalPrompt {
+            user_id: user.into(),
+            turn_id: "turn".into(),
+            text_bytes: text.len(),
+            attachments: vec![],
+            settings: OriginalSettings {
+                model: Setting::Value("original-model".into()),
+                reasoning: Setting::Value("low".into()),
+                fast: Setting::Value(true),
+                permission: Setting::Value("plan".into()),
+            },
+        }
+    }
+    fn page(context: &Context, user: &str, text: &str) -> OriginalPage {
+        let mut end = text.len().min(4);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        OriginalPage {
+            source_incarnation: context.source_incarnation,
+            session_id: context.session.clone(),
+            original: original(user, text),
+            offset: 0,
+            next_offset: end,
+            text: text[..end].into(),
+            complete: end == text.len(),
+        }
+    }
+    fn runtime() -> Runtime {
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(Provider::Claude),
+            false,
+            &crate::settings::AgentLaunchSettings::default(),
+        )
+        .unwrap();
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                session_id: Some("confirmed-session".into()),
+                capabilities: chat::Capabilities {
+                    original_retry: true,
+                    ..Default::default()
+                },
+                ..Snapshot::default()
+            },
+        ));
+        Runtime::new(
+            Target {
+                card: CardId::new(),
+                generation: 1,
+            },
+            session,
+            Connection::Live(handle),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        )
+    }
+    #[test]
+    fn restoration_pending_does_not_prefetch_or_offer_another_original() {
+        let mut runtime = runtime();
+        let idle_probe = runtime.recovery.originals.query_id_for_test();
+        Arc::make_mut(&mut runtime.snapshot).original_retry_pending = true;
+        runtime.sync_original();
+        assert!(runtime.recovery.originals.query.is_none());
+        assert!(runtime.original_retry_user().is_none());
+        for command in [
+            Command::Interrupt,
+            Command::Refresh,
+            Command::LoadEarlier,
+            Command::LoadLater,
+        ] {
+            assert!(runtime.original_restore_allows(&command));
+        }
+        Arc::make_mut(&mut runtime.snapshot).original_retry_pending = false;
+        runtime.sync_original();
+        assert!(runtime.recovery.originals.query.is_some());
+        assert_ne!(runtime.recovery.originals.query_id_for_test(), idle_probe);
+    }
+
+    #[test]
+    fn backend_source_token_rejects_post_reset_reply_before_the_snapshot_wake_arrives() {
+        for editing in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let mut runtime = runtime();
+            let target = runtime.target;
+            Arc::make_mut(&mut runtime.snapshot).source_incarnation =
+                Some(uuid::Uuid::from_u128(1));
+            runtime.replace_draft(text_editor::Content::with_text(
+                "typed while the original was loading",
+            ));
+            let current = (*runtime.snapshot).clone();
+            runtime.handle().unwrap().publish_snapshot_for_test(current);
+            let context = Context::current(&runtime).unwrap();
+            let handle = runtime.handle().cloned().unwrap();
+            runtime.recovery.originals.context = Some(context.clone());
+            runtime.recovery.originals.begin(
+                target,
+                context.clone(),
+                handle,
+                None,
+                if editing {
+                    Purpose::Edit { branch: None }
+                } else {
+                    Purpose::Metadata
+                },
+            );
+            let id = runtime.recovery.originals.query_id_for_test();
+            let value = if editing {
+                Value::Text(chat::original::OriginalText {
+                    source_incarnation: Some(uuid::Uuid::from_u128(2)),
+                    session_id: context.session.clone(),
+                    original: original("old-user", "complete old input"),
+                    text: "complete old input".into(),
+                })
+            } else {
+                let mut page = page(&context, "old-user", "complete old input");
+                page.source_incarnation = Some(uuid::Uuid::from_u128(2));
+                Value::Metadata(page)
+            };
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+            drop(app.original_ready(target, id, None, 0, Reply::fixture(Ok(value))));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(
+                runtime.snapshot.source_incarnation,
+                Some(uuid::Uuid::from_u128(1)),
+                "UI has not observed the new source publication yet"
+            );
+            assert!(
+                runtime.recovery.originals.metadata.is_none()
+                    && runtime.recovery.prepared_prompt.is_none()
+            );
+            assert_eq!(
+                runtime.composer.text(),
+                "typed while the original was loading"
+            );
+        }
+    }
+
+    #[test]
+    fn same_session_source_reset_rejects_old_original_reply_and_preserves_typed_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut runtime = runtime();
+        let target = runtime.target;
+        Arc::make_mut(&mut runtime.snapshot).source_incarnation = Some(uuid::Uuid::from_u128(1));
+        runtime.replace_draft(text_editor::Content::with_text("typed independent intent"));
+        runtime.sync_original();
+        let context = Context::current(&runtime).unwrap();
+        let id = runtime.recovery.originals.query_id_for_test();
+        let old = page(&context, "old-user", "old accepted input");
+        let mut next = (*runtime.snapshot).clone();
+        next.generation += 1;
+        next.source_incarnation = Some(uuid::Uuid::from_u128(2));
+        runtime.handle().unwrap().publish_snapshot_for_test(next);
+        runtime.refresh();
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.original_ready(
+            target,
+            id,
+            None,
+            0,
+            Reply::fixture(Ok(Value::Metadata(old))),
+        ));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.recovery.originals.metadata.is_none());
+        assert!(runtime.original_retry_user().is_none());
+        assert_eq!(runtime.composer.text(), "typed independent intent");
+    }
+
+    #[test]
+    fn cold_paged_out_latest_uses_authoritative_metadata_without_retaining_input() {
+        let mut runtime = runtime();
+        runtime.sync_original();
+        assert!(runtime.snapshot.items.is_empty());
+        let context = Context::current(&runtime).unwrap();
+        let id = runtime.recovery.originals.query_id_for_test();
+        assert!(
+            runtime
+                .recovery
+                .originals
+                .accept(runtime.target, id, &context)
+                .is_some()
+        );
+        assert!(runtime.recovery.originals.metadata(
+            &context,
+            page(&context, "native-latest", "A long accepted prompt")
+        ));
+        assert_eq!(runtime.original_retry_user(), Some("native-latest"));
+        assert!(runtime.recovery.submitted.is_none());
+        assert!(runtime.recovery.originals.query.is_none());
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .original_retry = false;
+        assert!(
+            runtime.original_retry_user().is_none(),
+            "providers without atomic exact retry hide the action"
+        );
+    }
+    #[test]
+    fn late_queries_cannot_cross_actor_session_turn_user_or_eligibility_revision() {
+        for change in 0..6 {
+            let mut runtime = runtime();
+            runtime.sync_original();
+            let old = Context::current(&runtime).unwrap();
+            let old_id = runtime.recovery.originals.query_id_for_test();
+            match change {
+                0 => {
+                    let handle = Arc::new(ClientHandle::fixture(
+                        runtime.session.clone(),
+                        (*runtime.snapshot).clone(),
+                    ));
+                    runtime.recovery.connection_replaced();
+                    runtime.connection = Connection::Live(handle);
+                }
+                1 => {
+                    Arc::make_mut(&mut runtime.snapshot).session_id =
+                        Some("replacement-session".into())
+                }
+                2 => Arc::make_mut(&mut runtime.snapshot).turn_generation += 1,
+                3 => Arc::make_mut(&mut runtime.snapshot)
+                    .items
+                    .push(Arc::new(chat::Item {
+                        id: "new-unannotated-user".into(),
+                        role: chat::Role::User,
+                        started_at: None,
+                        at: None,
+                        content: ItemContent::Text {
+                            text: "new input".into(),
+                            thinking: false,
+                            phase: chat::Phase::Final,
+                        },
+                    })),
+                4 => Arc::make_mut(&mut runtime.snapshot).original_revision += 1,
+                _ => runtime.target.generation += 1,
+            }
+            runtime.sync_original();
+            let current = Context::current(&runtime).unwrap();
+            assert_ne!(old, current);
+            assert!(
+                runtime
+                    .recovery
+                    .originals
+                    .accept(runtime.target, old_id, &current)
+                    .is_none()
+            );
+            assert!(
+                runtime.original_retry_user().is_none(),
+                "new unannotated input never falls back to an old original"
+            );
+            assert_ne!(runtime.recovery.originals.query_id_for_test(), old_id);
+        }
+    }
+    #[test]
+    fn pending_approval_does_not_offer_turn_recovery_or_probe_latest_original() {
+        let mut runtime = runtime();
+        let idle_probe = runtime.recovery.originals.query_id_for_test();
+        Arc::make_mut(&mut runtime.snapshot).waiting = true;
+        runtime.sync_original();
+        assert!(runtime.recovery.originals.query.is_none());
+        assert!(!runtime.recovery_available());
+        Arc::make_mut(&mut runtime.snapshot).waiting = false;
+        runtime.sync_original();
+        assert!(runtime.recovery.originals.query.is_some());
+        assert_ne!(runtime.recovery.originals.query_id_for_test(), idle_probe);
+        assert!(runtime.recovery_available());
+    }
+    #[test]
+    fn metadata_rejects_wrong_session_and_partial_shape() {
+        let runtime = runtime();
+        let context = Context::current(&runtime).unwrap();
+        for change in 0..3 {
+            let mut state = State::default();
+            let mut page = page(&context, "native-user", "accepted prompt");
+            match change {
+                0 => page.session_id = "other-session".into(),
+                1 => page.next_offset += 1,
+                _ => page.complete = true,
+            }
+            assert!(!state.metadata(&context, page));
+            assert!(state.metadata.is_none());
+        }
+    }
+    #[test]
+    fn accepted_unknown_settings_allow_edit_without_replacing_current_policy_or_enabling_retry() {
+        let mut runtime = runtime();
+        let context = Context::current(&runtime).unwrap();
+        let mut original = original("native-user", "accepted text with complete images");
+        original.settings = chat::annotations::OriginalSettings {
+            model: chat::annotations::Setting::Unknown,
+            reasoning: chat::annotations::Setting::Unknown,
+            fast: chat::annotations::Setting::Unknown,
+            permission: chat::annotations::Setting::Unknown,
+        };
+        original
+            .attachments
+            .push(chat::annotations::OriginalAttachment {
+                original_path: "/user/diagram.png".into(),
+                path: "/private/immutable/diagram.png".into(),
+                bytes: 40,
+                sha256: [9; 32],
+            });
+        let mut metadata = page(
+            &context,
+            "native-user",
+            "accepted text with complete images",
+        );
+        metadata.original = original.clone();
+        assert!(runtime.recovery.originals.metadata(&context, metadata));
+        runtime.recovery.originals.context = Some(context);
+        assert!(
+            runtime.original_retry_user().is_none(),
+            "accepted input alone does not prove exact restorable policy"
+        );
+        Arc::make_mut(&mut runtime.snapshot).selected_model = Some("current-model".into());
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = Some("current-policy".into());
+        let before = runtime.snapshot.clone();
+        let prompt = turn_actions::Prompt::from_original(
+            chat::original::OriginalText {
+                source_incarnation: None,
+                session_id: "confirmed-session".into(),
+                original,
+                text: "accepted text with complete images".into(),
+            },
+            &runtime.snapshot,
+        )
+        .unwrap();
+        runtime.load_recovery_prompt(prompt, "Editing starts a new turn.");
+        assert_eq!(
+            runtime.composer.text(),
+            "accepted text with complete images"
+        );
+        assert_eq!(
+            runtime.attachments[0].path,
+            PathBuf::from("/private/immutable/diagram.png")
+        );
+        assert_eq!(
+            runtime.attachment_display_path(&runtime.attachments[0]),
+            Path::new("/user/diagram.png")
+        );
+        assert_eq!(runtime.snapshot.selected_model, before.selected_model);
+        assert_eq!(runtime.snapshot.permission_mode, before.permission_mode);
+        assert!(
+            runtime.recovery.commands.is_empty(),
+            "Edit never restores historical settings"
+        );
+    }
+    #[test]
+    fn hidden_eviction_and_connection_replacement_reject_old_attempts() {
+        let mut runtime = runtime();
+        runtime.sync_original();
+        let id = runtime.recovery.originals.query_id_for_test();
+        let context = Context::current(&runtime).unwrap();
+        runtime.visible.store(false, Ordering::Relaxed);
+        runtime.sync_original();
+        assert!(runtime.recovery.originals.query.is_none());
+        assert!(
+            runtime
+                .recovery
+                .originals
+                .accept(runtime.target, id, &context)
+                .is_none()
+        );
+        runtime.visible.store(true, Ordering::Relaxed);
+        runtime.sync_original();
+        assert_ne!(runtime.recovery.originals.query_id_for_test(), id);
+    }
+    #[test]
+    fn full_edit_uses_immutable_attachment_bytes_but_displays_original_filename() {
+        let mut original = original("native-user", "accepted original");
+        original
+            .attachments
+            .push(chat::annotations::OriginalAttachment {
+                original_path: "/pictures/architecture.png".into(),
+                path: "/private/capture/00000000-0000-4000-8000-000000000000.png".into(),
+                bytes: 50,
+                sha256: [3; 32],
+            });
+        let prompt = turn_actions::Prompt::from_original(
+            chat::original::OriginalText {
+                source_incarnation: None,
+                session_id: "confirmed-session".into(),
+                original,
+                text: "accepted original".into(),
+            },
+            &runtime().snapshot,
+        )
+        .unwrap();
+        let mut runtime = runtime();
+        runtime.load_recovery_prompt(prompt, "Editing starts a new turn.");
+        let attachment = &runtime.attachments[0];
+        assert_eq!(
+            attachment.path,
+            PathBuf::from("/private/capture/00000000-0000-4000-8000-000000000000.png")
+        );
+        assert_eq!(
+            runtime.attachment_display_path(attachment),
+            Path::new("/pictures/architecture.png")
+        );
+        assert_eq!(runtime.composer.text(), "accepted original");
+    }
+    #[test]
+    fn queued_full_reply_holds_reader_admission_until_consumed_or_discarded() {
+        let permit = Arc::new(tokio::sync::Semaphore::new(1));
+        let original = original("native-user", "accepted original");
+        let reply = Reply(Arc::new(Mutex::new(Some(Output {
+            value: Ok(Value::Text(chat::original::OriginalText {
+                source_incarnation: None,
+                session_id: "confirmed-session".into(),
+                original,
+                text: "accepted original".into(),
+            })),
+            _permit: permit.clone().try_acquire_owned().unwrap(),
+        }))));
+        assert_eq!(permit.available_permits(), 0);
+        let clone = reply.clone();
+        drop(reply);
+        assert_eq!(permit.available_permits(), 0);
+        drop(clone);
+        assert_eq!(permit.available_permits(), 1);
+    }
+    #[test]
+    fn deleting_an_alias_retires_origin_stashes_and_late_reads_but_preserves_typed_drafts() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut runtime = runtime();
+        runtime.sync_original();
+        let target = runtime.target;
+        let first = Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            "/same/physical-home".into(),
+        )
+        .id();
+        let alias = Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            "/same/physical-home".into(),
+        )
+        .id();
+        assert_ne!(first, alias);
+        let context = Context::current(&runtime).unwrap();
+        let original = original("native-user", "private accepted original");
+        let mut prompt = turn_actions::Prompt::from_original(
+            chat::original::OriginalText {
+                source_incarnation: None,
+                session_id: context.session.clone(),
+                original: original.clone(),
+                text: "private accepted original".into(),
+            },
+            &runtime.snapshot,
+        )
+        .unwrap();
+        prompt.account_hint = Some(first.clone());
+        let prompt = Arc::new(prompt);
+        let weak = Arc::downgrade(&prompt);
+        runtime.recovery.prepared_prompt = Some(prompt);
+        runtime.recovery.originals.account_hint = Some(first.clone());
+        runtime.replace_draft(text_editor::Content::with_text("independently typed draft"));
+        runtime.attachments = vec![Attachment {
+            path: "/user/draft.png".into(),
+        }];
+        let handle = runtime.handle().cloned().unwrap();
+        runtime.recovery.originals.begin(
+            target,
+            context.clone(),
+            handle,
+            Some("native-user".into()),
+            Purpose::Edit { branch: None },
+        );
+        let id = runtime.recovery.originals.query_id_for_test();
+        let reply = Reply::fixture(Ok(Value::Text(chat::original::OriginalText {
+            source_incarnation: None,
+            session_id: context.session,
+            original,
+            text: "private accepted original".into(),
+        })));
+        let result_owner = Arc::downgrade(&reply.0);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        app.invalidate_originals_for_account(&alias);
+        assert!(
+            weak.upgrade().is_none(),
+            "a different registry alias cannot keep origin-derived plaintext alive"
+        );
+        assert_eq!(app.chat_ui.original_epoch, 1);
+        drop(app.original_ready(target, id, Some(first), 0, reply));
+        assert!(
+            result_owner.upgrade().is_none(),
+            "late full result releases its actual payload owner"
+        );
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.recovery.originals.metadata.is_none());
+        assert!(runtime.recovery.prepared_prompt.is_none());
+        assert_eq!(runtime.composer.text(), "independently typed draft");
+        assert_eq!(
+            runtime.attachments,
+            vec![Attachment {
+                path: "/user/draft.png".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn unavailable_original_cannot_edit_a_possibly_partial_visible_root() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut runtime = runtime();
+        let target = runtime.target;
+        let item = Arc::new(chat::Item {
+            id: "opaque-root".into(),
+            role: chat::Role::User,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: "only the first visible transport part".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        });
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![item];
+        runtime
+            .handle()
+            .unwrap()
+            .publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        runtime.sync_original();
+        let context = Context::current(&runtime).unwrap();
+        runtime.recovery.originals.begin(
+            target,
+            context.clone(),
+            runtime.handle().cloned().unwrap(),
+            Some("opaque-root".into()),
+            Purpose::Edit { branch: None },
+        );
+        let id = runtime.recovery.originals.query_id_for_test();
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.original_ready(
+            target,
+            id,
+            None,
+            0,
+            Reply::fixture(Err(OriginalError::Unavailable("no accepted record".into()))),
+        ));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(
+            runtime.composer.is_empty(),
+            "absence of visible sibling fragments is not completeness proof"
+        );
+        assert!(runtime.recovery.prepared_prompt.is_none());
+        assert_eq!(
+            runtime.recovery.notice.as_deref(),
+            Some("The complete original prompt is unavailable for this turn.")
+        );
+    }
+
+    #[test]
+    fn unavailable_local_history_fallback_is_revoked_without_losing_a_concurrent_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut runtime = runtime();
+        let target = runtime.target;
+        runtime.recovery.submitting(
+            &runtime.snapshot,
+            &Command::Prompt {
+                text: "accepted local history".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            },
+        );
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "actual-local-user".into(),
+            role: chat::Role::User,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: "accepted local history".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        })];
+        runtime
+            .handle()
+            .unwrap()
+            .publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(
+            runtime
+                .recovery
+                .submitted
+                .as_ref()
+                .unwrap()
+                .user_id
+                .as_deref(),
+            Some("actual-local-user")
+        );
+        assert!(!runtime.recovery.submitted.as_ref().unwrap().origin_backend);
+        let context = Context::current(&runtime).unwrap();
+        runtime.recovery.originals.begin(
+            target,
+            context,
+            runtime.handle().cloned().unwrap(),
+            Some("actual-local-user".into()),
+            Purpose::Edit { branch: None },
+        );
+        let id = runtime.recovery.originals.query_id_for_test();
+        runtime.replace_draft(text_editor::Content::with_text(
+            "typed while the original was loading",
+        ));
+        runtime.attachments = vec![Attachment {
+            path: "/user/concurrent.png".into(),
+        }];
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.original_ready(
+            target,
+            id,
+            None,
+            0,
+            Reply::fixture(Err(OriginalError::Unavailable("no accepted record".into()))),
+        ));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let prepared = runtime.recovery.prepared_prompt.as_ref().unwrap();
+        assert!(prepared.origin_backend);
+        let weak = Arc::downgrade(prepared);
+        let alias = Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            "/same/home/through-another-alias".into(),
+        )
+        .id();
+        app.invalidate_originals_for_account(&alias);
+        assert!(
+            weak.upgrade().is_none(),
+            "historical local fallback is origin-derived after recovery"
+        );
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.recovery.prepared_prompt.is_none());
+        assert_eq!(
+            runtime.composer.text(),
+            "typed while the original was loading"
+        );
+        assert_eq!(
+            runtime.attachments,
+            vec![Attachment {
+                path: "/user/concurrent.png".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn edited_send_keeps_private_dispatch_bytes_and_carries_only_display_hint() {
+        let mut runtime = runtime();
+        runtime.recovery.attachment_labels.insert(
+            "/private/capture.png".into(),
+            "/other-account/original.png".into(),
+        );
+        let command = Command::Prompt {
+            text: "edited user intent".into(),
+            attachments: vec![Attachment {
+                path: "/private/capture.png".into(),
+            }],
+            mode: PromptMode::Send,
+        };
+        assert_eq!(
+            runtime.prompt_attachment_names(command),
+            Command::PromptNamed {
+                text: "edited user intent".into(),
+                attachments: vec![chat::NamedAttachment {
+                    path: "/private/capture.png".into(),
+                    display_path: Some("/other-account/original.png".into())
+                }],
+                mode: PromptMode::Send
+            }
+        );
+        let ordinary = Command::Prompt {
+            text: "new ordinary intent".into(),
+            attachments: vec![Attachment {
+                path: "/user/new.png".into(),
+            }],
+            mode: PromptMode::Send,
+        };
+        assert_eq!(runtime.prompt_attachment_names(ordinary.clone()), ordinary);
+    }
+
+    #[test]
+    fn selected_child_copy_and_toggle_use_exact_current_transcript_for_reused_opaque_ids() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut runtime = runtime();
+        let target = runtime.target;
+        let item = |text: &str| {
+            Arc::new(chat::Item {
+                id: "shared-opaque-id".into(),
+                role: chat::Role::Assistant,
+                at: None,
+                started_at: None,
+                content: ItemContent::Text {
+                    text: text.into(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+            })
+        };
+        let parent = item("**PARENT** original markdown");
+        let child = item("**CHILD** original markdown");
+        Arc::make_mut(&mut runtime.snapshot).items = vec![parent.clone()];
+        Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+            id: "selected-child".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: chat::ToolStatus::Succeeded,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: false,
+            items: vec![child.clone()],
+        }];
+        runtime.selected_subagent = Some("selected-child".into());
+        assert!(Arc::ptr_eq(
+            runtime.active_item("shared-opaque-id").unwrap(),
+            &child
+        ));
+        assert_eq!(
+            runtime
+                .active_copy_text("shared-opaque-id", CopyPart::Text)
+                .as_deref(),
+            Some("**CHILD** original markdown")
+        );
+        assert_eq!(
+            runtime
+                .active_copy_text("shared-opaque-id", CopyPart::PlainText)
+                .as_deref(),
+            Some("CHILD original markdown")
+        );
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target, "shared-opaque-id".into())));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.expanded.contains("shared-opaque-id"));
+        assert!(
+            runtime.cache["shared-opaque-id"]
+                .item
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, &child))
+        );
+        assert!(runtime.cache["shared-opaque-id"].markdown.items().iter().any(|item|matches!(item,markdown::Item::Paragraph(text) if text.spans(design::markdown_settings(&cosmic::Theme::dark(),design::TEXT_PROSE).style).iter().any(|span|span.text.contains("CHILD")))));
+        runtime.selected_subagent = Some("missing-child".into());
+        runtime.copied = None;
+        assert!(
+            runtime
+                .active_copy_text("shared-opaque-id", CopyPart::Text)
+                .is_none()
+        );
+        drop(app.handle_chat_ui(Action::Copy(
+            target,
+            "shared-opaque-id".into(),
+            CopyPart::Text,
+        )));
+        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        app.chat_runtime_mut(target).unwrap().expanded.clear();
+        drop(app.handle_chat_ui(Action::Toggle(target, "shared-opaque-id".into())));
+        assert!(app.chat_runtime_mut(target).unwrap().expanded.is_empty());
+    }
+
+    #[test]
+    fn message_copy_never_uses_a_same_id_foreign_coordination_cache() {
+        use chat::coordination::{Coordination, Kind, Outbound, OutboundKind, Text};
+        let mut runtime = runtime();
+        let selected = Arc::new(chat::Item {
+            id: "same-message-id".into(),
+            role: chat::Role::Assistant,
+            at: None,
+            started_at: None,
+            content: ItemContent::Text {
+                text: "selected child message".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        });
+        let foreign = Arc::new(chat::Item {
+            id: selected.id.clone(),
+            role: chat::Role::Assistant,
+            at: None,
+            started_at: None,
+            content: ItemContent::Tool {
+                name: "foreign coordinator".into(),
+                input: "private other call".into(),
+                output: String::new(),
+                status: chat::ToolStatus::Succeeded,
+            },
+        });
+        Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+            id: "selected-child".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: chat::ToolStatus::Succeeded,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: false,
+            items: vec![selected.clone()],
+        }];
+        runtime.selected_subagent = Some("selected-child".into());
+        let reading = Coordination {
+            kind: Kind::Message(Outbound {
+                kind: OutboundKind::Send,
+                to: "another actor".into(),
+                body: Text::Inline("UNRELATED PRIVATE COORDINATION BODY".into()),
+                summary: String::new(),
+                waits: false,
+            }),
+            outcome: Default::default(),
+            subagents: vec![],
+            cli: true,
+        };
+        let mut cached = CachedItem::updated(
+            &foreign.content,
+            runtime.syntax_theme,
+            None,
+            true,
+            false,
+            Some(reading),
+        );
+        cached.item = Some(foreign);
+        assert!(cached.coordination.as_ref().unwrap().is_card());
+        runtime.cache.insert(selected.id.clone(), cached);
+        assert_eq!(
+            runtime
+                .active_copy_text(&selected.id, CopyPart::Text)
+                .as_deref(),
+            Some("selected child message")
+        );
+        assert_eq!(
+            runtime
+                .active_copy_text(&selected.id, CopyPart::PlainText)
+                .as_deref(),
+            Some("selected child message")
+        );
+    }
+}
