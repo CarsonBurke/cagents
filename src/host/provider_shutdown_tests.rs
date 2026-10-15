@@ -131,7 +131,7 @@ fn private_runtime(test: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(root).canonicalize().unwrap())
 }
 
-fn quiet_chat(root: &Path) -> crate::chat::Handle {
+fn quiet_chat(root: &Path) -> crate::chat::runtime::Handle {
     use crate::chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
     struct Quiet;
     impl Adapter for Quiet {
@@ -151,10 +151,10 @@ fn quiet_chat(root: &Path) -> crate::chat::Handle {
     };
     let mut initial = Step::default();
     let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
-    crate::chat::Handle::start(spec, Box::new(Quiet), initial, store, None, |_| {}).unwrap()
+    crate::chat::runtime::Handle::start(spec, Box::new(Quiet), initial, store, None, |_| {}).unwrap()
 }
 
-fn chat_record(source: crate::chat::Session, handle: crate::chat::Handle) -> super::chat::Record {
+fn chat_record(source: crate::chat::Session, handle: crate::chat::runtime::Handle) -> super::chat::Record {
     super::chat::Record {
         execution_instance: Uuid::new_v4(),
         console_recipe: None,
@@ -223,7 +223,7 @@ fn provider_shutdown_failure_is_reported_while_healthy_owners_are_reaped() {
     let receipt = directory.join(format!("{id}-{}-{}.closed", record.holder.pid, record.holder.start));
     let failed = quiet_chat(&root);
     failed.close().unwrap();
-    struct Cleanup { handle: crate::chat::Handle, receipt: std::path::PathBuf }
+    struct Cleanup { handle: crate::chat::runtime::Handle, receipt: std::path::PathBuf }
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.receipt);
