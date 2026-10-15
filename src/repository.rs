@@ -5,6 +5,9 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod worktree_setup_intent;
+pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
+
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -3123,6 +3126,9 @@ pub struct CreateWorktreeRequest {
     pub base: BaseRevision,
     pub track: bool,
     pub operation_id: OperationId,
+    /// Exact setup choice retained through uncertain creation and restart.
+    #[serde(default)]
+    pub setup_intent: Option<WorktreeSetupIntent>,
 }
 
 /// User intent, resolved without creating directories or changing Git refs.
@@ -5743,6 +5749,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         Ok(CreateWorktreeRequest {
             linear_issue: None,
+            setup_intent: None,
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
             repository: input.repository.clone(),
@@ -7419,6 +7426,7 @@ mod tests {
         let destination = root.path().join("feature; echo nope");
         let request = CreateWorktreeRequest {
             linear_issue: None,
+            setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: destination.clone(),
@@ -7450,6 +7458,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let request = CreateWorktreeRequest {
             linear_issue: None,
+            setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: root.path().join("feature"),
@@ -9210,6 +9219,7 @@ mod tests {
         let plan = service
             .plan_worktree_creation(&CreateWorktreeRequest {
                 linear_issue: None,
+                setup_intent: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
                 destination: managed.path().join("feature"),
@@ -11765,6 +11775,7 @@ mod worktree_journal_tests {
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
                 linear_issue: None,
+                setup_intent: None,
                 repository,
                 managed_root: root.clone(),
                 destination: root.join("feature"),

@@ -1204,6 +1204,7 @@ mod tests {
     fn request(id: OperationId) -> CreateWorktreeRequest {
         CreateWorktreeRequest {
             linear_issue: None,
+            setup_intent: None,
             repository: "/repo".into(),
             managed_root: "/".into(),
             destination: "/one".into(),
