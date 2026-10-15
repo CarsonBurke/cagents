@@ -3161,7 +3161,7 @@ impl SettingsField {
         Self::BrowserSearchUrl,
         Self::EditorFontFamily,
         Self::EditorFontSize,
-        Self::TerminalScrollbackLines,
+        Self::TerminalScrollbackMib,
         Self::ManagedWorktreeDirectory,
         Self::AutoDeleteMergedWorktrees,
         Self::WorktreeSort,
@@ -5153,8 +5153,8 @@ impl SettingsDraft {
             SettingsField::EditorFontSize => {
                 self.editor_font_size = previous.editor_font_size.clone()
             }
-            SettingsField::TerminalScrollbackLines => {
-                self.terminal_scrollback_lines = previous.terminal_scrollback_lines.clone()
+            SettingsField::TerminalScrollbackMib => {
+                self.terminal_scrollback_mib = previous.terminal_scrollback_mib.clone()
             }
             SettingsField::ManagedWorktreeDirectory => {
                 self.managed_worktree_directory = previous.managed_worktree_directory.clone()

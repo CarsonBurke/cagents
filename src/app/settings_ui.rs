@@ -1909,6 +1909,7 @@ mod search_tests {
             can_undo: false,
             invalid: &invalid,
             fonts: &app.settings_font_choices,
+            terminal_font_size: app.settings.terminal_font_size,
             accounts: vec![],
             updates: app.update_summary(),
             testing_notification: false,
@@ -2092,7 +2093,7 @@ mod typography_settings_tests {
                 SettingsField::FocusFollowsMouse,
                 SettingsField::ConfirmMultilinePaste,
                 SettingsField::TerminalScrollSize,
-                SettingsField::TerminalScrollbackLines,
+                SettingsField::TerminalScrollbackMib,
             ]
             .into_iter()
             .map(|field| (field, "not a value".into())),
