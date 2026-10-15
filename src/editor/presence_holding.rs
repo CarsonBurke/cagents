@@ -1,5 +1,13 @@
 //! Live recovery for one presence transaction. Every retry uses the retained
 //! parent and exact file witness; diagnostic paths never authorize effects.
+//!
+//! The freshly owned0700 original holding Root and its INTERNAL contents use
+//! the protected-private namespace assumption throughout transaction and retry:
+//! noncooperating same-UID/root changes to these internal leaves are excluded.
+//! Public source names, public holding directory entries/ancestors/lookalikes,
+//! and mutations through pre-existing source descriptors remain in scope. Leaf
+//! checks below do not claim universal atomic content CAS; all private effects
+//! stay relative to the retained original directory, never a reconstructed path.
 use super::*;
 
 struct LeafWitness {
