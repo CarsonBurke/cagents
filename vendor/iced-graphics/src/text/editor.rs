@@ -45,6 +45,15 @@ impl Editor {
         ))
     }
 
+    /// Changes native tab stops while retaining text, selection and scroll.
+    pub fn set_tab_width(&mut self, width: u16) {
+        if width == 0 || self.buffer().tab_width() == width { return; }
+        self.with_internal_mut(|internal| {
+            buffer_mut_from_editor(&mut internal.editor).set_tab_width(width);
+            internal.topmost_line_changed = Some(0);
+        });
+    }
+
     /// Creates a [`Weak`] reference to the [`Editor`].
     ///
     /// This is useful to avoid cloning the [`Editor`] when

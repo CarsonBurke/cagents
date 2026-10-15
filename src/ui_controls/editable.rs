@@ -147,6 +147,10 @@ impl<'a, Message: Clone + 'static> TextInput<'a, Message> {
         self.inner = self.inner.padding(padding);
         self
     }
+    pub fn font(mut self, font: cosmic::iced::Font) -> Self {
+        self.inner = self.inner.font(font);
+        self
+    }
     pub fn size(mut self, size: impl Into<Pixels>) -> Self {
         self.inner = self.inner.size(size);
         self

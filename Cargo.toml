@@ -40,7 +40,6 @@ host = [
     "dep:libghostty-vt",
     "dep:portable-pty",
     "dep:rusqlite",
-    "dep:tempfile",
     "dep:tokio",
     "dep:tracing-subscriber",
     "dep:tungstenite",
@@ -72,7 +71,6 @@ ui = [
     "dep:resvg",
     "dep:roxmltree",
     "dep:rusqlite",
-    "dep:tempfile",
     "dep:tokio",
     "dep:tokio-util",
     "dep:tracing-subscriber",
@@ -164,7 +162,7 @@ hayro = { version = "0.7.1", optional = true }
 # Seals the messages the daemon delivers between sessions, so a conversation
 # can tell them apart from text that merely looks like one. Daemon only.
 hmac = { version = "0.12", optional = true }
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "pnm"], optional = true }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
 # Exact same package/source as libcosmic's iced; only its hot feature is added.
 iced_hot = { package = "iced", git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, optional = true }
@@ -204,7 +202,8 @@ serde_path_to_error = "0.1"
 sha2 = "0.10"
 servo = { version = "=0.1.3", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", default-features = false, features = ["baked-in-resources", "js_jit"], optional = true }
 thiserror = "2.0"
-tempfile = { version = "3.21", optional = true }
+# Atomic settings writes are shared by CLI, daemon, and UI.
+tempfile = "3.21"
 tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 tracing = "0.1"
@@ -226,7 +225,6 @@ wayland-client = { version = "=0.31.15", features = ["system"], optional = true 
 wayland-protocols = { version = "=0.32.13", features = ["client"], optional = true }
 
 [dev-dependencies]
-tempfile = "3.21"
 tracing-log = "0.2"
 
 [profile.dev]

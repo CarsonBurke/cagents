@@ -1391,6 +1391,14 @@ pub struct CommitSummary {
     pub body: String,
 }
 
+fn history_matches(commit: &CommitSummary, query: &str) -> bool {
+    commit.subject.to_lowercase().contains(query)
+        || commit.body.to_lowercase().contains(query)
+        || commit.author.name.to_lowercase().contains(query)
+        || commit.author.email.to_lowercase().contains(query)
+        || commit.oid.as_str().starts_with(query)
+}
+
 /// Which pair of trees a comparison is between.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "basis", rename_all = "snake_case")]
@@ -1430,6 +1438,91 @@ impl DiffBasis {
             | Self::PullRequest { .. } => true,
         }
     }
+}
+
+/// An opaque, process-free observation of the metadata a live comparison
+/// depends on. Read it on a worker: even metadata operations can block on a
+/// network filesystem. Unrelated loose refs and unpublished lock files do not
+/// invalidate it, and symbolic ref traversal has a fixed depth limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryMetadataStamp(BTreeMap<PathBuf, Option<(u64, u64, u64, i64, i64, i64, i64)>>);
+
+pub fn repository_metadata_stamp(worktree: &Path, basis: &DiffBasis) -> io::Result<RepositoryMetadataStamp> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    type Identity = (u64, u64, u64, i64, i64, i64, i64);
+
+    fn observe(paths: &mut BTreeMap<PathBuf, Option<Identity>>, path: &Path, directory: bool) -> io::Result<()> {
+        let identity = match fs::metadata(path) {
+            Ok(meta) if directory => Some((meta.dev(), meta.ino(), 0, 0, 0, 0, 0)),
+            Ok(meta) => Some((meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        paths.insert(path.to_path_buf(), identity);
+        Ok(())
+    }
+
+    fn read_small(path: &Path) -> io::Result<Option<Vec<u8>>> {
+        let file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata is not a regular file")); }
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 { return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata exceeds 4 KiB")); }
+        Ok(Some(bytes))
+    }
+
+    fn reference(paths: &mut BTreeMap<PathBuf, Option<Identity>>, root: &Path, name: &Path) -> io::Result<()> {
+        let mut path = root.join(name);
+        for _ in 0..8 {
+            observe(paths, &path, false)?;
+            let Some(bytes) = read_small(&path)? else { return Ok(()); };
+            let Some(target) = trim_one_line_ending(&bytes).strip_prefix(b"ref: ") else { return Ok(()); };
+            let target = std::str::from_utf8(target).ok().and_then(|target| ValidatedRefName::parse(target).ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid symbolic Git ref"))?;
+            path = root.join(target.as_str());
+        }
+        Err(io::Error::new(io::ErrorKind::InvalidData, "Symbolic Git ref exceeds eight levels"))
+    }
+
+    let marker = worktree.join(".git");
+    let marker_meta = fs::metadata(&marker)?;
+    let git_dir = if marker_meta.is_dir() { marker.clone() } else {
+        let bytes = read_small(&marker)?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Missing Git directory marker"))?;
+        let path = trim_one_line_ending(&bytes).strip_prefix(b"gitdir: ")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid Git directory marker"))?;
+        worktree.join(bytes_to_path(path))
+    };
+    let git_dir = fs::canonicalize(git_dir)?;
+    let common = match read_small(&git_dir.join("commondir"))? {
+        Some(bytes) => fs::canonicalize(git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))?,
+        None => git_dir.clone(),
+    };
+    let mut paths = BTreeMap::new();
+    observe(&mut paths, worktree, true)?;
+    observe(&mut paths, &marker, marker_meta.is_dir())?;
+    for root in [&git_dir, &common] { observe(&mut paths, root, true)?; }
+    for name in ["index", "HEAD", "commondir", "config.worktree", "reftable/tables.list"] {
+        observe(&mut paths, &git_dir.join(name), false)?;
+    }
+    for name in ["packed-refs", "config", "reftable/tables.list"] {
+        observe(&mut paths, &common.join(name), false)?;
+    }
+    // HEAD itself belongs to this worktree; its ordinary symbolic target
+    // belongs to the common directory. Observe both roots for per-worktree refs.
+    if let Some(head) = read_small(&git_dir.join("HEAD"))?
+        && let Some(target) = trim_one_line_ending(&head).strip_prefix(b"ref: ") {
+        let target = std::str::from_utf8(target).ok().and_then(|target| ValidatedRefName::parse(target).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid symbolic HEAD"))?;
+        for root in [&git_dir, &common] { reference(&mut paths, root, Path::new(target.as_str()))?; }
+    }
+    if let DiffBasis::MergeBaseToHead { base_ref, .. } = basis {
+        for root in [&git_dir, &common] { reference(&mut paths, root, Path::new(base_ref.as_str()))?; }
+    }
+    Ok(RepositoryMetadataStamp(paths))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5044,6 +5137,32 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    /// Read a pinned commit message for the amend composer without walking history.
+    pub fn commit_message(
+        &self,
+        worktree: &Path,
+        oid: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<String, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            [
+                "show",
+                "--no-patch",
+                "--no-notes",
+                "--no-show-signature",
+                "--format=format:%B",
+                oid.as_str(),
+                "--",
+            ],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        String::from_utf8(output.stdout).map_err(|error| RepositoryError::InvalidOutput {
+            field: "commit_message",
+            reason: error.to_string(),
+        })
+    }
+
     /// The commit HEAD points at, or `None` on an unborn branch.
     pub fn resolve_head(
         &self,
@@ -5117,31 +5236,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         self.git_literal_read(worktree, arguments)
     }
 
+    fn history_start(
+        &self,
+        request: &HistoryRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Oid>, RepositoryError> {
+        match &request.revision {
+            HistoryRevision::Head => self.resolve_head(&request.worktree, cancellation),
+            HistoryRevision::Object { oid } => Ok(Some(oid.clone())),
+            HistoryRevision::Reference { name } => self.resolve_optional_revision(&request.worktree, name.as_str(), cancellation),
+        }
+    }
+
     /// One page of history, newest first.
     pub fn history(
         &self,
         request: &HistoryRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<CommitSummary>, RepositoryError> {
-        let start = match &request.revision {
-            // Resolved before walking so that every page of one paging session
-            // is taken from the same starting commit, and so that an unborn
-            // branch is an empty history rather than a `git log` failure.
-            HistoryRevision::Head => match self.resolve_head(&request.worktree, cancellation)? {
-                Some(oid) => oid,
-                None => return Ok(Vec::new()),
-            },
-            HistoryRevision::Object { oid } => oid.clone(),
-            HistoryRevision::Reference { name } => {
-                match self.resolve_optional_revision(
-                    &request.worktree,
-                    name.as_str(),
-                    cancellation,
-                )? {
-                    Some(oid) => oid,
-                    None => return Ok(Vec::new()),
-                }
-            }
+        let Some(start) = self.history_start(request, cancellation)? else {
+            return Ok(Vec::new());
         };
         let command = self.history_command(
             &request.worktree,
@@ -5152,6 +5266,64 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_history(&output.stdout);
         invalid_output(parsed, output)
+    }
+
+    /// Resolve a pasted commit SHA even when another branch owns the commit.
+    /// Restrict this extra lookup to hexadecimal prefixes; ordinary queries
+    /// remain literal message/author text and never become revision syntax.
+    fn history_sha_match(
+        &self,
+        request: &HistoryRequest,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CommitSummary>, RepositoryError> {
+        if !(4..=64).contains(&query.len()) || !query.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let Some(oid) = self.resolve_optional_revision(&request.worktree, query, cancellation)? else { return Ok(None); };
+        if !oid.as_str().starts_with(query) { return Ok(None); }
+        let pinned = HistoryRequest { revision: HistoryRevision::Object { oid }, page: 0, ..request.clone() };
+        Ok(self.history(&pinned, cancellation)?.into_iter().next().filter(|commit| history_matches(commit, query)))
+    }
+
+    /// Literal, case-insensitive OR search across message, author and SHA prefix.
+    /// Walk bounded pages on the reader worker so matches can occur anywhere in history.
+    /// A pasted SHA can also name a commit on a sibling branch, allowing a
+    /// selected change to be cherry-picked into the current worktree.
+    pub fn filtered_history(
+        &self,
+        request: &HistoryRequest,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<CommitSummary>, RepositoryError> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() { return self.history(request, cancellation); }
+        let candidate = self.history_sha_match(request, &query, cancellation)?;
+        let candidate_oid = candidate.as_ref().map(|commit| commit.oid.clone());
+        let start = self.history_start(request, cancellation)?;
+        let mut walk = request.clone();
+        if let Some(start) = &start { walk.revision = HistoryRevision::Object { oid: start.clone() }; }
+        walk.page = 0;
+        let mut skip = u64::from(request.page) * u64::from(HISTORY_PAGE_SIZE);
+        let mut matches = Vec::new();
+        if let Some(candidate) = candidate {
+            if skip > 0 { skip -= 1; } else { matches.push(candidate); }
+        }
+        loop {
+            let commits = if start.is_some() { self.history(&walk, cancellation)? } else { Vec::new() };
+            let complete = commits.len() < HISTORY_PAGE_SIZE as usize;
+            for commit in commits {
+                if candidate_oid.as_ref() == Some(&commit.oid) { continue; }
+                if history_matches(&commit, &query) {
+                    if skip > 0 { skip -= 1; }
+                    else { matches.push(commit); }
+                    if matches.len() == HISTORY_PAGE_SIZE as usize { return Ok(matches); }
+                }
+            }
+            if complete { return Ok(matches); }
+            let Some(next) = walk.page.checked_add(1) else { return Ok(matches); };
+            walk.page = next;
+        }
     }
 
     /// The merge base of `base_ref` and HEAD, which is what a branch
@@ -6289,12 +6461,35 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         amend: bool,
         cancellation: &CancellationToken,
     ) -> Result<CommitOutcome, RepositoryError> {
+        self.commit_with_amend_expected(request, amend, None, cancellation)
+    }
+
+    /// Amend only the commit whose message the composer loaded. An earlier
+    /// queued commit or another writer must not redirect this amendment.
+    pub fn commit_amend_at(
+        &self,
+        request: &CommitRequest,
+        expected_head: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
+        self.commit_with_amend_expected(request, true, Some(expected_head), cancellation)
+    }
+
+    fn commit_with_amend_expected(
+        &self,
+        request: &CommitRequest,
+        amend: bool,
+        expected_head: Option<&Oid>,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
         let mut command = self.commit_command(request)?;
         if amend {
-            command = command.arg("--amend");
+            // A loaded message is already an existing commit's exact content.
+            // Whitespace cleanup would silently rewrite a verbatim original.
+            command = command.arg("--amend").arg("--cleanup=verbatim");
         }
         if !amend
             && !self.has_staged_changes(&request.worktree, cancellation)?
@@ -6307,6 +6502,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         }
         let before = self.resolve_head(&request.worktree, cancellation)?;
+        if let Some(expected) = expected_head
+            && before.as_ref() != Some(expected)
+        {
+            return Ok(CommitOutcome::NotCreated {
+                failure: MutationFailure::Rejected {
+                    reason: "HEAD changed since Amend was enabled. Toggle Amend again to load the current commit.".into(),
+                },
+            });
+        }
         let failure = match self.run(&command, cancellation) {
             Ok(output) if output.success => None,
             Ok(output) => Some(MutationFailure::from(git_failure(&command, output))),
@@ -8075,6 +8279,57 @@ mod tests {
     use super::*;
     use std::{ffi::OsStr, sync::Mutex};
 
+    #[test]
+    fn comparison_metadata_stamp_tracks_only_relevant_refs_and_published_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let git = directory.path().join(".git");
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        fs::write(git.join("refs/heads/topic"), "old head\n").unwrap();
+        fs::write(git.join("refs/heads/main"), "old base\n").unwrap();
+        let basis = DiffBasis::MergeBaseToHead {
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: Oid::parse_object("1".repeat(40)).unwrap(),
+            merge_base: Oid::parse_object("2".repeat(40)).unwrap(),
+        };
+        let first = repository_metadata_stamp(directory.path(), &basis).unwrap();
+        fs::write(git.join("index.lock"), "unpublished").unwrap();
+        fs::write(git.join("refs/heads/topic.lock"), "unpublished").unwrap();
+        fs::write(git.join("refs/heads/irrelevant"), "not selected").unwrap();
+        assert_eq!(first, repository_metadata_stamp(directory.path(), &basis).unwrap());
+        fs::write(git.join("index"), "published index").unwrap();
+        let indexed = repository_metadata_stamp(directory.path(), &basis).unwrap();
+        assert_ne!(first, indexed);
+        fs::write(git.join("refs/heads/topic"), "new and longer head\n").unwrap();
+        let head = repository_metadata_stamp(directory.path(), &basis).unwrap();
+        assert_ne!(indexed, head);
+        fs::write(git.join("refs/heads/main"), "new and longer base\n").unwrap();
+        let base = repository_metadata_stamp(directory.path(), &basis).unwrap();
+        assert_ne!(head, base);
+        fs::write(git.join("packed-refs"), "packed data\n").unwrap();
+        assert_ne!(base, repository_metadata_stamp(directory.path(), &basis).unwrap());
+    }
+
+    #[test]
+    fn comparison_metadata_stamp_follows_linked_worktree_common_refs_and_bounds_symbolic_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        let common = directory.path().join("admin");
+        let git = common.join("worktrees/linked");
+        let root = directory.path().join("linked");
+        fs::create_dir_all(&git).unwrap();
+        fs::create_dir_all(common.join("refs/heads")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".git"), "gitdir: ../admin/worktrees/linked\n").unwrap();
+        fs::write(git.join("commondir"), "../..\n").unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        fs::write(common.join("refs/heads/topic"), "old\n").unwrap();
+        let first = repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap();
+        fs::write(common.join("refs/heads/topic"), "new longer\n").unwrap();
+        assert_ne!(first, repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap());
+        fs::write(common.join("refs/heads/topic"), "ref: refs/heads/topic\n").unwrap();
+        assert_eq!(repository_metadata_stamp(&root, &DiffBasis::HeadToIndex).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
     #[derive(Default)]
     struct FakeExecutor {
         commands: Mutex<Vec<CommandSpec>>,
@@ -8958,6 +9213,72 @@ mod tests {
         }
 
         #[test]
+        fn amend_message_reader_preserves_the_original_message_and_pins_its_commit() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            git(root, &["config", "user.name", "Fixture"]);
+            git(root, &["config", "user.email", "fixture@example.invalid"]);
+            fs::write(root.join("file.txt"), "first\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            git(
+                root,
+                &[
+                    "commit",
+                    "-m",
+                    "Original subject  \n\n\nMultiline body  \nSecond line\n\n",
+                    "--cleanup=verbatim",
+                ],
+            );
+            let cancel = CancellationToken::new();
+            let service = service();
+            let original = service.resolve_head(root, &cancel).unwrap().unwrap();
+            let message = service.commit_message(root, &original, &cancel).unwrap();
+            assert_eq!(
+                message,
+                "Original subject  \n\n\nMultiline body  \nSecond line\n\n"
+            );
+            fs::write(root.join("file.txt"), "second\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            let outcome = service
+                .commit_amend_at(
+                    &CommitRequest {
+                        worktree: root.to_path_buf(),
+                        message: message.clone(),
+                    },
+                    &original,
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(outcome, CommitOutcome::Created { .. }));
+            let amended = service.resolve_head(root, &cancel).unwrap().unwrap();
+            assert_ne!(amended, original);
+            let stale = service
+                .commit_amend_at(
+                    &CommitRequest {
+                        worktree: root.to_path_buf(),
+                        message: "Wrong target".into(),
+                    },
+                    &original,
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(stale, CommitOutcome::NotCreated { .. }));
+            assert_eq!(
+                service.resolve_head(root, &cancel).unwrap(),
+                Some(amended.clone())
+            );
+            assert_eq!(
+                service.commit_message(root, &amended, &cancel).unwrap(),
+                message
+            );
+            assert_eq!(
+                service.commit_message(root, &original, &cancel).unwrap(),
+                message
+            );
+        }
+
+        #[test]
         fn commit_navigation_reads_root_renames_and_deletions_from_immutable_objects() {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
@@ -9010,6 +9331,49 @@ mod tests {
                     ..
                 }
             ));
+        }
+
+        #[test]
+        fn history_sha_search_finds_a_sibling_commit_for_cherry_pick_and_revert() {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("source");
+            let target = fixture.path().join("target");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("base.txt"), "baseline\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-m", "baseline"]);
+            git(&root, &["branch", "target"]);
+            fs::write(root.join("agent-change.txt"), "selected agent change\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-m", "Fix from another branch", "-m", "Multiline body for the selected change"]);
+            let service = service();
+            let cancel = CancellationToken::new();
+            let source = service.resolve_head(&root, &cancel).unwrap().unwrap();
+            let source_request = HistoryRequest { worktree: root.clone(), revision: HistoryRevision::Head, page: 0, path: None };
+            assert_eq!(service.filtered_history(&source_request, source.as_str(), &cancel).unwrap().len(), 1,
+                "a direct SHA lookup must not duplicate its normal HEAD-history match");
+            git(&root, &["worktree", "add", target.to_str().unwrap(), "target"]);
+            fs::write(target.join("target-only.txt"), "preserve target\n").unwrap();
+            git(&target, &["add", "."]);
+            git(&target, &["commit", "-m", "Independent target change"]);
+            let request = HistoryRequest { worktree: target.clone(), revision: HistoryRevision::Head, page: 0, path: None };
+            assert!(!service.history(&request, &cancel).unwrap().iter().any(|commit| commit.oid == source));
+            for query in [source.as_str(), &source.as_str()[..8]] {
+                let found = service.filtered_history(&request, query, &cancel).unwrap();
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].oid, source);
+                assert!(found[0].body.contains("Multiline body"));
+            }
+            assert!(matches!(service.git_operation(&target, &GitOperation::CherryPick { oid: source.clone(), mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert_eq!(fs::read(target.join("agent-change.txt")).unwrap(), b"selected agent change\n");
+            let picked = service.resolve_head(&target, &cancel).unwrap().unwrap();
+            assert_ne!(picked, source);
+            assert!(matches!(service.git_operation(&target, &GitOperation::RevertCommit { oid: picked, mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert!(!target.join("agent-change.txt").exists());
+            assert_eq!(fs::read(target.join("target-only.txt")).unwrap(), b"preserve target\n");
+            assert!(root.join("agent-change.txt").exists());
+            assert_eq!(service.filtered_history(&request, source.as_str(), &cancel).unwrap().len(), 1);
         }
 
         fn git(directory: &Path, arguments: &[&str]) {
@@ -10402,6 +10766,57 @@ mod tests {
             Some(&OsString::from("src/main.rs"))
         );
         assert_eq!(HISTORY_FORMAT.matches("%x00").count() + 1, HISTORY_FIELDS);
+    }
+
+    #[test]
+    fn history_filter_searches_beyond_the_initial_page_without_interpreting_query_options() {
+        let record = |id: u8, subject: &str, author: &str| {
+            format!("{}\0\0{}\0author@example.invalid\01700000000 +0000\0Committer\0committer@example.invalid\01700000000 +0000\0{}\0\0", oid(id), author, subject).into_bytes()
+        };
+        let first = record(1, "ordinary subject", "Grace").repeat(HISTORY_PAGE_SIZE as usize);
+        let second = record(2, "A needle beyond page one", "Ada");
+        let service = fake_service(vec![success(&first), success(&second)]);
+        let request = HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Object { oid: oid(3) }, page: 0, path: None };
+        let found = service.filtered_history(&request, "NEEDLE", &CancellationToken::new()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].oid, oid(2));
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].arguments.contains(&OsString::from("--skip=0")));
+        assert!(commands[1].arguments.contains(&OsString::from("--skip=200")));
+        drop(commands);
+        let commit = &found[0];
+        assert!(history_matches(commit, "ada"));
+        assert!(history_matches(commit, &commit.oid.as_str()[..8]));
+        assert!(!history_matches(commit, "--all --author=*"));
+    }
+
+    #[test]
+    fn history_filter_resolves_head_once_for_a_consistent_search_walk() {
+        let record = format!("{}\0\0Ada\0ada@example.invalid\01700000000 +0000\0Ada\0ada@example.invalid\01700000000 +0000\0ordinary\0\0", oid(1)).into_bytes();
+        let first = record.repeat(HISTORY_PAGE_SIZE as usize);
+        let service = fake_service(vec![success(format!("{}\n", oid(3)).as_bytes()), success(&first), success(b"")]);
+        let found = service.filtered_history(&HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Head, page: 0, path: None }, "unmatched", &CancellationToken::new()).unwrap();
+        assert!(found.is_empty());
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 3);
+        assert!(commands[0].arguments.contains(&OsString::from("rev-parse")));
+        for command in &commands[1..] {
+            assert!(command.arguments.contains(&OsString::from(oid(3).as_str())));
+        }
+    }
+
+    #[test]
+    fn history_filter_pages_matching_results_and_keeps_message_author_or_sha_semantics() {
+        let record = |id: u8, author: &str, subject: &str| format!("{}\0\0{}\0author@example.invalid\01700000000 +0000\0Committer\0committer@example.invalid\01700000000 +0000\0{}\0body\0", oid(id), author, subject).into_bytes();
+        let first = record(1, "Ada", "ordinary").repeat(HISTORY_PAGE_SIZE as usize);
+        let second = record(2, "Grace", "Ada in the message");
+        let service = fake_service(vec![success(&first), success(&second)]);
+        let found = service.filtered_history(&HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Object { oid: oid(3) }, page: 1, path: None }, "ada", &CancellationToken::new()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].oid, oid(2));
+        assert!(history_matches(&found[0], "body"));
+        assert!(!history_matches(&found[0], "unmatched"));
     }
 
     #[test]

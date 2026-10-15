@@ -1,3 +1,11 @@
+Pinned from pop-os/libcosmic caec74c2559924443f12fc6faf97a5bcefe6271d, iced/graphics.
+The standalone manifest preserves that workspace's versions and features.
+Local addition: text::Editor::set_tab_width forwards to cosmic-text's native
+buffer, invalidating selection geometry and line highlighting. This lets the
+application change tab stops without rewriting source bytes or hit-test columns.
+
+Local addition: text::Editor::selection_bounds exposes native expanded word/line
+selection positions without allocating or normalizing a selected-text copy.
 # Rich paragraph ellipsis patch
 
 Source: `iced/graphics` from [pop-os/libcosmic](https://github.com/pop-os/libcosmic/tree/caec74c2559924443f12fc6faf97a5bcefe6271d/iced/graphics), revision `caec74c2559924443f12fc6faf97a5bcefe6271d`. The upstream MIT license is included. The standalone manifest preserves the pinned dependency graph and feature defaults.

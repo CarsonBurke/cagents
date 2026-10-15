@@ -381,6 +381,7 @@ impl Project {
                     || relative == Path::new("packed-refs")
                     || relative == Path::new("info/exclude")
             }) {
+                change.metadata = true;
                 change
                     .worktrees
                     .extend(self.worktrees.iter().map(|worktree| worktree.id));
@@ -435,6 +436,7 @@ impl Project {
                     change.worktrees.insert(worktree.id);
                 }
                 if metadata_owner == Some(worktree.id) {
+                    change.metadata = true;
                     change.worktrees.insert(worktree.id);
                     let name = path.file_name();
                     change.metadata = true;

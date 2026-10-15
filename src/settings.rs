@@ -1843,6 +1843,12 @@ pub fn shortcut_search_keywords(value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+const fn default_interface_font_size() -> f32 {
+    13.0
+}
+const fn default_chat_font_size() -> f32 {
+    14.0
+}
 
 const fn default_terminal_scrollback_lines() -> usize {
     10_000
@@ -1863,6 +1869,10 @@ fn default_managed_worktree_directory() -> String {
 const fn default_focus_follows_mouse() -> bool {
     false
 }
+
+const fn default_editor_auto_close() -> bool { true }
+
+const fn default_editor_tab_width() -> u16 { 4 }
 
 const fn default_editor_auto_save() -> bool {
     true
@@ -2026,6 +2036,16 @@ pub struct AppSettings {
     pub app_theme: AppTheme,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// Empty uses the desktop interface font.
+    #[serde(default)]
+    pub interface_font_family: String,
+    #[serde(default = "default_interface_font_size")]
+    pub interface_font_size: f32,
+    /// Empty follows the interface family; code remains monospace.
+    #[serde(default)]
+    pub chat_font_family: String,
+    #[serde(default = "default_chat_font_size")]
+    pub chat_font_size: f32,
     #[serde(default = "default_terminal_line_height")]
     pub terminal_line_height: f32,
     #[serde(default = "default_terminal_scroll_speed")]
@@ -2082,6 +2102,10 @@ pub struct AppSettings {
     pub browser_search_url: String,
     #[serde(default)]
     pub editor_wrap_lines: bool,
+    #[serde(default = "default_editor_tab_width")]
+    pub editor_tab_width: u16,
+    #[serde(default = "default_editor_auto_close")]
+    pub editor_auto_close: bool,
     #[serde(default = "default_diff_hide_unchanged")]
     pub diff_hide_unchanged: bool,
     #[serde(default)]
@@ -2139,6 +2163,12 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// Seconds to keep a language server warm after its last document closes.
+    #[serde(default = "default_lsp_idle_timeout")]
+    pub lsp_idle_timeout_seconds: u64,
+    /// Maximum admitted servers; active documents are never evicted.
+    #[serde(default = "default_lsp_max_sessions")]
+    pub lsp_max_sessions: usize,
     /// Palette entries selected most recently, newest first.
     #[serde(default)]
     pub palette_recents: Vec<String>,
@@ -2175,6 +2205,10 @@ impl Default for AppSettings {
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
             ui_scale: default_ui_scale(),
+            interface_font_family: String::new(),
+            interface_font_size: default_interface_font_size(),
+            chat_font_family: String::new(),
+            chat_font_size: default_chat_font_size(),
             terminal_line_height: default_terminal_line_height(),
             terminal_padding: default_terminal_padding(),
             terminal_scroll_size: default_terminal_scroll_size(),
@@ -2202,6 +2236,8 @@ impl Default for AppSettings {
             confirm_multiline_paste: true,
             browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
+            editor_tab_width: default_editor_tab_width(),
+            editor_auto_close: default_editor_auto_close(),
             diff_hide_unchanged: default_diff_hide_unchanged(),
             diff_ignore_whitespace: false,
             editor_syntax_theme: EditorSyntaxTheme::default(),
@@ -2216,12 +2252,21 @@ impl Default for AppSettings {
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
+            lsp_max_sessions: default_lsp_max_sessions(),
             editor_find_options: EditorFindOptions::default(),
             editor_replace_preserve_case: false,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+fn default_lsp_idle_timeout() -> u64 {
+    600
+}
+fn default_lsp_max_sessions() -> usize {
+    8
 }
 
 /// Persisted matching preferences shared by editor find surfaces.
@@ -2253,6 +2298,22 @@ pub struct LanguageServerSettings {
     /// Relative marker names that identify a project root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "server_option_disabled")]
+    pub format_on_save: bool,
+    #[serde(default = "default_formatting_timeout", skip_serializing_if = "formatting_timeout_is_default")]
+    pub formatting_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "optional_json_absent")]
+    pub initialization_options: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub configuration: serde_json::Value,
+}
+
+fn server_option_disabled(value:&bool)->bool {!*value}
+fn default_formatting_timeout()->u64 {1000}
+fn formatting_timeout_is_default(value:&u64)->bool {*value == default_formatting_timeout()}
+fn optional_json_absent(value:&Option<serde_json::Value>)->bool {value.as_ref().is_none_or(serde_json::Value::is_null)}
+impl Default for LanguageServerSettings {
+    fn default()->Self {Self {id:String::new(),languages:Vec::new(),command:Vec::new(),root_markers:Vec::new(),format_on_save:false,formatting_timeout_ms:default_formatting_timeout(),initialization_options:None,configuration:serde_json::Value::Null}}
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -2278,6 +2339,7 @@ pub fn default_language_servers() -> Vec<LanguageServerSettings> {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
+            ..LanguageServerSettings::default()
         }
     }
 
@@ -3035,6 +3097,33 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        for (family, reason) in [
+            (
+                &self.interface_font_family,
+                "interface_font_family must be a name of at most 128 bytes without control characters",
+            ),
+            (
+                &self.chat_font_family,
+                "chat_font_family must be a name of at most 128 bytes without control characters",
+            ),
+        ] {
+            if family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES
+                || family.chars().any(char::is_control)
+                || (!family.is_empty() && family.trim().is_empty())
+            {
+                return Err(SettingsError::Invalid(reason));
+            }
+        }
+        if !(10.0..=24.0).contains(&self.interface_font_size) {
+            return Err(SettingsError::Invalid(
+                "Interface font size must be between 10 and 24",
+            ));
+        }
+        if !(8.0..=40.0).contains(&self.chat_font_size) {
+            return Err(SettingsError::Invalid(
+                "Chat font size must be between 8 and 40",
+            ));
+        }
         self.git_status_limit = self.git_status_limit.clamp(1, 100_000);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
@@ -3095,6 +3184,9 @@ impl AppSettings {
             return Err(SettingsError::Invalid(
                 "terminal_font_size must be between 8 and 40",
             ));
+        }
+        if !(1..=16).contains(&self.editor_tab_width) {
+            return Err(SettingsError::Invalid("editor_tab_width must be between 1 and 16".into()));
         }
         if self
             .editor_font_size
@@ -3163,6 +3255,16 @@ impl AppSettings {
                 "managed_worktree_directory must be a nonempty path without control characters",
             ));
         }
+        if !(1..=64).contains(&self.lsp_max_sessions) {
+            return Err(SettingsError::Invalid(
+                "lsp_max_sessions must be between 1 and 64",
+            ));
+        }
+        if !(1..=604800).contains(&self.lsp_idle_timeout_seconds) {
+            return Err(SettingsError::Invalid(
+                "lsp_idle_timeout_seconds must be between 1 and 604800",
+            ));
+        }
         self.keyboard_shortcuts.validate()?;
         validate_language_servers(&self.language_servers)?;
         Ok(self)
@@ -3178,6 +3280,13 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
 
     for server in servers {
         let id = server.id.as_str();
+        if !(50..=10_000).contains(&server.formatting_timeout_ms) {
+            return Err(SettingsError::LanguageServer(format!("language server {id} formatting_timeout_ms must be between 50 and 10000")));
+        }
+        if server.initialization_options.as_ref().is_some_and(|value| serde_json::to_vec(value).map_or(true,|bytes| bytes.len() > 1024*1024))
+            || serde_json::to_vec(&server.configuration).map_or(true,|bytes| bytes.len() > 1024*1024) {
+            return Err(SettingsError::LanguageServer(format!("language server {id} configuration must fit within 1 MiB")));
+        }
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
                 "language_servers entry has an empty id".to_owned(),
@@ -3334,6 +3443,32 @@ pub fn save_merged(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
+    save_merged_observed_unlocked(path, base, desired).map(|_| ())
+}
+
+/// A save and its actual merged file contents, ordered while holding the file lock.
+#[derive(Clone, Debug)]
+pub struct SavedSettings {
+    pub settings: AppSettings,
+    pub reload_error: Option<String>,
+    pub observed_at: std::time::Instant,
+}
+
+pub fn save_merged_observed(
+    path: impl AsRef<Path>,
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<SavedSettings, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    save_merged_observed_unlocked(path, base, desired)
+}
+
+fn save_merged_observed_unlocked(
+    path: &Path,
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<SavedSettings, SettingsError> {
     let current = load_unlocked(path)?.settings;
     let mut current = toml::Value::try_from(current)?;
     merge_changed_fields(
@@ -3341,7 +3476,17 @@ pub fn save_merged(
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let settings = current.try_into::<AppSettings>()?.validate()?;
+    save_unlocked(path, &settings)?;
+    // Unknown values are preserved by saving. A known-but-invalid foreign
+    // value in another category must keep its banner after this save too.
+    let loaded = load_unlocked(path)?;
+    let reload_error = live_validation_error(&loaded);
+    Ok(SavedSettings {
+        settings: loaded.settings,
+        reload_error,
+        observed_at: std::time::Instant::now(),
+    })
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
@@ -3393,6 +3538,201 @@ fn load_unlocked(path: &Path) -> Result<Loaded, SettingsError> {
     }
 }
 
+/// Creates a documented, editable snapshot without replacing an existing file.
+pub fn ensure_file(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    reject_unsafe_destination(path)?;
+    if !path.exists() {
+        save_unlocked(path, settings)?;
+    }
+    Ok(())
+}
+
+/// Merge in-flight UI changes onto an externally edited configuration.
+pub fn merge_live(
+    base: &AppSettings,
+    desired: &AppSettings,
+    external: &AppSettings,
+) -> Result<AppSettings, SettingsError> {
+    let mut current = toml::Value::try_from(external)?;
+    merge_changed_fields(
+        &toml::Value::try_from(base)?,
+        &toml::Value::try_from(desired)?,
+        &mut current,
+    );
+    current.try_into::<AppSettings>()?.validate()
+}
+
+/// Live edits are atomic: a known setting that cannot be used rejects the whole
+/// edit, leaving the window's last working settings in force.
+pub fn load_live(path: impl AsRef<Path>) -> Result<AppSettings, String> {
+    load_live_observed(path).result
+}
+
+/// File reads may finish on a blocking thread in a different order from UI
+/// delivery. Stamp both valid and invalid snapshots inside the settings lock.
+#[derive(Clone, Debug)]
+pub struct LiveSettings {
+    pub result: Result<AppSettings, String>,
+    pub observed_at: std::time::Instant,
+}
+
+impl LiveSettings {
+    pub fn now(result: Result<AppSettings, String>) -> Self {
+        Self {
+            result,
+            observed_at: std::time::Instant::now(),
+        }
+    }
+}
+
+pub fn load_live_observed(path: impl AsRef<Path>) -> LiveSettings {
+    let path = path.as_ref();
+    let result = (|| {
+        let _lock = settings_lock(path).map_err(|error| error.to_string())?;
+        let result = load_unlocked(path)
+            .map_err(|error| error.to_string())
+            .and_then(|loaded| match live_validation_error(&loaded) {
+                Some(error) => Err(error),
+                None => Ok(loaded.settings),
+            });
+        Ok::<_, String>(LiveSettings::now(result))
+    })();
+    result.unwrap_or_else(|error| LiveSettings::now(Err(error)))
+}
+
+fn live_validation_error(loaded: &Loaded) -> Option<String> {
+    let errors: Vec<_> = loaded
+        .foreign
+        .iter()
+        .filter_map(|setting| match &setting.reason {
+            ForeignReason::UnknownKey => None,
+            ForeignReason::UnreadableValue(error) => Some(format!(
+                "settings.toml: “{}” is invalid ({error}).",
+                dotted(&setting.path)
+            )),
+        })
+        .collect();
+    (!errors.is_empty()).then(|| errors.join("\n"))
+}
+
+/// Save a byte-for-byte recovery copy before resetting any preferences.
+pub fn reset_with_backup(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+) -> Result<PathBuf, SettingsError> {
+    let mut keys: Vec<String> = written(settings)?
+        .as_table()
+        .expect("settings table")
+        .keys()
+        .cloned()
+        .collect();
+    keys.extend(
+        [
+            "custom_terminal_theme",
+            "editor_font_family",
+            "editor_font_size",
+        ]
+        .map(str::to_owned),
+    );
+    reset_keys_with_backup_inner(path, settings, &keys, true, None)
+}
+
+/// Reset selected top-level keys while keeping unrelated hand-written values.
+pub fn reset_keys_with_backup(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+    keys: &[String],
+) -> Result<PathBuf, SettingsError> {
+    reset_keys_with_backup_inner(path, settings, keys, false, Some(settings))
+}
+
+/// Reset one category while retaining local edits and unobserved disk changes
+/// outside its keys. The baseline, merge, backup and replacement share one lock.
+pub fn reset_keys_merged_with_backup(
+    path: impl AsRef<Path>,
+    base: &AppSettings,
+    desired: &AppSettings,
+    keys: &[String],
+) -> Result<PathBuf, SettingsError> {
+    reset_keys_with_backup_inner(path, desired, keys, false, Some(base))
+}
+
+fn reset_keys_with_backup_inner(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+    keys: &[String],
+    replace_future_schema: bool,
+    base: Option<&AppSettings>,
+) -> Result<PathBuf, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    if !path.exists() {
+        save_unlocked(path, settings)?;
+    }
+    let bytes = read_private_file(path)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut backup = tempfile::Builder::new()
+        .prefix(&format!("settings.toml.bak-{stamp}-"))
+        .tempfile_in(settings_parent(path)?)?;
+    backup
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    backup.write_all(&bytes)?;
+    backup.as_file().sync_all()?;
+    let (_, backup_path) = backup
+        .keep()
+        .map_err(|error| SettingsError::Io(error.error))?;
+    let merged;
+    let settings = if let Some(base) = base {
+        let mut current = toml::Value::try_from(load_unlocked(path)?.settings)?;
+        let desired = toml::Value::try_from(settings)?;
+        merge_changed_fields(&toml::Value::try_from(base)?, &desired, &mut current);
+        let table = current.as_table_mut().expect("settings table");
+        for key in keys {
+            if let Some(value) = desired.get(key.as_str()) {
+                table.insert(key.clone(), value.clone());
+            } else {
+                table.remove(key);
+            }
+        }
+        merged = current.try_into::<AppSettings>()?.validate()?;
+        &merged
+    } else {
+        settings
+    };
+    save_unlocked_for_keys(path, settings, keys, replace_future_schema)?;
+    Ok(backup_path)
+}
+
+/// Restore the original bytes, including comments, whitespace and unknown tables.
+pub fn restore_backup(
+    path: impl AsRef<Path>,
+    backup: impl AsRef<Path>,
+) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    let bytes = read_private_file(backup.as_ref())?;
+    reject_unsafe_destination(path)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".settings-undo-")
+        .tempfile_in(settings_parent(path)?)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| SettingsError::Io(error.error))?;
+    open_private_directory(settings_parent(path)?)?.sync_all()?;
+    Ok(())
+}
+
 pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
@@ -3400,6 +3740,15 @@ pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), Settin
 }
 
 fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
+    save_unlocked_for_keys(path, settings, &[], false)
+}
+
+fn save_unlocked_for_keys(
+    path: &Path,
+    settings: &AppSettings,
+    reset_keys: &[String],
+    replace_future_schema: bool,
+) -> Result<(), SettingsError> {
     let settings = settings.clone().validate()?;
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
@@ -3407,11 +3756,36 @@ fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsErro
     reject_unsafe_destination(path)?;
 
     let mut document = written(&settings)?;
+    let reset_values = document.clone();
     // Whatever a newer build wrote, and this one cannot represent, survives.
-    if let Some(current) = current_document(path)? {
-        keep_foreign_settings(&current, &mut document);
+    match current_document(path) {
+        Ok(Some(current)) => keep_foreign_settings(&current, &mut document),
+        Ok(None) => {}
+        Err(SettingsError::UnsupportedSchema(_)) if replace_future_schema => {}
+        Err(error) => return Err(error),
+    }
+    // Explicit reset overrides even a foreign/unreadable value whose decoded
+    // baseline was already the default. Other categories retain their values.
+    for key in reset_keys {
+        let table = document.as_table_mut().expect("settings table");
+        if let Some(value) = reset_values.get(key.as_str()) {
+            table.insert(key.clone(), value.clone());
+        } else {
+            table.remove(key);
+        }
     }
     let mut document = toml::to_string_pretty(&document)?;
+    if !path.exists() {
+        let defaults = toml::to_string_pretty(&AppSettings::default())?;
+        let reference = defaults
+            .lines()
+            .map(|line| format!("# {line}\n"))
+            .collect::<String>();
+        let (header, current) = document.split_once('\n').unwrap_or((&document, ""));
+        document = format!(
+            "{header}\n\n# Default values for reference (commented out).\n{reference}\n# Current settings; changes apply live in every window.\n{current}"
+        );
+    }
     if !document.ends_with('\n') {
         document.push('\n');
     }
@@ -4276,126 +4650,150 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn registered_editor_chords_preserve_workspace_scope_and_migrate_without_stealing() {
-        let shortcuts = KeyboardShortcuts::default();
-        assert!(shortcuts.fault().is_none());
-        let binding = parse_shortcut("Ctrl+Shift+Z").unwrap();
-        assert!(!shortcut_binding_conflicts(
-            "editor_redo",
-            "reopen_pane",
-            binding
-        ));
-        assert!(shortcut_binding_conflicts(
-            "editor_redo",
-            "editor_undo",
-            binding
-        ));
-        assert!(
-            shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+C").unwrap()).is_none()
-        );
-        assert!(
-            shortcut_chord_refusal_for("rename_pane", parse_shortcut("Ctrl+C").unwrap()).is_some()
-        );
-        assert!(
-            shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+S").unwrap()).is_none()
-        );
-        let mut sparse = toml::Table::new();
-        sparse.insert("reopen_pane".into(), vec!["Ctrl+Shift+Z"].into());
-        preserve_introduced_shortcuts(&mut sparse);
-        let decoded: KeyboardShortcuts = toml::Value::Table(sparse).try_into().unwrap();
-        assert_eq!(decoded.editor_redo, shortcuts.editor_redo);
-        assert_eq!(decoded.reopen_pane, shortcuts.reopen_pane);
-        assert!(decoded.fault().is_none());
-    }
-
-    #[test]
-    fn editor_chords_conflict_with_find_when_find_owns_the_editor_binding() {
-        let binding = parse_shortcut("Ctrl+F").unwrap();
-        assert!(shortcut_binding_conflicts(
-            "editor_redo",
-            "find_in_pane",
-            binding
-        ));
-        assert!(shortcut_binding_conflicts(
-            "find_in_pane",
-            "editor_redo",
-            binding
-        ));
-        assert!(text_editing_shortcut_conflict_for("find_in_pane", binding).is_none());
-        let mut shortcuts = KeyboardShortcuts::default();
-        shortcuts.editor_redo = vec!["Ctrl+F".into()];
-        assert!(
-            shortcuts
-                .fault()
-                .is_some_and(|fault| fault.conflicts_with.is_some())
-        );
-        shortcuts.find_in_pane = vec!["Ctrl+Alt+G".into()];
-        assert!(shortcuts.fault().is_none());
-        shortcuts.next_diagnostic = vec!["Ctrl+Z".into()];
-        assert!(
-            shortcuts
-                .fault()
-                .is_some_and(|fault| fault.conflicts_with.is_some()),
-            "two native editor commands cannot share Undo"
-        );
-        assert!(
-            shortcut_binding_conflicts(
-                "editor_undo",
-                "future_editor_action",
-                parse_shortcut("Ctrl+Z").unwrap()
-            ),
-            "an unknown future scope is preserved conservatively"
-        );
-    }
-
-    #[test]
-    fn working_diff_history_conflicts_with_review_vocabulary_but_not_reopen() {
-        for history in ["editor_undo", "editor_redo"] {
-            for review in SHORTCUT_ACTIONS
-                .into_iter()
-                .filter(|action| is_review_command(action))
-            {
-                for chord in ["Ctrl+C", "Ctrl+Z", "Ctrl+Shift+Z", "Alt+F9"] {
-                    let binding = parse_shortcut(chord).unwrap();
-                    assert!(
-                        shortcut_binding_conflicts(history, review, binding),
-                        "{history}/{review}/{chord}"
-                    );
-                    assert!(
-                        shortcut_binding_conflicts(review, history, binding),
-                        "{review}/{history}/{chord}"
-                    );
-                }
-            }
+    fn language_server_editor_options_round_trip_and_validate() {
+        let mut settings=AppSettings::default();
+        settings.language_servers[0].format_on_save=true;
+        settings.language_servers[0].formatting_timeout_ms=750;
+        settings.language_servers[0].initialization_options=Some(serde_json::json!({"check":{"command":"clippy"}}));
+        settings.language_servers[0].configuration=serde_json::json!({"rust-analyzer":{"check":{"command":"clippy"}}});
+        let text=toml::to_string(&settings).unwrap();
+        let decoded:AppSettings=toml::from_str(&text).unwrap();
+        assert_eq!(decoded.language_servers,settings.language_servers);
+        assert!(decoded.validate().is_ok());
+        for timeout in [0,49,10001,u64::MAX] {
+            let mut settings=AppSettings::default();settings.language_servers[0].formatting_timeout_ms=timeout;
+            assert!(settings.validate().is_err());
         }
-        let mut shortcuts = KeyboardShortcuts::default();
-        shortcuts.editor_undo = vec!["Ctrl+C".into()];
-        assert!(
-            shortcuts
-                .fault()
-                .is_some_and(|fault| fault.conflicts_with.is_some())
-        );
-        shortcuts.diff_copy.clear();
-        assert!(shortcuts.fault().is_none());
-        assert!(!shortcut_binding_conflicts(
-            "editor_redo",
-            "reopen_pane",
-            parse_shortcut("Ctrl+Shift+Z").unwrap()
-        ));
+        let mut settings=AppSettings::default();settings.language_servers[0].initialization_options=Some(serde_json::json!({"large":"x".repeat(1024*1024)}));
+        assert!(settings.validate().is_err());
     }
 
     #[test]
-    fn mutable_shortcut_order_matches_serialized_registry() {
-        for (index, name) in SHORTCUT_ACTIONS.iter().enumerate() {
-            let mut shortcuts = KeyboardShortcuts::default();
-            let chords = vec!["Ctrl+Alt+Shift+K".to_owned()];
-            shortcuts.set_action(index, chords.clone());
-            let serialized = toml::Value::try_from(&shortcuts).unwrap();
-            assert_eq!(
-                serialized.get(*name).unwrap().as_array().unwrap(),
-                &[toml::Value::String(chords[0].clone())]
+    fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
+        for cap in [0, 65, usize::MAX] {
+            let settings = AppSettings {
+                lsp_max_sessions: cap,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+        for timeout in [0, 604801, u64::MAX] {
+            let settings = AppSettings {
+                lsp_idle_timeout_seconds: timeout,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn live_settings_merge_retains_unrelated_changes_and_reports_conflicts() {
+        let base = AppSettings::default();
+        let mut desired = base.clone();
+        desired.terminal_font_size = 20.0;
+        let mut external = base.clone();
+        external.terminal_font_family = "monospace".into();
+        let merged = merge_live(&base, &desired, &external).unwrap();
+        assert_eq!(merged.terminal_font_size, 20.0);
+        assert_eq!(merged.terminal_font_family, "monospace");
+        desired.keyboard_shortcuts.new_terminal = vec!["Ctrl+Alt+X".into()];
+        external.keyboard_shortcuts.new_native_thread = vec!["Ctrl+Alt+X".into()];
+        assert!(merge_live(&base, &desired, &external).is_err());
+    }
+
+    #[test]
+    fn settings_reset_replaces_invalid_known_values_without_erasing_other_categories() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("terminal_font_size = 14.0", "terminal_font_size = -5.0");
+        std::fs::write(
+            &path,
+            format!("{original}\n[future_preferences]\nkeep = true\n"),
+        )
+        .unwrap();
+        let error = load_live(&path).unwrap_err();
+        assert!(error.contains("terminal_font_size"));
+        assert!(!error.contains("default is in effect"));
+        reset_keys_with_backup(
+            &path,
+            &AppSettings::default(),
+            &["terminal_font_size".into()],
+        )
+        .unwrap();
+        assert!(load_live(&path).is_ok());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("[future_preferences]")
+        );
+    }
+
+    #[test]
+    fn selected_settings_reset_keeps_unobserved_known_values_outside_its_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let cached = AppSettings::default();
+        let mut external = cached.clone();
+        external.terminal_font_size = 18.0;
+        external.keyboard_shortcuts.command_palette.clear();
+        save(&path, &external).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let backup =
+            reset_keys_with_backup(&path, &cached, &["keyboard_shortcuts".into()]).unwrap();
+        let saved = load_live(&path).unwrap();
+        assert_eq!(saved.terminal_font_size, 18.0);
+        assert_eq!(saved.keyboard_shortcuts, cached.keyboard_shortcuts);
+        assert_eq!(std::fs::read(backup).unwrap(), before);
+    }
+
+    #[test]
+    fn explicit_settings_reset_can_recover_a_newer_schema_after_backing_it_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = "schema_version = 999\n[future_table]\nkeep = true\n";
+        std::fs::write(&path, original).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        assert!(load_live(path).is_ok());
+        assert_eq!(std::fs::read(backup).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn reset_backup_restores_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = format!(
+            "# My hand-written configuration\n{}\n[my_future_table]\nfoo = 'bar'\n",
+            fs::read_to_string(&path).unwrap()
+        );
+        fs::write(&path, original.as_bytes()).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original.as_bytes());
+        restore_backup(&path, backup).unwrap();
+        assert_eq!(fs::read(path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn documentation_lists_every_app_settings_key() {
+        let document = include_str!("../docs/configuration.md");
+        let mut settings = AppSettings::default();
+        settings.editor_font_family = Some("monospace".into());
+        settings.editor_font_size = Some(14.0);
+        settings.custom_terminal_theme = Some(crate::terminal::TerminalTheme::Dark.palette());
+        for key in toml::Value::try_from(settings)
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .keys()
+        {
+            assert!(
+                document.contains(&format!("`{key}`")),
+                "Missing settings documentation: {key}"
             );
-            assert_eq!(shortcuts.actions()[index], &chords);
         }
     }
 
@@ -4758,6 +5156,10 @@ mod tests {
             hibernation_delay_ms: 1_234,
             app_theme: AppTheme::Light,
             ui_scale: 1.2,
+            interface_font_family: "DejaVu Sans".into(),
+            interface_font_size: 16.0,
+            chat_font_family: "DejaVu Serif".into(),
+            chat_font_size: 19.0,
             terminal_line_height: 1.5,
             terminal_padding: 12.0,
             terminal_scroll_size: 4,
@@ -6760,4 +7162,128 @@ new_thread = "Alt+Shift+G"
         ));
         assert!(!target.join("settings.toml").exists());
     }
+    #[test]
+    fn registered_editor_chords_preserve_workspace_scope_and_migrate_without_stealing() {
+        let shortcuts = KeyboardShortcuts::default();
+        assert!(shortcuts.fault().is_none());
+        let binding = parse_shortcut("Ctrl+Shift+Z").unwrap();
+        assert!(!shortcut_binding_conflicts(
+            "editor_redo",
+            "reopen_pane",
+            binding
+        ));
+        assert!(shortcut_binding_conflicts(
+            "editor_redo",
+            "editor_undo",
+            binding
+        ));
+        assert!(
+            shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+C").unwrap()).is_none()
+        );
+        assert!(
+            shortcut_chord_refusal_for("rename_pane", parse_shortcut("Ctrl+C").unwrap()).is_some()
+        );
+        assert!(
+            shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+S").unwrap()).is_none()
+        );
+        let mut sparse = toml::Table::new();
+        sparse.insert("reopen_pane".into(), vec!["Ctrl+Shift+Z"].into());
+        preserve_introduced_shortcuts(&mut sparse);
+        let decoded: KeyboardShortcuts = toml::Value::Table(sparse).try_into().unwrap();
+        assert_eq!(decoded.editor_redo, shortcuts.editor_redo);
+        assert_eq!(decoded.reopen_pane, shortcuts.reopen_pane);
+        assert!(decoded.fault().is_none());
+    }
+
+    #[test]
+    fn editor_chords_conflict_with_find_when_find_owns_the_editor_binding() {
+        let binding = parse_shortcut("Ctrl+F").unwrap();
+        assert!(shortcut_binding_conflicts(
+            "editor_redo",
+            "find_in_pane",
+            binding
+        ));
+        assert!(shortcut_binding_conflicts(
+            "find_in_pane",
+            "editor_redo",
+            binding
+        ));
+        assert!(text_editing_shortcut_conflict_for("find_in_pane", binding).is_none());
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.editor_redo = vec!["Ctrl+F".into()];
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some())
+        );
+        shortcuts.find_in_pane = vec!["Ctrl+Alt+G".into()];
+        assert!(shortcuts.fault().is_none());
+        shortcuts.next_diagnostic = vec!["Ctrl+Z".into()];
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some()),
+            "two native editor commands cannot share Undo"
+        );
+        assert!(
+            shortcut_binding_conflicts(
+                "editor_undo",
+                "future_editor_action",
+                parse_shortcut("Ctrl+Z").unwrap()
+            ),
+            "an unknown future scope is preserved conservatively"
+        );
+    }
+
+    #[test]
+    fn working_diff_history_conflicts_with_review_vocabulary_but_not_reopen() {
+        for history in ["editor_undo", "editor_redo"] {
+            for review in SHORTCUT_ACTIONS
+                .into_iter()
+                .filter(|action| is_review_command(action))
+            {
+                for chord in ["Ctrl+C", "Ctrl+Z", "Ctrl+Shift+Z", "Alt+F9"] {
+                    let binding = parse_shortcut(chord).unwrap();
+                    assert!(
+                        shortcut_binding_conflicts(history, review, binding),
+                        "{history}/{review}/{chord}"
+                    );
+                    assert!(
+                        shortcut_binding_conflicts(review, history, binding),
+                        "{review}/{history}/{chord}"
+                    );
+                }
+            }
+        }
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.editor_undo = vec!["Ctrl+C".into()];
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some())
+        );
+        shortcuts.diff_copy.clear();
+        assert!(shortcuts.fault().is_none());
+        assert!(!shortcut_binding_conflicts(
+            "editor_redo",
+            "reopen_pane",
+            parse_shortcut("Ctrl+Shift+Z").unwrap()
+        ));
+    }
+
+    #[test]
+    fn mutable_shortcut_order_matches_serialized_registry() {
+        for (index, name) in SHORTCUT_ACTIONS.iter().enumerate() {
+            let mut shortcuts = KeyboardShortcuts::default();
+            let chords = vec!["Ctrl+Alt+Shift+K".to_owned()];
+            shortcuts.set_action(index, chords.clone());
+            let serialized = toml::Value::try_from(&shortcuts).unwrap();
+            assert_eq!(
+                serialized.get(*name).unwrap().as_array().unwrap(),
+                &[toml::Value::String(chords[0].clone())]
+            );
+            assert_eq!(shortcuts.actions()[index], &chords);
+        }
+    }
+
 }

@@ -2056,6 +2056,8 @@ struct ChangeGroupChrome {
 pub struct CommitRow {
     pub oid: Oid,
     pub parent: Option<Oid>,
+    pub message: Arc<str>,
+    pub mainline: Option<u32>,
     chrome: CommitRowChrome,
 }
 
@@ -2084,6 +2086,8 @@ impl CommitRow {
         Self {
             oid: commit.oid.clone(),
             parent: commit.parents.first().cloned(),
+            message: compose_commit_message(&commit.subject, &commit.body).into(),
+            mainline: merge.then_some(1),
             chrome,
         }
     }
@@ -2258,6 +2262,7 @@ pub struct SourceControlModel {
     files_limited: bool,
     pub branch_changes: BranchChanges,
     pub history: Vec<CommitRow>,
+    pub history_query: String,
     pub commit_changes: Option<CommitChanges>,
     /// False until a page has landed. Without it an empty `history` is
     /// indistinguishable from a branch that has no commits.
@@ -2439,6 +2444,7 @@ impl SourceControlModel {
             files_limited: false,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
+            history_query: String::new(),
             commit_changes: None,
             history_loaded: false,
             history_requested: false,
@@ -2601,6 +2607,7 @@ impl SourceControlModel {
             files_limited: snapshot.files.listing_truncated,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
+            history_query: String::new(),
             commit_changes: None,
             history_loaded: false,
             history_requested: false,
@@ -2614,6 +2621,16 @@ impl SourceControlModel {
             chrome,
             file_search: FileSearch::Inactive,
         }
+    }
+
+    pub fn search_history(&mut self, query: String) {
+        self.history_query = query;
+        self.history.clear();
+        self.commit_changes = None;
+        self.history_loaded = false;
+        self.history_complete = false;
+        self.next_history_page = 0;
+        self.mark_history_requested();
     }
 
     /// Appends one loaded history page. A short page is the last one.
@@ -2664,7 +2681,7 @@ impl SourceControlModel {
     /// True while a further page can exist. An unborn `HEAD` has no walk to
     /// page through, so it is offered no pager.
     fn can_load_history(&self) -> bool {
-        !self.history_loading && !self.history_complete && !self.unborn
+        !self.history_loading && !self.history_complete && !self.unborn && self.head_oid.is_some()
     }
 
     /// Records that the first page has been asked for, so expanding, closing,
@@ -2836,6 +2853,7 @@ impl SourceControlModel {
         next.pending_marker_stage = self.pending_marker_stage.clone();
         next.pending_marker_approval = self.pending_marker_approval.clone();
         next.commit_changes = self.commit_changes.clone();
+        next.history_query.clone_from(&self.history_query);
         // The loading placeholder between two snapshots has not read `HEAD`
         // yet, and that gap must not look like a `HEAD` that moved.
         if next.head_oid.is_none() && !next.unborn {
@@ -3398,7 +3416,35 @@ struct CommitDraft {
     subject_composer: CommitComposer,
     composer: CommitComposer,
     amend: bool,
+    amend_stash: Option<Box<CommitDraft>>,
+    amend_loaded_message: Option<String>,
+    amend_loading: bool,
+    amend_edited: bool,
+    amend_head: Option<Oid>,
     revision: u64,
+}
+
+impl CommitDraft {
+    fn ready(&self) -> bool {
+        !self.amend_loading
+            && (!self.amend || self.amend_loaded_message.is_some() || self.amend_edited)
+    }
+
+    fn set_message(&mut self, message: &str) {
+        self.message = message.to_owned();
+        let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
+        self.subject = subject.to_owned();
+        self.subject_composer = CommitComposer(
+            cosmic::iced::widget::text_editor::Content::with_text(subject),
+        );
+        self.composer = CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
+            description.trim_start_matches('\n'),
+        ));
+    }
+}
+
+fn head_is_pushed(tracking: &TrackingState) -> bool {
+    matches!(tracking, TrackingState::Compared { ahead: 0, .. })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3421,6 +3467,8 @@ pub struct SidebarState {
     /// Compact mode only: whether the source-control popover is showing.
     panel_open: bool,
     files_query: String,
+    history_query: String,
+    history_branch: Option<(Oid, String)>,
     files_filter_open: bool,
     change_list_mode: FileListMode,
     /// Which view of the Git panel is showing. Local to the surface, like
@@ -3975,6 +4023,11 @@ impl SidebarState {
         }
     }
 
+    /// A submitted branch form must still own its exact commit and draft.
+    pub fn history_branch_matches(&self, oid: &Oid, name: &ValidatedBranchName) -> bool {
+        self.history_branch.as_ref().is_some_and(|(current, draft)| current == oid && draft == name.as_str())
+    }
+
     pub fn selected_file(&self) -> Option<&RepoPath> {
         match self.panel_selection.as_ref() {
             Some(PanelSelection::File(path)) => Some(path),
@@ -4053,6 +4106,7 @@ impl SidebarState {
             .active_worktree
             .as_ref()
             .is_some_and(|active| active.canonical_path == key.canonical_path)
+            && self.commit_draft.ready()
             && self.commit_draft.message == message
             && self.commit_draft.amend == amend)
             .then_some(self.commit_draft.revision)
@@ -4074,6 +4128,64 @@ impl SidebarState {
         {
             *draft = CommitDraft::default();
         }
+    }
+
+    pub fn amend_target(&self) -> Option<Oid> {
+        self.commit_draft
+            .amend
+            .then(|| self.commit_draft.amend_head.clone())
+            .flatten()
+    }
+
+    pub fn pin_amend_head(&mut self, key: &ActiveWorktreeKey, revision: u64, head: Oid) {
+        if self.active_worktree.as_ref() == Some(key)
+            && self.commit_draft.amend
+            && self.commit_draft.revision == revision
+        {
+            self.commit_draft.amend_head = Some(head);
+        }
+    }
+
+    pub fn amend_request_revision(&self) -> Option<u64> {
+        self.commit_draft
+            .amend_loading
+            .then_some(self.commit_draft.revision)
+    }
+
+    /// A delayed read must never overwrite typing, a later toggle, or another tree.
+    pub fn load_amend_message(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        revision: u64,
+        message: &str,
+    ) -> bool {
+        let draft = if self.active_worktree.as_ref() == Some(key) {
+            Some(&mut self.commit_draft)
+        } else {
+            self.parked_commit_drafts.get_mut(&key.canonical_path)
+        };
+        let Some(draft) = draft.filter(|draft| draft.amend && draft.revision == revision) else {
+            return false;
+        };
+        draft.set_message(message);
+        draft.amend_loaded_message = Some(message.to_owned());
+        draft.amend_loading = false;
+        true
+    }
+
+    pub fn finish_amend_read(&mut self, key: &ActiveWorktreeKey, revision: u64) -> bool {
+        let draft = if self.active_worktree.as_ref() == Some(key) {
+            Some(&mut self.commit_draft)
+        } else {
+            self.parked_commit_drafts.get_mut(&key.canonical_path)
+        };
+        if let Some(draft) =
+            draft.filter(|draft| draft.amend && draft.amend_loading && draft.revision == revision)
+        {
+            draft.amend_loading = false;
+            return true;
+        }
+        false
     }
 
     fn revise_commit_draft(&mut self) {
@@ -4130,6 +4242,8 @@ impl SidebarState {
         self.active_worktree = next;
         // Every panel-local draft belongs to the worktree it was typed for.
         self.files_query.clear();
+        self.history_query.clear();
+        self.history_branch = None;
         self.files_filter_open = false;
         self.expanded_directories.clear();
         self.collapsed_change_directories.clear();
@@ -4273,16 +4387,9 @@ impl SidebarState {
             }
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.revise_commit_draft();
-                self.commit_draft.message.clone_from(message);
-                let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
-                self.commit_draft.subject = subject.to_owned();
-                self.commit_draft.subject_composer = CommitComposer(
-                    cosmic::iced::widget::text_editor::Content::with_text(subject),
-                );
-                self.commit_draft.composer =
-                    CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
-                        description.trim_start_matches('\n'),
-                    ));
+                self.commit_draft.amend_loading = false;
+                self.commit_draft.amend_edited = true;
+                self.commit_draft.set_message(message);
             }
             SidebarAction::CommitSubjectEditorCursor { cursor, .. } => {
                 self.commit_draft.subject_composer.0.move_to(*cursor);
@@ -4293,6 +4400,8 @@ impl SidebarState {
             SidebarAction::CommitSubjectEditorAction { action, .. } => {
                 self.commit_draft.subject_composer.0.perform(action.clone());
                 if action.is_edit() {
+                    self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
                     let text = self.commit_draft.subject_composer.0.text();
                     self.commit_draft.subject = text.lines().collect::<Vec<_>>().join(" ");
@@ -4312,6 +4421,8 @@ impl SidebarState {
             SidebarAction::CommitEditorAction { action, .. } => {
                 self.commit_draft.composer.0.perform(action.clone());
                 if action.is_edit() {
+                    self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
                     self.commit_draft.message = compose_commit_message(
                         &self.commit_draft.subject,
@@ -4319,8 +4430,36 @@ impl SidebarState {
                     );
                 }
             }
+            SidebarAction::HistoryQueryChanged { query, .. } => self.history_query.clone_from(query),
+            SidebarAction::HistoryBranchChanged { name, .. } => {
+                if let Some((_, draft)) = self.history_branch.as_mut() { draft.clone_from(name); }
+            }
+            SidebarAction::CancelHistoryBranch => self.history_branch = None,
+            SidebarAction::CreateHistoryBranch { .. } => {},
+            SidebarAction::HistoryCommand { oid, command: HistoryCommand::CreateBranch, .. } => self.history_branch = Some((oid.clone(), String::new())),
             SidebarAction::AmendChanged { amend, .. } => {
                 if self.commit_draft.amend != *amend {
+                    if *amend {
+                        let stash = std::mem::take(&mut self.commit_draft);
+                        self.commit_draft.set_message(&stash.message);
+                        self.commit_draft.amend_stash = Some(Box::new(stash));
+                        self.commit_draft.amend_loaded_message = None;
+                        self.commit_draft.amend_loading = true;
+                        self.commit_draft.amend_edited = false;
+                    } else {
+                        let unchanged = self.commit_draft.amend_loaded_message.as_deref()
+                            == Some(self.commit_draft.message.as_str());
+                        let untouched = !self.commit_draft.amend_edited;
+                        if let Some(stash) = self.commit_draft.amend_stash.take()
+                            && (unchanged || untouched)
+                        {
+                            self.commit_draft = *stash;
+                        }
+                        self.commit_draft.amend_loaded_message = None;
+                        self.commit_draft.amend_loading = false;
+                        self.commit_draft.amend_edited = false;
+                        self.commit_draft.amend_head = None;
+                    }
                     self.revise_commit_draft();
                     self.commit_draft.amend = *amend;
                 }
@@ -4397,6 +4536,8 @@ impl SidebarState {
             | SidebarAction::CloseCommit { .. }
             | SidebarAction::ShowMoreCommitFiles { .. }
             | SidebarAction::LoadMoreHistory { .. }
+            | SidebarAction::SearchHistory { .. }
+            | SidebarAction::HistoryCommand { .. }
             | SidebarAction::Resize { .. }
             | SidebarAction::ResizeFinished
             | SidebarAction::SelectRows { .. }
@@ -4766,6 +4907,12 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         action: cosmic::iced::widget::text_editor::Action,
     },
+    HistoryQueryChanged { key: ActiveWorktreeKey, query: String },
+    SearchHistory { key: ActiveWorktreeKey, query: String },
+    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand, mainline: Option<u32>, message: Arc<str> },
+    HistoryBranchChanged { key: ActiveWorktreeKey, name: String },
+    CancelHistoryBranch,
+    CreateHistoryBranch { key: ActiveWorktreeKey, oid: Oid, name: ValidatedBranchName },
     AmendChanged {
         key: ActiveWorktreeKey,
         amend: bool,
@@ -5059,6 +5206,7 @@ fn view_inner<'a>(
                         cache.generation(model, state),
                         compact,
                         modal_open,
+                        crate::design::typography_revision(),
                         shortcut_generation,
                     ),
                     move |_| project_list(model, state, compact, modal_open, &shortcuts),
@@ -7884,6 +8032,32 @@ fn change_context_controls<'a>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryCommand { CopySha, CopyMessage, NewWorktree, CreateBranch, Revert, CherryPick }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand }
+
+impl widget::menu::Action for HistoryContextCommand<'_> {
+    type Message = SidebarAction;
+    fn message(&self) -> SidebarAction {
+        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) }
+    }
+}
+
+fn history_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a CommitRow, blocked: bool) -> Element<'a, SidebarAction> {
+    if blocked { return content; }
+    let entries = [
+        ("Copy SHA", HistoryCommand::CopySha),
+        ("Copy message", HistoryCommand::CopyMessage),
+        ("New worktree from this commit…", HistoryCommand::NewWorktree),
+        ("Create branch here…", HistoryCommand::CreateBranch),
+        (if row.mainline.is_some() { "Revert commit (first parent)" } else { "Revert commit" }, HistoryCommand::Revert),
+        (if row.mainline.is_some() { "Cherry-pick into this worktree (first parent)" } else { "Cherry-pick into this worktree" }, HistoryCommand::CherryPick),
+    ].into_iter().map(|(label, command)| widget::menu::Item::Button(label.to_owned(), None, HistoryContextCommand { key, row, command })).collect();
+    crate::interaction::context_menu(content, widget::menu::items(&std::collections::HashMap::new(), entries))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileContextCommand<'a> {
     Manage {
         key: &'a ActiveWorktreeKey,
@@ -9251,14 +9425,22 @@ fn files_section<'a>(
             query,
         });
     }
-    let folded = fold(state.files_query().trim());
+    if !modal_open
+        && let Some((path, _, _)) = crate::editor_navigation::parse_location(state.files_query().trim()) {
+        let candidate = PathBuf::from(path);
+        let relative = if candidate.is_absolute() { candidate.strip_prefix(&key.canonical_path).ok().map(Path::to_path_buf) } else { Some(candidate) };
+        if let Some(path) = relative.and_then(|path| RepoPath::parse(path).ok()) {
+            filter = filter.on_submit(SidebarAction::OpenFile { key: key.clone(), path });
+        }
+    }
+    let folded = fold(&crate::editor_navigation::file_query(state.files_query().trim()));
     // File browsing is always a tree: the flat list exists only for
     // diff/change review. A text filter still flattens to matching files.
     let flat = !folded.is_empty();
     let (visible, hidden, notice): (Vec<&FileRow>, usize, Option<&str>) = match &source.file_search
     {
         FileSearch::Pending { query }
-            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() =>
         {
             let (visible, hidden) = file_row_page(
                 &source.files,
@@ -9275,12 +9457,12 @@ fn files_section<'a>(
             query,
             files,
             hidden,
-        } if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() => {
+        } if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() => {
             let notice = files.is_empty().then_some("No files match this filter.");
             (files.iter().collect(), *hidden, notice)
         }
         FileSearch::Failed { query, message }
-            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() =>
         {
             (Vec::new(), 0, Some(message.as_str()))
         }
@@ -10784,6 +10966,7 @@ fn changes_footer<'a>(
     let input_key = key.clone();
     let can_commit = source.mutations_available() && !modal_open
         && !source.busy()
+        && state.commit_draft.ready()
         && !state.commit_draft.subject.trim().is_empty()
         && (source.staged_count > 0
             || (state.commit_draft.amend && source.head_oid.is_some())
@@ -10804,10 +10987,10 @@ fn changes_footer<'a>(
         crate::ui_controls::field::editor("Commit subject", &state.commit_draft.subject_composer.0)
             .placeholder("Commit subject")
             .id(chrome.commit_input_id.clone())
-            .font(cosmic::iced::Font::DEFAULT)
+            .font(design::interface_font())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .height(Length::Fixed(design::TEXT_BODY * 1.3 + 16.0))
-            .size(design::TEXT_BODY)
+            .height(Length::Fixed(design::interface_size() * 1.3 + 16.0))
+            .size(design::interface_size())
             .padding([space::S, 10.0])
             .style(commit_description_style)
             .key_binding(move |press| {
@@ -10856,13 +11039,13 @@ fn changes_footer<'a>(
             .id(chrome.commit_description_id.clone())
             .height(Length::Fixed(
                 (state.commit_draft.composer.0.line_count().clamp(2, 4) as f32)
-                    * design::TEXT_BODY
+                    * design::interface_size()
                     * 1.3
                     + 16.0,
             ))
-            .font(cosmic::iced::Font::DEFAULT)
+            .font(design::interface_font())
             .style(commit_description_style)
-            .size(design::TEXT_BODY)
+            .size(design::interface_size())
             .padding([space::XS, space::S])
             .key_binding(move |press| {
                 if !matches!(
@@ -10926,6 +11109,14 @@ fn changes_footer<'a>(
 
     if has_subject {
         column = column.push(commit_input);
+    }
+    if state.commit_draft.amend_loading {
+        column = column.push(design::caption("Loading HEAD’s commit message…"));
+    }
+    if state.commit_draft.amend && head_is_pushed(&source.tracking) {
+        column = column.push(design::caption(
+            "HEAD is already pushed; amending will require a force push.",
+        ));
     }
     let amend = crate::ui_controls::field::checkbox(state.commit_draft.amend)
         .label("Amend")
@@ -11249,10 +11440,32 @@ fn history_section<'a>(
                     .into()
             }),
     ));
+    let search_key = key.clone();
+    let submit_key = key.clone();
+    let mut search = crate::ui_controls::field::search("Message, author or SHA — Enter to search", &state.history_query);
+    if !modal_open {
+        search = search.on_input(move |query| SidebarAction::HistoryQueryChanged { key: search_key.clone(), query });
+        if source.head_oid.is_some() {
+            search = search.on_submit(move |query| SidebarAction::SearchHistory { key: submit_key.clone(), query });
+        }
+    }
+    column = column.push(search);
+    column = column.push(design::caption("Paste a commit SHA from another branch to find it here."));
+    if let Some((oid, name)) = &state.history_branch {
+        let branch_key = key.clone();
+        let create = ValidatedBranchName::parse(name.clone()).ok().map(|name| SidebarAction::CreateHistoryBranch { key: key.clone(), oid: oid.clone(), name });
+        let mut input = crate::ui_controls::field::text("New branch name", name);
+        if !modal_open { input = input.on_input(move |name| SidebarAction::HistoryBranchChanged { key: branch_key.clone(), name }); }
+        column = column.push(input);
+        column = column.push(widget::row::with_children(vec![
+            crate::ui_controls::button::secondary("Cancel").on_press_maybe((!modal_open).then_some(SidebarAction::CancelHistoryBranch)).into(),
+            crate::ui_controls::button::primary("Create branch").on_press_maybe(create.filter(|_| !modal_open)).into(),
+        ]).spacing(space::XS));
+    }
     let mut rows = widget::column::with_capacity(source.history.len());
     for row in &source.history {
         let chrome = &row.chrome;
-        rows = rows.push(crate::interaction::keyboard_list_row(
+        rows = rows.push(history_context_controls(crate::interaction::keyboard_list_row(
             button::custom(
                 widget::row::with_children(vec![
                     widget::container(Icon::Commit.handle().icon().size(ROW_ICON_SIZE))
@@ -11290,7 +11503,7 @@ fn history_section<'a>(
                 modal_open,
             ))
             .width(Length::Fill),
-        ));
+        ), key, row, modal_open));
     }
     column = column.push(rows);
     column = column.push(slot((!source.history_complete && !source.unborn).then(
@@ -11337,7 +11550,11 @@ fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
         return Some("This branch’s commits have not been loaded yet.");
     }
     if source.history.is_empty() {
-        return Some("HEAD names a commit, but the page of history that loaded held none.");
+        return Some(if source.history_query.is_empty() {
+            "HEAD names a commit, but the page of history that loaded held none."
+        } else {
+            "No commits match this message, author or SHA."
+        });
     }
     None
 }
@@ -12242,13 +12459,15 @@ fn search_label(
     heading: bool,
 ) -> Element<'static, SidebarAction> {
     use cosmic::iced::widget::text::Span;
+    let size = design::scaled_interface_size(size);
+    let line_height = cosmic::iced::widget::text::LineHeight::Absolute((size + 5.0).into());
     let font = cosmic::font::Font {
         weight: if heading {
             cosmic::iced::font::Weight::Medium
         } else {
             cosmic::iced::font::Weight::Normal
         },
-        ..cosmic::font::default()
+        ..design::interface_font()
     };
     let emphasis = cosmic::font::Font {
         weight: cosmic::iced::font::Weight::Bold,
@@ -12258,6 +12477,7 @@ fn search_label(
     if highlights.is_empty() {
         return widget::text::body(label.to_owned())
             .size(size)
+            .line_height(line_height)
             .font(font)
             .class(class)
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -12285,6 +12505,7 @@ fn search_label(
     }
     let label = cosmic::iced::widget::rich_text(spans)
         .size(size)
+        .line_height(line_height)
         .font(font)
         .class(class)
         .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -13619,6 +13840,48 @@ mod row_interaction {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn settings_interface_typography_reaches_plain_and_highlighted_sidebar_identity_labels() {
+        use super::*;
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        let renderer = headless_renderer();
+        let height = |query| {
+            let mut label = search_label(
+                "Project fixture",
+                query,
+                CHILD_ROW_TEXT_SIZE,
+                theme::Text::Default,
+                false,
+            );
+            let mut tree = Tree::new(label.as_widget());
+            label
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+                )
+                .size()
+                .height
+        };
+        design::configure_typography("", 13.0, "", 14.0);
+        let small = [height(""), height("fixture")];
+        design::configure_typography("", 24.0, "", 14.0);
+        let large = [height(""), height("fixture")];
+        for (small, large) in small.into_iter().zip(large) {
+            assert!(large > small, "sidebar identity must follow interface size");
+            assert!(
+                large <= WORKTREE_ROW_HEIGHT,
+                "largest line box must fit its row"
+            );
+            assert_eq!(
+                large, 29.0,
+                "plain and highlighted labels use the same absolute line box"
+            );
+        }
+        design::configure_typography("", 13.0, "", 14.0);
+    }
+
     #[test]
     fn context_conversation_labels_match_the_created_scope() {
         assert_eq!(new_conversation_label(None), "New channel");
@@ -19651,6 +19914,194 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn amend_loads_head_and_restores_the_complete_draft_unless_edited() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "My draft\n\nDraft body".into(),
+        });
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        assert!(state.load_amend_message(&key, revision, "HEAD subject\n\nHEAD body\n"));
+        assert_eq!(state.commit_draft.subject, "HEAD subject");
+        assert!(
+            state
+                .commit_draft
+                .composer
+                .0
+                .text()
+                .starts_with("HEAD body")
+        );
+        assert_eq!(state.commit_message(), "HEAD subject\n\nHEAD body\n");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), "My draft\n\nDraft body");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        assert!(state.load_amend_message(&key, revision, "HEAD subject"));
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Edited amend message".into(),
+        });
+        state.apply(&SidebarAction::AmendChanged { key, amend: false });
+        assert_eq!(state.commit_message(), "Edited amend message");
+    }
+
+    #[test]
+    fn amend_reads_cannot_overwrite_typing_or_a_later_toggle_and_can_settle_parked_drafts() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let old = state.amend_request_revision().unwrap();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Typing".into(),
+        });
+        assert!(!state.load_amend_message(&key, old, "Stale"));
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), "Typing");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        state.sync_active_worktree(&model, &focus_on(&fix_key()));
+        assert!(state.load_amend_message(&key, revision, "Parked HEAD"));
+        state.sync_active_worktree(&model, &focus_on(&key));
+        assert_eq!(state.commit_message(), "Parked HEAD");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), "Typing");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert!(!state.load_amend_message(&key, revision, "Too late"));
+        assert_eq!(state.commit_message(), "Typing");
+    }
+
+    #[test]
+    fn amend_target_remains_pinned_through_edits_and_navigation() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        let head = oid_of(0x11);
+        state.pin_amend_head(&key, revision, head.clone());
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Explicit replacement".into(),
+        });
+        assert_eq!(state.amend_target(), Some(head.clone()));
+        state.sync_active_worktree(&model, &focus_on(&fix_key()));
+        assert_eq!(state.amend_target(), None);
+        state.sync_active_worktree(&model, &focus_on(&key));
+        assert_eq!(state.amend_target(), Some(head));
+        state.apply(&SidebarAction::AmendChanged { key, amend: false });
+        assert_eq!(state.amend_target(), None);
+    }
+
+    #[test]
+    fn amend_failed_read_preserves_the_stash_and_requires_a_loaded_or_explicit_message() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Original draft\n\nOriginal body".into(),
+        });
+        let original = state.commit_draft.clone();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        assert_eq!(
+            state.submitted_commit_revision(&key, state.commit_message(), true),
+            None
+        );
+        state.finish_amend_read(&key, revision);
+        assert_eq!(
+            state.submitted_commit_revision(&key, state.commit_message(), true),
+            None
+        );
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), original.message);
+        assert_eq!(
+            state.commit_draft.subject_composer,
+            original.subject_composer
+        );
+        assert_eq!(state.commit_draft.composer, original.composer);
+
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        state.finish_amend_read(&key, revision);
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Intentional replacement".into(),
+        });
+        assert!(
+            state
+                .submitted_commit_revision(&key, state.commit_message(), true)
+                .is_some()
+        );
+        state.apply(&SidebarAction::AmendChanged { key, amend: false });
+        assert_eq!(state.commit_message(), "Intentional replacement");
+    }
+
+    #[test]
+    fn amend_pushed_head_warning_requires_a_measured_zero_ahead_count() {
+        assert!(head_is_pushed(&TrackingState::Compared {
+            upstream: "origin/main".into(),
+            ahead: 0,
+            behind: 3
+        }));
+        assert!(!head_is_pushed(&TrackingState::Compared {
+            upstream: "origin/main".into(),
+            ahead: 1,
+            behind: 0
+        }));
+        assert!(!head_is_pushed(&TrackingState::NoUpstream));
+        assert!(!head_is_pushed(&TrackingState::Unknown {
+            upstream: Some("origin/main".into())
+        }));
+    }
+
+    #[test]
     fn separate_commit_fields_preserve_description_and_clear_together() {
         let mut state = SidebarState::default();
         let key = main_key();
@@ -19785,7 +20236,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn submitted_commit_clears_only_its_revision_even_while_parked() {
+    fn amend_submitted_commit_clears_only_its_revision_even_while_parked() {
         let model = panel_model();
         let mut state = panel_state(&model);
         let key = main_key();
@@ -19797,6 +20248,8 @@ pub(crate) mod tests {
             key: key.clone(),
             amend: true,
         });
+        let revision = state.amend_request_revision().unwrap();
+        assert!(state.load_amend_message(&key, revision, "First subject\n\nFirst body"));
         let submitted = state
             .submitted_commit_revision(&key, state.commit_message(), true)
             .unwrap();
@@ -20799,6 +21252,21 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn history_actions_pin_the_message_and_merge_parent_from_the_rendered_commit() {
+        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
+        let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![oid_of(1), oid_of(2)], author: identity.clone(), committer: identity, subject: "Merge subject".into(), body: "Body line\n".into() });
+        let key = main_key();
+        let action = widget::menu::Action::message(&HistoryContextCommand { key: &key, row: &row, command: HistoryCommand::Revert });
+        let message = Arc::clone(&row.message);
+        drop(row);
+        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = action else { panic!("expected a history command"); };
+        assert_eq!(oid, oid_of(3));
+        assert_eq!(mainline, Some(1));
+        assert_eq!(captured.as_ref(), "Merge subject\n\nBody line\n");
+        assert!(Arc::ptr_eq(&captured, &message));
     }
 
     #[test]

@@ -12,6 +12,13 @@ pub struct FileRestoration {
     _permit: RestorationPermit,
 }
 
+impl FileRestoration {
+    pub(crate) fn git_mode(&self) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        if self.permissions.mode() & 0o100 != 0 { 0o100755 } else { 0o100644 }
+    }
+}
+
 static RESTORATION_DESCRIPTORS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 const MAX_RESTORATION_DESCRIPTORS: usize = 256;
@@ -42,6 +49,8 @@ impl Eq for FileRestoration {}
 #[derive(Clone)]
 pub(crate) struct PresenceSave {
     pub expected_present: bool,
+    /// Explicit Save Again after an observed external deletion; never an Undo fallback.
+    pub external_missing_recreate: bool,
     pub desired_present: bool,
     pub expected_mode: Option<u32>,
     pub restoration: Option<Arc<FileRestoration>>,
@@ -57,13 +66,21 @@ pub(crate) fn save_document_file(
     overwrite: bool,
     presence: PresenceSave,
 ) -> Result<SaveOutcome, FileIoError> {
-    if presence.expected_present && presence.desired_present && presence.restoration.is_none() {
-        return save_file(worktree, path, text, expected_hash, overwrite);
-    }
     let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
-    validate_repo_path(path)?;
     let root = worktree_root(worktree)?;
-    let (parent, name) = fs_safety::open_parent_beneath(&root, path).map_err(resolve_error)?;
+    save_document_file_at(&root, path, text, expected_hash, overwrite, presence)
+}
+
+/// Caller retains root/protection for the whole publication transaction.
+pub(crate) fn save_document_file_at(root: &Root, path: &Path, text: &str, expected_hash: blake3::Hash, overwrite: bool, presence: PresenceSave) -> Result<SaveOutcome, FileIoError> {
+    validate_repo_path(path)?;
+    if presence.expected_present && presence.desired_present && presence.restoration.is_none() {
+        return save_file_at(root, path, text, expected_hash, overwrite);
+    }
+    if !presence.expected_present && presence.desired_present && presence.external_missing_recreate && presence.restoration.is_none() {
+        return save_missing_file_at(root, path, text);
+    }
+    let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
     if presence.expected_present && presence.desired_present {
         let restoration = presence
             .restoration
@@ -294,41 +311,7 @@ fn replace_or_remove_document_file(
                 "The file contents changed while Revert acquired it.".into(),
             ));
         }
-        let (template, template_name) =
-            fs_safety::create_temporary_in(&holding, 0o600).map_err(resolve_error)?;
-        let capture = (|| {
-            fs_safety::copy_ownership(&held, &template).map_err(io_error)?;
-            fs_safety::copy_access_acl(&held, &template).map_err(io_error)?;
-            template
-                .set_permissions(original.permissions())
-                .map_err(io_error)?;
-            fs_safety::copy_access_acl(&held, &template).map_err(io_error)?;
-            let lost = fs_safety::copy_extended_attributes(&held, &template);
-            if !lost.is_empty() {
-                return Err(FileIoError::Io(format!(
-                    "Could not retain file metadata for Undo: {}",
-                    lost.iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
-            template.sync_all().map_err(io_error)?;
-            let captured = held.metadata().map_err(io_error)?;
-            if version(&before) != version(&captured)
-                || fs_safety::content_attributes(&held).map_err(io_error)? != attributes
-                || fs_safety::content_attributes(&template).map_err(io_error)? != attributes
-            {
-                return Err(FileIoError::Io(
-                    "The source metadata changed while Revert captured it.".into(),
-                ));
-            }
-            Ok(())
-        })();
-        // The descriptor, not a discoverable temporary name, owns the metadata.
-        fs_safety::unlink_within(&holding, &template_name).map_err(resolve_error)?;
-        capture?;
-        Ok(template)
+        immutable_metadata_template(&holding, &held, &before, &attributes)
     })();
     let put_back = |error: FileIoError| {
         let restored = fs_safety::rename_new_between(&holding, acquired_name, parent, name);
@@ -407,10 +390,150 @@ fn replace_or_remove_document_file(
     })
 }
 
+/// Captures only metadata for a cross-presence Reload. Both the returned text
+/// and this template must name the same exact regular-file contents.
+pub(crate) fn capture_restoration_at(root: &Root, path: &Path, expected_hash: blake3::Hash) -> Result<Arc<FileRestoration>, FileIoError> {
+    capture_restoration_with_hook(root, path, expected_hash, |_, _| Ok(()))
+}
+
+fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3::Hash, before_unlink: impl FnOnce(&Root, &std::ffi::OsStr) -> io::Result<()>) -> Result<Arc<FileRestoration>, FileIoError> {
+    validate_repo_path(path)?;
+    let permit = RestorationPermit::acquire()?;
+    let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
+    let listed = fs_safety::metadata_beneath(&parent, Path::new(&name)).map_err(resolve_error)?;
+    let mut source = fs_safety::open_beneath(&parent, Path::new(&name)).map_err(resolve_error)?;
+    let before = source.metadata().map_err(io_error)?;
+    if !same_inode(&listed, &before) || !before.is_file() {
+        return Err(FileIoError::Io("The reloaded file identity changed while retaining Undo metadata.".into()));
+    }
+    let attributes = fs_safety::content_attributes(&source).map_err(io_error)?;
+    let bytes = fs_safety::read_bounded(&mut source, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
+    if blake3::hash(&bytes) != expected_hash || version(&before) != version(&source.metadata().map_err(io_error)?) {
+        return Err(FileIoError::Io("The reloaded file changed while retaining Undo metadata.".into()));
+    }
+    // The metadata can be world-readable/writable. Until its temporary name
+    // is removed, it must live behind a private directory, just as removal's
+    // metadata capture does. Never expose it in the ordinary worktree parent.
+    let holding_name = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
+    let (holding, created) = fs_safety::create_directory_beneath(&parent, Path::new(&holding_name), 0o700).map_err(resolve_error)?;
+    if !created { return Err(FileIoError::Io("The private Undo metadata directory already exists.".into())); }
+    let capture = (|| {
+        fs_safety::set_directory_permissions(&holding, 0o700).map_err(io_error)?;
+        if holding.metadata().map_err(io_error)?.mode() & 0o777 != 0o700 {
+            return Err(FileIoError::Io("The Undo metadata directory is not private.".into()));
+        }
+        immutable_metadata_template_with_hook(&holding, &source, &before, &attributes, before_unlink)
+    })();
+    let cleanup = (|| {
+        let named = fs_safety::metadata_beneath(&parent, Path::new(&holding_name)).map_err(resolve_error)?;
+        let held = holding.metadata().map_err(io_error)?;
+        if !named.is_dir() || !held.is_dir() || named.dev() != held.dev() || named.ino() != held.ino() {
+            return Err(FileIoError::Io("The private Undo metadata directory was moved or replaced; no replacement directory was removed.".into()));
+        }
+        fs_safety::remove_directory_within(&parent, &holding_name).map_err(resolve_error)
+    })();
+    let template = match (capture, cleanup) {
+        (Ok(template), Ok(())) => template,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(cleanup)) => return Err(FileIoError::Io(format!("{error} Could not clean the private metadata directory: {cleanup}"))),
+    };
+    // Re-read the same descriptor after capture: chmod/xattrs and text races
+    // cannot produce metadata for another revision of these displayed bytes.
+    source.rewind().map_err(io_error)?;
+    let bytes = fs_safety::read_bounded(&mut source, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
+    let named = fs_safety::metadata_beneath(&parent, Path::new(&name)).map_err(resolve_error)?;
+    if blake3::hash(&bytes) != expected_hash || version(&before) != version(&source.metadata().map_err(io_error)?) || !same_inode(&before, &named) {
+        return Err(FileIoError::Io("The reloaded file changed while retaining Undo metadata.".into()));
+    }
+    Ok(Arc::new(FileRestoration { source: template, permissions: before.permissions(), _permit: permit }))
+}
+
+fn immutable_metadata_template(parent: &Root, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>) -> Result<File, FileIoError> {
+    immutable_metadata_template_with_hook(parent, source, before, attributes, |_, _| Ok(()))
+}
+
+fn immutable_metadata_template_with_hook(parent: &Root, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>, before_unlink: impl FnOnce(&Root, &std::ffi::OsStr) -> io::Result<()>) -> Result<File, FileIoError> {
+    let (template, name) = fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
+    let captured = (|| {
+        fs_safety::copy_ownership(source, &template).map_err(io_error)?;
+        fs_safety::copy_access_acl(source, &template).map_err(io_error)?;
+        template.set_permissions(before.permissions()).map_err(io_error)?;
+        fs_safety::copy_access_acl(source, &template).map_err(io_error)?;
+        let lost = fs_safety::copy_extended_attributes(source, &template);
+        if !lost.is_empty() { return Err(FileIoError::Io(format!("Could not retain file metadata for Undo: {}", lost.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))); }
+        template.sync_all().map_err(io_error)?;
+        if version(before) != version(&source.metadata().map_err(io_error)?)
+            || &fs_safety::content_attributes(source).map_err(io_error)? != attributes
+            || &fs_safety::content_attributes(&template).map_err(io_error)? != attributes {
+            return Err(FileIoError::Io("The source metadata changed while retaining Undo metadata.".into()));
+        }
+        before_unlink(parent, &name).map_err(io_error)?;
+        Ok(())
+    })();
+    fs_safety::unlink_within(parent, &name).map_err(resolve_error)?;
+    captured?;
+    if template.metadata().map_err(io_error)?.nlink() != 0 {
+        return Err(FileIoError::Io("The Undo metadata template acquired an outside hard link.".into()));
+    }
+    Ok(template)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn reload_metadata_is_private_while_named_and_refuses_an_outside_hard_link() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        let path = Path::new("file"); fs::write(directory.path().join(path), "contents").unwrap();
+        fs::set_permissions(directory.path().join(path), Permissions::from_mode(0o666)).unwrap();
+        let restoration = capture_restoration_with_hook(&root, path, blake3::hash(b"contents"), |holding, name| {
+            assert_eq!(holding.metadata()?.mode() & 0o777, 0o700);
+            assert_ne!(holding.path(), directory.path());
+            assert!(fs::read_dir(directory.path())?.all(|entry| { let entry = entry.unwrap(); entry.file_name() == "file" || entry.file_type().unwrap().is_dir() }));
+            assert_eq!(fs::metadata(holding.path().join(name))?.mode() & 0o777, 0o666);
+            Ok(())
+        }).unwrap();
+        assert_eq!(restoration.source.metadata().unwrap().nlink(), 0);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        let alias = directory.path().join("outside-template");
+        assert!(capture_restoration_with_hook(&root, path, blake3::hash(b"contents"), |holding, name| fs::hard_link(holding.path().join(name), &alias)).is_err());
+        fs::remove_file(alias).unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_to_string(directory.path().join(path)).unwrap(), "contents");
+    }
+
+    #[test]
+    fn reload_restoration_capture_refuses_changed_bytes_and_keeps_immutable_metadata() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap(); let path = Path::new("file");
+        fs::write(directory.path().join(path), "current").unwrap();
+        fs::set_permissions(directory.path().join(path), Permissions::from_mode(0o640)).unwrap();
+        assert!(capture_restoration_at(&root, path, blake3::hash(b"old")).is_err());
+        let restoration = capture_restoration_at(&root, path, blake3::hash(b"current")).unwrap();
+        fs::set_permissions(directory.path().join(path), Permissions::from_mode(0o700)).unwrap();
+        fs::remove_file(directory.path().join(path)).unwrap();
+        save_document_file_at(&root, path, "current", blake3::hash(b""), false, PresenceSave {
+            external_missing_recreate: false, expected_present: false, desired_present: true,
+            expected_mode: None, restoration: Some(restoration),
+        }).unwrap();
+        assert_eq!(fs::metadata(directory.path().join(path)).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn explicit_missing_recreation_uses_the_pinned_root_and_never_weakens_undo() {
+        let directory = tempfile::tempdir().unwrap(); let named = directory.path().join("worktree"); let moved = directory.path().join("original");
+        fs::create_dir(&named).unwrap(); let root = Root::open(&named).unwrap();
+        fs::rename(&named, &moved).unwrap(); fs::create_dir(&named).unwrap(); fs::write(named.join("file"), "replacement").unwrap();
+        let missing = PresenceSave { external_missing_recreate: false, expected_present: false, desired_present: true, expected_mode: None, restoration: None };
+        assert!(save_document_file_at(&root, Path::new("file"), "mine", blake3::hash(b""), true, missing.clone()).is_err());
+        save_document_file_at(&root, Path::new("file"), "mine", blake3::hash(b""), true, PresenceSave { external_missing_recreate: true, ..missing.clone() }).unwrap();
+        assert_eq!(fs::read_to_string(moved.join("file")).unwrap(), "mine");
+        assert_eq!(fs::read_to_string(named.join("file")).unwrap(), "replacement");
+        assert!(save_document_file_at(&root, Path::new("file"), "overwrite", blake3::hash(b""), true, PresenceSave { external_missing_recreate: true, ..missing }).is_err());
+        assert_eq!(fs::read_to_string(moved.join("file")).unwrap(), "mine");
+    }
 
     fn acl(named: u16, mask: u16) -> Vec<u8> {
         let mut bytes = 2_u32.to_le_bytes().to_vec();
@@ -488,7 +611,8 @@ mod tests {
             blake3::hash(b""),
             false,
             PresenceSave {
-                expected_present: false,
+                external_missing_recreate: false,
+            expected_present: false,
                 desired_present: true,
                 expected_mode: None,
                 restoration: Some(restoration),
@@ -546,6 +670,7 @@ mod tests {
 
     fn removal() -> PresenceSave {
         PresenceSave {
+            external_missing_recreate: false,
             expected_present: true,
             desired_present: false,
             expected_mode: Some(0o100755),
@@ -657,6 +782,7 @@ mod tests {
         assert_eq!(fs::read_dir(root).unwrap().count(), 1);
         fs::set_permissions(root.join("outside-link"), Permissions::from_mode(0o600)).unwrap();
         let restore = PresenceSave {
+            external_missing_recreate: false,
             expected_present: false,
             desired_present: true,
             expected_mode: None,
@@ -727,7 +853,8 @@ mod tests {
             blake3::hash(b""),
             false,
             PresenceSave {
-                expected_present: false,
+                external_missing_recreate: false,
+            expected_present: false,
                 desired_present: true,
                 expected_mode: None,
                 restoration: Some(restoration),

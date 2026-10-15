@@ -1249,6 +1249,45 @@ impl Cagents {
             .enumerate()
             .map(|(index, id)| (id, index))
             .collect();
+        if let Some(card) = self.workspace.focused() {
+            if let Some(doc) = self.lsp_document(card) {
+                let mut caps = self.lsp.capabilities(doc);
+                if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source()) {
+                    caps.rename = false; caps.format_document = false; caps.format_selection = false; caps.code_actions = false;
+                }
+                for (available, label, action) in [
+                    (caps.rename, "Rename symbol", repository_widget::EditorLspAction::Rename),
+                    (caps.format_document, "Format document", repository_widget::EditorLspAction::Format { selection: false }),
+                    (caps.format_selection, "Format selection", repository_widget::EditorLspAction::Format { selection: true }),
+                    (caps.code_actions, "Code actions", repository_widget::EditorLspAction::CodeActions),
+                    (caps.signature_help, "Show signature help", repository_widget::EditorLspAction::Signature),
+                ] {
+                    if available { entries.push((label.into(), String::new(), Message::Repository(RepositoryAction::Language { card, action }))); }
+                }
+            }
+        }
+        if let Some(card) = self.workspace.focused()
+            && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_focus_target(card).is_some())
+        {
+            for (label, chord, forward) in [("Next diagnostic", "F8", true), ("Previous diagnostic", "Shift+F8", false)] {
+                entries.push((label.into(), chord.into(), Message::Repository(RepositoryAction::Language {card,action:repository_widget::EditorLspAction::Diagnostic(forward)})));
+            }
+        }
+        entries.push((
+            "Open settings.toml".into(),
+            "Edit application configuration".into(),
+            Message::OpenSettingsFile { reveal: false },
+        ));
+        entries.push((
+            "Reveal settings.toml".into(),
+            "Show configuration in file manager".into(),
+            Message::OpenSettingsFile { reveal: true },
+        ));
+        entries.push((
+            "Resume conversation".into(),
+            "Search saved native chats".into(),
+            Message::ResumeConversation(resume_ui::Action::Open),
+        ));
         if category.is_none_or(|category| category == '@') {
             for card in self.durable.cards.iter().filter(|card| {
                 card.existence.is_open()
@@ -5101,10 +5140,15 @@ mod tests {
         let mut tree = Tree::new(focus_fixture_view(&app).as_widget());
         let open = app.update_palette(Action::Open);
         let _ = app.update_palette(Action::Query("open settings".into()));
-        assert!(matches!(
-            app.palette_entries()[0].2,
-            Message::RunCommand(Command::OpenSettings)
-        ));
+        // File-opening commands share these words. Choose the destination by
+        // its command identity so this remains a pane-focus contract.
+        app.palette.selected = app
+            .palette_entries()
+            .iter()
+            .position(|(_, _, message)| {
+                matches!(message, Message::RunCommand(Command::OpenSettings))
+            })
+            .expect("the settings-pane command is listed");
         let _ = focus_fixture_step(&app, &mut tree, &renderer, open, false);
         let submit = app.update_palette(Action::Submit);
         let destination = app.workspace.focused().unwrap();

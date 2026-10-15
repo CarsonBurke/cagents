@@ -349,6 +349,7 @@ impl Cagents {
     }
 
     pub(super) fn update_git(&mut self, action: Action) -> Task<Message> {
+        let mut document_tasks = Vec::new();
         match action {
             Action::Fallback => return self.git_fallback_tick(),
             Action::Remote {
@@ -462,6 +463,15 @@ impl Cagents {
                             "Local Git watching unavailable; checking once a minute: {error}"
                         )));
                     }
+                    let roots: HashSet<PathBuf> = self.sidebar_model.project(project).into_iter().flat_map(|project| &project.worktrees).filter(|worktree| change.worktrees.contains(&worktree.id)).map(|worktree| worktree.path.clone()).collect();
+                    for (&card, runtime) in &mut self.cards {
+                        if let CardRuntime::Repository(runtime) = runtime
+                            && runtime.descriptor.project == project
+                            && (change.topology || change.worktrees.is_empty() || roots.contains(&runtime.descriptor.worktree)) {
+                            document_tasks.push(repository_task(runtime.refresh_open_document(card)));
+                            if change.metadata || change.topology { document_tasks.push(repository_task(runtime.refresh_open_comparison(card))); }
+                        }
+                    }
                     self.refresh_ui.git.changed(project, change);
                 }
                 if let Some(key) = reload {
@@ -550,7 +560,8 @@ impl Cagents {
                 }
             }
         }
-        self.start_git_reads()
+        document_tasks.push(self.start_git_reads());
+        Task::batch(document_tasks)
     }
 
     pub(super) fn prioritize_git_watches(&mut self) {

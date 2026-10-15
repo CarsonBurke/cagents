@@ -140,7 +140,7 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
         .class(style(weight))
         .padding([0.0, space::M])
         .width(width)
-        .height(design::DENSE_ROW_HEIGHT)
+        .height(design::DENSE_ROW_HEIGHT.max(design::interface_size() + 5.0))
         .on_press_maybe(on_press);
         if let Some(id) = id {
             button = button.id(id);
