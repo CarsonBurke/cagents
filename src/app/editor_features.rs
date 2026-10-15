@@ -1330,7 +1330,11 @@ impl Cagents {
             }
             Action::RetryPublicationRecovery(authority) => self.start_publication_recovery(authority),
             Action::PublicationRecoveryResolved { authority, result } => {
-                self.finish_publication_recovery(authority, result); Task::none()
+                self.finish_publication_recovery(authority, result);
+                // Install fresh exact timers before scanning deferred project
+                // closes. Their writes retain the existing confirmation flow.
+                let autosaves = self.resume_recovered_editor_autosaves();
+                Task::batch([autosaves, self.complete_closed_projects()])
             }
             Action::Published { ticket, result } => {
                 // Retain before ticket/owner rejection: even a late completion

@@ -17493,6 +17493,13 @@ impl Application for Cagents {
                     _ => None,
                 };
                 if worktree.is_some_and(|worktree| self.publication_recovery_blocks(worktree)) {
+                    if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = action {
+                        match self.cards.get_mut(&identity.card) {
+                            Some(CardRuntime::Repository(runtime)) => { runtime.retire_auto_save_due(identity, *revision, *ticket); },
+                            Some(CardRuntime::PullRequests(pane)) => { pane.runtime.retire_auto_save_due(identity, *revision, *ticket); },
+                            _ => {},
+                        }
+                    }
                     self.status = Some(TransientNotice::warning("Resolve file recovery in this worktree before another disk operation."));
                     return Task::none();
                 }

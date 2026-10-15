@@ -6480,11 +6480,18 @@ impl RepositoryRuntime {
         })
     }
 
-    pub fn take_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
+    /// Retire exactly the delivered timer even when an external recovery
+    /// temporarily refuses its disk effect. A later retry can schedule anew.
+    pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
         if ticket != self.next_auto_save_ticket || !self.accepts_selected(identity)
-            || self.auto_save_pending != Some((identity.generation, revision)) || self.auto_save_revision() != Some(revision) { return false; }
+            || self.auto_save_pending != Some((identity.generation, revision)) { return false; }
         self.auto_save_pending = None;
         true
+    }
+
+    pub fn take_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
+        let ready = self.auto_save_revision() == Some(revision);
+        self.retire_auto_save_due(identity, revision, ticket) && ready
     }
 
     /// Formatters and workspace edits must not recreate an intentionally absent file.

@@ -65,6 +65,13 @@ impl Cagents {
             Err(error) => state.message = format!("File recovery remains pending. Retained files were kept. {error}").chars().take(4096).collect(),
         }
     }
+    pub(super) fn resume_recovered_editor_autosaves(&mut self) -> Task<Message> {
+        let tasks = self.cards.iter_mut().filter_map(|(card, runtime)| match runtime {
+            CardRuntime::Repository(runtime) => Some(repository_task(runtime.auto_save_task(*card))),
+            _ => None,
+        }).collect::<Vec<_>>();
+        Task::batch(tasks)
+    }
     pub(super) fn publication_recovery_view(&self) -> Option<Element<'_, Message>> {
         let state = self.editor_features.recovery.as_ref().filter(|state| !state.authority.is_resolved())?;
         Some(widget::container(widget::row::with_children(vec![
