@@ -364,11 +364,12 @@ impl Renderer {
     }
     fn child(&self, index: u32) -> Self {
         let mut path = self.path.clone(); path.push(index);
-        Self { item: self.item.clone(), path, find: self.find.clone(), target: self.target,
+        Self { flow_cache: self.flow_cache.clone(), item: self.item.clone(), path, find: self.find.clone(), target: self.target,
             reader_memory: self.reader_memory.clone(), reader_context: self.reader_context.clone(),
             blocks: self.blocks.clone(), revision: self.revision, dark: self.dark }
     }
-    fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical {
+    fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical { self.logical_identity(start) }
+    fn logical_identity(&self, start: usize) -> selectable_prose::Logical {
         selectable_prose::Logical { identity: selection::logical_identity(&self.item, &self.path), start }
     }
     fn items(
@@ -422,9 +423,9 @@ impl Renderer {
         use markdown::Item;
         match item {
             Item::Heading(level, text) => {
-                heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0)), Some(&self.flow_cache))
+                heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical_identity(0)), Some(&self.flow_cache))
             }
-            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0)), Some(&self.flow_cache)),
+            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical_identity(0)), Some(&self.flow_cache)),
             Item::CodeBlock { language, code, reader_source, .. } => {
                 self.code_block(settings, language.as_deref(), code, reader_source)
             }
@@ -817,15 +818,14 @@ fn paragraph(
     logical: Option<selectable_prose::Logical>,
     flow_cache: Option<&flow_layout::Cache>,
 ) -> Element<'static, Message> {
-    let spans = text.spans(settings.style);
     if text.len() > 2048
         && let Some(cache) = flow_cache
         && let Some(logical) = logical.clone()
     {
-        let flow = cache.entry(logical.identity, spans.clone());
-        return selectable_prose::flow_text(spans, settings.text_size, settings.style.font, target, find, logical, flow);
+        let flow = cache.markdown_entry(logical.identity, text.clone(), settings.style);
+        return selectable_prose::flow_source(settings.text_size, settings.style.font, target, find, logical, flow);
     }
-    leaf_text(spans, settings.text_size, settings.style.font, target, find, logical)
+    leaf_text(text.spans(settings.style), settings.text_size, settings.style.font, target, find, logical)
 }
 
 /// A table column's alignment as the layout takes it.
@@ -844,6 +844,25 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_inline_paragraph_does_not_materialize_presentation_on_ui_layout() {
+        use iced::advanced::{layout, widget::Tree};
+        let source = "**bold** ordinary *emphasis* [link](https://example.com) `code` ".repeat(4000);
+        let content = markdown::Content::parse(&source);
+        let markdown::Item::Paragraph(text) = &content.items()[0] else { panic!("paragraph fixture") };
+        let before = markdown::materialized_bytes();
+        let cache = flow_layout::Cache::default();
+        let mut element = paragraph(
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE), text,
+            Target { card: CardId::new(), generation: 0 }, None,
+            Some(selectable_prose::Logical { identity: 7, start: 0 }), Some(&cache));
+        let mut tree = Tree::new(&element);
+        element.as_widget_mut().layout(&mut tree, &crate::app::tests::headless_renderer(),
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)));
+        assert_eq!(markdown::materialized_bytes(), before,
+            "UI realization must not copy full plain text or style thousands of inline spans");
+    }
 
     #[test]
     fn giant_single_list_table_and_heading_keep_only_viewport_widget_trees() {
