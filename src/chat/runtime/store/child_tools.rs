@@ -22,17 +22,25 @@ const BUDGET_ERROR: &str = "This conversation reached its complete subagent tool
 const VERSION: i64 = 1;
 const VERSION_SCHEMA: &str = "CREATE TABLE child_tool_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL)";
 
-pub(super) fn initialize(db: &mut Connection, owner: uuid::Uuid) -> Result<(), String> {
+#[cfg(test)]
+fn initialize(db: &mut Connection, owner: uuid::Uuid) -> Result<(), String> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    raw::guard(&tx, owner)?;
+    initialize_in(&tx, owner)?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+/// The raw Store initializer owns the Immediate transaction and nonce change;
+/// this namespace joins it so unsupported child layouts roll back BOTH.
+pub(super) fn initialize_in(tx: &rusqlite::Transaction<'_>, owner: uuid::Uuid) -> Result<(), String> {
+    raw::guard(tx, owner)?;
     let versioned: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='child_tool_schema')",
         [], |row| row.get(0),
     ).map_err(|error| error.to_string())?;
     if versioned {
-        guard(&tx, owner)?;
-        validate_layout(&tx, true)?;
+        guard(tx, owner)?;
+        validate_layout(tx, true)?;
     } else {
         let present: usize = tx.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('child_tools','child_tool_chunks','child_tool_revoked','child_tool_budget')",
@@ -41,9 +49,9 @@ pub(super) fn initialize(db: &mut Connection, owner: uuid::Uuid) -> Result<(), S
         match present {
             0 => {
                 tx.execute_batch(SCHEMA).map_err(|error| error.to_string())?;
-                validate_layout(&tx, false)?;
+                validate_layout(tx, false)?;
             },
-            4 => validate_layout(&tx, false)?,
+            4 => validate_layout(tx, false)?,
             _ => return Err("Delegated tool schema is incomplete; its source data was retained".into()),
         }
         // A legacy layout is accepted only byte-for-byte modulo SQL spacing,
@@ -52,7 +60,7 @@ pub(super) fn initialize(db: &mut Connection, owner: uuid::Uuid) -> Result<(), S
         tx.execute("INSERT INTO child_tool_schema VALUES(1,?1)", [VERSION])
             .map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn validate_layout(db: &Connection, versioned: bool) -> Result<(), String> {
@@ -88,6 +96,7 @@ fn guard(db: &Connection, owner: uuid::Uuid) -> Result<(), String> {
         return Err("Delegated tool schema changed; this handle cannot read or write its source".into());
     }
     Ok(())
+}
 
 fn persisted_revoked(db: &Connection, agent: &str, id: &str) -> Result<bool, String> {
     db.query_row("SELECT EXISTS(SELECT 1 FROM child_tool_revoked WHERE agent=?1 AND id=?2)",
@@ -215,7 +224,7 @@ impl Store {
             Event::Reset { .. } => {
                 self.pending_child_tool = None;
                 let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        guard(&tx, self.raw_sources.nonce)?;
+                guard(&tx, self.raw_sources.nonce)?;
                 tx.execute_batch("DELETE FROM child_tools; DELETE FROM child_tool_revoked; UPDATE child_tool_budget SET bytes=0,items=0,chunks=0 WHERE singleton=1;").map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 self.child_tools_unavailable = None;
@@ -992,6 +1001,25 @@ mod tests {
             assert_eq!(db.total_changes(), before);
             assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='child_tool_schema')", [], |row| row.get::<_, bool>(0)).unwrap());
         }
+    }
+
+    #[test]
+    fn joined_namespace_refusal_rolls_back_raw_owner_and_child_schema_together() {
+        let mut store = Store::new().unwrap();
+        put(&mut store, "child", tool("known", "original", "body"));
+        store.db.execute("UPDATE child_tool_schema SET version=2", []).unwrap();
+        let nonce: String = store.db.query_row("SELECT nonce FROM raw_source_schema", [], |row| row.get(0)).unwrap();
+        assert!(raw::initialize_with(&mut store.db, initialize_in).is_err());
+        assert_eq!(store.db.query_row("SELECT nonce FROM raw_source_schema", [], |row| row.get::<_, String>(0)).unwrap(), nonce);
+        assert_eq!(store.db.query_row("SELECT version FROM child_tool_schema", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(store.db.query_row("SELECT count(*) FROM child_tools WHERE id='known'", [], |row| row.get::<_, usize>(0)).unwrap(), 1);
+        let mut db = Connection::open_in_memory().unwrap();
+        let result = raw::initialize_with(&mut db, |tx, owner| {
+            initialize_in(tx, owner)?;
+            Err("injected failure after both namespaces migrated".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND (name GLOB 'child_tool*' OR name GLOB 'raw_*')", [], |row| row.get::<_, usize>(0)).unwrap(), 0);
     }
 
     #[test]

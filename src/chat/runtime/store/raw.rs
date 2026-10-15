@@ -31,7 +31,17 @@ pub(super) struct State {
 /// Version zero means no namespace. An immediate reservation covers discovery,
 /// schema creation and publication. Unknown/partial/future schemas never become
 /// an implicit upgrade through CREATE IF NOT EXISTS.
+#[cfg(test)]
 pub(super) fn initialize(db: &mut Connection) -> Result<State, String> {
+    initialize_with(db, |_, _| Ok(()))
+}
+
+/// Additional canonical namespaces share this exact owner/schema transaction.
+/// Any refusal rolls back nonce rotation and every namespace migration.
+pub(super) fn initialize_with(
+    db: &mut Connection,
+    additional: impl FnOnce(&Transaction<'_>, uuid::Uuid) -> Result<(), String>,
+) -> Result<State, String> {
     let tx = db
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(err)?;
@@ -96,6 +106,7 @@ pub(super) fn initialize(db: &mut Connection) -> Result<State, String> {
             open.insert(key(&agent, &id), len);
         }
     }
+    additional(&tx, nonce)?;
     tx.commit().map_err(err)?;
     Ok(State {
         nonce,
