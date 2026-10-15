@@ -11,6 +11,8 @@ use regex::RegexBuilder;
 
 use crate::process::CancellationToken;
 
+mod ignore_policy;
+
 pub const RESULT_LIMIT: usize = 2_000;
 const BATCH_SIZE: usize = 64;
 const BATCH_DELAY: Duration = Duration::from_millis(25);
@@ -120,19 +122,25 @@ pub fn search(
             return;
         }
     };
+    let guarded_root = std::sync::Arc::new(guarded_root);
+    let policy = match ignore_policy::Policy::new(guarded_root.clone(), cancellation.clone(), options.include_ignored, options.include_hidden) {
+        Ok(policy) => policy,
+        Err(error) => {
+            if !cancellation.is_cancelled() { publish(Progress::Error(error)); }
+            return;
+        }
+    };
+    let filter = policy.clone();
     let mut walker = WalkBuilder::new(root);
     walker
-        .hidden(!options.include_hidden)
-        .git_ignore(!options.include_ignored)
-        .git_global(!options.include_ignored)
-        .git_exclude(!options.include_ignored)
-        .ignore(!options.include_ignored)
-        .require_git(false)
+        // All automatic ignore loaders are disabled. The descriptor-fed
+        // policy below preserves their precedence without FIFO/pathname reads.
+        .standard_filters(false)
         .follow_links(false)
         // Stable file order makes initial delivery independent of filesystem
         // insertion order (which can defer source files behind large trees).
         .sort_by_file_name(|left, right| left.cmp(right))
-        .filter_entry(|entry| entry.file_name() != ".git");
+        .filter_entry(move |entry| filter.lock().unwrap_or_else(|error|error.into_inner()).allows(entry));
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut total = 0;
     let mut skipped = 0;
@@ -140,6 +148,10 @@ pub fn search(
     let mut bytes = Vec::with_capacity(SEARCH_BLOCK_BYTES);
     for entry in walker.build() {
         if cancellation.is_cancelled() {
+            return;
+        }
+        if let Some(error) = policy.lock().unwrap_or_else(|error|error.into_inner()).error() {
+            publish(Progress::Error(error));
             return;
         }
         let entry = match entry {
@@ -295,6 +307,10 @@ pub fn search(
     if cancellation.is_cancelled() {
         return;
     }
+    if let Some(error) = policy.lock().unwrap_or_else(|error|error.into_inner()).error() {
+        if !cancellation.is_cancelled() { publish(Progress::Error(error)); }
+        return;
+    }
     if !batch.is_empty() && !publish(Progress::Batch(batch)) {
         return;
     }
@@ -378,6 +394,51 @@ mod tests {
         assert_eq!(result[0].length, 6);
         assert_eq!(result[0].path, Path::new("main.rs"));
     }
+    #[test]
+    fn special_ignore_files_end_the_worker_without_blocking_or_leaking_queries() {
+        use std::os::unix::ffi::OsStrExt;
+        for name in [".ignore", ".gitignore", "nested/.ignore", ".git/info/exclude"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let path = fixture.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: the temporary pathname is a valid NUL-terminated string.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            std::fs::write(fixture.path().join("match.txt"), "safe_marker").unwrap();
+            let root = fixture.path().to_path_buf();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || sender.send(run(&root, options("safe_marker"))).unwrap());
+            let events = receiver.recv_timeout(Duration::from_secs(2)).expect("an ignore FIFO must never strand a search worker");
+            worker.join().unwrap();
+            assert!(events.iter().any(|event| matches!(event, Progress::Error(error) if error.contains("regular file"))), "{events:?}");
+            let mut next = options("safe_marker"); next.include_ignored = true;
+            assert_eq!(matches(run(fixture.path(), next)).len(), 1, "a new query can explicitly bypass unsupported ignore metadata");
+        }
+    }
+
+    #[test]
+    fn descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("sub")).unwrap();
+        std::fs::create_dir_all(fixture.path().join("nested/.git")).unwrap();
+        std::fs::write(fixture.path().join(".gitignore"), "*.txt\n").unwrap();
+        std::fs::write(fixture.path().join(".ignore"), "!keep.txt\n").unwrap();
+        std::fs::write(fixture.path().join("sub/.gitignore"), "!child.txt\n").unwrap();
+        for path in ["keep.txt", "drop.txt", "sub/child.txt", "nested/included.txt"] { std::fs::write(fixture.path().join(path), "marker").unwrap(); }
+        let found = matches(run(fixture.path(), options("marker"))).into_iter().map(|matched| matched.path).collect::<Vec<_>>();
+        assert_eq!(found, vec![PathBuf::from("keep.txt"), "nested/included.txt".into(), "sub/child.txt".into()]);
+        let metadata = fixture.path().join("metadata");
+        std::fs::create_dir_all(metadata.join("worktrees/linked")).unwrap();
+        std::fs::create_dir_all(metadata.join("info")).unwrap();
+        std::fs::write(metadata.join("info/exclude"), "excluded.rs\n").unwrap();
+        std::fs::write(metadata.join("worktrees/linked/commondir"), "../..\n").unwrap();
+        let checkout = fixture.path().join("linked"); std::fs::create_dir(&checkout).unwrap();
+        std::fs::write(checkout.join(".git"), format!("gitdir: {}\n", metadata.join("worktrees/linked").display())).unwrap();
+        std::fs::write(checkout.join("excluded.rs"), "marker").unwrap();
+        std::fs::write(checkout.join("visible.rs"), "marker").unwrap();
+        assert_eq!(matches(run(&checkout, options("marker"))).into_iter().map(|matched| matched.path).collect::<Vec<_>>(), vec![PathBuf::from("visible.rs")]);
+    }
+
     #[test]
     fn whole_word_handles_punctuation_and_regex_alternate_retry() {
         let fixture = tempfile::tempdir().unwrap();
