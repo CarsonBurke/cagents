@@ -14,7 +14,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<ReviewRefresh, GitHubError> {
         key.validate()?;
-        let query = "query($owner:String!,$name:String!,$number:Int!){viewer{login} repository(owner:$owner,name:$name){pullRequest(number:$number){id number title body state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision viewerDidAuthor reviews(first:10,states:[PENDING]){nodes{id author{login} commit{oid} comments{totalCount}} pageInfo{hasNextPage endCursor}} files(first:100){nodes{path additions deletions changeType viewerViewedState} pageInfo{hasNextPage endCursor}}}}}";
+        let query = "query($owner:String!,$name:String!,$number:Int!){viewer{login} repository(owner:$owner,name:$name){pullRequest(number:$number){id number title body state isDraft headRefName headRefOid headRepository{name owner{login}} baseRefName baseRefOid author{login} updatedAt url reviewDecision viewerDidAuthor reviews(first:10,states:[PENDING]){nodes{id author{login} commit{oid} comments{totalCount}} pageInfo{hasNextPage endCursor}} files(first:100){nodes{path additions deletions changeType viewerViewedState} pageInfo{hasNextPage endCursor}}}}}";
         let data = self.graphql(
             &key.repository,
             query,
@@ -55,7 +55,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .has_next_page
             .then(|| next_cursor(&connection.page_info, None))
             .transpose()?;
-        let metadata: PullRequest = decode_value(pr)?;
+        let mut metadata=pr.clone();
+        metadata["headRepositoryOwner"]=pr.pointer("/headRepository/owner").cloned().unwrap_or(serde_json::Value::Null);
+        let metadata: PullRequest = decode_value(&metadata)?;
         validate_pull_request(&metadata, &key.repository)?;
         Ok(ReviewRefresh {
             files: PullRequestFilePage {
@@ -88,7 +90,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             assert!(command.arguments.iter().any(|arg| arg == "--include"));
             let body = serde_json::json!({"data":{"viewer":{"login":"reviewer"},"repository":{"pullRequest":{
-                "id":"PR_1","number":1,"title":"Review","state":"OPEN","headRefName":"feature","headRefOid":"a".repeat(40),"baseRefName":"main","baseRefOid":"b".repeat(40),"updatedAt":"2026-10-14T00:00:00Z","url":"https://refresh-test.invalid/o/r/pull/1","viewerDidAuthor":false,
+                "id":"PR_1","number":1,"title":"Review","state":"OPEN","headRefName":"feature","headRefOid":"a".repeat(40),"headRepository":{"name":"fork","owner":{"login":"author"}},"baseRefName":"main","baseRefOid":"b".repeat(40),"updatedAt":"2026-10-14T00:00:00Z","url":"https://refresh-test.invalid/o/r/pull/1","viewerDidAuthor":false,
                 "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
                 "files":{"nodes":[{"path":"file.rs","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}
             }}}});
@@ -118,6 +120,7 @@ mod tests {
             .unwrap();
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(refresh.context.viewer, "reviewer");
+        assert_eq!(refresh.metadata.as_ref().unwrap().head_repository_key(),Some(GitHubRepoKey::new("refresh-test.invalid",None,"author","fork").unwrap()));
         assert_eq!(
             refresh.files.files[0].viewer_viewed_state,
             FileViewedState::Viewed
