@@ -10282,9 +10282,13 @@ impl Cagents {
                     self.lsp.change(doc, version, &edits, &text);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
+                        crate::lsp::shift_diagnostics(&mut state.context.diagnostics, &edits);
+                        state.diagnostics_version = Some(version);
                     }
                     if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
-                        runtime.set_editor_diagnostics(vec![]);
+                        if let Some(state) = self.lsp_contexts.get(&card) {
+                            runtime.set_editor_diagnostics(state.context.diagnostics.clone());
+                        }
                         runtime.dismiss_editor_results();
                     }
                 }
@@ -10452,14 +10456,13 @@ impl Cagents {
         };
         match event {
             LspEvent::Diagnostics { version, items, .. } => {
+                // A delayed publication must not erase the shifted standing
+                // set for a newer buffer revision.
+                if self.lsp.document_version(doc) != Some(version) {
+                    return;
+                }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
-                    runtime.set_editor_diagnostics(
-                        if self.lsp.document_version(doc) == Some(version) {
-                            items.clone()
-                        } else {
-                            vec![]
-                        },
-                    );
+                    runtime.set_editor_diagnostics(items.clone());
                 }
                 state.context.diagnostics = items;
                 state.diagnostics_version = Some(version);
@@ -10822,7 +10825,7 @@ impl Cagents {
                 }
                 task
             }
-            Action::Next(_) | Action::Dismiss => {
+            Action::Next(_) | Action::Diagnostic(_) | Action::Dismiss => {
                 if matches!(action, Action::Dismiss) {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();

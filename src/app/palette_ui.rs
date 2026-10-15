@@ -215,6 +215,13 @@ impl Cagents {
                 )
             })
             .collect();
+        if let Some(card) = self.workspace.focused()
+            && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_focus_target(card).is_some())
+        {
+            for (label, chord, forward) in [("Next diagnostic", "F8", true), ("Previous diagnostic", "Shift+F8", false)] {
+                entries.push((label.into(), chord.into(), Message::Repository(RepositoryAction::Language {card,action:repository_widget::EditorLspAction::Diagnostic(forward)})));
+            }
+        }
         entries.push((
             "Resume conversation".into(),
             "Search saved native chats".into(),
