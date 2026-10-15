@@ -48,7 +48,7 @@ impl GitTarget {
         };
         match command {
             Command::GitApplyStash | Command::GitPopStash | Command::GitDropStash => {
-                !source.busy() && !source.stashes.is_empty()
+                source.mutations_available() && !source.busy() && !source.stashes.is_empty()
             }
             _ => self.action(model, state, command).is_some(),
         }
@@ -71,7 +71,7 @@ impl GitTarget {
         if command == Command::GitOutput && source.git_output().is_some() {
             return Some(SidebarAction::ToggleGitOutput { key });
         }
-        if source.busy() {
+        if !source.mutations_available() || source.busy() {
             return None;
         }
         let operation = match command {
@@ -169,7 +169,7 @@ impl GitTarget {
         entry: &crate::repository::StashEntry,
     ) -> Option<SidebarAction> {
         let source = self.source(model, state)?;
-        if source.busy()
+        if !source.mutations_available() || source.busy()
             || !source
                 .stashes
                 .iter()
@@ -216,6 +216,31 @@ pub fn is_stash_picker(command: Command) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_host_capability_refuses_git_mutations_and_retains_read_commands() {
+        let mut model = super::super::tests::panel_model();
+        let mut state = super::super::tests::panel_state(&model);
+        let source = model.source_control.as_mut().unwrap();
+        source.groups.retain(|group| group.area != ChangeArea::Conflict);
+        source.stashes = vec![crate::repository::StashEntry { reference: "stash@{0}".into(), oid: Oid::parse(&"a".repeat(40)).unwrap(), message: "Retained read-only stash".into() }];
+        source.error = Some("Failed\n\nGit output:\nactual output".into());
+        let entry = source.stashes[0].clone();
+        let target = GitTarget::capture(&model, &state).unwrap();
+        state.apply(&SidebarAction::CommitMessageChanged { key: target.key.clone(), message: "Retain this draft".into() });
+        for command in [Command::GitFetch, Command::GitPush, Command::GitSync, Command::GitStash, Command::GitApplyStash, Command::GitPopStash, Command::GitDropStash, Command::GitCommit, Command::GitAmend] {
+            assert!(target.available(&model, &state, command), "writable fixture positive: {command:?}");
+        }
+        model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from("Read-only Git host")));
+        for descriptor in crate::workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter(|descriptor| crate::workspace_widget::git_command_bit(descriptor.action).is_some()) {
+            let read = matches!(descriptor.action, Command::GitRefresh | Command::GitStashes | Command::GitOutput);
+            assert_eq!(target.available(&model, &state, descriptor.action), read, "capability must match actual operation: {:?}", descriptor.action);
+        }
+        for command in [Command::GitApplyStash, Command::GitPopStash, Command::GitDropStash] {
+            assert!(target.stash_action(&model, &state, command, &entry).is_none());
+        }
+        assert_eq!(target.stashes(&model, &state), &[entry], "stash inspection remains readable");
+    }
 
     #[test]
     fn whole_worktree_commands_share_capabilities_and_reject_rebound_sources() {
