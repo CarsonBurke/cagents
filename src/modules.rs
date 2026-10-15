@@ -118,6 +118,8 @@ pub mod transcript_location;
 pub mod tray;
 #[cfg(feature = "ui")]
 pub mod ui_controls;
+#[cfg(feature = "ui")]
+pub mod ui_memory;
 pub mod update;
 pub mod upgrade;
 pub mod worktree_cleanup;
