@@ -5790,7 +5790,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         let configured = input.managed_directory.trim();
         let configured = Path::new(if configured.is_empty() {
-            "worktrees/"
+            ".worktrees/"
         } else {
             configured
         });

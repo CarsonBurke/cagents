@@ -633,7 +633,7 @@ const fn default_terminal_scroll_speed() -> f32 {
 }
 
 fn default_managed_worktree_directory() -> String {
-    "worktrees/".to_owned()
+    ".worktrees/".to_owned()
 }
 
 const fn default_focus_follows_mouse() -> bool {
@@ -3175,7 +3175,7 @@ mod tests {
             .unwrap()
             .remove("managed_worktree_directory");
         let decoded: AppSettings = old.try_into().unwrap();
-        assert_eq!(decoded.managed_worktree_directory, "worktrees/");
+        assert_eq!(decoded.managed_worktree_directory, ".worktrees/");
         for path in ["", "  ", "trees\nelsewhere", "trees\0elsewhere"] {
             assert!(
                 AppSettings {
