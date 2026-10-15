@@ -3096,6 +3096,7 @@ impl RepositoryRuntime {
     }
     pub fn set_editor_code_action_support(&mut self, supported: bool) { self.language.code_action_support = supported; }
     pub fn set_editor_signature(&mut self, signature: Option<crate::lsp::LspSignatureHelp>) { self.language.signature = signature; }
+    pub fn editor_signature_visible(&self) -> bool { self.language.signature.is_some() }
     pub fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] { &self.language.diagnostics }
     pub fn rename_focus_id(card: CardId) -> widget::Id { widget::Id::new(format!("editor.rename.{card}")) }
 
@@ -3113,7 +3114,7 @@ impl RepositoryRuntime {
         });
     }
 
-    fn dismiss_editor_choices(&mut self) {
+    pub(crate) fn dismiss_editor_choices(&mut self) {
         self.language.code_actions.clear();
         self.language.completions.clear();
         self.language.hover.clear();
@@ -4184,6 +4185,7 @@ impl RepositoryRuntime {
         if self.search_mode || self.source_surface != SourceSurface::Editor || self.workspace_edit_pending() || self.is_read_only_source() {
             return Task::none();
         }
+        self.dismiss_editor_results();
         let DocumentState::Editable(document) = &mut self.document else {
             return Task::none();
         };

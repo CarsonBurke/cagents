@@ -10294,7 +10294,7 @@ impl Cagents {
                     }
                     if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                         runtime.set_editor_diagnostics(vec![]);
-                        runtime.dismiss_editor_results();
+                        runtime.dismiss_editor_choices();
                     }
                 }
                 LspIntent::Save { text } => {

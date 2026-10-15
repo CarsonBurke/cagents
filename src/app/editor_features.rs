@@ -248,6 +248,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_change_drain_keeps_signature_until_close_character_or_undo() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("call.rs");
+        std::fs::write(&path, "call(").unwrap();
+        let mut app = app();
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let card = buffer(&mut app, root.path(), "call.rs", "call(");
+        let doc = LspDocumentId(44);
+        app.lsp_documents.insert(doc, card);
+        app.lsp_contexts.entry(card).or_default().document = Some(doc);
+        let language = app.lsp.language_for(&path).unwrap();
+        app.lsp.open(doc, &path, root.path(), language, 1, "call(");
+        let help = LspSignatureHelp { signatures: Vec::new(), active_signature: 0, active_parameter: None };
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+            drop(runtime.take_lsp_intents());
+            runtime.set_lsp_document(Some(doc));
+            runtime.move_cursor_to(LspPosition::new(0, 5));
+            runtime.set_editor_signature(Some(help.clone()));
+        }
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert('1')) })));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.editor_signature_visible()));
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert(')')) })));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.editor_signature_visible()));
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.set_editor_signature(Some(help)); }
+        drop(app.update(Message::Repository(RepositoryAction::Undo { card })));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.editor_signature_visible()));
+    }
+
+    #[tokio::test]
     async fn server_edit_anchored_to_read_only_source_can_change_a_writable_worktree_target() {
         let root = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
