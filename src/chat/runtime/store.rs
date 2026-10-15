@@ -708,16 +708,9 @@ impl Store {
         if let Some(warning) = self.flush_input()? {
             out.push(nonfatal(warning));
         }
-        if let Event::TurnFinished { outcome, .. } = &event {
-            let status = match outcome {
-                crate::notifications::Kind::Cancelled => Some(crate::chat::ToolStatus::Stopped),
-                crate::notifications::Kind::Failed => Some(crate::chat::ToolStatus::Failed),
-                _ => None,
-            };
-            if let Some(status) = status {
-                self.finish_running(status)?;
-            }
-        }
+        // A turn outcome does not prove that every tool/process ended.
+        // Resumable provider terminals can intentionally outlive a cancelled
+        // turn. Only exact item-end/native cleanup evidence may retire them.
         let input_delta = matches!(&event, Event::InputDelta { .. });
         match event {
             Event::InputDelta { id, offset, delta } | Event::OutputDelta { id, offset, delta } => {
@@ -1850,21 +1843,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_outcomes_update_only_running_metadata_and_never_rewrite_bodies() {
-        for (outcome, expected) in [
-            (
-                crate::notifications::Kind::Cancelled,
-                crate::chat::ToolStatus::Stopped,
-            ),
-            (
-                crate::notifications::Kind::Failed,
-                crate::chat::ToolStatus::Failed,
-            ),
-            (
-                crate::notifications::Kind::Succeeded,
-                crate::chat::ToolStatus::Running,
-            ),
-        ] {
+    fn turn_outcomes_preserve_native_tool_status_and_never_rewrite_bodies() {
+        for outcome in [crate::notifications::Kind::Cancelled,crate::notifications::Kind::Failed,crate::notifications::Kind::Succeeded] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let mut store = Store::at(directory.path().into()).unwrap();
             let input = "retained input".repeat(1000);
@@ -1896,17 +1876,13 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 after - before,
-                if outcome == crate::notifications::Kind::Succeeded {
-                    0
-                } else {
-                    1
-                },
-                "only the metadata row changes; chunks are never deleted or rewritten"
+                0,
+                "turn settlement is not per-item terminal proof; neither metadata nor chunks are rewritten"
             );
             store.apply(Event::TurnStarted).unwrap();
             let page = store.window().unwrap();
             assert!(
-                matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==expected)
+                matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==crate::chat::ToolStatus::Running)
             );
         }
     }

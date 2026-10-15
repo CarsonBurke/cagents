@@ -3087,22 +3087,8 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::TurnFinished { outcome, .. } => {
             use crate::{agent::ActivityOutcome, notifications::Kind};
-            match outcome {
-                Kind::Cancelled => {
-                    state.requests.clear();
-                    state.waiting = false;
-                    state.busy = false;
-                    let all = state.capabilities.interrupt_stops_background;
-                    finish_snapshot_work(state, ToolStatus::Stopped, all);
-                }
-                Kind::Failed => {
-                    state.requests.clear();
-                    state.waiting = false;
-                    state.busy = false;
-                    finish_snapshot_work(state, ToolStatus::Failed, false);
-                }
-                _ => {}
-            }
+            // Decisions and background work can outlive their parent turn.
+            // Exact RequestResolved/Status/item-end events own those states.
             state.outcome = match outcome {
                 Kind::Succeeded => Some(ActivityOutcome::Succeeded),
                 Kind::Cancelled => Some(ActivityOutcome::Cancelled),
@@ -4044,7 +4030,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_failure_and_cancel_do_not_retain_live_approval_waiting() {
+    fn turn_outcomes_preserve_independent_decisions_until_resolution_or_exit() {
         let waiting = || Snapshot {
             ready: true,
             busy: true,
@@ -4071,16 +4057,16 @@ mod tests {
                 &mut indices,
                 Event::TurnFinished { key: None, outcome },
             );
-            assert!(state.requests.is_empty());
-            assert!(!state.waiting);
-            assert_eq!(state.activity(), ActivityState::Idle);
+            assert_eq!(state.requests.len(),1);
+            assert!(state.waiting);
+            assert_eq!(state.activity(),ActivityState::Waiting);
             assert!(state.outcome.is_some());
-            apply_event(&mut state, &mut indices, Event::TurnStarted);
-            assert_eq!(
-                state.activity(),
-                ActivityState::Idle,
-                "an old approval must not revive when a later prompt clears its terminal outcome"
-            );
+            apply_event(&mut state,&mut indices,Event::RequestResolved {id:"pending".into()});
+            apply_event(&mut state,&mut indices,Event::Waiting(false));
+            apply_event(&mut state,&mut indices,Event::Status {busy:false,detail:String::new()});
+            assert_eq!(state.activity(),ActivityState::Idle);
+            apply_event(&mut state,&mut indices,Event::TurnStarted);
+            assert_eq!(state.activity(),ActivityState::Idle);
         }
         let mut state = waiting();
         apply_event(
@@ -4348,7 +4334,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_work_does_not_become_running_again_when_the_next_turn_starts() {
+    fn cancelled_turn_does_not_invent_tool_or_delegated_process_completion() {
         let tool = Arc::new(Item {
             id: "old-tool".into(),
             role: Role::Assistant,
@@ -4376,8 +4362,8 @@ mod tests {
                 outcome: crate::notifications::Kind::Cancelled,
             },
         );
-        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Running));
+        assert_eq!(state.subagents[0].status, ToolStatus::Running);
         assert_eq!(
             state.subagents[1].status,
             ToolStatus::Running,
@@ -4385,8 +4371,8 @@ mod tests {
         );
         apply_event(&mut state, &mut indices, Event::TurnStarted);
         assert!(state.outcome.is_none());
-        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Running));
+        assert_eq!(state.subagents[0].status, ToolStatus::Running);
         finish_snapshot_work(&mut state, ToolStatus::Failed, true);
         assert_eq!(
             state.subagents[1].status,
