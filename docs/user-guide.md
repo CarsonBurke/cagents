@@ -115,8 +115,9 @@ determine which models and permission modes are available.
   for sending that action's keys to the terminal. Scoped chat/review actions
   remain available only in their own panes.
 - Native text controls keep undo, redo, clipboard and word-navigation chords.
-  **Ctrl+Shift+Z** redoes edits in the editor, composer and text fields; it
-  reopens a closed pane when a terminal or nontext control owns focus.
+  **Ctrl+Shift+Z** redoes edits in the editor and composer. Other text fields
+  keep the chord in their native editing context. It reopens a closed pane when
+  a terminal or nontext control owns focus.
   **Ctrl+F** finds in the focused editor or chat transcript and otherwise
   searches projects. Typing it in a sidebar or inspector field keeps the key in
   that field instead of opening find in the pane behind it.
