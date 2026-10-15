@@ -182,6 +182,39 @@ mod tests {
     }
 
     #[test]
+    fn background_find_keeps_the_same_match_across_history_pruning() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        let matched = |dropped, row| crate::terminal::SearchMatch {
+            history: crate::terminal::HistoryPosition { epoch: 1, dropped },
+            start_row: row,
+            start_column: 0,
+            end_row: row,
+            end_column: 6,
+        };
+        app.terminal_find.insert(card, Find {
+            open: true,
+            query: "needle".into(),
+            request: 7,
+            matches: vec![matched(100, 10), matched(100, 20)].into(),
+            selected: 1,
+            background_results: true,
+            ..Find::default()
+        });
+        app.terminal_search_results(
+            card,
+            7,
+            "needle".into(),
+            vec![matched(103, 2), matched(103, 7), matched(103, 17)],
+            false,
+        );
+        let find = &app.terminal_find[&card];
+        assert_eq!(find.selected, 2, "preserve the original text, not its old result index");
+        assert_eq!(find.matches[find.selected], matched(103, 17));
+        assert!(!find.focused);
+    }
+
+    #[test]
     fn live_find_refresh_consumes_its_timer_while_the_terminal_is_reconnecting() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let card = CardId::new();
