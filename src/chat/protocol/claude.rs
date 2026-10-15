@@ -1380,6 +1380,10 @@ impl Claude {
                         let tool_id = required(block, "tool_use_id")?.to_owned();
                         let cached=match self.cached_tool(child,&tool_id) {
                             Ok(cached)=>cached,
+                            // History supplied this result's exact original
+                            // call from the selected visible chain. It can
+                            // recover presentation without a cache source.
+                            Err(_) if correlated_call.is_some()=>None,
                             Err(message)=> {step.events.push(Event::Error {message,fatal:false});continue;}
                         };
                         let needs_call=cached.as_ref().is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
@@ -10102,6 +10106,31 @@ mod tests {
             Some(ToolStatus::Succeeded)
         );
     }
+    #[test]
+    fn claude_history_exact_call_recovers_when_cached_source_is_unavailable() {
+        struct MissingSource;
+        impl super::super::CanonicalItemReader for MissingSource {
+            fn read(&self, _: &super::super::CanonicalItemKey) -> Result<Option<Item>, String> {
+                Err("recorded source unavailable".into())
+            }
+        }
+        let mut adapter = Claude::default();
+        adapter.bind_item_reader(std::sync::Arc::new(MissingSource));
+        let record = HistoryRecord {
+            frame: json!({"type":"user","uuid":"result","message":{"content":[correlation_result("wanted",false)]},"toolUseResult":actual_patch()}),
+            tool_calls: [(0, std::sync::Arc::new(correlation_call("wanted", "/project/wanted.rs")))].into(),
+        };
+        let mut step = Step::default();
+        adapter.history_message(&record, &mut step).unwrap();
+        assert!(!step.events.iter().any(|event| matches!(event, Event::Error { .. })));
+        let item = step.events.iter().find_map(|event| match event {
+            Event::Item(item) if item.id == "wanted" => Some(item),
+            _ => None,
+        }).unwrap();
+        assert!(matches!(&item.content, ItemContent::Changes { status: ToolStatus::Succeeded, changes, .. }
+            if changes.len() == 1 && changes[0].path == "/project/wanted.rs"));
+    }
+
     #[test]
     fn claude_history_context_excludes_abandoned_retracted_and_future_calls() {
         let frames = vec![
