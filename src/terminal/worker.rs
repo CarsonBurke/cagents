@@ -2021,11 +2021,14 @@ impl Worker {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take();
-            if let Some(close) = close
-                && self.handle_command(close)
-            {
-                shutting_down = true;
-                break;
+            if let Some(close) = close {
+                if let Some(carried) = carried_command.take() {
+                    self.retained_commands.push_back(carried);
+                }
+                if self.handle_command(close) {
+                    shutting_down = true;
+                    break;
+                }
             }
             self.flush_pty_input();
             self.publish_bell();
@@ -3086,7 +3089,12 @@ impl Worker {
         // command from inheriting an idle shell's authority.
         let idle_shell = interactive_shell_launch(&self.launch) && root.original_executable();
         Ok((
-            family.has_jobs() || foreground != root.process.group || !idle_shell,
+            family.has_jobs()
+                || foreground != root.process.group
+                || !idle_shell
+                || !self.pending_input.is_empty()
+                || !self.commands.is_empty()
+                || !self.retained_commands.is_empty(),
             family,
         ))
     }
@@ -6221,6 +6229,46 @@ mod tests {
                 .try_iter()
                 .any(|event| matches!(event, TerminalEvent::Error { .. }))
         );
+        worker.run();
+    }
+
+    #[test]
+    fn queued_and_pending_input_require_close_confirmation() {
+        let home = tempfile::tempdir_in("/var/tmp").unwrap();
+        let launch = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/bash".into(),
+            arguments: vec!["--noprofile".into(), "--norc".into(), "-i".into()],
+            working_directory: home.path().into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), home.path().to_string_lossy().into_owned()),
+                ("HISTFILE".into(), "/dev/null".into()),
+                ("PS1".into(), "CENSUS_READY> ".into()),
+            ]),
+        };
+        let (mut worker, _) = capture_worker_for(launch);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            let ready = matches!(&message, PtyMessage::Bytes(bytes) if bytes.windows(12).any(|word| word == b"CENSUS_READY"));
+            worker.handle_pty_message(Some(message));
+            if ready { break; }
+        }
+        let active = |worker: &Worker| worker.inspect_close(std::time::Instant::now() + Duration::from_secs(3)).unwrap().0;
+        assert!(!active(&worker), "fixture must start as a proven idle shell");
+        let (commands, receiver) = command_channel(1);
+        worker.commands = receiver;
+        commands.send(Command::Input(b"unsent".to_vec())).unwrap();
+        assert!(active(&worker), "priority close must see accepted input still in its inbox");
+        let _ = worker.commands.try_recv();
+        worker.pending_input.extend(b"pending");
+        assert!(active(&worker), "accepted bytes cannot be silently closed before delivery");
+        worker.pending_input.clear();
+        worker.retained_commands.push_back(Command::Input(b"carried".to_vec()));
+        assert!(active(&worker), "coalesced/cancellation carry must also be inspected");
+        worker.retained_commands.clear();
+        assert!(!active(&worker));
+        drop(commands);
         worker.run();
     }
 
