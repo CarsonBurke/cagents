@@ -116,6 +116,7 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                 action,
             }),
             AgentCommand::Interrupt { agent, .. } => Kind::Act(Act::Interrupt { agent }),
+            AgentCommand::Close { repair_stale_presentation: true, .. } => Kind::Act(Act::Cli(subcommand_path(argv))),
             AgentCommand::Close {
                 agent: Some(agent), ..
             } => Kind::Act(Act::Close {
@@ -353,6 +354,12 @@ mod tests {
         let argv: Vec<String> = line.split(' ').map(str::to_owned).collect();
         let stdin = stdin.map_or(Text::Unseen, |stdin| Text::Inline(stdin.into()));
         super::coordination(&argv, stdin)
+    }
+
+    #[test]
+    fn presentation_repair_is_cli_metadata_rather_than_provider_close() {
+        assert!(matches!(parse("cagents agent close 1234 --repair-stale-presentation", None), Some(Kind::Act(Act::Cli(command))) if command == "agent close"));
+        assert!(matches!(parse("cagents agent close 1234", None), Some(Kind::Act(Act::Close { .. }))));
     }
 
     #[test]
