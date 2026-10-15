@@ -277,7 +277,7 @@ enum Prepared {
     Probe {
         cli: Cli,
         key: Option<String>,
-        lock: Option<crate::instance::OwnedLock>,
+        lock: Vec<crate::instance::OwnedLock>,
     },
 }
 
@@ -318,8 +318,8 @@ fn prepare(
         ));
     };
     let lock =
-        match lock_cache.try_probe_lock(&account.lock_name()) {
-            Ok(Some(lock)) => Some(lock),
+        match acquire_locks(lock_cache, &[account]) {
+            Ok(Some(locks)) => locks,
             Ok(None) => return Prepared::Done(Outcome::Busy),
             Err(_) => return Prepared::Done(Outcome::Failed(
                 "Account storage cannot be locked; check cache directory permissions and retry."
@@ -812,13 +812,37 @@ pub(super) fn lock_accounts(
     cache: &Cache,
     accounts: &[&Account],
 ) -> Result<Vec<crate::instance::OwnedLock>, String> {
-    let names: std::collections::BTreeSet<_> =
-        accounts.iter().map(|account| account.lock_name()).collect();
-    names.into_iter().map(|name| {
-        cache.try_probe_lock(&name)
-            .map_err(|_| "Account storage cannot be locked; check cache directory permissions and retry.".to_owned())?
-            .ok_or_else(|| "An account is being checked or changed in another window. Wait for that operation to finish and retry.".to_owned())
-    }).collect()
+    acquire_locks(cache, accounts)
+        .map_err(|_| "Account storage cannot be locked; check cache directory permissions and retry.".to_owned())?
+        .ok_or_else(|| "An account is being checked or changed in another window. Wait for that operation to finish and retry.".to_owned())
+}
+
+/// Keep logical names for compatible callers and also fence the actual home.
+/// Two registry IDs or providers can alias the same physical credential tree.
+/// Path and inode locks together cover aliases and pathname replacement.
+fn acquire_locks(cache: &Cache, accounts: &[&Account]) -> io::Result<Option<Vec<crate::instance::OwnedLock>>> {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    use sha2::{Digest, Sha256};
+    let mut names = std::collections::BTreeSet::new();
+    for account in accounts {
+        names.insert(account.lock_name());
+        if let Some(home) = account.resolved_home() {
+            let home = home.canonicalize().unwrap_or(home);
+            let digest = Sha256::digest(home.as_os_str().as_bytes());
+            names.insert(format!("physical-path-{digest:x}"));
+            if let Ok(metadata) = std::fs::metadata(&home) {
+                names.insert(format!("physical-inode-{}-{}", metadata.dev(), metadata.ino()));
+            }
+        }
+    }
+    let mut locks = Vec::new();
+    for name in names {
+        match cache.try_probe_lock(&name)? {
+            Some(lock) => locks.push(lock),
+            None => return Ok(None), // Releases every earlier acquired lock.
+        }
+    }
+    Ok(Some(locks))
 }
 
 pub async fn logout(account: Account) -> Result<(), String> {

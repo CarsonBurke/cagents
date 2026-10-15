@@ -1959,7 +1959,7 @@ impl Cagents {
         &mut self,
         change: impl FnOnce(&mut Registry) + Send + 'static,
     ) -> Task<Message> {
-        if crate::device::is_remote() {
+        if crate::device::is_remote() || self.account_ui.store.is_some() {
             let expected_revision = self.account_ui.registry.revision();
             let mut registry = self.account_ui.registry.clone();
             change(&mut registry);
@@ -1985,25 +1985,12 @@ impl Cagents {
                 Message::AccountUi(Action::Saved(result))
             });
         }
-        let Some(store) = self.account_ui.store.clone() else {
-            // A window without a configuration directory keeps its choices
-            // for as long as it runs.
-            let mut registry = self.account_ui.registry.clone();
-            change(&mut registry);
-            self.account_ui.set_registry(registry);
-            return Task::none();
-        };
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || store.update(change))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| {
-                    result
-                        .map(|(registry, ())| registry)
-                        .map_err(|error| error.to_string())
-                });
-            Message::AccountUi(Action::Saved(result))
-        })
+        // A window without a configuration directory keeps its choices for
+        // as long as it runs. Persisted mutations always use daemon admission.
+        let mut registry = self.account_ui.registry.clone();
+        change(&mut registry);
+        self.account_ui.set_registry(registry);
+        Task::none()
     }
 
     /// The status bar was shown or hidden, or the Accounts pane opened.
@@ -3612,7 +3599,7 @@ impl Cagents {
         }
         self.account_ui.table.linking = true;
         let key = uuid::Uuid::new_v4();
-        if crate::device::is_remote() {
+        if crate::device::is_remote() || self.account_ui.store.is_some() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     remote_lifecycle::<(Registry, uuid::Uuid)>(account::remote::Operation::Link {
@@ -3820,7 +3807,7 @@ impl Cagents {
 
     /// Deletes a home that never became an account, and its pending entry.
     fn discard_home(&self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
-        if crate::device::is_remote() {
+        if crate::device::is_remote() || self.account_ui.store.is_some() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     remote_lifecycle(account::remote::Operation::Abandon { provider, key })
@@ -4091,7 +4078,7 @@ impl Cagents {
             return self.discard_home(key, provider);
         }
         login.phase = LoginPhase::Settling;
-        if crate::device::is_remote() {
+        if crate::device::is_remote() || self.account_ui.store.is_some() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     remote_lifecycle(account::remote::Operation::Register { provider, key })

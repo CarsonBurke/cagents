@@ -70,6 +70,14 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
                 homes.path(*provider, *key),
             )))
         }
+        Operation::Link { provider, key, path } => {
+            let path = if let Some(relative) = path.trim().strip_prefix("~/") {
+                std::path::PathBuf::from(std::env::var_os("HOME").ok_or("HOME unavailable")?).join(relative)
+            } else { std::path::PathBuf::from(path.trim()) };
+            if !path.is_absolute() { return Err("Enter an absolute account home path".into()); }
+            let path = path.canonicalize().map_err(|error| error.to_string())?;
+            Ok(Some(Account::linked(*provider, *key, path)))
+        }
         Operation::Remove { id }
         | Operation::MoveAndArchive { id, .. }
         | Operation::DeleteFiles { id } => registry
@@ -127,6 +135,37 @@ pub enum Settled {
 
 #[cfg(feature = "host")]
 pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String> {
+    execute_with_commits(operation, &Commits { gate: None, verify: &|| Ok(()) })
+}
+
+/// The host installs a scoped reservation before this runs. Long provider and
+/// filesystem work stays outside global admission; only final registry/rename
+/// transactions take its writer. Unit callers retain their isolated stores.
+#[cfg(feature = "host")]
+pub(crate) fn execute_reserved(
+    operation: Operation,
+    gate: std::sync::Arc<std::sync::RwLock<()>>,
+    verify: impl Fn() -> Result<(), String>,
+) -> Result<serde_json::Value, String> {
+    execute_with_commits(operation, &Commits { gate: Some(gate), verify: &verify })
+}
+
+#[cfg(feature = "host")]
+struct Commits<'a> {
+    gate: Option<std::sync::Arc<std::sync::RwLock<()>>>,
+    verify: &'a dyn Fn() -> Result<(), String>,
+}
+#[cfg(feature = "host")]
+impl Commits<'_> {
+    fn apply<T>(&self, change: impl FnOnce() -> std::io::Result<T>) -> Result<T, String> {
+        let _writer = self.gate.as_ref().map(|gate| gate.write().unwrap_or_else(|p| p.into_inner()));
+        (self.verify)()?;
+        change().map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(feature = "host")]
+fn execute_with_commits(operation: Operation, commits: &Commits<'_>) -> Result<serde_json::Value, String> {
     use super::{
         Account, UsageStatus,
         home::{CodexConfig, Homes},
@@ -151,7 +190,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
             let search = runtime.block_on(probe::search_path());
             let program = probe::Cli::discover(provider, search.as_deref())?;
             let system = Account::system(provider).resolved_home();
-            let (key, home) = store
+            let (key, home) = commits.apply(|| store
                 .create_pending(&homes, provider, now, || {
                     homes.create_with_config(
                         provider,
@@ -162,15 +201,15 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                             CodexConfig::Shared
                         },
                     )
-                })
-                .map_err(|error| error.to_string())?;
+                }))?;
             let account = Account::managed(provider, key, home.clone());
             let recipe = match login_recipe(&account, &program) {
                 Ok(recipe) => recipe,
                 Err(error) => {
                     // A launch recipe failure must not strand an unused home
                     // and pending registry entry before the terminal opens.
-                    let _ = store.remove_home(&homes, provider, key, false);
+                    let _ = commits.apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())));
+                    homes.finish_removals();
                     return Err(error);
                 }
             };
@@ -198,13 +237,11 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
             let path = chosen.canonicalize().map_err(|error| error.to_string())?;
             crate::secure_file::validate_owned_directory(&path)
                 .map_err(|error| error.to_string())?;
-            let _lifecycle = homes.lifecycle_lock().map_err(|error| error.to_string())?;
             let system = Account::system(provider).resolved_home();
-            let (registry, result) = store
-                .update(|registry| {
-                    registry.link(provider, key, path, system.as_deref(), Some(&homes), now)
-                })
-                .map_err(|error| error.to_string())?;
+            let (registry, result) = commits.apply(|| {
+                let _lifecycle = homes.lifecycle_lock()?;
+                store.update(|registry| registry.link(provider, key, path, system.as_deref(), Some(&homes), now))
+            })?;
             let key = result?;
             serde_json::to_value((registry, key)).map_err(|error| error.to_string())
         }
@@ -242,13 +279,15 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                         );
                     }
                 };
+            let lock_cache = super::cache::Cache::installation().ok_or("Account storage cannot be locked")?;
+            let _probe_locks = probe::lock_accounts(&lock_cache, &[&account])?;
+            (commits.verify)()?;
             if identity.is_some() && snapshot.status == UsageStatus::NeedsLogin {
                 return Err("The provider needs this account to sign in again".into());
             }
             if !probe::confirms_login(identity.as_ref(), snapshot.status) {
-                let (registry, _) = store
-                    .remove_home(&homes, provider, key, false)
-                    .map_err(|error| error.to_string())?;
+                let (registry, _) = commits.apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())))?;
+                homes.finish_removals();
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
                     .map_err(|error| error.to_string());
             }
@@ -276,9 +315,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                     .and_then(|identity| identity.organization.clone()),
                 added_at: now,
             };
-            let (registry, registered) = store
-                .register_pending(&homes, managed, &system_identity)
-                .map_err(|error| error.to_string())?;
+            let (registry, registered) = commits.apply(|| store.register_pending(&homes, managed, &system_identity))?;
             let settled = match registered {
                 Ok(()) => Settled::Registered {
                     registry,
@@ -286,10 +323,10 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                     snapshot: Some(snapshot),
                 },
                 Err(existing) => {
-                    runtime.block_on(probe::logout(account))?;
-                    let (registry, _) = store
-                        .remove_home(&homes, provider, key, false)
-                        .map_err(|error| error.to_string())?;
+                    (commits.verify)()?;
+                    runtime.block_on(probe::logout_locked(account))?;
+                    let (registry, _) = commits.apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())))?;
+                    homes.finish_removals();
                     Settled::Duplicate {
                         existing,
                         registry: Some(registry),
@@ -307,9 +344,11 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
             {
                 return Err("This pending sign-in changed on the device".into());
             }
-            let (registry, _) = store
-                .remove_home(&homes, provider, key, false)
-                .map_err(|error| error.to_string())?;
+            let account = Account::managed(provider, key, homes.path(provider, key));
+            let lock_cache = super::cache::Cache::installation().ok_or("Account storage cannot be locked")?;
+            let _probe_locks = probe::lock_accounts(&lock_cache, &[&account])?;
+            let (registry, _) = commits.apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())))?;
+            homes.finish_removals();
             serde_json::to_value(Settled::Abandoned(Some(registry)))
                 .map_err(|error| error.to_string())
         }
@@ -329,9 +368,9 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
             let cache = super::cache::Cache::installation().ok_or(
                 "Account storage cannot be locked; restore the cache directory and retry.",
             )?;
-            let result = remove_account(operation, &store, &homes, &cache, |account| {
+            let result = remove_account_with_commits(operation, &store, &homes, &cache, |account| {
                 runtime.block_on(probe::logout_locked(account))
-            })?;
+            }, commits)?;
             serde_json::to_value(result).map_err(|error| error.to_string())
         }
     }
@@ -343,7 +382,19 @@ fn remove_account(
     store: &super::registry::Store,
     homes: &super::home::Homes,
     cache: &super::cache::Cache,
+    logout: impl FnMut(super::Account) -> Result<(), String>,
+) -> Result<(super::registry::Registry, Option<String>), String> {
+    remove_account_with_commits(operation, store, homes, cache, logout, &Commits { gate: None, verify: &|| Ok(()) })
+}
+
+#[cfg(feature = "host")]
+fn remove_account_with_commits(
+    operation: Operation,
+    store: &super::registry::Store,
+    homes: &super::home::Homes,
+    cache: &super::cache::Cache,
     mut logout: impl FnMut(super::Account) -> Result<(), String>,
+    commits: &Commits<'_>,
 ) -> Result<(super::registry::Registry, Option<String>), String> {
     use super::probe;
     let (id, target, delete) = match operation {
@@ -373,29 +424,31 @@ fn remove_account(
     let mut affected = vec![&account];
     affected.extend(target.as_ref());
     let _locks = probe::lock_accounts(cache, &affected)?;
+    (commits.verify)()?;
     if let Some(target) = &target {
         super::handoff::move_history(&account, target)?;
     }
+    (commits.verify)()?;
     let (registry, error) = if account.is_linked() {
-        let (registry, ()) = store
-            .update(|registry| {
-                registry.unregister(key);
-            })
-            .map_err(|error| error.to_string())?;
+        let (registry, ()) = commits.apply(|| store.update(|registry| { registry.unregister(key); }))?;
         (registry, None)
     } else {
         if delete {
             // Explicit file deletion remains available without an installed
             // provider CLI. Report failed sign-out separately from deletion.
             let logout_error = logout(account.clone()).err();
-            let mut annotation_warning = None;
-            let (registry, error) = store
-                .remove_home_checked(homes, account.provider, key, true, || {
-                    annotation_warning = purge_deleted_account_annotations(&account)
-                        .map_err(std::io::Error::other)?;
-                    Ok(())
-                })
-                .map_err(|error| error.to_string())?;
+            (commits.verify)()?;
+            // Purge is potentially large. Scoped admission and probe locks keep
+            // this home quiet without blocking unrelated terminal requests.
+            let mut retained = registry.clone();
+            retained.unregister(key);
+            let annotation_warning = if retained.contains_managed_home(homes, account.provider, key) {
+                None
+            } else {
+                purge_deleted_account_annotations(&account)?
+            };
+            let (registry, error) = commits.apply(|| store.park_home_checked(homes, account.provider, key, true, || Ok(())))?;
+            homes.finish_removals();
             let error = match (error, annotation_warning) {
                 (Some(error), Some(warning)) => Some(format!("{error}; {warning}")),
                 (error, warning) => error.or(warning),
@@ -412,10 +465,10 @@ fn remove_account(
             (registry, error)
         } else {
             logout(account.clone())?;
-            let _lifecycle = homes.lifecycle_lock().map_err(|error| error.to_string())?;
-            let (registry, _) = store
-                .update(|registry| registry.archive(key))
-                .map_err(|error| error.to_string())?;
+            let (registry, _) = commits.apply(|| {
+                let _lifecycle = homes.lifecycle_lock()?;
+                store.update(|registry| registry.archive(key))
+            })?;
             (registry, None)
         }
     };
