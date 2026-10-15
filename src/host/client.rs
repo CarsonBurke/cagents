@@ -448,6 +448,26 @@ pub(super) fn process_request(
             false,
         ));
     }
+    // Whole-session stop has a short exclusive admission phase. Waiting for
+    // provider/PTY cleanup must not hold the global control gate.
+    if let ClientRequest::DeviceOperation {operation:crate::device_service::Operation::Worktree {
+        operation:crate::worktree_control::Operation::StopSessions {repository,path,consent}
+    }}=&request {
+        let invalid=|message|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false);
+        let mut pending={
+            let _admission=gate.write().unwrap_or_else(|p|p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host,client_id,&request)?;
+            super::worktree_sessions::prepare_stop(host,repository,path,consent).map_err(invalid)?
+        };
+        pending.cleanup().map_err(invalid)?;
+        let reply={
+            let _admission=gate.write().unwrap_or_else(|p|p.into_inner());
+            ensure_control_open(host)?;
+            pending.commit(host).map_err(invalid)?
+        };
+        return Ok((ServerResponse::DeviceOperation {reply:crate::device_service::Reply::Worktree(reply)},Vec::new(),false));
+    }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
     let exclusive = matches!(

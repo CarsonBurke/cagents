@@ -9,7 +9,7 @@ use crate::{
     model::{TerminalId, TerminalSession},
     repository::{CancellationToken, RepositoryService},
     terminal::TerminalHandle,
-    worktree_control::{BusyAgent, Reply},
+    worktree_control::{BusyAgent, Reply, SessionIdentity, SessionStopConsent},
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::{Path, PathBuf}};
@@ -297,6 +297,95 @@ pub(super) fn close(host: &SharedHost, repository: &Path, path: &Path, agents: &
     }
     if !census(host, &path)?.is_empty() { return Err("Another actor appeared during close; refresh the remaining worktree census".into()); }
     Ok(Reply::SessionsClosed { path })
+}
+
+/// All exact actors are fenced while control admission is excluded. Cleanup
+/// deliberately runs after that gate is released; records remain on failure.
+pub(super) struct PendingStop {
+    path: PathBuf,
+    actors: Vec<Actor>,
+    terminals: Vec<crate::terminal::TerminalSessionStop>,
+    deadline: std::time::Instant,
+}
+fn session_identities(actors: &[Actor]) -> Vec<SessionIdentity> {
+    actors.iter().map(|actor| SessionIdentity {session:actor.token.session,instance:actor.token.session_instance}).collect()
+}
+fn validate_stop_consent(consent: &SessionStopConsent) -> Result<(), String> {
+    if !consent.sessions.windows(2).all(|pair|pair[0].session < pair[1].session) {
+        return Err("Session stop consent must contain a sorted, unique full session roster".into());
+    }
+    Ok(())
+}
+fn source_matches(host:&SharedHost, actor:&Actor) -> Result<(),String> {
+    let state=host.lock().unwrap_or_else(|p|p.into_inner());
+    if let Some(native)=&actor.native {
+        if state.chats.get(&actor.token.session).is_none_or(|record|record.execution_instance!=native.execution_instance || !record.handle.same_actor(&native.handle) || !HostedSession::Chat(record.session.clone()).same_process(&HostedSession::Chat(native.session.clone()))) {
+            return Err("The native session was replaced; its replacement was preserved".into());
+        }
+    }
+    if let Some(terminal)=&actor.terminal {
+        if state.terminals.get(&actor.token.session).is_none_or(|record|record.handle.execution_instance()!=terminal.instance || !record.handle.same_worker(&terminal.handle)) {
+            return Err("The terminal session was replaced; its replacement was preserved".into());
+        }
+    }
+    Ok(())
+}
+/// Caller holds exclusive control admission, never HostLock across actor ACKs.
+pub(super) fn prepare_stop(host:&SharedHost, repository:&Path, path:&Path, consent:&SessionStopConsent)->Result<PendingStop,String> {
+    validate_stop_consent(consent)?;
+    let path=selected_worktree(repository,path)?;
+    let actors=census(host,&path)?;
+    if session_identities(&actors)!=consent.sessions {
+        return Err("The worktree session roster changed after consent; refresh and review it again".into());
+    }
+    if actors.iter().any(|actor|actor.starting) {
+        return Err("A session is starting or changing ownership; wait for it to settle before stopping sessions".into());
+    }
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+    let mut terminals=Vec::new();
+    for actor in &actors {
+        source_matches(host,actor)?;
+        // Fence the console first: input and terminal-to-agent ownership
+        // transitions must be excluded before admitting the native stop.
+        if let Some(terminal)=&actor.terminal {
+            terminals.push(terminal.handle.fence_session_stop(terminal.instance,deadline)?);
+        }
+        if let Some(native)=&actor.native {
+            native.handle.fence_session_stop_until(native.observation.actor_id,deadline)?;
+        }
+    }
+    Ok(PendingStop {path,actors,terminals,deadline})
+}
+impl PendingStop {
+    /// No HostLock or global control admission may be held by this caller.
+    pub(super) fn cleanup(&mut self)->Result<(),String> {
+        for actor in &self.actors {
+            if let Some(native)=&actor.native { native.handle.close_until(self.deadline)?; }
+        }
+        for terminal in self.terminals.drain(..) { terminal.finish(self.deadline)?; }
+        Ok(())
+    }
+    /// Caller reacquires exclusive admission after cleanup. A replacement is
+    /// never retired on the strength of an older actor's successful cleanup.
+    pub(super) fn commit(self,host:&SharedHost)->Result<Reply,String> {
+        for actor in &self.actors { source_matches(host,actor)?; }
+        for actor in &self.actors {
+            let source=if let Some(native)=&actor.native {HostedSession::Chat(native.session.clone())}
+                else {HostedSession::Terminal(actor.terminal.as_ref().expect("resident actor").session.clone())};
+            super::agent_execution::retired_hosted(host,&source)?;
+            let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+            if actor.native.is_some() {
+                state.chats.remove(&actor.token.session);
+                if let Some(notifications)=&state.notifications {notifications.retire(actor.token.session);}
+                state.inventory_generation+=1;
+            }
+            if actor.terminal.is_some() {state.retire_terminal(actor.token.session);}
+        }
+        if !census(host,&self.path)?.is_empty() {
+            return Err("Another session appeared during cleanup; refresh the remaining worktree roster".into());
+        }
+        Ok(Reply::SessionsStopped {path:self.path})
+    }
 }
 
 #[cfg(test)]
