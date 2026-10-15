@@ -596,7 +596,8 @@ impl<'a> RowContext<'a> {
         let generation = runtime.generation;
         let revision = runtime.diff_layout_revision;
         let mode = runtime.diff_mode;
-        crate::interaction::context_menu_lazy(content, move || {
+        let menu_identity = (card, generation, revision, mode, row, side, source.sources);
+        crate::interaction::context_menu_lazy_keyed(content, menu_identity, move || {
             let command =
                 |command| MenuCommand(card, generation, revision, mode, source.sources, command);
             use widget::menu::{Item, KeyBind, key_bind::Modifier};

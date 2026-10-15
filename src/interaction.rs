@@ -423,6 +423,36 @@ pub fn context_menu_lazy<'a, Message: Clone + 'static>(
     .into()
 }
 
+/// A context menu whose native state closes when its target changes.
+/// Use stable row IDs and relevant source/selection revisions as lightweight
+/// keys, so unrelated frames preserve the menu without retaining stale actions.
+pub fn context_menu_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    key: Key,
+    menu: Vec<widget::menu::Tree<Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(content.into(), context_menu::surface_keyed(key, menu)),
+        kind: Kind::ContextMenu,
+        tip: None,
+        on_escape: None,
+    }.into()
+}
+
+/// Lazy menu construction with the same target lifetime as [`context_menu_keyed`].
+pub fn context_menu_lazy_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    key: Key,
+    builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(content.into(), context_menu::lazy_surface_keyed(key, builder)),
+        kind: Kind::ContextMenu,
+        tip: None,
+        on_escape: None,
+    }.into()
+}
+
 /// Keeps every key from the layers beneath a transient surface that the
 /// application's keyboard subscription drives, so a key that steers or
 /// dismisses it is not also typed into the pane it covers.
