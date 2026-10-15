@@ -11,6 +11,28 @@ use std::time::Duration;
 const STDOUT_LIMIT:usize=256*1024;
 const STDERR_LIMIT:usize=64*1024;
 const DEADLINE:Duration=Duration::from_secs(30);
+const PARENT_PID:&str="CAGENTS_UI_TEST_ORIGINAL_PARENT_PID";
+const PARENT_START:&str="CAGENTS_UI_TEST_ORIGINAL_PARENT_START";
+fn start_ticks(pid:u32)->String {
+    let stat=std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("original parent identity");
+    stat.rsplit_once(')').expect("process stat command boundary").1.split_whitespace()
+        .nth(19).expect("process start ticks").to_owned()
+}
+fn arm_owner_loss() {
+    let expected:u32=std::env::var(PARENT_PID).expect("private launch parent").parse().unwrap();
+    let expected_start=std::env::var(PARENT_START).expect("private launch parent start");
+    #[cfg(target_os="linux")]
+    {
+        // SAFETY: changes only this exact private test child's own parent-death
+        // disposition. The following parent/start check closes pre-arm loss;
+        // no numeric PID is used to send a signal to another process.
+        assert_eq!(unsafe {libc::prctl(libc::PR_SET_PDEATHSIG,libc::SIGKILL,0,0,0)},0);
+        assert_eq!(unsafe {libc::getppid()} as u32,expected,"original spawning parent already changed");
+        assert_eq!(start_ticks(expected),expected_start,"original parent identity changed");
+    }
+    #[cfg(not(target_os="linux"))]
+    panic!("private UI fixture owner-loss protection requires Linux");
+}
 
 fn run(test:&str, child_key:&str, value:&str, deadline:Duration, limits:(usize,usize))->Result<ProcessOutput,ProcessFailure> {
     use std::os::unix::fs::{PermissionsExt,OpenOptionsExt};
@@ -29,6 +51,7 @@ fn run(test:&str, child_key:&str, value:&str, deadline:Duration, limits:(usize,u
         .env("XDG_CACHE_HOME",directory.path().join("cache"))
         .env("XDG_RUNTIME_DIR",directory.path().join("runtime"))
         .env("TMPDIR",directory.path().join("tmp"))
+        .env(PARENT_PID,std::process::id().to_string()).env(PARENT_START,start_ticks(std::process::id()))
         .env(child_key,value).timeout(deadline).output_limits(limits.0,limits.1);
     let result=SystemProcessExecutor.execute(&spec,&CancellationToken::new());
     // Preserve bounded logs and the private test state for any failed run.
@@ -59,7 +82,7 @@ fn exact_pass(output:&ProcessOutput, test:&str)->bool {
 /// The caller returns immediately on true; the actual child body uses the same
 /// named libtest entry. Only this current executable is ever spawned.
 pub(crate) fn isolated(test:&str, child_key:&str)->bool {
-    if std::env::var_os(child_key).as_deref()==Some(std::ffi::OsStr::new("1")) {return false;}
+    if std::env::var_os(child_key).as_deref()==Some(std::ffi::OsStr::new("1")) {arm_owner_loss();return false;}
     let output=run(test,child_key,"1",DEADLINE,(STDOUT_LIMIT,STDERR_LIMIT)).unwrap_or_else(|failure| {
         panic!("isolated UI test {test} failed: {failure}\n{}\n{}",
             String::from_utf8_lossy(&failure.stdout),String::from_utf8_lossy(&failure.stderr))
@@ -79,10 +102,12 @@ mod tests {
     const FIXTURE:&str="ui_test_process::tests::child_fixture";
     #[test]
     fn child_fixture() {
+        if std::env::var_os(CHILD).is_some() {arm_owner_loss();}
         match std::env::var(CHILD).ok().as_deref() {
             Some("hang")=>{
                 println!("bounded UI fixture entered");std::io::stdout().flush().unwrap();
-                loop {std::thread::park();}
+                let end=std::time::Instant::now()+Duration::from_secs(8);
+                while std::time::Instant::now()<end {std::thread::park_timeout(Duration::from_millis(20));}
             }
             Some("cap")=>{
                 let bytes=[b'x';4096];let mut stdout=std::io::stdout().lock();
