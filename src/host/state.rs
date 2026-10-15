@@ -1249,6 +1249,28 @@ impl HostState {
     }
 
     /// Read-only history and presentation remain available after PTY teardown.
+    /// A recovered provider console remains provisional until its native actor
+    /// and durable Chat association have both been installed by typed recovery.
+    pub(super) fn native_terminal_binding_known(&self, id: TerminalId) -> bool {
+        let Some(terminal) = self.terminals.get(&id) else { return false; };
+        let Some(chat) = self.chats.get(&id) else { return false; };
+        let Some(pair) = chat.session.terminal.as_ref() else { return false; };
+        if chat.handle.is_completed()
+            || !chat.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&terminal.handle))
+            || pair.continuity.live_proof().as_ref() != Some(self.proof())
+            || terminal.session.continuity.live_proof().as_ref() != Some(self.proof()) { return false; }
+        let mut pair = pair.clone();
+        pair.continuity = terminal.session.continuity.clone();
+        pair.resume_hint = terminal.session.resume_hint.clone();
+        pair == terminal.session
+    }
+
+    pub(super) fn confirm_native_terminal_binding(&mut self, id: TerminalId) -> bool {
+        if !self.native_terminal_binding_known(id) { return false; }
+        self.terminals.get_mut(&id).expect("the validated pair remains under this host lock").authority_rebind_pending = false;
+        true
+    }
+
     pub(crate) fn history_handle(
         &self,
         client_id: ClientId,
@@ -2542,7 +2564,7 @@ fn restore_terminal_execution_authority(
     };
     let registry = super::agent_execution::registry(host)?;
     let authority = registry.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_authority_source(source.id)?;
-    if matches!(authority, Some(HostedSession::Terminal(_))) {
+    if matches!(&authority, Some(HostedSession::Terminal(_))) {
         let mut retained = Vec::new();
         for source in previous.iter().chain(std::iter::once(source)) {
             retained.push(HostedSession::Terminal(source.clone()));
@@ -2560,6 +2582,9 @@ fn restore_terminal_execution_authority(
             .adopt_authenticated_agent_session(&retained, &HostedSession::Terminal(successor))?;
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if matches!(&authority, Some(HostedSession::Chat(_))) && !state.native_terminal_binding_known(source.id) {
+        return Err("This console belongs to a native conversation whose exact actor and terminal pair have not reconnected; its original processes were preserved".into());
+    }
     if state.proof() != &proof { return Err("Daemon ownership changed during terminal authority binding".into()); }
     let record = state.terminals.get_mut(&source.id).filter(|record| record.handle.same_worker(&expected))
         .ok_or("The terminal worker changed during authority binding")?;

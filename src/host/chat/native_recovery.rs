@@ -371,7 +371,11 @@ fn restore_authenticated(
     };
     let response = session_snapshot(&record);
     record.handle.commit_native_installation();
+    let has_pair = record.paired_terminal.is_some();
     let retired = state.chats.insert(id, record);
+    if has_pair && !state.confirm_native_terminal_binding(id) {
+        tracing::warn!(terminal = %id, "Retained native actor installed but its exact console binding remains unavailable");
+    }
     if let Some(context) = execution_context {
         context.installed();
     }
