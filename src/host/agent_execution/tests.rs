@@ -1054,11 +1054,11 @@ fn combined_close_retains_real_cleanup_receipt_after_late_view_conflict_and_retr
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     let lease = crate::daemon::HostLease::acquire(&paths, &original_proof).unwrap();
     let context = Arc::new(ExecutionContext::new(Some(Arc::new(std::fs::File::open(directory).unwrap()))));
-    let process = ProcessSpec {execution: Some(context.clone()), messages: None,
+    let process_spec = ProcessSpec {execution: Some(context.clone()), messages: None,
         transport: TransportSpec::OwnedUnixWebSocket {socket}, program: "/bin/sleep".into(),
         arguments: vec!["60".into()], working_directory: directory.to_owned(),
         environment: Default::default(), unset_environment: Default::default()};
-    let mut holder = chat::native_holder::spawn(process, original.clone()).unwrap();
+    let mut holder = chat::native_holder::spawn(process_spec, original.clone()).unwrap();
     context.installed();
     let owner = holders::evidence(&holders::socket(&holders::directory(Kind::Native).unwrap(), id),
         Kind::Native).unwrap().unwrap();
