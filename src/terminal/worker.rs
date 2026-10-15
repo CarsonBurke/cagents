@@ -5660,7 +5660,7 @@ mod tests {
     #[test]
     fn interrupt_discards_kernel_buffered_paste_before_the_next_prompt() {
         let handle = TerminalHandle::spawn(
-            shell_session("stty -echo -icanon; trap 'echo interrupted' INT; echo ready; sleep 600; echo prompt; read line; printf 'received:%s\\n' \"$line\""),
+            shell_session(r#"stty -echo -icanon; trap 'echo interrupted' INT; echo ready; sleep 600; echo prompt; read line; printf 'received:%s\n' "$line""#),
             TerminalConfig::default(), |_| {},
         ).unwrap();
         wait_for_text(&handle, "ready");
