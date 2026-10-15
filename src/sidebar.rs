@@ -2820,6 +2820,14 @@ pub struct WorktreeAttention<'a> {
 }
 
 impl<'a> WorktreeAttention<'a> {
+    fn activity(self) -> Option<crate::agent::ActivityState> {
+        match self.state {
+            Some(AttentionState::Waiting) => Some(crate::agent::ActivityState::Waiting),
+            Some(AttentionState::Working) => Some(crate::agent::ActivityState::Working),
+            _ => None,
+        }
+    }
+
     fn observe(&mut self, card: CardId, activity: Option<crate::agent::ActivityState>, unread: bool, outcome: Option<&'a crate::agent::ActivityOutcome>) {
         self.state = self.state.max(attention_state(activity, unread, outcome));
         self.unread |= unread;
@@ -5490,7 +5498,7 @@ fn project_view<'a>(
                 entity
                     .worktrees
                     .iter()
-                    .filter_map(|worktree| project.state.agent_activity(project_id, worktree.id)),
+                    .filter_map(|worktree| project.worktree_attention(worktree.id).activity()),
             )
             .max_by_key(|activity| match activity {
                 crate::agent::ActivityState::Waiting => 2,
@@ -5501,8 +5509,11 @@ fn project_view<'a>(
             || entity
                 .worktrees
                 .iter()
-                .any(|worktree| project.state.has_agent_update(project_id, worktree.id));
-        if let Some(indicator) = agent_indicator(activity, unread) {
+                .any(|worktree| project.worktree_attention(worktree.id).unread);
+        let outcome = entity.channels.iter().filter_map(|channel| channel.outcome.as_ref())
+            .chain(project.attention.values().filter_map(|summary| summary.outcome))
+            .max_by_key(|outcome| outcome_priority(outcome));
+        if let Some(indicator) = outcome_indicator(activity, unread, outcome) {
             identity = identity.push(indicator);
         }
         identity = identity.push(design::caption(
@@ -5580,16 +5591,14 @@ fn project_view<'a>(
                         modal_open,
                         entity.github_ready,
                         project.editors,
-                        project.state.has_agent_update(project_id, worktree.id),
-                        project.state.agent_activity(project_id, worktree.id),
-                        project.state.worktree_outcome(project_id, worktree.id),
+                        project.worktree_attention(worktree.id).unread,
+                        project.worktree_attention(worktree.id).activity(),
+                        project.worktree_attention(worktree.id).outcome,
                         project
                             .state
                             .attention_retained(SelectionRow::Worktree(project_id, worktree.id))
-                            && !project.state.has_agent_update(project_id, worktree.id)
-                            && !project
-                                .state
-                                .worktree_attention(project_id, worktree.id)
+                            && !project.worktree_attention(worktree.id).unread
+                            && !project.worktree_attention(worktree.id).state
                                 .is_some_and(AttentionState::needs_attention),
                         project.state.worktree_has_panes(project_id, worktree.id),
                         false,
@@ -5732,13 +5741,10 @@ fn compact_project<'a>(
                         project_id: entity.id,
                         worktree_id: worktree.id,
                     })
-                || project.state.has_agent_update(entity.id, worktree.id)
+                || project.worktree_attention(worktree.id).unread
                 || project.state.worktree_has_panes(entity.id, worktree.id)
                 || worktree.deletion.is_some()
-                || project
-                    .state
-                    .agent_activity(entity.id, worktree.id)
-                    .is_some())
+                || project.attention.contains_key(&worktree.id))
     }) {
         column = column.push(RowInteraction::selectable(
             worktree_view(
@@ -5750,16 +5756,14 @@ fn compact_project<'a>(
                 modal_open,
                 entity.github_ready,
                 project.editors,
-                project.state.has_agent_update(entity.id, worktree.id),
-                project.state.agent_activity(entity.id, worktree.id),
-                project.state.worktree_outcome(entity.id, worktree.id),
+                project.worktree_attention(worktree.id).unread,
+                project.worktree_attention(worktree.id).activity(),
+                project.worktree_attention(worktree.id).outcome,
                 project
                     .state
                     .attention_retained(SelectionRow::Worktree(entity.id, worktree.id))
-                    && !project.state.has_agent_update(entity.id, worktree.id)
-                    && !project
-                        .state
-                        .worktree_attention(entity.id, worktree.id)
+                    && !project.worktree_attention(worktree.id).unread
+                    && !project.worktree_attention(worktree.id).state
                         .is_some_and(AttentionState::needs_attention),
                 project.state.worktree_has_panes(entity.id, worktree.id),
                 true,
@@ -9921,6 +9925,13 @@ struct FilteredProject<'a> {
     channels: Vec<&'a SidebarChannel>,
     editors: &'a [SidebarEditor],
     state: &'a SidebarState,
+    attention: HashMap<WorktreeId, WorktreeAttention<'a>>,
+}
+
+impl<'a> FilteredProject<'a> {
+    fn worktree_attention(&self, worktree: WorktreeId) -> WorktreeAttention<'a> {
+        self.attention.get(&worktree).copied().unwrap_or_default()
+    }
 }
 
 /// Cache each visible row's rank once; terminal redraws must not scan the
@@ -9997,11 +10008,9 @@ pub fn visible_selection_rows(
                                     project_id: project.project.id,
                                     worktree_id: worktree.id,
                                 })
-                            || state.has_agent_update(project.project.id, worktree.id)
+                            || project.worktree_attention(worktree.id).unread
                             || state.worktree_has_panes(project.project.id, worktree.id)
-                            || state
-                                .agent_activity(project.project.id, worktree.id)
-                                .is_some()
+                            || project.attention.contains_key(&worktree.id)
                             || worktree.deletion.is_some()
                     })
                     .map(|worktree| SelectionRow::Worktree(project.project.id, worktree.id)),
@@ -10050,8 +10059,10 @@ fn filtered_projects<'a>(
                     channels: Vec::new(),
                     editors: &model.external_editors,
                     state,
+                    attention: HashMap::new(),
                 });
             }
+            let attention = state.worktree_attention_summaries(project.id);
             let mut channels =
                 channels_in_display_order(project.channels.iter().filter(|channel| {
                     (project_matches
@@ -10088,9 +10099,8 @@ fn filtered_projects<'a>(
                             state
                                 .retained_attention
                                 .contains(&SelectionRow::Worktree(project.id, worktree.id))
-                                || state.has_agent_update(project.id, worktree.id)
-                                || state
-                                    .worktree_attention(project.id, worktree.id)
+                                || attention.get(&worktree.id).is_some_and(|summary| summary.unread)
+                                || attention.get(&worktree.id).and_then(|summary| summary.state)
                                     .is_some_and(AttentionState::needs_attention)
                         }
                     })
@@ -10118,6 +10128,7 @@ fn filtered_projects<'a>(
                 channels,
                 editors: &model.external_editors,
                 state,
+                attention,
             })
         })
         .collect();
