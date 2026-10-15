@@ -3079,13 +3079,21 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             // Legacy existence is arbitrary TEXT. Quarantine unreadable rows
             // without parsing them, preserve forensic bytes and narrow IDs,
             // and pause automatic resource adoption when attribution is lost.
-            let damaged = transaction.prepare("SELECT card_id, kind_tag FROM cards WHERE NOT json_valid(existence_json)")?
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            let damaged = transaction
+                .prepare(
+                    "SELECT card_id, kind_tag FROM cards WHERE NOT json_valid(existence_json)",
+                )?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             for (id, kind) in damaged {
                 tracing::warn!(card = %id, %kind, "quarantined unreadable legacy card existence; original bytes retained");
                 if matches!(kind.as_str(), "terminal" | "chat") {
-                    closed_claims::preserve_unknown_claim(&transaction, parse_id("closed card", &id)?)?;
+                    closed_claims::preserve_unknown_claim(
+                        &transaction,
+                        parse_id("closed card", &id)?,
+                    )?;
                 }
             }
             let ids = transaction.prepare("SELECT card_id FROM cards WHERE retired = 1 AND kind_tag IN ('terminal', 'chat')")?
@@ -8299,14 +8307,23 @@ mod tests {
         store.shutdown().unwrap();
         drop(store);
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch("DROP INDEX cards_active_workspace_order_idx;
+        connection
+            .execute_batch(
+                "DROP INDEX cards_active_workspace_order_idx;
             DROP INDEX cards_retired_age_idx;
             DROP TABLE closed_card_archives;
             DROP TABLE closed_terminal_claims;
             DROP TABLE closed_cards;
             ALTER TABLE cards DROP COLUMN retired;
-            PRAGMA user_version = 11;").unwrap();
-        connection.execute("UPDATE cards SET existence_json = '{malformed' WHERE card_id = ?1", [damaged.cards[0].id.to_string()]).unwrap();
+            PRAGMA user_version = 11;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE cards SET existence_json = '{malformed' WHERE card_id = ?1",
+                [damaged.cards[0].id.to_string()],
+            )
+            .unwrap();
         drop(connection);
         let migrated = StateStore::open(&path, boot_id).unwrap();
         assert_eq!(migrated.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -8315,8 +8332,24 @@ mod tests {
         assert_eq!(restored.cards[0].id, healthy.cards[0].id);
         assert!(migrated.card_was_closed(damaged.cards[0].id));
         assert!(migrated.has_unknown_closed_claims());
-        assert!(migrated.load_workspace(damaged.id, None).unwrap().unwrap().cards.is_empty());
-        let raw: String = migrated.lock_inner().unwrap().connection.query_row("SELECT existence_json FROM cards WHERE card_id = ?1", [damaged.cards[0].id.to_string()], |row| row.get(0)).unwrap();
+        assert!(
+            migrated
+                .load_workspace(damaged.id, None)
+                .unwrap()
+                .unwrap()
+                .cards
+                .is_empty()
+        );
+        let raw: String = migrated
+            .lock_inner()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT existence_json FROM cards WHERE card_id = ?1",
+                [damaged.cards[0].id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(raw, "{malformed", "migration must preserve forensic bytes");
         SaveLane::default().save(&migrated, &restored).unwrap();
     }
@@ -9140,11 +9173,18 @@ mod tests {
         assert_eq!(refusals, 1);
         assert!(store.load_card(card, None).unwrap().is_none());
         assert!(store.card_was_closed(card));
-        assert!(store.has_unknown_closed_claims(), "a card-ID guard alone cannot replace its missing resource attribution");
-        assert!(store.terminal_was_closed(&source_terminal), "automatic inventory must not re-adopt the discarded resource");
+        assert!(
+            store.has_unknown_closed_claims(),
+            "a card-ID guard alone cannot replace its missing resource attribution"
+        );
+        assert!(
+            store.terminal_was_closed(&source_terminal),
+            "automatic inventory must not re-adopt the discarded resource"
+        );
         store.shutdown().unwrap();
         drop(store);
-        let reopened = StateStore::open(directory.path().join("state.sqlite3"), boot("boot")).unwrap();
+        let reopened =
+            StateStore::open(directory.path().join("state.sqlite3"), boot("boot")).unwrap();
         assert!(reopened.card_was_closed(card));
         assert!(reopened.has_unknown_closed_claims());
         assert!(reopened.terminal_was_closed(&source_terminal));
@@ -9319,20 +9359,33 @@ mod tests {
                 .map(|ordinal| {
                     let kind = if ordinal % 2 == 0 {
                         let mut template = workspace_with_terminal(&boot_id);
-                        let CardKind::Terminal(mut terminal) = template.cards.remove(0).kind else { unreachable!() };
+                        let CardKind::Terminal(mut terminal) = template.cards.remove(0).kind else {
+                            unreachable!()
+                        };
                         terminal.resume_hint = None;
                         terminal.recovery_origin = Some(TerminalId::new());
                         terminal.launch.program = "/bin/sh".into();
-                        terminal.launch.arguments = vec!["-c".into(), format!("printf 'retirement-{ordinal}'; exec sleep 3600")];
-                        terminal.launch.environment.insert("LANG".into(), "C.UTF-8".into());
+                        terminal.launch.arguments = vec![
+                            "-c".into(),
+                            format!("printf 'retirement-{ordinal}'; exec sleep 3600"),
+                        ];
+                        terminal
+                            .launch
+                            .environment
+                            .insert("LANG".into(), "C.UTF-8".into());
                         CardKind::Terminal(terminal)
                     } else {
-                        let provider = if ordinal % 4 == 1 { crate::agent::Provider::Claude } else { crate::agent::Provider::Codex };
+                        let provider = if ordinal % 4 == 1 {
+                            crate::agent::Provider::Claude
+                        } else {
+                            crate::agent::Provider::Codex
+                        };
                         let (_, mut chat) = agent_workspace(provider);
                         let native_id = uuid::Uuid::new_v4().to_string();
                         let terminal = chat.terminal.as_mut().unwrap();
                         terminal.launch.arguments[1] = native_id.clone();
-                        terminal.resume_hint = crate::model::agent_recovery::hint_from_launch(&terminal.launch);
+                        terminal.resume_hint =
+                            crate::model::agent_recovery::hint_from_launch(&terminal.launch);
                         terminal.continuity = TerminalContinuity::Live {
                             host_session_id: HostSessionId::new("benchmark-host"),
                             boot_id: boot_id.clone(),
@@ -9345,22 +9398,48 @@ mod tests {
                         CardKind::Chat(chat)
                     };
                     CardState {
-                        id: CardId::new(), generation: 0, title: format!("Closed pane {ordinal}"),
-                        width_fraction: 1.0, existence: closed_by_user(),
-                        exposure: Exposure::Offscreen, residency: Residency::Cold, kind,
+                        id: CardId::new(),
+                        generation: 0,
+                        title: format!("Closed pane {ordinal}"),
+                        width_fraction: 1.0,
+                        existence: closed_by_user(),
+                        exposure: Exposure::Offscreen,
+                        residency: Residency::Cold,
+                        kind,
                     }
                 })
                 .collect();
             SaveLane::default().save(&store, &state).unwrap();
             let inner = store.lock_inner().unwrap();
-            let rows: i64 = inner.connection.query_row("SELECT COUNT(*) FROM closed_terminal_claims WHERE unknown = 0", [], |row| row.get(0)).unwrap();
-            assert_eq!(rows, if index == 1 { 2000 } else { 0 }, "benchmark must include real terminal/chat claim decoding");
+            let rows: i64 = inner
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM closed_terminal_claims WHERE unknown = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                rows,
+                if index == 1 { 2000 } else { 0 },
+                "benchmark must include real terminal/chat claim decoding"
+            );
             let mut claim_records = 0;
             let mut proof_lineages = 0;
-            let mut statement = inner.connection.prepare("SELECT claims_json FROM closed_terminal_claims").unwrap();
-            for claims in statement.query_map([], |row| row.get::<_, String>(0)).unwrap() {
-                let claims = serde_json::from_str::<Vec<serde_json::Value>>(&claims.unwrap()).unwrap();
-                proof_lineages += claims.iter().filter(|claim| claim["proof"].is_object() && claim["content"].is_object()).count();
+            let mut statement = inner
+                .connection
+                .prepare("SELECT claims_json FROM closed_terminal_claims")
+                .unwrap();
+            for claims in statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+            {
+                let claims =
+                    serde_json::from_str::<Vec<serde_json::Value>>(&claims.unwrap()).unwrap();
+                proof_lineages += claims
+                    .iter()
+                    .filter(|claim| claim["proof"].is_object() && claim["content"].is_object())
+                    .count();
                 claim_records += claims.len();
             }
             assert_eq!(claim_records, if index == 1 { 3000 } else { 0 });

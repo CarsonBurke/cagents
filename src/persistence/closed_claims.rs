@@ -182,7 +182,11 @@ pub(super) fn save_claims(transaction: &Transaction<'_>, id: CardId) -> Result<(
             }
             claims
         }
-        None => return Err(StoreError::InvalidState("closed card content never reached storage; resource attribution is unknown".into())),
+        None => {
+            return Err(StoreError::InvalidState(
+                "closed card content never reached storage; resource attribution is unknown".into(),
+            ));
+        }
         _ => Vec::new(),
     };
     if !claims.is_empty() {
