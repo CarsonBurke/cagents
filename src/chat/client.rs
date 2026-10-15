@@ -3528,10 +3528,14 @@ mod tests {
             let first = handle.clone();
             let second = handle.clone();
             let first = tokio::spawn(async move {
-                first.original_prompt(Some("one"), Some("native-session"), 0, 256).await
+                first
+                    .original_prompt(Some("one"), Some("native-session"), 0, 256)
+                    .await
             });
             let second = tokio::spawn(async move {
-                second.original_prompt(Some("two"), Some("native-session"), 0, 256).await
+                second
+                    .original_prompt(Some("two"), Some("native-session"), 0, 256)
+                    .await
             });
             assert_eq!(first.await.unwrap().unwrap().text, "one");
             assert_eq!(second.await.unwrap().unwrap().text, "two");
