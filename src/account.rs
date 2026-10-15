@@ -15,7 +15,7 @@
 //! JSON a CLI printed, so they are fixture-tested here. A running native chat
 //! forwards the account frames its CLI already streams as a [`LiveReport`],
 //! which spares a probe while the conversation is busy. Probing a CLI is the
-//! interface's job and lives in [`probe`].
+//! interface and daemon's job and lives in [`probe`].
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,8 @@ pub mod probe;
 pub mod registry;
 pub mod remote;
 pub mod routing;
+#[cfg(feature = "host")]
+pub mod routing_refresh;
 pub mod schedule;
 #[cfg(feature = "host")]
 pub(crate) mod scope;
@@ -257,6 +259,9 @@ pub fn is_account_namespace(provider: Provider, path: &Path) -> bool {
 /// A home the reader's own environment chose - the system account's - is
 /// never listed, so it survives into a cagents process started from there.
 pub const SELECTION_MARKER: &str = "CAGENTS_ACCOUNT_HOMES";
+/// Marks a cagents-owned sign-in recipe even when a configured wrapper has a
+/// custom basename or fixed arguments. Never inferred from an arbitrary process.
+pub const SIGN_IN_MARKER: &str = "CAGENTS_ACCOUNT_SIGN_IN";
 
 /// The provider home variables to drop from an inherited environment, read
 /// through `environment`: those that only record an account cagents selected

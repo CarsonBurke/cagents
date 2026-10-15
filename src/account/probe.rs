@@ -118,6 +118,87 @@ pub enum Outcome {
     Busy,
 }
 
+/// One captured provider policy, shared by discovery, probes and sign-in.
+/// Debug never exposes configured environment values or arguments.
+#[derive(Clone)]
+pub struct Cli {
+    pub program: PathBuf,
+    pub configuration: crate::settings::AgentLaunchSettings,
+}
+impl std::fmt::Debug for Cli {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Cli")
+            .field("program", &self.program)
+            .field("configuration", &"<redacted>")
+            .finish()
+    }
+}
+enum CliFailure {
+    Unavailable(String),
+    Invalid(String),
+}
+impl CliFailure {
+    fn message(self) -> String {
+        match self {
+            Self::Unavailable(message) | Self::Invalid(message) => message,
+        }
+    }
+}
+impl Cli {
+    fn capture(provider: Provider, search_path: Option<&OsStr>) -> Result<Self, CliFailure> {
+        let configuration =
+            crate::settings::agents::provider_settings(provider).map_err(CliFailure::Invalid)?;
+        Self::configured(provider, search_path, configuration)
+    }
+    fn configured(
+        provider: Provider,
+        search_path: Option<&OsStr>,
+        configuration: crate::settings::AgentLaunchSettings,
+    ) -> Result<Self, CliFailure> {
+        // Auth/probes do not select a conversation model or permissions. A
+        // retained invalid launch default must remain repairable without
+        // preventing discovery or sign-in; execution policy still validates.
+        configuration
+            .validate_execution(provider)
+            .map_err(CliFailure::Invalid)?;
+        let program = configuration
+            .resolve_executable(provider, search_path)
+            .map_err(|error| {
+                if configuration.executable.is_some() {
+                    CliFailure::Invalid(error)
+                } else {
+                    CliFailure::Unavailable(error)
+                }
+            })?;
+        Ok(Self {
+            program,
+            configuration,
+        })
+    }
+    pub fn discover(provider: Provider, search_path: Option<&OsStr>) -> Result<Self, String> {
+        Self::capture(provider, search_path).map_err(CliFailure::message)
+    }
+}
+#[cfg(test)]
+impl From<&str> for Cli {
+    fn from(program: &str) -> Self {
+        Self {
+            program: program.into(),
+            configuration: Default::default(),
+        }
+    }
+}
+#[cfg(test)]
+impl From<PathBuf> for Cli {
+    fn from(program: PathBuf) -> Self {
+        Self {
+            program,
+            configuration: Default::default(),
+        }
+    }
+}
+
 /// Probes `account`, sharing the answer with other windows through `cache`.
 ///
 /// Unless `force`d, a cached answer another window observed within
@@ -133,12 +214,12 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         })
         .await
     };
-    let (program, key, lock) = match setup {
+    let (cli, key, lock) = match setup {
         Ok(Prepared::Done(outcome)) => return outcome,
-        Ok(Prepared::Probe { program, key, lock }) => (program, key, lock),
+        Ok(Prepared::Probe { cli, key, lock }) => (cli, key, lock),
         Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
     };
-    let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &program)).await;
+    let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &cli)).await;
     let outcome = match probed {
         Ok(Ok(Probed {
             identity,
@@ -194,7 +275,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
 enum Prepared {
     Done(Outcome),
     Probe {
-        program: PathBuf,
+        cli: Cli,
         key: Option<String>,
         lock: Option<crate::instance::OwnedLock>,
     },
@@ -222,33 +303,40 @@ fn prepare(
             cli_name(account.provider)
         ));
     }
-    let Some(program) = find_executable(account.provider.executable(), search_path) else {
-        return unavailable(format!("{} is not installed", cli_name(account.provider)));
+    let cli = match Cli::capture(account.provider, search_path) {
+        Ok(cli) => cli,
+        Err(CliFailure::Unavailable(error)) => return unavailable(error),
+        Err(CliFailure::Invalid(error)) => return Prepared::Done(Outcome::Failed(error)),
     };
     let key = account.cache_key();
-    let Some(cache) = cache else {
-        return Prepared::Probe {
-            program,
-            key,
-            lock: None,
+    // Even an uncached verification can refresh provider-owned credentials.
+    // It must share exclusion with archive/move/delete, never run unlocked.
+    let fallback = cache.is_none().then(Cache::installation).flatten();
+    let Some(lock_cache) = cache.or(fallback.as_ref()) else {
+        return Prepared::Done(Outcome::Failed(
+            "Account storage cannot be locked; restore the cache directory and retry.".into(),
+        ));
+    };
+    let lock =
+        match lock_cache.try_probe_lock(&account.lock_name()) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => return Prepared::Done(Outcome::Busy),
+            Err(_) => return Prepared::Done(Outcome::Failed(
+                "Account storage cannot be locked; check cache directory permissions and retry."
+                    .into(),
+            )),
         };
-    };
-    let lock = match cache.try_probe_lock(&account.lock_name()) {
-        Ok(Some(lock)) => Some(lock),
-        Ok(None) => return Prepared::Done(Outcome::Busy),
-        // Without a lock directory the probe still runs; it only loses the
-        // guarantee that another window is not running the same one.
-        Err(_) => None,
-    };
     if !force
-        && let Some(entry) = key.as_ref().and_then(|key| cache.load(now).remove(key))
+        && let Some(entry) = key
+            .as_ref()
+            .and_then(|key| cache.and_then(|cache| cache.load(now).remove(key)))
         && now.saturating_sub(entry.snapshot.observed_at) < STALE_AFTER
     {
         let mut snapshot = entry.snapshot;
         snapshot.source = UsageSource::Cache;
         return Prepared::Done(answered(entry.identity, snapshot));
     }
-    Prepared::Probe { program, key, lock }
+    Prepared::Probe { cli, key, lock }
 }
 
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
@@ -289,10 +377,10 @@ fn now_ms() -> u64 {
     crate::chat::now_ms().unwrap_or_default()
 }
 
-async fn probe_cli(account: &Account, program: &Path) -> Result<Probed, String> {
+async fn probe_cli(account: &Account, cli: &Cli) -> Result<Probed, String> {
     match account.provider {
-        Provider::Claude => probe_claude(account, program).await,
-        Provider::Codex => probe_codex(account, program).await,
+        Provider::Claude => probe_claude(account, &cli.program, &cli.configuration).await,
+        Provider::Codex => probe_codex(account, &cli.program, &cli.configuration).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
     }
 }
@@ -300,6 +388,8 @@ async fn probe_cli(account: &Account, program: &Path) -> Result<Probed, String> 
 /// The `PATH` the reader's shell sets up, once asked: `Some(None)` when it
 /// could not say.
 static SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> = tokio::sync::OnceCell::const_new();
+static REFRESHED_SHELL_PATH: std::sync::Mutex<Option<OsString>> = std::sync::Mutex::new(None);
+static SHELL_REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The directories a provider's CLI is looked for in: the ones a terminal
 /// would search.
@@ -323,9 +413,7 @@ pub async fn search_path() -> Option<OsString> {
 /// What [`search_path`] would answer now, without waiting for the shell:
 /// this process's own `PATH` until the shell has been asked.
 pub fn current_search_path() -> Option<OsString> {
-    shell_search_path()
-        .map(OsStr::to_owned)
-        .or_else(|| std::env::var_os("PATH"))
+    shell_search_path().or_else(|| std::env::var_os("PATH"))
 }
 
 /// Whether the shell has been asked for its `PATH`, so that
@@ -337,8 +425,30 @@ pub fn shell_asked() -> bool {
 /// The shell's `PATH`, if [`search_path`] has already read one. A CLI found on
 /// it runs with it, as it would in a terminal: a Node CLI's
 /// `#!/usr/bin/env node` looks for Node there.
-pub fn shell_search_path() -> Option<&'static OsStr> {
-    SHELL_PATH.get()?.as_deref()
+pub fn shell_search_path() -> Option<OsString> {
+    REFRESHED_SHELL_PATH
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+        .or_else(|| SHELL_PATH.get().cloned().flatten())
+}
+
+/// Re-read shell startup after returning from an external CLI installation.
+/// A failed refresh preserves the last usable path. Serialize shell launches
+/// so simultaneous account views cannot create a burst of startup processes.
+pub async fn refresh_search_path() -> Option<OsString> {
+    let _refresh = SHELL_REFRESH.lock().await;
+    if !shell_asked() {
+        return search_path().await;
+    }
+    if let Ok(shell) = crate::model::login_shell()
+        && let Some(path) = shell_path(Path::new(&shell), SHELL_TIMEOUT).await
+    {
+        *REFRESHED_SHELL_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(path);
+    }
+    current_search_path()
 }
 
 /// The `PATH` `shell` sets up when started interactively, as a terminal
@@ -451,8 +561,18 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-fn command(account: &Account, program: &Path) -> Command {
+fn command(
+    account: &Account,
+    program: &Path,
+    configuration: &crate::settings::AgentLaunchSettings,
+) -> Command {
     let mut command = Command::new(program);
+    if let Some(path) = shell_search_path() {
+        command.env("PATH", path);
+    }
+    command
+        .args(&configuration.arguments)
+        .envs(&configuration.environment);
     for variable in SCRUBBED_ENVIRONMENT {
         command.env_remove(variable);
     }
@@ -468,9 +588,6 @@ fn command(account: &Account, program: &Path) -> Command {
             }
         }
         None => {}
-    }
-    if let Some(path) = shell_search_path() {
-        command.env("PATH", path);
     }
     for variable in account.credential_overrides() {
         command.env_remove(variable);
@@ -689,7 +806,30 @@ async fn run_json(command: Command) -> Result<Value, String> {
 /// not an error: the home is going regardless, and only the CLI knows where
 /// else its login lived. Only a managed account is ever signed out here; the
 /// system account's login is the reader's own.
+/// Acquire unique account probe locks in a stable order, all or nothing.
+/// Lifecycle mutations keep these guards through all copying and sign-out.
+pub(super) fn lock_accounts(
+    cache: &Cache,
+    accounts: &[&Account],
+) -> Result<Vec<crate::instance::OwnedLock>, String> {
+    let names: std::collections::BTreeSet<_> =
+        accounts.iter().map(|account| account.lock_name()).collect();
+    names.into_iter().map(|name| {
+        cache.try_probe_lock(&name)
+            .map_err(|_| "Account storage cannot be locked; check cache directory permissions and retry.".to_owned())?
+            .ok_or_else(|| "An account is being checked or changed in another window. Wait for that operation to finish and retry.".to_owned())
+    }).collect()
+}
+
 pub async fn logout(account: Account) -> Result<(), String> {
+    let cache = Cache::installation()
+        .ok_or("Account storage cannot be locked; restore the cache directory and retry.")?;
+    let _locks = lock_accounts(&cache, &[&account])?;
+    logout_locked(account).await
+}
+
+/// The caller holds this account's probe lock for the complete lifecycle write.
+pub(super) async fn logout_locked(account: Account) -> Result<(), String> {
     if account.is_system() {
         return Err("The system account is not signed out by cagents".into());
     }
@@ -698,17 +838,12 @@ pub async fn logout(account: Account) -> Result<(), String> {
         Provider::Codex => &["logout"],
         Provider::Omp => return Ok(()),
     };
-    let executable = account.provider.executable();
+    let provider = account.provider;
     let search_path = search_path().await;
-    let Some(program) =
-        tokio::task::spawn_blocking(move || find_executable(executable, search_path.as_deref()))
-            .await
-            .ok()
-            .flatten()
-    else {
-        return Ok(());
-    };
-    let mut command = command(&account, &program);
+    let cli = tokio::task::spawn_blocking(move || Cli::discover(provider, search_path.as_deref()))
+        .await
+        .map_err(|error| error.to_string())??;
+    let mut command = command(&account, &cli.program, &cli.configuration);
     command.args(arguments);
     let mut group = Group::spawn(command).await?;
     let finished = tokio::time::timeout(TIMEOUT, async {
@@ -718,8 +853,17 @@ pub async fn logout(account: Account) -> Result<(), String> {
     })
     .await;
     group.finish().await;
+    let status = group
+        .child
+        .wait()
+        .await
+        .map_err(|_| "The provider's sign-out status could not be confirmed".to_owned())?;
     match finished {
-        Ok(_) => Ok(()),
+        Ok(_) if status.success() => Ok(()),
+        Ok(_) => Err(format!(
+            "{} did not confirm sign-out",
+            cli_name(account.provider)
+        )),
         Err(_) => Err(format!(
             "{} did not sign out within {} seconds",
             cli_name(account.provider),
@@ -735,10 +879,14 @@ pub async fn logout(account: Account) -> Result<(), String> {
 /// slash commands and no session persistence: it only ever answers two
 /// control requests and never takes a turn, and that way it runs none of the
 /// user's hooks and leaves nothing behind in their history.
-async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, String> {
-    let mut status = command(account, program);
+async fn probe_claude(
+    account: &Account,
+    program: &Path,
+    configuration: &crate::settings::AgentLaunchSettings,
+) -> Result<Probed, String> {
+    let mut status = command(account, program, configuration);
     status.args(["auth", "status", "--json"]);
-    let mut usage = command(account, program);
+    let mut usage = command(account, program, configuration);
     usage.args([
         "-p",
         "--input-format",
@@ -891,8 +1039,12 @@ pub fn match_control_response(frame: &Value, request_id: &str) -> Option<Result<
 
 /// Codex: `codex app-server` over stdio, asked for the account and its
 /// limits and then closed.
-async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String> {
-    let mut command = command(account, program);
+async fn probe_codex(
+    account: &Account,
+    program: &Path,
+    configuration: &crate::settings::AgentLaunchSettings,
+) -> Result<Probed, String> {
+    let mut command = command(account, program, configuration);
     command.arg("app-server");
     let mut session = Session::spawn(command).await?;
     let result = codex_exchange(&mut session).await;
@@ -1079,7 +1231,7 @@ mod tests {
                     .map(|name| format!("[ \"${{{name}+x}}\" = '{expected}' ] || exit 17"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let output = command(&account, Path::new("/bin/sh"))
+                let output = command(&account, Path::new("/bin/sh"), &Default::default())
                     .args(["-c", &script])
                     .output()
                     .await
@@ -1201,7 +1353,9 @@ sleep 30
             identity,
             snapshot,
             models,
-        } = probe_claude(&account, &script).await.unwrap();
+        } = probe_claude(&account, &script, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
         assert_eq!(models.len(), 1, "initialize listed one model");
         assert_eq!(snapshot.windows.len(), 1);
@@ -1221,9 +1375,13 @@ sleep 30
         make_executable(&script);
         let Probed {
             identity, snapshot, ..
-        } = probe_claude(&Account::system(Provider::Claude), &script)
-            .await
-            .unwrap();
+        } = probe_claude(
+            &Account::system(Provider::Claude),
+            &script,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert!(identity.is_none());
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
     }
@@ -1262,9 +1420,13 @@ cat >/dev/null
             identity,
             snapshot,
             models,
-        } = probe_codex(&Account::system(Provider::Codex), &script)
-            .await
-            .unwrap();
+        } = probe_codex(
+            &Account::system(Provider::Codex),
+            &script,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(identity.unwrap().plan.as_deref(), Some("plus"));
         assert_eq!(models.len(), 1, "a signed-out Codex still lists its models");
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
@@ -1278,9 +1440,13 @@ cat >/dev/null
         std::fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
         make_executable(&script);
         assert!(
-            probe_codex(&Account::system(Provider::Codex), &script)
-                .await
-                .is_err()
+            probe_codex(
+                &Account::system(Provider::Codex),
+                &script,
+                &Default::default()
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1304,7 +1470,7 @@ cat >/dev/null
         make_executable(&script);
         let home = directory.path().join("home");
         let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), home.clone());
-        let mut command = command(&account, &script);
+        let mut command = command(&account, &script, &Default::default());
         command.arg("logout");
         let mut group = Group::spawn(command).await.unwrap();
         group.finish().await;
@@ -1319,6 +1485,64 @@ cat >/dev/null
     /// may greet the reader first or leave a job running that holds the
     /// output open; a shell that never answers leaves the search to this
     /// process's own `PATH`, without holding anything up.
+    #[test]
+    fn auth_discovery_ignores_launch_only_defaults_and_retains_execution_safety() {
+        let configuration = crate::settings::AgentLaunchSettings {
+            executable: Some("/bin/sh".into()),
+            permission_mode: Some("retained-unknown-mode".into()),
+            model: Some("retained\ninvalidmodel".into()),
+            ..Default::default()
+        };
+        assert!(configuration.validate(Provider::Claude).is_err());
+        let cli = Cli::configured(Provider::Claude, None, configuration.clone())
+            .unwrap_or_else(|_| panic!("launch-only defaults do not govern authentication"));
+        assert_eq!(cli.program, Path::new("/bin/sh"));
+        let mut invalid = configuration;
+        invalid
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/wrong-home".into());
+        assert!(Cli::configured(Provider::Claude, None, invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn configured_probe_flags_and_environment_keep_account_isolation_last() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("provider-wrapper");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s:%s:%s:%s:%s:%s' \"$1\" \"$2\" \"$3\" \"$FIXTURE_NETWORK\" \"$CLAUDE_CONFIG_DIR\" \"${ANTHROPIC_API_KEY-unset}\"\n").unwrap();
+        make_executable(&script);
+        let account = Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            directory.path().join("selected-home"),
+        );
+        let configuration = crate::settings::AgentLaunchSettings {
+            arguments: vec!["--fixture-flag".into()],
+            environment: std::collections::BTreeMap::from([
+                ("FIXTURE_NETWORK".into(), "fixture-proxy".into()),
+                ("CLAUDE_CONFIG_DIR".into(), "/must-not-win".into()),
+                ("ANTHROPIC_API_KEY".into(), "synthetic-fixture".into()),
+            ]),
+            ..Default::default()
+        };
+        assert!(
+            configuration.validate(Provider::Claude).is_err(),
+            "discovery refuses invalid saved overrides"
+        );
+        let output = command(&account, &script, &configuration)
+            .args(["auth", "status"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "--fixture-flag:auth:status:fixture-proxy:{}:unset",
+                account.resolved_home().unwrap().display()
+            )
+        );
+    }
+
     #[tokio::test]
     async fn the_cli_is_looked_for_where_the_readers_shell_would_look() {
         let directory = tempfile::tempdir().unwrap();
@@ -1398,5 +1622,39 @@ cat >/dev/null
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[tokio::test]
+    async fn abandoned_probe_future_kills_its_provider_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec sleep 300"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        let group = Group::spawn(command).await.unwrap();
+        let id = group.id.unwrap();
+        let pending = async move {
+            let _group = group;
+            std::future::pending::<()>().await;
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), pending)
+                .await
+                .is_err()
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal zero only inspects the fixture-owned process ID.
+            if unsafe { libc::kill(id, 0) } != 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "abandoned fixture provider remains alive"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

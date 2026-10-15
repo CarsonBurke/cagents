@@ -1,3 +1,4 @@
+mod accounts;
 mod activity;
 mod agent_execution;
 mod automations;
@@ -251,6 +252,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             .map_err(io::Error::other)?;
     }
     let _agent_activity = activity::Monitor::start(&host)?;
+    let _account_probes = accounts::Monitor::start(&host)?;
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;

@@ -255,6 +255,7 @@ pub(crate) struct HostState {
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
     pub(super) automations: Option<super::automations::Handle>,
+    pub(super) account_routing: Option<Arc<super::accounts::Signal>>,
     /// Wakes the courier that hands messages to idle conversations.
     pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
     /// Seals the messages the courier delivers and recognizes them in
@@ -317,6 +318,10 @@ struct PreparedUpgrade {
 }
 
 impl HostState {
+    pub(super) fn account_cleanup_evidence(&self) -> Option<Arc<crate::upgrade::handoff::Store>> {
+        self.upgrade_evidence.clone()
+    }
+
     pub(super) fn enable_holder_recovery(&mut self) {
         self.recover_holders = true;
     }
@@ -333,6 +338,7 @@ impl HostState {
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             automations: None,
+            account_routing: None,
             mailbox: None,
             mailbox_seal: None,
             execution_gates: BTreeMap::new(),

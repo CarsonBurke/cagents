@@ -79,6 +79,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::SendTestNotification
         | R::ChatStart { .. }
         | R::ChatRecoverAccount { .. }
+        | R::ChatAccountSwitchGeneration { .. }
         | R::ChatAttach { .. }
         | R::ChatDetach { .. }
         | R::ChatCommand { .. }

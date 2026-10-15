@@ -91,7 +91,7 @@ pub fn select_cached(
         .unwrap_or(preferred)
 }
 
-fn fresh(snapshot: &UsageSnapshot, now: u64) -> bool {
+pub(super) fn fresh(snapshot: &UsageSnapshot, now: u64) -> bool {
     snapshot.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
         && now.saturating_sub(snapshot.observed_at) <= schedule::DISPLAY_STALE_AFTER
         && !snapshot.windows.iter().any(|window| {

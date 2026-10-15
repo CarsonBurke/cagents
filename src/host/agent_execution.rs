@@ -120,9 +120,31 @@ pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
                 .unwrap_or_default()
                 .as_millis()
                 .min(u64::MAX as u128) as u64;
-            let entries = crate::account::cache::Cache::installation()
+            let cache = crate::account::cache::Cache::installation();
+            let mut entries = cache
+                .as_ref()
                 .map(|cache| cache.load(now))
                 .unwrap_or_default();
+            if preferred
+                .cache_key()
+                .and_then(|key| entries.get(&key))
+                .is_some_and(|entry| {
+                    crate::account::routing::needs_alternate_for(&preferred, &entry.snapshot, now)
+                })
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(crate::account::routing_refresh::refresh(
+                    &accounts,
+                    homes.as_ref(),
+                    &preferred,
+                    cache,
+                    &mut entries,
+                    now,
+                ));
+            }
             Ok(crate::account::routing::select_cached(
                 &accounts,
                 homes.as_ref(),
@@ -346,8 +368,18 @@ fn dispatch(
         (record.session.clone(), record.handle.clone())
     } else {
         let account = selected_account(&accepted.agent.spec).map_err(before)?;
-        let settings = crate::settings::default_path().map_err(|error| before(error.to_string())).and_then(|path| crate::settings::load(path).map_err(|error| before(error.to_string())))?;
-        let configuration = settings.agents.get(crate::settings::agents::provider_key(accepted.agent.spec.provider)).cloned().unwrap_or_default();
+        let settings = crate::settings::default_path()
+            .map_err(|error| before(error.to_string()))
+            .and_then(|path| {
+                crate::settings::load(path).map_err(|error| before(error.to_string()))
+            })?;
+        let configuration = settings
+            .agents
+            .get(crate::settings::agents::provider_key(
+                accepted.agent.spec.provider,
+            ))
+            .cloned()
+            .unwrap_or_default();
         let mut session = chat::fresh_session_configured(
             accepted.agent.spec.provider,
             TerminalId::new(),
@@ -359,7 +391,8 @@ fn dispatch(
                 effort: accepted.agent.spec.reasoning_effort.as_deref(),
                 permission_mode: accepted.agent.spec.permission_mode.as_deref(),
             },
-        ).map_err(before)?;
+        )
+        .map_err(before)?;
         let proof = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
