@@ -469,6 +469,9 @@ impl Cagents {
                         return Some(reason);
                     }
                 }
+                CardRuntime::PullRequests(pane)=>{
+                    if let Some(reason)=pane.review.restart_blocker() {return Some(reason);}
+                }
                 _ => {}
             }
         }

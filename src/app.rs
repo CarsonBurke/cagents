@@ -6542,6 +6542,7 @@ impl Cagents {
         let mut selection: Option<Option<u64>> = dismissed_pending.then_some(None);
         let mut links = Vec::new();
         let mut checkout = None;
+        let mut checkout_open = None;
         let mut cleanup = None;
         for effect in pane.review.take_effects() {
             match effect {
@@ -6577,6 +6578,7 @@ impl Cagents {
                         .project(&self.sidebar_model)
                         .map(|project| (project, target));
                 }
+                pull_request_review::Effect::OpenCheckout(path)=>checkout_open=Some(path),
                 pull_request_review::Effect::CleanupMergedHead(head) => {
                     cleanup = pane
                         .project(&self.sidebar_model)
@@ -6598,6 +6600,7 @@ impl Cagents {
         for url in links {
             tasks.push(self.open_clicked_link(url));
         }
+        if let Some(path)=checkout_open {tasks.push(self.select_worktree(path,false));}
         if let Some((project, head)) = cleanup {
             tasks.push(self.open_merged_pull_request_cleanup(card, project, head));
         }
@@ -16332,9 +16335,17 @@ impl Application for Cagents {
                 }
                 match result {
                     Ok(plan) => {
-                        if let Some(path) = plan.existing_worktree {
-                            self.status = Some(TransientNotice::warning(plan.notice));
-                            return self.select_worktree(path, false);
+                        if let Some(reconciliation)=plan.reconciliation {
+                            if let Some(CardRuntime::PullRequests(pane))=self.cards.get_mut(&card) {
+                                pane.review.offer_existing_checkout(target,reconciliation,plan.notice);
+                            }
+                            return Task::none();
+                        }
+                        if plan.existing_worktree.is_some() {
+                            if let Some(CardRuntime::PullRequests(pane))=self.cards.get_mut(&card) {
+                                pane.review.report_checkout_error("Existing checkout has no verified reconciliation plan; prepare it again.".into());
+                            }
+                            return Task::none();
                         }
                         let task = self.open_worktree_dialog(
                             project,
@@ -19045,6 +19056,40 @@ mod tests {
         let _ = app.update(Message::WindowCloseRequested(window));
         assert!(app.dirty_repository_close.is_none());
         assert_eq!(app.exit, closing);
+    }
+
+    #[test]
+    fn pending_pull_request_checkout_fences_actual_window_close_and_update_dispatch() {
+        let mut app=context_inspector_test_app(false);
+        let (card,task)=app.add_pull_requests_card("/fixture".into());drop(task);
+        let Some(CardRuntime::PullRequests(pane))=app.cards.get_mut(&card) else{panic!("review card")};
+        let ticket=pane.review.fixture_existing_checkout_pending();
+        let generation=pane.review.selection_generation();
+        for message in [Message::CloseCard(card),Message::CloseCardUnasked(card)] {
+            app.notices.clear();
+            drop(app.update(message));
+            assert!(app.cards.contains_key(&card));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.workspace.pending_close().is_none());
+            assert!(app.notices.recent().any(|entry|entry.notice.message.contains("checkout reconciliation")));
+        }
+        app.workspace.request_close(card).unwrap();
+        drop(app.update(Message::CommitClose(card)));
+        assert!(app.cards.contains_key(&card));assert!(app.workspace.pending_close().is_none(),
+            "a new accepted operation must retire an earlier close reservation without removing the card");
+        let window=window::Id::unique();app.core.set_main_window_id(Some(window));
+        assert!(app.window_update_blocker().unwrap().contains("checkout reconciliation"));
+        drop(app.update_update_ui(update_ui::Action::StartApply));
+        assert!(app.status.as_ref().unwrap().message.contains("checkout reconciliation"));
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(app.exit.is_none());assert_eq!(app.core.main_window_id(),Some(window));
+        assert_eq!(app.transient_work_close,Some(window));assert!(app.cards.contains_key(&card));
+        drop(app.update(Message::CancelTransientWorkClose));
+        drop(app.update(Message::PullRequestReview {card,action:pull_request_review::Action::ExistingCheckout(
+            pull_request_review::checkout_ui::Action::Finished {generation,ticket,result:Err("Reconciliation refused; checkout preserved.".into())}
+        )}));
+        assert!(app.window_close_transient_blocker().is_none());
+        assert!(app.window_update_blocker().is_none());
     }
 
     #[test]

@@ -44,6 +44,7 @@ type ActionTask = iced::Task<Action>;
 
 pub mod cache;
 pub mod checkout;
+pub mod checkout_ui;
 pub mod completion;
 pub mod discussion;
 pub mod discussion_ui;
@@ -250,6 +251,7 @@ pub enum Action {
     },
     OpenUrl(Url),
     Checkout,
+    ExistingCheckout(checkout_ui::Action),
     DismissNotice,
 }
 
@@ -260,6 +262,7 @@ impl Action {
         matches!(
             self,
             Self::FilePage(file_pages::PageAction::Loaded { .. })
+                | Self::ExistingCheckout(checkout_ui::Action::Finished { .. })
                 | Self::Loaded { .. }
                 | Self::ListLoaded { .. }
                 | Self::TargetLoaded { .. }
@@ -312,6 +315,7 @@ pub enum Effect {
     PreviousChange,
     OpenUrl(Url),
     Checkout(CheckoutTarget),
+    OpenCheckout(PathBuf),
     CleanupMergedHead(CleanupHead),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
@@ -440,6 +444,7 @@ pub struct State {
     unavailable_reason: Option<String>,
     discussion: discussion_ui::DiscussionState,
     completion: completion::Controls,
+    existing_checkout: checkout_ui::Confirmation,
     parked_discussions: Vec<(ReviewTarget, discussion_ui::DiscussionState)>,
     api: Arc<dyn GitHubReviewApi>,
     cache: Option<Arc<dyn cache::Store>>,
@@ -662,6 +667,7 @@ impl State {
             unavailable_reason: None,
             discussion: discussion_ui::DiscussionState::default(),
             completion: completion::Controls::default(),
+            existing_checkout: checkout_ui::Confirmation::default(),
             parked_discussions: Vec::new(),
             api,
             cache: None,
@@ -1261,6 +1267,7 @@ impl State {
             }
             Action::Checkout => {
                 if !self.refreshing
+                    && !self.existing_checkout.busy()
                     && let (Some(target), Some(context), Some(range)) =
                         (&self.target, &self.context, &self.range)
                     && context.head_oid == range.head.as_str()
@@ -1281,6 +1288,7 @@ impl State {
                 }
                 ActionTask::none()
             }
+            Action::ExistingCheckout(action)=>self.update_existing_checkout(action),
             Action::DismissNotice => {
                 self.notice = None;
                 ActionTask::none()
@@ -1488,6 +1496,7 @@ impl State {
     }
 
     fn reset_target(&mut self) {
+        self.existing_checkout.reset();
         self.completion.reset();
         self.cache_loading = false;
         self.cache_dirty = false;
@@ -2058,9 +2067,9 @@ impl State {
         .center(Length::Fixed(ROW_ICON_WIDTH))
         .into();
         let mut controls: Vec<Element<'_, Action>> = vec![
-            icon_button(Icon::Branch, "Create worktree from reviewed commit")
+            icon_button(Icon::Branch, "Check out pull request")
                 .on_press_maybe(
-                    (!modal_open && !busy && self.context.is_some() && self.range.is_some())
+                    (!modal_open && !busy && !self.existing_checkout.busy() && self.context.is_some() && self.range.is_some())
                         .then(|| self.fenced(Action::Checkout)),
                 )
                 .into(),
@@ -2175,6 +2184,9 @@ impl State {
         );
         if self.completion.open {
             rows.push(self.completion_view(modal_open));
+        }
+        if let Some(confirmation)=self.existing_checkout_view(modal_open) {
+            rows.push(confirmation);
         }
         widget::column::with_children(rows)
             .spacing(space::XS)

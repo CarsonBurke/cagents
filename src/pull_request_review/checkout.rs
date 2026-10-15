@@ -28,8 +28,9 @@ pub fn create(
 use crate::{
     github::GitHubService,
     repository::{
-        CommandSpec, LocalRefRecord, ProcessExecutor, RemoteRecord, SystemProcessExecutor,
-        WorktreeRecord,
+        CommandSpec, ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, LocalRefRecord,
+        PrCheckoutTracking, ProcessExecutor, RemoteRecord, SystemProcessExecutor,
+        ValidatedBranchName, VerifiedPrCheckout, WorktreeRecord,
     },
 };
 use std::path::{Path, PathBuf};
@@ -41,7 +42,26 @@ pub struct PreparedCheckout {
     pub branch_input: String,
     pub base: String,
     pub existing_worktree: Option<PathBuf>,
+    /// Existing checkouts are reconciled only after an explicit confirmation.
+    pub reconciliation: Option<ExistingPrCheckoutPlan>,
+    existing_request: Option<ExistingPrCheckoutRequest>,
     pub notice: String,
+}
+
+/// Both shells fence the backend's completed receipt to the review that the
+/// user confirmed. No filesystem lookup or Git command runs on the UI thread.
+pub fn verified_existing_path(target:&super::CheckoutTarget,plan:&ExistingPrCheckoutPlan,receipt:&VerifiedPrCheckout)->Result<PathBuf,String> {
+    let request=plan.request();
+    let upstream=match request.tracking {
+        PrCheckoutTracking::RemoteBranch=>Some(format!("refs/remotes/{}/{}",request.remote,request.head_branch.as_str())),
+        PrCheckoutTracking::ReadOnly=>None,
+    };
+    if request.repository!=target.repository || request.expected_head!=target.head
+        || receipt.path()!=plan.path() || receipt.head()!=&request.expected_head
+        || receipt.branch()!=&request.branch || receipt.upstream()!=upstream.as_deref() {
+        return Err("The checkout receipt no longer matches this review. Prepare checkout again.".into());
+    }
+    Ok(receipt.path().to_owned())
 }
 
 pub trait CheckoutGit {
@@ -107,6 +127,8 @@ pub fn prepare(
             branch_input: target.suggested_branch(),
             base: target.head.as_str().to_owned(),
             existing_worktree: None,
+            reconciliation: None,
+            existing_request: None,
             notice: "Read-only commit checkout; no PR branch upstream is known.".into(),
         });
     }
@@ -124,14 +146,22 @@ pub fn prepare(
             "The pull request head changed. Refresh its review before checking out.".into(),
         );
     }
-    plan(
+    let mut prepared = plan(
         target,
         &head,
         &LocalGit {
             repository: &target.repository,
             cancellation,
         },
-    )
+    )?;
+    if let Some(request) = &prepared.existing_request {
+        let reconciliation = RepositoryService::system("git")
+            .prepare_existing_pr_checkout(request, cancellation)
+            .map_err(|error| error.to_string())?;
+        prepared.notice = format!("{} {}",prepared.notice,reconciliation.notice());
+        prepared.reconciliation = Some(reconciliation);
+    }
+    Ok(prepared)
 }
 
 /// Resolve identity before creating anything. Existing branches are never reset;
@@ -170,7 +200,7 @@ pub fn plan(
         .filter(|remote| matches_remote(remote))
         .map(|remote| format!("refs/remotes/{}/{}", remote.name, head.branch))
         .collect::<Vec<_>>();
-    let existing_worktree = refs
+    let existing = refs
         .iter()
         .filter(|local| {
             local.upstream.as_ref().is_some_and(|reference| {
@@ -178,21 +208,46 @@ pub fn plan(
                     .iter()
                     .any(|upstream| reference.as_str() == upstream.as_str())
             }) || (local.name.as_str() == format!("refs/heads/{}", head.branch)
-                && local.upstream.is_none()
-                && local.oid.as_str() == head.oid)
+                && local.upstream.is_none())
         })
         .find_map(|local| {
             worktrees
                 .iter()
                 .find(|worktree| worktree.branch.as_deref() == Some(local.name.as_str()))
-        })
-        .map(|worktree| worktree.path.clone());
-    if let Some(path) = existing_worktree {
+                .map(|worktree| (local, worktree))
+        });
+    let ensure_remote = || {
+        if existing_remote.is_none() {
+            let ssh = remotes.iter().filter_map(|remote| remote.fetch_url.as_deref())
+                .any(|url| url.starts_with("git@") || url.starts_with("ssh://"));
+            git.add_remote(&remote, if ssh { &head.ssh_url } else { &head.clone_url })?;
+        }
+        Ok::<(), String>(())
+    };
+    if let Some((local, worktree)) = existing {
+        ensure_remote()?;
+        let tracking_remote = local.upstream.as_ref().and_then(|upstream| remotes.iter()
+            .filter(|candidate| matches_remote(candidate))
+            .find(|candidate| upstream.as_str() == format!("refs/remotes/{}/{}", candidate.name, head.branch)))
+            .map(|remote| remote.name.clone()).unwrap_or_else(|| remote.clone());
+        let branch = local.name.as_str().strip_prefix("refs/heads/")
+            .ok_or("The existing checkout does not name a local branch")?;
         return Ok(PreparedCheckout {
             repository: target.repository.clone(),
             branch_input: head.branch.clone(),
             base: String::new(),
-            existing_worktree: Some(path),
+            existing_worktree: Some(worktree.path.clone()),
+            reconciliation: None,
+            existing_request: Some(ExistingPrCheckoutRequest {
+                repository: target.repository.clone(), worktree: worktree.path.clone(),
+                branch: ValidatedBranchName::parse(branch).map_err(|e|e.to_string())?,
+                head_repository: head.repository.clone(),
+                head_branch: ValidatedBranchName::parse(&head.branch).map_err(|e|e.to_string())?,
+                expected_head: target.head.clone(), remote: tracking_remote,
+                tracking: if head.can_push || local.upstream.is_some() {
+                    PrCheckoutTracking::RemoteBranch
+                } else { PrCheckoutTracking::ReadOnly },
+            }),
             notice: format!(
                 "Open the existing worktree for PR branch {}.{}",
                 head.branch,
@@ -205,22 +260,27 @@ pub fn plan(
         });
     }
     if !head.can_push {
-        return Ok(PreparedCheckout { repository: target.repository.clone(), branch_input: format!("pr/{}", target.number), base: target.head.as_str().to_owned(),
-            existing_worktree: worktrees.iter().find(|worktree| worktree.branch.as_deref() == Some(format!("refs/heads/pr/{}", target.number).as_str())).map(|worktree| worktree.path.clone()),
+        let branch = format!("pr/{}", target.number);
+        let worktree = worktrees.iter().find(|worktree| worktree.branch.as_deref() == Some(format!("refs/heads/{branch}").as_str()));
+        if worktree.is_some() { ensure_remote()?; }
+        return Ok(PreparedCheckout { repository: target.repository.clone(), branch_input: branch.clone(), base: target.head.as_str().to_owned(),
+            existing_worktree: worktree.map(|worktree|worktree.path.clone()), reconciliation:None,
+            existing_request: worktree.map(|worktree| Ok::<_,String>(ExistingPrCheckoutRequest {
+                repository:target.repository.clone(),worktree:worktree.path.clone(),
+                branch:ValidatedBranchName::parse(&branch).map_err(|e|e.to_string())?,
+                head_repository:head.repository.clone(),head_branch:ValidatedBranchName::parse(&head.branch).map_err(|e|e.to_string())?,
+                expected_head:target.head.clone(),remote:remote.clone(),tracking:PrCheckoutTracking::ReadOnly,
+            })).transpose()?,
             notice: "You do not have permission to push to the PR head. This checkout uses a read-only local branch; commits cannot be pushed to the PR.".into() });
     }
-    if existing_remote.is_none() {
-        let ssh = remotes
-            .iter()
-            .filter_map(|remote| remote.fetch_url.as_deref())
-            .any(|url| url.starts_with("git@") || url.starts_with("ssh://"));
-        git.add_remote(&remote, if ssh { &head.ssh_url } else { &head.clone_url })?;
-    }
+    ensure_remote()?;
     Ok(PreparedCheckout {
         repository: target.repository.clone(),
         branch_input: format!("{remote}/{}", head.branch),
         base: String::new(),
         existing_worktree: None,
+        reconciliation: None,
+        existing_request: None,
         notice: format!(
             "Checks out {} tracking {remote}/{}. Commits can be pushed back to PR #{}.",
             head.branch, head.branch, target.number
@@ -362,5 +422,43 @@ mod tests {
         assert_eq!(plan.base, target.head.as_str());
         assert!(plan.notice.contains("do not have permission"));
         assert!(git.added.borrow().is_empty());
+    }
+
+    #[test]
+    fn untracked_and_old_existing_checkouts_require_reconciliation_before_opening() {
+        for upstream in [None, Some("refs/remotes/origin/feature/x")] {
+            let (target, head, mut git) = fixture();
+            git.refs.push(LocalRefRecord {
+                name: ValidatedRefName::parse("refs/heads/feature/x").unwrap(),
+                oid: Oid::parse(&"b".repeat(40)).unwrap(),
+                upstream: upstream.map(|value|ValidatedRefName::parse(value).unwrap()),
+                head:false,
+            });
+            git.worktrees=crate::repository::parse_worktree_list(format!(
+                "worktree /existing\0HEAD {}\0branch refs/heads/feature/x\0\0", "b".repeat(40)
+            ).as_bytes()).unwrap();
+            let planned=plan(&target,&head,&git).unwrap();
+            let request=planned.existing_request.unwrap();
+            assert_eq!(request.worktree,PathBuf::from("/existing"));
+            assert_eq!(request.expected_head,target.head);
+            assert_eq!(request.branch.as_str(),"feature/x");
+            assert_eq!(request.tracking,PrCheckoutTracking::RemoteBranch);
+            assert!(planned.reconciliation.is_none(),"planning alone cannot authorize opening");
+        }
+    }
+
+    #[test]
+    fn an_old_readonly_pr_branch_requires_head_reconciliation_without_tracking() {
+        let (target,mut head,mut git)=fixture();head.can_push=false;
+        git.worktrees=crate::repository::parse_worktree_list(format!(
+            "worktree /readonly\0HEAD {}\0branch refs/heads/pr/7\0\0", "b".repeat(40)
+        ).as_bytes()).unwrap();
+        let planned=plan(&target,&head,&git).unwrap();
+        let request=planned.existing_request.unwrap();
+        assert_eq!(request.branch.as_str(),"pr/7");
+        assert_eq!(request.head_branch.as_str(),"feature/x");
+        assert_eq!(request.tracking,PrCheckoutTracking::ReadOnly);
+        assert_eq!(request.expected_head,target.head);
+        assert!(planned.reconciliation.is_none());
     }
 }

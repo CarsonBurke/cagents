@@ -145,6 +145,11 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        if let Some(CardRuntime::PullRequests(pane))=self.cards.get(&card)
+            && let Some(reason)=pane.review.restart_blocker() {
+            self.status=Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
         if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
             if !self.terminal_close_attempts.insert(session.id) {
                 return Task::none();
@@ -330,6 +335,14 @@ impl Cagents {
             Option<(TerminalId, TerminalId)>,
         )>,
     ) -> Option<Task<Message>> {
+        if let Some(CardRuntime::PullRequests(pane))=self.cards.get(&id)
+            && let Some(reason)=pane.review.restart_blocker() {
+            if self.workspace.pending_close().is_some_and(|pending|pending.unmounting==id) {
+                let _=self.workspace.cancel_close(id);
+            }
+            self.status=Some(TransientNotice::warning(reason));
+            return None;
+        }
         let handoff = self.workspace.pending_close();
         let replacing = replacement.is_some();
         let closed_descriptor = (!replacing).then(|| self.card_state(id).cloned()).flatten();
