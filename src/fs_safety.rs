@@ -137,6 +137,12 @@ impl Root {
         })
     }
 
+    /// Duplicate the retained directory for a command that must resolve the
+    /// same object through an inherited descriptor, independent of its name.
+    pub(crate) fn retained_directory(&self) -> io::Result<File> {
+        self.directory.try_clone().map(File::from)
+    }
+
     /// This root's own metadata, for a caller that needs the directory's
     /// identity — its device and inode — rather than the name it was reached
     /// by. `fstat` answers through an `O_PATH` descriptor, so this needs no
